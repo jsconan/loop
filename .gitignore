@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local config
+config.local.toml
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
