@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pprint import pprint
 
 from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseReasoningItem,
     ResponseReasoningTextDeltaEvent,
@@ -11,6 +13,7 @@ from openai.types.responses import (
 )
 
 from .client import Client
+from .tools import ToolCall
 
 
 @dataclass
@@ -19,6 +22,7 @@ class Response:
 
     answer: str
     reasoning: str
+    tool_calls: list[ResponseFunctionToolCall]
 
 
 class BaseLoop:
@@ -42,6 +46,9 @@ class BaseLoop:
             self._messages.append({"role": "user", "content": user_input})
 
             response = self.output(self.query())
+            while self.handle_tool_calls(response):
+                response = self.output(self.query())
+
             self._messages.append(
                 {
                     "role": "assistant",
@@ -51,6 +58,28 @@ class BaseLoop:
             )
 
         self.end()
+
+    def handle_tool_calls(self, response: Response) -> bool:
+        """Handle tool calls made by the LLM during reasoning.
+
+        Args:
+            response: The LLM response containing tool call events.
+        """
+        if not response.tool_calls:
+            return False
+
+        for tool_call in response.tool_calls:
+            print(f"\n[TOOL CALL]: {tool_call.name}({tool_call.arguments})")
+            self._messages.append(tool_call.model_dump(exclude_none=True))
+            tool = ToolCall(name=tool_call.name, arguments=tool_call.arguments)
+            self._messages.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": tool_call.call_id,
+                    "output": tool.call(),
+                }
+            )
+        return True
 
     def query(self) -> None:
         """Request a response for the current conversation history."""
@@ -83,6 +112,7 @@ class BaseLoop:
         """
         thinking_text = ""
         answer_text = ""
+        tool_calls = []
 
         for message in response.output:
             if self._debug:
@@ -100,9 +130,17 @@ class BaseLoop:
                 print(f"Message: {content}")
                 continue
 
+            if isinstance(message, ResponseFunctionToolCall):
+                tool_calls.append(message)
+                continue
+
         print("")
 
-        return Response(answer=answer_text.strip(), reasoning=thinking_text.strip())
+        return Response(
+            answer=answer_text.strip(),
+            reasoning=thinking_text.strip(),
+            tool_calls=tool_calls,
+        )
 
     def end(self) -> None:
         """Display the conversation termination message."""
@@ -129,6 +167,7 @@ class StreamingLoop(BaseLoop):
         answer_started = False
         thinking_text = ""
         answer_text = ""
+        tool_calls = []
 
         print("\nThinking...")
 
@@ -141,13 +180,18 @@ class StreamingLoop(BaseLoop):
                 if not is_thinking:
                     print("\n[THOUGHT PROCESS]:")
                     is_thinking = True
-                    thinking_text += event.delta
+                thinking_text += event.delta
 
             if isinstance(event, ResponseTextDeltaEvent):
                 if not answer_started:
                     print("\n[ANSWER]:")
                     answer_started = True
-                    answer_text += event.delta
+                answer_text += event.delta
+
+            if isinstance(event, ResponseOutputItemDoneEvent):
+                if isinstance(event.item, ResponseFunctionToolCall):
+                    tool_calls.append(event.item)
+                    continue
 
             if isinstance(event, (ResponseTextDeltaEvent, ResponseReasoningTextDeltaEvent)):
                 print(event.delta, end="", flush=True)
@@ -155,4 +199,8 @@ class StreamingLoop(BaseLoop):
 
         print("")
 
-        return Response(answer=answer_text.strip(), reasoning=thinking_text.strip())
+        return Response(
+            answer=answer_text.strip(),
+            reasoning=thinking_text.strip(),
+            tool_calls=tool_calls,
+        )

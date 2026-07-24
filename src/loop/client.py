@@ -6,6 +6,7 @@ from openai import AsyncOpenAI, BaseModel, OpenAI
 from openai.types.responses import ResponseInputParam
 
 from .config import BASE_URL, MODEL
+from .tools import TOOLS
 
 _DEFAULT_API_KEY = "local-api-key"
 
@@ -80,6 +81,7 @@ class Client:
             input=input,
             stream=stream,
             stream_options={"include_usage": True},
+            tools=TOOLS,
         )
         return response
 
@@ -104,5 +106,6 @@ class Client:
             input=input,
             stream=stream,
             stream_options={"include_usage": True},
+            tools=TOOLS,
         )
         return response
