@@ -1,7 +1,90 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "loop"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = ["openai>=2.46.0"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.3.0",
+    "pylint>=3.3.9",
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.14.11",
+]
+lint = ["ruff", "pylint"]
+test = ["pytest-cov", "pytest"]
+
+[tool.uv]
+exclude-newer = "7 days"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loop"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pylint]
+max-line-length = 100
+disable = [
+    "C0302", # (too-many-lines)
+    "R0801", # (duplicate-code)
+    "R0902", # (too-many-instance-attributes)
+    "R0903", # (too-few-public-methods)
+    "R0904", # (too-many-public-methods)
+    "R0911", # (too-many-return-statements)
+    "R0913", # (too-many-arguments)
+    "R0914", # (too-many-locals)
+    "R0917", # (too-many-positional-arguments)
+    "W0511", # (fixme)
+]
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint."MESSAGES CONTROL"]
+disable = [
+    "too-many-lines",
+    "duplicate-code",
+    "too-many-instance-attributes",
+    "too-few-public-methods",
+    "too-many-public-methods",
+    "too-many-return-statements",
+    "too-many-arguments",
+    "too-many-locals",
+    "too-many-positional-arguments",
+    "fixme",
+]
+
+[tool.pytest.ini_options]
+addopts = ["-ra", "-q"]
+testpaths = ["tests/"]
+
+[tool.coverage.run]
+branch = true
+relative_files = true
+source = ["src/loop"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
+[tool.coverage.paths]
+source = ["src/loop"]
+tests = ["tests/"]
