@@ -1,8 +1,9 @@
 """Run an interactive conversation with an LLM backend."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pprint import pprint
 
+from openai import BaseModel
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseOutputItemDoneEvent,
@@ -22,7 +23,8 @@ class Response:
 
     answer: str
     reasoning: str
-    tool_calls: list[ResponseFunctionToolCall]
+    tool_calls: list[ResponseFunctionToolCall] = field(default_factory=list)
+    output_items: list[BaseModel] = field(default_factory=list)
 
 
 class BaseLoop:
@@ -46,18 +48,20 @@ class BaseLoop:
             self._messages.append({"role": "user", "content": user_input})
 
             response = self.output(self.query())
+            self.record_output(response)
             while self.handle_tool_calls(response):
                 response = self.output(self.query())
-
-            self._messages.append(
-                {
-                    "role": "assistant",
-                    "content": response.answer.strip(),
-                    "reasoning": response.reasoning.strip(),
-                }
-            )
+                self.record_output(response)
 
         self.end()
+
+    def record_output(self, response: Response) -> None:
+        """Append completed response output items to the conversation history.
+
+        Args:
+            response: The LLM response containing output items.
+        """
+        self._messages.extend(item.model_dump(exclude_none=True) for item in response.output_items)
 
     def handle_tool_calls(self, response: Response) -> bool:
         """Handle tool calls made by the LLM during reasoning.
@@ -70,7 +74,6 @@ class BaseLoop:
 
         for tool_call in response.tool_calls:
             print(f"\n[TOOL CALL]: {tool_call.name}({tool_call.arguments})")
-            self._messages.append(tool_call.model_dump(exclude_none=True))
             tool = ToolCall(name=tool_call.name, arguments=tool_call.arguments)
             self._messages.append(
                 {
@@ -140,6 +143,7 @@ class BaseLoop:
             answer=answer_text.strip(),
             reasoning=thinking_text.strip(),
             tool_calls=tool_calls,
+            output_items=list(response.output),
         )
 
     def end(self) -> None:
@@ -168,6 +172,7 @@ class StreamingLoop(BaseLoop):
         thinking_text = ""
         answer_text = ""
         tool_calls = []
+        output_items = []
 
         print("\nThinking...")
 
@@ -189,6 +194,7 @@ class StreamingLoop(BaseLoop):
                 answer_text += event.delta
 
             if isinstance(event, ResponseOutputItemDoneEvent):
+                output_items.append(event.item)
                 if isinstance(event.item, ResponseFunctionToolCall):
                     tool_calls.append(event.item)
                     continue
@@ -203,4 +209,5 @@ class StreamingLoop(BaseLoop):
             answer=answer_text.strip(),
             reasoning=thinking_text.strip(),
             tool_calls=tool_calls,
+            output_items=output_items,
         )
