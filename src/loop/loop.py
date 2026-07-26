@@ -156,8 +156,9 @@ class BaseLoop:
                 pprint(message)
 
             if isinstance(message, ResponseReasoningItem):
-                thinking_text += message.content[0].text if message.content else ""
-                print(f"Reasoning: {message.content[0].text}")
+                content = message.content[0].text if message.content else ""
+                thinking_text += content
+                print(f"Reasoning: {content}")
                 continue
 
             if isinstance(message, ResponseOutputMessage):
