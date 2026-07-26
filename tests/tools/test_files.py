@@ -27,16 +27,21 @@ def test_list_folders_returns_sorted_folder_names_and_reports_failures(tmp_path)
     assert list_folders(str(tmp_path / "missing")).startswith("Error listing folders:")
 
 
-def test_read_text_file_returns_content_and_reports_empty_or_failed_reads(tmp_path):
-    """Reading reports content, empty files, and operating-system failures."""
+def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads(tmp_path):
+    """Reading reports content, empty files, binary files, and failures."""
     populated = tmp_path / "populated.txt"
     populated.write_text("hello", encoding="utf-8")
     empty = tmp_path / "empty.txt"
     empty.touch()
+    binary = tmp_path / "binary.dat"
+    binary.write_bytes(b"valid UTF-8\0binary payload")
 
     assert read_text_file.__name__ == "read_text_file"
     assert read_text_file(str(populated)) == "hello"
     assert read_text_file(str(empty)) == f"File '{empty}' is empty."
+    assert read_text_file(str(binary)) == (
+        f"Error reading file: File '{binary}' appears to be binary."
+    )
     assert read_text_file(str(tmp_path / "missing.txt")).startswith("Error reading file:")
 
 

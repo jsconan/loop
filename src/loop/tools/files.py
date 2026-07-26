@@ -38,11 +38,12 @@ def read_text_file(
 ) -> str:
     """Read the contents of a text file from the local disk."""
     try:
-        with open(path, "r", encoding="utf-8") as file:
-            content = file.read()
-            if not content:
-                return f"File '{path}' is empty."
-            return content
+        content = Path(path).read_bytes()
+        if not content:
+            return f"File '{path}' is empty."
+        if b"\0" in content:
+            return f"Error reading file: File '{path}' appears to be binary."
+        return content.decode("utf-8")
     except Exception as exc:  # pylint: disable=broad-except
         return f"Error reading file: {exc}"
 
