@@ -1,8 +1,6 @@
-"""Tests for the built-in public tools module."""
+"""Tests for the built-in file access tools."""
 
-import re
-
-from loop import get_current_datetime, list_files, list_folders, read_text_file, write_text_file
+from loop import list_files, list_folders, read_text_file, write_text_file
 
 
 def test_list_files_returns_sorted_file_names_and_reports_failures(tmp_path):
@@ -59,11 +57,3 @@ def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _prompt: "y")
     result = write_text_file(str(tmp_path / "missing" / "file.txt"), "content")
     assert result.startswith("Error writing to file:")
-
-
-def test_current_datetime_has_the_documented_shape():
-    """The date tool returns a complete human-readable local timestamp."""
-    assert re.fullmatch(
-        r"[A-Z][a-z]+, [A-Z][a-z]+ \d{2}, \d{4} - \d{2}:\d{2}:\d{2}",
-        get_current_datetime(),
-    )

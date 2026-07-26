@@ -1,6 +1,5 @@
-"""Tools that can be called from the loop."""
+"""Tools for accessing files and folders on the local disk."""
 
-from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -22,7 +21,9 @@ def list_files(
 
 @tool_registry.tool
 def list_folders(
-    path: Annotated[str, Field(description="Path to the folder whose subfolders should be listed.")],
+    path: Annotated[
+        str, Field(description="Path to the folder whose subfolders should be listed.")
+    ],
 ) -> list[str] | str:
     """List the folders directly contained in a folder on the local disk."""
     try:
@@ -61,9 +62,3 @@ def write_text_file(
         return f"Successfully wrote to file '{path}'."
     except Exception as exc:  # pylint: disable=broad-except
         return f"Error writing to file: {exc}"
-
-
-@tool_registry.tool
-def get_current_datetime() -> str:
-    """Return the current local date and time."""
-    return datetime.now().strftime("%A, %B %d, %Y - %H:%M:%S")

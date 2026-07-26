@@ -27,7 +27,7 @@ Examples:
 ```text
 src/loop/client.py          -> tests/test_client.py
 src/loop/loop.py            -> tests/test_loop.py
-src/loop/tools/tools.py     -> tests/tools/test_tools.py
+src/loop/tools/files.py     -> tests/tools/test_files.py
 src/loop/types/tooling.py   -> tests/types/test_tooling.py
 src/loop/utils/tooling.py   -> tests/utils/test_tooling.py
 ```
