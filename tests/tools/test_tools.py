@@ -2,7 +2,31 @@
 
 import re
 
-from loop import get_current_datetime, read_text_file, write_text_file
+from loop import get_current_datetime, list_files, list_folders, read_text_file, write_text_file
+
+
+def test_list_files_returns_sorted_file_names_and_reports_failures(tmp_path):
+    """Listing returns direct files in name order and reports invalid folders."""
+    (tmp_path / "zebra.txt").touch()
+    (tmp_path / "alpha.txt").touch()
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "ignored.txt").touch()
+
+    assert list_files.__name__ == "list_files"
+    assert list_files(str(tmp_path)) == ["alpha.txt", "zebra.txt"]
+    assert list_files(str(tmp_path / "missing")).startswith("Error listing files:")
+
+
+def test_list_folders_returns_sorted_folder_names_and_reports_failures(tmp_path):
+    """Listing returns direct folders in name order and reports invalid folders."""
+    (tmp_path / "zebra").mkdir()
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / "file.txt").touch()
+    (tmp_path / "alpha" / "ignored").mkdir()
+
+    assert list_folders.__name__ == "list_folders"
+    assert list_folders(str(tmp_path)) == ["alpha", "zebra"]
+    assert list_folders(str(tmp_path / "missing")).startswith("Error listing folders:")
 
 
 def test_read_text_file_returns_content_and_reports_empty_or_failed_reads(tmp_path):

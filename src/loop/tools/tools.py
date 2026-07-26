@@ -1,11 +1,34 @@
 """Tools that can be called from the loop."""
 
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field
 
 from ..tooling import tool_registry
+
+
+@tool_registry.tool
+def list_files(
+    path: Annotated[str, Field(description="Path to the folder whose files should be listed.")],
+) -> list[str] | str:
+    """List the files directly contained in a folder on the local disk."""
+    try:
+        return sorted(entry.name for entry in Path(path).iterdir() if entry.is_file())
+    except Exception as exc:  # pylint: disable=broad-except
+        return f"Error listing files: {exc}"
+
+
+@tool_registry.tool
+def list_folders(
+    path: Annotated[str, Field(description="Path to the folder whose subfolders should be listed.")],
+) -> list[str] | str:
+    """List the folders directly contained in a folder on the local disk."""
+    try:
+        return sorted(entry.name for entry in Path(path).iterdir() if entry.is_dir())
+    except Exception as exc:  # pylint: disable=broad-except
+        return f"Error listing folders: {exc}"
 
 
 @tool_registry.tool
