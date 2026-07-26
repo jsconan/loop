@@ -14,12 +14,19 @@ from openai.types.responses import (
 )
 
 from .client import Client
-from .tools import ToolCall
+from .tooling import ToolRegistry
 
 
 @dataclass
 class Response:
-    """Collected answer and reasoning text from an LLM response."""
+    """Collected answer and reasoning text from an LLM response.
+
+    Attributes:
+        answer: The final answer text.
+        reasoning: The model's reasoning text.
+        tool_calls: Function tool calls requested by the model.
+        output_items: Raw output items returned by the model.
+    """
 
     answer: str
     reasoning: str
@@ -28,14 +35,30 @@ class Response:
 
 
 class BaseLoop:
-    """Run an interactive conversation using non-streaming responses."""
+    """Run an interactive conversation using non-streaming responses.
+
+    Args:
+        client: Client used to request model responses. When omitted, a client is created.
+        debug: Whether to print raw response events.
+        tool_registry: Registry used by the automatically created client.
+
+    Raises:
+        ValueError: If both ``client`` and ``tool_registry`` are provided.
+    """
 
     _client: Client
     _messages: list[dict]
     _debug: bool
 
-    def __init__(self, client: Client = None, debug: bool = False) -> None:
-        self._client = client or Client()
+    def __init__(
+        self,
+        client: Client | None = None,
+        debug: bool = False,
+        tool_registry: ToolRegistry | None = None,
+    ) -> None:
+        if client is not None and tool_registry is not None:
+            raise ValueError("Pass either client or tool_registry, not both.")
+        self._client = client or Client(tool_registry=tool_registry)
         self._messages = []
         self._debug = debug
 
@@ -47,11 +70,12 @@ class BaseLoop:
                 break
             self._messages.append({"role": "user", "content": user_input})
 
-            response = self.output(self.query())
-            self.record_output(response)
-            while self.handle_tool_calls(response):
+            while True:
                 response = self.output(self.query())
                 self.record_output(response)
+
+                if not self.handle_tool_calls(response):
+                    break
 
         self.end()
 
@@ -68,24 +92,33 @@ class BaseLoop:
 
         Args:
             response: The LLM response containing tool call events.
+
+        Returns:
+            ``True`` if at least one tool call was handled; otherwise ``False``.
         """
         if not response.tool_calls:
             return False
 
         for tool_call in response.tool_calls:
             print(f"\n[TOOL CALL]: {tool_call.name}({tool_call.arguments})")
-            tool = ToolCall(name=tool_call.name, arguments=tool_call.arguments)
             self._messages.append(
                 {
                     "type": "function_call_output",
                     "call_id": tool_call.call_id,
-                    "output": tool.call(),
+                    "output": self._client.tool_registry.call(
+                        tool_call.name,
+                        tool_call.arguments,
+                    ),
                 }
             )
         return True
 
     def query(self) -> None:
-        """Request a response for the current conversation history."""
+        """Request a response for the current conversation history.
+
+        Returns:
+            The response returned by the configured backend.
+        """
         return self._client.get_response(input=self._messages)
 
     def input(self) -> str | False:
@@ -155,7 +188,11 @@ class StreamingLoop(BaseLoop):
     """Run an interactive conversation while streaming response events."""
 
     def query(self) -> None:
-        """Request a streaming response for the current conversation history."""
+        """Request a streaming response for the current conversation history.
+
+        Returns:
+            An iterable streaming response returned by the configured backend.
+        """
         return self._client.get_response(input=self._messages, stream=True)
 
     def output(self, response) -> Response:

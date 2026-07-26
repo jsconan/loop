@@ -7,20 +7,15 @@ __all__ = [
     "read_text_file",
     "Response",
     "StreamingLoop",
-    "TOOL_FUNCTIONS",
-    "ToolCall",
-    "TOOLS",
+    "tool_registry",
+    "Tool",
+    "ToolRegistrationError",
+    "ToolRegistry",
     "write_text_file",
 ]
 
 
 from .client import Client
 from .loop import BaseLoop, Response, StreamingLoop
-from .tools import (
-    TOOL_FUNCTIONS,
-    TOOLS,
-    ToolCall,
-    get_current_datetime,
-    read_text_file,
-    write_text_file,
-)
+from .tooling import Tool, ToolRegistrationError, ToolRegistry
+from .tools import get_current_datetime, read_text_file, tool_registry, write_text_file
