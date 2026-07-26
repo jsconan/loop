@@ -1,148 +1,20 @@
 """Typed registration and dispatch for functions exposed to an LLM."""
 
 import inspect
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, get_type_hints
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, ValidationError, create_model
+from pydantic import BaseModel, ValidationError
 
-
-class ToolRegistrationError(ValueError):
-    """Raised when a Python function cannot be registered as a tool."""
-
-
-def _description(function: Callable[..., Any]) -> str:
-    """Return the summary paragraph from a function's docstring.
-
-    Args:
-        function: Function whose docstring supplies the description.
-
-    Returns:
-        The docstring's first paragraph as a single line.
-
-    Raises:
-        ToolRegistrationError: If the function has no docstring.
-    """
-    docstring = inspect.getdoc(function)
-    if not docstring:
-        raise ToolRegistrationError(f"Tool '{function.__name__}' must have a docstring.")
-    return docstring.split("\n\n", maxsplit=1)[0].replace("\n", " ")
-
-
-def _strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Adapt Pydantic JSON Schema to OpenAI strict function-tool rules.
-
-    Args:
-        schema: Schema to modify recursively in place.
-
-    Returns:
-        The adapted schema.
-    """
-    definitions = schema.get("$defs", {})
-    for definition in definitions.values():
-        _strict_schema(definition)
-
-    if schema.get("type") == "object":
-        schema.setdefault("additionalProperties", False)
-
-    properties = schema.get("properties")
-    if isinstance(properties, dict):
-        schema["required"] = list(properties)
-        for property_schema in properties.values():
-            _strict_schema(property_schema)
-
-    items = schema.get("items")
-    if isinstance(items, dict):
-        _strict_schema(items)
-
-    for keyword in ("anyOf", "oneOf", "allOf"):
-        for alternative in schema.get(keyword, []):
-            if isinstance(alternative, dict):
-                _strict_schema(alternative)
-
-    if schema.get("default", object()) is None:
-        schema.pop("default")
-    return schema
-
-
-def _arguments_model(function: Callable[..., Any], tool_name: str) -> type[BaseModel]:
-    """Build a validating Pydantic model from a function signature.
-
-    Args:
-        function: Function whose parameters define the model fields.
-        tool_name: Public tool name used in the model and error messages.
-
-    Returns:
-        A Pydantic model that validates the function's arguments.
-
-    Raises:
-        ToolRegistrationError: If a parameter kind is unsupported or lacks a type annotation.
-    """
-    signature = inspect.signature(function)
-    hints = get_type_hints(function, include_extras=True)
-    fields: dict[str, tuple[Any, Any]] = {}
-
-    for parameter in signature.parameters.values():
-        if parameter.kind in {
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.VAR_KEYWORD,
-        }:
-            raise ToolRegistrationError(
-                f"Tool '{tool_name}' has unsupported parameter '{parameter.name}'."
-            )
-        if parameter.name not in hints:
-            raise ToolRegistrationError(
-                f"Tool '{tool_name}' parameter '{parameter.name}' needs a type annotation."
-            )
-
-        default = ... if parameter.default is inspect.Parameter.empty else parameter.default
-        fields[parameter.name] = (hints[parameter.name], default)
-
-    model_name = "".join(part.title() for part in tool_name.split("_")) + "Arguments"
-    return create_model(
-        model_name,
-        __config__=ConfigDict(extra="forbid"),
-        **fields,
-    )
-
-
-def _serialize(result: Any) -> str:
-    """Convert a tool result to the string required by ``function_call_output``.
-
-    Args:
-        result: Tool result to serialize.
-
-    Returns:
-        The original string, serialized Pydantic model, or JSON-encoded value.
-
-    Raises:
-        TypeError: If ``result`` contains a value that JSON cannot serialize.
-    """
-    if isinstance(result, str):
-        return result
-    if isinstance(result, BaseModel):
-        return result.model_dump_json()
-    return json.dumps(result)
-
-
-def _error(kind: str, message: str, **details: Any) -> str:
-    """Return a stable, model-readable error result.
-
-    Args:
-        kind: Machine-readable error category.
-        message: Human-readable error description.
-        **details: Additional fields to include in the error object.
-
-    Returns:
-        A JSON-encoded error object.
-
-    Raises:
-        TypeError: If a detail value cannot be JSON serialized.
-    """
-    return json.dumps({"error": kind, "message": message, **details})
+from .types.tooling import ToolRegistrationError
+from .utils.tooling import (
+    get_tool_arguments_model,
+    get_tool_description,
+    get_tool_schema,
+    serialize_tool_error,
+    serialize_tool_result,
+)
 
 
 @dataclass(frozen=True)
@@ -171,7 +43,7 @@ class Tool:
             "type": "function",
             "name": self.name,
             "description": self.description,
-            "parameters": _strict_schema(self.arguments_model.model_json_schema()),
+            "parameters": get_tool_schema(self.arguments_model.model_json_schema()),
             "strict": True,
         }
 
@@ -189,16 +61,16 @@ class Tool:
             return validation_error
 
         if inspect.iscoroutinefunction(self.function):
-            return _error(
+            return serialize_tool_error(
                 "async_tool_in_sync_loop",
                 f"Tool '{self.name}' must be called through call_async().",
             )
 
         try:
             result = self.function(**validated)
-            return _serialize(result)
+            return serialize_tool_result(result)
         except Exception as exc:  # pylint: disable=broad-except
-            return _error("execution_failed", f"Tool '{self.name}' failed: {exc}")
+            return serialize_tool_error("execution_failed", f"Tool '{self.name}' failed: {exc}")
 
     async def call_async(self, arguments: str) -> str:
         """Validate and invoke either an asynchronous or synchronous function.
@@ -217,9 +89,9 @@ class Tool:
             result = self.function(**validated)
             if inspect.isawaitable(result):
                 result = await result
-            return _serialize(result)
+            return serialize_tool_result(result)
         except Exception as exc:  # pylint: disable=broad-except
-            return _error("execution_failed", f"Tool '{self.name}' failed: {exc}")
+            return serialize_tool_error("execution_failed", f"Tool '{self.name}' failed: {exc}")
 
     def _validate_arguments(
         self,
@@ -236,7 +108,7 @@ class Tool:
         try:
             validated = self.arguments_model.model_validate_json(arguments or "{}")
         except ValidationError as exc:
-            return None, _error(
+            return None, serialize_tool_error(
                 "invalid_arguments",
                 f"Invalid arguments for tool '{self.name}'.",
                 details=exc.errors(include_url=False),
@@ -280,9 +152,9 @@ class ToolRegistry:
                 raise ToolRegistrationError(f"Tool '{tool_name}' is already registered.")
             self._tools[tool_name] = Tool(
                 name=tool_name,
-                description=description or _description(target),
+                description=description or get_tool_description(target),
                 function=target,
-                arguments_model=_arguments_model(target, tool_name),
+                arguments_model=get_tool_arguments_model(target, tool_name),
             )
             return target
 
@@ -308,7 +180,7 @@ class ToolRegistry:
         """
         tool = self._tools.get(name)
         if tool is None:
-            return _error("unknown_tool", f"Tool '{name}' is not available.")
+            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
         return tool.call(arguments)
 
     async def call_async(self, name: str, arguments: str) -> str:
@@ -323,5 +195,8 @@ class ToolRegistry:
         """
         tool = self._tools.get(name)
         if tool is None:
-            return _error("unknown_tool", f"Tool '{name}' is not available.")
+            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
         return await tool.call_async(arguments)
+
+
+tool_registry = ToolRegistry()

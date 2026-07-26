@@ -17,5 +17,6 @@ __all__ = [
 
 from .client import Client
 from .loop import BaseLoop, Response, StreamingLoop
-from .tooling import Tool, ToolRegistrationError, ToolRegistry
-from .tools import get_current_datetime, read_text_file, tool_registry, write_text_file
+from .tooling import Tool, ToolRegistry, tool_registry
+from .tools import get_current_datetime, read_text_file, write_text_file
+from .types import ToolRegistrationError

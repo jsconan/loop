@@ -5,9 +5,7 @@ from typing import Annotated
 
 from pydantic import Field
 
-from .tooling import ToolRegistry
-
-tool_registry = ToolRegistry()
+from ..tooling import tool_registry
 
 
 @tool_registry.tool

@@ -7,7 +7,7 @@ from openai.types.responses import ResponseInputParam
 
 from .config import BASE_URL, MODEL
 from .tooling import ToolRegistry
-from .tools import tool_registry as default_tool_registry
+from .tooling import tool_registry as default_tool_registry
 
 _DEFAULT_API_KEY = "local-api-key"
 
