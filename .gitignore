@@ -24,3 +24,7 @@ config.local.toml
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Agentic / Tooling
+.codex/
+graphify-out/
