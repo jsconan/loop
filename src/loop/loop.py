@@ -12,8 +12,8 @@ from openai.types.responses import (
 )
 
 from .client import Client
-from .interaction import ConsoleInteraction, Interaction
-from .tooling import ToolRegistry
+from .interaction import Interaction
+from .tooling import ToolRegistry, tool_registry as default_tool_registry
 
 
 @dataclass
@@ -62,30 +62,13 @@ class BaseLoop:
             raise ValueError("Pass either client or tool_registry, not both.")
 
         if tool_registry is None:
-            client_registry = client and getattr(client, "tool_registry", None)
-            if isinstance(client_registry, ToolRegistry):
-                tool_registry = client_registry
+            tool_registry = getattr(client, "tool_registry", default_tool_registry)
 
-        if (
-            interaction is not None
-            and tool_registry is not None
-            and interaction is not tool_registry.interaction
-        ):
+        if interaction is not None and interaction is not tool_registry.interaction:
             raise ValueError("The loop and tool registry must use the same interaction service.")
 
-        if interaction is None:
-            if tool_registry is not None:
-                interaction = tool_registry.interaction
-            else:
-                interaction = ConsoleInteraction()
-        self._interaction = interaction
-
-        if client is not None:
-            self._client = client
-        else:
-            self._client = Client(
-                tool_registry=tool_registry or ToolRegistry(interaction=self._interaction)
-            )
+        self._interaction = interaction or tool_registry.interaction
+        self._client = client or Client(tool_registry=tool_registry)
         self._messages = []
         self._debug = debug
 

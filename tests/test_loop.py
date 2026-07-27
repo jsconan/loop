@@ -15,7 +15,7 @@ from openai.types.responses import (
 
 from loop.loop import BaseLoop, Response, StreamingLoop
 from loop.interaction import Interaction
-from loop.tooling import ToolRegistry
+from loop.tooling import ToolRegistry, tool_registry as default_tool_registry
 
 
 def function_call() -> ResponseFunctionToolCall:
@@ -42,6 +42,18 @@ def test_default_client_receives_custom_tool_registry(monkeypatch):
 
     assert loop.query() == "response"
     client_factory.assert_called_once_with(tool_registry=registry)
+
+
+def test_default_loop_uses_the_default_tool_registry(monkeypatch):
+    """A default loop passes the populated shared registry to its client."""
+    created_client = Mock(tool_registry=default_tool_registry)
+    client_factory = Mock(return_value=created_client)
+    monkeypatch.setattr("loop.loop.Client", client_factory)
+
+    BaseLoop()
+
+    client_factory.assert_called_once_with(tool_registry=default_tool_registry)
+    assert default_tool_registry.schemas()
 
 
 def test_client_and_tool_registry_cannot_both_be_supplied():
@@ -165,7 +177,8 @@ def test_input_and_end_use_the_injected_interaction():
     """Input validation and termination output avoid process-global terminal functions."""
     interaction = Mock(spec=Interaction)
     interaction.input.side_effect = ["", "q"]
-    loop = BaseLoop(client=SimpleNamespace(), interaction=interaction)
+    registry = ToolRegistry(interaction=interaction)
+    loop = BaseLoop(client=SimpleNamespace(tool_registry=registry), interaction=interaction)
 
     assert loop.input() is False
     loop.end()
