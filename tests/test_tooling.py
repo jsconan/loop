@@ -8,6 +8,31 @@ import pytest
 from loop.tooling import ToolRegistrationError, ToolRegistry
 
 
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ("y", True),
+        (" Y ", True),
+        ("", False),
+        ("yes", False),
+        ("n", False),
+    ],
+)
+def test_tool_confirmation_requires_a_single_affirmative_y(monkeypatch, answer, expected):
+    """Confirmation accepts only a stripped, case-insensitive ``y`` response."""
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or answer)
+    registry = ToolRegistry()
+
+    @registry.tool
+    def guarded(self) -> bool:
+        """Run an action after confirmation."""
+        return self.confirm("Continue?")
+
+    assert json.loads(registry.call("guarded", "{}")) is expected
+    assert prompts == ["Continue? [y/N]: "]
+
+
 def test_decorator_registers_and_dispatches_function():
     """A decorated function is exposed by name and available for dispatch."""
     registry = ToolRegistry()

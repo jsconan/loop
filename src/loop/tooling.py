@@ -34,6 +34,17 @@ class Tool:
     function: Callable[..., Any]
     arguments_model: type[BaseModel]
 
+    def confirm(self, message: str) -> bool:
+        """Ask the user to confirm an action.
+
+        Args:
+            message: Confirmation prompt shown to the user.
+
+        Returns:
+            Whether the user answered ``y`` (case-insensitively).
+        """
+        return input(f"{message} [y/N]: ").strip().lower() == "y"
+
     def schema(self) -> dict[str, Any]:
         """Return this tool in the flat Responses API function-tool format.
 

@@ -50,11 +50,12 @@ def read_text_file(
 
 @tool_registry.tool
 def write_text_file(
+    self,
     path: Annotated[str, Field(description="Path to the text file to write.")],
     content: Annotated[str, Field(description="Content to write to the file.")],
 ) -> str:
     """Write content to a text file on the local disk."""
-    if input(f"Agent wants to write to file '{path}'. Proceed? [y/N]: ").strip().lower() != "y":
+    if not self.confirm(f"Agent wants to write to file '{path}'. Proceed?"):
         return "Write operation cancelled."
 
     try:

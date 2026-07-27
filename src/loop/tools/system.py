@@ -36,10 +36,11 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
 
 @tool_registry.tool
 def run_command(
+    self,
     command: Annotated[str, Field(description="The system command to execute.")],
 ) -> str:
     """Run a system command and return the output."""
-    if input(f"Agent wants to run command '{command}'. Proceed? [y/N]: ").strip().lower() != "y":
+    if not self.confirm(f"Agent wants to run command '{command}'. Proceed?"):
         return "Command execution cancelled by user."
 
     try:

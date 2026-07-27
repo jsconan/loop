@@ -1,6 +1,16 @@
 """Tests for the built-in file access tools."""
 
-from loop import list_files, list_folders, read_text_file, write_text_file
+import json
+from unittest.mock import MagicMock, call
+
+from loop import Tool, list_files, list_folders, read_text_file, tool_registry
+
+
+def write_text_file(path, content):
+    """Dispatch the context-aware file-writing tool."""
+    return tool_registry.call(
+        "write_text_file", json.dumps({"path": str(path), "content": content})
+    )
 
 
 def test_list_files_returns_sorted_file_names_and_reports_failures(tmp_path):
@@ -48,17 +58,22 @@ def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads
 def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, monkeypatch):
     """Writing only happens after an affirmative confirmation."""
     target = tmp_path / "written.txt"
-    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    confirm = MagicMock(side_effect=[False, True])
+    monkeypatch.setattr(Tool, "confirm", confirm)
+
     assert write_text_file(str(target), "blocked") == "Write operation cancelled."
     assert not target.exists()
 
-    monkeypatch.setattr("builtins.input", lambda _prompt: " Y ")
     assert write_text_file(str(target), "saved") == f"Successfully wrote to file '{target}'."
     assert target.read_text(encoding="utf-8") == "saved"
+    assert confirm.call_args_list == [
+        call(f"Agent wants to write to file '{target}'. Proceed?"),
+        call(f"Agent wants to write to file '{target}'. Proceed?"),
+    ]
 
 
 def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):
     """An invalid destination becomes a readable tool result."""
-    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+    monkeypatch.setattr(Tool, "confirm", MagicMock(return_value=True))
     result = write_text_file(str(tmp_path / "missing" / "file.txt"), "content")
     assert result.startswith("Error writing to file:")

@@ -1,13 +1,20 @@
 """Tests for the built-in system tools."""
 
+import json
 import subprocess
 from unittest.mock import MagicMock, call
 
 import pytest
 
-from loop.tools.system import MAX_OUTPUT_CHARS, run_command
+from loop import Tool, tool_registry
+from loop.tools.system import MAX_OUTPUT_CHARS
 
 # pylint: disable=unused-argument, redefined-outer-name
+
+
+def run_command(command):
+    """Dispatch the context-aware command tool."""
+    return tool_registry.call("run_command", json.dumps({"command": command}))
 
 
 class ImmediateThread:
@@ -35,7 +42,7 @@ class ImmediateThread:
 def confirmed(monkeypatch):
     """Confirm command execution and make stream readers synchronous."""
     ImmediateThread.instances = []
-    monkeypatch.setattr("builtins.input", lambda _prompt: " Y ")
+    monkeypatch.setattr(Tool, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.system.threading.Thread", ImmediateThread)
 
 
@@ -51,12 +58,14 @@ def make_process(*, stdout=("",), stderr=("",), returncode=0):
 
 
 def test_run_command_requires_an_affirmative_confirmation(monkeypatch):
-    """Any response other than a case-insensitive, stripped ``y`` cancels."""
+    """A rejected confirmation cancels command execution."""
     popen = MagicMock()
-    monkeypatch.setattr("builtins.input", lambda _prompt: "N")
+    confirm = MagicMock(return_value=False)
+    monkeypatch.setattr(Tool, "confirm", confirm)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", popen)
 
     assert run_command("echo hello") == "Command execution cancelled by user."
+    confirm.assert_called_once_with("Agent wants to run command 'echo hello'. Proceed?")
     popen.assert_not_called()
 
 
