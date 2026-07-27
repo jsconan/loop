@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+
 import pytest
 
 from loop.tooling import ToolRegistrationError, ToolRegistry
@@ -40,6 +41,21 @@ def test_duplicate_names_are_rejected():
         def second(value: str) -> str:
             """Return another value."""
             return value
+
+
+def test_context_aware_function_is_bound_to_its_tool():
+    """A function's self is its Tool and is omitted from the public schema."""
+    registry = ToolRegistry()
+
+    @registry.tool
+    def decorated(self, value: str) -> str:
+        """Decorate a value."""
+        return f"{self.name}:{value}"
+
+    schema = registry.schemas()[0]
+
+    assert list(schema["parameters"]["properties"]) == ["value"]
+    assert registry.call("decorated", '{"value":"done"}') == "decorated:done"
 
 
 def test_invalid_json_and_arguments_do_not_call_function():
@@ -89,7 +105,8 @@ def test_dispatch_returns_strings_and_catches_execution_failures():
 
     assert registry.call("text", "") == "plain"
     assert json.loads(registry.call("broken", "{}")) == {
-        "error": "execution_failed", "message": "Tool 'broken' failed: boom"
+        "error": "execution_failed",
+        "message": "Tool 'broken' failed: boom",
     }
 
 
@@ -122,8 +139,10 @@ def test_async_dispatch_validates_unknown_sync_and_failing_tools():
     @registry.tool
     def returns_awaitable(number: int):
         """Return an awaitable from a synchronous callable."""
+
         async def calculate():
             return number * 3
+
         return calculate()
 
     @registry.tool

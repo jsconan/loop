@@ -45,7 +45,11 @@ def get_tool_arguments_model(function: Callable[..., Any], tool_name: str) -> ty
     hints = get_type_hints(function, include_extras=True)
     fields = {}
 
-    for parameter in signature.parameters.values():
+    parameters = list(signature.parameters.values())
+    if parameters and parameters[0].name == "self":
+        parameters = parameters[1:]
+
+    for parameter in parameters:
         if parameter.kind in {
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.VAR_POSITIONAL,

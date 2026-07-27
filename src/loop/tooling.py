@@ -3,6 +3,7 @@
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -67,7 +68,7 @@ class Tool:
             )
 
         try:
-            result = self.function(**validated)
+            result = self._invoke(validated)
             return serialize_tool_result(result)
         except Exception as exc:  # pylint: disable=broad-except
             return serialize_tool_error("execution_failed", f"Tool '{self.name}' failed: {exc}")
@@ -86,12 +87,19 @@ class Tool:
             return validation_error
 
         try:
-            result = self.function(**validated)
+            result = self._invoke(validated)
             if inspect.isawaitable(result):
                 result = await result
             return serialize_tool_result(result)
         except Exception as exc:  # pylint: disable=broad-except
             return serialize_tool_error("execution_failed", f"Tool '{self.name}' failed: {exc}")
+
+    def _invoke(self, arguments: dict[str, Any]) -> Any:
+        """Invoke the function, binding context-aware functions to this tool."""
+        parameters = inspect.signature(self.function).parameters
+        if parameters and next(iter(parameters.values())).name == "self":
+            return MethodType(self.function, self)(**arguments)
+        return self.function(**arguments)
 
     def _validate_arguments(
         self,

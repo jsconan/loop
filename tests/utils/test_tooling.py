@@ -15,6 +15,8 @@ from loop.utils.tooling import (
     serialize_tool_result,
 )
 
+# pylint: disable=unused-argument, redefined-outer-name
+
 
 def test_get_tool_description_returns_flattened_summary():
     """Only the normalized first docstring paragraph becomes the description."""
@@ -56,6 +58,20 @@ def test_get_tool_arguments_model_builds_strict_fields_and_defaults():
         model.model_validate({"value": 0})
     with pytest.raises(ValueError):
         model.model_validate({"value": 1, "unexpected": True})
+
+
+def test_get_tool_arguments_model_omits_method_self_parameter():
+    """The bound tool instance is not exposed as a model-supplied argument."""
+
+    def contextual(self, value: int) -> None:
+        pass
+
+    model = get_tool_arguments_model(contextual, "contextual")
+
+    assert model.model_json_schema()["properties"] == {
+        "value": {"title": "Value", "type": "integer"}
+    }
+    assert model.model_validate({"value": 2}).model_dump() == {"value": 2}
 
 
 @pytest.mark.parametrize(
