@@ -1,10 +1,11 @@
-"""Tools for accessing files and folders on the local disk."""
+"""Provide tools for accessing files and folders on the local disk."""
 
 from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field
 
+from ..interaction import ToolContext
 from ..tooling import tool_registry
 
 
@@ -50,12 +51,12 @@ def read_text_file(
 
 @tool_registry.tool
 def write_text_file(
-    self,
+    context: ToolContext,
     path: Annotated[str, Field(description="Path to the text file to write.")],
     content: Annotated[str, Field(description="Content to write to the file.")],
 ) -> str:
     """Write content to a text file on the local disk."""
-    if not self.confirm(f"Agent wants to write to file '{path}'. Proceed?"):
+    if not context.confirm(f"Agent wants to write to file '{path}'. Proceed?"):
         return "Write operation cancelled."
 
     try:

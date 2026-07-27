@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from loop import Tool, tool_registry
+from loop import ConsoleInteraction, tool_registry
 from loop.tools.system import MAX_OUTPUT_CHARS
 
 # pylint: disable=unused-argument, redefined-outer-name
@@ -42,7 +42,7 @@ class ImmediateThread:
 def confirmed(monkeypatch):
     """Confirm command execution and make stream readers synchronous."""
     ImmediateThread.instances = []
-    monkeypatch.setattr(Tool, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.system.threading.Thread", ImmediateThread)
 
 
@@ -61,11 +61,13 @@ def test_run_command_requires_an_affirmative_confirmation(monkeypatch):
     """A rejected confirmation cancels command execution."""
     popen = MagicMock()
     confirm = MagicMock(return_value=False)
-    monkeypatch.setattr(Tool, "confirm", confirm)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", popen)
 
     assert run_command("echo hello") == "Command execution cancelled by user."
-    confirm.assert_called_once_with("Agent wants to run command 'echo hello'. Proceed?")
+    confirm.assert_called_once_with(
+        "Agent wants to run command 'echo hello'. Proceed?", default=False
+    )
     popen.assert_not_called()
 
 

@@ -1,4 +1,4 @@
-"""Tools for interacting with the system."""
+"""Provide tools for interacting with the system."""
 
 import os
 import signal
@@ -8,6 +8,7 @@ from typing import Annotated
 
 from pydantic import Field
 
+from ..interaction import ToolContext
 from ..tooling import tool_registry
 
 COMMAND_TIMEOUT_SECONDS = 30
@@ -36,11 +37,11 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
 
 @tool_registry.tool
 def run_command(
-    self,
+    context: ToolContext,
     command: Annotated[str, Field(description="The system command to execute.")],
 ) -> str:
     """Run a system command and return the output."""
-    if not self.confirm(f"Agent wants to run command '{command}'. Proceed?"):
+    if not context.confirm(f"Agent wants to run command '{command}'. Proceed?"):
         return "Command execution cancelled by user."
 
     try:

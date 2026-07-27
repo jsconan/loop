@@ -1,13 +1,13 @@
-"""Typed registration and dispatch for functions exposed to an LLM."""
+"""Register and dispatch typed functions exposed to an LLM."""
 
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
-from types import MethodType
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from .interaction import ConsoleInteraction, Interaction, ToolContext
 from .types.tooling import ToolRegistrationError
 from .utils.tooling import (
     get_tool_arguments_model,
@@ -15,35 +15,27 @@ from .utils.tooling import (
     get_tool_schema,
     serialize_tool_error,
     serialize_tool_result,
+    takes_tool_context,
 )
 
 
 @dataclass(frozen=True)
 class Tool:
-    """A function together with its LLM declaration and argument validator.
+    """Represent a function with its LLM declaration and argument validator.
 
     Attributes:
         name: Public name exposed to the model.
         description: Description exposed in the tool declaration.
         function: Python function invoked for the tool.
         arguments_model: Pydantic model used to validate arguments.
+        interaction: Service available to the tool during invocation.
     """
 
     name: str
     description: str
     function: Callable[..., Any]
     arguments_model: type[BaseModel]
-
-    def confirm(self, message: str) -> bool:
-        """Ask the user to confirm an action.
-
-        Args:
-            message: Confirmation prompt shown to the user.
-
-        Returns:
-            Whether the user answered ``y`` (case-insensitively).
-        """
-        return input(f"{message} [y/N]: ").strip().lower() == "y"
+    interaction: Interaction
 
     def schema(self) -> dict[str, Any]:
         """Return this tool in the flat Responses API function-tool format.
@@ -106,10 +98,10 @@ class Tool:
             return serialize_tool_error("execution_failed", f"Tool '{self.name}' failed: {exc}")
 
     def _invoke(self, arguments: dict[str, Any]) -> Any:
-        """Invoke the function, binding context-aware functions to this tool."""
-        parameters = inspect.signature(self.function).parameters
-        if parameters and next(iter(parameters.values())).name == "self":
-            return MethodType(self.function, self)(**arguments)
+        """Invoke the function with an explicit context when it requests one."""
+        if takes_tool_context(self.function):
+            context = ToolContext(interaction=self.interaction, tool_name=self.name)
+            return self.function(context, **arguments)
         return self.function(**arguments)
 
     def _validate_arguments(
@@ -136,12 +128,24 @@ class Tool:
 
 
 class ToolRegistry:
-    """Collect tool declarations and route model calls to their implementations."""
+    """Collect tool declarations and route model calls to their implementations.
+
+    Args:
+        interaction: Service injected into context-aware tools. Creates a terminal-backed service
+            when omitted.
+    """
 
     _tools: dict[str, Tool]
+    _interaction: Interaction
 
-    def __init__(self) -> None:
+    def __init__(self, interaction: Interaction | None = None) -> None:
         self._tools = {}
+        self._interaction = interaction or ConsoleInteraction()
+
+    @property
+    def interaction(self) -> Interaction:
+        """Return the interaction service supplied to registered tools."""
+        return self._interaction
 
     def tool(
         self,
@@ -174,6 +178,7 @@ class ToolRegistry:
                 description=description or get_tool_description(target),
                 function=target,
                 arguments_model=get_tool_arguments_model(target, tool_name),
+                interaction=self._interaction,
             )
             return target
 

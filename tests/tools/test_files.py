@@ -3,7 +3,7 @@
 import json
 from unittest.mock import MagicMock, call
 
-from loop import Tool, list_files, list_folders, read_text_file, tool_registry
+from loop import ConsoleInteraction, list_files, list_folders, read_text_file, tool_registry
 
 
 def write_text_file(path, content):
@@ -59,7 +59,7 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
     """Writing only happens after an affirmative confirmation."""
     target = tmp_path / "written.txt"
     confirm = MagicMock(side_effect=[False, True])
-    monkeypatch.setattr(Tool, "confirm", confirm)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
     assert write_text_file(str(target), "blocked") == "Write operation cancelled."
     assert not target.exists()
@@ -67,13 +67,13 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
     assert write_text_file(str(target), "saved") == f"Successfully wrote to file '{target}'."
     assert target.read_text(encoding="utf-8") == "saved"
     assert confirm.call_args_list == [
-        call(f"Agent wants to write to file '{target}'. Proceed?"),
-        call(f"Agent wants to write to file '{target}'. Proceed?"),
+        call(f"Agent wants to write to file '{target}'. Proceed?", default=False),
+        call(f"Agent wants to write to file '{target}'. Proceed?", default=False),
     ]
 
 
 def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):
     """An invalid destination becomes a readable tool result."""
-    monkeypatch.setattr(Tool, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     result = write_text_file(str(tmp_path / "missing" / "file.txt"), "content")
     assert result.startswith("Error writing to file:")

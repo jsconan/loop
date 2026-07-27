@@ -6,6 +6,7 @@ from typing import Annotated
 import pytest
 from pydantic import BaseModel, Field
 
+from loop.interaction import ToolContext
 from loop.types.tooling import ToolRegistrationError
 from loop.utils.tooling import (
     get_tool_arguments_model,
@@ -13,6 +14,7 @@ from loop.utils.tooling import (
     get_tool_schema,
     serialize_tool_error,
     serialize_tool_result,
+    takes_tool_context,
 )
 
 # pylint: disable=unused-argument, redefined-outer-name
@@ -60,10 +62,10 @@ def test_get_tool_arguments_model_builds_strict_fields_and_defaults():
         model.model_validate({"value": 1, "unexpected": True})
 
 
-def test_get_tool_arguments_model_omits_method_self_parameter():
-    """The bound tool instance is not exposed as a model-supplied argument."""
+def test_get_tool_arguments_model_omits_typed_tool_context():
+    """The runtime tool context is not exposed as a model-supplied argument."""
 
-    def contextual(self, value: int) -> None:
+    def contextual(context: ToolContext, value: int) -> None:
         pass
 
     model = get_tool_arguments_model(contextual, "contextual")
@@ -72,6 +74,33 @@ def test_get_tool_arguments_model_omits_method_self_parameter():
         "value": {"title": "Value", "type": "integer"}
     }
     assert model.model_validate({"value": 2}).model_dump() == {"value": 2}
+
+
+def test_get_tool_arguments_model_rejects_tool_context_after_first_parameter():
+    """Tool context cannot occupy a model-controlled argument position."""
+
+    def misplaced(value: int, context: ToolContext) -> None:
+        pass
+
+    with pytest.raises(ToolRegistrationError, match="must declare ToolContext as its first"):
+        get_tool_arguments_model(misplaced, "misplaced")
+
+
+def test_takes_tool_context_identifies_only_a_typed_first_parameter():
+    """Context injection is selected by annotation instead of parameter name."""
+
+    def contextual(context: ToolContext) -> None:
+        pass
+
+    def ordinary(self: str) -> None:
+        pass
+
+    def empty() -> None:
+        pass
+
+    assert takes_tool_context(contextual)
+    assert not takes_tool_context(ordinary)
+    assert not takes_tool_context(empty)
 
 
 @pytest.mark.parametrize(

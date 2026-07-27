@@ -1,7 +1,7 @@
 """Run an interactive conversation with an LLM backend."""
 
 from dataclasses import dataclass, field
-from pprint import pprint
+from pprint import pformat
 
 from openai import BaseModel
 from openai.types.responses import (
@@ -14,12 +14,13 @@ from openai.types.responses import (
 )
 
 from .client import Client
+from .interaction import ConsoleInteraction, Interaction
 from .tooling import ToolRegistry
 
 
 @dataclass
 class Response:
-    """Collected answer and reasoning text from an LLM response.
+    """Collect answer and reasoning text from an LLM response.
 
     Attributes:
         answer: The final answer text.
@@ -41,24 +42,52 @@ class BaseLoop:
         client: Client used to request model responses. When omitted, a client is created.
         debug: Whether to print raw response events.
         tool_registry: Registry used by the automatically created client.
+        interaction: Service used for all user input and output.
 
     Raises:
-        ValueError: If both ``client`` and ``tool_registry`` are provided.
+        ValueError: If dependencies select conflicting registries or interaction services.
     """
 
     _client: Client
     _messages: list[dict]
     _debug: bool
+    _interaction: Interaction
 
     def __init__(
         self,
         client: Client | None = None,
         debug: bool = False,
         tool_registry: ToolRegistry | None = None,
+        interaction: Interaction | None = None,
     ) -> None:
         if client is not None and tool_registry is not None:
             raise ValueError("Pass either client or tool_registry, not both.")
-        self._client = client or Client(tool_registry=tool_registry)
+
+        if tool_registry is None:
+            client_registry = client and getattr(client, "tool_registry", None)
+            if isinstance(client_registry, ToolRegistry):
+                tool_registry = client_registry
+
+        if (
+            interaction is not None
+            and tool_registry is not None
+            and interaction is not tool_registry.interaction
+        ):
+            raise ValueError("The loop and tool registry must use the same interaction service.")
+
+        if interaction is None:
+            if tool_registry is not None:
+                interaction = tool_registry.interaction
+            else:
+                interaction = ConsoleInteraction()
+        self._interaction = interaction
+
+        if client is not None:
+            self._client = client
+        else:
+            self._client = Client(
+                tool_registry=tool_registry or ToolRegistry(interaction=self._interaction)
+            )
         self._messages = []
         self._debug = debug
 
@@ -100,7 +129,7 @@ class BaseLoop:
             return False
 
         for tool_call in response.tool_calls:
-            print(f"\n[TOOL CALL]: {tool_call.name}({tool_call.arguments})")
+            self._interaction.write(f"\n[TOOL CALL]: {tool_call.name}({tool_call.arguments})")
             self._messages.append(
                 {
                     "type": "function_call_output",
@@ -128,9 +157,9 @@ class BaseLoop:
             The entered message, or ``False`` when the user requests to exit.
         """
         while True:
-            user_input = input("\nYou: ").strip()
+            user_input = self._interaction.prompt("\nYou: ").strip()
             if not user_input:
-                print("Please enter a message!")
+                self._interaction.write("Please enter a message!")
                 continue
 
             if user_input.lower() in ["exit", "quit", "bye", "q"]:
@@ -152,26 +181,26 @@ class BaseLoop:
 
         for message in response.output:
             if self._debug:
-                print(f"\n[DEBUG EVENT]: {type(message)}")
-                pprint(message)
+                self._interaction.write(f"\n[DEBUG EVENT]: {type(message)}")
+                self._interaction.write(pformat(message))
 
             if isinstance(message, ResponseReasoningItem):
                 content = message.content[0].text if message.content else ""
                 thinking_text += content
-                print(f"Reasoning: {content}")
+                self._interaction.write(f"Reasoning: {content}")
                 continue
 
             if isinstance(message, ResponseOutputMessage):
                 content = message.content[0].text if message.content else ""
                 answer_text += content
-                print(f"Message: {content}")
+                self._interaction.write(f"Message: {content}")
                 continue
 
             if isinstance(message, ResponseFunctionToolCall):
                 tool_calls.append(message)
                 continue
 
-        print("")
+        self._interaction.write()
 
         return Response(
             answer=answer_text.strip(),
@@ -182,7 +211,7 @@ class BaseLoop:
 
     def end(self) -> None:
         """Display the conversation termination message."""
-        print("\nConversation ended.")
+        self._interaction.write("\nConversation ended.")
 
 
 class StreamingLoop(BaseLoop):
@@ -212,22 +241,22 @@ class StreamingLoop(BaseLoop):
         tool_calls = []
         output_items = []
 
-        print("\nThinking...")
+        self._interaction.write("\nThinking...")
 
         for event in response:
             if self._debug:
-                print(f"\n[DEBUG EVENT]: {type(event)}")
-                pprint(event)
+                self._interaction.write(f"\n[DEBUG EVENT]: {type(event)}")
+                self._interaction.write(pformat(event))
 
             if isinstance(event, ResponseReasoningTextDeltaEvent):
                 if not is_thinking:
-                    print("\n[THOUGHT PROCESS]:")
+                    self._interaction.write("\n[THOUGHT PROCESS]:")
                     is_thinking = True
                 thinking_text += event.delta
 
             if isinstance(event, ResponseTextDeltaEvent):
                 if not answer_started:
-                    print("\n[ANSWER]:")
+                    self._interaction.write("\n[ANSWER]:")
                     answer_started = True
                 answer_text += event.delta
 
@@ -238,10 +267,10 @@ class StreamingLoop(BaseLoop):
                     continue
 
             if isinstance(event, (ResponseTextDeltaEvent, ResponseReasoningTextDeltaEvent)):
-                print(event.delta, end="", flush=True)
+                self._interaction.write(event.delta, end="", flush=True)
                 continue
 
-        print("")
+        self._interaction.write()
 
         return Response(
             answer=answer_text.strip(),

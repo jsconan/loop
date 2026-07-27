@@ -14,6 +14,7 @@ from openai.types.responses import (
 )
 
 from loop.loop import BaseLoop, Response, StreamingLoop
+from loop.interaction import Interaction
 from loop.tooling import ToolRegistry
 
 
@@ -47,6 +48,27 @@ def test_client_and_tool_registry_cannot_both_be_supplied():
     """Ambiguous dependency injection is rejected explicitly."""
     with pytest.raises(ValueError, match="either client or tool_registry"):
         StreamingLoop(client=SimpleNamespace(), tool_registry=ToolRegistry())
+
+
+def test_loop_and_registry_must_share_an_explicit_interaction():
+    """A session cannot silently route loop and tool interaction to different services."""
+    with pytest.raises(ValueError, match="same interaction service"):
+        BaseLoop(
+            tool_registry=ToolRegistry(interaction=Mock(spec=Interaction)),
+            interaction=Mock(spec=Interaction),
+        )
+
+
+def test_loop_adopts_the_registry_interaction():
+    """A loop and its automatically created client share registry interaction."""
+    interaction = Mock(spec=Interaction)
+    registry = ToolRegistry(interaction=interaction)
+    interaction.prompt.return_value = "hello"
+
+    loop = BaseLoop(tool_registry=registry)
+
+    assert loop.input() == "hello"
+    interaction.prompt.assert_called_once_with("\nYou: ")
 
 
 def test_run_requeries_after_a_tool_call_and_ends(capsys):
@@ -137,6 +159,20 @@ def test_input_returns_trimmed_message(monkeypatch):
     """Interactive input returns a non-command message without surrounding whitespace."""
     monkeypatch.setattr("builtins.input", lambda _prompt: " hello ")
     assert BaseLoop(client=SimpleNamespace()).input() == "hello"
+
+
+def test_input_and_end_use_the_injected_interaction():
+    """Input validation and termination output avoid process-global terminal functions."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.side_effect = [" ", " q "]
+    loop = BaseLoop(client=SimpleNamespace(), interaction=interaction)
+
+    assert loop.input() is False
+    loop.end()
+
+    assert interaction.prompt.call_count == 2
+    interaction.write.assert_any_call("Please enter a message!")
+    interaction.write.assert_any_call("\nConversation ended.")
 
 
 def test_non_streaming_output_collects_reasoning_message_call_and_ignores_unknown(capsys):

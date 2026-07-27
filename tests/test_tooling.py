@@ -2,35 +2,29 @@
 
 import asyncio
 import json
+from unittest.mock import Mock
 
 import pytest
 
+from loop.interaction import Interaction, ToolContext
 from loop.tooling import ToolRegistrationError, ToolRegistry
 
 
-@pytest.mark.parametrize(
-    ("answer", "expected"),
-    [
-        ("y", True),
-        (" Y ", True),
-        ("", False),
-        ("yes", False),
-        ("n", False),
-    ],
-)
-def test_tool_confirmation_requires_a_single_affirmative_y(monkeypatch, answer, expected):
-    """Confirmation accepts only a stripped, case-insensitive ``y`` response."""
-    prompts = []
-    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or answer)
-    registry = ToolRegistry()
+def test_tool_confirmation_uses_the_registry_interaction():
+    """Context-aware tools delegate confirmation to the injected interaction service."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    registry = ToolRegistry(interaction=interaction)
 
     @registry.tool
-    def guarded(self) -> bool:
+    def guarded(context: ToolContext) -> bool:
         """Run an action after confirmation."""
-        return self.confirm("Continue?")
+        assert context.tool_name == "guarded"
+        return context.confirm("Continue?", default=True)
 
-    assert json.loads(registry.call("guarded", "{}")) is expected
-    assert prompts == ["Continue? [y/N]: "]
+    assert json.loads(registry.call("guarded", "{}")) is True
+    assert registry.interaction is interaction
+    interaction.confirm.assert_called_once_with("Continue?", default=True)
 
 
 def test_decorator_registers_and_dispatches_function():
@@ -68,14 +62,14 @@ def test_duplicate_names_are_rejected():
             return value
 
 
-def test_context_aware_function_is_bound_to_its_tool():
-    """A function's self is its Tool and is omitted from the public schema."""
+def test_context_aware_function_receives_an_explicit_tool_context():
+    """A typed context is injected and omitted from the public schema."""
     registry = ToolRegistry()
 
     @registry.tool
-    def decorated(self, value: str) -> str:
+    def decorated(context: ToolContext, value: str) -> str:
         """Decorate a value."""
-        return f"{self.name}:{value}"
+        return f"{context.tool_name}:{value}"
 
     schema = registry.schemas()[0]
 

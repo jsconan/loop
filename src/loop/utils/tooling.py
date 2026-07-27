@@ -1,4 +1,4 @@
-"""Utility functions for tooling."""
+"""Provide utility functions for tool registration and dispatch."""
 
 import inspect
 import json
@@ -7,6 +7,7 @@ from typing import Any, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, create_model
 
+from ..interaction import ToolContext
 from ..types import ToolRegistrationError
 
 
@@ -46,10 +47,14 @@ def get_tool_arguments_model(function: Callable[..., Any], tool_name: str) -> ty
     fields = {}
 
     parameters = list(signature.parameters.values())
-    if parameters and parameters[0].name == "self":
+    if parameters and hints.get(parameters[0].name) is ToolContext:
         parameters = parameters[1:]
 
     for parameter in parameters:
+        if hints.get(parameter.name) is ToolContext:
+            raise ToolRegistrationError(
+                f"Tool '{tool_name}' must declare ToolContext as its first parameter."
+            )
         if parameter.kind in {
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.VAR_POSITIONAL,
@@ -72,6 +77,22 @@ def get_tool_arguments_model(function: Callable[..., Any], tool_name: str) -> ty
         __config__=ConfigDict(extra="forbid"),
         **fields,
     )
+
+
+def takes_tool_context(function: Callable[..., Any]) -> bool:
+    """Determine whether a function requests an injected tool context.
+
+    Args:
+        function: Function whose first parameter may request a tool context.
+
+    Returns:
+        Whether the first parameter is annotated as ``ToolContext``.
+    """
+    parameters = list(inspect.signature(function).parameters.values())
+    if not parameters:
+        return False
+    hints = get_type_hints(function, include_extras=True)
+    return hints.get(parameters[0].name) is ToolContext
 
 
 def get_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:

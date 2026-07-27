@@ -3,7 +3,9 @@
 __all__ = [
     "BaseLoop",
     "Client",
+    "ConsoleInteraction",
     "get_current_datetime",
+    "Interaction",
     "list_files",
     "list_folders",
     "read_text_file",
@@ -12,6 +14,7 @@ __all__ = [
     "StreamingLoop",
     "tool_registry",
     "Tool",
+    "ToolContext",
     "ToolRegistrationError",
     "ToolRegistry",
     "write_text_file",
@@ -19,6 +22,7 @@ __all__ = [
 
 
 from .client import Client
+from .interaction import ConsoleInteraction, Interaction, ToolContext
 from .loop import BaseLoop, Response, StreamingLoop
 from .tooling import Tool, ToolRegistry, tool_registry
 from .tools import (
