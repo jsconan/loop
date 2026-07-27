@@ -35,6 +35,10 @@ src/loop/utils/tooling.py   -> tests/utils/test_tooling.py
 ## Test boundaries
 
 - Test behavior through public interfaces.
+- Do not make tests depend on implementation details or assume how a collaborator works internally.
+  Test the unit's public inputs and outputs, and mock external dependencies or components outside
+  the behavior under test at their public boundary. Test those collaborators' internals only in
+  their own focused test suite.
 - Do not import private helpers.
 - Do not access, mutate, or assert directly against private members.
 - Prefer forging realistic input payloads, response objects, events, and tool calls that trigger
