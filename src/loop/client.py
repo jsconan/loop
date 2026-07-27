@@ -5,10 +5,11 @@ import os
 from openai import AsyncOpenAI, BaseModel, OpenAI
 from openai.types.responses import ResponseInputParam
 
-from .config import BASE_URL, MODEL
 from .tooling import ToolRegistry
 from .tooling import tool_registry as default_tool_registry
 
+_BASE_URL = "http://localhost:8000/v1"
+_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 _DEFAULT_API_KEY = "local-api-key"
 
 
@@ -31,16 +32,16 @@ class Client:
 
     def __init__(
         self,
-        default_model: str = MODEL,
-        base_url: str = BASE_URL,
+        default_model: str | None = None,
+        base_url: str | None = None,
         api_key: str | None = None,
         tool_registry: ToolRegistry | None = None,
     ) -> None:
         self._client = None
         self._async_client = None
-        self._default_model = default_model
-        self._base_url = base_url
-        self._api_key = api_key or os.environ.get("OPENAI_API_KEY", _DEFAULT_API_KEY)
+        self._default_model = default_model or os.getenv("DEFAULT_MODEL", _MODEL)
+        self._base_url = base_url or os.getenv("BASE_URL", _BASE_URL)
+        self._api_key = api_key or os.getenv("OPENAI_API_KEY", _DEFAULT_API_KEY)
         self._tool_registry = tool_registry or default_tool_registry
 
     @property

@@ -3,12 +3,24 @@
 import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from loop.client import Client
 from loop.tooling import ToolRegistry
 
 
-def test_configuration_and_lazy_clients_use_explicit_credentials():
+@pytest.fixture(autouse=True)
+def isolate_client_environment(monkeypatch):
+    """Prevent host configuration from influencing client tests."""
+    for variable in ("DEFAULT_MODEL", "BASE_URL", "OPENAI_API_KEY"):
+        monkeypatch.delenv(variable, raising=False)
+
+
+def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
     """Configured values are exposed and used once for each lazy SDK client."""
+    monkeypatch.setenv("DEFAULT_MODEL", "environment-model")
+    monkeypatch.setenv("BASE_URL", "https://environment.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
     registry = ToolRegistry()
     sync_sdk = Mock()
     async_sdk = Mock()
@@ -29,6 +41,25 @@ def test_configuration_and_lazy_clients_use_explicit_credentials():
 
     openai.assert_called_once_with(base_url="https://example.test/v1", api_key="secret")
     async_openai.assert_called_once_with(base_url="https://example.test/v1", api_key="secret")
+
+
+def test_configuration_comes_from_environment(monkeypatch):
+    """Omitted model and URL values come from the environment."""
+    monkeypatch.setenv("DEFAULT_MODEL", "environment-model")
+    monkeypatch.setenv("BASE_URL", "https://environment.test/v1")
+
+    client = Client()
+
+    assert client.default_model == "environment-model"
+    assert client.base_url == "https://environment.test/v1"
+
+
+def test_configuration_falls_back_to_built_in_defaults():
+    """Omitted model and URL values use the built-in local defaults."""
+    client = Client()
+
+    assert client.default_model == "nvidia/Qwen3.6-35B-A3B-NVFP4"
+    assert client.base_url == "http://localhost:8000/v1"
 
 
 def test_api_key_comes_from_environment_or_falls_back(monkeypatch):
