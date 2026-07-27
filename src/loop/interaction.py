@@ -1,30 +1,63 @@
 """Define user interaction abstractions and tool invocation context."""
 
 from dataclasses import dataclass
-from typing import Protocol
+from pprint import pformat
+from typing import Any, Protocol
 
 
 class Interaction(Protocol):
-    """Provide user input, output, and confirmation independently of a UI."""
+    """Provide semantically classified user interaction independently of a UI."""
 
-    def prompt(self, message: str) -> str:
-        """Read textual input after displaying a prompt.
-
-        Args:
-            message: Prompt to display before reading input.
+    def input(self) -> str:
+        """Read textual user input without surrounding whitespace.
 
         Returns:
-            The text entered by the user.
+            The stripped text entered by the user.
         """
 
-    def write(self, message: str = "", *, end: str = "\n", flush: bool = False) -> None:
-        """Write user-visible output.
+    def reasoning(self, message: str) -> None:
+        """Display model reasoning output."""
+
+    def reasoning_delta(self, delta: str, *, start: bool = False) -> None:
+        """Display a streamed model reasoning delta."""
+
+    def answer(self, message: str) -> None:
+        """Display model answer output."""
+
+    def answer_delta(self, delta: str, *, start: bool = False) -> None:
+        """Display a streamed model answer delta."""
+
+    def error(self, message: str) -> None:
+        """Display an error message."""
+
+    def warning(self, message: str) -> None:
+        """Display a warning message."""
+
+    def debug(self, value: Any) -> None:
+        """Display diagnostic output."""
+
+    def info(self, message: str = "") -> None:
+        """Display neutral status information."""
+
+    def tool_call(self, name: str, arguments: str) -> None:
+        """Display a model-requested tool call.
 
         Args:
-            message: Text to write.
-            end: Text appended after the message.
-            flush: Whether to flush the output destination immediately.
+            name: Name of the requested tool.
+            arguments: JSON arguments supplied to the tool.
         """
+
+    def invalid_input(self) -> None:
+        """Display feedback for empty user input."""
+
+    def thinking(self) -> None:
+        """Display that a model response is pending."""
+
+    def response_finished(self) -> None:
+        """Finish the presentation of a model response."""
+
+    def conversation_ended(self) -> None:
+        """Display that the conversation has ended."""
 
     def confirm(self, message: str, *, default: bool = False) -> bool:
         """Ask the user to approve an operation.
@@ -66,26 +99,77 @@ class ToolContext:
 class ConsoleInteraction:
     """Interact with a user through the process terminal."""
 
-    def prompt(self, message: str) -> str:
-        """Read textual input from the terminal.
-
-        Args:
-            message: Prompt to display before reading input.
+    def input(self) -> str:
+        """Read stripped textual input from the terminal.
 
         Returns:
-            The text entered by the user.
+            The stripped text entered by the user.
         """
-        return input(message)
+        return input("\nYou: ").strip()
 
-    def write(self, message: str = "", *, end: str = "\n", flush: bool = False) -> None:
-        """Write output to the terminal.
+    def reasoning(self, message: str) -> None:
+        """Write model reasoning to the terminal."""
+        print("\n[THOUGHT PROCESS]:")
+        print(message)
+
+    def reasoning_delta(self, delta: str, *, start: bool = False) -> None:
+        """Write a streamed model reasoning delta to the terminal."""
+        if start:
+            print("\n[THOUGHT PROCESS]:")
+        print(delta, end="", flush=True)
+
+    def answer(self, message: str) -> None:
+        """Write a model answer to the terminal."""
+        print("\n[ANSWER]:")
+        print(message)
+
+    def answer_delta(self, delta: str, *, start: bool = False) -> None:
+        """Write a streamed model answer delta to the terminal."""
+        if start:
+            print("\n[ANSWER]:")
+        print(delta, end="", flush=True)
+
+    def error(self, message: str) -> None:
+        """Write an error to the terminal."""
+        print(f"Error: {message}")
+
+    def warning(self, message: str) -> None:
+        """Write a warning to the terminal."""
+        print(f"Warning: {message}")
+
+    def debug(self, value: Any) -> None:
+        """Write diagnostic output to the terminal."""
+        print(f"\n[DEBUG EVENT]: {type(value)}")
+        print(pformat(value))
+
+    def info(self, message: str = "") -> None:
+        """Write neutral status information to the terminal."""
+        print(message)
+
+    def tool_call(self, name: str, arguments: str) -> None:
+        """Write a model-requested tool call to the terminal.
 
         Args:
-            message: Text to write.
-            end: Text appended after the message.
-            flush: Whether to flush the terminal immediately.
+            name: Name of the requested tool.
+            arguments: JSON arguments supplied to the tool.
         """
-        print(message, end=end, flush=flush)
+        print(f"\n[TOOL CALL]: {name}({arguments})")
+
+    def invalid_input(self) -> None:
+        """Ask the terminal user to enter a non-empty message."""
+        self.warning("Please enter a message!")
+
+    def thinking(self) -> None:
+        """Indicate in the terminal that a model response is pending."""
+        self.info("\nThinking...")
+
+    def response_finished(self) -> None:
+        """Terminate streamed terminal output with a newline."""
+        self.info()
+
+    def conversation_ended(self) -> None:
+        """Report conversation termination in the terminal."""
+        self.info("\nConversation ended.")
 
     def confirm(self, message: str, *, default: bool = False) -> bool:
         """Ask for a yes-or-no answer and apply an empty-answer default.
@@ -98,7 +182,7 @@ class ConsoleInteraction:
             Whether the user approved the operation.
         """
         suffix = "[Y/n]" if default else "[y/N]"
-        answer = self.prompt(f"{message} {suffix}: ").strip().lower()
+        answer = input(f"{message} {suffix}: ").strip().lower()
         if not answer:
             return default
         return answer in {"y", "yes"}

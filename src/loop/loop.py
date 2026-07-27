@@ -1,8 +1,6 @@
 """Run an interactive conversation with an LLM backend."""
 
 from dataclasses import dataclass, field
-from pprint import pformat
-
 from openai import BaseModel
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -129,7 +127,7 @@ class BaseLoop:
             return False
 
         for tool_call in response.tool_calls:
-            self._interaction.write(f"\n[TOOL CALL]: {tool_call.name}({tool_call.arguments})")
+            self._interaction.tool_call(tool_call.name, tool_call.arguments)
             self._messages.append(
                 {
                     "type": "function_call_output",
@@ -157,9 +155,9 @@ class BaseLoop:
             The entered message, or ``False`` when the user requests to exit.
         """
         while True:
-            user_input = self._interaction.prompt("\nYou: ").strip()
+            user_input = self._interaction.input()
             if not user_input:
-                self._interaction.write("Please enter a message!")
+                self._interaction.invalid_input()
                 continue
 
             if user_input.lower() in ["exit", "quit", "bye", "q"]:
@@ -181,26 +179,23 @@ class BaseLoop:
 
         for message in response.output:
             if self._debug:
-                self._interaction.write(f"\n[DEBUG EVENT]: {type(message)}")
-                self._interaction.write(pformat(message))
+                self._interaction.debug(message)
 
             if isinstance(message, ResponseReasoningItem):
                 content = message.content[0].text if message.content else ""
                 thinking_text += content
-                self._interaction.write(f"Reasoning: {content}")
+                self._interaction.reasoning(content)
                 continue
 
             if isinstance(message, ResponseOutputMessage):
                 content = message.content[0].text if message.content else ""
                 answer_text += content
-                self._interaction.write(f"Message: {content}")
+                self._interaction.answer(content)
                 continue
 
             if isinstance(message, ResponseFunctionToolCall):
                 tool_calls.append(message)
                 continue
-
-        self._interaction.write()
 
         return Response(
             answer=answer_text.strip(),
@@ -211,7 +206,7 @@ class BaseLoop:
 
     def end(self) -> None:
         """Display the conversation termination message."""
-        self._interaction.write("\nConversation ended.")
+        self._interaction.conversation_ended()
 
 
 class StreamingLoop(BaseLoop):
@@ -241,23 +236,16 @@ class StreamingLoop(BaseLoop):
         tool_calls = []
         output_items = []
 
-        self._interaction.write("\nThinking...")
+        self._interaction.thinking()
 
         for event in response:
             if self._debug:
-                self._interaction.write(f"\n[DEBUG EVENT]: {type(event)}")
-                self._interaction.write(pformat(event))
+                self._interaction.debug(event)
 
             if isinstance(event, ResponseReasoningTextDeltaEvent):
-                if not is_thinking:
-                    self._interaction.write("\n[THOUGHT PROCESS]:")
-                    is_thinking = True
                 thinking_text += event.delta
 
             if isinstance(event, ResponseTextDeltaEvent):
-                if not answer_started:
-                    self._interaction.write("\n[ANSWER]:")
-                    answer_started = True
                 answer_text += event.delta
 
             if isinstance(event, ResponseOutputItemDoneEvent):
@@ -266,11 +254,18 @@ class StreamingLoop(BaseLoop):
                     tool_calls.append(event.item)
                     continue
 
-            if isinstance(event, (ResponseTextDeltaEvent, ResponseReasoningTextDeltaEvent)):
-                self._interaction.write(event.delta, end="", flush=True)
+            if isinstance(event, ResponseReasoningTextDeltaEvent):
+                self._interaction.reasoning_delta(event.delta, start=not is_thinking)
+                is_thinking = True
                 continue
 
-        self._interaction.write()
+            if isinstance(event, ResponseTextDeltaEvent):
+                self._interaction.answer_delta(event.delta, start=not answer_started)
+                answer_started = True
+                continue
+
+        if is_thinking or answer_started:
+            self._interaction.response_finished()
 
         return Response(
             answer=answer_text.strip(),

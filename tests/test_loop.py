@@ -63,12 +63,12 @@ def test_loop_adopts_the_registry_interaction():
     """A loop and its automatically created client share registry interaction."""
     interaction = Mock(spec=Interaction)
     registry = ToolRegistry(interaction=interaction)
-    interaction.prompt.return_value = "hello"
+    interaction.input.return_value = "hello"
 
     loop = BaseLoop(tool_registry=registry)
 
     assert loop.input() == "hello"
-    interaction.prompt.assert_called_once_with("\nYou: ")
+    interaction.input.assert_called_once_with()
 
 
 def test_run_requeries_after_a_tool_call_and_ends(capsys):
@@ -164,15 +164,15 @@ def test_input_returns_trimmed_message(monkeypatch):
 def test_input_and_end_use_the_injected_interaction():
     """Input validation and termination output avoid process-global terminal functions."""
     interaction = Mock(spec=Interaction)
-    interaction.prompt.side_effect = [" ", " q "]
+    interaction.input.side_effect = ["", "q"]
     loop = BaseLoop(client=SimpleNamespace(), interaction=interaction)
 
     assert loop.input() is False
     loop.end()
 
-    assert interaction.prompt.call_count == 2
-    interaction.write.assert_any_call("Please enter a message!")
-    interaction.write.assert_any_call("\nConversation ended.")
+    assert interaction.input.call_count == 2
+    interaction.invalid_input.assert_called_once_with()
+    interaction.conversation_ended.assert_called_once_with()
 
 
 def test_non_streaming_output_collects_reasoning_message_call_and_ignores_unknown(capsys):
