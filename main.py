@@ -13,7 +13,7 @@ def main() -> None:
         print("Hello from loop!")
         loop = StreamingLoop()
         loop.run()
-    except (KeyboardInterrupt, ShutdownRequested):
+    except (EOFError, KeyboardInterrupt, ShutdownRequested):
         print("\nStopping loop. Goodbye!")
 
 

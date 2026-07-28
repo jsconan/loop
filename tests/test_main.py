@@ -8,7 +8,7 @@ import main
 from loop.types import ShutdownRequested
 
 
-@pytest.mark.parametrize("interruption", [KeyboardInterrupt, ShutdownRequested])
+@pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt, ShutdownRequested])
 def test_main_gracefully_handles_shutdown_requests(monkeypatch, capsys, interruption):
     """Interrupts stop the CLI with a friendly message and no exception."""
     loop = Mock()
