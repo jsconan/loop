@@ -62,22 +62,13 @@ def test_client_and_tool_registry_cannot_both_be_supplied():
         StreamingLoop(client=SimpleNamespace(), tool_registry=ToolRegistry())
 
 
-def test_loop_and_registry_must_share_an_explicit_interaction():
-    """A session cannot silently route loop and tool interaction to different services."""
-    with pytest.raises(ValueError, match="same interaction service"):
-        BaseLoop(
-            tool_registry=ToolRegistry(interaction=Mock(spec=Interaction)),
-            interaction=Mock(spec=Interaction),
-        )
-
-
-def test_loop_adopts_the_registry_interaction():
-    """A loop and its automatically created client share registry interaction."""
+def test_loop_uses_its_injected_interaction():
+    """A loop uses its injected interaction independently of the tool registry."""
     interaction = Mock(spec=Interaction)
-    registry = ToolRegistry(interaction=interaction)
+    registry = ToolRegistry()
     interaction.input.return_value = "hello"
 
-    loop = BaseLoop(tool_registry=registry)
+    loop = BaseLoop(tool_registry=registry, interaction=interaction)
 
     assert loop.input() == "hello"
     interaction.input.assert_called_once_with()
@@ -137,7 +128,12 @@ def test_response_output_and_tool_results_use_responses_api_input_items():
             "output": "tool result",
         },
     ]
-    tool_registry.call.assert_called_once_with("get_current_datetime", "{}")
+    assert tool_registry.call.call_count == 1
+    tool_registry.call.assert_called_once_with(
+        "get_current_datetime",
+        "{}",
+        interaction=loop._interaction,
+    )
 
 
 def test_no_tool_calls_are_reported_without_dispatch():
@@ -177,7 +173,7 @@ def test_input_and_end_use_the_injected_interaction():
     """Input validation and termination output avoid process-global terminal functions."""
     interaction = Mock(spec=Interaction)
     interaction.input.side_effect = ["", "q"]
-    registry = ToolRegistry(interaction=interaction)
+    registry = ToolRegistry()
     loop = BaseLoop(client=SimpleNamespace(tool_registry=registry), interaction=interaction)
 
     assert loop.input() is False

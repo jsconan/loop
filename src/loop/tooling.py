@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from .interaction import ConsoleInteraction, Interaction, ToolContext
+from .interaction import Interaction, ToolContext
 from .types.tooling import ToolRegistrationError
 from .utils.tooling import (
     get_tool_arguments_model,
@@ -28,14 +28,12 @@ class Tool:
         description: Description exposed in the tool declaration.
         function: Python function invoked for the tool.
         arguments_model: Pydantic model used to validate arguments.
-        interaction: Service available to the tool during invocation.
     """
 
     name: str
     description: str
     function: Callable[..., Any]
     arguments_model: type[BaseModel]
-    interaction: Interaction
 
     def schema(self) -> dict[str, Any]:
         """Return this tool in the flat Responses API function-tool format.
@@ -51,14 +49,18 @@ class Tool:
             "strict": True,
         }
 
-    def call(self, arguments: str) -> str:
+    def call(self, arguments: str, context: ToolContext | None = None) -> str:
         """Validate JSON arguments, invoke the function, and serialize its result.
 
         Args:
             arguments: JSON-encoded arguments supplied by the model.
+            context: Runtime context supplied to a context-aware tool.
 
         Returns:
             The serialized function result or a model-readable error.
+
+        Raises:
+            ValueError: If the tool requires a context but none is provided.
         """
         validated, validation_error = self._validate_arguments(arguments)
         if validation_error is not None:
@@ -71,36 +73,41 @@ class Tool:
             )
 
         try:
-            result = self._invoke(validated)
+            result = self._invoke(validated, context)
             return serialize_tool_result(result)
         except Exception as exc:  # pylint: disable=broad-except
             return serialize_tool_error("execution_failed", f"Tool '{self.name}' failed: {exc}")
 
-    async def call_async(self, arguments: str) -> str:
+    async def call_async(self, arguments: str, context: ToolContext | None = None) -> str:
         """Validate and invoke either an asynchronous or synchronous function.
 
         Args:
             arguments: JSON-encoded arguments supplied by the model.
+            context: Runtime context supplied to a context-aware tool.
 
         Returns:
             The serialized function result or a model-readable error.
+
+        Raises:
+            ValueError: If the tool requires a context but none is provided.
         """
         validated, validation_error = self._validate_arguments(arguments)
         if validation_error is not None:
             return validation_error
 
         try:
-            result = self._invoke(validated)
+            result = self._invoke(validated, context)
             if inspect.isawaitable(result):
                 result = await result
             return serialize_tool_result(result)
         except Exception as exc:  # pylint: disable=broad-except
             return serialize_tool_error("execution_failed", f"Tool '{self.name}' failed: {exc}")
 
-    def _invoke(self, arguments: dict[str, Any]) -> Any:
+    def _invoke(self, arguments: dict[str, Any], context: ToolContext | None) -> Any:
         """Invoke the function with an explicit context when it requests one."""
         if takes_tool_context(self.function):
-            context = ToolContext(interaction=self.interaction, tool_name=self.name)
+            if context is None:
+                raise ValueError(f"Tool '{self.name}' requires a ToolContext.")
             return self.function(context, **arguments)
         return self.function(**arguments)
 
@@ -131,21 +138,26 @@ class ToolRegistry:
     """Collect tool declarations and route model calls to their implementations.
 
     Args:
-        interaction: Service injected into context-aware tools. Creates a terminal-backed service
-            when omitted.
+        interaction: Default interaction used by context-aware tools when dispatch does not
+            provide one.
     """
 
     _tools: dict[str, Tool]
-    _interaction: Interaction
+    _interaction: Interaction | None
 
     def __init__(self, interaction: Interaction | None = None) -> None:
         self._tools = {}
-        self._interaction = interaction or ConsoleInteraction()
+        self._interaction = interaction
 
     @property
-    def interaction(self) -> Interaction:
-        """Return the interaction service supplied to registered tools."""
+    def interaction(self) -> Interaction | None:
+        """Return the default interaction used during tool dispatch."""
         return self._interaction
+
+    @interaction.setter
+    def interaction(self, interaction: Interaction | None) -> None:
+        """Set or clear the default interaction used during tool dispatch."""
+        self._interaction = interaction
 
     def tool(
         self,
@@ -178,7 +190,6 @@ class ToolRegistry:
                 description=description or get_tool_description(target),
                 function=target,
                 arguments_model=get_tool_arguments_model(target, tool_name),
-                interaction=self._interaction,
             )
             return target
 
@@ -192,35 +203,67 @@ class ToolRegistry:
         """
         return [tool.schema() for tool in self._tools.values()]
 
-    def call(self, name: str, arguments: str) -> str:
+    def call(
+        self,
+        name: str,
+        arguments: str,
+        *,
+        interaction: Interaction | None = None,
+    ) -> str:
         """Dispatch a synchronous tool call by registered name.
 
         Args:
             name: Registered tool name.
             arguments: JSON-encoded arguments supplied by the model.
+            interaction: Interaction for this invocation. Overrides the registry default.
 
         Returns:
             The serialized tool result or a model-readable error.
+
+        Raises:
+            ValueError: If the tool requires a context but none is provided.
         """
         tool = self._tools.get(name)
         if tool is None:
             return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
-        return tool.call(arguments)
+        return tool.call(arguments, self._context_for(tool, interaction))
 
-    async def call_async(self, name: str, arguments: str) -> str:
+    async def call_async(
+        self,
+        name: str,
+        arguments: str,
+        *,
+        interaction: Interaction | None = None,
+    ) -> str:
         """Dispatch an asynchronous or synchronous tool call by registered name.
 
         Args:
             name: Registered tool name.
             arguments: JSON-encoded arguments supplied by the model.
+            interaction: Interaction for this invocation. Overrides the registry default.
 
         Returns:
             The serialized tool result or a model-readable error.
+
+        Raises:
+            ValueError: If the tool requires a context but none is provided.
         """
         tool = self._tools.get(name)
         if tool is None:
             return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
-        return await tool.call_async(arguments)
+        return await tool.call_async(arguments, self._context_for(tool, interaction))
+
+    def _context_for(
+        self,
+        tool: Tool,
+        interaction: Interaction | None,
+    ) -> ToolContext | None:
+        """Build a tool context from the invocation override or registry default."""
+        if interaction is None:
+            interaction = self._interaction
+        if interaction is None:
+            return None
+        return ToolContext(interaction=interaction, tool_name=tool.name)
 
 
 tool_registry = ToolRegistry()

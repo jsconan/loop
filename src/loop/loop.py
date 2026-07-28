@@ -1,6 +1,7 @@
 """Run an interactive conversation with an LLM backend."""
 
 from dataclasses import dataclass, field
+
 from openai import BaseModel
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -12,8 +13,9 @@ from openai.types.responses import (
 )
 
 from .client import Client
-from .interaction import Interaction
-from .tooling import ToolRegistry, tool_registry as default_tool_registry
+from .interaction import ConsoleInteraction, Interaction
+from .tooling import ToolRegistry
+from .tooling import tool_registry as default_tool_registry
 
 
 @dataclass
@@ -43,7 +45,7 @@ class BaseLoop:
         interaction: Service used for all user input and output.
 
     Raises:
-        ValueError: If dependencies select conflicting registries or interaction services.
+        ValueError: If both a client and tool registry are supplied.
     """
 
     _client: Client
@@ -64,10 +66,7 @@ class BaseLoop:
         if tool_registry is None:
             tool_registry = getattr(client, "tool_registry", default_tool_registry)
 
-        if interaction is not None and interaction is not tool_registry.interaction:
-            raise ValueError("The loop and tool registry must use the same interaction service.")
-
-        self._interaction = interaction or tool_registry.interaction
+        self._interaction = interaction or tool_registry.interaction or ConsoleInteraction()
         self._client = client or Client(tool_registry=tool_registry)
         self._messages = []
         self._debug = debug
@@ -118,6 +117,7 @@ class BaseLoop:
                     "output": self._client.tool_registry.call(
                         tool_call.name,
                         tool_call.arguments,
+                        interaction=self._interaction,
                     ),
                 }
             )

@@ -14,7 +14,11 @@ from loop.tools.system import MAX_OUTPUT_CHARS
 
 def run_command(command):
     """Dispatch the context-aware command tool."""
-    return tool_registry.call("run_command", json.dumps({"command": command}))
+    return tool_registry.call(
+        "run_command",
+        json.dumps({"command": command}),
+        interaction=ConsoleInteraction(),
+    )
 
 
 class ImmediateThread:

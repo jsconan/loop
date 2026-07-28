@@ -3,13 +3,21 @@
 import json
 from unittest.mock import MagicMock, call
 
-from loop import ConsoleInteraction, list_files, list_folders, read_text_file, tool_registry
+from loop import (
+    ConsoleInteraction,
+    list_files,
+    list_folders,
+    read_text_file,
+    tool_registry,
+)
 
 
 def write_text_file(path, content):
     """Dispatch the context-aware file-writing tool."""
     return tool_registry.call(
-        "write_text_file", json.dumps({"path": str(path), "content": content})
+        "write_text_file",
+        json.dumps({"path": str(path), "content": content}),
+        interaction=ConsoleInteraction(),
     )
 
 
