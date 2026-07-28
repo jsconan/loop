@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from pprint import pformat
 from typing import Any, Protocol
 
+from prompt_toolkit import PromptSession
+from rich.console import Console
+from rich.prompt import Confirm
+
 
 class Interaction(Protocol):
     """Provide semantically classified user interaction independently of a UI."""
@@ -97,7 +101,20 @@ class ToolContext:
 
 
 class ConsoleInteraction:
-    """Interact with a user through the process terminal."""
+    """Interact with a user through a rich, editable process terminal.
+
+    Args:
+        console: Rich console used for terminal output.
+        session: Prompt session used for editable user input.
+    """
+
+    def __init__(
+        self,
+        console: Console | None = None,
+        session: PromptSession[str] | None = None,
+    ) -> None:
+        self._console = console or Console()
+        self._session = session or PromptSession()
 
     def input(self) -> str:
         """Read stripped textual input from the terminal.
@@ -105,46 +122,58 @@ class ConsoleInteraction:
         Returns:
             The stripped text entered by the user.
         """
-        return input("\nYou: ").strip()
+        return self._session.prompt("\nYou: ").strip()
+
+    def _reasoning_heading(self) -> None:
+        """Write a reasoning heading to the terminal."""
+        self._console.print("\n[THOUGHT PROCESS]:", style="dim cyan", markup=False)
 
     def reasoning(self, message: str) -> None:
         """Write model reasoning to the terminal."""
-        print("\n[THOUGHT PROCESS]:")
-        print(message)
+        self._reasoning_heading()
+        self._console.print(message, style="dim", markup=False, highlight=False)
 
     def reasoning_delta(self, delta: str, *, start: bool = False) -> None:
         """Write a streamed model reasoning delta to the terminal."""
         if start:
-            print("\n[THOUGHT PROCESS]:")
-        print(delta, end="", flush=True)
+            self._reasoning_heading()
+        self._console.print(
+            delta, end="", style="dim", markup=False, highlight=False, soft_wrap=True
+        )
+
+    def _answer_heading(self) -> None:
+        """Write an answer heading to the terminal."""
+        self._console.print("\n[ANSWER]:", style="bold bright_green", markup=False)
 
     def answer(self, message: str) -> None:
         """Write a model answer to the terminal."""
-        print("\n[ANSWER]:")
-        print(message)
+        self._answer_heading()
+        self._console.print(message, style="bold", markup=False, highlight=False)
 
     def answer_delta(self, delta: str, *, start: bool = False) -> None:
         """Write a streamed model answer delta to the terminal."""
         if start:
-            print("\n[ANSWER]:")
-        print(delta, end="", flush=True)
+            self._answer_heading()
+        self._console.print(
+            delta, end="", style="bold", markup=False, highlight=False, soft_wrap=True
+        )
 
     def error(self, message: str) -> None:
         """Write an error to the terminal."""
-        print(f"Error: {message}")
+        self._console.print(f"Error: {message}", style="bold red", markup=False)
 
     def warning(self, message: str) -> None:
         """Write a warning to the terminal."""
-        print(f"Warning: {message}")
+        self._console.print(f"Warning: {message}", style="bold yellow", markup=False)
 
     def debug(self, value: Any) -> None:
         """Write diagnostic output to the terminal."""
-        print(f"\n[DEBUG EVENT]: {type(value)}")
-        print(pformat(value))
+        self._console.print(f"\n[DEBUG EVENT]: {type(value)}", style="dim blue", markup=False)
+        self._console.print(pformat(value), style="dim", markup=False, highlight=False)
 
     def info(self, message: str = "") -> None:
         """Write neutral status information to the terminal."""
-        print(message)
+        self._console.print(message, markup=False, highlight=False)
 
     def tool_call(self, name: str, arguments: str) -> None:
         """Write a model-requested tool call to the terminal.
@@ -153,7 +182,9 @@ class ConsoleInteraction:
             name: Name of the requested tool.
             arguments: JSON arguments supplied to the tool.
         """
-        print(f"\n[TOOL CALL]: {name}({arguments})")
+        self._console.print(
+            f"\n[TOOL CALL]: {name}({arguments})", style="dim magenta", markup=False
+        )
 
     def invalid_input(self) -> None:
         """Ask the terminal user to enter a non-empty message."""
@@ -181,8 +212,4 @@ class ConsoleInteraction:
         Returns:
             Whether the user approved the operation.
         """
-        suffix = "[Y/n]" if default else "[y/N]"
-        answer = input(f"{message} {suffix}: ").strip().lower()
-        if not answer:
-            return default
-        return answer in {"y", "yes"}
+        return Confirm.ask(message, default=default, console=self._console)

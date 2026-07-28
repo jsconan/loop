@@ -1,19 +1,20 @@
 """Tests for terminal-backed user interaction."""
 
+from unittest.mock import Mock
+
 import pytest
+from rich.prompt import Confirm
 
 from loop.interaction import ConsoleInteraction
 
 
-def test_input_reads_from_the_terminal(monkeypatch):
+def test_input_reads_from_the_terminal():
     """Input owns its prompt and strips the terminal input."""
-    def terminal_input(message):
-        assert message == "\nYou: "
-        return "  answer  \n"
+    session = Mock()
+    session.prompt.return_value = "  answer  \n"
 
-    monkeypatch.setattr("builtins.input", terminal_input)
-
-    assert ConsoleInteraction().input() == "answer"
+    assert ConsoleInteraction(session=session).input() == "answer"
+    session.prompt.assert_called_once_with("\nYou: ")
 
 
 @pytest.mark.parametrize(
@@ -84,6 +85,21 @@ def test_debug_formats_raw_values(capsys):
     assert "{'details': [1, 2]}" in output
 
 
+def test_output_styles_prioritize_answers_over_diagnostics():
+    """Answers are emphasized while reasoning, tool calls, and debug output are dimmed."""
+    console = Mock()
+    interaction = ConsoleInteraction(console=console)
+
+    interaction.answer("result")
+    interaction.reasoning("thought")
+    interaction.tool_call("search", "{}")
+    interaction.debug({"detail": True})
+
+    styles = [call.kwargs.get("style") for call in console.print.call_args_list]
+    assert styles[:2] == ["bold bright_green", "bold"]
+    assert styles[2:] == ["dim cyan", "dim", "dim magenta", "dim blue", "dim"]
+
+
 def test_conversation_events_have_console_presentations(capsys):
     """The console owns validation, progress, response, and termination formatting."""
     interaction = ConsoleInteraction()
@@ -97,23 +113,13 @@ def test_conversation_events_have_console_presentations(capsys):
     )
 
 
-@pytest.mark.parametrize(
-    ("answer", "default", "expected", "suffix"),
-    [
-        ("y", False, True, "[y/N]"),
-        (" YES ", False, True, "[y/N]"),
-        ("n", True, False, "[Y/n]"),
-        ("anything", True, False, "[Y/n]"),
-        ("", False, False, "[y/N]"),
-        ("   ", True, True, "[Y/n]"),
-    ],
-)
-def test_confirm_parses_answers_and_empty_defaults(
-    monkeypatch, answer, default, expected, suffix
-):
-    """Confirmation accepts yes and applies its configured empty-answer default."""
-    prompts = []
-    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or answer)
+@pytest.mark.parametrize(("default", "expected"), [(False, True), (True, False)])
+def test_confirm_uses_rich_with_the_configured_default(monkeypatch, default, expected):
+    """Confirmation delegates its question and default to Rich."""
+    ask = Mock(return_value=expected)
+    console = Mock()
+    monkeypatch.setattr(Confirm, "ask", ask)
+    interaction = ConsoleInteraction(console=console)
 
-    assert ConsoleInteraction().confirm("Continue?", default=default) is expected
-    assert prompts == [f"Continue? {suffix}: "]
+    assert interaction.confirm("Continue?", default=default) is expected
+    ask.assert_called_once_with("Continue?", default=default, console=console)

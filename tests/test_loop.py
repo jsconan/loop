@@ -181,14 +181,18 @@ def test_non_streaming_query_and_streaming_query_forward_conversation_history():
 def test_input_reprompts_for_blank_and_recognizes_exit(monkeypatch, capsys):
     """Interactive input rejects blanks and accepts case-insensitive exit commands."""
     values = iter(["   ", " EXIT "])
-    monkeypatch.setattr("builtins.input", lambda _prompt: next(values))
+    monkeypatch.setattr(
+        "loop.interaction.PromptSession.prompt", lambda _session, _prompt: next(values)
+    )
     assert BaseLoop(client=SimpleNamespace()).input() is False
     assert "Please enter a message!" in capsys.readouterr().out
 
 
 def test_input_returns_trimmed_message(monkeypatch):
     """Interactive input returns a non-command message without surrounding whitespace."""
-    monkeypatch.setattr("builtins.input", lambda _prompt: " hello ")
+    monkeypatch.setattr(
+        "loop.interaction.PromptSession.prompt", lambda _session, _prompt: " hello "
+    )
     assert BaseLoop(client=SimpleNamespace()).input() == "hello"
 
 
