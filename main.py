@@ -1,6 +1,6 @@
 """Main entry point for the loop package."""
 
-from loop import StreamingLoop
+from loop import ConsoleInteraction, StreamingLoop
 from loop.types import ShutdownRequested
 from loop.utils.signals import register_shutdown_signals
 
@@ -8,13 +8,14 @@ from loop.utils.signals import register_shutdown_signals
 def main() -> None:
     """Run an interactive conversation with an LLM backend."""
     register_shutdown_signals()
+    interaction = ConsoleInteraction()
 
     try:
-        print("Hello from loop!")
-        loop = StreamingLoop()
+        interaction.info("Hello from loop!")
+        loop = StreamingLoop(interaction=interaction)
         loop.run()
-    except (EOFError, KeyboardInterrupt, ShutdownRequested):
-        print("\nStopping loop. Goodbye!")
+    except EOFError, KeyboardInterrupt, ShutdownRequested:
+        interaction.info("\nStopping loop. Goodbye!")
 
 
 if __name__ == "__main__":
