@@ -13,9 +13,10 @@ from openai.types.responses import (
     ResponseTextDeltaEvent,
 )
 
-from loop.loop import BaseLoop, Response, StreamingLoop
 from loop.interaction import Interaction
-from loop.tooling import ToolRegistry, tool_registry as default_tool_registry
+from loop.loop import BaseLoop, Response, StreamingLoop
+from loop.tooling import ToolRegistry
+from loop.tooling import tool_registry as default_tool_registry
 
 
 def function_call() -> ResponseFunctionToolCall:
@@ -74,6 +75,22 @@ def test_loop_uses_its_injected_interaction():
     interaction.input.assert_called_once_with()
 
 
+def test_loop_exposes_its_configured_state():
+    """Loop accessors expose the configured dependencies and conversation state."""
+    client = SimpleNamespace()
+    interaction = Mock(spec=Interaction)
+    loop = BaseLoop(client=client, debug=True, interaction=interaction)
+
+    assert loop.client is client
+    assert loop.messages == []
+    assert loop.debug is True
+    assert loop.interaction is interaction
+
+    loop.debug = False
+
+    assert loop.debug is False
+
+
 def test_run_requeries_after_a_tool_call_and_ends(capsys):
     """The public runner records a tool result, requeries, then exits on the next input."""
     registry = ToolRegistry()
@@ -84,8 +101,12 @@ def test_run_requeries_after_a_tool_call_and_ends(capsys):
         return text
 
     call = ResponseFunctionToolCall(
-        id="fc", call_id="call", name="echo", arguments='{"text":"done"}',
-        type="function_call", status="completed",
+        id="fc",
+        call_id="call",
+        name="echo",
+        arguments='{"text":"done"}',
+        type="function_call",
+        status="completed",
     )
     client = Mock(tool_registry=registry)
     client.get_response.side_effect = [
@@ -101,7 +122,9 @@ def test_run_requeries_after_a_tool_call_and_ends(capsys):
     assert client.get_response.call_count == 2
     second_payload = client.get_response.call_args_list[1].kwargs["input"]
     assert second_payload[-1] == {
-        "type": "function_call_output", "call_id": "call", "output": "done"
+        "type": "function_call_output",
+        "call_id": "call",
+        "output": "done",
     }
     assert "Conversation ended." in capsys.readouterr().out
 
@@ -132,7 +155,7 @@ def test_response_output_and_tool_results_use_responses_api_input_items():
     tool_registry.call.assert_called_once_with(
         "get_current_datetime",
         "{}",
-        interaction=loop._interaction,
+        interaction=loop.interaction,
     )
 
 
@@ -222,9 +245,7 @@ def test_non_streaming_output_handles_empty_content(capsys):
     message = ResponseOutputMessage(
         id="m", type="message", role="assistant", status="completed", content=[]
     )
-    result = BaseLoop(client=SimpleNamespace()).output(
-        SimpleNamespace(output=[reasoning, message])
-    )
+    result = BaseLoop(client=SimpleNamespace()).output(SimpleNamespace(output=[reasoning, message]))
     assert result.answer == result.reasoning == ""
     capsys.readouterr()
 
@@ -289,8 +310,11 @@ def test_streaming_debug_and_completed_non_tool_items(capsys):
     """Debug streaming records every completed item, including ordinary messages."""
     message = ResponseOutputMessage.model_validate(
         {
-            "id": "message_1", "type": "message", "role": "assistant",
-            "status": "completed", "content": [],
+            "id": "message_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [],
         }
     )
     event = ResponseOutputItemDoneEvent(

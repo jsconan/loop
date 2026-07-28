@@ -71,6 +71,31 @@ class BaseLoop:
         self._messages = []
         self._debug = debug
 
+    @property
+    def client(self) -> Client:
+        """Return the client used to request model responses."""
+        return self._client
+
+    @property
+    def messages(self) -> list[dict]:
+        """Return the current conversation history."""
+        return self._messages
+
+    @property
+    def debug(self) -> bool:
+        """Return whether raw response event output is enabled."""
+        return self._debug
+
+    @debug.setter
+    def debug(self, debug: bool) -> None:
+        """Enable or disable raw response event output."""
+        self._debug = debug
+
+    @property
+    def interaction(self) -> Interaction:
+        """Return the service used for user input and output."""
+        return self._interaction
+
     def run(self):
         """Run the conversation until the user requests to exit."""
         while True:
