@@ -1,13 +1,20 @@
 """Main entry point for the loop package."""
 
 from loop import StreamingLoop
+from loop.types import ShutdownRequested
+from loop.utils.signals import register_shutdown_signals
 
 
-def main():
+def main() -> None:
     """Run an interactive conversation with an LLM backend."""
-    print("Hello from loop!")
-    loop = StreamingLoop()
-    loop.run()
+    register_shutdown_signals()
+
+    try:
+        print("Hello from loop!")
+        loop = StreamingLoop()
+        loop.run()
+    except (KeyboardInterrupt, ShutdownRequested):
+        print("\nStopping loop. Goodbye!")
 
 
 if __name__ == "__main__":
