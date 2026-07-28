@@ -69,7 +69,7 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
     confirm = MagicMock(side_effect=[False, True])
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
-    assert write_text_file(str(target), "blocked") == "Write operation cancelled."
+    assert write_text_file(str(target), "blocked") == "Write operation cancelled by user."
     assert not target.exists()
 
     assert write_text_file(str(target), "saved") == f"Successfully wrote to file '{target}'."

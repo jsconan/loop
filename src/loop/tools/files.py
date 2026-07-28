@@ -57,7 +57,7 @@ def write_text_file(
 ) -> str:
     """Write content to a text file on the local disk."""
     if not context.confirm(f"Agent wants to write to file '{path}'. Proceed?"):
-        return "Write operation cancelled."
+        return "Write operation cancelled by user."
 
     try:
         with open(path, "w", encoding="utf-8") as file:
