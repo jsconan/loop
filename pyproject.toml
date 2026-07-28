@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "loop"
 version = "0.1.0"
-description = "Add your description here"
+description = "An experimental agentic loop for OpenAI-compatible Responses API servers"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = ["openai>=2.46.0", "pydantic>=2.13.0"]
