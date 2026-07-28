@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "An experimental agentic loop for OpenAI-compatible Responses API servers"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = ["openai>=2.46.0", "pydantic>=2.13.0"]
+dependencies = [
+    "openai>=2.46.0",
+    "prompt-toolkit>=3.0.52",
+    "pydantic>=2.13.0",
+    "rich>=14.1.0",
+]
 
 [dependency-groups]
 dev = [
