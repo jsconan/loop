@@ -9,7 +9,9 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseReasoningItem,
     ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent,
     ResponseTextDeltaEvent,
+    ResponseTextDoneEvent,
 )
 
 from .client import Client
@@ -250,11 +252,11 @@ class StreamingLoop(BaseLoop):
             if self._debug:
                 self._interaction.debug(event)
 
-            if isinstance(event, ResponseReasoningTextDeltaEvent):
-                thinking_text += event.delta
+            if isinstance(event, ResponseReasoningTextDoneEvent):
+                thinking_text += event.text
 
-            if isinstance(event, ResponseTextDeltaEvent):
-                answer_text += event.delta
+            if isinstance(event, ResponseTextDoneEvent):
+                answer_text += event.text
 
             if isinstance(event, ResponseOutputItemDoneEvent):
                 output_items.append(event.item)

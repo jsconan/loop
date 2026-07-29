@@ -10,7 +10,9 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseReasoningItem,
     ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent,
     ResponseTextDeltaEvent,
+    ResponseTextDoneEvent,
 )
 
 from loop.interaction import Interaction
@@ -254,8 +256,8 @@ def test_non_streaming_output_handles_empty_content(capsys):
     capsys.readouterr()
 
 
-def test_streaming_output_collects_all_deltas_and_completed_tool_call(capsys):
-    """Streaming output collects deltas and completed function calls."""
+def test_streaming_output_collects_done_text_and_completed_tool_call(capsys):
+    """Streaming output collects completed text and function calls."""
     loop = StreamingLoop(client=SimpleNamespace())
     call = function_call()
     events = [
@@ -275,12 +277,20 @@ def test_streaming_output_collects_all_deltas_and_completed_tool_call(capsys):
             sequence_number=2,
             type="response.reasoning_text.delta",
         ),
+        ResponseReasoningTextDoneEvent(
+            text="think again",
+            item_id="rs_123",
+            output_index=0,
+            content_index=0,
+            sequence_number=3,
+            type="response.reasoning_text.done",
+        ),
         ResponseTextDeltaEvent(
             delta="hello ",
             item_id="msg_123",
             output_index=1,
             content_index=0,
-            sequence_number=3,
+            sequence_number=4,
             type="response.output_text.delta",
             logprobs=[],
         ),
@@ -289,14 +299,23 @@ def test_streaming_output_collects_all_deltas_and_completed_tool_call(capsys):
             item_id="msg_123",
             output_index=1,
             content_index=0,
-            sequence_number=4,
+            sequence_number=5,
             type="response.output_text.delta",
+            logprobs=[],
+        ),
+        ResponseTextDoneEvent(
+            text="hello world",
+            item_id="msg_123",
+            output_index=1,
+            content_index=0,
+            sequence_number=6,
+            type="response.output_text.done",
             logprobs=[],
         ),
         ResponseOutputItemDoneEvent(
             item=call,
             output_index=2,
-            sequence_number=5,
+            sequence_number=7,
             type="response.output_item.done",
         ),
     ]
