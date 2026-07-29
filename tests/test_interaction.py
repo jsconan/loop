@@ -18,25 +18,31 @@ def test_input_reads_from_the_terminal():
 
 
 @pytest.mark.parametrize(
-    ("method", "heading"),
-    [("reasoning", "[THOUGHT PROCESS]"), ("answer", "[ANSWER]")],
+    ("method", "expected"),
+    [
+        ("reasoning", "\nThinking...\n\ncomplete\n"),
+        ("answer", "\nAnswer:complete\n"),
+    ],
 )
-def test_model_output_has_a_console_presentation(capsys, method, heading):
+def test_model_output_has_a_console_presentation(capsys, method, expected):
     """The console owns presentation of complete model output."""
     getattr(ConsoleInteraction(), method)("complete")
 
-    assert capsys.readouterr().out == f"\n{heading}:\ncomplete\n"
+    assert capsys.readouterr().out == expected
 
 
 @pytest.mark.parametrize(
-    ("method", "heading"),
-    [("reasoning_delta", "[THOUGHT PROCESS]"), ("answer_delta", "[ANSWER]")],
+    ("method", "expected"),
+    [
+        ("reasoning_delta", "\nThinking...\n\npartial"),
+        ("answer_delta", "\nAnswer:partial"),
+    ],
 )
-def test_model_output_formats_stream_starts(capsys, method, heading):
+def test_model_output_formats_stream_starts(capsys, method, expected):
     """The console owns presentation of model-output stream boundaries."""
     getattr(ConsoleInteraction(), method)("partial", start=True)
 
-    assert capsys.readouterr().out == f"\n{heading}:\npartial"
+    assert capsys.readouterr().out == expected
 
 
 @pytest.mark.parametrize("method", ["reasoning_delta", "answer_delta"])
@@ -104,13 +110,10 @@ def test_conversation_events_have_console_presentations(capsys):
     """The console owns validation, progress, response, and termination formatting."""
     interaction = ConsoleInteraction()
     interaction.invalid_input()
-    interaction.thinking()
     interaction.response_finished()
     interaction.conversation_ended()
 
-    assert capsys.readouterr().out == (
-        "Warning: Please enter a message!\n\nThinking...\n\n\nConversation ended.\n"
-    )
+    assert capsys.readouterr().out == "Warning: Please enter a message!\n\n\nConversation ended.\n"
 
 
 @pytest.mark.parametrize(("default", "expected"), [(False, True), (True, False)])

@@ -54,9 +54,6 @@ class Interaction(Protocol):
     def invalid_input(self) -> None:
         """Display feedback for empty user input."""
 
-    def thinking(self) -> None:
-        """Display that a model response is pending."""
-
     def response_finished(self) -> None:
         """Finish the presentation of a model response."""
 
@@ -126,7 +123,7 @@ class ConsoleInteraction:
 
     def _reasoning_heading(self) -> None:
         """Write a reasoning heading to the terminal."""
-        self._console.print("\n[THOUGHT PROCESS]:", style="dim cyan", markup=False)
+        self._console.print("\nThinking...\n", style="dim cyan", markup=False)
 
     def reasoning(self, message: str) -> None:
         """Write model reasoning to the terminal."""
@@ -143,7 +140,7 @@ class ConsoleInteraction:
 
     def _answer_heading(self) -> None:
         """Write an answer heading to the terminal."""
-        self._console.print("\n[ANSWER]:", style="bold bright_green", markup=False)
+        self._console.print("\nAnswer:", end="", style="bold bright_green", markup=False)
 
     def answer(self, message: str) -> None:
         """Write a model answer to the terminal."""
@@ -189,10 +186,6 @@ class ConsoleInteraction:
     def invalid_input(self) -> None:
         """Ask the terminal user to enter a non-empty message."""
         self.warning("Please enter a message!")
-
-    def thinking(self) -> None:
-        """Indicate in the terminal that a model response is pending."""
-        self.info("\nThinking...")
 
     def response_finished(self) -> None:
         """Terminate streamed terminal output with a newline."""

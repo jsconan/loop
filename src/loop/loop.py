@@ -246,23 +246,9 @@ class StreamingLoop(BaseLoop):
         tool_calls = []
         output_items = []
 
-        self._interaction.thinking()
-
         for event in response:
             if self._debug:
                 self._interaction.debug(event)
-
-            if isinstance(event, ResponseReasoningTextDoneEvent):
-                thinking_text += event.text
-
-            if isinstance(event, ResponseTextDoneEvent):
-                answer_text += event.text
-
-            if isinstance(event, ResponseOutputItemDoneEvent):
-                output_items.append(event.item)
-                if isinstance(event.item, ResponseFunctionToolCall):
-                    tool_calls.append(event.item)
-                    continue
 
             if isinstance(event, ResponseReasoningTextDeltaEvent):
                 self._interaction.reasoning_delta(event.delta, start=not is_thinking)
@@ -273,6 +259,18 @@ class StreamingLoop(BaseLoop):
                 self._interaction.answer_delta(event.delta, start=not answer_started)
                 answer_started = True
                 continue
+
+            if isinstance(event, ResponseOutputItemDoneEvent):
+                output_items.append(event.item)
+                if isinstance(event.item, ResponseFunctionToolCall):
+                    tool_calls.append(event.item)
+                    continue
+
+            if isinstance(event, ResponseReasoningTextDoneEvent):
+                thinking_text += event.text
+
+            if isinstance(event, ResponseTextDoneEvent):
+                answer_text += event.text
 
         if is_thinking or answer_started:
             self._interaction.response_finished()
