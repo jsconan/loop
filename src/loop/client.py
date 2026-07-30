@@ -100,6 +100,7 @@ class Client:
     def get_response(
         self,
         input: str | ResponseInputParam,  # pylint: disable=redefined-builtin
+        instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
     ) -> BaseModel:
@@ -107,6 +108,7 @@ class Client:
 
         Args:
             input: Text or structured input to send to the model.
+            instructions: System or developer instructions to apply to the request.
             stream: Whether to return a streaming response.
             model: Model identifier to use instead of the default model.
 
@@ -116,6 +118,7 @@ class Client:
         response = self.get_client().responses.create(
             model=model or self._default_model,
             input=input,
+            instructions=instructions,
             stream=stream,
             stream_options={"include_usage": True},
             tools=self._tool_registry.schemas(),
@@ -125,6 +128,7 @@ class Client:
     async def get_response_async(
         self,
         input: str | ResponseInputParam,  # pylint: disable=redefined-builtin
+        instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
     ) -> BaseModel:
@@ -132,6 +136,7 @@ class Client:
 
         Args:
             input: Text or structured input to send to the model.
+            instructions: System or developer instructions to apply to the request.
             stream: Whether to return a streaming response.
             model: Model identifier to use instead of the default model.
 
@@ -141,6 +146,7 @@ class Client:
         response = await self.get_async_client().responses.create(
             model=model or self._default_model,
             input=input,
+            instructions=instructions,
             stream=stream,
             stream_options={"include_usage": True},
             tools=self._tool_registry.schemas(),

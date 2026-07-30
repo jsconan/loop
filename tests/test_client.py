@@ -84,12 +84,18 @@ def test_sync_response_forwards_schema_streaming_and_model_selection():
     client = Client("default", tool_registry=registry)
 
     with patch("loop.client.OpenAI", return_value=sdk):
-        result = client.get_response("hello", stream=True, model="override")
+        result = client.get_response(
+            "hello",
+            instructions="Follow the project rules.",
+            stream=True,
+            model="override",
+        )
 
     assert result == "response"
     sdk.responses.create.assert_called_once_with(
         model="override",
         input="hello",
+        instructions="Follow the project rules.",
         stream=True,
         stream_options={"include_usage": True},
         tools=[{"type": "function", "name": "demo"}],
@@ -111,6 +117,7 @@ def test_async_response_uses_default_model():
     sdk.responses.create.assert_awaited_once_with(
         model="default",
         input=[{"role": "user", "content": "hi"}],
+        instructions=None,
         stream=False,
         stream_options={"include_usage": True},
         tools=[],
