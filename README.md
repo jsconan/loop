@@ -18,6 +18,7 @@ The project defaults to a local server at `http://localhost:8000/v1` running
 - A decorator-based registry for synchronous and asynchronous Python tools
 - Built-in tools for filesystem access, shell commands, and the current date and time
 - Confirmation before a model writes a file or runs a shell command
+- Hierarchical project instructions from `AGENTS.md` files
 
 ## Requirements
 
@@ -63,6 +64,10 @@ uv run python main.py
 
 Enter a message at the `You:` prompt. To stop, enter `exit`, `quit`, `bye`, or
 `q`.
+
+At startup, the loop loads non-empty `AGENTS.md` files from the Git project root through the
+current working directory. Instructions are combined from least to most specific and remain fixed
+for the conversation. Other agent instruction filenames are ignored.
 
 When the model requests a file write or shell command, the loop displays the
 operation and asks for confirmation first. File and directory reads do not

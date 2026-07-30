@@ -1,6 +1,7 @@
 """Run an interactive conversation with an LLM backend."""
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from openai import BaseModel
 from openai.types.responses import (
@@ -18,6 +19,7 @@ from .client import Client
 from .interaction import ConsoleInteraction, Interaction
 from .tooling import ToolRegistry
 from .tooling import tool_registry as default_tool_registry
+from .utils.agents import load_agents_instructions
 
 
 @dataclass
@@ -42,25 +44,29 @@ class BaseLoop:
 
     Args:
         client: Client used to request model responses. When omitted, a client is created.
-        debug: Whether to print raw response events.
         tool_registry: Registry used by the automatically created client.
         interaction: Service used for all user input and output.
+        working_directory: Directory used to discover applicable AGENTS.md files.
+        debug: Whether to print raw response events.
 
     Raises:
         ValueError: If both a client and tool registry are supplied.
     """
 
     _client: Client
+    _instructions: str | None
     _messages: list[dict]
-    _debug: bool
     _interaction: Interaction
+    _working_directory: Path
+    _debug: bool
 
     def __init__(
         self,
         client: Client | None = None,
-        debug: bool = False,
         tool_registry: ToolRegistry | None = None,
         interaction: Interaction | None = None,
+        working_directory: Path | str | None = None,
+        debug: bool = False,
     ) -> None:
         if client is not None and tool_registry is not None:
             raise ValueError("Pass either client or tool_registry, not both.")
@@ -71,6 +77,8 @@ class BaseLoop:
         self._interaction = interaction or tool_registry.interaction or ConsoleInteraction()
         self._client = client or Client(tool_registry=tool_registry)
         self._messages = []
+        self._working_directory = Path(working_directory or Path.cwd()).resolve()
+        self._instructions = load_agents_instructions(self._working_directory)
         self._debug = debug
 
     @property
@@ -79,9 +87,24 @@ class BaseLoop:
         return self._client
 
     @property
+    def instructions(self) -> str | None:
+        """Return the AGENTS.md instructions loaded for this session."""
+        return self._instructions
+
+    @property
     def messages(self) -> list[dict]:
         """Return the current conversation history."""
         return self._messages
+
+    @property
+    def interaction(self) -> Interaction:
+        """Return the service used for user input and output."""
+        return self._interaction
+
+    @property
+    def working_directory(self) -> Path:
+        """Return the directory used to discover project instructions."""
+        return self._working_directory
 
     @property
     def debug(self) -> bool:
@@ -92,11 +115,6 @@ class BaseLoop:
     def debug(self, debug: bool) -> None:
         """Enable or disable raw response event output."""
         self._debug = debug
-
-    @property
-    def interaction(self) -> Interaction:
-        """Return the service used for user input and output."""
-        return self._interaction
 
     def run(self):
         """Run the conversation until the user requests to exit."""
@@ -156,7 +174,10 @@ class BaseLoop:
         Returns:
             The response returned by the configured backend.
         """
-        return self._client.get_response(input=self._messages)
+        return self._client.get_response(
+            input=self._messages,
+            instructions=self._instructions,
+        )
 
     def input(self) -> str | False:
         """Prompt for a non-empty user message or an exit command.
@@ -228,7 +249,11 @@ class StreamingLoop(BaseLoop):
         Returns:
             An iterable streaming response returned by the configured backend.
         """
-        return self._client.get_response(input=self._messages, stream=True)
+        return self._client.get_response(
+            input=self._messages,
+            instructions=self._instructions,
+            stream=True,
+        )
 
     def output(self, response) -> Response:
         """Display and collect events from a streaming response.

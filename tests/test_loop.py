@@ -77,20 +77,45 @@ def test_loop_uses_its_injected_interaction():
     interaction.input.assert_called_once_with()
 
 
-def test_loop_exposes_its_configured_state():
+def test_loop_exposes_its_configured_state(tmp_path):
     """Loop accessors expose the configured dependencies and conversation state."""
     client = SimpleNamespace()
     interaction = Mock(spec=Interaction)
-    loop = BaseLoop(client=client, debug=True, interaction=interaction)
+    loop = BaseLoop(
+        client=client,
+        debug=True,
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
 
     assert loop.client is client
     assert loop.messages == []
     assert loop.debug is True
     assert loop.interaction is interaction
+    assert loop.working_directory == tmp_path.resolve()
+    assert loop.instructions is None
 
     loop.debug = False
 
     assert loop.debug is False
+
+
+def test_loop_loads_project_instructions_once_at_initialization(monkeypatch, tmp_path):
+    """A loop retains the instructions returned for its configured working directory."""
+    loader = Mock(return_value="project rules")
+    monkeypatch.setattr("loop.loop.load_agents_instructions", loader)
+
+    loop = BaseLoop(client=SimpleNamespace(), working_directory=tmp_path)
+
+    assert loop.instructions == "project rules"
+    loader.assert_called_once_with(tmp_path.resolve())
+
+
+def test_loop_accepts_a_string_working_directory(tmp_path):
+    """A string working directory is normalized to an absolute path."""
+    loop = BaseLoop(client=SimpleNamespace(), working_directory=str(tmp_path))
+
+    assert loop.working_directory == tmp_path.resolve()
 
 
 def test_run_requeries_after_a_tool_call_and_ends(capsys):
@@ -167,17 +192,25 @@ def test_no_tool_calls_are_reported_without_dispatch():
     assert loop.handle_tool_calls(Response("answer", "reasoning")) is False
 
 
-def test_non_streaming_query_and_streaming_query_forward_conversation_history():
-    """Each loop mode selects the expected request streaming behavior."""
+def test_non_streaming_query_and_streaming_query_forward_history_and_instructions(tmp_path):
+    """Each loop mode forwards its history, instructions, and streaming behavior."""
+    (tmp_path / "AGENTS.md").write_text("project rules", encoding="utf-8")
     client = Mock()
     client.get_response.side_effect = ["plain", "stream"]
-    plain_loop = BaseLoop(client=client)
-    stream_loop = StreamingLoop(client=client)
+    plain_loop = BaseLoop(client=client, working_directory=tmp_path)
+    stream_loop = StreamingLoop(client=client, working_directory=tmp_path)
 
     assert plain_loop.query() == "plain"
     assert stream_loop.query() == "stream"
-    assert client.get_response.call_args_list[0].kwargs == {"input": []}
-    assert client.get_response.call_args_list[1].kwargs == {"input": [], "stream": True}
+    assert client.get_response.call_args_list[0].kwargs == {
+        "input": [],
+        "instructions": "project rules",
+    }
+    assert client.get_response.call_args_list[1].kwargs == {
+        "input": [],
+        "instructions": "project rules",
+        "stream": True,
+    }
 
 
 def test_input_reprompts_for_blank_and_recognizes_exit(monkeypatch, capsys):
