@@ -2,7 +2,7 @@
 
 import pytest
 
-from loop.utils.agents import load_agents_instructions
+from loop.utils.agents import build_instructions, load_agents_instructions
 
 
 def test_load_agents_instructions_accumulates_only_agents_files_in_scope(tmp_path):
@@ -90,3 +90,15 @@ def test_load_agents_instructions_requires_utf8(tmp_path):
 
     with pytest.raises(UnicodeDecodeError):
         load_agents_instructions(tmp_path)
+
+
+def test_build_instructions_combines_non_empty_sections():
+    """Non-empty sections are preserved and separated by a blank line."""
+    assert build_instructions("project rules", None, "", "skill catalog") == (
+        "project rules\n\nskill catalog"
+    )
+
+
+def test_build_instructions_returns_none_without_content():
+    """Missing or empty sections do not produce an instruction string."""
+    assert build_instructions(None, "") is None

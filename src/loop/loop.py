@@ -17,9 +17,10 @@ from openai.types.responses import (
 
 from .client import Client
 from .interaction import ConsoleInteraction, Interaction
+from .skills import SkillManager
 from .tooling import ToolRegistry
 from .tooling import tool_registry as default_tool_registry
-from .utils.agents import load_agents_instructions
+from .utils.agents import build_instructions, load_agents_instructions
 
 
 @dataclass
@@ -45,6 +46,7 @@ class BaseLoop:
     Args:
         client: Client used to request model responses. When omitted, a client is created.
         tool_registry: Registry used by the automatically created client.
+        skill_manager: Manager used to discover and progressively activate Agent Skills.
         interaction: Service used for all user input and output.
         working_directory: Directory used to discover applicable AGENTS.md files.
         debug: Whether to print raw response events.
@@ -56,6 +58,7 @@ class BaseLoop:
     _client: Client
     _instructions: str | None
     _messages: list[dict]
+    _skill_manager: SkillManager
     _interaction: Interaction
     _working_directory: Path
     _debug: bool
@@ -64,6 +67,7 @@ class BaseLoop:
         self,
         client: Client | None = None,
         tool_registry: ToolRegistry | None = None,
+        skill_manager: SkillManager | None = None,
         interaction: Interaction | None = None,
         working_directory: Path | str | None = None,
         debug: bool = False,
@@ -78,7 +82,11 @@ class BaseLoop:
         self._client = client or Client(tool_registry=tool_registry)
         self._messages = []
         self._working_directory = Path(working_directory or Path.cwd()).resolve()
-        self._instructions = load_agents_instructions(self._working_directory)
+        self._skill_manager = skill_manager or SkillManager.discover(self._working_directory)
+        self._instructions = build_instructions(
+            load_agents_instructions(self._working_directory),
+            self._skill_manager.catalog(),
+        )
         self._debug = debug
 
     @property
@@ -95,6 +103,11 @@ class BaseLoop:
     def messages(self) -> list[dict]:
         """Return the current conversation history."""
         return self._messages
+
+    @property
+    def skill_manager(self) -> SkillManager:
+        """Return the skill manager active for this conversation."""
+        return self._skill_manager
 
     @property
     def interaction(self) -> Interaction:
@@ -163,6 +176,7 @@ class BaseLoop:
                         tool_call.name,
                         tool_call.arguments,
                         interaction=self._interaction,
+                        skill_manager=self._skill_manager,
                     ),
                 }
             )

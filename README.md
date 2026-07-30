@@ -19,6 +19,7 @@ The project defaults to a local server at `http://localhost:8000/v1` running
 - Built-in tools for filesystem access, shell commands, and the current date and time
 - Confirmation before a model writes a file or runs a shell command
 - Hierarchical project instructions from `AGENTS.md` files
+- Progressive discovery and activation of Agent Skills from `SKILL.md` files
 
 ## Requirements
 
@@ -123,6 +124,25 @@ def describe_tool(context: ToolContext, value: str) -> str:
 ```
 
 The context provides invocation metadata and access to the injected user interaction service.
+For loop-managed calls it also exposes the active `SkillManager`.
+
+### Agent Skills
+
+At startup, the loop discovers `SKILL.md` files under `.agents/skills` from the repository root
+through the working directory, followed by `~/.agents/skills`. Only each skill's YAML `name` and
+`description` are initially loaded and disclosed to the model. The complete Markdown instructions
+are read and cached only when the model calls `manage_skills` with the `activate` action.
+
+A minimal skill looks like this:
+
+```markdown
+---
+name: review-changes
+description: Review code changes for correctness, regressions, and missing tests.
+---
+
+Follow the repository's review workflow and report findings by severity.
+```
 
 ## Configuration
 
@@ -159,6 +179,7 @@ The default registry exposes these functions to the model:
 | `write_text_file`      | Writes a UTF-8 text file after interactive confirmation                       |
 | `get_current_datetime` | Returns the current local date and time                                       |
 | `run_command`          | Runs a shell command after interactive confirmation, with a 30-second timeout |
+| `manage_skills`        | Lists skill metadata or activates one skill's instructions on demand          |
 
 These tools operate with the permissions of the process running `loop`. Reads
 are not sandboxed, and approved commands are passed to the system shell. Run the

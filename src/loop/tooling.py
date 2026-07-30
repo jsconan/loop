@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from .interaction import Interaction, ToolContext
+from .skills import SkillManager
 from .types.tooling import ToolRegistrationError
 from .utils.tooling import (
     get_tool_arguments_model,
@@ -209,6 +210,7 @@ class ToolRegistry:
         arguments: str,
         *,
         interaction: Interaction | None = None,
+        skill_manager: SkillManager | None = None,
     ) -> str:
         """Dispatch a synchronous tool call by registered name.
 
@@ -216,6 +218,7 @@ class ToolRegistry:
             name: Registered tool name.
             arguments: JSON-encoded arguments supplied by the model.
             interaction: Interaction for this invocation. Overrides the registry default.
+            skill_manager: Skill manager active for the current conversation.
 
         Returns:
             The serialized tool result or a model-readable error.
@@ -226,7 +229,10 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
-        return tool.call(arguments, self._context_for(tool, interaction))
+        return tool.call(
+            arguments,
+            self._context_for(tool, interaction, skill_manager),
+        )
 
     async def call_async(
         self,
@@ -234,6 +240,7 @@ class ToolRegistry:
         arguments: str,
         *,
         interaction: Interaction | None = None,
+        skill_manager: SkillManager | None = None,
     ) -> str:
         """Dispatch an asynchronous or synchronous tool call by registered name.
 
@@ -241,6 +248,7 @@ class ToolRegistry:
             name: Registered tool name.
             arguments: JSON-encoded arguments supplied by the model.
             interaction: Interaction for this invocation. Overrides the registry default.
+            skill_manager: Skill manager active for the current conversation.
 
         Returns:
             The serialized tool result or a model-readable error.
@@ -251,19 +259,27 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
-        return await tool.call_async(arguments, self._context_for(tool, interaction))
+        return await tool.call_async(
+            arguments,
+            self._context_for(tool, interaction, skill_manager),
+        )
 
     def _context_for(
         self,
         tool: Tool,
         interaction: Interaction | None,
+        skill_manager: SkillManager | None,
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""
         if interaction is None:
             interaction = self._interaction
         if interaction is None:
             return None
-        return ToolContext(interaction=interaction, tool_name=tool.name)
+        return ToolContext(
+            interaction=interaction,
+            tool_name=tool.name,
+            skill_manager=skill_manager,
+        )
 
 
 tool_registry = ToolRegistry()

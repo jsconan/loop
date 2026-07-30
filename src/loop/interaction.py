@@ -1,12 +1,17 @@
 """Define user interaction abstractions and tool invocation context."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pprint import pformat
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from prompt_toolkit import PromptSession
 from rich.console import Console
 from rich.prompt import Confirm
+
+if TYPE_CHECKING:
+    from .skills import SkillManager
 
 
 class Interaction(Protocol):
@@ -79,10 +84,12 @@ class ToolContext:
     Args:
         interaction: Service used to communicate with the user.
         tool_name: Public name of the tool being invoked.
+        skill_manager: Skill manager active for the current conversation.
     """
 
     interaction: Interaction
     tool_name: str
+    skill_manager: SkillManager | None = None
 
     def confirm(self, message: str, *, default: bool = False) -> bool:
         """Ask the user to confirm an action through the interaction service.

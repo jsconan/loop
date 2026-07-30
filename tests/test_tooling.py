@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from loop.interaction import Interaction, ToolContext
+from loop.skills import SkillManager
 from loop.tooling import ToolRegistrationError, ToolRegistry
 
 
@@ -106,6 +107,24 @@ def test_context_aware_function_receives_an_explicit_tool_context():
         registry.call("decorated", '{"value":"done"}', interaction=interaction)
         == "decorated:done"
     )
+
+
+def test_context_aware_function_receives_the_active_skill_manager():
+    """Dispatch places the conversation's skill manager in ToolContext."""
+    registry = ToolRegistry()
+    manager = SkillManager()
+
+    @registry.tool
+    def has_skills(context: ToolContext) -> bool:
+        """Report whether a skill manager is active."""
+        return context.skill_manager is manager
+
+    assert registry.call(
+        "has_skills",
+        "{}",
+        interaction=Mock(spec=Interaction),
+        skill_manager=manager,
+    ) == "true"
 
 
 def test_context_aware_function_requires_runtime_context():

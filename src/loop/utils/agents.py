@@ -51,3 +51,9 @@ def load_agents_instructions(
     if len(encoded) <= max_bytes:
         return combined
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def build_instructions(*sections: str | None) -> str | None:
+    """Combine non-empty instruction sections without changing their content."""
+    included = [section for section in sections if section]
+    return "\n\n".join(included) or None

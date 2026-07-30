@@ -183,6 +183,7 @@ def test_response_output_and_tool_results_use_responses_api_input_items():
         "get_current_datetime",
         "{}",
         interaction=loop.interaction,
+        skill_manager=loop.skill_manager,
     )
 
 
