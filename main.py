@@ -1,5 +1,7 @@
 """Main entry point for the loop package."""
 
+from dotenv import find_dotenv, load_dotenv
+
 from loop import ConsoleInteraction, StreamingLoop
 from loop.types import ShutdownRequested
 from loop.utils.signals import register_shutdown_signals
@@ -7,6 +9,7 @@ from loop.utils.signals import register_shutdown_signals
 
 def main() -> None:
     """Run an interactive conversation with an LLM backend."""
+    load_dotenv(find_dotenv(usecwd=True))
     register_shutdown_signals()
     interaction = ConsoleInteraction()
 
