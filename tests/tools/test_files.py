@@ -103,6 +103,23 @@ def test_list_folder_respects_git_and_agent_ignore_files(tmp_path):
     ]
 
 
+def test_list_folder_rejects_ignored_folder_as_traversal_root(tmp_path):
+    """An ignored folder cannot be listed by requesting it directly."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").touch()
+    (tmp_path / ".gitignore").write_text("private/\n", encoding="utf-8")
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "secret.txt").touch()
+
+    assert list_folder(str(tmp_path / ".git")) == (
+        f"Error listing folder: Path '{tmp_path / '.git'}' is ignored."
+    )
+    assert list_folder(str(private)) == (
+        f"Error listing folder: Path '{private}' is ignored."
+    )
+
+
 def test_list_folder_applies_ancestor_and_nested_ignore_files(tmp_path):
     """Ignore rules follow the project hierarchy and nested rules win."""
     (tmp_path / ".git").mkdir()

@@ -32,6 +32,8 @@ def list_folder(
     """List selected, non-ignored entries in a folder on the local disk."""
     try:
         folder = Path(path).resolve()
+        if is_path_ignored(folder):
+            return f"Error listing folder: Path '{path}' is ignored."
         entries = iter_visible_paths(folder, recursive)
         return sorted(
             (
