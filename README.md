@@ -32,7 +32,7 @@ The project defaults to a local server at `http://localhost:8000/v1` running
 Clone the repository and install its dependencies:
 
 ```bash
-git clone https://github.com/jsconan/things.git
+git clone https://github.com/jsconan/loop.git
 cd loop
 uv sync
 ```
@@ -176,7 +176,7 @@ The default registry exposes these functions to the model:
 
 | Tool                   | Behavior                                                                      |
 | ---------------------- | ----------------------------------------------------------------------------- |
-| `list_folder`          | Lists typed file/folder entries, optionally including nested entries           |
+| `list_folder`          | Lists typed file/folder entries, optionally including nested entries          |
 | `read_text_file`       | Reads a UTF-8 text file                                                       |
 | `write_text_file`      | Writes a UTF-8 text file after interactive confirmation                       |
 | `get_current_datetime` | Returns the current local date and time                                       |
