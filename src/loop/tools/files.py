@@ -7,7 +7,7 @@ from pydantic import Field
 
 from ..interaction import ToolContext
 from ..tooling import tool_registry
-from ..utils.path import iter_visible_paths
+from ..utils.path import is_path_ignored, iter_visible_paths
 
 
 class FolderEntry(TypedDict):
@@ -51,10 +51,16 @@ def list_folder(
 
 @tool_registry.tool
 def read_text_file(
+    context: ToolContext,
     path: Annotated[str, Field(description="Path to the text file to read.")],
 ) -> str:
     """Read the contents of a text file from the local disk."""
     try:
+        if is_path_ignored(path) and not context.confirm(
+            f"Agent wants to read ignored file '{path}'. Proceed?"
+        ):
+            return "Read operation cancelled by user."
+
         content = Path(path).read_bytes()
         if not content:
             return f"File '{path}' is empty."

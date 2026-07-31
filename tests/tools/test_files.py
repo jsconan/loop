@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, call
 from loop import (
     ConsoleInteraction,
     list_folder,
-    read_text_file,
     tool_registry,
 )
 
@@ -16,6 +15,15 @@ def write_text_file(path, content):
     return tool_registry.call(
         "write_text_file",
         json.dumps({"path": str(path), "content": content}),
+        interaction=ConsoleInteraction(),
+    )
+
+
+def read_text_file(path):
+    """Dispatch the context-aware file-reading tool."""
+    return tool_registry.call(
+        "read_text_file",
+        json.dumps({"path": str(path)}),
         interaction=ConsoleInteraction(),
     )
 
@@ -135,13 +143,40 @@ def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads
     binary = tmp_path / "binary.dat"
     binary.write_bytes(b"valid UTF-8\0binary payload")
 
-    assert read_text_file.__name__ == "read_text_file"
     assert read_text_file(str(populated)) == "hello"
     assert read_text_file(str(empty)) == f"File '{empty}' is empty."
     assert read_text_file(str(binary)) == (
         f"Error reading file: File '{binary}' appears to be binary."
     )
     assert read_text_file(str(tmp_path / "missing.txt")).startswith("Error reading file:")
+
+
+def test_read_text_file_requires_confirmation_for_ignored_files(tmp_path, monkeypatch):
+    """Ignored files are only read after an affirmative confirmation."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("sensitive", encoding="utf-8")
+    confirm = MagicMock(side_effect=[False, True])
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    assert read_text_file(secret) == "Read operation cancelled by user."
+    assert read_text_file(secret) == "sensitive"
+    assert confirm.call_args_list == [
+        call(f"Agent wants to read ignored file '{secret}'. Proceed?", default=False),
+        call(f"Agent wants to read ignored file '{secret}'. Proceed?", default=False),
+    ]
+
+
+def test_read_text_file_does_not_confirm_for_visible_files(tmp_path, monkeypatch):
+    """Visible files remain readable without interrupting the user."""
+    visible = tmp_path / "visible.txt"
+    visible.write_text("hello", encoding="utf-8")
+    confirm = MagicMock()
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    assert read_text_file(visible) == "hello"
+    confirm.assert_not_called()
 
 
 def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, monkeypatch):
