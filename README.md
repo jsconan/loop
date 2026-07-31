@@ -173,8 +173,7 @@ The default registry exposes these functions to the model:
 
 | Tool                   | Behavior                                                                      |
 | ---------------------- | ----------------------------------------------------------------------------- |
-| `list_files`           | Lists files directly inside a directory                                       |
-| `list_folders`         | Lists subdirectories directly inside a directory                              |
+| `list_folder`          | Lists typed file/folder entries, optionally including nested entries           |
 | `read_text_file`       | Reads a UTF-8 text file                                                       |
 | `write_text_file`      | Writes a UTF-8 text file after interactive confirmation                       |
 | `get_current_datetime` | Returns the current local date and time                                       |

@@ -6,8 +6,7 @@ __all__ = [
     "ConsoleInteraction",
     "get_current_datetime",
     "Interaction",
-    "list_files",
-    "list_folders",
+    "list_folder",
     "manage_skills",
     "read_text_file",
     "Response",
@@ -31,8 +30,7 @@ from .skills import Skill, SkillManager
 from .tooling import Tool, ToolRegistry, tool_registry
 from .tools import (
     get_current_datetime,
-    list_files,
-    list_folders,
+    list_folder,
     manage_skills,
     read_text_file,
     run_command,

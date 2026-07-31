@@ -5,8 +5,7 @@ from unittest.mock import MagicMock, call
 
 from loop import (
     ConsoleInteraction,
-    list_files,
-    list_folders,
+    list_folder,
     read_text_file,
     tool_registry,
 )
@@ -21,28 +20,54 @@ def write_text_file(path, content):
     )
 
 
-def test_list_files_returns_sorted_file_names_and_reports_failures(tmp_path):
-    """Listing returns direct files in name order and reports invalid folders."""
+def test_list_folder_filters_and_sorts_immediate_entries(tmp_path):
+    """Listing filters immediate entries by type and sorts their names."""
     (tmp_path / "zebra.txt").touch()
     (tmp_path / "alpha.txt").touch()
     (tmp_path / "nested").mkdir()
     (tmp_path / "nested" / "ignored.txt").touch()
 
-    assert list_files.__name__ == "list_files"
-    assert list_files(str(tmp_path)) == ["alpha.txt", "zebra.txt"]
-    assert list_files(str(tmp_path / "missing")).startswith("Error listing files:")
+    assert list_folder.__name__ == "list_folder"
+    assert list_folder(str(tmp_path)) == [
+        {"path": "alpha.txt", "type": "file"},
+        {"path": "nested", "type": "folder"},
+        {"path": "zebra.txt", "type": "file"},
+    ]
+    assert list_folder(str(tmp_path), "files") == [
+        {"path": "alpha.txt", "type": "file"},
+        {"path": "zebra.txt", "type": "file"},
+    ]
+    assert list_folder(str(tmp_path), "folders") == [
+        {"path": "nested", "type": "folder"}
+    ]
 
 
-def test_list_folders_returns_sorted_folder_names_and_reports_failures(tmp_path):
-    """Listing returns direct folders in name order and reports invalid folders."""
-    (tmp_path / "zebra").mkdir()
-    (tmp_path / "alpha").mkdir()
-    (tmp_path / "file.txt").touch()
-    (tmp_path / "alpha" / "ignored").mkdir()
+def test_list_folder_recursively_returns_relative_paths(tmp_path):
+    """Recursive listings return selected entries relative to the requested folder."""
+    (tmp_path / "root.txt").touch()
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "child.txt").touch()
+    (tmp_path / "nested" / "deeper").mkdir()
 
-    assert list_folders.__name__ == "list_folders"
-    assert list_folders(str(tmp_path)) == ["alpha", "zebra"]
-    assert list_folders(str(tmp_path / "missing")).startswith("Error listing folders:")
+    assert list_folder(str(tmp_path), "files", recursive=True) == [
+        {"path": "nested/child.txt", "type": "file"},
+        {"path": "root.txt", "type": "file"},
+    ]
+    assert list_folder(str(tmp_path), "folders", recursive=True) == [
+        {"path": "nested", "type": "folder"},
+        {"path": "nested/deeper", "type": "folder"},
+    ]
+    assert list_folder(str(tmp_path), recursive=True) == [
+        {"path": "nested", "type": "folder"},
+        {"path": "nested/child.txt", "type": "file"},
+        {"path": "nested/deeper", "type": "folder"},
+        {"path": "root.txt", "type": "file"},
+    ]
+
+
+def test_list_folder_reports_failures(tmp_path):
+    """Listing reports an invalid folder as a readable tool result."""
+    assert list_folder(str(tmp_path / "missing")).startswith("Error listing folder:")
 
 
 def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads(tmp_path):

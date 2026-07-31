@@ -2,8 +2,7 @@
 
 __all__ = [
     "get_current_datetime",
-    "list_files",
-    "list_folders",
+    "list_folder",
     "manage_skills",
     "read_text_file",
     "run_command",
@@ -12,6 +11,6 @@ __all__ = [
 
 
 from .dates import get_current_datetime
-from .files import list_files, list_folders, read_text_file, write_text_file
+from .files import list_folder, read_text_file, write_text_file
 from .skills import manage_skills
 from .system import run_command

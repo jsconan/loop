@@ -1,7 +1,7 @@
 """Provide tools for accessing files and folders on the local disk."""
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal, TypedDict
 
 from pydantic import Field
 
@@ -9,28 +9,43 @@ from ..interaction import ToolContext
 from ..tooling import tool_registry
 
 
-@tool_registry.tool
-def list_files(
-    path: Annotated[str, Field(description="Path to the folder whose files should be listed.")],
-) -> list[str] | str:
-    """List the files directly contained in a folder on the local disk."""
-    try:
-        return sorted(entry.name for entry in Path(path).iterdir() if entry.is_file())
-    except Exception as exc:  # pylint: disable=broad-except
-        return f"Error listing files: {exc}"
+class FolderEntry(TypedDict):
+    """Describe a listed folder entry."""
+
+    path: str
+    type: Literal["file", "folder"]
 
 
 @tool_registry.tool
-def list_folders(
-    path: Annotated[
-        str, Field(description="Path to the folder whose subfolders should be listed.")
-    ],
-) -> list[str] | str:
-    """List the folders directly contained in a folder on the local disk."""
+def list_folder(
+    path: Annotated[str, Field(description="Path to the folder whose entries should be listed.")],
+    entry_type: Annotated[
+        Literal["files", "folders", "all"],
+        Field(description="Type of entries to list."),
+    ] = "all",
+    recursive: Annotated[
+        bool,
+        Field(description="Whether to include entries in nested folders."),
+    ] = False,
+) -> list[FolderEntry] | str:
+    """List selected entries in a folder on the local disk."""
     try:
-        return sorted(entry.name for entry in Path(path).iterdir() if entry.is_dir())
+        folder = Path(path)
+        entries = folder.rglob("*") if recursive else folder.iterdir()
+        return sorted(
+            (
+                {
+                    "path": str(entry.relative_to(folder)) if recursive else entry.name,
+                    "type": "folder" if entry.is_dir() else "file",
+                }
+                for entry in entries
+                if (entry_type in ("all", "files") and entry.is_file())
+                or (entry_type in ("all", "folders") and entry.is_dir())
+            ),
+            key=lambda entry: entry["path"],
+        )
     except Exception as exc:  # pylint: disable=broad-except
-        return f"Error listing folders: {exc}"
+        return f"Error listing folder: {exc}"
 
 
 @tool_registry.tool
