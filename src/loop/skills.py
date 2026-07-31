@@ -7,9 +7,12 @@ from typing import Any
 
 import yaml
 
-from .utils.path import find_project_root
+from .utils.instructions import (
+    instruction_directories,
+    read_instruction_body,
+    read_instruction_frontmatter,
+)
 
-DEFAULT_SKILLS_DIRECTORY = Path(".agents/skills")
 MAX_CATALOG_CHARS = 8_000
 
 
@@ -75,7 +78,7 @@ class SkillManager:
         directories = (
             skill_directories
             if skill_directories is not None
-            else cls._default_directories(working_directory)
+            else instruction_directories(working_directory)
         )
         skills = []
         diagnostics = []
@@ -85,54 +88,15 @@ class SkillManager:
                 continue
             for location in sorted(directory.glob("*/SKILL.md")):
                 try:
-                    skills.append(cls._read_metadata(location.resolve()))
+                    location = location.resolve()
+                    metadata = read_instruction_frontmatter(
+                        location, required_fields=("name", "description")
+                    )
+                    skills.append(Skill(metadata["name"], metadata["description"], location))
                 except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
                     diagnostics.append(f"Skipped '{location}': {exc}")
 
         return cls(skills, diagnostics)
-
-    @staticmethod
-    def _default_directories(working_directory: Path) -> list[Path]:
-        """Return repository-to-working-directory roots followed by the user root."""
-        project_root = find_project_root(working_directory)
-        if project_root is None:
-            directories = [working_directory / DEFAULT_SKILLS_DIRECTORY]
-        else:
-            scoped = []
-            directory = working_directory
-            while True:
-                scoped.append(directory / DEFAULT_SKILLS_DIRECTORY)
-                if directory == project_root:
-                    break
-                directory = directory.parent
-            directories = list(reversed(scoped))
-        directories.append(Path.home() / DEFAULT_SKILLS_DIRECTORY)
-        return directories
-
-    @staticmethod
-    def _read_metadata(location: Path) -> Skill:
-        """Read and validate only the frontmatter of a skill file."""
-        frontmatter = []
-        with location.open(encoding="utf-8") as skill_file:
-            if skill_file.readline().strip() != "---":
-                raise ValueError("SKILL.md must start with YAML frontmatter")
-            for line in skill_file:
-                if line.strip() == "---":
-                    break
-                frontmatter.append(line)
-            else:
-                raise ValueError("SKILL.md frontmatter is not terminated")
-
-        metadata = yaml.safe_load("".join(frontmatter))
-        if not isinstance(metadata, dict):
-            raise ValueError("SKILL.md frontmatter must be a mapping")
-        name = metadata.get("name")
-        description = metadata.get("description")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("SKILL.md requires a non-empty name")
-        if not isinstance(description, str) or not description.strip():
-            raise ValueError("SKILL.md requires a non-empty description")
-        return Skill(name.strip(), description.strip(), location)
 
     def list(self) -> dict[str, Any]:
         """Return available skills, activation state, and discovery diagnostics."""
@@ -163,7 +127,9 @@ class SkillManager:
         skill = matches[0]
         if skill.location not in self._activated:
             content = skill.location.read_text(encoding="utf-8")
-            self._activated[skill.location] = self._body(content)
+            self._activated[skill.location] = read_instruction_body(
+                content, skill.location.name
+            )
         return {
             **self._summary(skill),
             "skill_root": str(skill.location.parent),
@@ -216,14 +182,3 @@ class SkillManager:
             "location": str(skill.location),
             "activated": skill.location in self._activated,
         }
-
-    @staticmethod
-    def _body(content: str) -> str:
-        """Return the Markdown body following YAML frontmatter."""
-        lines = content.splitlines()
-        if not lines or lines[0].strip() != "---":
-            raise ValueError("SKILL.md must start with YAML frontmatter")
-        for index, line in enumerate(lines[1:], start=1):
-            if line.strip() == "---":
-                return "\n".join(lines[index + 1 :]).strip()
-        raise ValueError("SKILL.md frontmatter is not terminated")

@@ -1,8 +1,106 @@
-"""Tests for AGENTS.md instruction discovery."""
+"""Tests for instruction discovery and parsing."""
+
+from pathlib import Path
 
 import pytest
 
-from loop.utils.instructions import build_instructions, load_agents_instructions
+from loop.utils.instructions import (
+    build_instructions,
+    instruction_directories,
+    load_agents_instructions,
+    read_instruction_body,
+    read_instruction_frontmatter,
+)
+
+
+def test_instruction_directories_orders_project_scopes_before_user_directory(tmp_path, monkeypatch):
+    """Instruction directories follow project scope order and end with the user scope."""
+    project = tmp_path / "project"
+    working_directory = project / "packages" / "app"
+    home = tmp_path / "home"
+    working_directory.mkdir(parents=True)
+    (project / ".git").mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    assert instruction_directories(working_directory) == [
+        project / ".agents/skills",
+        project / "packages/.agents/skills",
+        working_directory / ".agents/skills",
+        home / ".agents/skills",
+    ]
+
+
+def test_instruction_directories_uses_local_and_user_scopes_without_project(tmp_path, monkeypatch):
+    """A directory outside a project contributes only its local and user scopes."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    assert instruction_directories(tmp_path, Path("instructions")) == [
+        tmp_path / "instructions",
+        home / "instructions",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("No frontmatter", "must start with YAML frontmatter"),
+        ("---\nname: broken\n", "frontmatter is not terminated"),
+        ("---\n- item\n---\n", "frontmatter must be a mapping"),
+    ],
+)
+def test_read_instruction_frontmatter_validates_structure(tmp_path, content, message):
+    """Frontmatter parsing rejects missing, unterminated, and non-mapping metadata."""
+    location = tmp_path / "SKILL.md"
+    location.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        read_instruction_frontmatter(location)
+
+
+def test_read_instruction_frontmatter_returns_yaml_mapping(tmp_path):
+    """Frontmatter parsing returns the decoded YAML mapping without reading the body."""
+    location = tmp_path / "SKILL.md"
+    location.write_text("---\nname: review\n---\nBody", encoding="utf-8")
+
+    assert read_instruction_frontmatter(location) == {"name": "review"}
+
+
+@pytest.mark.parametrize("field", ["description:", "description: 1", "description: '  '"])
+def test_read_instruction_frontmatter_validates_required_fields(tmp_path, field):
+    """Required fields must be non-empty strings and valid values are normalized."""
+    location = tmp_path / "SKILL.md"
+    location.write_text(
+        f"---\nname: review\n{field}\n---\nBody", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="requires a non-empty description"):
+        read_instruction_frontmatter(location, required_fields=("name", "description"))
+
+    location.write_text(
+        "---\nname: ' review '\ndescription: ' Review work. '\n---\nBody", encoding="utf-8"
+    )
+    assert read_instruction_frontmatter(
+        location, required_fields=("name", "description")
+    ) == {"name": "review", "description": "Review work."}
+
+
+def test_read_instruction_body_returns_trimmed_markdown():
+    """Body parsing removes frontmatter and surrounding whitespace."""
+    assert read_instruction_body("---\nname: review\n---\n\nDo work.\n", "SKILL.md") == ("Do work.")
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("No frontmatter", "must start with YAML frontmatter"),
+        ("---\nname: broken\n", "frontmatter is not terminated"),
+    ],
+)
+def test_read_instruction_body_validates_frontmatter(content, message):
+    """Body parsing rejects missing and unterminated frontmatter."""
+    with pytest.raises(ValueError, match=message):
+        read_instruction_body(content, "SKILL.md")
 
 
 def test_load_agents_instructions_accumulates_only_agents_files_in_scope(tmp_path):
