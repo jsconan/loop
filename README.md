@@ -180,6 +180,11 @@ The default registry exposes these functions to the model:
 | `run_command`          | Runs a shell command after interactive confirmation, with a 30-second timeout |
 | `manage_skills`        | Lists skill metadata or activates one skill's instructions on demand          |
 
+`list_folder` follows `.gitignore` and `.agentignore` files from the Git project root through
+nested folders, using Git's pattern syntax. Agent-specific rules take precedence over Git rules,
+and ignored directories are not traversed. This filtering controls file discovery only; it does
+not prevent an explicitly requested file from being read or changed.
+
 These tools operate with the permissions of the process running `loop`. Reads
 are not sandboxed, and approved commands are passed to the system shell. Run the
 project only in an environment where you are comfortable granting the model that

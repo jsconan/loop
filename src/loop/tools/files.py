@@ -7,6 +7,7 @@ from pydantic import Field
 
 from ..interaction import ToolContext
 from ..tooling import tool_registry
+from ..utils.path import iter_visible_paths
 
 
 class FolderEntry(TypedDict):
@@ -28,10 +29,10 @@ def list_folder(
         Field(description="Whether to include entries in nested folders."),
     ] = False,
 ) -> list[FolderEntry] | str:
-    """List selected entries in a folder on the local disk."""
+    """List selected, non-ignored entries in a folder on the local disk."""
     try:
-        folder = Path(path)
-        entries = folder.rglob("*") if recursive else folder.iterdir()
+        folder = Path(path).resolve()
+        entries = iter_visible_paths(folder, recursive)
         return sorted(
             (
                 {

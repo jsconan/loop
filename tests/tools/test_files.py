@@ -37,9 +37,7 @@ def test_list_folder_filters_and_sorts_immediate_entries(tmp_path):
         {"path": "alpha.txt", "type": "file"},
         {"path": "zebra.txt", "type": "file"},
     ]
-    assert list_folder(str(tmp_path), "folders") == [
-        {"path": "nested", "type": "folder"}
-    ]
+    assert list_folder(str(tmp_path), "folders") == [{"path": "nested", "type": "folder"}]
 
 
 def test_list_folder_recursively_returns_relative_paths(tmp_path):
@@ -62,6 +60,64 @@ def test_list_folder_recursively_returns_relative_paths(tmp_path):
         {"path": "nested/child.txt", "type": "file"},
         {"path": "nested/deeper", "type": "folder"},
         {"path": "root.txt", "type": "file"},
+    ]
+
+
+def test_list_folder_respects_git_and_agent_ignore_files(tmp_path):
+    """Listings prune ignored paths and give agent rules higher precedence."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "metadata").touch()
+    (tmp_path / ".gitignore").write_text(
+        "*.log\ngenerated/\n!secret.txt\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".agentignore").write_text(
+        "secret.txt\n!generated/\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "debug.log").touch()
+    (tmp_path / "secret.txt").touch()
+    (tmp_path / "visible.txt").touch()
+    (tmp_path / "generated").mkdir()
+    (tmp_path / "generated" / "output.txt").touch()
+
+    assert list_folder(str(tmp_path), "files") == [
+        {"path": ".agentignore", "type": "file"},
+        {"path": ".gitignore", "type": "file"},
+        {"path": "visible.txt", "type": "file"},
+    ]
+    assert list_folder(str(tmp_path), recursive=True) == [
+        {"path": ".agentignore", "type": "file"},
+        {"path": ".gitignore", "type": "file"},
+        {"path": "generated", "type": "folder"},
+        {"path": "generated/output.txt", "type": "file"},
+        {"path": "visible.txt", "type": "file"},
+    ]
+
+
+def test_list_folder_applies_ancestor_and_nested_ignore_files(tmp_path):
+    """Ignore rules follow the project hierarchy and nested rules win."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".gitignore").write_text("!keep.tmp\n", encoding="utf-8")
+    (project / ".agentignore").write_text("private/\n", encoding="utf-8")
+    (project / "drop.tmp").touch()
+    (project / "keep.tmp").touch()
+    (project / "private").mkdir()
+    (project / "private" / "hidden.txt").touch()
+    (project / "src").mkdir()
+    (project / "src" / ".agentignore").write_text("generated.py\n", encoding="utf-8")
+    (project / "src" / "generated.py").touch()
+    (project / "src" / "main.py").touch()
+
+    assert list_folder(str(project), "files", recursive=True) == [
+        {"path": ".agentignore", "type": "file"},
+        {"path": ".gitignore", "type": "file"},
+        {"path": "keep.tmp", "type": "file"},
+        {"path": "src/.agentignore", "type": "file"},
+        {"path": "src/main.py", "type": "file"},
     ]
 
 
