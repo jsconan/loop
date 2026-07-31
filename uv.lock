@@ -252,6 +252,7 @@ name = "loop"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "openai" },
     { name = "pathspec" },
     { name = "prompt-toolkit" },
@@ -279,6 +280,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "openai", specifier = ">=2.46.0" },
     { name = "pathspec", specifier = ">=1.0.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.52" },
