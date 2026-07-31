@@ -35,6 +35,8 @@ def fetch_content(
             timeout=30.0,
         )
         response.raise_for_status()
+        if b"\0" in response.content:
+            raise ValueError(f"Content at '{url}' appears to be binary.")
         return response.text
     except Exception as exc:  # pylint: disable=broad-except
         return f"Error fetching content: {exc}"

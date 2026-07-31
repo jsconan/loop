@@ -33,8 +33,8 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
         "https://example.com/file.txt",
         headers={
             "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; "
+                "rv:153.0) Gecko/20100101 Firefox/153.0"
             ),
         },
         follow_redirects=True,
@@ -76,6 +76,18 @@ def test_fetch_content_reports_failures(monkeypatch):
     assert fetch_content("https://example.com/file.txt") == (
         "Error fetching content: network unavailable"
     )
+
+
+def test_fetch_content_rejects_binary_content(monkeypatch):
+    """Binary response content is not returned to the agent."""
+    response = MagicMock(content=b"binary\0content")
+    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr("loop.tools.web.httpx.get", MagicMock(return_value=response))
+
+    assert fetch_content("https://example.com/file.bin") == (
+        "Error fetching content: Content at 'https://example.com/file.bin' appears to be binary."
+    )
+    response.raise_for_status.assert_called_once_with()
 
 
 def test_fetch_content_rejects_non_http_urls(monkeypatch):
