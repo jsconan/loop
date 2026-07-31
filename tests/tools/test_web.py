@@ -90,3 +90,17 @@ def test_fetch_content_rejects_non_http_urls(monkeypatch):
     assert "Invalid arguments for tool 'fetch_content'" in result
     confirm.assert_not_called()
     get.assert_not_called()
+
+
+def test_fetch_content_rejects_malformed_urls(monkeypatch):
+    """Malformed HTTP URLs are rejected before confirmation or network access."""
+    confirm = MagicMock(return_value=True)
+    get = MagicMock()
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr("loop.tools.web.httpx.get", get)
+
+    result = fetch_content("https://")
+
+    assert "Invalid arguments for tool 'fetch_content'" in result
+    confirm.assert_not_called()
+    get.assert_not_called()

@@ -4,14 +4,13 @@ import os
 from typing import Annotated
 
 import httpx
-from pydantic import Field
+from pydantic import Field, HttpUrl
 
 from ..interaction import ToolContext
 from ..tooling import tool_registry
 
 _DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
 )
 
 
@@ -19,11 +18,12 @@ _DEFAULT_USER_AGENT = (
 def fetch_content(
     context: ToolContext,
     url: Annotated[
-        str,
-        Field(description="HTTP(S) URL of the content to fetch.", pattern=r"^https?://"),
+        HttpUrl,
+        Field(description="HTTP(S) URL of the content to fetch."),
     ],
 ) -> str:
     """Fetch and return text content from a URL."""
+    url = str(url)
     if not context.confirm(f"Agent wants to fetch content from '{url}'. Proceed?"):
         return "Fetch operation cancelled by user."
 
