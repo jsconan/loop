@@ -167,6 +167,9 @@ variables and built-in defaults:
 | Model    | `DEFAULT_MODEL`      | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
 | API key  | `OPENAI_API_KEY`     | `local-api-key`                |
 
+The `fetch_content` tool sends a browser-like user agent by default. Set `USER_AGENT` to override
+it for web requests.
+
 ## Built-in tools
 
 The default registry exposes these functions to the model:
@@ -177,6 +180,7 @@ The default registry exposes these functions to the model:
 | `read_text_file`       | Reads a UTF-8 text file                                                       |
 | `write_text_file`      | Writes a UTF-8 text file after interactive confirmation                       |
 | `get_current_datetime` | Returns the current local date and time                                       |
+| `fetch_content`        | Fetches raw text content from an HTTP(S) URL after interactive confirmation   |
 | `run_command`          | Runs a shell command after interactive confirmation, with a 30-second timeout |
 | `manage_skills`        | Lists skill metadata or activates one skill's instructions on demand          |
 

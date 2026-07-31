@@ -4,6 +4,7 @@ __all__ = [
     "BaseLoop",
     "Client",
     "ConsoleInteraction",
+    "fetch_content",
     "get_current_datetime",
     "Interaction",
     "list_folder",
@@ -29,6 +30,7 @@ from .loop import BaseLoop, Response, StreamingLoop
 from .skills import Skill, SkillManager
 from .tooling import Tool, ToolRegistry, tool_registry
 from .tools import (
+    fetch_content,
     get_current_datetime,
     list_folder,
     manage_skills,
