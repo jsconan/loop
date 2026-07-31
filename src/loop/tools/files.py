@@ -8,6 +8,7 @@ from pydantic import Field
 from ..interaction import ToolContext
 from ..tooling import tool_registry
 from ..utils.path import is_path_ignored, iter_visible_paths
+from ..utils.text import format_content_preview
 
 
 class FolderEntry(TypedDict):
@@ -79,8 +80,12 @@ def write_text_file(
     path: Annotated[str, Field(description="Path to the text file to write.")],
     content: Annotated[str, Field(description="Content to write to the file.")],
 ) -> str:
-    """Write content to a text file on the local disk."""
-    if not context.confirm(f"Agent wants to write to file '{path}'. Proceed?"):
+    """Write content to a file on the local disk."""
+    preview = format_content_preview(content)
+
+    context.interaction.info(f"Content to write to '{path}':\n{preview}")
+
+    if not context.confirm("Write the above content?"):
         return "Write operation cancelled by user."
 
     try:

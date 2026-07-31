@@ -208,9 +208,19 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
     assert write_text_file(str(target), "saved") == f"Successfully wrote to file '{target}'."
     assert target.read_text(encoding="utf-8") == "saved"
     assert confirm.call_args_list == [
-        call(f"Agent wants to write to file '{target}'. Proceed?", default=False),
-        call(f"Agent wants to write to file '{target}'. Proceed?", default=False),
+        call("Write the above content?", default=False),
+        call("Write the above content?", default=False),
     ]
+
+
+def test_write_text_file_truncation_notice_for_large_content(tmp_path, monkeypatch):
+    """Writing content exceeding the character limit appends a truncation notice."""
+    target = tmp_path / "big.txt"
+    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+
+    long_content = "x" * 2001
+    assert write_text_file(str(target), long_content) == f"Successfully wrote to file '{target}'."
+    assert target.read_text(encoding="utf-8") == long_content
 
 
 def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):
