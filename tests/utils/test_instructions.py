@@ -2,7 +2,7 @@
 
 import pytest
 
-from loop.utils.agents import build_instructions, load_agents_instructions
+from loop.utils.instructions import build_instructions, load_agents_instructions
 
 
 def test_load_agents_instructions_accumulates_only_agents_files_in_scope(tmp_path):

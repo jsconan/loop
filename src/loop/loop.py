@@ -20,7 +20,7 @@ from .interaction import ConsoleInteraction, Interaction
 from .skills import SkillManager
 from .tooling import ToolRegistry
 from .tooling import tool_registry as default_tool_registry
-from .utils.agents import build_instructions, load_agents_instructions
+from .utils.instructions import build_instructions, load_agents_instructions
 
 
 @dataclass
