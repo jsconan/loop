@@ -39,5 +39,5 @@ docstrings.
 ## Verify the change
 
 Define an observable success criterion. Run the narrowest relevant checks first, then the broader
-project checks warranted by the risk. Use the `unit-testing` skill when test code must be added or
+project checks warranted by the risk. Use the `testing` skill when test code must be added or
 changed.

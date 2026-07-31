@@ -39,7 +39,7 @@
 
 - Use the `coding` skill when adding, modifying, refactoring, fixing, or reviewing code under
   `src/`.
-- Use the `unit-testing` skill when adding, changing, reorganizing, or diagnosing tests under
+- Use the `testing` skill when adding, changing, reorganizing, or diagnosing tests under
   `tests/`.
 
 ## graphify

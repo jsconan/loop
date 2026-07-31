@@ -1,9 +1,9 @@
 ---
-name: unit-testing
+name: testing
 description: Write, update, reorganize, diagnose, and verify isolated pytest unit tests. Use whenever work affects tests, test placement, mocks or fixtures, behavioral coverage, edge and error cases, or this repository's 100% statement-and-branch coverage requirement.
 ---
 
-# Unit Testing
+# Testing
 
 Preserve 100% statement and branch coverage for active source code. Test supported behavior, edge
 cases, error paths, and branches. Never lower, bypass, exclude, or weaken coverage requirements to
