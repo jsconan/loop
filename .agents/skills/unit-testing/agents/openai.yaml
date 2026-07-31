@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unit Testing"
+  short_description: "Write isolated unit tests with full coverage"
+  default_prompt: "Use $unit-testing to write unit tests for this behavior."

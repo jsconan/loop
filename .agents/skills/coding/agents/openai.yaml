@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coding"
+  short_description: "Implement and document source-code changes"
+  default_prompt: "Use $coding to implement this change under src/."
