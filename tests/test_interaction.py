@@ -8,13 +8,41 @@ from rich.prompt import Confirm
 from loop.interaction import ConsoleInteraction
 
 
-def test_input_reads_from_the_terminal():
-    """Input owns its prompt and strips the terminal input."""
+def test_input_reads_a_trimmed_message_from_the_terminal():
+    """Input owns its prompt and strips the terminal message."""
     session = Mock()
     session.prompt.return_value = "  answer  \n"
 
     assert ConsoleInteraction(session=session).input() == "answer"
     session.prompt.assert_called_once_with("\nYou: ")
+
+
+def test_input_reprompts_for_blank_input(capsys):
+    """Input warns and prompts again until the terminal provides a message."""
+    session = Mock()
+    session.prompt.side_effect = ["   ", "answer"]
+
+    assert ConsoleInteraction(session=session).input() == "answer"
+    assert capsys.readouterr().out == "Warning: Please enter a message!\n"
+    assert session.prompt.call_count == 2
+
+
+@pytest.mark.parametrize("command", ["exit", "QUIT", " Bye ", "q"])
+def test_input_returns_false_for_exit_commands(command):
+    """Input recognizes supported exit commands without case or surrounding whitespace."""
+    session = Mock()
+    session.prompt.return_value = command
+
+    assert ConsoleInteraction(session=session).input() is False
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, EOFError])
+def test_input_returns_false_when_the_prompt_is_interrupted(error):
+    """Input treats terminal interruption and end-of-file as exit requests."""
+    session = Mock()
+    session.prompt.side_effect = error
+
+    assert ConsoleInteraction(session=session).input() is False
 
 
 @pytest.mark.parametrize(
@@ -138,13 +166,12 @@ def test_output_styles_prioritize_answers_over_diagnostics():
 
 
 def test_conversation_events_have_console_presentations(capsys):
-    """The console owns validation, progress, response, and termination formatting."""
+    """The console owns response and termination formatting."""
     interaction = ConsoleInteraction()
-    interaction.invalid_input()
     interaction.response_finished()
     interaction.conversation_ended()
 
-    assert capsys.readouterr().out == "Warning: Please enter a message!\n\n\nConversation ended.\n"
+    assert capsys.readouterr().out == "\n\nConversation ended.\n"
 
 
 @pytest.mark.parametrize(("default", "expected"), [(False, True), (True, False)])

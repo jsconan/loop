@@ -17,11 +17,12 @@ if TYPE_CHECKING:
 class Interaction(Protocol):
     """Provide semantically classified user interaction independently of a UI."""
 
-    def input(self) -> str:
-        """Read textual user input without surrounding whitespace.
+    def input(self) -> str | False:
+        """Read a non-empty user message or an exit command.
 
         Returns:
-            The stripped text entered by the user.
+            The stripped text entered by the user, or ``False`` when the user
+            requests to exit.
         """
 
     def reasoning(self, message: str) -> None:
@@ -55,9 +56,6 @@ class Interaction(Protocol):
             name: Name of the requested tool.
             arguments: JSON arguments supplied to the tool.
         """
-
-    def invalid_input(self) -> None:
-        """Display feedback for empty user input."""
 
     def token_usage(
         self,
@@ -128,13 +126,23 @@ class ConsoleInteraction:
         self._console = console or Console()
         self._session = session or PromptSession()
 
-    def input(self) -> str:
-        """Read stripped textual input from the terminal.
+    def input(self) -> str | False:
+        """Prompt for a non-empty user message or an exit command.
 
         Returns:
-            The stripped text entered by the user.
+            The entered message, or ``False`` when the user requests to exit.
         """
-        return self._session.prompt("\nYou: ").strip()
+        while True:
+            try:
+                user_input = self._session.prompt("\nYou: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                return False
+            if not user_input:
+                self.warning("Please enter a message!")
+                continue
+            if user_input.lower() in ["exit", "quit", "bye", "q"]:
+                return False
+            return user_input
 
     def _reasoning_heading(self) -> None:
         """Write a reasoning heading to the terminal."""
@@ -197,10 +205,6 @@ class ConsoleInteraction:
         self._console.print(
             f"\n[TOOL CALL]: {name}({arguments})", style="dim magenta", markup=False
         )
-
-    def invalid_input(self) -> None:
-        """Ask the terminal user to enter a non-empty message."""
-        self.warning("Please enter a message!")
 
     def token_usage(
         self,

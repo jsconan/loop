@@ -77,18 +77,6 @@ def test_client_and_tool_registry_cannot_both_be_supplied():
         StreamingLoop(client=SimpleNamespace(), tool_registry=ToolRegistry())
 
 
-def test_loop_uses_its_injected_interaction():
-    """A loop uses its injected interaction independently of the tool registry."""
-    interaction = Mock(spec=Interaction)
-    registry = ToolRegistry()
-    interaction.input.return_value = "hello"
-
-    loop = BaseLoop(tool_registry=registry, interaction=interaction)
-
-    assert loop.input() == "hello"
-    interaction.input.assert_called_once_with()
-
-
 def test_loop_exposes_its_configured_state(tmp_path):
     """Loop accessors expose the configured dependencies and conversation state."""
     client = loop_client()
@@ -130,7 +118,7 @@ def test_loop_accepts_a_string_working_directory(tmp_path):
     assert loop.working_directory == tmp_path.resolve()
 
 
-def test_run_requeries_after_a_tool_call_and_ends(capsys):
+def test_run_requeries_after_a_tool_call_and_ends():
     """The public runner records a tool result, requeries, then exits on the next input."""
     registry = ToolRegistry()
 
@@ -153,9 +141,9 @@ def test_run_requeries_after_a_tool_call_and_ends(capsys):
         SimpleNamespace(output=[call]),
         SimpleNamespace(output=[]),
     ]
-    loop = BaseLoop(client=client)
-    entries = iter(["hello", False])
-    loop.input = lambda: next(entries)
+    interaction = Mock(spec=Interaction)
+    interaction.input.side_effect = ["hello", False]
+    loop = BaseLoop(client=client, interaction=interaction)
 
     loop.run()
 
@@ -166,14 +154,14 @@ def test_run_requeries_after_a_tool_call_and_ends(capsys):
         "call_id": "call",
         "output": "done",
     }
-    assert "Conversation ended." in capsys.readouterr().out
+    interaction.conversation_ended.assert_called_once_with()
 
 
 def test_run_displays_token_usage_after_output():
     """The public runner reports updated usage only after displaying the response."""
     events = []
     interaction = Mock(spec=Interaction)
-    interaction.input.side_effect = ["hello", "q"]
+    interaction.input.side_effect = ["hello", False]
     interaction.answer.side_effect = lambda _content: events.append("output")
     interaction.token_usage.side_effect = lambda *_args: events.append("usage")
     client = Mock(default_model="requested-model")
@@ -242,7 +230,7 @@ def test_response_output_and_tool_results_use_responses_api_input_items():
 def test_latest_model_request_sets_current_context():
     """A tool follow-up replaces context usage with its resulting context size."""
     interaction = Mock(spec=Interaction)
-    interaction.input.side_effect = ["hello", "q"]
+    interaction.input.side_effect = ["hello", False]
     client = Mock()
     client.get_context_window.return_value = 1000
     loop = BaseLoop(client=client, interaction=interaction)
@@ -291,10 +279,10 @@ def test_latest_model_request_sets_current_context():
             total_tokens=total_tokens,
         )
 
-    assert loop.input() == "hello"
+    assert interaction.input() == "hello"
     loop.output(SimpleNamespace(output=[reasoning_one, answer_one], usage=raw_usage(100, 5, 105)))
     loop.output(SimpleNamespace(output=[reasoning_two, answer_two], usage=raw_usage(110, 9, 119)))
-    assert loop.input() is False
+    assert interaction.input() is False
 
     interaction.token_usage.assert_not_called()
 
@@ -326,36 +314,14 @@ def test_non_streaming_query_and_streaming_query_forward_history_and_instruction
     }
 
 
-def test_input_reprompts_for_blank_and_recognizes_exit(monkeypatch, capsys):
-    """Interactive input rejects blanks and accepts case-insensitive exit commands."""
-    values = iter(["   ", " EXIT "])
-    monkeypatch.setattr(
-        "loop.interaction.PromptSession.prompt", lambda _session, _prompt: next(values)
-    )
-    assert BaseLoop(client=loop_client()).input() is False
-    assert "Please enter a message!" in capsys.readouterr().out
-
-
-def test_input_returns_trimmed_message(monkeypatch):
-    """Interactive input returns a non-command message without surrounding whitespace."""
-    monkeypatch.setattr(
-        "loop.interaction.PromptSession.prompt", lambda _session, _prompt: " hello "
-    )
-    assert BaseLoop(client=loop_client()).input() == "hello"
-
-
-def test_input_and_end_use_the_injected_interaction():
-    """Input validation and termination output avoid process-global terminal functions."""
+def test_end_uses_the_injected_interaction():
+    """Termination output uses the injected interaction."""
     interaction = Mock(spec=Interaction)
-    interaction.input.side_effect = ["", "q"]
     registry = ToolRegistry()
     loop = BaseLoop(client=loop_client(tool_registry=registry), interaction=interaction)
 
-    assert loop.input() is False
     loop.end()
 
-    assert interaction.input.call_count == 2
-    interaction.invalid_input.assert_called_once_with()
     interaction.conversation_ended.assert_called_once_with()
     interaction.token_usage.assert_not_called()
 
@@ -363,7 +329,7 @@ def test_input_and_end_use_the_injected_interaction():
 def test_output_tracks_current_context_for_each_step():
     """Each model response replaces the tracked context token count."""
     interaction = Mock(spec=Interaction)
-    interaction.input.side_effect = ["first", "second", "third", "q"]
+    interaction.input.side_effect = ["first", "second", "third", False]
     client = Mock()
     client.get_context_window.return_value = 262144
     loop = BaseLoop(client=client, interaction=interaction)
@@ -382,13 +348,13 @@ def test_output_tracks_current_context_for_each_step():
         ]
     ]
 
-    assert loop.input() == "first"
+    assert interaction.input() == "first"
     first = loop.output(SimpleNamespace(output=[], usage=raw_usage[0])).usage
-    assert loop.input() == "second"
+    assert interaction.input() == "second"
     second = loop.output(SimpleNamespace(output=[], usage=raw_usage[1])).usage
-    assert loop.input() == "third"
+    assert interaction.input() == "third"
     third = loop.output(SimpleNamespace(output=[], usage=raw_usage[2])).usage
-    assert loop.input() is False
+    assert interaction.input() is False
 
     assert (first, second, third) == (2440, 3113, 3020)
 
@@ -398,7 +364,7 @@ def test_output_tracks_current_context_for_each_step():
 def test_output_tracks_the_model_reported_by_the_backend():
     """Response output tracks the model reported by the backend."""
     interaction = Mock(spec=Interaction)
-    interaction.input.side_effect = ["hello", "q"]
+    interaction.input.side_effect = ["hello", False]
     client = Mock(default_model="requested-model")
     client.get_context_window.return_value = 2000
     loop = BaseLoop(client=client, interaction=interaction)
@@ -410,9 +376,9 @@ def test_output_tracks_the_model_reported_by_the_backend():
         total_tokens=12,
     )
 
-    assert loop.input() == "hello"
+    assert interaction.input() == "hello"
     loop.output(SimpleNamespace(output=[], usage=usage, model="served-model"))
-    assert loop.input() is False
+    assert interaction.input() is False
 
     client.get_context_window.assert_not_called()
     interaction.token_usage.assert_not_called()

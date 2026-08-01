@@ -142,7 +142,7 @@ class BaseLoop:
     def run(self):
         """Run the conversation until the user requests to exit."""
         while True:
-            user_input = self.input()
+            user_input = self._interaction.input()
             if user_input is False:
                 break
             self._messages.append({"role": "user", "content": user_input})
@@ -208,22 +208,6 @@ class BaseLoop:
             input=self._messages,
             instructions=self._instructions,
         )
-
-    def input(self) -> str | False:
-        """Prompt for a non-empty user message or an exit command.
-
-        Returns:
-            The entered message, or ``False`` when the user requests to exit.
-        """
-        while True:
-            user_input = self._interaction.input()
-            if not user_input:
-                self._interaction.invalid_input()
-                continue
-
-            if user_input.lower() in ["exit", "quit", "bye", "q"]:
-                return False
-            return user_input
 
     def _update_context(self, usage, model: str | None) -> int | None:
         """Track the context produced by the latest model response."""
