@@ -5,6 +5,7 @@ from pathlib import Path
 
 from openai import BaseModel
 from openai.types.responses import (
+    ResponseCompletedEvent,
     ResponseFunctionToolCall,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
@@ -32,12 +33,16 @@ class Response:
         reasoning: The model's reasoning text.
         tool_calls: Function tool calls requested by the model.
         output_items: Raw output items returned by the model.
+        usage: Total tokens in the context after the response, when reported by the backend.
+        model: Model identifier reported by the backend.
     """
 
     answer: str
     reasoning: str
     tool_calls: list[ResponseFunctionToolCall] = field(default_factory=list)
     output_items: list[BaseModel] = field(default_factory=list)
+    usage: int | None = None
+    model: str | None = None
 
 
 class BaseLoop:
@@ -62,6 +67,8 @@ class BaseLoop:
     _interaction: Interaction
     _working_directory: Path
     _debug: bool
+    _context_tokens: int
+    _current_model: str | None
 
     def __init__(
         self,
@@ -76,7 +83,7 @@ class BaseLoop:
             raise ValueError("Pass either client or tool_registry, not both.")
 
         if tool_registry is None:
-            tool_registry = getattr(client, "tool_registry", default_tool_registry)
+            tool_registry = client.tool_registry if client is not None else default_tool_registry
 
         self._interaction = interaction or tool_registry.interaction or ConsoleInteraction()
         self._client = client or Client(tool_registry=tool_registry)
@@ -88,6 +95,9 @@ class BaseLoop:
             self._skill_manager.catalog(),
         )
         self._debug = debug
+        self._context_tokens = 0
+        default_model = self._client.default_model
+        self._current_model = default_model if isinstance(default_model, str) else None
 
     @property
     def client(self) -> Client:
@@ -143,6 +153,12 @@ class BaseLoop:
 
                 if not self.handle_tool_calls(response):
                     break
+
+            self._interaction.token_usage(
+                self._current_model,
+                self._context_tokens,
+                self._client.get_context_window(self._current_model),
+            )
 
         self.end()
 
@@ -209,6 +225,15 @@ class BaseLoop:
                 return False
             return user_input
 
+    def _update_context(self, usage, model: str | None) -> int | None:
+        """Track the context produced by the latest model response."""
+        total_tokens = getattr(usage, "total_tokens", None)
+        if isinstance(total_tokens, int) and total_tokens >= 0:
+            self._context_tokens = total_tokens
+        if isinstance(model, str):
+            self._current_model = model
+        return total_tokens if isinstance(total_tokens, int) and total_tokens >= 0 else None
+
     def output(self, response) -> Response:
         """Display and collect reasoning and answer content from a response.
 
@@ -221,6 +246,8 @@ class BaseLoop:
         thinking_text = ""
         answer_text = ""
         tool_calls = []
+        raw_usage = getattr(response, "usage", None)
+        model = getattr(response, "model", None)
 
         for message in response.output:
             if self._debug:
@@ -247,6 +274,8 @@ class BaseLoop:
             reasoning=thinking_text.strip(),
             tool_calls=tool_calls,
             output_items=list(response.output),
+            usage=self._update_context(raw_usage, model),
+            model=model if isinstance(model, str) else None,
         )
 
     def end(self) -> None:
@@ -284,6 +313,8 @@ class StreamingLoop(BaseLoop):
         answer_text = ""
         tool_calls = []
         output_items = []
+        usage = None
+        model = None
 
         for event in response:
             if self._debug:
@@ -305,6 +336,11 @@ class StreamingLoop(BaseLoop):
                     tool_calls.append(event.item)
                     continue
 
+            if isinstance(event, ResponseCompletedEvent):
+                usage = event.response.usage
+                model = event.response.model
+                continue
+
             if isinstance(event, ResponseReasoningTextDoneEvent):
                 thinking_text += event.text
 
@@ -319,4 +355,6 @@ class StreamingLoop(BaseLoop):
             reasoning=thinking_text.strip(),
             tool_calls=tool_calls,
             output_items=output_items,
+            usage=self._update_context(usage, model),
+            model=model,
         )

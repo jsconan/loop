@@ -59,6 +59,14 @@ class Interaction(Protocol):
     def invalid_input(self) -> None:
         """Display feedback for empty user input."""
 
+    def token_usage(
+        self,
+        model: str | None,
+        context_tokens: int | None,
+        context_window: int | None,
+    ) -> None:
+        """Display the current model and context occupancy."""
+
     def response_finished(self) -> None:
         """Finish the presentation of a model response."""
 
@@ -193,6 +201,23 @@ class ConsoleInteraction:
     def invalid_input(self) -> None:
         """Ask the terminal user to enter a non-empty message."""
         self.warning("Please enter a message!")
+
+    def token_usage(
+        self,
+        model: str | None,
+        context_tokens: int | None,
+        context_window: int | None,
+    ) -> None:
+        """Write the current model and context occupancy."""
+        current_model = model or "?"
+        used = f"{context_tokens:,}" if context_tokens is not None else "?"
+        capacity = f"{context_window:,}" if context_window is not None else "?"
+        self._console.print(
+            f"Model: {current_model} · Context: {used} / {capacity} tokens",
+            style="dim cyan",
+            markup=False,
+            soft_wrap=True,
+        )
 
     def response_finished(self) -> None:
         """Terminate streamed terminal output with a newline."""

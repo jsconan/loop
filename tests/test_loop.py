@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 from openai.types.responses import (
     ResponseFunctionToolCall,
+    ResponseCompletedEvent,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseReasoningItem,
@@ -13,6 +14,7 @@ from openai.types.responses import (
     ResponseReasoningTextDoneEvent,
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
+    ResponseUsage,
 )
 
 from loop.interaction import Interaction
@@ -31,6 +33,16 @@ def function_call() -> ResponseFunctionToolCall:
         type="function_call",
         status="completed",
     )
+
+
+def loop_client(**attributes):
+    """Build a minimal test client that satisfies the loop's client contract."""
+    defaults = {
+        "tool_registry": default_tool_registry,
+        "default_model": "default-model",
+        "get_context_window": lambda _model: None,
+    }
+    return SimpleNamespace(**(defaults | attributes))
 
 
 def test_default_client_receives_custom_tool_registry(monkeypatch):
@@ -79,7 +91,7 @@ def test_loop_uses_its_injected_interaction():
 
 def test_loop_exposes_its_configured_state(tmp_path):
     """Loop accessors expose the configured dependencies and conversation state."""
-    client = SimpleNamespace()
+    client = loop_client()
     interaction = Mock(spec=Interaction)
     loop = BaseLoop(
         client=client,
@@ -105,7 +117,7 @@ def test_loop_loads_project_instructions_once_at_initialization(monkeypatch, tmp
     loader = Mock(return_value="project rules")
     monkeypatch.setattr("loop.loop.load_agents_instructions", loader)
 
-    loop = BaseLoop(client=SimpleNamespace(), working_directory=tmp_path)
+    loop = BaseLoop(client=loop_client(), working_directory=tmp_path)
 
     assert loop.instructions == "project rules"
     loader.assert_called_once_with(tmp_path.resolve())
@@ -113,7 +125,7 @@ def test_loop_loads_project_instructions_once_at_initialization(monkeypatch, tmp
 
 def test_loop_accepts_a_string_working_directory(tmp_path):
     """A string working directory is normalized to an absolute path."""
-    loop = BaseLoop(client=SimpleNamespace(), working_directory=str(tmp_path))
+    loop = BaseLoop(client=loop_client(), working_directory=str(tmp_path))
 
     assert loop.working_directory == tmp_path.resolve()
 
@@ -136,6 +148,7 @@ def test_run_requeries_after_a_tool_call_and_ends(capsys):
         status="completed",
     )
     client = Mock(tool_registry=registry)
+    client.get_context_window.return_value = None
     client.get_response.side_effect = [
         SimpleNamespace(output=[call]),
         SimpleNamespace(output=[]),
@@ -154,6 +167,45 @@ def test_run_requeries_after_a_tool_call_and_ends(capsys):
         "output": "done",
     }
     assert "Conversation ended." in capsys.readouterr().out
+
+
+def test_run_displays_token_usage_after_output():
+    """The public runner reports updated usage only after displaying the response."""
+    events = []
+    interaction = Mock(spec=Interaction)
+    interaction.input.side_effect = ["hello", "q"]
+    interaction.answer.side_effect = lambda _content: events.append("output")
+    interaction.token_usage.side_effect = lambda *_args: events.append("usage")
+    client = Mock(default_model="requested-model")
+    client.get_context_window.return_value = 1000
+    client.get_response.return_value = SimpleNamespace(
+        output=[
+            ResponseOutputMessage.model_validate(
+                {
+                    "id": "message_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {"type": "output_text", "text": "answer", "annotations": []}
+                    ],
+                }
+            )
+        ],
+        usage=ResponseUsage(
+            input_tokens=10,
+            input_tokens_details={"cache_write_tokens": 0, "cached_tokens": 0},
+            output_tokens=2,
+            output_tokens_details={"reasoning_tokens": 0},
+            total_tokens=12,
+        ),
+        model="served-model",
+    )
+
+    BaseLoop(client=client, interaction=interaction).run()
+
+    assert events == ["output", "usage"]
+    interaction.token_usage.assert_called_once_with("served-model", 12, 1000)
 
 
 def test_response_output_and_tool_results_use_responses_api_input_items():
@@ -187,9 +239,69 @@ def test_response_output_and_tool_results_use_responses_api_input_items():
     )
 
 
+def test_latest_model_request_sets_current_context():
+    """A tool follow-up replaces context usage with its resulting context size."""
+    interaction = Mock(spec=Interaction)
+    interaction.input.side_effect = ["hello", "q"]
+    client = Mock()
+    client.get_context_window.return_value = 1000
+    loop = BaseLoop(client=client, interaction=interaction)
+    reasoning_one = ResponseReasoningItem.model_validate(
+        {
+            "id": "reasoning_1",
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "think one"}],
+        }
+    )
+    reasoning_two = ResponseReasoningItem.model_validate(
+        {
+            "id": "reasoning_2",
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "think two"}],
+        }
+    )
+    answer_one = ResponseOutputMessage.model_validate(
+        {
+            "id": "message_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "answer one", "annotations": []}],
+        }
+    )
+    answer_two = ResponseOutputMessage.model_validate(
+        {
+            "id": "message_2",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "answer two", "annotations": []}],
+        }
+    )
+
+    def raw_usage(input_tokens, output_tokens, total_tokens):
+        """Build response usage for one model request."""
+        return ResponseUsage(
+            input_tokens=input_tokens,
+            input_tokens_details={"cache_write_tokens": 0, "cached_tokens": 0},
+            output_tokens=output_tokens,
+            output_tokens_details={"reasoning_tokens": 0},
+            total_tokens=total_tokens,
+        )
+
+    assert loop.input() == "hello"
+    loop.output(SimpleNamespace(output=[reasoning_one, answer_one], usage=raw_usage(100, 5, 105)))
+    loop.output(SimpleNamespace(output=[reasoning_two, answer_two], usage=raw_usage(110, 9, 119)))
+    assert loop.input() is False
+
+    interaction.token_usage.assert_not_called()
+
+
 def test_no_tool_calls_are_reported_without_dispatch():
     """A response without function calls ends the tool-processing cycle."""
-    loop = BaseLoop(client=SimpleNamespace())
+    loop = BaseLoop(client=loop_client())
     assert loop.handle_tool_calls(Response("answer", "reasoning")) is False
 
 
@@ -220,7 +332,7 @@ def test_input_reprompts_for_blank_and_recognizes_exit(monkeypatch, capsys):
     monkeypatch.setattr(
         "loop.interaction.PromptSession.prompt", lambda _session, _prompt: next(values)
     )
-    assert BaseLoop(client=SimpleNamespace()).input() is False
+    assert BaseLoop(client=loop_client()).input() is False
     assert "Please enter a message!" in capsys.readouterr().out
 
 
@@ -229,7 +341,7 @@ def test_input_returns_trimmed_message(monkeypatch):
     monkeypatch.setattr(
         "loop.interaction.PromptSession.prompt", lambda _session, _prompt: " hello "
     )
-    assert BaseLoop(client=SimpleNamespace()).input() == "hello"
+    assert BaseLoop(client=loop_client()).input() == "hello"
 
 
 def test_input_and_end_use_the_injected_interaction():
@@ -237,7 +349,7 @@ def test_input_and_end_use_the_injected_interaction():
     interaction = Mock(spec=Interaction)
     interaction.input.side_effect = ["", "q"]
     registry = ToolRegistry()
-    loop = BaseLoop(client=SimpleNamespace(tool_registry=registry), interaction=interaction)
+    loop = BaseLoop(client=loop_client(tool_registry=registry), interaction=interaction)
 
     assert loop.input() is False
     loop.end()
@@ -245,6 +357,65 @@ def test_input_and_end_use_the_injected_interaction():
     assert interaction.input.call_count == 2
     interaction.invalid_input.assert_called_once_with()
     interaction.conversation_ended.assert_called_once_with()
+    interaction.token_usage.assert_not_called()
+
+
+def test_output_tracks_current_context_for_each_step():
+    """Each model response replaces the tracked context token count."""
+    interaction = Mock(spec=Interaction)
+    interaction.input.side_effect = ["first", "second", "third", "q"]
+    client = Mock()
+    client.get_context_window.return_value = 262144
+    loop = BaseLoop(client=client, interaction=interaction)
+    raw_usage = [
+        ResponseUsage(
+            input_tokens=input_tokens,
+            input_tokens_details={"cache_write_tokens": 0, "cached_tokens": 0},
+            output_tokens=output_tokens,
+            output_tokens_details={"reasoning_tokens": reasoning_tokens},
+            total_tokens=total_tokens,
+        )
+        for input_tokens, output_tokens, reasoning_tokens, total_tokens in [
+            (2281, 159, 59, 2440),
+            (2942, 171, 71, 3113),
+            (2728, 292, 92, 3020),
+        ]
+    ]
+
+    assert loop.input() == "first"
+    first = loop.output(SimpleNamespace(output=[], usage=raw_usage[0])).usage
+    assert loop.input() == "second"
+    second = loop.output(SimpleNamespace(output=[], usage=raw_usage[1])).usage
+    assert loop.input() == "third"
+    third = loop.output(SimpleNamespace(output=[], usage=raw_usage[2])).usage
+    assert loop.input() is False
+
+    assert (first, second, third) == (2440, 3113, 3020)
+
+    interaction.token_usage.assert_not_called()
+
+
+def test_output_tracks_the_model_reported_by_the_backend():
+    """Response output tracks the model reported by the backend."""
+    interaction = Mock(spec=Interaction)
+    interaction.input.side_effect = ["hello", "q"]
+    client = Mock(default_model="requested-model")
+    client.get_context_window.return_value = 2000
+    loop = BaseLoop(client=client, interaction=interaction)
+    usage = ResponseUsage(
+        input_tokens=10,
+        input_tokens_details={"cache_write_tokens": 0, "cached_tokens": 0},
+        output_tokens=2,
+        output_tokens_details={"reasoning_tokens": 0},
+        total_tokens=12,
+    )
+
+    assert loop.input() == "hello"
+    loop.output(SimpleNamespace(output=[], usage=usage, model="served-model"))
+    assert loop.input() is False
+
+    client.get_context_window.assert_not_called()
+    interaction.token_usage.assert_not_called()
 
 
 def test_non_streaming_output_collects_reasoning_message_call_and_ignores_unknown(capsys):
@@ -268,14 +439,22 @@ def test_non_streaming_output_collects_reasoning_message_call_and_ignores_unknow
     )
     call = function_call()
     unknown = SimpleNamespace(kind="unknown")
-    loop = BaseLoop(client=SimpleNamespace(), debug=True)
+    loop = BaseLoop(client=loop_client(), debug=True)
 
-    result = loop.output(SimpleNamespace(output=[reasoning, message, call, unknown]))
+    usage = ResponseUsage(
+        input_tokens=100,
+        input_tokens_details={"cache_write_tokens": 0, "cached_tokens": 0},
+        output_tokens=20,
+        output_tokens_details={"reasoning_tokens": 0},
+        total_tokens=120,
+    )
+    result = loop.output(SimpleNamespace(output=[reasoning, message, call, unknown], usage=usage))
 
     assert result.answer == "the answer"
     assert result.reasoning == "consider this"
     assert result.tool_calls == [call]
     assert result.output_items == [reasoning, message, call, unknown]
+    assert result.usage == 120
     assert "[DEBUG EVENT]" in capsys.readouterr().out
 
 
@@ -285,14 +464,14 @@ def test_non_streaming_output_handles_empty_content(capsys):
     message = ResponseOutputMessage(
         id="m", type="message", role="assistant", status="completed", content=[]
     )
-    result = BaseLoop(client=SimpleNamespace()).output(SimpleNamespace(output=[reasoning, message]))
+    result = BaseLoop(client=loop_client()).output(SimpleNamespace(output=[reasoning, message]))
     assert result.answer == result.reasoning == ""
     capsys.readouterr()
 
 
 def test_streaming_output_collects_done_text_and_completed_tool_call(capsys):
     """Streaming output collects completed text and function calls."""
-    loop = StreamingLoop(client=SimpleNamespace())
+    loop = StreamingLoop(client=loop_client())
     call = function_call()
     events = [
         ResponseReasoningTextDeltaEvent(
@@ -352,6 +531,32 @@ def test_streaming_output_collects_done_text_and_completed_tool_call(capsys):
             sequence_number=7,
             type="response.output_item.done",
         ),
+        ResponseCompletedEvent.model_validate(
+            {
+                "type": "response.completed",
+                "sequence_number": 8,
+                "response": {
+                    "id": "response_1",
+                    "created_at": 0,
+                    "model": "gpt-4o",
+                    "object": "response",
+                    "output": [],
+                    "parallel_tool_calls": True,
+                    "tool_choice": "auto",
+                    "tools": [],
+                        "usage": {
+                            "input_tokens": 200,
+                            "input_tokens_details": {
+                                "cache_write_tokens": 0,
+                                "cached_tokens": 0,
+                            },
+                            "output_tokens": 30,
+                            "output_tokens_details": {"reasoning_tokens": 7},
+                        "total_tokens": 230,
+                    },
+                },
+            }
+        ),
     ]
 
     response = loop.output(events)
@@ -360,6 +565,8 @@ def test_streaming_output_collects_done_text_and_completed_tool_call(capsys):
     assert response.answer == "hello world"
     assert response.tool_calls == [call]
     assert response.output_items == [call]
+    assert response.usage == 230
+    assert response.model == "gpt-4o"
     capsys.readouterr()
 
 
@@ -377,7 +584,7 @@ def test_streaming_debug_and_completed_non_tool_items(capsys):
     event = ResponseOutputItemDoneEvent(
         item=message, output_index=0, sequence_number=1, type="response.output_item.done"
     )
-    result = StreamingLoop(client=SimpleNamespace(), debug=True).output([event])
+    result = StreamingLoop(client=loop_client(), debug=True).output([event])
     assert result.output_items == [message]
     assert result.tool_calls == []
     assert "[DEBUG EVENT]" in capsys.readouterr().out

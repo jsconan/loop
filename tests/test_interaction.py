@@ -82,6 +82,37 @@ def test_tool_call_displays_its_name_and_arguments(capsys):
     assert capsys.readouterr().out == '\n[TOOL CALL]: search({"query":"term"})\n'
 
 
+@pytest.mark.parametrize(
+    ("model", "context_tokens", "context_window", "expected"),
+    [
+        (
+            None,
+            None,
+            262144,
+            "Model: ? · Context: ? / 262,144 tokens\n",
+        ),
+        (
+            "served-model",
+            18432,
+            262144,
+            "Model: served-model · Context: 18,432 / 262,144 tokens\n",
+        ),
+        (
+            "local-model",
+            12,
+            None,
+            "Model: local-model · Context: 12 / ? tokens\n",
+        ),
+    ],
+)
+def test_token_usage_has_a_console_presentation(
+    capsys, model, context_tokens, context_window, expected
+):
+    """Token usage presents the current model and context against maximum context."""
+    ConsoleInteraction().token_usage(model, context_tokens, context_window)
+    assert capsys.readouterr().out == expected
+
+
 def test_debug_formats_raw_values(capsys):
     """The console owns type labeling and pretty-printing of diagnostic values."""
     ConsoleInteraction().debug({"details": [1, 2]})
