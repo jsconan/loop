@@ -18,7 +18,7 @@ from openai.types.responses import (
 )
 
 from loop.interaction import Interaction
-from loop.loop import BaseLoop, Response, StreamingLoop
+from loop.loop import BaseLoop, LoopContext, Response, StreamingLoop
 from loop.tooling import ToolRegistry
 from loop.tooling import tool_registry as default_tool_registry
 
@@ -43,6 +43,43 @@ def loop_client(**attributes):
         "get_context_window": lambda _model: None,
     }
     return SimpleNamespace(**(defaults | attributes))
+
+
+def test_loop_context_adds_one_or_multiple_messages():
+    """Context methods add dictionaries and dump models to conversation history."""
+    context = LoopContext()
+    user_message = {"role": "user", "content": "hello"}
+    assistant_message = {"role": "assistant", "content": "answer"}
+    call = function_call()
+    dumped_call = call.model_dump(exclude_none=True)
+
+    context.add_message(user_message)
+    context.add_message(call)
+    context.add_messages(message for message in (assistant_message, call))
+
+    assert context.messages == [
+        user_message,
+        dumped_call,
+        assistant_message,
+        dumped_call,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("method", "argument"),
+    [
+        ("add_message", "invalid"),
+        ("add_messages", [{"role": "user", "content": "hello"}, "invalid"]),
+    ],
+)
+def test_loop_context_rejects_invalid_message_types(method, argument):
+    """Context additions reject unsupported message types without changing history."""
+    context = LoopContext()
+
+    with pytest.raises(ValueError, match="Expected message to be a dict or BaseModel"):
+        getattr(context, method)(argument)
+
+    assert context.messages == []
 
 
 def test_default_client_receives_custom_tool_registry(monkeypatch):
@@ -94,10 +131,35 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.interaction is interaction
     assert loop.working_directory == tmp_path.resolve()
     assert loop.instructions is None
+    assert loop.context == LoopContext(model="default-model")
 
     loop.debug = False
 
     assert loop.debug is False
+
+
+def test_loops_can_share_conversation_context(tmp_path):
+    """An injected context carries conversation and usage state between loop modes."""
+    context = LoopContext(messages=[{"role": "user", "content": "hello"}])
+    first_client = loop_client(default_model="requested-model")
+    first = BaseLoop(client=first_client, context=context, working_directory=tmp_path)
+    usage = SimpleNamespace(total_tokens=12)
+
+    first.output(SimpleNamespace(output=[], usage=usage, model="served-model"))
+    second_client = Mock(default_model="other-model")
+    second_client.get_response.return_value = "response"
+    second = StreamingLoop(client=second_client, context=context, working_directory=tmp_path)
+
+    assert first.context is second.context is context
+    assert second.messages == [{"role": "user", "content": "hello"}]
+    assert second.context.tokens == 12
+    assert second.context.model == "served-model"
+    assert second.query() == "response"
+    second_client.get_response.assert_called_once_with(
+        input=context.messages,
+        instructions=None,
+        stream=True,
+    )
 
 
 def test_loop_loads_project_instructions_once_at_initialization(monkeypatch, tmp_path):

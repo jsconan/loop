@@ -8,6 +8,7 @@ __all__ = [
     "get_current_datetime",
     "Interaction",
     "list_folder",
+    "LoopContext",
     "manage_skills",
     "read_text_file",
     "Response",
@@ -26,7 +27,7 @@ __all__ = [
 
 from .client import Client
 from .interaction import ConsoleInteraction, Interaction, ToolContext
-from .loop import BaseLoop, Response, StreamingLoop
+from .loop import BaseLoop, LoopContext, Response, StreamingLoop
 from .skills import Skill, SkillManager
 from .tooling import Tool, ToolRegistry, tool_registry
 from .tools import (

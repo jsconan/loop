@@ -1,5 +1,6 @@
 """Run an interactive conversation with an LLM backend."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,6 +46,51 @@ class Response:
     model: str | None = None
 
 
+@dataclass
+class LoopContext:
+    """Store conversation history and the latest model context usage.
+
+    Args:
+        messages: Initial Responses API input items accumulated during the conversation.
+        tokens: Initial total tokens in the context after the latest response.
+        model: Initial model identifier reported by the latest response.
+    """
+
+    messages: list[dict] = field(default_factory=list)
+    tokens: int = 0
+    model: str | None = None
+
+    def add_message(self, message: BaseModel | dict) -> None:
+        """Add one message to the conversation history.
+
+        Args:
+            message: Responses API input item to add. Models are dumped to dictionaries.
+
+        Raises:
+            ValueError: If the message is not a dictionary or a BaseModel.
+        """
+        self.messages.append(self._get_message(message))
+
+    def add_messages(self, messages: Iterable[BaseModel | dict]) -> None:
+        """Add messages to the conversation history.
+
+        Args:
+            messages: Responses API input items to add. Models are dumped to dictionaries.
+
+        Raises:
+            ValueError: If any message is not a dictionary or a BaseModel.
+        """
+        self.messages.extend([self._get_message(message) for message in messages])
+
+    def _get_message(self, message: dict | BaseModel) -> dict:
+        """Convert a message to a dictionary for storage in the conversation history."""
+        if isinstance(message, BaseModel):
+            message = message.model_dump(exclude_none=True)
+        if not isinstance(message, dict):
+            raise ValueError(f"Expected message to be a dict or BaseModel, got {type(message)}")
+        return message
+
+
 class BaseLoop:
     """Run an interactive conversation using non-streaming responses.
 
@@ -54,6 +100,7 @@ class BaseLoop:
         skill_manager: Manager used to discover and progressively activate Agent Skills.
         interaction: Service used for all user input and output.
         working_directory: Directory used to discover applicable AGENTS.md files.
+        context: Conversation state to use. Supply the same context to share state between loops.
         debug: Whether to print raw response events.
 
     Raises:
@@ -62,13 +109,11 @@ class BaseLoop:
 
     _client: Client
     _instructions: str | None
-    _messages: list[dict]
+    _context: LoopContext
     _skill_manager: SkillManager
     _interaction: Interaction
     _working_directory: Path
     _debug: bool
-    _context_tokens: int
-    _current_model: str | None
 
     def __init__(
         self,
@@ -77,6 +122,7 @@ class BaseLoop:
         skill_manager: SkillManager | None = None,
         interaction: Interaction | None = None,
         working_directory: Path | str | None = None,
+        context: LoopContext | None = None,
         debug: bool = False,
     ) -> None:
         if client is not None and tool_registry is not None:
@@ -87,7 +133,7 @@ class BaseLoop:
 
         self._interaction = interaction or tool_registry.interaction or ConsoleInteraction()
         self._client = client or Client(tool_registry=tool_registry)
-        self._messages = []
+        self._context = context or LoopContext()
         self._working_directory = Path(working_directory or Path.cwd()).resolve()
         self._skill_manager = skill_manager or SkillManager.discover(self._working_directory)
         self._instructions = build_instructions(
@@ -95,9 +141,9 @@ class BaseLoop:
             self._skill_manager.catalog(),
         )
         self._debug = debug
-        self._context_tokens = 0
         default_model = self._client.default_model
-        self._current_model = default_model if isinstance(default_model, str) else None
+        if self._context.model is None and isinstance(default_model, str):
+            self._context.model = default_model
 
     @property
     def client(self) -> Client:
@@ -112,7 +158,12 @@ class BaseLoop:
     @property
     def messages(self) -> list[dict]:
         """Return the current conversation history."""
-        return self._messages
+        return self._context.messages
+
+    @property
+    def context(self) -> LoopContext:
+        """Return the shared conversation context."""
+        return self._context
 
     @property
     def skill_manager(self) -> SkillManager:
@@ -145,7 +196,7 @@ class BaseLoop:
             user_input = self._interaction.input()
             if user_input is False:
                 break
-            self._messages.append({"role": "user", "content": user_input})
+            self._context.add_message({"role": "user", "content": user_input})
 
             while True:
                 response = self.output(self.query())
@@ -155,9 +206,9 @@ class BaseLoop:
                     break
 
             self._interaction.token_usage(
-                self._current_model,
-                self._context_tokens,
-                self._client.get_context_window(self._current_model),
+                self._context.model,
+                self._context.tokens,
+                self._client.get_context_window(self._context.model),
             )
 
         self.end()
@@ -168,7 +219,7 @@ class BaseLoop:
         Args:
             response: The LLM response containing output items.
         """
-        self._messages.extend(item.model_dump(exclude_none=True) for item in response.output_items)
+        self._context.add_messages(response.output_items)
 
     def handle_tool_calls(self, response: Response) -> bool:
         """Handle tool calls made by the LLM during reasoning.
@@ -184,7 +235,7 @@ class BaseLoop:
 
         for tool_call in response.tool_calls:
             self._interaction.tool_call(tool_call.name, tool_call.arguments)
-            self._messages.append(
+            self._context.add_message(
                 {
                     "type": "function_call_output",
                     "call_id": tool_call.call_id,
@@ -205,7 +256,7 @@ class BaseLoop:
             The response returned by the configured backend.
         """
         return self._client.get_response(
-            input=self._messages,
+            input=self._context.messages,
             instructions=self._instructions,
         )
 
@@ -213,9 +264,9 @@ class BaseLoop:
         """Track the context produced by the latest model response."""
         total_tokens = getattr(usage, "total_tokens", None)
         if isinstance(total_tokens, int) and total_tokens >= 0:
-            self._context_tokens = total_tokens
+            self._context.tokens = total_tokens
         if isinstance(model, str):
-            self._current_model = model
+            self._context.model = model
         return total_tokens if isinstance(total_tokens, int) and total_tokens >= 0 else None
 
     def output(self, response) -> Response:
@@ -277,7 +328,7 @@ class StreamingLoop(BaseLoop):
             An iterable streaming response returned by the configured backend.
         """
         return self._client.get_response(
-            input=self._messages,
+            input=self._context.messages,
             instructions=self._instructions,
             stream=True,
         )
