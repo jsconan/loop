@@ -5,15 +5,19 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop.utils import signals
-from loop.types import ShutdownRequested
-from loop.utils.signals import register_shutdown_signals, request_shutdown
+from loop.utils import ShutdownRequested, register_shutdown_signals, signals
 
 
-def test_termination_signal_requests_shutdown():
-    """A termination signal raises the controlled shutdown exception."""
+def test_termination_signal_requests_shutdown(monkeypatch):
+    """A registered termination handler raises the controlled shutdown exception."""
+    register = Mock()
+    monkeypatch.setattr(signals.signal, "signal", register)
+
+    register_shutdown_signals()
+
+    handler = register.call_args_list[0].args[1]
     with pytest.raises(ShutdownRequested):
-        request_shutdown(signal.SIGTERM, None)
+        handler(signal.SIGTERM, None)
 
 
 def test_register_shutdown_signals_registers_supported_termination_signals(monkeypatch):
@@ -24,13 +28,11 @@ def test_register_shutdown_signals_registers_supported_termination_signals(monke
     register_shutdown_signals()
 
     expected_signals = [
-        getattr(signal, name)
-        for name in ("SIGTERM", "SIGHUP", "SIGQUIT")
-        if hasattr(signal, name)
+        getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGQUIT") if hasattr(signal, name)
     ]
     assert register.call_count == len(expected_signals)
-    for shutdown_signal in expected_signals:
-        register.assert_any_call(shutdown_signal, request_shutdown)
+    handlers = {call.args[1] for call in register.call_args_list}
+    assert len(handlers) == 1
 
 
 def test_register_shutdown_signals_skips_unsupported_signals(monkeypatch):
@@ -42,8 +44,6 @@ def test_register_shutdown_signals_skips_unsupported_signals(monkeypatch):
     register_shutdown_signals()
 
     expected_signals = [
-        getattr(signal, name)
-        for name in ("SIGTERM", "SIGQUIT")
-        if hasattr(signal, name)
+        getattr(signal, name) for name in ("SIGTERM", "SIGQUIT") if hasattr(signal, name)
     ]
     assert [call.args[0] for call in register.call_args_list] == expected_signals

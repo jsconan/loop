@@ -18,12 +18,10 @@ from openai.types.responses import (
 
 from .client import Client
 from .context import LoopContext
-from .interaction import ConsoleInteraction
-from .skills import SkillManager
+from .interaction import ConsoleInteraction, Interaction
+from .skills import SkillManager, build_instructions, load_agents_instructions
 from .tooling import ToolRegistry
 from .tooling import tool_registry as default_tool_registry
-from .types import Interaction
-from .utils.instructions import build_instructions, load_agents_instructions
 
 
 @dataclass

@@ -8,7 +8,10 @@ from typing import Any, get_type_hints
 from pydantic import BaseModel, ConfigDict, create_model
 
 from ..context import ToolContext
-from ..types import ToolRegistrationError
+
+
+class ToolRegistrationError(ValueError):
+    """Indicate that a Python function cannot be registered as a tool."""
 
 
 def get_tool_description(function: Callable[..., Any]) -> str:

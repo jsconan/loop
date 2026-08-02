@@ -1,6 +1,6 @@
 """Tests for path discovery helpers."""
 
-from loop.utils.path import find_project_root, is_path_ignored
+from loop.utils import find_project_root, is_path_ignored
 
 
 def test_find_project_root_returns_none_outside_a_git_project(tmp_path):

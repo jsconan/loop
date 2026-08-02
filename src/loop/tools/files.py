@@ -7,8 +7,7 @@ from pydantic import Field
 
 from ..context import ToolContext
 from ..tooling import tool_registry
-from ..utils.path import is_path_ignored, iter_visible_paths
-from ..utils.text import format_content_preview
+from ..utils import format_content_preview, is_path_ignored, iter_visible_paths
 
 
 class FolderEntry(TypedDict):

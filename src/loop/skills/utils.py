@@ -6,7 +6,7 @@ from typing import Any
 
 import yaml
 
-from .path import find_project_root
+from ..utils import find_project_root
 
 MAX_AGENTS_BYTES = 32 * 1024
 DEFAULT_AGENTS_FILENAME = "AGENTS.md"

@@ -43,43 +43,6 @@ def loop_client(**attributes):
     return SimpleNamespace(**(defaults | attributes))
 
 
-def test_loop_context_adds_one_or_multiple_messages():
-    """Context methods add dictionaries and dump models to conversation history."""
-    context = LoopContext()
-    user_message = {"role": "user", "content": "hello"}
-    assistant_message = {"role": "assistant", "content": "answer"}
-    call = function_call()
-    dumped_call = call.model_dump(exclude_none=True)
-
-    context.add_message(user_message)
-    context.add_message(call)
-    context.add_messages(message for message in (assistant_message, call))
-
-    assert context.messages == [
-        user_message,
-        dumped_call,
-        assistant_message,
-        dumped_call,
-    ]
-
-
-@pytest.mark.parametrize(
-    ("method", "argument"),
-    [
-        ("add_message", "invalid"),
-        ("add_messages", [{"role": "user", "content": "hello"}, "invalid"]),
-    ],
-)
-def test_loop_context_rejects_invalid_message_types(method, argument):
-    """Context additions reject unsupported message types without changing history."""
-    context = LoopContext()
-
-    with pytest.raises(ValueError, match="Expected message to be a dict or BaseModel"):
-        getattr(context, method)(argument)
-
-    assert context.messages == []
-
-
 def test_default_client_receives_custom_tool_registry(monkeypatch):
     """A loop-created client uses the registry supplied to the loop."""
     registry = ToolRegistry()

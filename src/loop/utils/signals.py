@@ -2,16 +2,18 @@
 
 import signal
 
-from ..types import ShutdownRequested
 
-
-def request_shutdown(_signum: int, _frame: object | None) -> None:
-    """Convert a termination signal into a controlled shutdown request."""
-    raise ShutdownRequested
+class ShutdownRequested(Exception):
+    """Indicate that the process received a termination signal."""
 
 
 def register_shutdown_signals() -> None:
     """Register controlled shutdown handling for supported termination signals."""
+
+    def _request_shutdown(_signum: int, _frame: object | None) -> None:
+
+        raise ShutdownRequested()
+
     for signal_name in ("SIGTERM", "SIGHUP", "SIGQUIT"):
         if shutdown_signal := getattr(signal, signal_name, None):
-            signal.signal(shutdown_signal, request_shutdown)
+            signal.signal(shutdown_signal, _request_shutdown)

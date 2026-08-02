@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from loop.utils.instructions import (
+from loop.skills import (
     build_instructions,
     instruction_directories,
     load_agents_instructions,
@@ -70,9 +70,7 @@ def test_read_instruction_frontmatter_returns_yaml_mapping(tmp_path):
 def test_read_instruction_frontmatter_validates_required_fields(tmp_path, field):
     """Required fields must be non-empty strings and valid values are normalized."""
     location = tmp_path / "SKILL.md"
-    location.write_text(
-        f"---\nname: review\n{field}\n---\nBody", encoding="utf-8"
-    )
+    location.write_text(f"---\nname: review\n{field}\n---\nBody", encoding="utf-8")
 
     with pytest.raises(ValueError, match="requires a non-empty description"):
         read_instruction_frontmatter(location, required_fields=("name", "description"))
@@ -80,9 +78,10 @@ def test_read_instruction_frontmatter_validates_required_fields(tmp_path, field)
     location.write_text(
         "---\nname: ' review '\ndescription: ' Review work. '\n---\nBody", encoding="utf-8"
     )
-    assert read_instruction_frontmatter(
-        location, required_fields=("name", "description")
-    ) == {"name": "review", "description": "Review work."}
+    assert read_instruction_frontmatter(location, required_fields=("name", "description")) == {
+        "name": "review",
+        "description": "Review work.",
+    }
 
 
 def test_read_instruction_body_returns_trimmed_markdown():

@@ -2,9 +2,7 @@
 
 from dotenv import find_dotenv, load_dotenv
 
-from loop import ConsoleInteraction, StreamingLoop
-from loop.types import ShutdownRequested
-from loop.utils.signals import register_shutdown_signals
+from loop import ConsoleInteraction, ShutdownRequested, StreamingLoop, register_shutdown_signals
 
 
 def main() -> None:

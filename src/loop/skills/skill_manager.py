@@ -1,34 +1,15 @@
 """Discover and progressively load Agent Skills."""
 
-from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .utils.instructions import (
-    instruction_directories,
-    read_instruction_body,
-    read_instruction_frontmatter,
-)
+from .skill import Skill
+from .utils import instruction_directories, read_instruction_body, read_instruction_frontmatter
 
 MAX_CATALOG_CHARS = 8_000
-
-
-@dataclass(frozen=True)
-class Skill:
-    """Describe an Agent Skill without eagerly loading its instructions.
-
-    Args:
-        name (str): Public name declared by the skill.
-        description (str): Summary used by the model to decide when to activate the skill.
-        location (Path): Absolute path to the skill's ``SKILL.md`` file.
-    """
-
-    name: str
-    description: str
-    location: Path
 
 
 class SkillManager:
@@ -140,9 +121,7 @@ class SkillManager:
         skill = matches[0]
         if skill.location not in self._activated:
             content = skill.location.read_text(encoding="utf-8")
-            self._activated[skill.location] = read_instruction_body(
-                content, skill.location.name
-            )
+            self._activated[skill.location] = read_instruction_body(content, skill.location.name)
         return {
             **self._summary(skill),
             "skill_root": str(skill.location.parent),

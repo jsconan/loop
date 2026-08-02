@@ -11,6 +11,7 @@ __all__ = [
     "LoopContext",
     "manage_skills",
     "read_text_file",
+    "register_shutdown_signals",
     "Response",
     "run_command",
     "ShutdownRequested",
@@ -28,10 +29,10 @@ __all__ = [
 
 from .client import Client
 from .context import LoopContext, ToolContext
-from .interaction import ConsoleInteraction
+from .interaction import ConsoleInteraction, Interaction
 from .loop import BaseLoop, Response, StreamingLoop
 from .skills import Skill, SkillManager
-from .tooling import Tool, ToolRegistry, tool_registry
+from .tooling import Tool, ToolRegistrationError, ToolRegistry, tool_registry
 from .tools import (
     fetch_content,
     get_current_datetime,
@@ -41,4 +42,4 @@ from .tools import (
     run_command,
     write_text_file,
 )
-from .types import Interaction, ShutdownRequested, ToolRegistrationError
+from .utils import ShutdownRequested, register_shutdown_signals
