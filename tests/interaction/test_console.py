@@ -165,13 +165,35 @@ def test_output_styles_prioritize_answers_over_diagnostics():
     assert styles[2:] == ["dim cyan", "dim", "dim magenta", "dim blue", "dim"]
 
 
-def test_conversation_events_have_console_presentations(capsys):
-    """The console owns response and termination formatting."""
+def test_response_scope_terminates_streamed_output(capsys):
+    """A response scope terminates streamed output before subsequent presentation."""
     interaction = ConsoleInteraction()
-    interaction.response_finished()
+    with interaction.response():
+        interaction.answer_delta("partial", start=True)
     interaction.conversation_ended()
 
-    assert capsys.readouterr().out == "\n\nConversation ended.\n"
+    assert capsys.readouterr().out == "\nAnswer:partial\n\nConversation ended.\n"
+
+
+def test_response_scope_does_not_extend_complete_output(capsys):
+    """A response scope adds no separator when output already terminates itself."""
+    interaction = ConsoleInteraction()
+    with interaction.response():
+        interaction.answer("complete")
+
+    assert capsys.readouterr().out == "\nAnswer:complete\n"
+
+
+def test_response_scope_terminates_streamed_output_after_an_error(capsys):
+    """A response scope terminates streamed output when presentation fails."""
+    interaction = ConsoleInteraction()
+
+    with pytest.raises(RuntimeError, match="failed"):
+        with interaction.response():
+            interaction.answer_delta("partial", start=True)
+            raise RuntimeError("failed")
+
+    assert capsys.readouterr().out == "\nAnswer:partial\n"
 
 
 @pytest.mark.parametrize(("default", "expected"), [(False, True), (True, False)])

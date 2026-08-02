@@ -1,5 +1,7 @@
 """Define user interaction abstractions and tool invocation context."""
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from pprint import pformat
 from typing import Any
 
@@ -24,6 +26,22 @@ class ConsoleInteraction:
     ) -> None:
         self._console = console or Console()
         self._session = session or PromptSession()
+        self._streamed_output = False
+
+    @contextmanager
+    def response(self) -> Generator[None]:
+        """Present one model response and finalize streamed output.
+
+        Yields:
+            None: Control while the response is being presented.
+        """
+        self._streamed_output = False
+        try:
+            yield
+        finally:
+            if self._streamed_output:
+                self.info()
+            self._streamed_output = False
 
     def input(self) -> str | False:
         """Prompt for a non-empty user message or an exit command.
@@ -65,6 +83,7 @@ class ConsoleInteraction:
         """
         if start:
             self._reasoning_heading()
+        self._streamed_output = True
         self._console.print(
             delta, end="", style="dim", markup=False, highlight=False, soft_wrap=True
         )
@@ -91,6 +110,7 @@ class ConsoleInteraction:
         """
         if start:
             self._answer_heading()
+        self._streamed_output = True
         self._console.print(
             delta, end="", style="bold", markup=False, highlight=False, soft_wrap=True
         )
@@ -161,10 +181,6 @@ class ConsoleInteraction:
             markup=False,
             soft_wrap=True,
         )
-
-    def response_finished(self) -> None:
-        """Terminate streamed terminal output with a newline."""
-        self.info()
 
     def conversation_ended(self) -> None:
         """Report conversation termination in the terminal."""

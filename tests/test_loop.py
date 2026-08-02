@@ -1,5 +1,6 @@
 """Tests for normalized response handling and conversation orchestration."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -155,6 +156,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items():
         ],
     ]
     interaction = Mock(spec=Interaction)
+    interaction.response.return_value = nullcontext()
     interaction.input.side_effect = ["hello", False]
 
     Loop(backend=backend, interaction=interaction).run()
@@ -167,7 +169,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items():
     ]
     assert second_input[-1] == Message(role="assistant", content="done")
     interaction.answer_delta.assert_called_once_with("done", start=True)
-    interaction.response_finished.assert_called_once_with()
+    assert interaction.response.call_count == 2
     interaction.token_usage.assert_called_once_with("requested-model", 12, 1000)
     interaction.conversation_ended.assert_called_once_with()
 
@@ -208,6 +210,7 @@ def test_query_selects_only_the_event_production_mode():
 def test_one_output_loop_uses_terminal_response_text(capsys):
     """Streaming output displays deltas but returns authoritative terminal text."""
     interaction = Mock(spec=Interaction)
+    interaction.response.return_value = nullcontext()
     call = function_call()
     items = (
         Reasoning(content="think again", id="r"),
@@ -247,7 +250,7 @@ def test_one_output_loop_uses_terminal_response_text(capsys):
     assert interaction.reasoning_delta.call_args_list[1].kwargs == {"start": False}
     assert interaction.answer_delta.call_args_list[0].kwargs == {"start": True}
     assert interaction.answer_delta.call_args_list[1].kwargs == {"start": False}
-    interaction.response_finished.assert_called_once_with()
+    interaction.response.assert_called_once_with()
     assert interaction.debug.call_count == len(events)
     capsys.readouterr()
 
@@ -255,6 +258,7 @@ def test_one_output_loop_uses_terminal_response_text(capsys):
 def test_output_displays_non_streaming_completed_text():
     """Completed text is displayed directly when no streaming deltas were received."""
     interaction = Mock(spec=Interaction)
+    interaction.response.return_value = nullcontext()
 
     response = Loop(backend=loop_backend(), interaction=interaction).output(
         [
@@ -267,13 +271,14 @@ def test_output_displays_non_streaming_completed_text():
     assert response == Response(answer="answer", reasoning="think")
     interaction.reasoning.assert_called_once_with("think")
     interaction.answer.assert_called_once_with("answer")
-    interaction.response_finished.assert_not_called()
+    interaction.response.assert_called_once_with()
 
 
 def test_empty_output_preserves_existing_context_metadata():
     """A completion without reported metadata leaves existing context values unchanged."""
     context = LoopContext(tokens=7, model="existing")
     interaction = Mock(spec=Interaction)
+    interaction.response.return_value = nullcontext()
 
     response = Loop(backend=loop_backend(), context=context, interaction=interaction).output(
         [ResponseCompleted()]
@@ -282,7 +287,7 @@ def test_empty_output_preserves_existing_context_metadata():
     assert response == Response(answer="", reasoning="")
     assert context.tokens == 7
     assert context.model == "existing"
-    interaction.response_finished.assert_not_called()
+    interaction.response.assert_called_once_with()
 
 
 def test_end_uses_the_injected_interaction():

@@ -264,43 +264,42 @@ class Loop:
         reasoning_started = False
         answer_started = False
 
-        for event in events:
-            if self._debug:
-                self._interaction.debug(event)
+        with self._interaction.response():
+            for event in events:
+                if self._debug:
+                    self._interaction.debug(event)
 
-            if isinstance(event, ReasoningDelta):
-                self._interaction.reasoning_delta(event.text, start=not reasoning_started)
-                reasoning_started = True
-                continue
+                if isinstance(event, ReasoningDelta):
+                    self._interaction.reasoning_delta(event.text, start=not reasoning_started)
+                    reasoning_started = True
+                    continue
 
-            if isinstance(event, AnswerDelta):
-                self._interaction.answer_delta(event.text, start=not answer_started)
-                answer_started = True
-                continue
+                if isinstance(event, AnswerDelta):
+                    self._interaction.answer_delta(event.text, start=not answer_started)
+                    answer_started = True
+                    continue
 
-            if isinstance(event, ReasoningCompleted):
-                reasoning = event.text
-                self._interaction.reasoning(event.text)
-                continue
+                if isinstance(event, ReasoningCompleted):
+                    reasoning = event.text
+                    self._interaction.reasoning(event.text)
+                    continue
 
-            if isinstance(event, AnswerCompleted):
-                answer = event.text
-                self._interaction.answer(event.text)
-                continue
+                if isinstance(event, AnswerCompleted):
+                    answer = event.text
+                    self._interaction.answer(event.text)
+                    continue
 
-            if isinstance(event, ToolCallCompleted):
-                tool_calls.append(event.call)
-                continue
+                if isinstance(event, ToolCallCompleted):
+                    tool_calls.append(event.call)
+                    continue
 
-            if isinstance(event, ResponseCompleted):
-                items = event.items
-                usage = event.usage
-                model = event.model
-                answer = event.answer
-                reasoning = event.reasoning
+                if isinstance(event, ResponseCompleted):
+                    items = event.items
+                    usage = event.usage
+                    model = event.model
+                    answer = event.answer
+                    reasoning = event.reasoning
 
-        if reasoning_started or answer_started:
-            self._interaction.response_finished()
         self._update_context(usage, model)
         return Response(
             answer=answer,

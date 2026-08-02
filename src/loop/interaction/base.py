@@ -1,10 +1,18 @@
 """Define user interaction abstractions."""
 
+from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
 
 class Interaction(Protocol):
     """Provide semantically classified user interaction independently of a UI."""
+
+    def response(self) -> AbstractContextManager[None]:
+        """Create a presentation scope for one model response.
+
+        Returns:
+            AbstractContextManager[None]: Scope that finalizes response presentation on exit.
+        """
 
     def input(self) -> str | False:
         """Read a non-empty user message or an exit command.
@@ -93,9 +101,6 @@ class Interaction(Protocol):
             context_tokens (int | None): Number of tokens currently in the context, when known.
             context_window (int | None): Maximum context size in tokens, when known.
         """
-
-    def response_finished(self) -> None:
-        """Finish the presentation of a model response."""
 
     def conversation_ended(self) -> None:
         """Display that the conversation has ended."""
