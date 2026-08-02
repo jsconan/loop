@@ -150,6 +150,34 @@ def test_run_requeries_after_a_tool_call_and_records_local_items():
     interaction.conversation_ended.assert_called_once_with()
 
 
+def test_run_keeps_handled_commands_out_of_model_history():
+    """The runner skips every command consumed by its command manager."""
+    backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+    interaction = Mock(spec=Interaction)
+    interaction.input.side_effect = ["/help", "/missing", False]
+
+    loop = Loop(backend=backend, interaction=interaction)
+    loop.run()
+
+    assert loop.messages == []
+    backend.get_response.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["/exit", "/quit"])
+def test_run_exit_commands_end_the_conversation(command):
+    """Predefined slash exit commands terminate without a backend request."""
+    backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+    interaction = Mock(spec=Interaction)
+    interaction.input.return_value = command
+
+    loop = Loop(backend=backend, interaction=interaction)
+    loop.run()
+
+    assert loop.messages == []
+    backend.get_response.assert_not_called()
+    interaction.conversation_ended.assert_called_once_with()
+
+
 def test_handle_tool_calls_uses_local_objects():
     """Tool results remain typed in context."""
     registry = Mock()

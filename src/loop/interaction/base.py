@@ -3,6 +3,8 @@
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
+from ..commands import Command
+
 
 class Interaction(Protocol):
     """Provide semantically classified user interaction independently of a UI."""
@@ -14,8 +16,11 @@ class Interaction(Protocol):
             AbstractContextManager[None]: Scope that finalizes response presentation on exit.
         """
 
-    def input(self) -> str | False:
+    def input(self, commands: tuple[Command, ...] = ()) -> str | False:
         """Read a non-empty user message or an exit command.
+
+        Args:
+            commands (tuple[Command, ...]): Commands available for input completion.
 
         Returns:
             str | False: The stripped text entered by the user, or ``False`` when the user

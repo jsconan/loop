@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 from rich.prompt import Confirm
 
+from loop import Command
 from loop.interaction import ConsoleInteraction
 
 
@@ -14,7 +15,22 @@ def test_input_reads_a_trimmed_message_from_the_terminal():
     session.prompt.return_value = "  answer  \n"
 
     assert ConsoleInteraction(session=session).input() == "answer"
-    session.prompt.assert_called_once_with("\nYou: ")
+    session.prompt.assert_called_once()
+    assert session.prompt.call_args.args == ("\nYou: ",)
+
+
+def test_input_offers_command_names_and_descriptions_for_completion():
+    """Terminal input derives slash completion metadata from available commands."""
+    session = Mock()
+    session.prompt.return_value = "answer"
+    commands = (Command("/help", "Show help.", Mock()),)
+
+    ConsoleInteraction(session=session).input(commands)
+
+    completer = session.prompt.call_args.kwargs["completer"]
+    completions = list(completer.get_completions(Mock(text_before_cursor="/h"), Mock()))
+    assert [completion.text for completion in completions] == ["/help"]
+    assert completions[0].display_meta_text == "Show help."
 
 
 def test_input_reprompts_for_blank_input(capsys):

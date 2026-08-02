@@ -5,6 +5,8 @@ __all__ = [
     "AnswerCompleted",
     "Backend",
     "ConsoleInteraction",
+    "Command",
+    "CommandManager",
     "ConversationItem",
     "fetch_content",
     "get_current_datetime",
@@ -43,6 +45,7 @@ __all__ = [
 
 
 from .backend import Backend, OpenAIBackend
+from .commands import Command, CommandManager
 from .context import LoopContext, ToolContext
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop, Response

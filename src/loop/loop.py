@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .backend import Backend
+from .commands import CommandManager
 from .context import LoopContext
 from .interaction import ConsoleInteraction, Interaction
 from .models import (
@@ -50,6 +51,7 @@ class Loop:
     _debug: bool
     _stream: bool
     _model: str | None
+    _command_manager: CommandManager
 
     def __init__(
         self,
@@ -75,6 +77,7 @@ class Loop:
         self._stream = stream
         self._debug = debug
         self._model = model
+        self._command_manager = CommandManager()
 
     @property
     def backend(self) -> Backend:
@@ -177,10 +180,12 @@ class Loop:
 
     def run(self):
         """Run the conversation until the user requests to exit."""
-        while True:
-            user_input = self._interaction.input()
+        while not self._command_manager.exit_requested:
+            user_input = self._interaction.input(self._command_manager.commands)
             if user_input is False:
                 break
+            if self._command_manager.handle_user_command(user_input, self._interaction):
+                continue
             self._context.add_message(Message(role="user", content=user_input))
 
             while True:
