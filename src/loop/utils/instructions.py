@@ -20,13 +20,13 @@ def instruction_directories(
     """Return project instruction directories in scope order, followed by the user directory.
 
     Args:
-        working_directory: Directory whose repository-scoped instructions should apply.
-        relative_directory: Instruction directory relative to each project and user scope.
+        working_directory (Path): Directory whose repository-scoped instructions should apply.
+        relative_directory (Path): Instruction directory relative to each project and user scope.
 
     Returns:
-        Project directories from the repository root through ``working_directory``, followed
-        by the directory in the user's home. Outside a repository, only the working-directory
-        and user scopes are returned.
+        list[Path]: Project directories from the repository root through ``working_directory``,
+            followed by the directory in the user's home. Outside a repository, only the
+            working-directory and user scopes are returned.
     """
     project_root = find_project_root(working_directory)
     if project_root is None:
@@ -51,12 +51,12 @@ def read_instruction_frontmatter(
     """Read and validate the YAML frontmatter of an instruction file.
 
     Args:
-        location: Instruction file to read as UTF-8.
-        required_fields: Metadata fields that must contain non-empty strings. Valid values
-            are stripped before being returned.
+        location (Path): Instruction file to read as UTF-8.
+        required_fields (Collection[str]): Metadata fields that must contain non-empty strings.
+            Valid values are stripped before being returned.
 
     Returns:
-        The decoded frontmatter mapping.
+        dict[str, Any]: The decoded frontmatter mapping.
 
     Raises:
         OSError: The instruction file cannot be opened or read.
@@ -90,11 +90,11 @@ def read_instruction_body(content: str, filename: str) -> str:
     """Return the Markdown body following YAML frontmatter.
 
     Args:
-        content: Complete instruction-file content.
-        filename: Display name used in validation errors.
+        content (str): Complete instruction-file content.
+        filename (str): Display name used in validation errors.
 
     Returns:
-        The trimmed Markdown following the closing frontmatter delimiter.
+        str: The trimmed Markdown following the closing frontmatter delimiter.
 
     Raises:
         ValueError: Frontmatter is missing or unterminated.
@@ -116,12 +116,12 @@ def load_agents_instructions(
     """Load AGENTS.md files from the project root through the working directory.
 
     Args:
-        working_directory: Directory whose instruction scope should be loaded.
-        agents_filename: Name of the instruction file to discover.
-        max_bytes: Maximum encoded size of the combined instructions.
+        working_directory (Path | str): Directory whose instruction scope should be loaded.
+        agents_filename (str): Name of the instruction file to discover.
+        max_bytes (int): Maximum encoded size of the combined instructions.
 
     Returns:
-        The combined instructions in scope, truncated to ``max_bytes``, or ``None``
+        str | None: The combined instructions in scope, truncated to ``max_bytes``, or ``None``
         when no non-empty AGENTS.md file applies.
 
     Raises:
@@ -161,10 +161,10 @@ def build_instructions(*sections: str | None) -> str | None:
     """Combine non-empty instruction sections without changing their content.
 
     Args:
-        *sections: Optional instruction sections in desired output order.
+        *sections (str | None): Optional instruction sections in desired output order.
 
     Returns:
-        Sections separated by blank lines, or ``None`` when every section is empty.
+        str | None: Sections separated by blank lines, or ``None`` when every section is empty.
     """
     included = [section for section in sections if section]
     return "\n\n".join(included) or None

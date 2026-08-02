@@ -1,4 +1,4 @@
-"""Tools for working with dates and times."""
+"""Provide tools for working with dates and times."""
 
 from datetime import datetime
 

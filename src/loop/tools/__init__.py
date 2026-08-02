@@ -1,4 +1,4 @@
-"""Tools that can be called from the loop."""
+"""Expose tools that can be called from the loop."""
 
 __all__ = [
     "fetch_content",

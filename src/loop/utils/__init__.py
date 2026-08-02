@@ -1,1 +1,1 @@
-"""Utilities for the Loop package."""
+"""Provide utilities for the loop package."""

@@ -1,4 +1,4 @@
-"""Loop package initialization."""
+"""Expose the public loop package interface."""
 
 __all__ = [
     "BaseLoop",

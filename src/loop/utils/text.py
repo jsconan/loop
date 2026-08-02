@@ -16,12 +16,12 @@ def format_content_preview(
     preserving line breaks for readability.
 
     Args:
-        content: The raw file content to display.
-        max_chars: Maximum allowed character count before truncation.
-        max_lines: Maximum allowed line count before truncation.
+        content (str): The raw file content to display.
+        max_chars (int): Maximum allowed character count before truncation.
+        max_lines (int): Maximum allowed line count before truncation.
 
     Returns:
-        A formatted preview string with line numbers and optional truncation notices.
+        str: A formatted preview string with line numbers and optional truncation notices.
     """
     truncated = False
     truncated_message: str | None = None

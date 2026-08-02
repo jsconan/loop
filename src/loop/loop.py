@@ -29,13 +29,17 @@ from .utils.instructions import build_instructions, load_agents_instructions
 class Response:
     """Collect answer and reasoning text from an LLM response.
 
-    Attributes:
-        answer: The final answer text.
-        reasoning: The model's reasoning text.
-        tool_calls: Function tool calls requested by the model.
-        output_items: Raw output items returned by the model.
-        usage: Total tokens in the context after the response, when reported by the backend.
-        model: Model identifier reported by the backend.
+    Args:
+        answer (str): The final answer text.
+        reasoning (str): The model's reasoning text.
+        tool_calls (list[ResponseFunctionToolCall]): Function tool calls requested by the model.
+            Defaults to an empty list.
+        output_items (list[BaseModel]): Raw output items returned by the model. Defaults to an
+            empty list.
+        usage (int | None): Total tokens in the context after the response, or ``None`` when not
+            reported.
+        model (str | None): Model identifier reported by the backend, or ``None`` when not
+            reported.
     """
 
     answer: str
@@ -51,9 +55,11 @@ class LoopContext:
     """Store conversation history and the latest model context usage.
 
     Args:
-        messages: Initial Responses API input items accumulated during the conversation.
-        tokens: Initial total tokens in the context after the latest response.
-        model: Initial model identifier reported by the latest response.
+        messages (list[dict]): Initial Responses API input items. Defaults to an empty list.
+        tokens (int): Initial total tokens in the context after the latest response. Defaults to
+            zero.
+        model (str | None): Initial model identifier reported by the latest response, or ``None``
+            when unknown.
     """
 
     messages: list[dict] = field(default_factory=list)
@@ -64,7 +70,8 @@ class LoopContext:
         """Add one message to the conversation history.
 
         Args:
-            message: Responses API input item to add. Models are dumped to dictionaries.
+            message (BaseModel | dict): Responses API input item to add. Models are dumped to
+                dictionaries.
 
         Raises:
             ValueError: If the message is not a dictionary or a BaseModel.
@@ -75,7 +82,8 @@ class LoopContext:
         """Add messages to the conversation history.
 
         Args:
-            messages: Responses API input items to add. Models are dumped to dictionaries.
+            messages (Iterable[BaseModel | dict]): Responses API input items to add. Models are
+                dumped to dictionaries.
 
         Raises:
             ValueError: If any message is not a dictionary or a BaseModel.
@@ -95,13 +103,17 @@ class BaseLoop:
     """Run an interactive conversation using non-streaming responses.
 
     Args:
-        client: Client used to request model responses. When omitted, a client is created.
-        tool_registry: Registry used by the automatically created client.
-        skill_manager: Manager used to discover and progressively activate Agent Skills.
-        interaction: Service used for all user input and output.
-        working_directory: Directory used to discover applicable AGENTS.md files.
-        context: Conversation state to use. Supply the same context to share state between loops.
-        debug: Whether to print raw response events.
+        client (Client | None): Client used to request model responses. When omitted, a client is
+            created.
+        tool_registry (ToolRegistry | None): Registry used by the automatically created client.
+        skill_manager (SkillManager | None): Manager used to discover and progressively activate
+            Agent Skills.
+        interaction (Interaction | None): Service used for all user input and output.
+        working_directory (Path | str | None): Directory used to discover applicable AGENTS.md
+            files.
+        context (LoopContext | None): Conversation state to use. Supply the same context to share
+            state between loops.
+        debug (bool): Whether to print raw response events.
 
     Raises:
         ValueError: If both a client and tool registry are supplied.
@@ -147,47 +159,83 @@ class BaseLoop:
 
     @property
     def client(self) -> Client:
-        """Return the client used to request model responses."""
+        """Return the client used to request model responses.
+
+        Returns:
+            Client: The configured LLM client.
+        """
         return self._client
 
     @property
     def instructions(self) -> str | None:
-        """Return the AGENTS.md instructions loaded for this session."""
+        """Return the AGENTS.md instructions loaded for this session.
+
+        Returns:
+            str | None: The combined project instructions, or ``None`` when none were found.
+        """
         return self._instructions
 
     @property
     def messages(self) -> list[dict]:
-        """Return the current conversation history."""
+        """Return the current conversation history.
+
+        Returns:
+            list[dict]: Responses API input items accumulated during the conversation.
+        """
         return self._context.messages
 
     @property
     def context(self) -> LoopContext:
-        """Return the shared conversation context."""
+        """Return the shared conversation context.
+
+        Returns:
+            LoopContext: The mutable conversation state used by the loop.
+        """
         return self._context
 
     @property
     def skill_manager(self) -> SkillManager:
-        """Return the skill manager active for this conversation."""
+        """Return the skill manager active for this conversation.
+
+        Returns:
+            SkillManager: The active skill manager.
+        """
         return self._skill_manager
 
     @property
     def interaction(self) -> Interaction:
-        """Return the service used for user input and output."""
+        """Return the service used for user input and output.
+
+        Returns:
+            Interaction: The configured interaction service.
+        """
         return self._interaction
 
     @property
     def working_directory(self) -> Path:
-        """Return the directory used to discover project instructions."""
+        """Return the directory used to discover project instructions.
+
+        Returns:
+            Path: The resolved working directory.
+        """
         return self._working_directory
 
     @property
     def debug(self) -> bool:
-        """Return whether raw response event output is enabled."""
+        """Return whether raw response event output is enabled.
+
+        Returns:
+            bool: Whether debug output is enabled.
+        """
         return self._debug
 
     @debug.setter
     def debug(self, debug: bool) -> None:
-        """Enable or disable raw response event output."""
+        """Enable or disable raw response event output.
+
+        Args:
+            debug (bool): Whether to enable debug output.
+        """
         self._debug = debug
 
     def run(self):
@@ -217,7 +265,7 @@ class BaseLoop:
         """Append completed response output items to the conversation history.
 
         Args:
-            response: The LLM response containing output items.
+            response (Response): The LLM response containing output items.
         """
         self._context.add_messages(response.output_items)
 
@@ -225,10 +273,10 @@ class BaseLoop:
         """Handle tool calls made by the LLM during reasoning.
 
         Args:
-            response: The LLM response containing tool call events.
+            response (Response): The LLM response containing tool call events.
 
         Returns:
-            ``True`` if at least one tool call was handled; otherwise ``False``.
+            bool: ``True`` if at least one tool call was handled; otherwise ``False``.
         """
         if not response.tool_calls:
             return False
@@ -249,11 +297,11 @@ class BaseLoop:
             )
         return True
 
-    def query(self) -> None:
+    def query(self) -> BaseModel:
         """Request a response for the current conversation history.
 
         Returns:
-            The response returned by the configured backend.
+            BaseModel: The response returned by the configured backend.
         """
         return self._client.get_response(
             input=self._context.messages,
@@ -273,10 +321,10 @@ class BaseLoop:
         """Display and collect reasoning and answer content from a response.
 
         Args:
-            response: A completed response returned by the LLM backend.
+            response (Any): A completed response returned by the LLM backend.
 
         Returns:
-            The collected answer and reasoning text.
+            Response: The collected answer and reasoning text.
         """
         thinking_text = ""
         answer_text = ""
@@ -321,11 +369,11 @@ class BaseLoop:
 class StreamingLoop(BaseLoop):
     """Run an interactive conversation while streaming response events."""
 
-    def query(self) -> None:
+    def query(self) -> BaseModel:
         """Request a streaming response for the current conversation history.
 
         Returns:
-            An iterable streaming response returned by the configured backend.
+            BaseModel: An iterable streaming response returned by the configured backend.
         """
         return self._client.get_response(
             input=self._context.messages,
@@ -337,10 +385,10 @@ class StreamingLoop(BaseLoop):
         """Display and collect events from a streaming response.
 
         Args:
-            response: An iterable of streaming events returned by the LLM backend.
+            response (Iterable[Any]): An iterable of streaming events returned by the LLM backend.
 
         Returns:
-            The collected answer and reasoning text.
+            Response: The collected answer and reasoning text.
         """
         is_thinking = False
         answer_started = False

@@ -15,10 +15,10 @@ def get_tool_description(function: Callable[..., Any]) -> str:
     """Return the summary paragraph from a function's docstring.
 
     Args:
-        function: Function whose docstring supplies the description.
+        function (Callable[..., Any]): Function whose docstring supplies the description.
 
     Returns:
-        The docstring's first paragraph as a single line.
+        str: The docstring's first paragraph as a single line.
 
     Raises:
         ToolRegistrationError: If the function has no docstring.
@@ -33,11 +33,11 @@ def get_tool_arguments_model(function: Callable[..., Any], tool_name: str) -> ty
     """Build a validating Pydantic model from a function signature.
 
     Args:
-        function: Function whose parameters define the model fields.
-        tool_name: Public tool name used in the model and error messages.
+        function (Callable[..., Any]): Function whose parameters define the model fields.
+        tool_name (str): Public tool name used in the model and error messages.
 
     Returns:
-        A Pydantic model that validates the function's arguments.
+        type[BaseModel]: A Pydantic model that validates the function's arguments.
 
     Raises:
         ToolRegistrationError: If a parameter kind is unsupported or lacks a type annotation.
@@ -83,10 +83,10 @@ def takes_tool_context(function: Callable[..., Any]) -> bool:
     """Determine whether a function requests an injected tool context.
 
     Args:
-        function: Function whose first parameter may request a tool context.
+        function (Callable[..., Any]): Function whose first parameter may request a tool context.
 
     Returns:
-        Whether the first parameter is annotated as ``ToolContext``.
+        bool: Whether the first parameter is annotated as ``ToolContext``.
     """
     parameters = list(inspect.signature(function).parameters.values())
     if not parameters:
@@ -99,10 +99,10 @@ def get_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Adapt Pydantic JSON Schema to OpenAI strict function-tool rules.
 
     Args:
-        schema: Schema to modify recursively in place.
+        schema (dict[str, Any]): Schema to modify recursively in place.
 
     Returns:
-        The adapted schema.
+        dict[str, Any]: The adapted schema.
     """
     definitions = schema.get("$defs", {})
     for definition in definitions.values():
@@ -135,10 +135,10 @@ def serialize_tool_result(result: Any) -> str:
     """Convert a tool result to the string required by ``function_call_output``.
 
     Args:
-        result: Tool result to serialize.
+        result (Any): Tool result to serialize.
 
     Returns:
-        The original string, serialized Pydantic model, or JSON-encoded value.
+        str: The original string, serialized Pydantic model, or JSON-encoded value.
 
     Raises:
         TypeError: If ``result`` contains a value that JSON cannot serialize.
@@ -154,12 +154,12 @@ def serialize_tool_error(kind: str, message: str, **details: Any) -> str:
     """Return a stable, model-readable error result.
 
     Args:
-        kind: Machine-readable error category.
-        message: Human-readable error description.
-        **details: Additional fields to include in the error object.
+        kind (str): Machine-readable error category.
+        message (str): Human-readable error description.
+        **details (Any): Additional fields to include in the error object.
 
     Returns:
-        A JSON-encoded error object.
+        str: A JSON-encoded error object.
 
     Raises:
         TypeError: If a detail value cannot be JSON serialized.

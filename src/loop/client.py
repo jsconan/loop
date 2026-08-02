@@ -1,4 +1,4 @@
-"""Client implementation for connecting to the LLM backend."""
+"""Provide a client for connecting to the LLM backend."""
 
 import os
 
@@ -19,15 +19,18 @@ class Client:
     """Manage synchronous and asynchronous clients for the LLM backend.
 
     Args:
-        default_model: Model identifier used when a request does not specify one.
-        base_url: Base URL of the OpenAI-compatible backend.
-        api_key: API key for the backend. Defaults to ``OPENAI_API_KEY`` or a local key.
-        tool_registry: Registry supplying tool schemas for requests.
-        context_window: Deployed model context limit. Defaults to ``CONTEXT_WINDOW`` or
+        default_model (str | None): Model identifier used when a request does not specify one.
+        base_url (str | None): Base URL of the OpenAI-compatible backend.
+        api_key (str | None): API key for the backend. Defaults to ``OPENAI_API_KEY`` or a local
+            key.
+        tool_registry (ToolRegistry | None): Registry supplying tool schemas for requests.
+            Defaults to the package
+            registry.
+        context_window (int | None): Deployed model context limit. Defaults to ``CONTEXT_WINDOW`` or
             best-effort model metadata discovery.
 
     Raises:
-        ValueError: If the configured context window is not a positive integer.
+        ValueError: If the configured context window is not an integer or is not positive.
     """
 
     _client: OpenAI | None
@@ -68,7 +71,7 @@ class Client:
         """Return the registry used for declarations and runtime dispatch.
 
         Returns:
-            The configured tool registry.
+            ToolRegistry: The configured tool registry.
         """
         return self._tool_registry
 
@@ -77,7 +80,7 @@ class Client:
         """Return the model used when a request does not specify one.
 
         Returns:
-            The default model identifier.
+            str: The default model identifier.
         """
         return self._default_model
 
@@ -86,7 +89,7 @@ class Client:
         """Return the base URL of the configured LLM backend.
 
         Returns:
-            The configured backend URL.
+            str: The configured backend URL.
         """
         return self._base_url
 
@@ -95,7 +98,7 @@ class Client:
         """Return the default model context limit when available.
 
         Returns:
-            The context limit, or ``None`` when it cannot be determined.
+            int | None: The context limit, or ``None`` when it cannot be determined.
         """
         return self.get_context_window()
 
@@ -103,7 +106,7 @@ class Client:
         """Return the lazily initialized synchronous OpenAI client.
 
         Returns:
-            The synchronous OpenAI client.
+            OpenAI: The synchronous OpenAI client.
         """
         if self._client is None:
             self._client = OpenAI(
@@ -116,7 +119,7 @@ class Client:
         """Return the lazily initialized asynchronous OpenAI client.
 
         Returns:
-            The asynchronous OpenAI client.
+            AsyncOpenAI: The asynchronous OpenAI client.
         """
         if self._async_client is None:
             self._async_client = AsyncOpenAI(
@@ -129,7 +132,7 @@ class Client:
         """Return the models available from the configured backend.
 
         Returns:
-            The available models.
+            list[Model]: The available models.
         """
         return list(self.get_client().models.list(timeout=2.0))
 
@@ -137,7 +140,7 @@ class Client:
         """Asynchronously return the models available from the configured backend.
 
         Returns:
-            The available models.
+            list[Model]: The available models.
         """
         return list(await self.get_async_client().models.list(timeout=2.0))
 
@@ -151,13 +154,13 @@ class Client:
         """Create a synchronous response from the configured backend.
 
         Args:
-            input: Text or structured input to send to the model.
-            instructions: System or developer instructions to apply to the request.
-            stream: Whether to return a streaming response.
-            model: Model identifier to use instead of the default model.
+            input (str | ResponseInputParam): Text or structured input to send to the model.
+            instructions (str | None): System or developer instructions to apply to the request.
+            stream (bool): Whether to return a streaming response.
+            model (str | None): Model identifier to use instead of the default model.
 
         Returns:
-            The response produced by the backend.
+            BaseModel: The response produced by the backend.
         """
         response = self.get_client().responses.create(
             model=model or self._default_model,
@@ -179,13 +182,13 @@ class Client:
         """Create an asynchronous response from the configured backend.
 
         Args:
-            input: Text or structured input to send to the model.
-            instructions: System or developer instructions to apply to the request.
-            stream: Whether to return a streaming response.
-            model: Model identifier to use instead of the default model.
+            input (str | ResponseInputParam): Text or structured input to send to the model.
+            instructions (str | None): System or developer instructions to apply to the request.
+            stream (bool): Whether to return a streaming response.
+            model (str | None): Model identifier to use instead of the default model.
 
         Returns:
-            The response produced by the backend.
+            BaseModel: The response produced by the backend.
         """
         response = await self.get_async_client().responses.create(
             model=model or self._default_model,
@@ -201,10 +204,10 @@ class Client:
         """Return the deployed context limit for a selected model when available.
 
         Args:
-            model: Model identifier to inspect instead of the default model.
+            model (str | None): Model identifier to inspect instead of the default model.
 
         Returns:
-            The configured or discovered context limit, or ``None`` when unavailable.
+            int | None: The configured or discovered context limit, or ``None`` when unavailable.
         """
         if self._configured_context_window is not None:
             return self._configured_context_window
@@ -223,10 +226,10 @@ class Client:
         """Asynchronously return the selected model's deployed context limit.
 
         Args:
-            model: Model identifier to inspect instead of the default model.
+            model (str | None): Model identifier to inspect instead of the default model.
 
         Returns:
-            The configured or discovered context limit, or ``None`` when unavailable.
+            int | None: The configured or discovered context limit, or ``None`` when unavailable.
         """
         if self._configured_context_window is not None:
             return self._configured_context_window
@@ -245,11 +248,11 @@ class Client:
         """Count text tokens for the selected model when available.
 
         Args:
-            prompt: Text to tokenize.
-            model: Model identifier to use instead of the default model.
+            prompt (str): Text to tokenize.
+            model (str | None): Model identifier to use instead of the default model.
 
         Returns:
-            The token count, or ``None`` when tokenization fails or is unavailable.
+            int | None: The token count, or ``None`` when tokenization fails or is unavailable.
         """
         base_url = self._base_url.rstrip("/")
         if base_url.endswith("/v1"):
@@ -274,11 +277,11 @@ class Client:
         """Asynchronously count text tokens for the selected model when available.
 
         Args:
-            prompt: Text to tokenize.
-            model: Model identifier to use instead of the default model.
+            prompt (str): Text to tokenize.
+            model (str | None): Model identifier to use instead of the default model.
 
         Returns:
-            The token count, or ``None`` when tokenization fails or is unavailable.
+            int | None: The token count, or ``None`` when tokenization fails or is unavailable.
         """
         base_url = self._base_url.rstrip("/")
         if base_url.endswith("/v1"):

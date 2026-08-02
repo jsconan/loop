@@ -16,10 +16,10 @@ def find_project_root(working_directory: Path | str) -> Path | None:
     """Return the closest Git project root containing the working directory.
 
     Args:
-        working_directory: Directory from which to search upward.
+        working_directory (Path | str): Directory from which to search upward.
 
     Returns:
-        The closest directory containing a ``.git`` marker, or ``None`` when no
+        Path | None: The closest directory containing a ``.git`` marker, or ``None`` when no
         project root is found.
     """
     working_directory = Path(working_directory)
@@ -88,11 +88,11 @@ def is_path_ignored(path: Path | str, root: Path | str | None = None) -> bool:
     stop rule discovery, matching recursive traversal behavior.
 
     Args:
-        path: File or directory to evaluate.
-        root: Optional boundary for hierarchical ignore-file discovery.
+        path (Path | str): File or directory to evaluate.
+        root (Path | str | None): Optional boundary for hierarchical ignore-file discovery.
 
     Returns:
-        Whether ``.gitignore``, higher-priority ``.agentignore``, or Git metadata
+        bool: Whether ``.gitignore``, higher-priority ``.agentignore``, or Git metadata
         exclusion hides the path.
 
     Raises:
@@ -139,11 +139,11 @@ def iter_visible_paths(folder: Path | str, recursive: bool = False) -> Iterator[
     directories are listed without being followed.
 
     Args:
-        folder: Directory whose visible children should be discovered.
-        recursive: Whether to traverse visible child directories recursively.
+        folder (Path | str): Directory whose visible children should be discovered.
+        recursive (bool): Whether to traverse visible child directories recursively.
 
     Yields:
-        Visible files and directories as absolute paths.
+        Path: Visible files and directories as absolute paths.
     """
     folder = Path(folder).resolve()
     yield from _iter_visible_paths(folder, recursive, _initial_ignore_rules(folder))

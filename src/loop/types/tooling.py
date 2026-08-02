@@ -1,5 +1,5 @@
-"""Exceptions and types used in tooling and tool registration."""
+"""Define exceptions used in tooling and tool registration."""
 
 
 class ToolRegistrationError(ValueError):
-    """Raised when a Python function cannot be registered as a tool."""
+    """Indicate that a Python function cannot be registered as a tool."""

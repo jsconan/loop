@@ -20,10 +20,10 @@ MAX_CATALOG_CHARS = 8_000
 class Skill:
     """Describe an Agent Skill without eagerly loading its instructions.
 
-    Attributes:
-        name: Public name declared by the skill.
-        description: Summary used by the model to decide when to activate the skill.
-        location: Absolute path to the skill's ``SKILL.md`` file.
+    Args:
+        name (str): Public name declared by the skill.
+        description (str): Summary used by the model to decide when to activate the skill.
+        location (Path): Absolute path to the skill's ``SKILL.md`` file.
     """
 
     name: str
@@ -35,8 +35,9 @@ class SkillManager:
     """Discover skill metadata and load complete instructions on activation.
 
     Args:
-        skills: Discovered skill metadata.
-        diagnostics: Non-fatal discovery errors suitable for inspection.
+        skills (list[Skill] | None): Discovered skill metadata. Defaults to an empty list.
+        diagnostics (list[str] | None): Non-fatal discovery errors suitable for inspection.
+            Defaults to an empty list.
     """
 
     def __init__(
@@ -50,12 +51,20 @@ class SkillManager:
 
     @property
     def skills(self) -> tuple[Skill, ...]:
-        """Return discovered skill metadata in discovery order."""
+        """Return discovered skill metadata in discovery order.
+
+        Returns:
+            tuple[Skill, ...]: An immutable snapshot of the discovered skills.
+        """
         return tuple(self._skills)
 
     @property
     def diagnostics(self) -> tuple[str, ...]:
-        """Return non-fatal errors encountered during discovery."""
+        """Return non-fatal errors encountered during discovery.
+
+        Returns:
+            tuple[str, ...]: An immutable snapshot of discovery diagnostics.
+        """
         return tuple(self._diagnostics)
 
     @classmethod
@@ -67,12 +76,12 @@ class SkillManager:
         """Discover available skills while reading only their YAML metadata.
 
         Args:
-            working_directory: Directory whose repository-scoped skills should apply.
-            skill_directories: Explicit skill roots. When omitted, repository and user roots
-                from the Agent Skills convention are searched.
+            working_directory (Path | str): Directory whose repository-scoped skills should apply.
+            skill_directories (list[Path] | None): Explicit skill roots. When omitted, repository
+                and user roots from the Agent Skills convention are searched.
 
         Returns:
-            A manager containing valid skill metadata and discovery diagnostics.
+            SkillManager: A manager containing valid skill metadata and discovery diagnostics.
         """
         working_directory = Path(working_directory).resolve()
         directories = (
@@ -99,7 +108,11 @@ class SkillManager:
         return cls(skills, diagnostics)
 
     def list(self) -> dict[str, Any]:
-        """Return available skills, activation state, and discovery diagnostics."""
+        """Return available skills, activation state, and discovery diagnostics.
+
+        Returns:
+            dict[str, Any]: Model-readable skill summaries and discovery diagnostics.
+        """
         return {
             "skills": [self._summary(skill) for skill in self._skills],
             "diagnostics": list(self._diagnostics),
@@ -109,10 +122,10 @@ class SkillManager:
         """Load and return one skill's complete instructions.
 
         Args:
-            name: Exact skill name to activate.
+            name (str): Exact skill name to activate.
 
         Returns:
-            Activated instructions, or a structured missing or ambiguous result.
+            dict[str, Any]: Activated instructions, or a structured missing or ambiguous result.
         """
         matches = [skill for skill in self._skills if skill.name == name]
         if not matches:
@@ -141,10 +154,10 @@ class SkillManager:
         """Format a bounded metadata-only catalog for the model's initial instructions.
 
         Args:
-            max_chars: Maximum number of characters in the returned catalog.
+            max_chars (int): Maximum number of characters in the returned catalog.
 
         Returns:
-            The catalog, or ``None`` when no skills were discovered.
+            str | None: The catalog, or ``None`` when no skills were discovered.
         """
         if not self._skills:
             return None

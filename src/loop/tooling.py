@@ -24,11 +24,11 @@ from .utils.tooling import (
 class Tool:
     """Represent a function with its LLM declaration and argument validator.
 
-    Attributes:
-        name: Public name exposed to the model.
-        description: Description exposed in the tool declaration.
-        function: Python function invoked for the tool.
-        arguments_model: Pydantic model used to validate arguments.
+    Args:
+        name (str): Public name exposed to the model.
+        description (str): Description exposed in the tool declaration.
+        function (Callable[..., Any]): Python function invoked for the tool.
+        arguments_model (type[BaseModel]): Pydantic model used to validate arguments.
     """
 
     name: str
@@ -40,7 +40,7 @@ class Tool:
         """Return this tool in the flat Responses API function-tool format.
 
         Returns:
-            The strict function-tool declaration.
+            dict[str, Any]: The strict function-tool declaration.
         """
         return {
             "type": "function",
@@ -54,11 +54,11 @@ class Tool:
         """Validate JSON arguments, invoke the function, and serialize its result.
 
         Args:
-            arguments: JSON-encoded arguments supplied by the model.
-            context: Runtime context supplied to a context-aware tool.
+            arguments (str): JSON-encoded arguments supplied by the model.
+            context (ToolContext | None): Runtime context supplied to a context-aware tool.
 
         Returns:
-            The serialized function result or a model-readable error.
+            str: The serialized function result or a model-readable error.
 
         Raises:
             ValueError: If the tool requires a context but none is provided.
@@ -83,11 +83,11 @@ class Tool:
         """Validate and invoke either an asynchronous or synchronous function.
 
         Args:
-            arguments: JSON-encoded arguments supplied by the model.
-            context: Runtime context supplied to a context-aware tool.
+            arguments (str): JSON-encoded arguments supplied by the model.
+            context (ToolContext | None): Runtime context supplied to a context-aware tool.
 
         Returns:
-            The serialized function result or a model-readable error.
+            str: The serialized function result or a model-readable error.
 
         Raises:
             ValueError: If the tool requires a context but none is provided.
@@ -119,10 +119,11 @@ class Tool:
         """Return validated keyword arguments or a model-readable error.
 
         Args:
-            arguments: JSON-encoded arguments supplied by the model.
+            arguments (str): JSON-encoded arguments supplied by the model.
 
         Returns:
-            A pair containing validated arguments and no error, or no arguments and an error.
+            tuple[dict[str, Any] | None, str | None]: A pair containing validated arguments and no
+                error, or no arguments and an error.
         """
         try:
             validated = self.arguments_model.model_validate_json(arguments or "{}")
@@ -139,8 +140,9 @@ class ToolRegistry:
     """Collect tool declarations and route model calls to their implementations.
 
     Args:
-        interaction: Default interaction used by context-aware tools when dispatch does not
-            provide one.
+        interaction (Interaction | None): Default interaction used by context-aware tools when
+            dispatch does not provide one, or ``None`` to require an invocation-specific
+            interaction.
     """
 
     _tools: dict[str, Tool]
@@ -152,12 +154,20 @@ class ToolRegistry:
 
     @property
     def interaction(self) -> Interaction | None:
-        """Return the default interaction used during tool dispatch."""
+        """Return the default interaction used during tool dispatch.
+
+        Returns:
+            Interaction | None: The default interaction, or ``None`` when none is configured.
+        """
         return self._interaction
 
     @interaction.setter
     def interaction(self, interaction: Interaction | None) -> None:
-        """Set or clear the default interaction used during tool dispatch."""
+        """Set or clear the default interaction used during tool dispatch.
+
+        Args:
+            interaction (Interaction | None): Default interaction to use, or ``None`` to clear it.
+        """
         self._interaction = interaction
 
     def tool(
@@ -170,12 +180,14 @@ class ToolRegistry:
         """Register a function, usable as ``@tool_registry.tool`` or with options.
 
         Args:
-            function: Function to register when the decorator is used without options.
-            name: Public tool name. Defaults to the function name.
-            description: Public description. Defaults to the docstring summary.
+            function (Callable[..., Any] | None): Function to register when the decorator is used
+                without options.
+            name (str | None): Public tool name. Defaults to the function name.
+            description (str | None): Public description. Defaults to the docstring summary.
 
         Returns:
-            The registered function, or a decorator when ``function`` is omitted.
+            Callable[..., Any]: The registered function, or a decorator when ``function`` is
+                omitted.
 
         Raises:
             ToolRegistrationError: If the name is already registered, the function has no
@@ -200,7 +212,7 @@ class ToolRegistry:
         """Return declarations for all registered tools.
 
         Returns:
-            Function-tool declarations in registration order.
+            list[dict[str, Any]]: Function-tool declarations in registration order.
         """
         return [tool.schema() for tool in self._tools.values()]
 
@@ -215,13 +227,14 @@ class ToolRegistry:
         """Dispatch a synchronous tool call by registered name.
 
         Args:
-            name: Registered tool name.
-            arguments: JSON-encoded arguments supplied by the model.
-            interaction: Interaction for this invocation. Overrides the registry default.
-            skill_manager: Skill manager active for the current conversation.
+            name (str): Registered tool name.
+            arguments (str): JSON-encoded arguments supplied by the model.
+            interaction (Interaction | None): Interaction for this invocation. Overrides the
+                registry default.
+            skill_manager (SkillManager | None): Skill manager active for the current conversation.
 
         Returns:
-            The serialized tool result or a model-readable error.
+            str: The serialized tool result or a model-readable error.
 
         Raises:
             ValueError: If the tool requires a context but none is provided.
@@ -245,13 +258,14 @@ class ToolRegistry:
         """Dispatch an asynchronous or synchronous tool call by registered name.
 
         Args:
-            name: Registered tool name.
-            arguments: JSON-encoded arguments supplied by the model.
-            interaction: Interaction for this invocation. Overrides the registry default.
-            skill_manager: Skill manager active for the current conversation.
+            name (str): Registered tool name.
+            arguments (str): JSON-encoded arguments supplied by the model.
+            interaction (Interaction | None): Interaction for this invocation. Overrides the
+                registry default.
+            skill_manager (SkillManager | None): Skill manager active for the current conversation.
 
         Returns:
-            The serialized tool result or a model-readable error.
+            str: The serialized tool result or a model-readable error.
 
         Raises:
             ValueError: If the tool requires a context but none is provided.

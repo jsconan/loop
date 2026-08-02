@@ -21,40 +21,74 @@ class Interaction(Protocol):
         """Read a non-empty user message or an exit command.
 
         Returns:
-            The stripped text entered by the user, or ``False`` when the user
+            str | False: The stripped text entered by the user, or ``False`` when the user
             requests to exit.
         """
 
     def reasoning(self, message: str) -> None:
-        """Display model reasoning output."""
+        """Display model reasoning output.
+
+        Args:
+            message (str): Complete reasoning text to display.
+        """
 
     def reasoning_delta(self, delta: str, *, start: bool = False) -> None:
-        """Display a streamed model reasoning delta."""
+        """Display a streamed model reasoning delta.
+
+        Args:
+            delta (str): Incremental reasoning text to display.
+            start (bool): Whether this is the first reasoning delta in the response.
+        """
 
     def answer(self, message: str) -> None:
-        """Display model answer output."""
+        """Display model answer output.
+
+        Args:
+            message (str): Complete answer text to display.
+        """
 
     def answer_delta(self, delta: str, *, start: bool = False) -> None:
-        """Display a streamed model answer delta."""
+        """Display a streamed model answer delta.
+
+        Args:
+            delta (str): Incremental answer text to display.
+            start (bool): Whether this is the first answer delta in the response.
+        """
 
     def error(self, message: str) -> None:
-        """Display an error message."""
+        """Display an error message.
+
+        Args:
+            message (str): Error text to display.
+        """
 
     def warning(self, message: str) -> None:
-        """Display a warning message."""
+        """Display a warning message.
+
+        Args:
+            message (str): Warning text to display.
+        """
 
     def debug(self, value: Any) -> None:
-        """Display diagnostic output."""
+        """Display diagnostic output.
+
+        Args:
+            value (Any): Diagnostic value to display.
+        """
 
     def info(self, message: str = "") -> None:
-        """Display neutral status information."""
+        """Display neutral status information.
+
+        Args:
+            message (str): Status text to display, or an empty string for a blank line.
+        """
 
     def tool_call(self, name: str, arguments: str) -> None:
         """Display a model-requested tool call.
 
         Args:
-            name: Name of the requested tool.
-            arguments: JSON arguments supplied to the tool.
+            name (str): Name of the requested tool.
+            arguments (str): JSON arguments supplied to the tool.
         """
 
     def token_usage(
@@ -63,7 +97,13 @@ class Interaction(Protocol):
         context_tokens: int | None,
         context_window: int | None,
     ) -> None:
-        """Display the current model and context occupancy."""
+        """Display the current model and context occupancy.
+
+        Args:
+            model (str | None): Current model identifier, when known.
+            context_tokens (int | None): Number of tokens currently in the context, when known.
+            context_window (int | None): Maximum context size in tokens, when known.
+        """
 
     def response_finished(self) -> None:
         """Finish the presentation of a model response."""
@@ -75,11 +115,11 @@ class Interaction(Protocol):
         """Ask the user to approve an operation.
 
         Args:
-            message: Confirmation question to display.
-            default: Answer to use when the user enters no response.
+            message (str): Confirmation question to display.
+            default (bool): Answer to use when the user enters no response.
 
         Returns:
-            Whether the user approved the operation.
+            bool: Whether the user approved the operation.
         """
 
 
@@ -88,9 +128,11 @@ class ToolContext:
     """Provide runtime services and metadata to a context-aware tool.
 
     Args:
-        interaction: Service used to communicate with the user.
-        tool_name: Public name of the tool being invoked.
-        skill_manager: Skill manager active for the current conversation.
+        interaction (Interaction): Service used to communicate with the user.
+        tool_name (str): Public name of the tool being invoked.
+        skill_manager (SkillManager | None): Skill manager active for the current conversation,
+            or ``None`` when
+            skills are unavailable.
     """
 
     interaction: Interaction
@@ -101,11 +143,11 @@ class ToolContext:
         """Ask the user to confirm an action through the interaction service.
 
         Args:
-            message: Confirmation question to display.
-            default: Answer to use when the user enters no response.
+            message (str): Confirmation question to display.
+            default (bool): Answer to use when the user enters no response.
 
         Returns:
-            Whether the user approved the action.
+            bool: Whether the user approved the action.
         """
         return self.interaction.confirm(message, default=default)
 
@@ -114,8 +156,9 @@ class ConsoleInteraction:
     """Interact with a user through a rich, editable process terminal.
 
     Args:
-        console: Rich console used for terminal output.
-        session: Prompt session used for editable user input.
+        console (Console | None): Rich console used for terminal output. Defaults to a new console.
+        session (PromptSession[str] | None): Prompt session used for editable user input. Defaults
+            to a new session.
     """
 
     def __init__(
@@ -130,7 +173,7 @@ class ConsoleInteraction:
         """Prompt for a non-empty user message or an exit command.
 
         Returns:
-            The entered message, or ``False`` when the user requests to exit.
+            str | False: The entered message, or ``False`` when the user requests to exit.
         """
         while True:
             try:
@@ -149,12 +192,21 @@ class ConsoleInteraction:
         self._console.print("\nThinking...\n", style="dim cyan", markup=False)
 
     def reasoning(self, message: str) -> None:
-        """Write model reasoning to the terminal."""
+        """Write model reasoning to the terminal.
+
+        Args:
+            message (str): Complete reasoning text to write.
+        """
         self._reasoning_heading()
         self._console.print(message, style="dim", markup=False, highlight=False)
 
     def reasoning_delta(self, delta: str, *, start: bool = False) -> None:
-        """Write a streamed model reasoning delta to the terminal."""
+        """Write a streamed model reasoning delta to the terminal.
+
+        Args:
+            delta (str): Incremental reasoning text to write.
+            start (bool): Whether to write the reasoning heading before the delta.
+        """
         if start:
             self._reasoning_heading()
         self._console.print(
@@ -166,12 +218,21 @@ class ConsoleInteraction:
         self._console.print("\nAnswer:", end="", style="bold bright_green", markup=False)
 
     def answer(self, message: str) -> None:
-        """Write a model answer to the terminal."""
+        """Write a model answer to the terminal.
+
+        Args:
+            message (str): Complete answer text to write.
+        """
         self._answer_heading()
         self._console.print(message, style="bold", markup=False, highlight=False)
 
     def answer_delta(self, delta: str, *, start: bool = False) -> None:
-        """Write a streamed model answer delta to the terminal."""
+        """Write a streamed model answer delta to the terminal.
+
+        Args:
+            delta (str): Incremental answer text to write.
+            start (bool): Whether to write the answer heading before the delta.
+        """
         if start:
             self._answer_heading()
         self._console.print(
@@ -179,28 +240,44 @@ class ConsoleInteraction:
         )
 
     def error(self, message: str) -> None:
-        """Write an error to the terminal."""
+        """Write an error to the terminal.
+
+        Args:
+            message (str): Error text to write.
+        """
         self._console.print(f"Error: {message}", style="bold red", markup=False)
 
     def warning(self, message: str) -> None:
-        """Write a warning to the terminal."""
+        """Write a warning to the terminal.
+
+        Args:
+            message (str): Warning text to write.
+        """
         self._console.print(f"Warning: {message}", style="bold yellow", markup=False)
 
     def debug(self, value: Any) -> None:
-        """Write diagnostic output to the terminal."""
+        """Write diagnostic output to the terminal.
+
+        Args:
+            value (Any): Diagnostic value to write.
+        """
         self._console.print(f"\n[DEBUG EVENT]: {type(value)}", style="dim blue", markup=False)
         self._console.print(pformat(value), style="dim", markup=False, highlight=False)
 
     def info(self, message: str = "") -> None:
-        """Write neutral status information to the terminal."""
+        """Write neutral status information to the terminal.
+
+        Args:
+            message (str): Status text to write, or an empty string for a blank line.
+        """
         self._console.print(message, markup=False, highlight=False)
 
     def tool_call(self, name: str, arguments: str) -> None:
         """Write a model-requested tool call to the terminal.
 
         Args:
-            name: Name of the requested tool.
-            arguments: JSON arguments supplied to the tool.
+            name (str): Name of the requested tool.
+            arguments (str): JSON arguments supplied to the tool.
         """
         self._console.print(
             f"\n[TOOL CALL]: {name}({arguments})", style="dim magenta", markup=False
@@ -212,7 +289,13 @@ class ConsoleInteraction:
         context_tokens: int | None,
         context_window: int | None,
     ) -> None:
-        """Write the current model and context occupancy."""
+        """Write the current model and context occupancy.
+
+        Args:
+            model (str | None): Current model identifier, when known.
+            context_tokens (int | None): Number of tokens currently in the context, when known.
+            context_window (int | None): Maximum context size in tokens, when known.
+        """
         current_model = model or "?"
         used = f"{context_tokens:,}" if context_tokens is not None else "?"
         capacity = f"{context_window:,}" if context_window is not None else "?"
@@ -235,10 +318,10 @@ class ConsoleInteraction:
         """Ask for a yes-or-no answer and apply an empty-answer default.
 
         Args:
-            message: Confirmation question to display.
-            default: Answer to use when the user enters no response.
+            message (str): Confirmation question to display.
+            default (bool): Answer to use when the user enters no response.
 
         Returns:
-            Whether the user approved the operation.
+            bool: Whether the user approved the operation.
         """
         return Confirm.ask(message, default=default, console=self._console)

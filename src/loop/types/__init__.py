@@ -1,4 +1,4 @@
-"""Exceptions and types used in loop package."""
+"""Expose exceptions and types used by the loop package."""
 
 __all__ = [
     "ShutdownRequested",
