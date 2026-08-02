@@ -35,6 +35,20 @@
   checks before and after. Non-trivial new logic should leave behind the smallest runnable test or
   assertion that would fail if it broke. Trivial one-line changes do not require a new test.
 
+### Documentation
+
+- Treat documentation as part of the implementation. When a signature or behavior changes, update
+  the affected docstring in the same change and compare it against the final implementation.
+- Complete every applicable docstring section: document every argument with its type and purpose,
+  every returned or yielded value with its type and purpose, and every intentionally raised
+  exception. Do not leave sections partial merely because annotations or the signature provide
+  some of the same information.
+- Exempt registered tool docstrings from argument, return, yield, and type documentation; keep them
+  concise for use as tool descriptions and document their arguments through Pydantic fields
+  instead.
+- Follow the detailed source and test docstring conventions in the required `coding` and `testing`
+  skills.
+
 ## Skills
 
 - Use the `coding` skill when adding, modifying, refactoring, fixing, or reviewing code under

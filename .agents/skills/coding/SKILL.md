@@ -23,21 +23,36 @@ unrelated refactoring or new dependencies.
 
 - Add docstrings to every public module, class, function, method, and property.
 - Start each docstring with a concise, imperative summary.
-- Use Google-style `Args:`, `Returns:`, `Yields:`, and `Raises:` sections when applicable.
-- Omit sections that only repeat the signature, annotations, or summary. Omit `Returns:` when a
-  callable does not return a value.
+- Use complete Google-style sections for the final signature and behavior:
+  - `Args:` documents every parameter except `self` and `cls` as `name (type): description`, even
+    when the signature has a type annotation. Include the meaning of defaults when it is not
+    obvious. In a class docstring, document every `__init__` parameter there.
+  - `Returns:` documents every non-`None` return value as `type: description`, even when the
+    signature has a return annotation. For a tuple, document the composite tuple type and the
+    meaning of each member. Omit it only when every normal path returns `None`.
+  - `Yields:` replaces `Returns:` for an iterator and documents each yielded value as
+    `type: description`.
+  - `Raises:` documents each exception that the callable deliberately raises or exposes as part of
+    its contract. Do not list incidental implementation exceptions.
+- Do not omit an applicable entry or its type merely because the signature or annotation provides
+  the same information.
 - Do not add docstrings to dunder methods.
 - Document initialization behavior and arguments in the class docstring, not `__init__`.
 - Keep private function and method docstrings concise. Add argument, return, or error sections only
-  when the behavior is complex enough to require them.
-- Keep registered tool function docstrings concise because the full docstring becomes the tool
-  description. Put argument details in Pydantic field descriptions.
+  when the behavior is complex enough to require them; when adding a section, complete it using the
+  same rules as public docstrings.
+- Treat registered tool functions as the deliberate exception: keep their docstrings to the
+  imperative summary because the full docstring becomes the tool description. Argument, return,
+  yield, and type documentation requirements do not apply to tools; put argument details in
+  Pydantic field descriptions instead of an `Args:` section.
 
-Review and update stale documentation on the affected public surface without rewriting unrelated
-docstrings.
+After implementing, compare each added or changed callable's docstring with its final signature,
+return and yield paths, and explicit exceptions. Update stale documentation on the affected public
+surface without rewriting unrelated docstrings.
 
 ## Verify the change
 
-Define an observable success criterion. Run the narrowest relevant checks first, then the broader
+Define an observable success criterion. Include docstring completeness in the check whenever a
+public signature or behavior changes. Run the narrowest relevant checks first, then the broader
 project checks warranted by the risk. Use the `testing` skill when test code must be added or
 changed.

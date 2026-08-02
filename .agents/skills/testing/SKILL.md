@@ -38,6 +38,14 @@ only when mirrored test directories must be importable; do not place tests or ac
   internals only in their owning suite.
 - Test module-level helpers in their defining module's suite, not again through every consumer.
 
+## Document test intent
+
+- Add a concise module docstring describing the suite and a concise docstring to every test,
+  fixture, and test helper.
+- Describe the behavior or guarantee being exercised, not the test's implementation steps.
+- When changing a test's scope or expected outcome, update its docstring so it still describes the
+  complete behavior covered by the final test.
+
 ## Keep tests isolated
 
 Make every test deterministic, idempotent, standalone, and independent of execution order or the
