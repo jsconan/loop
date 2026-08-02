@@ -13,7 +13,7 @@ The project defaults to a local server at `http://localhost:8000/v1` running
 
 - Interactive, multi-turn conversations
 - Streaming response and reasoning output
-- Synchronous and asynchronous clients
+- Synchronous and asynchronous backend access
 - Responses API function-call handling
 - A decorator-based registry for synchronous and asynchronous Python tools
 - Built-in tools for filesystem access, shell commands, and the current date and time
@@ -51,13 +51,13 @@ export OPENAI_API_KEY="your-api-key"
 ```
 
 For local servers that do not require authentication, no environment variable is
-needed; the client supplies a placeholder key.
+needed; the OpenAI backend supplies a placeholder key.
 
 ## Usage
 
 ### Interactive conversation
 
-Run the streaming chat loop:
+Run the chat loop, which enables streaming in `main.py`:
 
 ```bash
 uv run python main.py
@@ -74,17 +74,18 @@ When the model requests a file write or shell command, the loop displays the
 operation and asks for confirmation first. File and directory reads do not
 require confirmation.
 
-### Use the client directly
+### Use the backend directly
 
 ```python
-from loop import Client
+from loop import AnswerDelta, OpenAIBackend
 
-client = Client()
-response = client.get_response(
+backend = OpenAIBackend()
+events = backend.get_response(
     input="Explain why the sky is blue in two sentences.",
 )
 
-print(response.output_text)
+answer = "".join(event.text for event in events if isinstance(event, AnswerDelta))
+print(answer)
 ```
 
 ### Asynchronous requests
@@ -92,15 +93,19 @@ print(response.output_text)
 ```python
 import asyncio
 
-from loop import Client
+from loop import AnswerDelta, OpenAIBackend
 
 
 async def main() -> None:
-    client = Client()
-    response = await client.get_response_async(
-        input="Give me three names for a lunar rover.",
-    )
-    print(response.output_text)
+    backend = OpenAIBackend()
+    answer_parts = []
+    async for event in backend.get_response_async(
+        input="Give me three names for a lunar rover.", stream=True
+    ):
+        if isinstance(event, AnswerDelta):
+            answer_parts.append(event.text)
+    answer = "".join(answer_parts)
+    print(answer)
 
 
 asyncio.run(main())
@@ -146,12 +151,12 @@ Follow the repository's review workflow and report findings by severity.
 
 ## Configuration
 
-Pass configuration directly to `Client` when using a different server or model:
+Pass configuration directly to `OpenAIBackend` when using a different server or model:
 
 ```python
-from loop import Client
+from loop import OpenAIBackend
 
-client = Client(
+backend = OpenAIBackend(
     base_url="https://example.com/v1",
     api_key="your-api-key",
     default_model="your-model-id",
@@ -213,8 +218,9 @@ uv run pylint src
 The package uses a `src` layout. Its main components are:
 
 ```text
-src/loop/client.py  OpenAI-compatible sync and async client
-src/loop/loop.py    Interactive and streaming conversation loops
-src/loop/tooling.py Tool registration, schemas, and dispatch
-src/loop/tools/     Built-in tool implementations
+src/loop/backend/    Backend contract and OpenAI-compatible adapter
+src/loop/loop.py     Interactive conversation loop and streaming configuration
+src/loop/models.py   Conversation and response events
+src/loop/tooling/    Tool registration, definitions, and dispatch
+src/loop/tools/      Built-in tool implementations
 ```

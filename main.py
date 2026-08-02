@@ -2,7 +2,7 @@
 
 from dotenv import find_dotenv, load_dotenv
 
-from loop import ConsoleInteraction, ShutdownRequested, StreamingLoop, register_shutdown_signals
+from loop import ConsoleInteraction, Loop, ShutdownRequested, register_shutdown_signals
 
 
 def main() -> None:
@@ -13,7 +13,7 @@ def main() -> None:
 
     try:
         interaction.info("Hello from loop!")
-        loop = StreamingLoop(interaction=interaction)
+        loop = Loop(interaction=interaction, stream=True)
         loop.run()
     except EOFError, KeyboardInterrupt, ShutdownRequested:
         interaction.info("\nStopping loop. Goodbye!")

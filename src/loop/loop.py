@@ -1,61 +1,37 @@
 """Run an interactive conversation with an LLM backend."""
 
-from dataclasses import dataclass, field
+from collections.abc import Iterable
 from pathlib import Path
 
-from openai import BaseModel
-from openai.types.responses import (
-    ResponseCompletedEvent,
-    ResponseFunctionToolCall,
-    ResponseOutputItemDoneEvent,
-    ResponseOutputMessage,
-    ResponseReasoningItem,
-    ResponseReasoningTextDeltaEvent,
-    ResponseReasoningTextDoneEvent,
-    ResponseTextDeltaEvent,
-    ResponseTextDoneEvent,
-)
-
-from .client import Client
+from .backend import Backend, OpenAIBackend
 from .context import LoopContext
 from .interaction import ConsoleInteraction, Interaction
+from .models import (
+    AnswerCompleted,
+    AnswerDelta,
+    ConversationItem,
+    Message,
+    ReasoningCompleted,
+    ReasoningDelta,
+    Response,
+    ResponseCompleted,
+    ResponseEvent,
+    ToolCallCompleted,
+    ToolResult,
+    Usage,
+)
 from .skills import SkillManager, build_instructions, load_agents_instructions
 from .tooling import ToolRegistry
 from .tooling import tool_registry as default_tool_registry
 
 
-@dataclass
-class Response:
-    """Collect answer and reasoning text from an LLM response.
+class Loop:
+    """Run an interactive conversation using normalized response events.
 
     Args:
-        answer (str): The final answer text.
-        reasoning (str): The model's reasoning text.
-        tool_calls (list[ResponseFunctionToolCall]): Function tool calls requested by the model.
-            Defaults to an empty list.
-        output_items (list[BaseModel]): Raw output items returned by the model. Defaults to an
-            empty list.
-        usage (int | None): Total tokens in the context after the response, or ``None`` when not
-            reported.
-        model (str | None): Model identifier reported by the backend, or ``None`` when not
-            reported.
-    """
-
-    answer: str
-    reasoning: str
-    tool_calls: list[ResponseFunctionToolCall] = field(default_factory=list)
-    output_items: list[BaseModel] = field(default_factory=list)
-    usage: int | None = None
-    model: str | None = None
-
-
-class BaseLoop:
-    """Run an interactive conversation using non-streaming responses.
-
-    Args:
-        client (Client | None): Client used to request model responses. When omitted, a client is
-            created.
-        tool_registry (ToolRegistry | None): Registry used by the automatically created client.
+        backend (Backend | None): Backend used to request model responses. When omitted, a backend
+            is created.
+        tool_registry (ToolRegistry | None): Registry used by the automatically created backend.
         skill_manager (SkillManager | None): Manager used to discover and progressively activate
             Agent Skills.
         interaction (Interaction | None): Service used for all user input and output.
@@ -63,38 +39,41 @@ class BaseLoop:
             files.
         context (LoopContext | None): Conversation state to use. Supply the same context to share
             state between loops.
+        stream (bool): Whether the backend should produce response events incrementally.
         debug (bool): Whether to print raw response events.
 
     Raises:
-        ValueError: If both a client and tool registry are supplied.
+        ValueError: If both a backend and tool registry are supplied.
     """
 
-    _client: Client
+    _backend: Backend
     _instructions: str | None
     _context: LoopContext
     _skill_manager: SkillManager
     _interaction: Interaction
     _working_directory: Path
     _debug: bool
+    _stream: bool
 
     def __init__(
         self,
-        client: Client | None = None,
+        backend: Backend | None = None,
         tool_registry: ToolRegistry | None = None,
         skill_manager: SkillManager | None = None,
         interaction: Interaction | None = None,
         working_directory: Path | str | None = None,
         context: LoopContext | None = None,
+        stream: bool = False,
         debug: bool = False,
     ) -> None:
-        if client is not None and tool_registry is not None:
-            raise ValueError("Pass either client or tool_registry, not both.")
+        if backend is not None and tool_registry is not None:
+            raise ValueError("Pass either backend or tool_registry, not both.")
 
         if tool_registry is None:
-            tool_registry = client.tool_registry if client is not None else default_tool_registry
+            tool_registry = backend.tool_registry if backend is not None else default_tool_registry
 
         self._interaction = interaction or tool_registry.interaction or ConsoleInteraction()
-        self._client = client or Client(tool_registry=tool_registry)
+        self._backend = backend or OpenAIBackend(tool_registry=tool_registry)
         self._context = context or LoopContext()
         self._working_directory = Path(working_directory or Path.cwd()).resolve()
         self._skill_manager = skill_manager or SkillManager.discover(self._working_directory)
@@ -102,19 +81,20 @@ class BaseLoop:
             load_agents_instructions(self._working_directory),
             self._skill_manager.catalog(),
         )
+        self._stream = stream
         self._debug = debug
-        default_model = self._client.default_model
+        default_model = self._backend.default_model
         if self._context.model is None and isinstance(default_model, str):
             self._context.model = default_model
 
     @property
-    def client(self) -> Client:
-        """Return the client used to request model responses.
+    def backend(self) -> Backend:
+        """Return the backend used to request model responses.
 
         Returns:
-            Client: The configured LLM client.
+            Backend: The configured LLM backend.
         """
-        return self._client
+        return self._backend
 
     @property
     def instructions(self) -> str | None:
@@ -126,11 +106,11 @@ class BaseLoop:
         return self._instructions
 
     @property
-    def messages(self) -> list[dict]:
+    def messages(self) -> list[ConversationItem]:
         """Return the current conversation history.
 
         Returns:
-            list[dict]: Responses API input items accumulated during the conversation.
+            list[ConversationItem]: Items accumulated during the conversation.
         """
         return self._context.messages
 
@@ -179,6 +159,15 @@ class BaseLoop:
         """
         return self._debug
 
+    @property
+    def stream(self) -> bool:
+        """Return whether responses are requested incrementally.
+
+        Returns:
+            bool: Whether response streaming is enabled.
+        """
+        return self._stream
+
     @debug.setter
     def debug(self, debug: bool) -> None:
         """Enable or disable raw response event output.
@@ -194,11 +183,11 @@ class BaseLoop:
             user_input = self._interaction.input()
             if user_input is False:
                 break
-            self._context.add_message({"role": "user", "content": user_input})
+            self._context.add_message(Message(role="user", content=user_input))
 
             while True:
                 response = self.output(self.query())
-                self.record_output(response)
+                self._context.add_messages(response.items)
 
                 if not self.handle_tool_calls(response):
                     break
@@ -206,18 +195,10 @@ class BaseLoop:
             self._interaction.token_usage(
                 self._context.model,
                 self._context.tokens,
-                self._client.get_context_window(self._context.model),
+                self._backend.get_context_window(self._context.model),
             )
 
         self.end()
-
-    def record_output(self, response: Response) -> None:
-        """Append completed response output items to the conversation history.
-
-        Args:
-            response (Response): The LLM response containing output items.
-        """
-        self._context.add_messages(response.output_items)
 
     def handle_tool_calls(self, response: Response) -> bool:
         """Handle tool calls made by the LLM during reasoning.
@@ -234,160 +215,102 @@ class BaseLoop:
         for tool_call in response.tool_calls:
             self._interaction.tool_call(tool_call.name, tool_call.arguments)
             self._context.add_message(
-                {
-                    "type": "function_call_output",
-                    "call_id": tool_call.call_id,
-                    "output": self._client.tool_registry.call(
+                ToolResult(
+                    call_id=tool_call.call_id,
+                    output=self._backend.tool_registry.call(
                         tool_call.name,
                         tool_call.arguments,
                         interaction=self._interaction,
                         skill_manager=self._skill_manager,
                     ),
-                }
+                )
             )
         return True
 
-    def query(self) -> BaseModel:
-        """Request a response for the current conversation history.
+    def query(self) -> Iterable[ResponseEvent]:
+        """Request normalized events for the current conversation history.
 
         Returns:
-            BaseModel: The response returned by the configured backend.
+            Iterable[ResponseEvent]: Events returned by the configured backend.
         """
-        return self._client.get_response(
+        return self._backend.get_response(
             input=self._context.messages,
             instructions=self._instructions,
+            stream=self._stream,
         )
 
-    def _update_context(self, usage, model: str | None) -> int | None:
+    def _update_context(self, usage: Usage, model: str | None) -> None:
         """Track the context produced by the latest model response."""
-        total_tokens = getattr(usage, "total_tokens", None)
-        if isinstance(total_tokens, int) and total_tokens >= 0:
-            self._context.tokens = total_tokens
+        if usage.total_tokens is not None:
+            self._context.tokens = usage.total_tokens
         if isinstance(model, str):
             self._context.model = model
-        return total_tokens if isinstance(total_tokens, int) and total_tokens >= 0 else None
 
-    def output(self, response) -> Response:
-        """Display and collect reasoning and answer content from a response.
+    def output(self, events: Iterable[ResponseEvent]) -> Response:
+        """Display and collect normalized response events.
 
         Args:
-            response (Any): A completed response returned by the LLM backend.
+            events (Iterable[ResponseEvent]): Response events to display and collect.
 
         Returns:
             Response: The collected answer and reasoning text.
         """
-        thinking_text = ""
-        answer_text = ""
+        reasoning = ""
+        answer = ""
         tool_calls = []
-        raw_usage = getattr(response, "usage", None)
-        model = getattr(response, "model", None)
+        items = ()
+        usage = Usage()
+        model = None
+        reasoning_started = False
+        answer_started = False
 
-        for message in response.output:
+        for event in events:
             if self._debug:
-                self._interaction.debug(message)
+                self._interaction.debug(event)
 
-            if isinstance(message, ResponseReasoningItem):
-                content = message.content[0].text if message.content else ""
-                thinking_text += content
-                self._interaction.reasoning(content)
+            if isinstance(event, ReasoningDelta):
+                self._interaction.reasoning_delta(event.text, start=not reasoning_started)
+                reasoning_started = True
                 continue
 
-            if isinstance(message, ResponseOutputMessage):
-                content = message.content[0].text if message.content else ""
-                answer_text += content
-                self._interaction.answer(content)
+            if isinstance(event, AnswerDelta):
+                self._interaction.answer_delta(event.text, start=not answer_started)
+                answer_started = True
                 continue
 
-            if isinstance(message, ResponseFunctionToolCall):
-                tool_calls.append(message)
+            if isinstance(event, ReasoningCompleted):
+                reasoning = event.text
+                self._interaction.reasoning(event.text)
                 continue
 
+            if isinstance(event, AnswerCompleted):
+                answer = event.text
+                self._interaction.answer(event.text)
+                continue
+
+            if isinstance(event, ToolCallCompleted):
+                tool_calls.append(event.call)
+                continue
+
+            if isinstance(event, ResponseCompleted):
+                items = event.items
+                usage = event.usage
+                model = event.model
+                answer = event.answer
+                reasoning = event.reasoning
+
+        if reasoning_started or answer_started:
+            self._interaction.response_finished()
+        self._update_context(usage, model)
         return Response(
-            answer=answer_text.strip(),
-            reasoning=thinking_text.strip(),
-            tool_calls=tool_calls,
-            output_items=list(response.output),
-            usage=self._update_context(raw_usage, model),
-            model=model if isinstance(model, str) else None,
+            answer=answer,
+            reasoning=reasoning,
+            tool_calls=tuple(tool_calls),
+            items=items,
+            usage=usage,
+            model=model,
         )
 
     def end(self) -> None:
         """Display the conversation termination message."""
         self._interaction.conversation_ended()
-
-
-class StreamingLoop(BaseLoop):
-    """Run an interactive conversation while streaming response events."""
-
-    def query(self) -> BaseModel:
-        """Request a streaming response for the current conversation history.
-
-        Returns:
-            BaseModel: An iterable streaming response returned by the configured backend.
-        """
-        return self._client.get_response(
-            input=self._context.messages,
-            instructions=self._instructions,
-            stream=True,
-        )
-
-    def output(self, response) -> Response:
-        """Display and collect events from a streaming response.
-
-        Args:
-            response (Iterable[Any]): An iterable of streaming events returned by the LLM backend.
-
-        Returns:
-            Response: The collected answer and reasoning text.
-        """
-        is_thinking = False
-        answer_started = False
-        thinking_text = ""
-        answer_text = ""
-        tool_calls = []
-        output_items = []
-        usage = None
-        model = None
-
-        for event in response:
-            if self._debug:
-                self._interaction.debug(event)
-
-            if isinstance(event, ResponseReasoningTextDeltaEvent):
-                self._interaction.reasoning_delta(event.delta, start=not is_thinking)
-                is_thinking = True
-                continue
-
-            if isinstance(event, ResponseTextDeltaEvent):
-                self._interaction.answer_delta(event.delta, start=not answer_started)
-                answer_started = True
-                continue
-
-            if isinstance(event, ResponseOutputItemDoneEvent):
-                output_items.append(event.item)
-                if isinstance(event.item, ResponseFunctionToolCall):
-                    tool_calls.append(event.item)
-                    continue
-
-            if isinstance(event, ResponseCompletedEvent):
-                usage = event.response.usage
-                model = event.response.model
-                continue
-
-            if isinstance(event, ResponseReasoningTextDoneEvent):
-                thinking_text += event.text
-
-            if isinstance(event, ResponseTextDoneEvent):
-                answer_text += event.text
-
-        if is_thinking or answer_started:
-            self._interaction.response_finished()
-
-        return Response(
-            answer=answer_text.strip(),
-            reasoning=thinking_text.strip(),
-            tool_calls=tool_calls,
-            output_items=output_items,
-            usage=self._update_context(usage, model),
-            model=model,
-        )

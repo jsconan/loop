@@ -5,6 +5,7 @@ from typing import Any
 
 from ..context import ToolContext
 from ..interaction import Interaction
+from ..models import ToolDefinition
 from ..skills import SkillManager
 from .tool import Tool
 from .utils import (
@@ -87,13 +88,13 @@ class ToolRegistry:
 
         return _register(function) if function is not None else _register
 
-    def schemas(self) -> list[dict[str, Any]]:
-        """Return declarations for all registered tools.
+    def definitions(self) -> list[ToolDefinition]:
+        """Return definitions for all registered tools.
 
         Returns:
-            list[dict[str, Any]]: Function-tool declarations in registration order.
+            list[ToolDefinition]: Function-tool definitions in registration order.
         """
-        return [tool.schema() for tool in self._tools.values()]
+        return [tool.definition() for tool in self._tools.values()]
 
     def call(
         self,

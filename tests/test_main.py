@@ -17,13 +17,13 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     loop_factory = Mock(return_value=loop)
     register_shutdown_signals = Mock()
     monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
-    monkeypatch.setattr(main, "StreamingLoop", loop_factory)
+    monkeypatch.setattr(main, "Loop", loop_factory)
     monkeypatch.setattr(main, "register_shutdown_signals", register_shutdown_signals)
 
     main.main()
 
     register_shutdown_signals.assert_called_once_with()
-    loop_factory.assert_called_once_with(interaction=interaction)
+    loop_factory.assert_called_once_with(interaction=interaction, stream=True)
     assert interaction.info.call_args_list == [
         call("Hello from loop!"),
         call("\nStopping loop. Goodbye!"),
@@ -36,11 +36,11 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch):
     loop = Mock()
     loop_factory = Mock(return_value=loop)
     monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
-    monkeypatch.setattr(main, "StreamingLoop", loop_factory)
+    monkeypatch.setattr(main, "Loop", loop_factory)
     monkeypatch.setattr(main, "register_shutdown_signals", Mock())
 
     main.main()
 
-    loop_factory.assert_called_once_with(interaction=interaction)
+    loop_factory.assert_called_once_with(interaction=interaction, stream=True)
     interaction.info.assert_called_once_with("Hello from loop!")
     loop.run.assert_called_once_with()

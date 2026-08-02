@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from ..context import ToolContext
+from ..models import ToolDefinition
 from .utils import (
     get_tool_schema,
     serialize_tool_error,
@@ -32,19 +33,17 @@ class Tool:
     function: Callable[..., Any]
     arguments_model: type[BaseModel]
 
-    def schema(self) -> dict[str, Any]:
-        """Return this tool in the flat Responses API function-tool format.
+    def definition(self) -> ToolDefinition:
+        """Return the function-tool definition.
 
         Returns:
-            dict[str, Any]: The strict function-tool declaration.
+            ToolDefinition: The strict function-tool definition.
         """
-        return {
-            "type": "function",
-            "name": self.name,
-            "description": self.description,
-            "parameters": get_tool_schema(self.arguments_model.model_json_schema()),
-            "strict": True,
-        }
+        return ToolDefinition(
+            name=self.name,
+            description=self.description,
+            parameters=get_tool_schema(self.arguments_model.model_json_schema()),
+        )
 
     def call(self, arguments: str, context: ToolContext | None = None) -> str:
         """Validate JSON arguments, invoke the function, and serialize its result.

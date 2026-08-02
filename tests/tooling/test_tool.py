@@ -21,20 +21,17 @@ def make_tool(function=Mock(return_value=2)) -> Tool:
     return Tool("calculate", "Calculate a value.", function, Arguments)
 
 
-def test_schema_adapts_the_argument_model(monkeypatch):
-    """Schema exposes flat tool metadata and delegates strict-schema adaptation."""
+def test_definition_adapts_the_argument_model(monkeypatch):
+    """Definition exposes neutral tool metadata and delegates schema adaptation."""
     adapt = Mock(return_value={"adapted": True})
     monkeypatch.setattr("loop.tooling.tool.get_tool_schema", adapt)
 
-    schema = make_tool().schema()
+    definition = make_tool().definition()
 
-    assert schema == {
-        "type": "function",
-        "name": "calculate",
-        "description": "Calculate a value.",
-        "parameters": {"adapted": True},
-        "strict": True,
-    }
+    assert definition.name == "calculate"
+    assert definition.description == "Calculate a value."
+    assert definition.parameters == {"adapted": True}
+    assert definition.strict is True
     adapt.assert_called_once_with(Arguments.model_json_schema())
 
 

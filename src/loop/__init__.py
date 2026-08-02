@@ -1,36 +1,68 @@
 """Expose the public loop package interface."""
 
 __all__ = [
-    "BaseLoop",
-    "Client",
+    "AnswerDelta",
+    "AnswerCompleted",
+    "Backend",
     "ConsoleInteraction",
+    "ConversationItem",
     "fetch_content",
     "get_current_datetime",
     "Interaction",
     "list_folder",
+    "Loop",
     "LoopContext",
     "manage_skills",
+    "Message",
+    "ModelInfo",
+    "OpenAIBackend",
     "read_text_file",
+    "Reasoning",
+    "ReasoningCompleted",
+    "ReasoningDelta",
     "register_shutdown_signals",
     "Response",
+    "ResponseCompleted",
+    "ResponseEvent",
     "run_command",
     "ShutdownRequested",
     "Skill",
     "SkillManager",
-    "StreamingLoop",
     "tool_registry",
     "Tool",
+    "ToolCall",
+    "ToolCallCompleted",
     "ToolContext",
+    "ToolDefinition",
     "ToolRegistrationError",
     "ToolRegistry",
+    "ToolResult",
+    "Usage",
     "write_text_file",
 ]
 
 
-from .client import Client
+from .backend import Backend, OpenAIBackend
 from .context import LoopContext, ToolContext
 from .interaction import ConsoleInteraction, Interaction
-from .loop import BaseLoop, Response, StreamingLoop
+from .loop import Loop, Response
+from .models import (
+    AnswerCompleted,
+    AnswerDelta,
+    ConversationItem,
+    Message,
+    ModelInfo,
+    Reasoning,
+    ReasoningCompleted,
+    ReasoningDelta,
+    ResponseCompleted,
+    ResponseEvent,
+    ToolCall,
+    ToolCallCompleted,
+    ToolDefinition,
+    ToolResult,
+    Usage,
+)
 from .skills import Skill, SkillManager
 from .tooling import Tool, ToolRegistrationError, ToolRegistry, tool_registry
 from .tools import (

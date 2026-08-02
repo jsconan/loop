@@ -59,12 +59,12 @@ def test_tool_accepts_explicit_metadata_and_rejects_duplicate_names(monkeypatch)
         registry.tool(first, name="selected", description="Explicit")
 
 
-def test_schemas_delegate_to_registered_tools(monkeypatch):
-    """Schema collection preserves registration order and delegates to each tool."""
+def test_definitions_delegate_to_registered_tools(monkeypatch):
+    """Definition collection preserves registration order and delegates to each tool."""
     first = Mock()
-    first.schema.return_value = {"name": "first"}
+    first.definition.return_value = {"name": "first"}
     second = Mock()
-    second.schema.return_value = {"name": "second"}
+    second.definition.return_value = {"name": "second"}
     tool_type = Mock(side_effect=[first, second])
     monkeypatch.setattr(tool_registry_module, "Tool", tool_type)
     monkeypatch.setattr(tool_registry_module, "get_tool_description", Mock(return_value="Doc"))
@@ -77,7 +77,7 @@ def test_schemas_delegate_to_registered_tools(monkeypatch):
     def second() -> None:
         pass
 
-    assert registry.schemas() == [{"name": "first"}, {"name": "second"}]
+    assert registry.definitions() == [{"name": "first"}, {"name": "second"}]
 
 
 def test_interaction_property_can_be_replaced_and_cleared():
