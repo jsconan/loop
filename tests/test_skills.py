@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from loop.skills import SkillManager
+from loop import SkillManager
 
 
 def write_skill(directory: Path, name: str, description: str, body: str = "Instructions") -> Path:
@@ -94,9 +94,7 @@ def test_default_discovery_orders_project_scopes_before_user_skills(tmp_path, mo
     working_directory.mkdir(parents=True)
     (project / ".git").mkdir()
     write_skill(project / ".agents" / "skills" / "root", "root", "Root skill.")
-    write_skill(
-        working_directory / ".agents" / "skills" / "local", "local", "Local skill."
-    )
+    write_skill(working_directory / ".agents" / "skills" / "local", "local", "Local skill.")
     write_skill(home / ".agents" / "skills" / "user", "user", "User skill.")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
@@ -128,9 +126,7 @@ def test_list_activation_errors_and_duplicate_names_are_structured(tmp_path):
         ("---\nname: changed", "frontmatter is not terminated"),
     ],
 )
-def test_activation_reports_skill_files_that_become_malformed(
-    tmp_path, replacement, message
-):
+def test_activation_reports_skill_files_that_become_malformed(tmp_path, replacement, message):
     """Activation validates the complete file even when valid metadata was discovered earlier."""
     location = write_skill(tmp_path / "skills" / "changing", "changing", "Changes later.")
     manager = SkillManager.discover(tmp_path, [tmp_path / "skills"])

@@ -8,8 +8,7 @@ import httpx
 import pytest
 from openai import APIConnectionError
 
-from loop.client import Client
-from loop.tooling import ToolRegistry
+from loop import Client, ToolRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -182,9 +181,10 @@ def test_prompt_tokens_use_the_server_tokenizer_when_available():
     response = Mock()
     response.json.return_value = {"count": 3}
     with patch("loop.client.httpx.post", return_value=response) as post:
-        assert Client("model", "http://localhost:8000/v1", "key").count_tokens(
-            "Hi", model="active"
-        ) == 3
+        assert (
+            Client("model", "http://localhost:8000/v1", "key").count_tokens("Hi", model="active")
+            == 3
+        )
 
     post.assert_called_once_with(
         "http://localhost:8000/tokenize",

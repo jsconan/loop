@@ -6,7 +6,7 @@ from typing import Annotated
 import httpx
 from pydantic import Field, HttpUrl
 
-from ..interaction import ToolContext
+from ..context import ToolContext
 from ..tooling import tool_registry
 
 _DEFAULT_USER_AGENT = (

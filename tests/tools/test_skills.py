@@ -3,9 +3,7 @@
 import json
 from unittest.mock import Mock
 
-from loop.interaction import Interaction
-from loop.skills import Skill, SkillManager
-from loop.tooling import tool_registry
+from loop import Interaction, Skill, SkillManager, tool_registry
 
 
 def test_manage_skills_lists_and_activates_through_one_tool(tmp_path):

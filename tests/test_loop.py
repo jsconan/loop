@@ -5,8 +5,8 @@ from unittest.mock import Mock
 
 import pytest
 from openai.types.responses import (
-    ResponseFunctionToolCall,
     ResponseCompletedEvent,
+    ResponseFunctionToolCall,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseReasoningItem,
@@ -17,10 +17,8 @@ from openai.types.responses import (
     ResponseUsage,
 )
 
-from loop.interaction import Interaction
-from loop.loop import BaseLoop, LoopContext, Response, StreamingLoop
-from loop.tooling import ToolRegistry
-from loop.tooling import tool_registry as default_tool_registry
+from loop import BaseLoop, Interaction, LoopContext, Response, StreamingLoop, ToolRegistry
+from loop import tool_registry as default_tool_registry
 
 
 def function_call() -> ResponseFunctionToolCall:
@@ -236,9 +234,7 @@ def test_run_displays_token_usage_after_output():
                     "type": "message",
                     "role": "assistant",
                     "status": "completed",
-                    "content": [
-                        {"type": "output_text", "text": "answer", "annotations": []}
-                    ],
+                    "content": [{"type": "output_text", "text": "answer", "annotations": []}],
                 }
             )
         ],
@@ -572,14 +568,14 @@ def test_streaming_output_collects_done_text_and_completed_tool_call(capsys):
                     "parallel_tool_calls": True,
                     "tool_choice": "auto",
                     "tools": [],
-                        "usage": {
-                            "input_tokens": 200,
-                            "input_tokens_details": {
-                                "cache_write_tokens": 0,
-                                "cached_tokens": 0,
-                            },
-                            "output_tokens": 30,
-                            "output_tokens_details": {"reasoning_tokens": 7},
+                    "usage": {
+                        "input_tokens": 200,
+                        "input_tokens_details": {
+                            "cache_write_tokens": 0,
+                            "cached_tokens": 0,
+                        },
+                        "output_tokens": 30,
+                        "output_tokens_details": {"reasoning_tokens": 7},
                         "total_tokens": 230,
                     },
                 },

@@ -13,9 +13,10 @@ __all__ = [
     "read_text_file",
     "Response",
     "run_command",
-    "StreamingLoop",
+    "ShutdownRequested",
     "Skill",
     "SkillManager",
+    "StreamingLoop",
     "tool_registry",
     "Tool",
     "ToolContext",
@@ -26,8 +27,9 @@ __all__ = [
 
 
 from .client import Client
-from .interaction import ConsoleInteraction, Interaction, ToolContext
-from .loop import BaseLoop, LoopContext, Response, StreamingLoop
+from .context import LoopContext, ToolContext
+from .interaction import ConsoleInteraction
+from .loop import BaseLoop, Response, StreamingLoop
 from .skills import Skill, SkillManager
 from .tooling import Tool, ToolRegistry, tool_registry
 from .tools import (
@@ -39,4 +41,4 @@ from .tools import (
     run_command,
     write_text_file,
 )
-from .types import ToolRegistrationError
+from .types import Interaction, ShutdownRequested, ToolRegistrationError

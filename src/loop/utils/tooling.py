@@ -7,7 +7,7 @@ from typing import Any, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, create_model
 
-from ..interaction import ToolContext
+from ..context import ToolContext
 from ..types import ToolRegistrationError
 
 

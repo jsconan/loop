@@ -6,9 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop.interaction import Interaction, ToolContext
-from loop.skills import SkillManager
-from loop.tooling import ToolRegistrationError, ToolRegistry
+from loop import Interaction, SkillManager, ToolContext, ToolRegistrationError, ToolRegistry
 
 
 def test_tool_confirmation_uses_the_registry_interaction():
@@ -41,10 +39,7 @@ def test_runtime_interaction_overrides_mutable_registry_default():
         return f"{context.tool_name}:{selected}"
 
     assert registry.call("selected", "{}") == "selected:default"
-    assert (
-        registry.call("selected", "{}", interaction=runtime_interaction)
-        == "selected:runtime"
-    )
+    assert registry.call("selected", "{}", interaction=runtime_interaction) == "selected:runtime"
 
     registry.interaction = runtime_interaction
     assert registry.interaction is runtime_interaction
@@ -104,8 +99,7 @@ def test_context_aware_function_receives_an_explicit_tool_context():
     assert list(schema["parameters"]["properties"]) == ["value"]
     interaction = Mock(spec=Interaction)
     assert (
-        registry.call("decorated", '{"value":"done"}', interaction=interaction)
-        == "decorated:done"
+        registry.call("decorated", '{"value":"done"}', interaction=interaction) == "decorated:done"
     )
 
 
@@ -119,12 +113,15 @@ def test_context_aware_function_receives_the_active_skill_manager():
         """Report whether a skill manager is active."""
         return context.skill_manager is manager
 
-    assert registry.call(
-        "has_skills",
-        "{}",
-        interaction=Mock(spec=Interaction),
-        skill_manager=manager,
-    ) == "true"
+    assert (
+        registry.call(
+            "has_skills",
+            "{}",
+            interaction=Mock(spec=Interaction),
+            skill_manager=manager,
+        )
+        == "true"
+    )
 
 
 def test_context_aware_function_requires_runtime_context():

@@ -5,7 +5,7 @@ from unittest.mock import Mock, call
 import pytest
 
 import main
-from loop.types import ShutdownRequested
+from loop import ShutdownRequested
 
 
 @pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt, ShutdownRequested])

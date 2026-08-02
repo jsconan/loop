@@ -5,7 +5,7 @@ from typing import Annotated, Literal, TypedDict
 
 from pydantic import Field
 
-from ..interaction import ToolContext
+from ..context import ToolContext
 from ..tooling import tool_registry
 from ..utils.path import is_path_ignored, iter_visible_paths
 from ..utils.text import format_content_preview

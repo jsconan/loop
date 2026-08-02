@@ -8,7 +8,7 @@ from typing import Annotated
 
 from pydantic import Field
 
-from ..interaction import ToolContext
+from ..context import ToolContext
 from ..tooling import tool_registry
 
 COMMAND_TIMEOUT_SECONDS = 30

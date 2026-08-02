@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 from rich.prompt import Confirm
 
-from loop.interaction import ConsoleInteraction
+from loop import ConsoleInteraction
 
 
 def test_input_reads_a_trimmed_message_from_the_terminal():

@@ -7,9 +7,9 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from .interaction import Interaction, ToolContext
+from .context import ToolContext
 from .skills import SkillManager
-from .types.tooling import ToolRegistrationError
+from .types import Interaction, ToolRegistrationError
 from .utils.tooling import (
     get_tool_arguments_model,
     get_tool_description,
