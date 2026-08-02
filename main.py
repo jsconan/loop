@@ -1,8 +1,20 @@
 """Main entry point for the loop package."""
 
+import os
+
 from dotenv import find_dotenv, load_dotenv
 
-from loop import ConsoleInteraction, Loop, ShutdownRequested, register_shutdown_signals
+from loop import (
+    ConsoleInteraction,
+    Loop,
+    OpenAIBackend,
+    ShutdownRequested,
+    register_shutdown_signals,
+)
+
+_BASE_URL = "http://localhost:8000/v1"
+_DEFAULT_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
+_API_KEY = "local-api-key"
 
 
 def main() -> None:
@@ -13,7 +25,14 @@ def main() -> None:
 
     try:
         interaction.info("Hello from loop!")
-        loop = Loop(interaction=interaction, stream=True)
+        context_window = os.getenv("CONTEXT_WINDOW")
+        backend = OpenAIBackend(
+            base_url=os.getenv("BASE_URL", _BASE_URL),
+            default_model=os.getenv("DEFAULT_MODEL", _DEFAULT_MODEL),
+            api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
+            context_window=int(context_window) if context_window is not None else None,
+        )
+        loop = Loop(backend, interaction=interaction, stream=True)
         loop.run()
     except EOFError, KeyboardInterrupt, ShutdownRequested:
         interaction.info("\nStopping loop. Goodbye!")

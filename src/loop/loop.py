@@ -3,7 +3,7 @@
 from collections.abc import Iterable
 from pathlib import Path
 
-from .backend import Backend, OpenAIBackend
+from .backend import Backend
 from .context import LoopContext
 from .interaction import ConsoleInteraction, Interaction
 from .models import (
@@ -21,17 +21,14 @@ from .models import (
     Usage,
 )
 from .skills import SkillManager, build_instructions, load_agents_instructions
-from .tooling import ToolRegistry
-from .tooling import tool_registry as default_tool_registry
 
 
 class Loop:
     """Run an interactive conversation using normalized response events.
 
     Args:
-        backend (Backend | None): Backend used to request model responses. When omitted, a backend
-            is created.
-        tool_registry (ToolRegistry | None): Registry used by the automatically created backend.
+        backend (Backend): Backend used to request model responses.
+        model (str | None): Model selected for requests, or ``None`` to use the backend default.
         skill_manager (SkillManager | None): Manager used to discover and progressively activate
             Agent Skills.
         interaction (Interaction | None): Service used for all user input and output.
@@ -42,8 +39,6 @@ class Loop:
         stream (bool): Whether the backend should produce response events incrementally.
         debug (bool): Whether to print raw response events.
 
-    Raises:
-        ValueError: If both a backend and tool registry are supplied.
     """
 
     _backend: Backend
@@ -54,11 +49,13 @@ class Loop:
     _working_directory: Path
     _debug: bool
     _stream: bool
+    _model: str | None
 
     def __init__(
         self,
-        backend: Backend | None = None,
-        tool_registry: ToolRegistry | None = None,
+        backend: Backend,
+        *,
+        model: str | None = None,
         skill_manager: SkillManager | None = None,
         interaction: Interaction | None = None,
         working_directory: Path | str | None = None,
@@ -66,14 +63,8 @@ class Loop:
         stream: bool = False,
         debug: bool = False,
     ) -> None:
-        if backend is not None and tool_registry is not None:
-            raise ValueError("Pass either backend or tool_registry, not both.")
-
-        if tool_registry is None:
-            tool_registry = backend.tool_registry if backend is not None else default_tool_registry
-
-        self._interaction = interaction or tool_registry.interaction or ConsoleInteraction()
-        self._backend = backend or OpenAIBackend(tool_registry=tool_registry)
+        self._interaction = interaction or backend.tool_registry.interaction or ConsoleInteraction()
+        self._backend = backend
         self._context = context or LoopContext()
         self._working_directory = Path(working_directory or Path.cwd()).resolve()
         self._skill_manager = skill_manager or SkillManager.discover(self._working_directory)
@@ -83,9 +74,7 @@ class Loop:
         )
         self._stream = stream
         self._debug = debug
-        default_model = self._backend.default_model
-        if self._context.model is None and isinstance(default_model, str):
-            self._context.model = default_model
+        self._model = model
 
     @property
     def backend(self) -> Backend:
@@ -168,6 +157,15 @@ class Loop:
         """
         return self._stream
 
+    @property
+    def model(self) -> str | None:
+        """Return the model explicitly selected for requests.
+
+        Returns:
+            str | None: The selected model, or ``None`` when the backend default is used.
+        """
+        return self._model
+
     @debug.setter
     def debug(self, debug: bool) -> None:
         """Enable or disable raw response event output.
@@ -193,9 +191,9 @@ class Loop:
                     break
 
             self._interaction.token_usage(
-                self._context.model,
+                self._context.model or self._model or self._backend.default_model,
                 self._context.tokens,
-                self._backend.get_context_window(self._context.model),
+                self._backend.get_context_window(self._model),
             )
 
         self.end()
@@ -232,11 +230,18 @@ class Loop:
 
         Returns:
             Iterable[ResponseEvent]: Events returned by the configured backend.
+
+        Raises:
+            ValueError: If neither the loop nor the backend selects a model.
         """
+        selected_model = self._model or self._backend.default_model
+        if not selected_model:
+            raise ValueError("No model was selected and the backend has no default model.")
         return self._backend.get_response(
             input=self._context.messages,
             instructions=self._instructions,
             stream=self._stream,
+            model=selected_model,
         )
 
     def _update_context(self, usage: Usage, model: str | None) -> None:

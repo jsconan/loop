@@ -113,7 +113,12 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
         patch("loop.backend.openai.OpenAI", return_value=sync_sdk) as openai,
         patch("loop.backend.openai.AsyncOpenAI", return_value=async_sdk) as async_openai,
     ):
-        client = OpenAIBackend("chosen-model", "https://example.test/v1", "secret", registry)
+        client = OpenAIBackend(
+            default_model="chosen-model",
+            base_url="https://example.test/v1",
+            api_key="secret",
+            tool_registry=registry,
+        )
 
         assert client.default_model == "chosen-model"
         assert client.base_url == "https://example.test/v1"
@@ -127,40 +132,28 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
     async_openai.assert_called_once_with(base_url="https://example.test/v1", api_key="secret")
 
 
-def test_configuration_comes_from_environment(monkeypatch):
-    """Omitted model and URL values come from the environment."""
+def test_backend_does_not_read_process_configuration(monkeypatch):
+    """Backend construction remains independent of process environment and application defaults."""
     monkeypatch.setenv("DEFAULT_MODEL", "environment-model")
     monkeypatch.setenv("BASE_URL", "https://environment.test/v1")
-    monkeypatch.setenv("CONTEXT_WINDOW", "32768")
-
-    client = OpenAIBackend()
-
-    assert client.default_model == "environment-model"
-    assert client.base_url == "https://environment.test/v1"
-    assert client.context_window == 32768
-
-
-def test_configuration_falls_back_to_built_in_defaults():
-    """Omitted model and URL values use the built-in local defaults."""
-    client = OpenAIBackend()
-
-    assert client.default_model == "nvidia/Qwen3.6-35B-A3B-NVFP4"
-    assert client.base_url == "http://localhost:8000/v1"
-
-
-def test_api_key_comes_from_environment_or_falls_back(monkeypatch):
-    """Omitted credentials prefer the environment and otherwise use the local key."""
     monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
-    with patch("loop.backend.openai.OpenAI") as openai:
-        openai.return_value.models.list.return_value = []
-        OpenAIBackend().get_models()
-    assert openai.call_args.kwargs["api_key"] == "environment-key"
 
-    monkeypatch.delenv("OPENAI_API_KEY")
-    with patch("loop.backend.openai.OpenAI") as openai:
-        openai.return_value.models.list.return_value = []
-        OpenAIBackend().get_models()
-    assert openai.call_args.kwargs["api_key"] == "local-api-key"
+    client = OpenAIBackend()
+
+    assert client.default_model is None
+    assert client.base_url is None
+    assert not hasattr(client, "api_key")
+
+
+def test_response_requires_an_explicit_or_default_model():
+    """Synchronous and asynchronous requests reject missing model selection."""
+    backend = OpenAIBackend()
+
+    with pytest.raises(ValueError, match="No model was selected"):
+        list(backend.get_response("hello"))
+
+    with pytest.raises(ValueError, match="No model was selected"):
+        asyncio.run(collect_events(backend.get_response_async("hello")))
 
 
 @pytest.mark.parametrize("context_window", [0, -1])
@@ -210,7 +203,7 @@ def test_context_window_is_discovered_from_matching_model_metadata():
         SimpleNamespace(id="other", model_extra={"max_model_len": 1000}),
         SimpleNamespace(id="default", model_extra={"max_model_len": 65536}),
     ]
-    client = OpenAIBackend("default")
+    client = OpenAIBackend(default_model="default")
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
         assert client.context_window == 65536
@@ -223,18 +216,20 @@ def test_context_window_is_discovered_from_matching_model_metadata():
         SimpleNamespace(id="default", model_extra={"max_model_len": 131072})
     ]
     with patch("loop.backend.openai.OpenAI", return_value=direct):
-        assert OpenAIBackend("default").context_window == 131072
+        assert OpenAIBackend(default_model="default").context_window == 131072
 
     selected = Mock()
     selected.models.list.return_value = [
         SimpleNamespace(id="served-model", model_extra={"max_model_len": 262144})
     ]
     with patch("loop.backend.openai.OpenAI", return_value=selected):
-        client = OpenAIBackend("requested-model")
+        client = OpenAIBackend(default_model="requested-model")
         assert client.get_context_window("served-model") == 262144
         assert client.get_context_window("served-model") == 262144
 
     selected.models.list.assert_called_once_with(timeout=2.0)
+
+    assert OpenAIBackend(default_model="default", context_window=4096).context_window == 4096
 
 
 def test_context_window_discovery_gracefully_handles_unavailable_metadata():
@@ -244,7 +239,7 @@ def test_context_window_discovery_gracefully_handles_unavailable_metadata():
         request=httpx.Request("GET", "https://example.test/v1/models")
     )
     with patch("loop.backend.openai.OpenAI", return_value=unavailable):
-        assert OpenAIBackend("default").context_window is None
+        assert OpenAIBackend(default_model="default").context_window is None
 
     missing = Mock()
     missing.models.list.return_value = [
@@ -252,21 +247,21 @@ def test_context_window_discovery_gracefully_handles_unavailable_metadata():
         SimpleNamespace(id="default", model_extra={}),
     ]
     with patch("loop.backend.openai.OpenAI", return_value=missing):
-        assert OpenAIBackend("default").context_window is None
+        assert OpenAIBackend(default_model="default").context_window is None
 
     absent = Mock()
     absent.models.list.return_value = [
         SimpleNamespace(id="other", model_extra={"max_model_len": 1000})
     ]
     with patch("loop.backend.openai.OpenAI", return_value=absent):
-        assert OpenAIBackend("default").context_window is None
+        assert OpenAIBackend(default_model="default").context_window is None
 
     malformed = Mock()
     malformed.models.list.return_value = [
         SimpleNamespace(id="default", model_extra={"max_model_len": "invalid"})
     ]
     with patch("loop.backend.openai.OpenAI", return_value=malformed):
-        assert OpenAIBackend("default").context_window is None
+        assert OpenAIBackend(default_model="default").context_window is None
 
 
 def test_prompt_tokens_use_the_server_tokenizer_when_available():
@@ -274,7 +269,9 @@ def test_prompt_tokens_use_the_server_tokenizer_when_available():
     response = Mock()
     response.json.return_value = {"count": 3}
     with patch("loop.backend.openai.httpx.post", return_value=response) as post:
-        backend = OpenAIBackend("model", "http://localhost:8000/v1", "key")
+        backend = OpenAIBackend(
+            default_model="model", base_url="http://localhost:8000/v1", api_key="key"
+        )
         assert (
             backend.count_tokens("Hi", model="active") == 3
         )
@@ -293,9 +290,22 @@ def test_prompt_tokenizer_preserves_a_nonstandard_api_base_path():
     response = Mock()
     response.json.return_value = {"count": 1}
     with patch("loop.backend.openai.httpx.post", return_value=response) as post:
-        assert OpenAIBackend(base_url="https://example.test/api").count_tokens("x") == 1
+        assert (
+            OpenAIBackend(base_url="https://example.test/api", default_model="model").count_tokens(
+                "x"
+            )
+            == 1
+        )
 
     assert post.call_args.args[0] == "https://example.test/api/tokenize"
+
+
+def test_prompt_tokenizers_are_unavailable_without_a_base_url():
+    """Token counting returns unknown when no tokenizer service URL is configured."""
+    backend = OpenAIBackend(default_model="default")
+
+    assert backend.count_tokens("Hi") is None
+    assert asyncio.run(backend.count_tokens_async("Hi")) is None
 
 
 def test_async_model_metadata_and_tokenizer_use_the_selected_model():
@@ -308,7 +318,9 @@ def test_async_model_metadata_and_tokenizer_use_the_selected_model():
     response.json.return_value = {"count": 4}
     http = AsyncMock()
     http.__aenter__.return_value.post = AsyncMock(return_value=response)
-    client = OpenAIBackend("default", "http://localhost:8000/v1", "key")
+    client = OpenAIBackend(
+        default_model="default", base_url="http://localhost:8000/v1", api_key="key"
+    )
 
     with (
         patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
@@ -341,7 +353,9 @@ def test_async_usage_helpers_gracefully_handle_configuration_and_failures():
     response.raise_for_status.side_effect = httpx.HTTPError("unavailable")
     http = AsyncMock()
     http.__aenter__.return_value.post = AsyncMock(return_value=response)
-    client = OpenAIBackend("default", "https://example.test/api", "key")
+    client = OpenAIBackend(
+        default_model="default", base_url="https://example.test/api", api_key="key"
+    )
 
     with (
         patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
@@ -361,7 +375,12 @@ def test_prompt_counting_gracefully_handles_unavailable_counts(payload):
     response = Mock()
     response.json.return_value = payload
     with patch("loop.backend.openai.httpx.post", return_value=response):
-        assert OpenAIBackend().count_tokens("Hi") is None
+        assert (
+            OpenAIBackend(
+                default_model="default", base_url="https://example.test/v1"
+            ).count_tokens("Hi")
+            is None
+        )
 
 
 def test_sync_response_forwards_schema_streaming_and_model_selection():
@@ -373,7 +392,7 @@ def test_sync_response_forwards_schema_streaming_and_model_selection():
     registry.definitions.return_value = [definition]
     sdk = Mock()
     sdk.responses.create.return_value = []
-    client = OpenAIBackend("default", tool_registry=registry)
+    client = OpenAIBackend(default_model="default", tool_registry=registry)
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
         result = list(
@@ -414,7 +433,7 @@ def test_async_response_uses_default_model():
             output=[], output_text="", usage=None, model="served-model"
         )
     )
-    client = OpenAIBackend("default", tool_registry=registry)
+    client = OpenAIBackend(default_model="default", tool_registry=registry)
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
         result = asyncio.run(
@@ -483,7 +502,9 @@ def test_completed_response_normalizes_items_and_serializes_local_history():
     ]
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        events = list(OpenAIBackend(tool_registry=registry).get_response(history))
+        events = list(
+            OpenAIBackend(default_model="default", tool_registry=registry).get_response(history)
+        )
 
     local_call = ToolCall(call_id="call_1", name="demo", arguments="{}", id="fc_1")
     items = (
@@ -554,7 +575,7 @@ def test_completed_response_emits_only_final_reasoning():
     )
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        events = list(OpenAIBackend().get_response("hello"))
+        events = list(OpenAIBackend(default_model="default").get_response("hello"))
 
     assert events == [
         ReasoningCompleted(text="final"),
@@ -583,7 +604,7 @@ def test_completed_response_ignores_empty_text_and_invalid_metadata():
     )
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        events = list(OpenAIBackend().get_response("hello"))
+        events = list(OpenAIBackend(default_model="default").get_response("hello"))
 
     assert events == [
         ResponseCompleted(
@@ -595,7 +616,11 @@ def test_completed_response_ignores_empty_text_and_invalid_metadata():
 def test_response_rejects_non_local_history_items():
     """Request serialization rejects values outside the local conversation model."""
     with pytest.raises(TypeError, match="Unsupported conversation item"):
-        list(OpenAIBackend().get_response([{"role": "user", "content": "hello"}]))
+        list(
+            OpenAIBackend(default_model="default", api_key="test-key").get_response(
+                [{"role": "user", "content": "hello"}]
+            )
+        )
 
 
 def test_streaming_response_normalizes_provider_events():
@@ -684,7 +709,7 @@ def test_streaming_response_normalizes_provider_events():
     sdk.responses.create.return_value = provider_events
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        events = list(OpenAIBackend().get_response("hello", stream=True))
+        events = list(OpenAIBackend(default_model="default").get_response("hello", stream=True))
 
     local_call = ToolCall(call_id="call_1", name="demo", arguments="{}", id="fc_1")
     assert events == [
@@ -724,7 +749,9 @@ def test_async_streaming_response_uses_the_normalized_event_contract():
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
         events = asyncio.run(
-            collect_events(OpenAIBackend().get_response_async("hello", stream=True))
+            collect_events(
+                OpenAIBackend(default_model="default").get_response_async("hello", stream=True)
+            )
         )
 
     assert events == [AnswerDelta(text="answer"), ResponseCompleted(model="served-model")]
@@ -759,7 +786,7 @@ def test_async_streaming_yields_before_the_provider_stream_completes():
 
     async def read_first_event():
         """Read and close the first response event."""
-        events = OpenAIBackend().get_response_async("hello", stream=True)
+        events = OpenAIBackend(default_model="default").get_response_async("hello", stream=True)
         first = await anext(events)
         await events.aclose()
         return first

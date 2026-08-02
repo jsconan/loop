@@ -1,6 +1,5 @@
 """Adapt OpenAI-compatible APIs to conversation response events."""
 
-import os
 from collections.abc import AsyncIterator, Iterable, Iterator
 
 import httpx
@@ -36,25 +35,21 @@ from ..models import (
 )
 from ..tooling import ToolRegistry
 from ..tooling import tool_registry as default_tool_registry
-
-_BASE_URL = "http://localhost:8000/v1"
-_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
-_DEFAULT_API_KEY = "local-api-key"
+from .base import Backend
 
 
-class OpenAIBackend:
+class OpenAIBackend(Backend):
     """Adapt an OpenAI-compatible API to conversation models and events.
 
     Args:
         default_model (str | None): Model identifier used when a request does not specify one.
         base_url (str | None): Base URL of the OpenAI-compatible backend.
-        api_key (str | None): API key for the backend. Defaults to ``OPENAI_API_KEY`` or a local
-            key.
+        api_key (str | None): API key used privately by the backend client.
         tool_registry (ToolRegistry | None): Registry supplying tool schemas for requests.
             Defaults to the package
             registry.
-        context_window (int | None): Deployed model context limit. Defaults to ``CONTEXT_WINDOW`` or
-            best-effort model metadata discovery.
+        context_window (int | None): Deployed model context limit, or ``None`` to use best-effort
+            model metadata discovery.
 
     Raises:
         ValueError: If the configured context window is not an integer or is not positive.
@@ -62,63 +57,30 @@ class OpenAIBackend:
 
     _client: OpenAI | None
     _async_client: AsyncOpenAI | None
-    _base_url: str
-    _api_key: str
-    _default_model: str
-    _tool_registry: ToolRegistry
     _configured_context_window: int | None
     _context_windows: dict[str, int | None]
 
     def __init__(
         self,
+        *,
         default_model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         tool_registry: ToolRegistry | None = None,
         context_window: int | None = None,
     ) -> None:
+        super().__init__(
+            base_url=base_url,
+            default_model=default_model,
+            api_key=api_key,
+            tool_registry=tool_registry or default_tool_registry,
+        )
         self._client = None
         self._async_client = None
-        self._default_model = default_model or os.getenv("DEFAULT_MODEL", _MODEL)
-        self._base_url = base_url or os.getenv("BASE_URL", _BASE_URL)
-        self._api_key = api_key or os.getenv("OPENAI_API_KEY", _DEFAULT_API_KEY)
-        self._tool_registry = tool_registry or default_tool_registry
-        configured_window = (
-            context_window if context_window is not None else os.getenv("CONTEXT_WINDOW")
-        )
-        self._configured_context_window = (
-            int(configured_window) if configured_window is not None else None
-        )
+        self._configured_context_window = context_window
         if self._configured_context_window is not None and self._configured_context_window <= 0:
             raise ValueError("Context window must be a positive integer.")
         self._context_windows = {}
-
-    @property
-    def tool_registry(self) -> ToolRegistry:
-        """Return the registry used for declarations and runtime dispatch.
-
-        Returns:
-            ToolRegistry: The configured tool registry.
-        """
-        return self._tool_registry
-
-    @property
-    def default_model(self) -> str:
-        """Return the model used when a request does not specify one.
-
-        Returns:
-            str: The default model identifier.
-        """
-        return self._default_model
-
-    @property
-    def base_url(self) -> str:
-        """Return the base URL of the configured LLM backend.
-
-        Returns:
-            str: The configured backend URL.
-        """
-        return self._base_url
 
     @property
     def context_window(self) -> int | None:
@@ -182,9 +144,13 @@ class OpenAIBackend:
 
         Yields:
             ResponseEvent: Response events in output order.
+
+        Raises:
+            ValueError: If neither the request nor backend selects a model.
         """
+        selected_model = self._select_model(model)
         response = self._get_client().responses.create(
-            model=model or self._default_model,
+            model=selected_model,
             input=self._serialize_input(input),
             instructions=instructions,
             stream=stream,
@@ -215,9 +181,13 @@ class OpenAIBackend:
 
         Yields:
             ResponseEvent: Response events in output order.
+
+        Raises:
+            ValueError: If neither the request nor backend selects a model.
         """
+        selected_model = self._select_model(model)
         response = await self._get_async_client().responses.create(
-            model=model or self._default_model,
+            model=selected_model,
             input=self._serialize_input(input),
             instructions=instructions,
             stream=stream,
@@ -241,10 +211,13 @@ class OpenAIBackend:
 
         Returns:
             int | None: The configured or discovered context limit, or ``None`` when unavailable.
+
+        Raises:
+            ValueError: If neither the request nor backend selects a model.
         """
         if self._configured_context_window is not None:
             return self._configured_context_window
-        selected_model = model or self._default_model
+        selected_model = self._select_model(model)
         if selected_model not in self._context_windows:
             try:
                 models = self.get_models()
@@ -263,10 +236,13 @@ class OpenAIBackend:
 
         Returns:
             int | None: The configured or discovered context limit, or ``None`` when unavailable.
+
+        Raises:
+            ValueError: If neither the request nor backend selects a model.
         """
         if self._configured_context_window is not None:
             return self._configured_context_window
-        selected_model = model or self._default_model
+        selected_model = self._select_model(model)
         if selected_model not in self._context_windows:
             try:
                 models = await self.get_models_async()
@@ -286,7 +262,13 @@ class OpenAIBackend:
 
         Returns:
             int | None: The token count, or ``None`` when tokenization fails or is unavailable.
+
+        Raises:
+            ValueError: If neither the request nor backend selects a model.
         """
+        selected_model = self._select_model(model)
+        if self._base_url is None:
+            return None
         base_url = self._base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
@@ -294,7 +276,7 @@ class OpenAIBackend:
             response = httpx.post(
                 f"{base_url}/tokenize",
                 json={
-                    "model": model or self._default_model,
+                    "model": selected_model,
                     "prompt": prompt,
                     "add_special_tokens": False,
                 },
@@ -315,7 +297,13 @@ class OpenAIBackend:
 
         Returns:
             int | None: The token count, or ``None`` when tokenization fails or is unavailable.
+
+        Raises:
+            ValueError: If neither the request nor backend selects a model.
         """
+        selected_model = self._select_model(model)
+        if self._base_url is None:
+            return None
         base_url = self._base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
@@ -324,7 +312,7 @@ class OpenAIBackend:
                 response = await client.post(
                     f"{base_url}/tokenize",
                     json={
-                        "model": model or self._default_model,
+                        "model": selected_model,
                         "prompt": prompt,
                         "add_special_tokens": False,
                     },

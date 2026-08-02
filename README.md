@@ -79,7 +79,11 @@ require confirmation.
 ```python
 from loop import AnswerDelta, OpenAIBackend
 
-backend = OpenAIBackend()
+backend = OpenAIBackend(
+    base_url="http://localhost:8000/v1",
+    api_key="local-api-key",
+    default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
+)
 events = backend.get_response(
     input="Explain why the sky is blue in two sentences.",
 )
@@ -97,7 +101,11 @@ from loop import AnswerDelta, OpenAIBackend
 
 
 async def main() -> None:
-    backend = OpenAIBackend()
+    backend = OpenAIBackend(
+        base_url="http://localhost:8000/v1",
+        api_key="local-api-key",
+        default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
+    )
     answer_parts = []
     async for event in backend.get_response_async(
         input="Give me three names for a lunar rover.", stream=True
@@ -163,14 +171,16 @@ backend = OpenAIBackend(
 )
 ```
 
-Constructor arguments take precedence over the corresponding environment
-variables and built-in defaults:
+The executable in `main.py` resolves environment variables and applies these application defaults:
 
 | Setting  | Environment variable | Built-in default               |
 | -------- | -------------------- | ------------------------------ |
 | Base URL | `BASE_URL`           | `http://localhost:8000/v1`     |
 | Model    | `DEFAULT_MODEL`      | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
 | API key  | `OPENAI_API_KEY`     | `local-api-key`                |
+
+`OpenAIBackend` itself does not read environment variables or provide deployment defaults. Library
+callers configure it explicitly, and credentials remain private backend state.
 
 The `fetch_content` tool sends a browser-like user agent by default. Set `USER_AGENT` to override
 it for web requests.

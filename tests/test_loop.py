@@ -44,43 +44,17 @@ def loop_backend(**attributes):
     return SimpleNamespace(**(defaults | attributes))
 
 
-def test_default_backend_receives_custom_tool_registry(monkeypatch):
-    """A loop-created backend uses the registry supplied to the loop."""
-    registry = ToolRegistry()
-    created_backend = Mock()
-    created_backend.get_response.return_value = [ResponseCompleted()]
-    backend_factory = Mock(return_value=created_backend)
-    monkeypatch.setattr("loop.loop.OpenAIBackend", backend_factory)
-
-    loop = Loop(tool_registry=registry, stream=True)
-
-    assert list(loop.query()) == [ResponseCompleted()]
-    backend_factory.assert_called_once_with(tool_registry=registry)
-
-
-def test_default_loop_uses_the_default_tool_registry(monkeypatch):
-    """A default loop passes the populated shared registry to its backend."""
-    created_backend = Mock(tool_registry=default_tool_registry)
-    backend_factory = Mock(return_value=created_backend)
-    monkeypatch.setattr("loop.loop.OpenAIBackend", backend_factory)
-
-    Loop()
-
-    backend_factory.assert_called_once_with(tool_registry=default_tool_registry)
-    assert default_tool_registry.definitions()
-
-
-def test_backend_and_tool_registry_cannot_both_be_supplied():
-    """Ambiguous dependency injection is rejected explicitly."""
-    with pytest.raises(ValueError, match="either backend or tool_registry"):
-        Loop(backend=SimpleNamespace(), tool_registry=ToolRegistry())
-
-
 def test_loop_exposes_its_configured_state(tmp_path):
     """Loop accessors expose configured dependencies and mutable state."""
     backend = loop_backend()
     interaction = Mock(spec=Interaction)
-    loop = Loop(backend=backend, debug=True, interaction=interaction, working_directory=tmp_path)
+    loop = Loop(
+        backend=backend,
+        model="requested-model",
+        debug=True,
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
 
     assert loop.backend is backend
     assert loop.messages == []
@@ -89,7 +63,8 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.interaction is interaction
     assert loop.working_directory == tmp_path.resolve()
     assert loop.instructions is None
-    assert loop.context == LoopContext(model="default-model")
+    assert loop.context == LoopContext()
+    assert loop.model == "requested-model"
     assert loop.skill_manager is not None
 
     loop.debug = False
@@ -114,6 +89,7 @@ def test_loops_share_local_conversation_context(tmp_path):
         input=context.messages,
         instructions=None,
         stream=True,
+        model="other-model",
     )
 
 
@@ -205,6 +181,26 @@ def test_query_selects_only_the_event_production_mode():
 
     assert backend.get_response.call_args_list[0].kwargs["stream"] is False
     assert backend.get_response.call_args_list[1].kwargs["stream"] is True
+
+
+def test_query_prefers_the_explicit_model_over_response_metadata():
+    """Request selection stays independent of a model reported by an earlier response."""
+    backend = loop_backend(get_response=Mock(return_value=[]))
+    context = LoopContext(model="served-model")
+
+    list(Loop(backend=backend, model="requested-model", context=context).query())
+
+    assert backend.get_response.call_args.kwargs["model"] == "requested-model"
+
+
+def test_query_rejects_missing_model_selection():
+    """A query fails clearly when neither the loop nor backend selects a model."""
+    backend = loop_backend(default_model=None, get_response=Mock())
+
+    with pytest.raises(ValueError, match="No model was selected"):
+        Loop(backend=backend).query()
+
+    backend.get_response.assert_not_called()
 
 
 def test_one_output_loop_uses_terminal_response_text(capsys):
