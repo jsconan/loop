@@ -2,8 +2,14 @@
 
 import pytest
 
-from loop import Message, ToolCall
-from loop.context import LoopContext
+from loop import (
+    LoopContext,
+    Message,
+    Reasoning,
+    ToolCall,
+    ToolResult,
+    UnsupportedConversationItemError,
+)
 
 
 def function_call() -> ToolCall:
@@ -48,3 +54,63 @@ def test_rejects_invalid_message_types(method, argument, invalid_type):
         getattr(context, method)(argument)
 
     assert context.messages == []
+
+
+def test_serializes_and_deserializes_complete_typed_contexts():
+    """Context JSON preserves every item type, token count, and model identifier."""
+    context = LoopContext(
+        messages=[
+            Message(role="user", content="hello"),
+            Reasoning(content="thinking", id="reasoning"),
+            function_call(),
+            ToolResult(call_id="call_123", output="done"),
+        ],
+        tokens=12,
+        model="model-a",
+    )
+
+    assert LoopContext.deserialize(context.serialize()) == context
+
+
+def test_serialize_identifies_unsupported_conversation_item_types():
+    """Context serialization reports the unsupported Python item type."""
+    context = LoopContext(messages=[object()])
+
+    with pytest.raises(
+        UnsupportedConversationItemError,
+        match="Unsupported conversation item type: object\\.",
+    ):
+        context.serialize()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-json",
+        '{"version":2,"messages":[],"tokens":0,"model":null}',
+        (
+            '{"version":1,"messages":[{"type":"message","data":{}}],'
+            '"tokens":0,"model":null}'
+        ),
+        '{"version":1,"messages":[],"tokens":true,"model":null}',
+        '{"version":1,"messages":[],"tokens":0,"model":42}',
+    ],
+)
+def test_deserialize_rejects_invalid_or_unsupported_data(payload):
+    """Context deserialization rejects corrupt and incorrectly typed data."""
+    with pytest.raises(ValueError):
+        LoopContext.deserialize(payload)
+
+
+def test_deserialize_identifies_unsupported_conversation_item_types():
+    """Context deserialization reports the unsupported serialized item type."""
+    payload = (
+        '{"version":1,"messages":[{"type":"unknown","data":{}}],'
+        '"tokens":0,"model":null}'
+    )
+
+    with pytest.raises(
+        UnsupportedConversationItemError,
+        match="Unsupported conversation item type: 'unknown'\\.",
+    ):
+        LoopContext.deserialize(payload)

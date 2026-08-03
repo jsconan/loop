@@ -3,7 +3,8 @@
 __all__ = [
     "LoopContext",
     "ToolContext",
+    "UnsupportedConversationItemError",
 ]
 
-from .loop import LoopContext
+from .loop import LoopContext, UnsupportedConversationItemError
 from .tool import ToolContext

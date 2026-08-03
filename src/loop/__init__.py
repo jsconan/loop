@@ -39,6 +39,7 @@ __all__ = [
     "ToolRegistrationError",
     "ToolRegistry",
     "ToolResult",
+    "UnsupportedConversationItemError",
     "Usage",
     "write_text_file",
 ]
@@ -46,7 +47,7 @@ __all__ = [
 
 from .backend import Backend, OpenAIBackend
 from .commands import Command, CommandManager
-from .context import LoopContext, ToolContext
+from .context import LoopContext, ToolContext, UnsupportedConversationItemError
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop, Response
 from .models import (
