@@ -1,6 +1,6 @@
 """Register and dispatch typed functions exposed to an LLM."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from ..context import ToolContext
@@ -20,6 +20,8 @@ class ToolRegistry:
     """Collect tool declarations and route model calls to their implementations.
 
     Args:
+        tools (Iterable[Callable[..., Any]] | None): Functions to register in iteration order, or
+            ``None`` to construct an empty registry.
         interaction (Interaction | None): Default interaction used by context-aware tools when
             dispatch does not provide one, or ``None`` to require an invocation-specific
             interaction.
@@ -28,9 +30,15 @@ class ToolRegistry:
     _tools: dict[str, Tool]
     _interaction: Interaction | None
 
-    def __init__(self, interaction: Interaction | None = None) -> None:
+    def __init__(
+        self,
+        tools: Iterable[Callable[..., Any]] | None = None,
+        interaction: Interaction | None = None,
+    ) -> None:
         self._tools = {}
         self._interaction = interaction
+        for function in tools or ():
+            self.tool(function)
 
     @property
     def interaction(self) -> Interaction | None:

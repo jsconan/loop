@@ -23,6 +23,25 @@ def register(registry: ToolRegistry):
     return calculate
 
 
+def test_constructor_registers_tools_in_iteration_order():
+    """Construction registers each supplied function through the normal tool path."""
+    def first() -> str:
+        """Return the first result."""
+        return "first"
+
+    def second() -> str:
+        """Return the second result."""
+        return "second"
+
+    registry = ToolRegistry([first, second])
+
+    assert [definition.name for definition in registry.definitions()] == [
+        "first",
+        "second",
+    ]
+    assert registry.call("first", "{}") == "first"
+
+
 def test_tool_registers_a_function_with_derived_metadata(monkeypatch):
     """The decorator builds and retains a tool while returning the original function."""
     tool = Mock()
@@ -84,7 +103,7 @@ def test_interaction_property_can_be_replaced_and_cleared():
     """The registry exposes mutable default interaction configuration."""
     first = Mock(spec=Interaction)
     second = Mock(spec=Interaction)
-    registry = ToolRegistry(first)
+    registry = ToolRegistry(interaction=first)
 
     assert registry.interaction is first
     registry.interaction = second
@@ -110,7 +129,7 @@ def test_call_routes_arguments_and_runtime_context(monkeypatch):
     monkeypatch.setattr(tool_registry_module, "Tool", Mock(return_value=tool))
     monkeypatch.setattr(tool_registry_module, "get_tool_description", Mock(return_value="Doc"))
     monkeypatch.setattr(tool_registry_module, "get_tool_arguments_model", Mock())
-    registry = ToolRegistry(Mock(spec=Interaction))
+    registry = ToolRegistry(interaction=Mock(spec=Interaction))
     register(registry)
     runtime = Mock(spec=Interaction)
     manager = Mock()
@@ -128,7 +147,7 @@ def test_call_uses_default_or_no_context(monkeypatch):
     monkeypatch.setattr(tool_registry_module, "get_tool_description", Mock(return_value="Doc"))
     monkeypatch.setattr(tool_registry_module, "get_tool_arguments_model", Mock())
     interaction = Mock(spec=Interaction)
-    registry = ToolRegistry(interaction)
+    registry = ToolRegistry(interaction=interaction)
     register(registry)
 
     registry.call("calculate", "{}")
