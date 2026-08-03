@@ -14,6 +14,10 @@ __all__ = [
     "list_folder",
     "Loop",
     "LoopContext",
+    "SessionInfo",
+    "SessionNotFoundError",
+    "SessionStore",
+    "SQLiteSessionStore",
     "manage_skills",
     "Message",
     "ModelInfo",
@@ -67,6 +71,7 @@ from .models import (
     ToolResult,
     Usage,
 )
+from .session import SessionInfo, SessionNotFoundError, SessionStore, SQLiteSessionStore
 from .skills import Skill, SkillManager
 from .tooling import Tool, ToolRegistrationError, ToolRegistry, tool_registry
 from .tools import (
