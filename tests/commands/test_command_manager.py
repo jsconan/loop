@@ -100,6 +100,17 @@ def test_handle_user_command_consumes_and_displays_unknown_commands():
     assert manager.exit_requested is False
 
 
+def test_call_dispatches_registered_command_with_explicit_interaction():
+    """Direct command calls route supplied arguments and invocation interaction."""
+    registered = command()
+    interaction = Mock(spec=Interaction)
+    manager = CommandManager((registered,))
+
+    manager.call("/test", "some arguments", interaction=interaction)
+
+    registered.handler.assert_called_once_with(manager, interaction, "some arguments")
+
+
 def test_request_exit_changes_manager_state_without_a_dispatch_result():
     """Termination is explicit manager state independent of command handling results."""
     manager = CommandManager()

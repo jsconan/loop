@@ -118,19 +118,36 @@ class CommandManager:
         Returns:
             bool: ``True`` when the input was consumed as a command; otherwise ``False``.
         """
-        interaction = interaction if interaction is not None else self._interaction
         if not user_input.startswith("/"):
             return False
 
         parts = user_input.split(maxsplit=1)
         name = parts[0]
         arguments = parts[1] if len(parts) == 2 else ""
+        self.call(name, arguments.strip(), interaction=interaction)
+        return True
+
+    def call(
+        self,
+        name: str,
+        arguments: str,
+        *,
+        interaction: Interaction | None = None,
+    ) -> None:
+        """Dispatch a command call by registered name.
+
+        Args:
+            name (str): Registered slash-prefixed command name.
+            arguments (str): Arguments supplied after the command name.
+            interaction (Interaction | None): Interaction used by the command and error reporting.
+                Overrides the interaction provided during initialization.
+        """
+        interaction = interaction if interaction is not None else self._interaction
         command = self._commands.get(name)
         if command is None:
             interaction.warning(f"Unknown command '{name}'. Type /help for available commands.")
-            return True
-        command.handler(self, interaction, arguments.strip())
-        return True
+            return
+        command.handler(self, interaction, arguments)
 
     def request_exit(self) -> None:
         """Request termination of the active conversation loop."""
