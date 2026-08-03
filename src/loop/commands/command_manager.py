@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from .builtins import exit_command, help_command
@@ -22,7 +23,10 @@ class CommandManager:
     """Collect predefined commands and handle command input.
 
     Args:
-        commands (tuple[Command, ...]): Additional commands registered after the built-ins.
+        commands (Iterable[Command] | None): Additional commands registered after the built-ins,
+            or ``None`` to register only the built-ins.
+        interaction (Interaction | None): Default interaction used by command dispatch, or
+            ``None`` when callers will provide one during dispatch.
 
     Raises:
         ValueError: If a command name is invalid or registered more than once.
@@ -30,12 +34,36 @@ class CommandManager:
 
     _commands: dict[str, Command]
     _exit_requested: bool
+    _interaction: Interaction | None
 
-    def __init__(self, commands: tuple[Command, ...] = ()) -> None:
+    def __init__(
+        self,
+        commands: Iterable[Command] | None = None,
+        interaction: Interaction | None = None,
+    ) -> None:
         self._commands = {}
         self._exit_requested = False
-        for command in (*BUILTIN_COMMANDS, *commands):
+        self._interaction = interaction
+        for command in (*BUILTIN_COMMANDS, *(commands or ())):
             self.register(command)
+
+    @property
+    def interaction(self) -> Interaction | None:
+        """Return the default interaction used during command dispatch.
+
+        Returns:
+            Interaction | None: The default interaction, or ``None`` when none is configured.
+        """
+        return self._interaction
+
+    @interaction.setter
+    def interaction(self, interaction: Interaction | None) -> None:
+        """Set or clear the default interaction used during command dispatch.
+
+        Args:
+            interaction (Interaction | None): Default interaction to use, or ``None`` to clear it.
+        """
+        self._interaction = interaction
 
     @property
     def commands(self) -> tuple[Command, ...]:
@@ -75,16 +103,22 @@ class CommandManager:
             raise ValueError(f"Command '{command.name}' is already registered.")
         self._commands[command.name] = command
 
-    def handle_user_command(self, user_input: str, interaction: Interaction) -> bool:
+    def handle_user_command(
+        self,
+        user_input: str,
+        interaction: Interaction | None = None,
+    ) -> bool:
         """Handle slash-prefixed input and related display.
 
         Args:
             user_input (str): Stripped user input to classify and dispatch.
-            interaction (Interaction): Active interaction used by commands and error reporting.
+            interaction (Interaction | None): Interaction used by commands and error reporting.
+                Defaults to the interaction provided during initialization.
 
         Returns:
             bool: ``True`` when the input was consumed as a command; otherwise ``False``.
         """
+        interaction = interaction if interaction is not None else self._interaction
         if not user_input.startswith("/"):
             return False
 

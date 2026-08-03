@@ -77,7 +77,7 @@ class Loop:
         self._stream = stream
         self._debug = debug
         self._model = model
-        self._command_manager = CommandManager()
+        self._command_manager = CommandManager(interaction=self._interaction)
 
     @property
     def backend(self) -> Backend:
@@ -184,7 +184,7 @@ class Loop:
             user_input = self._interaction.input(self._command_manager.commands)
             if user_input is False:
                 break
-            if self._command_manager.handle_user_command(user_input, self._interaction):
+            if self._command_manager.handle_user_command(user_input):
                 continue
             self._context.add_message(Message(role="user", content=user_input))
 

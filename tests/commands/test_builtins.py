@@ -9,7 +9,10 @@ from loop.commands import exit_command, help_command
 def test_help_displays_all_commands_from_manager_metadata():
     """Help renders the authoritative command catalog through the interaction."""
     interaction = Mock(spec=Interaction)
-    manager = CommandManager((Command("/long-command", "Run a longer command.", Mock()),))
+    manager = CommandManager(
+        (Command("/long-command", "Run a longer command.", Mock()),),
+        interaction,
+    )
 
     help_command(manager, interaction, "")
 
@@ -24,7 +27,7 @@ def test_help_reports_unsupported_arguments():
     """Help owns presentation of its argument error."""
     interaction = Mock(spec=Interaction)
 
-    help_command(CommandManager(), interaction, "extra")
+    help_command(CommandManager(interaction=interaction), interaction, "extra")
 
     interaction.warning.assert_called_once_with("/help does not accept arguments.")
 
@@ -32,7 +35,7 @@ def test_help_reports_unsupported_arguments():
 def test_exit_command_requests_termination():
     """The exit handler requests manager termination."""
     interaction = Mock(spec=Interaction)
-    manager = CommandManager()
+    manager = CommandManager(interaction=interaction)
 
     exit_command(manager, interaction, "")
 
@@ -42,7 +45,7 @@ def test_exit_command_requests_termination():
 def test_exit_reports_unsupported_arguments_without_terminating():
     """Invalid exit usage remains handled without ending the conversation."""
     interaction = Mock(spec=Interaction)
-    manager = CommandManager()
+    manager = CommandManager(interaction=interaction)
 
     exit_command(manager, interaction, "later")
 
