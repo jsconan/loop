@@ -10,14 +10,15 @@ from loop import (
     AnswerCompleted,
     AnswerDelta,
     Interaction,
-    LoopContext,
     Loop,
+    LoopContext,
     Message,
     Reasoning,
     ReasoningCompleted,
     ReasoningDelta,
     Response,
     ResponseCompleted,
+    SQLiteSessionStore,
     ToolCall,
     ToolCallCompleted,
     ToolRegistry,
@@ -29,9 +30,7 @@ from loop import tool_registry as default_tool_registry
 
 def function_call() -> ToolCall:
     """Build a completed local function-tool call."""
-    return ToolCall(
-        call_id="call_123", name="get_current_datetime", arguments="{}", id="fc_123"
-    )
+    return ToolCall(call_id="call_123", name="get_current_datetime", arguments="{}", id="fc_123")
 
 
 def loop_backend(**attributes):
@@ -63,7 +62,7 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.interaction is interaction
     assert loop.working_directory == tmp_path.resolve()
     assert loop.instructions is None
-    assert loop.context == LoopContext()
+    assert loop.session == LoopContext()
     assert loop.model == "requested-model"
     assert loop.skill_manager is not None
 
@@ -73,24 +72,98 @@ def test_loop_exposes_its_configured_state(tmp_path):
 
 def test_loops_share_local_conversation_context(tmp_path):
     """Injected context carries local history and metadata between loop modes."""
-    context = LoopContext(messages=[Message(role="user", content="hello")])
-    first = Loop(backend=loop_backend(), context=context, working_directory=tmp_path)
-    first.output([ResponseCompleted(usage=Usage(total_tokens=12), model="served-model")])
+    session = LoopContext(
+        messages=[Message(role="user", content="hello")], tokens=12, model="served-model"
+    )
+    first = Loop(backend=loop_backend(), session=session, working_directory=tmp_path)
     second_backend = Mock(default_model="other-model")
     second_backend.get_response.return_value = []
-    second = Loop(backend=second_backend, context=context, working_directory=tmp_path, stream=True)
+    second = Loop(backend=second_backend, session=session, working_directory=tmp_path, stream=True)
 
-    assert first.context is second.context is context
+    assert first.session is second.session is session
     assert second.messages == [Message(role="user", content="hello")]
-    assert second.context.tokens == 12
-    assert second.context.model == "served-model"
+    assert second.session.tokens == 12
+    assert second.session.model == "served-model"
     assert list(second.query()) == []
     second_backend.get_response.assert_called_once_with(
-        input=context.messages,
+        input=session.messages,
         instructions=None,
         stream=True,
         model="other-model",
     )
+
+
+def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
+    """A fresh session creates storage only after a query result forms a complete snapshot."""
+    backend = loop_backend(
+        get_response=Mock(
+            return_value=[
+                ResponseCompleted(
+                    items=(Message(role="assistant", content="answer"),),
+                    usage=Usage(total_tokens=9),
+                    model="served-model",
+                )
+            ]
+        )
+    )
+    interaction = Mock(spec=Interaction)
+    interaction.response.return_value = nullcontext()
+    interaction.input.side_effect = ["hello", False]
+    store = SQLiteSessionStore(tmp_path / ".loop" / "sessions.db")
+    loop = Loop(
+        backend=backend,
+        working_directory=tmp_path,
+        interaction=interaction,
+        session_store=store,
+    )
+
+    assert not (tmp_path / ".loop").exists()
+
+    loop.run()
+
+    session_info = store.list()[0]
+    assert store.load(session_info.id) == loop.session
+    assert loop.session.messages == [
+        Message(role="user", content="hello"),
+        Message(role="assistant", content="answer"),
+    ]
+    assert loop.session.tokens == 9
+    assert loop.session.model == "served-model"
+
+
+def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
+    """A caller that omits persistence keeps completed queries entirely in memory."""
+    interaction = Mock(spec=Interaction)
+    interaction.response.return_value = nullcontext()
+    interaction.input.side_effect = ["hello", False]
+    loop = Loop(
+        backend=loop_backend(get_response=Mock(return_value=[ResponseCompleted()])),
+        working_directory=tmp_path,
+        interaction=interaction,
+    )
+
+    loop.run()
+
+    assert not (tmp_path / ".loop").exists()
+
+
+def test_persisted_session_identifier_requires_a_caller_provided_store():
+    """A persisted identifier cannot be resolved without an injected store."""
+    with pytest.raises(ValueError, match="session store is required"):
+        Loop(backend=loop_backend(), session="session-id")
+
+
+def test_loop_loads_a_persisted_session_identifier(tmp_path):
+    """The constructor accepts a session identifier and resumes its complete state."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    stored = LoopContext(
+        messages=[Message(role="user", content="saved")], tokens=4, model="saved-model"
+    )
+    session_id = store.save(None, stored)
+
+    loop = Loop(backend=loop_backend(), session=session_id, session_store=store)
+
+    assert loop.session == stored
 
 
 def test_loop_loads_project_instructions_once(monkeypatch, tmp_path):
@@ -104,7 +177,7 @@ def test_loop_loads_project_instructions_once(monkeypatch, tmp_path):
     loader.assert_called_once_with(tmp_path.resolve())
 
 
-def test_run_requeries_after_a_tool_call_and_records_local_items():
+def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
     """The runner records a tool result, requeries, reports usage, and exits."""
     registry = ToolRegistry()
 
@@ -135,7 +208,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items():
     interaction.response.return_value = nullcontext()
     interaction.input.side_effect = ["hello", False]
 
-    Loop(backend=backend, interaction=interaction).run()
+    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     second_input = backend.get_response.call_args_list[1].kwargs["input"]
     assert second_input[:3] == [
@@ -202,10 +275,10 @@ def test_handle_tool_calls_uses_local_objects():
 def test_query_selects_only_the_event_production_mode():
     """Both loop modes forward identical history with only the stream flag differing."""
     backend = loop_backend(get_response=Mock(return_value=[]))
-    context = LoopContext([Message(role="user", content="hello")])
+    session = LoopContext(messages=[Message(role="user", content="hello")])
 
-    list(Loop(backend=backend, context=context).query())
-    list(Loop(backend=backend, context=context, stream=True).query())
+    list(Loop(backend=backend, session=session).query())
+    list(Loop(backend=backend, session=session, stream=True).query())
 
     assert backend.get_response.call_args_list[0].kwargs["stream"] is False
     assert backend.get_response.call_args_list[1].kwargs["stream"] is True
@@ -214,9 +287,9 @@ def test_query_selects_only_the_event_production_mode():
 def test_query_prefers_the_explicit_model_over_response_metadata():
     """Request selection stays independent of a model reported by an earlier response."""
     backend = loop_backend(get_response=Mock(return_value=[]))
-    context = LoopContext(model="served-model")
+    session = LoopContext(model="served-model")
 
-    list(Loop(backend=backend, model="requested-model", context=context).query())
+    list(Loop(backend=backend, model="requested-model", session=session).query())
 
     assert backend.get_response.call_args.kwargs["model"] == "requested-model"
 
@@ -268,8 +341,7 @@ def test_one_output_loop_uses_terminal_response_text(capsys):
         usage=Usage(total_tokens=230),
         model="served-model",
     )
-    assert loop.context.tokens == 230
-    assert loop.context.model == "served-model"
+    assert loop.session == LoopContext()
     assert interaction.reasoning_delta.call_args_list[0].kwargs == {"start": True}
     assert interaction.reasoning_delta.call_args_list[1].kwargs == {"start": False}
     assert interaction.answer_delta.call_args_list[0].kwargs == {"start": True}
@@ -300,17 +372,17 @@ def test_output_displays_non_streaming_completed_text():
 
 def test_empty_output_preserves_existing_context_metadata():
     """A completion without reported metadata leaves existing context values unchanged."""
-    context = LoopContext(tokens=7, model="existing")
+    session = LoopContext(tokens=7, model="existing")
     interaction = Mock(spec=Interaction)
     interaction.response.return_value = nullcontext()
 
-    response = Loop(backend=loop_backend(), context=context, interaction=interaction).output(
+    response = Loop(backend=loop_backend(), session=session, interaction=interaction).output(
         [ResponseCompleted()]
     )
 
     assert response == Response(answer="", reasoning="")
-    assert context.tokens == 7
-    assert context.model == "existing"
+    assert session.tokens == 7
+    assert session.model == "existing"
     interaction.response.assert_called_once_with()
 
 

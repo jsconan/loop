@@ -21,6 +21,7 @@ from .models import (
     ToolResult,
     Usage,
 )
+from .session import SessionStore
 from .skills import SkillManager, build_instructions, load_agents_instructions
 
 
@@ -35,16 +36,23 @@ class Loop:
         interaction (Interaction | None): Service used for all user input and output.
         working_directory (Path | str | None): Directory used to discover applicable AGENTS.md
             files.
-        context (LoopContext | None): Conversation state to use. Supply the same context to share
-            state between loops.
+        session (LoopContext | str | None): Conversation context or persisted session identifier
+            to load. Defaults to a fresh context; an injected store persists it after its first
+            query.
+        session_store (SessionStore | None): Caller-provided session store, or ``None`` to keep
+            the session in memory without persistence.
         stream (bool): Whether the backend should produce response events incrementally.
         debug (bool): Whether to print raw response events.
 
+    Raises:
+        ValueError: If a persisted session identifier is supplied without a session store.
     """
 
     _backend: Backend
     _instructions: str | None
-    _context: LoopContext
+    _session: LoopContext
+    _session_id: str | None
+    _session_store: SessionStore | None
     _skill_manager: SkillManager
     _interaction: Interaction
     _working_directory: Path
@@ -61,13 +69,21 @@ class Loop:
         skill_manager: SkillManager | None = None,
         interaction: Interaction | None = None,
         working_directory: Path | str | None = None,
-        context: LoopContext | None = None,
+        session: LoopContext | str | None = None,
+        session_store: SessionStore | None = None,
         stream: bool = False,
         debug: bool = False,
     ) -> None:
         self._interaction = interaction or backend.tool_registry.interaction or ConsoleInteraction()
         self._backend = backend
-        self._context = context or LoopContext()
+        self._session_id = None
+        self._session_store = session_store
+        if isinstance(session, str):
+            if self._session_store is None:
+                raise ValueError("A session store is required to load a persisted session.")
+            self._session_id = session
+            session = self._session_store.load(session)
+        self._session = session or LoopContext()
         self._working_directory = Path(working_directory or Path.cwd()).resolve()
         self._skill_manager = skill_manager or SkillManager.discover(self._working_directory)
         self._instructions = build_instructions(
@@ -104,16 +120,16 @@ class Loop:
         Returns:
             list[ConversationItem]: Items accumulated during the conversation.
         """
-        return self._context.messages
+        return self._session.messages
 
     @property
-    def context(self) -> LoopContext:
-        """Return the shared conversation context.
+    def session(self) -> LoopContext:
+        """Return the active conversation session.
 
         Returns:
-            LoopContext: The mutable conversation state used by the loop.
+            LoopContext: The mutable conversation context used by the loop.
         """
-        return self._context
+        return self._session
 
     @property
     def skill_manager(self) -> SkillManager:
@@ -186,18 +202,18 @@ class Loop:
                 break
             if self._command_manager.handle_user_command(user_input):
                 continue
-            self._context.add_message(Message(role="user", content=user_input))
+            self._add_message(Message(role="user", content=user_input))
 
             while True:
                 response = self.output(self.query())
-                self._context.add_messages(response.items)
+                self._add_message(response)
 
                 if not self.handle_tool_calls(response):
                     break
 
             self._interaction.token_usage(
-                self._context.model or self._model or self._backend.default_model,
-                self._context.tokens,
+                self._session.model,
+                self._session.tokens,
                 self._backend.get_context_window(self._model),
             )
 
@@ -217,7 +233,7 @@ class Loop:
 
         for tool_call in response.tool_calls:
             self._interaction.tool_call(tool_call.name, tool_call.arguments)
-            self._context.add_message(
+            self._add_message(
                 ToolResult(
                     call_id=tool_call.call_id,
                     output=self._backend.tool_registry.call(
@@ -242,19 +258,26 @@ class Loop:
         selected_model = self._model or self._backend.default_model
         if not selected_model:
             raise ValueError("No model was selected and the backend has no default model.")
+        self._session.model = selected_model
         return self._backend.get_response(
-            input=self._context.messages,
+            input=self._session.messages,
             instructions=self._instructions,
             stream=self._stream,
             model=selected_model,
         )
 
-    def _update_context(self, usage: Usage, model: str | None) -> None:
-        """Track the context produced by the latest model response."""
-        if usage.total_tokens is not None:
-            self._context.tokens = usage.total_tokens
-        if isinstance(model, str):
-            self._context.model = model
+    def _add_message(self, message: ConversationItem | Response) -> None:
+        """Add conversation items and persist the resulting complete session."""
+        if isinstance(message, Response):
+            self._session.add_messages(message.items)
+            if message.usage.total_tokens is not None:
+                self._session.tokens = message.usage.total_tokens
+            if isinstance(message.model, str):
+                self._session.model = message.model
+        else:
+            self._session.add_message(message)
+        if self._session_store is not None:
+            self._session_id = self._session_store.save(self._session_id, self._session)
 
     def output(self, events: Iterable[ResponseEvent]) -> Response:
         """Display and collect normalized response events.
@@ -310,7 +333,6 @@ class Loop:
                     answer = event.answer
                     reasoning = event.reasoning
 
-        self._update_context(usage, model)
         return Response(
             answer=answer,
             reasoning=reasoning,

@@ -1,6 +1,7 @@
 """Main entry point for the loop package."""
 
 import os
+from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -9,6 +10,8 @@ from loop import (
     Loop,
     OpenAIBackend,
     ShutdownRequested,
+    SQLiteSessionStore,
+    find_project_root,
     register_shutdown_signals,
 )
 
@@ -32,7 +35,15 @@ def main() -> None:
             api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
             context_window=int(context_window) if context_window is not None else None,
         )
-        loop = Loop(backend, interaction=interaction, stream=True)
+        working_directory = Path.cwd()
+        project_root = find_project_root(working_directory) or working_directory
+        loop = Loop(
+            backend,
+            interaction=interaction,
+            working_directory=working_directory,
+            session_store=SQLiteSessionStore(project_root / ".loop" / "sessions.db"),
+            stream=True,
+        )
         loop.run()
     except EOFError, KeyboardInterrupt, ShutdownRequested:
         interaction.info("\nStopping loop. Goodbye!")
