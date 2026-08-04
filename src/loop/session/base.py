@@ -26,6 +26,20 @@ class SessionInfo:
     message_count: int
 
 
+@dataclass(frozen=True)
+class Session(SessionInfo):
+    """Describe a persisted session and its complete serialized context.
+
+    Args:
+        id (str): Persistent session identifier.
+        updated_at (datetime): Time of the latest persisted update.
+        message_count (int): Number of conversation items in the session.
+        context (str): Serialized complete context snapshot.
+    """
+
+    context: str
+
+
 class SessionStore(Protocol):
     """Persist and retrieve complete loop contexts by session identifier."""
 

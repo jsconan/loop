@@ -19,6 +19,7 @@ __all__ = [
     "Loop",
     "LoopContext",
     "manage_skills",
+    "MemorySessionStore",
     "Message",
     "ModelInfo",
     "OpenAIBackend",
@@ -31,6 +32,7 @@ __all__ = [
     "ResponseCompleted",
     "ResponseEvent",
     "run_command",
+    "Session",
     "SessionInfo",
     "SessionNotFoundError",
     "SessionStore",
@@ -75,7 +77,14 @@ from .models import (
     ToolResult,
     Usage,
 )
-from .session import SessionInfo, SessionNotFoundError, SessionStore, SQLiteSessionStore
+from .session import (
+    MemorySessionStore,
+    Session,
+    SessionInfo,
+    SessionNotFoundError,
+    SessionStore,
+    SQLiteSessionStore,
+)
 from .skills import Skill, SkillManager
 from .tooling import Tool, ToolRegistrationError, ToolRegistry, tool_registry
 from .tools import (
