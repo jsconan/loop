@@ -21,7 +21,7 @@ from .models import (
     ToolResult,
     Usage,
 )
-from .session import SessionStore
+from .session import MemorySessionStore, SessionStore
 from .skills import SkillManager, build_instructions, load_agents_instructions
 
 
@@ -39,20 +39,18 @@ class Loop:
         session (LoopContext | str | None): Conversation context or persisted session identifier
             to load. Defaults to a fresh context; an injected store persists it after its first
             query.
-        session_store (SessionStore | None): Caller-provided session store, or ``None`` to keep
-            the session in memory without persistence.
+        session_store (SessionStore | None): Session store, or ``None`` to use an instance-local
+            memory store.
         stream (bool): Whether the backend should produce response events incrementally.
         debug (bool): Whether to print raw response events.
 
-    Raises:
-        ValueError: If a persisted session identifier is supplied without a session store.
     """
 
     _backend: Backend
     _instructions: str | None
     _session: LoopContext
     _session_id: str | None
-    _session_store: SessionStore | None
+    _session_store: SessionStore
     _skill_manager: SkillManager
     _interaction: Interaction
     _working_directory: Path
@@ -77,10 +75,8 @@ class Loop:
         self._interaction = interaction or backend.tool_registry.interaction or ConsoleInteraction()
         self._backend = backend
         self._session_id = None
-        self._session_store = session_store
+        self._session_store = session_store or MemorySessionStore()
         if isinstance(session, str):
-            if self._session_store is None:
-                raise ValueError("A session store is required to load a persisted session.")
             self._session_id = session
             session = self._session_store.load(session)
         self._session = session or LoopContext()
@@ -276,8 +272,7 @@ class Loop:
                 self._session.model = message.model
         else:
             self._session.add_message(message)
-        if self._session_store is not None:
-            self._session_id = self._session_store.save(self._session_id, self._session)
+        self._session_id = self._session_store.save(self._session_id, self._session)
 
     def output(self, events: Iterable[ResponseEvent]) -> Response:
         """Display and collect normalized response events.

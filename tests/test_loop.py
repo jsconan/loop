@@ -147,10 +147,19 @@ def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
     assert not (tmp_path / ".loop").exists()
 
 
-def test_persisted_session_identifier_requires_a_caller_provided_store():
-    """A persisted identifier cannot be resolved without an injected store."""
-    with pytest.raises(ValueError, match="session store is required"):
-        Loop(backend=loop_backend(), session="session-id")
+def test_persisted_session_identifier_uses_the_default_memory_store(monkeypatch):
+    """A persisted identifier is resolved through an instance-local memory store by default."""
+    stored = LoopContext(messages=[Message(role="user", content="saved")])
+    store = Mock()
+    store.load.return_value = stored
+    store_factory = Mock(return_value=store)
+    monkeypatch.setattr("loop.loop.MemorySessionStore", store_factory)
+
+    loop = Loop(backend=loop_backend(), session="session-id")
+
+    assert loop.session is stored
+    store_factory.assert_called_once_with()
+    store.load.assert_called_once_with("session-id")
 
 
 def test_loop_loads_a_persisted_session_identifier(tmp_path):
