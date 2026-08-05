@@ -16,11 +16,17 @@ class Interaction(Protocol):
             AbstractContextManager[None]: Scope that finalizes response presentation on exit.
         """
 
-    def input(self, commands: tuple[Command, ...] = ()) -> str | False:
+    def input(
+        self,
+        commands: tuple[Command, ...] = (),
+        message: str | None = None,
+    ) -> str | False:
         """Read a non-empty user message or an exit command.
 
         Args:
             commands (tuple[Command, ...]): Commands available for input completion.
+            message (str | None): Prompt message displayed before reading input.
+                Defaults to ``None``.
 
         Returns:
             str | False: The stripped text entered by the user, or ``False`` when the user

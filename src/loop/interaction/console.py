@@ -46,15 +46,23 @@ class ConsoleInteraction:
                 self.info()
             self._streamed_output = False
 
-    def input(self, commands: tuple[Command, ...] = ()) -> str | False:
+    def input(
+        self,
+        commands: tuple[Command, ...] = (),
+        message: str | None = None,
+    ) -> str | False:
         """Prompt for a non-empty user message or an exit command.
 
         Args:
             commands (tuple[Command, ...]): Commands available for input completion.
+            message (str | None): Prompt message displayed before reading input.
+                Defaults to ``None`` for the default prompt.
 
         Returns:
             str | False: The entered message, or ``False`` when the user requests to exit.
         """
+        if message is None:
+            message = "\nYou: "
         completer = WordCompleter(
             [command.name for command in commands],
             meta_dict={command.name: command.description for command in commands},
@@ -62,7 +70,7 @@ class ConsoleInteraction:
         )
         while True:
             try:
-                user_input = self._session.prompt("\nYou: ", completer=completer).strip()
+                user_input = self._session.prompt(message, completer=completer).strip()
             except KeyboardInterrupt, EOFError:
                 return False
             if not user_input:

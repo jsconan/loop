@@ -9,14 +9,14 @@ from loop import Command
 from loop.interaction import ConsoleInteraction
 
 
-def test_input_reads_a_trimmed_message_from_the_terminal():
-    """Input owns its prompt and strips the terminal message."""
+def test_input_reads_a_trimmed_message_with_a_custom_prompt():
+    """Input forwards its prompt message and strips the terminal response."""
     session = Mock()
     session.prompt.return_value = "  answer  \n"
 
-    assert ConsoleInteraction(session=session).input() == "answer"
+    assert ConsoleInteraction(session=session).input(message="Question: ") == "answer"
     session.prompt.assert_called_once()
-    assert session.prompt.call_args.args == ("\nYou: ",)
+    assert session.prompt.call_args.args == ("Question: ",)
 
 
 def test_input_offers_command_names_and_descriptions_for_completion():
@@ -25,7 +25,7 @@ def test_input_offers_command_names_and_descriptions_for_completion():
     session.prompt.return_value = "answer"
     commands = (Command("/help", "Show help.", Mock()),)
 
-    ConsoleInteraction(session=session).input(commands)
+    ConsoleInteraction(session=session).input(commands=commands)
 
     completer = session.prompt.call_args.kwargs["completer"]
     completions = list(completer.get_completions(Mock(text_before_cursor="/h"), Mock()))

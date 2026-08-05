@@ -193,7 +193,7 @@ class Loop:
     def run(self):
         """Run the conversation until the user requests to exit."""
         while not self._command_manager.exit_requested:
-            user_input = self._interaction.input(self._command_manager.commands)
+            user_input = self._interaction.input(commands=self._command_manager.commands)
             if user_input is False:
                 break
             if self._command_manager.handle_user_command(user_input):

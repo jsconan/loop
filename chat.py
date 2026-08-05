@@ -47,7 +47,7 @@ def main() -> None:
 
         session = LoopContext()
         while not command_manager.exit_requested:
-            prompt = interaction.input(command_manager.commands)
+            prompt = interaction.input(commands=command_manager.commands)
             if prompt is False:
                 break
             if command_manager.handle_user_command(prompt):
