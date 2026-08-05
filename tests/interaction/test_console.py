@@ -6,6 +6,7 @@ import pytest
 from rich.prompt import Confirm
 
 from loop import Command
+from loop.commands.utils import get_command_arguments_model
 from loop.interaction import ConsoleInteraction
 
 
@@ -23,7 +24,12 @@ def test_input_offers_command_names_and_descriptions_for_completion():
     """Terminal input derives slash completion metadata from available commands."""
     session = Mock()
     session.prompt.return_value = "answer"
-    commands = (Command("/help", "Show help.", Mock()),)
+    def function() -> None:
+        pass
+
+    commands = (
+        Command("help", "Show help.", function, get_command_arguments_model(function, "help")),
+    )
 
     ConsoleInteraction(session=session).input(commands=commands)
 

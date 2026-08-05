@@ -1,35 +1,39 @@
-"""Register and dispatch user commands."""
+"""Register and dispatch schema-backed user commands."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import inspect
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
-from .builtins import exit_command, help_command
+from pydantic import ValidationError
+
+from ..context import CommandContext
+from .builtins import exit as exit_command
+from .builtins import help as help_command
+from .builtins import quit as quit_command
 from .command import Command
+from .utils import CommandRegistrationError, get_command_arguments_model, takes_command_context
 
 if TYPE_CHECKING:
     from ..interaction import Interaction
 
 
-BUILTIN_COMMANDS = (
-    Command("/help", "Show the available commands.", help_command),
-    Command("/exit", "End the conversation.", exit_command),
-    Command("/quit", "End the conversation.", exit_command),
-)
+BUILTIN_COMMANDS = (help_command, exit_command, quit_command)
 
 
 class CommandManager:
-    """Collect predefined commands and handle command input.
+    """Collect command declarations and route user input to their functions.
 
     Args:
-        commands (Iterable[Command] | None): Additional commands registered after the built-ins,
-            or ``None`` to register only the built-ins.
-        interaction (Interaction | None): Default interaction used by command dispatch, or
-            ``None`` when callers will provide one during dispatch.
+        commands (Iterable[Command | Callable[..., None]] | None): Additional command declarations
+            registered after the built-ins, or ``None`` to register only the built-ins.
+        interaction (Interaction | None): Default interaction used during dispatch, or ``None``
+            when callers will provide one for each invocation.
 
     Raises:
         ValueError: If a command name is invalid or registered more than once.
+        CommandRegistrationError: If a function cannot be represented by an argument schema.
     """
 
     _commands: dict[str, Command]
@@ -38,7 +42,7 @@ class CommandManager:
 
     def __init__(
         self,
-        commands: Iterable[Command] | None = None,
+        commands: Iterable[Command | Callable[..., None]] | None = None,
         interaction: Interaction | None = None,
     ) -> None:
         self._commands = {}
@@ -83,37 +87,62 @@ class CommandManager:
         """
         return self._exit_requested
 
-    def register(self, command: Command) -> None:
-        """Register one predefined command.
+    def register(
+        self,
+        function: Command | Callable[..., None] | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Callable[..., None]:
+        """Register a command declaration or function, directly or as a decorator.
 
         Args:
-            command (Command): Command definition to register.
+            function (Command | Callable[..., None] | None): Command or function to register when
+                called directly. Omit it when using registration options as a decorator.
+            name (str | None): Slash-free command name. Defaults to the function name.
+            description (str | None): Display description. Defaults to the docstring summary.
+
+        Returns:
+            Callable[..., None]: The registered function, or a decorator when no target is given.
 
         Raises:
-            ValueError: If the name does not start with a slash, contains whitespace, or is
-                already registered.
+            ValueError: If the command name is invalid, duplicated, or conflicts with explicit
+                metadata supplied for a ``Command`` instance.
+            CommandRegistrationError: If metadata or parameters cannot produce a schema.
         """
-        if (
-            not command.name.startswith("/")
-            or command.name == "/"
-            or any(character.isspace() for character in command.name)
-        ):
-            raise ValueError(f"Invalid command name '{command.name}'.")
-        if command.name in self._commands:
-            raise ValueError(f"Command '{command.name}' is already registered.")
-        self._commands[command.name] = command
 
-    def handle_user_command(
-        self,
-        user_input: str,
-        interaction: Interaction | None = None,
-    ) -> bool:
-        """Handle slash-prefixed input and related display.
+        def _register(target: Command | Callable[..., None]) -> Callable[..., None]:
+            if isinstance(target, Command):
+                if name is not None or description is not None:
+                    raise ValueError("Explicit metadata cannot override a Command declaration.")
+                command = target
+            else:
+                command_name = name or target.__name__
+                command = Command(
+                    name=command_name,
+                    description=description or self._description_for(target),
+                    function=target,
+                    arguments_model=get_command_arguments_model(target, command_name),
+                )
+            if (
+                not command.name
+                or command.name.startswith("/")
+                or any(character.isspace() for character in command.name)
+            ):
+                raise ValueError(f"Invalid command name '{command.name}'.")
+            if command.name in self._commands:
+                raise ValueError(f"Command '{command.name}' is already registered.")
+            self._commands[command.name] = command
+            return command.function
+
+        return _register(function) if function is not None else _register
+
+    def handle_user_command(self, user_input: str, interaction: Interaction | None = None) -> bool:
+        """Classify and dispatch slash-prefixed user input.
 
         Args:
             user_input (str): Stripped user input to classify and dispatch.
-            interaction (Interaction | None): Interaction used by commands and error reporting.
-                Defaults to the interaction provided during initialization.
+            interaction (Interaction | None): Invocation interaction overriding the default.
 
         Returns:
             bool: ``True`` when the input was consumed as a command; otherwise ``False``.
@@ -121,7 +150,7 @@ class CommandManager:
         if not user_input.startswith("/"):
             return False
 
-        parts = user_input.split(maxsplit=1)
+        parts = user_input[1:].split(maxsplit=1)
         name = parts[0]
         arguments = parts[1] if len(parts) == 2 else ""
         self.call(name, arguments.strip(), interaction=interaction)
@@ -130,25 +159,53 @@ class CommandManager:
     def call(
         self,
         name: str,
-        arguments: str,
+        arguments: str = "",
         *,
         interaction: Interaction | None = None,
     ) -> None:
-        """Dispatch a command call by registered name.
+        """Dispatch a command call by its slash-free registered name.
 
         Args:
-            name (str): Registered slash-prefixed command name.
-            arguments (str): Arguments supplied after the command name.
-            interaction (Interaction | None): Interaction used by the command and error reporting.
-                Overrides the interaction provided during initialization.
+            name (str): Slash-free registered command name.
+            arguments (str): Raw argument text, or a JSON object for multiple parameters.
+            interaction (Interaction | None): Invocation interaction overriding the default.
+
+        Raises:
+            ValueError: If a slash-prefixed name is supplied or an interaction required for
+                dispatch is unavailable.
         """
-        interaction = interaction if interaction is not None else self._interaction
+        if name.startswith("/"):
+            raise ValueError("Command names passed to call() must not start with '/'.")
+        active_interaction = interaction if interaction is not None else self._interaction
         command = self._commands.get(name)
         if command is None:
-            interaction.warning(f"Unknown command '{name}'. Type /help for available commands.")
-            return
-        command.handler(self, interaction, arguments)
+            if active_interaction is None:
+                raise ValueError("Command dispatch requires an Interaction.")
+            active_interaction.warning(
+                f"Unknown command '/{name}'. Type /help for available commands."
+            )
+            return None
+
+        context = None
+        if takes_command_context(command.function):
+            if active_interaction is None:
+                raise ValueError(f"Command '{name}' requires an Interaction.")
+            context = CommandContext(name=name, interaction=active_interaction, manager=self)
+        try:
+            command.call(arguments, context)
+        except ValidationError as exc:
+            if active_interaction is None:
+                raise
+            active_interaction.warning(f"Invalid arguments for command '/{name}': {exc}")
 
     def request_exit(self) -> None:
         """Request termination of the active conversation loop."""
         self._exit_requested = True
+
+    @staticmethod
+    def _description_for(function: Callable[..., None]) -> str:
+        """Return a command description from its docstring summary."""
+        docstring = inspect.getdoc(function)
+        if not docstring:
+            raise CommandRegistrationError(f"Command '{function.__name__}' must have a docstring.")
+        return docstring.split("\n\n", maxsplit=1)[0].replace("\n", " ")

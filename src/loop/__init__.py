@@ -5,7 +5,9 @@ __all__ = [
     "AnswerDelta",
     "Backend",
     "Command",
+    "CommandContext",
     "CommandManager",
+    "CommandRegistrationError",
     "ConsoleInteraction",
     "ConversationItem",
     "fetch_content",
@@ -56,8 +58,8 @@ __all__ = [
 
 
 from .backend import Backend, OpenAIBackend
-from .commands import Command, CommandManager
-from .context import LoopContext, ToolContext, UnsupportedConversationItemError
+from .commands import Command, CommandManager, CommandRegistrationError
+from .context import CommandContext, LoopContext, ToolContext, UnsupportedConversationItemError
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop, Response
 from .models import (

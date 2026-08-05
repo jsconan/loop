@@ -64,8 +64,8 @@ class ConsoleInteraction:
         if message is None:
             message = "\nYou: "
         completer = WordCompleter(
-            [command.name for command in commands],
-            meta_dict={command.name: command.description for command in commands},
+            [f"/{command.name}" for command in commands],
+            meta_dict={f"/{command.name}": command.description for command in commands},
             sentence=True,
         )
         while True:
