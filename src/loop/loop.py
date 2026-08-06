@@ -5,7 +5,6 @@ from pathlib import Path
 
 from .backend import Backend
 from .commands import CommandManager
-from .context import LoopContext
 from .interaction import ConsoleInteraction, Interaction
 from .models import (
     AnswerCompleted,
@@ -21,7 +20,7 @@ from .models import (
     ToolResult,
     Usage,
 )
-from .session import MemorySessionStore, SessionStore
+from .session import MemorySessionStore, Session, SessionStore
 from .skills import SkillManager, build_instructions, load_agents_instructions
 
 
@@ -36,9 +35,8 @@ class Loop:
         interaction (Interaction | None): Service used for all user input and output.
         working_directory (Path | str | None): Directory used to discover applicable AGENTS.md
             files.
-        session (LoopContext | str | None): Conversation context or persisted session identifier
-            to load. Defaults to a fresh context; an injected store persists it after its first
-            query.
+        session (Session | str | None): Session or persisted session identifier to load.
+            Defaults to a fresh session; an injected store persists it after its first query.
         session_store (SessionStore | None): Session store, or ``None`` to use an instance-local
             memory store.
         stream (bool): Whether the backend should produce response events incrementally.
@@ -48,8 +46,7 @@ class Loop:
 
     _backend: Backend
     _instructions: str | None
-    _session: LoopContext
-    _session_id: str | None
+    _session: Session
     _session_store: SessionStore
     _skill_manager: SkillManager
     _interaction: Interaction
@@ -67,19 +64,17 @@ class Loop:
         skill_manager: SkillManager | None = None,
         interaction: Interaction | None = None,
         working_directory: Path | str | None = None,
-        session: LoopContext | str | None = None,
+        session: Session | str | None = None,
         session_store: SessionStore | None = None,
         stream: bool = False,
         debug: bool = False,
     ) -> None:
         self._interaction = interaction or backend.tool_registry.interaction or ConsoleInteraction()
         self._backend = backend
-        self._session_id = None
         self._session_store = session_store or MemorySessionStore()
         if isinstance(session, str):
-            self._session_id = session
             session = self._session_store.load(session)
-        self._session = session or LoopContext()
+        self._session = session or Session()
         self._working_directory = Path(working_directory or Path.cwd()).resolve()
         self._skill_manager = skill_manager or SkillManager.discover(self._working_directory)
         self._instructions = build_instructions(
@@ -119,11 +114,11 @@ class Loop:
         return self._session.messages
 
     @property
-    def session(self) -> LoopContext:
-        """Return the active conversation session.
+    def session(self) -> Session:
+        """Return the active session.
 
         Returns:
-            LoopContext: The mutable conversation context used by the loop.
+            Session: The mutable session used by the loop.
         """
         return self._session
 
@@ -272,7 +267,7 @@ class Loop:
                 self._session.model = message.model
         else:
             self._session.add_message(message)
-        self._session_id = self._session_store.save(self._session_id, self._session)
+        self._session_store.save(self._session)
 
     def output(self, events: Iterable[ResponseEvent]) -> Response:
         """Display and collect normalized response events.

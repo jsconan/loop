@@ -9,12 +9,12 @@ from loop import (
     AnswerDelta,
     CommandManager,
     ConsoleInteraction,
-    LoopContext,
     Message,
     OpenAIBackend,
     ReasoningCompleted,
     ReasoningDelta,
     ResponseCompleted,
+    Session,
     ShutdownRequested,
     ToolRegistry,
     register_shutdown_signals,
@@ -45,7 +45,7 @@ def main() -> None:
 
         interaction.info("Hello from Chat!")
 
-        session = LoopContext()
+        session = Session()
         while not command_manager.exit_requested:
             prompt = interaction.input(commands=command_manager.commands)
             if prompt is False:

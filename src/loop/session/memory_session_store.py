@@ -1,62 +1,71 @@
-"""Persist complete loop contexts in memory."""
+"""Persist session snapshots in memory."""
 
 from datetime import UTC, datetime
 from uuid import uuid7
 
-from ..context import LoopContext
-from .base import Session, SessionInfo, SessionNotFoundError
+from .base import Session, SessionInfo, SessionNotFoundError, StoredSession
 
 
 class MemorySessionStore:
-    """Store complete context snapshots in an instance-local list."""
+    """Store session snapshots in an instance-local list."""
 
-    _sessions: list[Session]
+    _sessions: list[StoredSession]
 
     def __init__(self) -> None:
         self._sessions = []
 
-    def save(self, session_id: str | None, context: LoopContext) -> str:
-        """Persist a complete context snapshot in memory.
+    def _find_session(self, session_id: str) -> StoredSession | None:
+        return next(filter(lambda s: s["id"] == session_id, self._sessions), None)
+
+    def save(self, session: Session) -> str:
+        """Persist a session snapshot in memory.
 
         Args:
-            session_id (str | None): Existing identifier, or ``None`` for a new session.
-            context (LoopContext): Complete context snapshot to persist.
+            session (Session): Session to persist.
 
         Returns:
             str: Existing or newly assigned persistent identifier.
         """
-        session_id = session_id or str(uuid7())
-        session = Session(
-            id=session_id,
-            updated_at=datetime.now(UTC),
-            message_count=len(context.messages),
-            context=context.serialize(),
-        )
-        for index, existing in enumerate(self._sessions):
-            if existing.id == session_id:
-                self._sessions[index] = session
-                break
-        else:
-            self._sessions.append(session)
-        return session_id
+        if session.id is None:
+            session.id = str(uuid7())
+        now = datetime.now(UTC)
 
-    def load(self, session_id: str) -> LoopContext:
-        """Load a complete in-memory context snapshot.
+        stored_session = self._find_session(session.id)
+        if stored_session:
+            stored_session["updated_at"] = now
+            stored_session["message_count"] = len(session.messages)
+            stored_session["session"] = session.serialize()
+        else:
+            self._sessions.append(
+                StoredSession(
+                    id=session.id,
+                    created_at=now,
+                    updated_at=now,
+                    message_count=len(session.messages),
+                    session=session.serialize(),
+                )
+            )
+        return session.id
+
+    def load(self, session_id: str) -> Session:
+        """Load a session snapshot from memory.
 
         Args:
             session_id (str): Identifier of the session to load.
 
         Returns:
-            LoopContext: Reconstructed context state.
+            Session: Reconstructed session state.
 
         Raises:
             SessionNotFoundError: If the requested session does not exist.
             ValueError: If the persisted session has an unsupported or invalid format.
         """
-        for session in self._sessions:
-            if session.id == session_id:
-                return LoopContext.deserialize(session.context)
-        raise SessionNotFoundError(f"Session '{session_id}' was not found.")
+        stored_session = self._find_session(session_id)
+        if stored_session is None:
+            raise SessionNotFoundError(f"Session '{session_id}' was not found.")
+        session = Session.deserialize(stored_session["session"])
+        session.id = session_id
+        return session
 
     def list(self) -> list[SessionInfo]:
         """List in-memory sessions from most to least recently updated.
@@ -64,12 +73,14 @@ class MemorySessionStore:
         Returns:
             list[SessionInfo]: Lightweight persisted-session descriptions.
         """
-        sessions = sorted(self._sessions, key=lambda session: (session.updated_at, session.id))
+        sessions = sorted(
+            self._sessions, key=lambda session: (session["updated_at"], session["id"])
+        )
         return [
             SessionInfo(
-                id=session.id,
-                updated_at=session.updated_at,
-                message_count=session.message_count,
+                id=session["id"],
+                updated_at=session["updated_at"],
+                message_count=session["message_count"],
             )
             for session in reversed(sessions)
         ]

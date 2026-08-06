@@ -4,7 +4,7 @@ from datetime import UTC
 
 import pytest
 
-from loop import LoopContext, MemorySessionStore, Message, SessionNotFoundError
+from loop import MemorySessionStore, Message, Session, SessionNotFoundError
 
 
 def test_store_starts_empty_and_reports_missing_sessions():
@@ -19,19 +19,19 @@ def test_store_starts_empty_and_reports_missing_sessions():
 def test_store_round_trips_snapshots_and_updates_metadata():
     """Saved snapshots stay isolated and updates preserve the session identity."""
     store = MemorySessionStore()
-    context = LoopContext(messages=[Message(role="user", content="hello")], tokens=12)
+    session = Session(messages=[Message(role="user", content="hello")], tokens=12)
 
-    session_id = store.save(None, context)
-    context.messages.append(Message(role="assistant", content="answer"))
-    assert store.load(session_id) != context
+    session_id = store.save(session)
+    session.messages.append(Message(role="assistant", content="answer"))
+    assert store.load(session_id) != session
 
-    context.model = "model-a"
-    assert store.save(session_id, context) == session_id
+    session.model = "model-a"
+    assert store.save(session) == session_id
 
     loaded = store.load(session_id)
     listings = store.list()
-    assert loaded == context
-    assert loaded is not context
+    assert loaded == session
+    assert loaded is not session
     assert listings[0].id == session_id
     assert listings[0].message_count == 2
     assert listings[0].updated_at.tzinfo == UTC
@@ -40,10 +40,14 @@ def test_store_round_trips_snapshots_and_updates_metadata():
 def test_store_lists_recent_sessions_first_and_keeps_instances_isolated():
     """Listings follow update recency and separate stores do not share sessions."""
     store = MemorySessionStore()
-    first_id = store.save("first", LoopContext())
-    second_id = store.save("second", LoopContext())
-    store.save(first_id, LoopContext(messages=[Message(role="user", content="updated")]))
+    first = Session()
+    second = Session()
+    first_id = store.save(first)
+    second_id = store.save(second)
+    first.messages.append(Message(role="user", content="updated"))
+    store.save(first)
 
     assert [item.id for item in store.list()] == [first_id, second_id]
-    assert store.load(second_id) == LoopContext()
+    assert store.load(second_id) == second
+    assert store.load(second_id) is not second
     assert MemorySessionStore().list() == []

@@ -1,6 +1,4 @@
-"""Persist complete loop contexts in a local SQLite database."""
-
-from __future__ import annotations
+"""Persist session snapshots in a local SQLite database."""
 
 import sqlite3
 from contextlib import closing
@@ -8,16 +6,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid7
 
-from ..context import LoopContext
-from .base import SessionInfo, SessionNotFoundError
+from .base import Session, SessionInfo, SessionNotFoundError
 
 
 class SQLiteSessionStore:
-    """Store complete context snapshots in SQLite.
+    """Store complete session snapshots in SQLite.
 
     Args:
         path (Path | str): SQLite database path. Its parent is created on the first save.
     """
+
+    _path: Path
 
     def __init__(self, path: Path | str) -> None:
         self._path = Path(path)
@@ -31,44 +30,45 @@ class SQLiteSessionStore:
         """
         return self._path
 
-    def save(self, session_id: str | None, context: LoopContext) -> str:
-        """Persist a complete context snapshot atomically.
+    def save(self, session: Session) -> str:
+        """Persist a session snapshot atomically.
 
         Args:
-            session_id (str | None): Existing identifier, or ``None`` for a new session.
-            context (LoopContext): Complete context snapshot to persist.
+            session (Session): Session to persist.
 
         Returns:
             str: Existing or newly assigned persistent identifier.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        session_id = session_id or str(uuid7())
+        if session.id is None:
+            session.id = str(uuid7())
+
         now = datetime.now(UTC).isoformat()
-        payload = context.serialize()
+        payload = session.serialize()
         with closing(sqlite3.connect(self._path)) as connection:
             with connection:
                 self._create_schema(connection)
                 connection.execute(
                     """
-                    INSERT INTO sessions (id, created_at, updated_at, message_count, context)
+                    INSERT INTO sessions (id, created_at, updated_at, message_count, session)
                     VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         updated_at = excluded.updated_at,
                         message_count = excluded.message_count,
-                        context = excluded.context
+                        session = excluded.session
                     """,
-                    (session_id, now, now, len(context.messages), payload),
+                    (session.id, now, now, len(session.messages), payload),
                 )
-        return session_id
+        return session.id
 
-    def load(self, session_id: str) -> LoopContext:
-        """Load a complete persisted context.
+    def load(self, session_id: str) -> Session:
+        """Load a persisted session snapshot.
 
         Args:
             session_id (str): Identifier of the session to load.
 
         Returns:
-            LoopContext: Reconstructed context state.
+            Session: Reconstructed session state.
 
         Raises:
             SessionNotFoundError: If the database or requested session does not exist.
@@ -76,14 +76,17 @@ class SQLiteSessionStore:
         """
         if not self._path.is_file():
             raise SessionNotFoundError(f"Session '{session_id}' was not found.")
+
         with closing(sqlite3.connect(self._path)) as connection:
             self._create_schema(connection)
             row = connection.execute(
-                "SELECT context FROM sessions WHERE id = ?", (session_id,)
+                "SELECT session FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
         if row is None:
             raise SessionNotFoundError(f"Session '{session_id}' was not found.")
-        return LoopContext.deserialize(row[0])
+        session = Session.deserialize(row[0])
+        session.id = session_id
+        return session
 
     def list(self) -> list[SessionInfo]:
         """List persisted sessions from most to least recently updated.
@@ -117,7 +120,7 @@ class SQLiteSessionStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 message_count INTEGER NOT NULL,
-                context TEXT NOT NULL
+                session TEXT NOT NULL
             )
             """
         )

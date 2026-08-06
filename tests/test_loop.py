@@ -11,13 +11,13 @@ from loop import (
     AnswerDelta,
     Interaction,
     Loop,
-    LoopContext,
     Message,
     Reasoning,
     ReasoningCompleted,
     ReasoningDelta,
     Response,
     ResponseCompleted,
+    Session,
     SQLiteSessionStore,
     ToolCall,
     ToolCallCompleted,
@@ -62,7 +62,7 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.interaction is interaction
     assert loop.working_directory == tmp_path.resolve()
     assert loop.instructions is None
-    assert loop.session == LoopContext()
+    assert loop.session == Session()
     assert loop.model == "requested-model"
     assert loop.skill_manager is not None
 
@@ -72,7 +72,7 @@ def test_loop_exposes_its_configured_state(tmp_path):
 
 def test_loops_share_local_conversation_context(tmp_path):
     """Injected context carries local history and metadata between loop modes."""
-    session = LoopContext(
+    session = Session(
         messages=[Message(role="user", content="hello")], tokens=12, model="served-model"
     )
     first = Loop(backend=loop_backend(), session=session, working_directory=tmp_path)
@@ -149,7 +149,7 @@ def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
 
 def test_persisted_session_identifier_uses_the_default_memory_store(monkeypatch):
     """A persisted identifier is resolved through an instance-local memory store by default."""
-    stored = LoopContext(messages=[Message(role="user", content="saved")])
+    stored = Session(messages=[Message(role="user", content="saved")])
     store = Mock()
     store.load.return_value = stored
     store_factory = Mock(return_value=store)
@@ -165,10 +165,10 @@ def test_persisted_session_identifier_uses_the_default_memory_store(monkeypatch)
 def test_loop_loads_a_persisted_session_identifier(tmp_path):
     """The constructor accepts a session identifier and resumes its complete state."""
     store = SQLiteSessionStore(tmp_path / "sessions.db")
-    stored = LoopContext(
+    stored = Session(
         messages=[Message(role="user", content="saved")], tokens=4, model="saved-model"
     )
-    session_id = store.save(None, stored)
+    session_id = store.save(stored)
 
     loop = Loop(backend=loop_backend(), session=session_id, session_store=store)
 
@@ -284,7 +284,7 @@ def test_handle_tool_calls_uses_local_objects():
 def test_query_selects_only_the_event_production_mode():
     """Both loop modes forward identical history with only the stream flag differing."""
     backend = loop_backend(get_response=Mock(return_value=[]))
-    session = LoopContext(messages=[Message(role="user", content="hello")])
+    session = Session(messages=[Message(role="user", content="hello")])
 
     list(Loop(backend=backend, session=session).query())
     list(Loop(backend=backend, session=session, stream=True).query())
@@ -296,7 +296,7 @@ def test_query_selects_only_the_event_production_mode():
 def test_query_prefers_the_explicit_model_over_response_metadata():
     """Request selection stays independent of a model reported by an earlier response."""
     backend = loop_backend(get_response=Mock(return_value=[]))
-    session = LoopContext(model="served-model")
+    session = Session(model="served-model")
 
     list(Loop(backend=backend, model="requested-model", session=session).query())
 
@@ -350,7 +350,7 @@ def test_one_output_loop_uses_terminal_response_text(capsys):
         usage=Usage(total_tokens=230),
         model="served-model",
     )
-    assert loop.session == LoopContext()
+    assert loop.session == Session()
     assert interaction.reasoning_delta.call_args_list[0].kwargs == {"start": True}
     assert interaction.reasoning_delta.call_args_list[1].kwargs == {"start": False}
     assert interaction.answer_delta.call_args_list[0].kwargs == {"start": True}
@@ -381,7 +381,7 @@ def test_output_displays_non_streaming_completed_text():
 
 def test_empty_output_preserves_existing_context_metadata():
     """A completion without reported metadata leaves existing context values unchanged."""
-    session = LoopContext(tokens=7, model="existing")
+    session = Session(tokens=7, model="existing")
     interaction = Mock(spec=Interaction)
     interaction.response.return_value = nullcontext()
 

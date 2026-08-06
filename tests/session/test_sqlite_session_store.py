@@ -7,9 +7,9 @@ from datetime import UTC
 import pytest
 
 from loop import (
-    LoopContext,
     Message,
     Reasoning,
+    Session,
     SessionNotFoundError,
     SQLiteSessionStore,
     ToolCall,
@@ -41,7 +41,7 @@ def test_store_stays_absent_until_save_and_reports_missing_sessions(tmp_path):
 def test_store_round_trips_complete_typed_contexts_and_updates_metadata(tmp_path):
     """SQLite snapshots preserve every item type, tokens, model, and stable identity."""
     store = SQLiteSessionStore(tmp_path / "sessions.db")
-    context = LoopContext(
+    session = Session(
         messages=[
             Message(role="user", content="hello"),
             Reasoning(content="thinking", id="reasoning"),
@@ -52,15 +52,15 @@ def test_store_round_trips_complete_typed_contexts_and_updates_metadata(tmp_path
         model="model-a",
     )
 
-    session_id = store.save(None, context)
-    context.messages.append(Message(role="assistant", content="answer"))
-    context.tokens = 18
-    context.model = "model-b"
-    assert store.save(session_id, context) == session_id
+    session_id = store.save(session)
+    session.messages.append(Message(role="assistant", content="answer"))
+    session.tokens = 18
+    session.model = "model-b"
+    assert store.save(session) == session_id
 
     loaded = store.load(session_id)
     listings = store.list()
-    assert loaded == context
+    assert loaded == session
     assert listings[0].id == session_id
     assert listings[0].message_count == 5
     assert listings[0].updated_at.tzinfo == UTC
@@ -69,8 +69,8 @@ def test_store_round_trips_complete_typed_contexts_and_updates_metadata(tmp_path
 def test_store_lists_most_recent_sessions_first(tmp_path):
     """Listings order sessions by their latest persisted update."""
     store = SQLiteSessionStore(tmp_path / "sessions.db")
-    first_id = store.save(None, LoopContext())
-    second_id = store.save(None, LoopContext())
+    first_id = store.save(Session())
+    second_id = store.save(Session())
     with closing(sqlite3.connect(store.path)) as connection:
         with connection:
             connection.execute(
@@ -96,10 +96,10 @@ def test_store_lists_most_recent_sessions_first(tmp_path):
 def test_store_rejects_invalid_or_unsupported_persisted_data(tmp_path, payload):
     """Loading rejects corrupt, unknown, and incorrectly typed snapshot data."""
     store = SQLiteSessionStore(tmp_path / "sessions.db")
-    session_id = store.save(None, LoopContext())
+    session_id = store.save(Session())
     with closing(sqlite3.connect(store.path)) as connection:
         with connection:
-            connection.execute("UPDATE sessions SET context = ?", (payload,))
+            connection.execute("UPDATE sessions SET session = ?", (payload,))
 
     with pytest.raises(ValueError):
         store.load(session_id)

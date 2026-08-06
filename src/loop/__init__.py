@@ -19,7 +19,6 @@ __all__ = [
     "iter_visible_paths",
     "list_folder",
     "Loop",
-    "LoopContext",
     "manage_skills",
     "MemorySessionStore",
     "Message",
@@ -34,6 +33,8 @@ __all__ = [
     "ResponseCompleted",
     "ResponseEvent",
     "run_command",
+    "SerializedMessage",
+    "SerializedSession",
     "Session",
     "SessionInfo",
     "SessionNotFoundError",
@@ -42,6 +43,7 @@ __all__ = [
     "Skill",
     "SkillManager",
     "SQLiteSessionStore",
+    "StoredSession",
     "tool_registry",
     "Tool",
     "ToolCall",
@@ -59,7 +61,7 @@ __all__ = [
 
 from .backend import Backend, OpenAIBackend
 from .commands import Command, CommandManager, CommandRegistrationError
-from .context import CommandContext, LoopContext, ToolContext, UnsupportedConversationItemError
+from .context import CommandContext, ToolContext
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop, Response
 from .models import (
@@ -81,11 +83,15 @@ from .models import (
 )
 from .session import (
     MemorySessionStore,
+    SerializedMessage,
+    SerializedSession,
     Session,
     SessionInfo,
     SessionNotFoundError,
     SessionStore,
     SQLiteSessionStore,
+    StoredSession,
+    UnsupportedConversationItemError,
 )
 from .skills import Skill, SkillManager
 from .tooling import Tool, ToolRegistrationError, ToolRegistry, tool_registry
