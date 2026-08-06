@@ -8,7 +8,7 @@ from typing import Protocol, Self, TypedDict
 
 from pydantic import ValidationError
 
-from ..models import ConversationItem, Message, Reasoning, ToolCall, ToolResult
+from ..models import ConversationItem, Message, Reasoning, Response, ToolCall, ToolResult
 
 _SCHEMA_VERSION = 1
 _ITEM_TYPES = {
@@ -109,16 +109,23 @@ class Session:
     tokens: int = 0
     model: str | None = None
 
-    def add_message(self, message: ConversationItem) -> None:
+    def add_message(self, message: ConversationItem | Response) -> None:
         """Add one message to the conversation history.
 
         Args:
-            message (ConversationItem): Conversation item to add.
+            message (ConversationItem | Response): Conversation item to add.
 
         Raises:
             ValueError: If the value is not a supported conversation item.
         """
-        self.messages.append(self._get_message(message))
+        if isinstance(message, Response):
+            self.add_messages(message.items)
+            if message.usage.total_tokens is not None:
+                self.tokens = message.usage.total_tokens
+            if isinstance(message.model, str):
+                self.model = message.model
+        else:
+            self.messages.append(self._get_message(message))
 
     def add_messages(self, messages: Iterable[ConversationItem]) -> None:
         """Add messages to the conversation history.

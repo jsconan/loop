@@ -259,14 +259,7 @@ class Loop:
 
     def _add_message(self, message: ConversationItem | Response) -> None:
         """Add conversation items and persist the resulting complete session."""
-        if isinstance(message, Response):
-            self._session.add_messages(message.items)
-            if message.usage.total_tokens is not None:
-                self._session.tokens = message.usage.total_tokens
-            if isinstance(message.model, str):
-                self._session.model = message.model
-        else:
-            self._session.add_message(message)
+        self._session.add_message(message)
         self._session_store.save(self._session)
 
     def output(self, events: Iterable[ResponseEvent]) -> Response:
