@@ -27,6 +27,7 @@ from ..models import (
     ReasoningDelta,
     ResponseCompleted,
     ResponseEvent,
+    ResponseMetadata,
     ToolCall,
     ToolCallCompleted,
     ToolDefinition,
@@ -461,17 +462,25 @@ class OpenAIBackend(Backend):
             )
         return None
 
-    @staticmethod
+    @classmethod
     def _completion(
+        cls,
         response: OpenAIResponse,
         items: Iterable[ConversationItem],
     ) -> ResponseCompleted:
         """Translate terminal OpenAI response content and metadata."""
-        completed_items = tuple(items)
-        total_tokens = response.usage.total_tokens if response.usage is not None else None
-        if not isinstance(total_tokens, int) or total_tokens < 0:
-            total_tokens = None
+        usage = cls._usage(response)
         model = response.model
+        response_id = getattr(response, "id", None)
+        metadata = ResponseMetadata(
+            response_id=response_id if isinstance(response_id, str) else None,
+            model=model if isinstance(model, str) else None,
+            usage=usage if usage.model_dump() else None,
+        )
+        completed_items = tuple(items)
+        if metadata.model_dump():
+            for item in completed_items:
+                item.metadata = metadata
         answer = response.output_text
         reasoning = next(
             (
@@ -483,8 +492,27 @@ class OpenAIBackend(Backend):
         )
         return ResponseCompleted(
             items=completed_items,
-            usage=Usage(total_tokens=total_tokens),
+            usage=usage,
             model=model if isinstance(model, str) else None,
             answer=answer if isinstance(answer, str) else "",
             reasoning=reasoning,
+        )
+
+    @staticmethod
+    def _usage(response: OpenAIResponse) -> Usage:
+        """Translate non-negative token counts from an OpenAI response."""
+        usage = response.usage
+        input_details = getattr(usage, "input_tokens_details", None)
+        output_details = getattr(usage, "output_tokens_details", None)
+
+        def token_count(obj: object, field: str) -> int | None:
+            value = getattr(obj, field, None)
+            return value if isinstance(value, int) and value >= 0 else None
+
+        return Usage(
+            input_tokens=token_count(usage, "input_tokens"),
+            output_tokens=token_count(usage, "output_tokens"),
+            total_tokens=token_count(usage, "total_tokens"),
+            cached_tokens=token_count(input_details, "cached_tokens"),
+            reasoning_tokens=token_count(output_details, "reasoning_tokens"),
         )

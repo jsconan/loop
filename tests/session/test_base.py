@@ -8,6 +8,7 @@ from loop import (
     Message,
     Reasoning,
     Response,
+    ResponseMetadata,
     Session,
     SessionInfo,
     ToolCall,
@@ -93,10 +94,15 @@ def test_session_rejects_invalid_message_types(method):
 
 def test_session_serializes_and_deserializes_all_conversation_items():
     """Session snapshots round-trip every supported item type and response metadata."""
+    metadata = ResponseMetadata(
+        response_id="response_1",
+        model="model-a",
+        usage=Usage(input_tokens=30, output_tokens=12, total_tokens=42),
+    )
     session = Session(
         messages=[
             Message(role="user", content="hello"),
-            Reasoning(content="thinking", id="reasoning"),
+            Reasoning(content="thinking", id="reasoning", metadata=metadata),
             function_call(),
             ToolResult(call_id="call_123", output="done"),
         ],

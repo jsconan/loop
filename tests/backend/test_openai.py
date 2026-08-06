@@ -29,6 +29,7 @@ from loop import (
     ReasoningCompleted,
     ReasoningDelta,
     ResponseCompleted,
+    ResponseMetadata,
     ToolCall,
     ToolCallCompleted,
     ToolRegistry,
@@ -507,14 +508,16 @@ def test_completed_response_normalizes_items_and_serializes_local_history():
         )
 
     local_call = ToolCall(call_id="call_1", name="demo", arguments="{}", id="fc_1")
+    metadata = ResponseMetadata(model="served-model", usage=Usage(total_tokens=21))
+    completed_call = local_call.model_copy(update={"metadata": metadata})
     items = (
-        Reasoning(content="think", id="reasoning_1"),
-        Message(role="assistant", content="answer"),
-        local_call,
+        Reasoning(content="think", id="reasoning_1", metadata=metadata),
+        Message(role="assistant", content="answer", metadata=metadata),
+        completed_call,
     )
     assert events == [
         ReasoningCompleted(text="think"),
-        ToolCallCompleted(call=local_call),
+        ToolCallCompleted(call=completed_call),
         AnswerCompleted(text="authoritative answer"),
         ResponseCompleted(
             items=items,
@@ -524,6 +527,7 @@ def test_completed_response_normalizes_items_and_serializes_local_history():
             reasoning="think",
         ),
     ]
+    assert events[1].call is events[3].items[2]
     assert sdk.responses.create.call_args.kwargs["input"] == [
         {"role": "user", "content": "hello"},
         {"type": "reasoning", "summary": [], "content": [], "id": "reasoning_old"},
@@ -712,22 +716,35 @@ def test_streaming_response_normalizes_provider_events():
         events = list(OpenAIBackend(default_model="default").get_response("hello", stream=True))
 
     local_call = ToolCall(call_id="call_1", name="demo", arguments="{}", id="fc_1")
+    metadata = ResponseMetadata(
+        response_id="response_1",
+        model="served-model",
+        usage=Usage(
+            input_tokens=10,
+            output_tokens=2,
+            total_tokens=12,
+            cached_tokens=0,
+            reasoning_tokens=0,
+        ),
+    )
+    completed_call = local_call.model_copy(update={"metadata": metadata})
     assert events == [
         ReasoningDelta(text="think"),
         AnswerDelta(text="answer"),
-        ToolCallCompleted(call=local_call),
+        ToolCallCompleted(call=completed_call),
         ResponseCompleted(
             items=(
-                Reasoning(content="final thought", id="r"),
-                Message(role="assistant", content="final answer"),
-                local_call,
+                Reasoning(content="final thought", id="r", metadata=metadata),
+                Message(role="assistant", content="final answer", metadata=metadata),
+                completed_call,
             ),
-            usage=Usage(total_tokens=12),
+            usage=metadata.usage,
             model="served-model",
             answer="final answer",
             reasoning="final thought",
         ),
     ]
+    assert events[2].call is events[3].items[2]
 
 
 def test_async_streaming_response_uses_the_normalized_event_contract():

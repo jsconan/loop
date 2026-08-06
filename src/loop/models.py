@@ -5,31 +5,83 @@ from typing import Any, Literal, TypeAlias
 from pydantic import BaseModel, Field
 
 
-class Message(BaseModel):
+class Usage(BaseModel):
+    """Describe token usage reported for a response.
+
+    Args:
+        input_tokens (int | None): Input tokens consumed when reported.
+        output_tokens (int | None): Output tokens generated when reported.
+        total_tokens (int | None): Total tokens consumed when reported.
+        cached_tokens (int | None): Cached input tokens consumed when reported.
+        reasoning_tokens (int | None): Reasoning output tokens generated when reported.
+    """
+
+    input_tokens: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    output_tokens: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    total_tokens: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    cached_tokens: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    reasoning_tokens: int | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class ResponseMetadata(BaseModel):
+    """Describe the provider response that produced a conversation item.
+
+    Usage describes the complete response and is not an item-specific token count.
+
+    Args:
+        response_id (str | None): Provider response identifier when reported.
+        model (str | None): Model identifier reported for the response.
+        usage (Usage | None): Token usage for the complete response.
+    """
+
+    response_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    model: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    usage: Usage | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class ConversationItemModel(BaseModel):
+    """Provide metadata shared by conversation item models.
+
+    Args:
+        metadata (ResponseMetadata | None): Metadata for the provider response that produced the
+            item, or ``None`` for input and locally produced items.
+    """
+
+    metadata: ResponseMetadata | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+
+class Message(ConversationItemModel):
     """Represent a user or assistant conversation message.
 
     Args:
         role (Literal["user", "assistant"]): Participant that produced the message.
         content (str): Message text.
+        metadata (ResponseMetadata | None): Metadata for the provider response that produced the
+            message.
     """
 
     role: Literal["user", "assistant"]
     content: str
 
 
-class Reasoning(BaseModel):
+class Reasoning(ConversationItemModel):
     """Represent reasoning retained for conversation continuity.
 
     Args:
         content (str): Completed reasoning text.
         id (str | None): Response item identifier when available.
+        metadata (ResponseMetadata | None): Metadata for the provider response that produced the
+            reasoning.
     """
 
     content: str
     id: str | None = None
 
 
-class ToolCall(BaseModel):
+class ToolCall(ConversationItemModel):
     """Represent a completed function-tool request.
 
     Args:
@@ -37,6 +89,8 @@ class ToolCall(BaseModel):
         name (str): Registered tool name.
         arguments (str): JSON-encoded tool arguments.
         id (str | None): Response item identifier when available.
+        metadata (ResponseMetadata | None): Metadata for the provider response that produced the
+            request.
     """
 
     call_id: str
@@ -45,12 +99,14 @@ class ToolCall(BaseModel):
     id: str | None = None
 
 
-class ToolResult(BaseModel):
+class ToolResult(ConversationItemModel):
     """Represent the serialized result of a function-tool request.
 
     Args:
         call_id (str): Identifier of the corresponding tool call.
         output (str): Serialized tool output.
+        metadata (ResponseMetadata | None): Metadata for the provider response that produced the
+            result, or ``None`` for a locally produced result.
     """
 
     call_id: str
@@ -86,16 +142,6 @@ class ModelInfo(BaseModel):
 
     id: str
     context_window: int | None = None
-
-
-class Usage(BaseModel):
-    """Describe token usage reported for a completed response.
-
-    Args:
-        total_tokens (int | None): Total tokens in the resulting context when reported.
-    """
-
-    total_tokens: int | None = None
 
 
 class ReasoningDelta(BaseModel):

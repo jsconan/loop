@@ -321,7 +321,6 @@ def test_one_output_loop_uses_terminal_response_text(capsys):
     items = (
         Reasoning(content="think again", id="r"),
         Message(role="assistant", content="hello world"),
-        call,
     )
     events = [
         ReasoningDelta(text="incomplete "),
