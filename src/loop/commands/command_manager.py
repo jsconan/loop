@@ -184,7 +184,7 @@ class CommandManager:
             active_interaction.warning(
                 f"Unknown command '/{name}'. Type /help for available commands."
             )
-            return None
+            return
 
         context = None
         if takes_command_context(command.function):
