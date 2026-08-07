@@ -36,7 +36,7 @@ from ..models import (
 )
 from ..tooling import ToolRegistry
 from ..tooling import tool_registry as default_tool_registry
-from .base import Backend
+from .backend import Backend
 
 
 class OpenAIBackend(Backend):

@@ -2,5 +2,5 @@
 
 __all__ = ["Backend", "OpenAIBackend"]
 
-from .base import Backend
+from .backend import Backend
 from .openai import OpenAIBackend
