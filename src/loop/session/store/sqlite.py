@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid7
 
-from ..base import Session, SessionInfo, SessionNotFoundError
+from ..session import Session, SessionInfo, SessionNotFoundError
 
 
 class SQLiteSessionStore:

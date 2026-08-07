@@ -9,7 +9,7 @@ from ..models import (
     Response,
     ToolResult,
 )
-from .base import Session, SessionStore
+from .session import Session, SessionStore
 from .store import MemorySessionStore
 
 

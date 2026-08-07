@@ -14,7 +14,7 @@ __all__ = [
     "UnsupportedConversationItemError",
 ]
 
-from .base import (
+from .session import (
     SerializedMessage,
     SerializedSession,
     Session,
