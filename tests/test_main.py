@@ -6,7 +6,7 @@ from unittest.mock import Mock, call
 import pytest
 
 import main
-from loop import ShutdownRequested
+from loop import SessionManager, ShutdownRequested
 
 
 @pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt, ShutdownRequested])
@@ -20,11 +20,14 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     backend_factory = Mock(return_value=backend)
     session_store = Mock()
     session_store_factory = Mock(return_value=session_store)
+    session_manager = Mock()
+    session_manager_factory = Mock(return_value=session_manager)
     register_shutdown_signals = Mock()
     monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
     monkeypatch.setattr(main, "Loop", loop_factory)
     monkeypatch.setattr(main, "OpenAIBackend", backend_factory)
     monkeypatch.setattr(main, "SQLiteSessionStore", session_store_factory)
+    monkeypatch.setattr(main, "SessionManager", session_manager_factory)
     monkeypatch.setattr(main, "find_project_root", Mock(return_value=Path("/project")))
     monkeypatch.setattr(main, "register_shutdown_signals", register_shutdown_signals)
     monkeypatch.delenv("BASE_URL", raising=False)
@@ -42,10 +45,14 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
         context_window=None,
     )
     session_store_factory.assert_called_once_with(Path("/project/.loop/sessions.db"))
+    session_manager_factory.assert_called_once_with(
+        interaction=interaction,
+        session_store=session_store,
+    )
     loop_factory.assert_called_once_with(
         backend,
         interaction=interaction,
-        session_store=session_store,
+        session_manager=session_manager,
         stream=True,
         working_directory=Path.cwd(),
     )
@@ -64,10 +71,13 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
     backend_factory = Mock(return_value=backend)
     session_store = Mock()
     session_store_factory = Mock(return_value=session_store)
+    session_manager = Mock(spec=SessionManager)
+    session_manager_factory = Mock(return_value=session_manager)
     monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
     monkeypatch.setattr(main, "Loop", loop_factory)
     monkeypatch.setattr(main, "OpenAIBackend", backend_factory)
     monkeypatch.setattr(main, "SQLiteSessionStore", session_store_factory)
+    monkeypatch.setattr(main, "SessionManager", session_manager_factory)
     monkeypatch.setattr(main, "find_project_root", Mock(return_value=None))
     monkeypatch.setattr(main, "register_shutdown_signals", Mock())
     monkeypatch.chdir(tmp_path)
@@ -85,10 +95,14 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
         context_window=32768,
     )
     session_store_factory.assert_called_once_with(tmp_path / ".loop" / "sessions.db")
+    session_manager_factory.assert_called_once_with(
+        interaction=interaction,
+        session_store=session_store,
+    )
     loop_factory.assert_called_once_with(
         backend,
         interaction=interaction,
-        session_store=session_store,
+        session_manager=session_manager,
         stream=True,
         working_directory=tmp_path,
     )

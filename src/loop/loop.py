@@ -5,15 +5,13 @@ from pathlib import Path
 
 from .backend import Backend
 from .commands import CommandManager
-from .interaction import ConsoleInteraction, Interaction
+from .interaction import Interaction
 from .models import (
     ConversationItem,
-    Message,
     Response,
     ResponseEvent,
-    ToolResult,
 )
-from .session import MemorySessionStore, Session, SessionStore
+from .session import Session, SessionManager
 from .skills import SkillManager, build_instructions, load_agents_instructions
 
 
@@ -30,8 +28,8 @@ class Loop:
             files.
         session (Session | str | None): Session or persisted session identifier to load.
             Defaults to a fresh session; an injected store persists it after its first query.
-        session_store (SessionStore | None): Session store, or ``None`` to use an instance-local
-            memory store.
+        session_manager (SessionManager | None): Manager used to persist and retrieve sessions.
+            Defaults to an instance-local memory store when ``None`` is provided.
         stream (bool): Whether the backend should produce response events incrementally.
         debug (bool): Whether to print raw response events.
 
@@ -39,8 +37,7 @@ class Loop:
 
     _backend: Backend
     _instructions: str | None
-    _session: Session
-    _session_store: SessionStore
+    _session_manager: SessionManager
     _skill_manager: SkillManager
     _interaction: Interaction
     _working_directory: Path
@@ -58,16 +55,22 @@ class Loop:
         interaction: Interaction | None = None,
         working_directory: Path | str | None = None,
         session: Session | str | None = None,
-        session_store: SessionStore | None = None,
+        session_manager: SessionManager | None = None,
         stream: bool = False,
         debug: bool = False,
     ) -> None:
-        self._interaction = interaction or backend.tool_registry.interaction or ConsoleInteraction()
+        if session_manager is not None:
+            self._session_manager = session_manager
+            if session:
+                self._session_manager.load_session(session)
+        else:
+            self._session_manager = SessionManager(
+                interaction=interaction,
+                session=session,
+            )
+        self._interaction = interaction or self._session_manager.interaction
         self._backend = backend
-        self._session_store = session_store or MemorySessionStore()
-        if isinstance(session, str):
-            session = self._session_store.load(session)
-        self._session = session or Session()
+
         self._working_directory = Path(working_directory or Path.cwd()).resolve()
         self._skill_manager = skill_manager or SkillManager.discover(self._working_directory)
         self._instructions = build_instructions(
@@ -104,7 +107,7 @@ class Loop:
         Returns:
             list[ConversationItem]: Items accumulated during the conversation.
         """
-        return self._session.messages
+        return self._session_manager.messages
 
     @property
     def session(self) -> Session:
@@ -113,7 +116,7 @@ class Loop:
         Returns:
             Session: The mutable session used by the loop.
         """
-        return self._session
+        return self._session_manager.session
 
     @property
     def skill_manager(self) -> SkillManager:
@@ -151,6 +154,15 @@ class Loop:
         """
         return self._debug
 
+    @debug.setter
+    def debug(self, debug: bool) -> None:
+        """Enable or disable raw response event output.
+
+        Args:
+            debug (bool): Whether to enable debug output.
+        """
+        self._debug = debug
+
     @property
     def stream(self) -> bool:
         """Return whether responses are requested incrementally.
@@ -169,15 +181,6 @@ class Loop:
         """
         return self._model
 
-    @debug.setter
-    def debug(self, debug: bool) -> None:
-        """Enable or disable raw response event output.
-
-        Args:
-            debug (bool): Whether to enable debug output.
-        """
-        self._debug = debug
-
     def run(self):
         """Run the conversation until the user requests to exit."""
         while not self._command_manager.exit_requested:
@@ -186,19 +189,19 @@ class Loop:
                 break
             if self._command_manager.handle_user_command(user_input):
                 continue
-            self._add_message(Message(role="user", content=user_input))
+            self._session_manager.add_user_message(content=user_input)
 
             while True:
                 events = self.query()
                 response = self._interaction.output(events, debug=self._debug)
-                self._add_message(response)
+                self._session_manager.add_response(response)
 
                 if not self.handle_tool_calls(response):
                     break
 
             self._interaction.token_usage(
-                self._session.model,
-                self._session.tokens,
+                self._session_manager.model,
+                self._session_manager.tokens,
                 self._backend.get_context_window(self._model),
             )
 
@@ -218,17 +221,13 @@ class Loop:
 
         for tool_call in response.tool_calls:
             self._interaction.tool_call(tool_call.name, tool_call.arguments)
-            self._add_message(
-                ToolResult(
-                    call_id=tool_call.call_id,
-                    output=self._backend.tool_registry.call(
-                        tool_call.name,
-                        tool_call.arguments,
-                        interaction=self._interaction,
-                        skill_manager=self._skill_manager,
-                    ),
-                )
+            tool_result = self._backend.tool_registry.call(
+                tool_call.name,
+                tool_call.arguments,
+                interaction=self._interaction,
+                skill_manager=self._skill_manager,
             )
+            self._session_manager.add_tool_call(call_id=tool_call.call_id, output=tool_result)
         return True
 
     def query(self) -> Iterable[ResponseEvent]:
@@ -243,18 +242,13 @@ class Loop:
         selected_model = self._model or self._backend.default_model
         if not selected_model:
             raise ValueError("No model was selected and the backend has no default model.")
-        self._session.model = selected_model
+        self._session_manager.model = selected_model
         return self._backend.get_response(
-            input=self._session.messages,
+            input=self._session_manager.messages,
             instructions=self._instructions,
             stream=self._stream,
             model=selected_model,
         )
-
-    def _add_message(self, message: ConversationItem | Response) -> None:
-        """Add conversation items and persist the resulting complete session."""
-        self._session.add_message(message)
-        self._session_store.save(self._session)
 
     def end(self) -> None:
         """Display the conversation termination message."""

@@ -6,6 +6,7 @@ __all__ = [
     "SerializedSession",
     "Session",
     "SessionInfo",
+    "SessionManager",
     "SessionNotFoundError",
     "SessionStore",
     "SQLiteSessionStore",
@@ -23,4 +24,5 @@ from .base import (
     StoredSession,
     UnsupportedConversationItemError,
 )
+from .session_manager import SessionManager
 from .store import MemorySessionStore, SQLiteSessionStore

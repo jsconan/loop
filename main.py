@@ -9,6 +9,7 @@ from loop import (
     ConsoleInteraction,
     Loop,
     OpenAIBackend,
+    SessionManager,
     ShutdownRequested,
     SQLiteSessionStore,
     find_project_root,
@@ -37,11 +38,15 @@ def main() -> None:
         )
         working_directory = Path.cwd()
         project_root = find_project_root(working_directory) or working_directory
+        session_manager = SessionManager(
+            interaction=interaction,
+            session_store=SQLiteSessionStore(project_root / ".loop" / "sessions.db"),
+        )
         loop = Loop(
             backend,
             interaction=interaction,
             working_directory=working_directory,
-            session_store=SQLiteSessionStore(project_root / ".loop" / "sessions.db"),
+            session_manager=session_manager,
             stream=True,
         )
         loop.run()

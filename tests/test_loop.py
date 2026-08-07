@@ -15,6 +15,7 @@ from loop import (
     Response,
     ResponseCompleted,
     Session,
+    SessionManager,
     SQLiteSessionStore,
     ToolCall,
     ToolCallCompleted,
@@ -116,11 +117,12 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
     interaction = output_interaction()
     interaction.input.side_effect = ["hello", False]
     store = SQLiteSessionStore(tmp_path / ".loop" / "sessions.db")
+    session_manager = SessionManager(interaction=interaction, session_store=store)
     loop = Loop(
         backend=backend,
         working_directory=tmp_path,
         interaction=interaction,
-        session_store=store,
+        session_manager=session_manager,
     )
 
     assert not (tmp_path / ".loop").exists()
@@ -152,19 +154,17 @@ def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
     assert not (tmp_path / ".loop").exists()
 
 
-def test_persisted_session_identifier_uses_the_default_memory_store(monkeypatch):
-    """A persisted identifier is resolved through an instance-local memory store by default."""
+def test_loop_delegates_a_session_identifier_to_an_injected_manager():
+    """A persisted identifier is resolved through the injected session manager."""
     stored = Session(messages=[Message(role="user", content="saved")])
-    store = Mock()
-    store.load.return_value = stored
-    store_factory = Mock(return_value=store)
-    monkeypatch.setattr("loop.loop.MemorySessionStore", store_factory)
+    manager = Mock(spec=SessionManager)
+    manager.session = stored
+    manager.interaction = Mock(spec=Interaction)
 
-    loop = Loop(backend=loop_backend(), session="session-id")
+    loop = Loop(backend=loop_backend(), session="session-id", session_manager=manager)
 
     assert loop.session is stored
-    store_factory.assert_called_once_with()
-    store.load.assert_called_once_with("session-id")
+    manager.load_session.assert_called_once_with("session-id")
 
 
 def test_loop_loads_a_persisted_session_identifier(tmp_path):
@@ -175,9 +175,30 @@ def test_loop_loads_a_persisted_session_identifier(tmp_path):
     )
     session_id = store.save(stored)
 
-    loop = Loop(backend=loop_backend(), session=session_id, session_store=store)
+    manager = SessionManager(session_store=store)
+    loop = Loop(backend=loop_backend(), session=session_id, session_manager=manager)
 
     assert loop.session == stored
+
+
+def test_loop_uses_an_injected_manager_session_without_reloading_it():
+    """An injected manager keeps its active session when no replacement is requested."""
+    session = Session(messages=[Message(role="user", content="saved")])
+    manager = SessionManager(session=session)
+
+    loop = Loop(backend=loop_backend(), session_manager=manager)
+
+    assert loop.session is session
+
+
+def test_loop_prefers_an_explicit_interaction_over_the_manager_interaction():
+    """An explicit interaction controls loop I/O when a manager is also supplied."""
+    manager = SessionManager(interaction=Mock(spec=Interaction))
+    interaction = Mock(spec=Interaction)
+
+    loop = Loop(backend=loop_backend(), interaction=interaction, session_manager=manager)
+
+    assert loop.interaction is interaction
 
 
 def test_loop_loads_project_instructions_once(monkeypatch, tmp_path):
