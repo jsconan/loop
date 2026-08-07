@@ -11,9 +11,10 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from ..commands import Command
+from .interaction import Interaction
 
 
-class ConsoleInteraction:
+class ConsoleInteraction(Interaction):
     """Interact with a user through a rich, editable process terminal.
 
     Args:

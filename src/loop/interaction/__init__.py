@@ -5,5 +5,5 @@ __all__ = [
     "ConsoleInteraction",
 ]
 
-from .base import Interaction
 from .console import ConsoleInteraction
+from .interaction import Interaction

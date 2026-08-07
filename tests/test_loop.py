@@ -12,9 +12,6 @@ from loop import (
     Interaction,
     Loop,
     Message,
-    Reasoning,
-    ReasoningCompleted,
-    ReasoningDelta,
     Response,
     ResponseCompleted,
     Session,
@@ -41,6 +38,16 @@ def loop_backend(**attributes):
         "get_context_window": lambda _model: None,
     }
     return SimpleNamespace(**(defaults | attributes))
+
+
+def output_interaction() -> Mock:
+    """Build an interaction mock that executes the base response collector."""
+    interaction = Mock(spec=Interaction)
+    interaction.response.return_value = nullcontext()
+    interaction.output.side_effect = lambda events, **kwargs: Interaction.output(
+        interaction, events, **kwargs
+    )
+    return interaction
 
 
 def test_loop_exposes_its_configured_state(tmp_path):
@@ -106,8 +113,7 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
             ]
         )
     )
-    interaction = Mock(spec=Interaction)
-    interaction.response.return_value = nullcontext()
+    interaction = output_interaction()
     interaction.input.side_effect = ["hello", False]
     store = SQLiteSessionStore(tmp_path / ".loop" / "sessions.db")
     loop = Loop(
@@ -133,8 +139,7 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
 
 def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
     """A caller that omits persistence keeps completed queries entirely in memory."""
-    interaction = Mock(spec=Interaction)
-    interaction.response.return_value = nullcontext()
+    interaction = output_interaction()
     interaction.input.side_effect = ["hello", False]
     loop = Loop(
         backend=loop_backend(get_response=Mock(return_value=[ResponseCompleted()])),
@@ -213,8 +218,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
             ),
         ],
     ]
-    interaction = Mock(spec=Interaction)
-    interaction.response.return_value = nullcontext()
+    interaction = output_interaction()
     interaction.input.side_effect = ["hello", False]
 
     Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
@@ -311,87 +315,6 @@ def test_query_rejects_missing_model_selection():
         Loop(backend=backend).query()
 
     backend.get_response.assert_not_called()
-
-
-def test_one_output_loop_uses_terminal_response_text(capsys):
-    """Streaming output displays deltas but returns authoritative terminal text."""
-    interaction = Mock(spec=Interaction)
-    interaction.response.return_value = nullcontext()
-    call = function_call()
-    items = (
-        Reasoning(content="think again", id="r"),
-        Message(role="assistant", content="hello world"),
-    )
-    events = [
-        ReasoningDelta(text="incomplete "),
-        ReasoningDelta(text="thought"),
-        AnswerDelta(text="incomplete "),
-        AnswerDelta(text="answer"),
-        ToolCallCompleted(call=call),
-        SimpleNamespace(ignored=True),
-        ResponseCompleted(
-            items=items,
-            usage=Usage(total_tokens=230),
-            model="served-model",
-            answer="  hello world  ",
-            reasoning="  think again  ",
-        ),
-    ]
-    loop = Loop(backend=loop_backend(), interaction=interaction, debug=True)
-
-    response = loop.output(events)
-
-    assert response == Response(
-        answer="  hello world  ",
-        reasoning="  think again  ",
-        tool_calls=(call,),
-        items=items,
-        usage=Usage(total_tokens=230),
-        model="served-model",
-    )
-    assert loop.session == Session()
-    assert interaction.reasoning_delta.call_args_list[0].kwargs == {"start": True}
-    assert interaction.reasoning_delta.call_args_list[1].kwargs == {"start": False}
-    assert interaction.answer_delta.call_args_list[0].kwargs == {"start": True}
-    assert interaction.answer_delta.call_args_list[1].kwargs == {"start": False}
-    interaction.response.assert_called_once_with()
-    assert interaction.debug.call_count == len(events)
-    capsys.readouterr()
-
-
-def test_output_displays_non_streaming_completed_text():
-    """Completed text is displayed directly when no streaming deltas were received."""
-    interaction = Mock(spec=Interaction)
-    interaction.response.return_value = nullcontext()
-
-    response = Loop(backend=loop_backend(), interaction=interaction).output(
-        [
-            ReasoningCompleted(text="think"),
-            AnswerCompleted(text="answer"),
-            ResponseCompleted(answer="answer", reasoning="think"),
-        ]
-    )
-
-    assert response == Response(answer="answer", reasoning="think")
-    interaction.reasoning.assert_called_once_with("think")
-    interaction.answer.assert_called_once_with("answer")
-    interaction.response.assert_called_once_with()
-
-
-def test_empty_output_preserves_existing_context_metadata():
-    """A completion without reported metadata leaves existing context values unchanged."""
-    session = Session(tokens=7, model="existing")
-    interaction = Mock(spec=Interaction)
-    interaction.response.return_value = nullcontext()
-
-    response = Loop(backend=loop_backend(), session=session, interaction=interaction).output(
-        [ResponseCompleted()]
-    )
-
-    assert response == Response(answer="", reasoning="")
-    assert session.tokens == 7
-    assert session.model == "existing"
-    interaction.response.assert_called_once_with()
 
 
 def test_end_uses_the_injected_interaction():

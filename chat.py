@@ -5,15 +5,10 @@ import os
 from dotenv import find_dotenv, load_dotenv
 
 from loop import (
-    AnswerCompleted,
-    AnswerDelta,
     CommandManager,
     ConsoleInteraction,
     Message,
     OpenAIBackend,
-    ReasoningCompleted,
-    ReasoningDelta,
-    ResponseCompleted,
     Session,
     ShutdownRequested,
     ToolRegistry,
@@ -55,30 +50,9 @@ def main() -> None:
 
             session.add_message(Message(role="user", content=prompt))
 
-            reasoning_started = False
-            answer_started = False
             events = backend.get_response(input=session.messages, stream=True)
-            for event in events:
-                if isinstance(event, ReasoningDelta):
-                    interaction.reasoning_delta(event.text, start=not reasoning_started)
-                    reasoning_started = True
-                    continue
-
-                if isinstance(event, AnswerDelta):
-                    interaction.answer_delta(event.text, start=not answer_started)
-                    answer_started = True
-                    continue
-
-                if isinstance(event, ReasoningCompleted):
-                    interaction.reasoning(event.text)
-                    continue
-
-                if isinstance(event, AnswerCompleted):
-                    interaction.answer(event.text)
-                    continue
-
-                if isinstance(event, ResponseCompleted):
-                    session.add_messages(event.items)
+            response = interaction.output(events)
+            session.add_message(response)
 
         interaction.conversation_ended()
 

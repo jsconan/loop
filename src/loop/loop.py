@@ -7,18 +7,11 @@ from .backend import Backend
 from .commands import CommandManager
 from .interaction import ConsoleInteraction, Interaction
 from .models import (
-    AnswerCompleted,
-    AnswerDelta,
     ConversationItem,
     Message,
-    ReasoningCompleted,
-    ReasoningDelta,
     Response,
-    ResponseCompleted,
     ResponseEvent,
-    ToolCallCompleted,
     ToolResult,
-    Usage,
 )
 from .session import MemorySessionStore, Session, SessionStore
 from .skills import SkillManager, build_instructions, load_agents_instructions
@@ -196,7 +189,8 @@ class Loop:
             self._add_message(Message(role="user", content=user_input))
 
             while True:
-                response = self.output(self.query())
+                events = self.query()
+                response = self._interaction.output(events, debug=self._debug)
                 self._add_message(response)
 
                 if not self.handle_tool_calls(response):
@@ -261,69 +255,6 @@ class Loop:
         """Add conversation items and persist the resulting complete session."""
         self._session.add_message(message)
         self._session_store.save(self._session)
-
-    def output(self, events: Iterable[ResponseEvent]) -> Response:
-        """Display and collect normalized response events.
-
-        Args:
-            events (Iterable[ResponseEvent]): Response events to display and collect.
-
-        Returns:
-            Response: The collected answer and reasoning text.
-        """
-        reasoning = ""
-        answer = ""
-        tool_calls = []
-        items = ()
-        usage = Usage()
-        model = None
-        reasoning_started = False
-        answer_started = False
-
-        with self._interaction.response():
-            for event in events:
-                if self._debug:
-                    self._interaction.debug(event)
-
-                if isinstance(event, ReasoningDelta):
-                    self._interaction.reasoning_delta(event.text, start=not reasoning_started)
-                    reasoning_started = True
-                    continue
-
-                if isinstance(event, AnswerDelta):
-                    self._interaction.answer_delta(event.text, start=not answer_started)
-                    answer_started = True
-                    continue
-
-                if isinstance(event, ReasoningCompleted):
-                    reasoning = event.text
-                    self._interaction.reasoning(event.text)
-                    continue
-
-                if isinstance(event, AnswerCompleted):
-                    answer = event.text
-                    self._interaction.answer(event.text)
-                    continue
-
-                if isinstance(event, ToolCallCompleted):
-                    tool_calls.append(event.call)
-                    continue
-
-                if isinstance(event, ResponseCompleted):
-                    items = event.items
-                    usage = event.usage
-                    model = event.model
-                    answer = event.answer
-                    reasoning = event.reasoning
-
-        return Response(
-            answer=answer,
-            reasoning=reasoning,
-            tool_calls=tuple(tool_calls),
-            items=items,
-            usage=usage,
-            model=model,
-        )
 
     def end(self) -> None:
         """Display the conversation termination message."""
