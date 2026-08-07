@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from uuid import uuid7
 
-from .base import Session, SessionInfo, SessionNotFoundError, StoredSession
+from ..base import Session, SessionInfo, SessionNotFoundError, StoredSession
 
 
 class MemorySessionStore:
