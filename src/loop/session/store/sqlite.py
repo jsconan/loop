@@ -72,6 +72,8 @@ class SQLiteSessionStore:
 
         Raises:
             SessionNotFoundError: If the database or requested session does not exist.
+            UnsupportedConversationItemError: If a serialized conversation item type is not
+                supported.
             ValueError: If the persisted session has an unsupported or invalid format.
         """
         if not self._path.is_file():

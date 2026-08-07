@@ -254,6 +254,8 @@ class SessionStore(Protocol):
 
         Raises:
             SessionNotFoundError: If the requested session does not exist.
+            UnsupportedConversationItemError: If a serialized conversation item type is not
+                supported.
             ValueError: If its persisted format is invalid or unsupported.
         """
 

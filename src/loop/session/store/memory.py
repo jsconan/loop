@@ -58,6 +58,8 @@ class MemorySessionStore:
 
         Raises:
             SessionNotFoundError: If the requested session does not exist.
+            UnsupportedConversationItemError: If a serialized conversation item type is not
+                supported.
             ValueError: If the persisted session has an unsupported or invalid format.
         """
         stored_session = self._find_session(session_id)
