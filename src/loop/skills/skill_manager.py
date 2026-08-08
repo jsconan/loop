@@ -61,6 +61,24 @@ class SkillManager:
         """
         return tuple(skill for skill in self._skills if skill.location in self._activated)
 
+    @property
+    def count(self) -> int:
+        """Return the number of available skills.
+
+        Returns:
+            int: The number of discovered skills.
+        """
+        return len(self._skills)
+
+    @property
+    def activated(self) -> int:
+        """Return the number of activated skills.
+
+        Returns:
+            int: The number of skills whose instructions are loaded.
+        """
+        return len(self._activated)
+
     @classmethod
     def discover(
         cls,
@@ -141,6 +159,33 @@ class SkillManager:
             "instructions": self._activated[skill.location],
             "status": "activated",
         }
+
+    def deactivate(self, name: str) -> dict[str, Any]:
+        """Deactivate one skill and release its instructions.
+
+        Args:
+            name (str): Exact skill name to deactivate.
+
+        Returns:
+            dict[str, Any]: Deactivated skill metadata, or a structured missing or ambiguous result.
+        """
+        matches = [skill for skill in self._skills if skill.name == name]
+        if not matches:
+            return {"error": "unknown_skill", "message": f"Skill '{name}' is not available."}
+        if len(matches) > 1:
+            return {
+                "error": "ambiguous_skill",
+                "message": f"Skill '{name}' is declared in more than one location.",
+                "locations": [str(skill.location) for skill in matches],
+            }
+
+        skill = matches[0]
+        self._activated.pop(skill.location, None)
+        return {**self._summary(skill), "status": "deactivated"}
+
+    def deactivate_all(self) -> None:
+        """Deactivate all skills and release their instructions."""
+        self._activated.clear()
 
     def catalog(self, max_chars: int = MAX_CATALOG_CHARS) -> str | None:
         """Format a bounded metadata-only catalog for the model's initial instructions.

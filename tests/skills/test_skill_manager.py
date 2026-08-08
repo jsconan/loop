@@ -64,6 +64,52 @@ def test_activated_skills_returns_immutable_discovery_ordered_snapshot(tmp_path)
     assert tuple(skill.name for skill in manager.activated_skills) == ("first", "second")
 
 
+def test_counts_and_deactivate_manage_activated_skill_lifecycle(tmp_path):
+    """Counts reflect discovery and deactivation releases cached instructions."""
+    skills_directory = tmp_path / "skills"
+    location = write_skill(skills_directory / "first", "first", "First skill.")
+    write_skill(skills_directory / "second", "second", "Second skill.")
+    manager = SkillManager.discover(tmp_path, [skills_directory])
+
+    assert manager.count == 2
+    assert manager.activated == 0
+
+    manager.activate("first")
+    assert manager.activated == 1
+    assert manager.deactivate("first")["status"] == "deactivated"
+    assert manager.activated == 0
+    assert not manager.list()["skills"][0]["activated"]
+
+    location.write_text(
+        "---\nname: first\ndescription: First skill.\n---\n\nNew instructions.\n",
+        encoding="utf-8",
+    )
+    assert manager.activate("first")["instructions"] == "New instructions."
+
+
+def test_deactivate_reports_name_errors_and_deactivate_all_clears_every_skill(tmp_path):
+    """Deactivation validates names and bulk deactivation clears cached instructions."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    write_skill(first / "same", "same", "First definition.")
+    write_skill(second / "same", "same", "Second definition.")
+    write_skill(first / "unique", "unique", "Unique definition.")
+    manager = SkillManager.discover(tmp_path, [first, second])
+
+    manager.activate("unique")
+
+    assert manager.deactivate("missing")["error"] == "unknown_skill"
+    assert manager.deactivate("same")["error"] == "ambiguous_skill"
+    assert manager.deactivate("unique")["status"] == "deactivated"
+    assert manager.deactivate("unique")["status"] == "deactivated"
+
+    manager.activate("unique")
+    manager.deactivate_all()
+
+    assert manager.activated == 0
+    assert manager.activated_skills == ()
+
+
 def test_discovery_skips_invalid_skills_and_reports_diagnostics(tmp_path):
     """Malformed metadata does not prevent valid skills from loading."""
     skills_directory = tmp_path / "skills"
