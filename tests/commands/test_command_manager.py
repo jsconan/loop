@@ -10,6 +10,7 @@ from loop.commands.utils import get_command_arguments_model
 
 def declared_command(name: str = "test") -> Command:
     """Build a parameterless command with explicit metadata."""
+
     def function() -> None:
         pass
 
@@ -26,7 +27,11 @@ def test_manager_registers_builtins_before_declared_and_discovered_commands():
     manager = CommandManager((explicit, discovered), Mock(spec=Interaction))
 
     assert [item.name for item in manager.commands] == [
-        "help", "exit", "quit", "explicit", "discovered"
+        "help",
+        "exit",
+        "quit",
+        "explicit",
+        "discovered",
     ]
     assert manager.commands[3] is explicit
     assert manager.exit_requested is False

@@ -13,10 +13,10 @@ from openai.types.responses import (
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseReasoningItem,
-    ResponseReasoningTextDoneEvent,
     ResponseReasoningTextDeltaEvent,
-    ResponseTextDoneEvent,
+    ResponseReasoningTextDoneEvent,
     ResponseTextDeltaEvent,
+    ResponseTextDoneEvent,
 )
 
 from loop import (
@@ -273,9 +273,7 @@ def test_prompt_tokens_use_the_server_tokenizer_when_available():
         backend = OpenAIBackend(
             default_model="model", base_url="http://localhost:8000/v1", api_key="key"
         )
-        assert (
-            backend.count_tokens("Hi", model="active") == 3
-        )
+        assert backend.count_tokens("Hi", model="active") == 3
 
     post.assert_called_once_with(
         "http://localhost:8000/tokenize",
@@ -377,9 +375,9 @@ def test_prompt_counting_gracefully_handles_unavailable_counts(payload):
     response.json.return_value = payload
     with patch("loop.backend.openai.httpx.post", return_value=response):
         assert (
-            OpenAIBackend(
-                default_model="default", base_url="https://example.test/v1"
-            ).count_tokens("Hi")
+            OpenAIBackend(default_model="default", base_url="https://example.test/v1").count_tokens(
+                "Hi"
+            )
             is None
         )
 
@@ -430,17 +428,13 @@ def test_async_response_uses_default_model():
     registry.definitions.return_value = []
     sdk = Mock()
     sdk.responses.create = AsyncMock(
-        return_value=SimpleNamespace(
-            output=[], output_text="", usage=None, model="served-model"
-        )
+        return_value=SimpleNamespace(output=[], output_text="", usage=None, model="served-model")
     )
     client = OpenAIBackend(default_model="default", tool_registry=registry)
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
         result = asyncio.run(
-            collect_events(
-                client.get_response_async([Message(role="user", content="hi")])
-            )
+            collect_events(client.get_response_async([Message(role="user", content="hi")]))
         )
 
     assert result == [ResponseCompleted(model="served-model")]
@@ -651,9 +645,7 @@ def test_streaming_response_normalizes_provider_events():
             "type": "message",
             "role": "assistant",
             "status": "completed",
-            "content": [
-                {"type": "output_text", "text": "final answer", "annotations": []}
-            ],
+            "content": [{"type": "output_text", "text": "final answer", "annotations": []}],
         }
     )
     provider_events = [

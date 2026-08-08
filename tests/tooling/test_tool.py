@@ -83,6 +83,7 @@ def test_call_returns_validation_errors_without_invoking(monkeypatch):
 
 def test_call_rejects_coroutine_functions_in_sync_dispatch(monkeypatch):
     """Synchronous dispatch directs coroutine functions to the asynchronous API."""
+
     async def calculate(number: int) -> int:
         return number * 2
 
@@ -104,13 +105,12 @@ def test_call_serializes_execution_failures(monkeypatch):
     monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
 
     assert make_tool(function).call('{"number": 3}') == "failed"
-    serialize_error.assert_called_once_with(
-        "execution_failed", "Tool 'calculate' failed: boom"
-    )
+    serialize_error.assert_called_once_with("execution_failed", "Tool 'calculate' failed: boom")
 
 
 def test_call_async_supports_sync_and_awaitable_results(monkeypatch):
     """Asynchronous dispatch serializes both immediate and awaitable application results."""
+
     async def calculate(number: int) -> int:
         return number * 2
 

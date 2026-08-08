@@ -47,6 +47,7 @@ def test_command_calls_parameterless_function_and_injects_context_when_declared(
 
 def test_command_rejects_invalid_multiple_arguments():
     """Multiple typed parameters require a valid JSON object payload."""
+
     def pair(first: int, second: int) -> None:
         pass
 

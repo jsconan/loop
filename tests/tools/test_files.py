@@ -32,9 +32,7 @@ def list_folder(path, entry_type="all", recursive=False):
     """Dispatch the context-aware folder-listing tool."""
     result = tool_registry.call(
         "list_folder",
-        json.dumps(
-            {"path": str(path), "entry_type": entry_type, "recursive": recursive}
-        ),
+        json.dumps({"path": str(path), "entry_type": entry_type, "recursive": recursive}),
         interaction=ConsoleInteraction(),
     )
     try:
@@ -129,9 +127,7 @@ def test_list_folder_rejects_ignored_folder_as_traversal_root(tmp_path):
     assert list_folder(str(tmp_path / ".git")) == (
         f"Error listing folder: Path '{tmp_path / '.git'}' is ignored."
     )
-    assert list_folder(str(private)) == (
-        f"Error listing folder: Path '{private}' is ignored."
-    )
+    assert list_folder(str(private)) == (f"Error listing folder: Path '{private}' is ignored.")
 
 
 def test_list_folder_applies_ancestor_and_nested_ignore_files(tmp_path):

@@ -24,6 +24,7 @@ def test_input_offers_command_names_and_descriptions_for_completion():
     """Terminal input derives slash completion metadata from available commands."""
     session = Mock()
     session.prompt.return_value = "answer"
+
     def function() -> None:
         pass
 
