@@ -113,6 +113,19 @@ def test_session_serializes_and_deserializes_all_conversation_items():
     assert Session.deserialize(session.serialize()) == session
 
 
+def test_session_round_trips_instruction_context_and_reads_version_one_defaults():
+    """Persistence retains refresh intent while older snapshots receive safe defaults."""
+    session = Session(
+        instruction_working_directory="/project/src",
+        active_skills=[("review", "/project/.agents/skills/review/SKILL.md")],
+    )
+
+    assert Session.deserialize(session.serialize()) == session
+    restored = Session.deserialize('{"version":1,"messages":[],"tokens":0,"model":null}')
+    assert restored.instruction_working_directory is None
+    assert restored.active_skills == []
+
+
 def test_session_serialization_identifies_unsupported_item_types():
     """Serialization reports the unsupported Python conversation item type."""
     session = Session(messages=[object()])
@@ -129,7 +142,7 @@ def test_session_serialization_identifies_unsupported_item_types():
     [
         ("not-json", "Invalid serialized session"),
         ("[]", "Invalid serialized session"),
-        ('{"version":2,"messages":[],"tokens":0,"model":null}', "Unsupported session version 2"),
+        ('{"version":3,"messages":[],"tokens":0,"model":null}', "Unsupported session version 3"),
         ('{"messages":[],"tokens":0,"model":null}', "Unsupported session version None"),
         (
             '{"version":1,"messages":[{"type":"message","data":{}}],"tokens":0,"model":null}',
@@ -139,6 +152,26 @@ def test_session_serialization_identifies_unsupported_item_types():
         ('{"version":1,"messages":[],"tokens":-1,"model":null}', "Invalid serialized session"),
         ('{"version":1,"messages":[],"tokens":0,"model":42}', "Invalid serialized session"),
         ('{"version":1,"messages":null,"tokens":0,"model":null}', "Invalid serialized session"),
+        (
+            '{"version":2,"messages":[],"tokens":0,"model":null,'
+            '"instruction_working_directory":42,"active_skills":[]}',
+            "Invalid serialized session",
+        ),
+        (
+            '{"version":2,"messages":[],"tokens":0,"model":null,'
+            '"instruction_working_directory":null,"active_skills":null}',
+            "Invalid serialized session",
+        ),
+        (
+            '{"version":2,"messages":[],"tokens":0,"model":null,'
+            '"instruction_working_directory":null,"active_skills":[["name"]]}',
+            "Invalid serialized session",
+        ),
+        (
+            '{"version":2,"messages":[],"tokens":0,"model":null,'
+            '"instruction_working_directory":null,"active_skills":[["name",1]]}',
+            "Invalid serialized session",
+        ),
     ],
 )
 def test_session_deserialization_rejects_invalid_data(payload, message):

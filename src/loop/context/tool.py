@@ -1,6 +1,7 @@
 """Define tool invocation context."""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..interaction import Interaction
@@ -23,6 +24,33 @@ class ToolContext:
     interaction: Interaction
     tool_name: str
     instructions_manager: InstructionsManager | None = None
+
+    def observe_file(self, path: Path | str) -> None:
+        """Report a successfully loaded file to instruction management.
+
+        Args:
+            path (Path | str): File whose containing instruction scope is now relevant.
+        """
+        if self.instructions_manager is not None:
+            self.instructions_manager.observe_path(path)
+
+    def observe_directory(self, path: Path | str) -> None:
+        """Report a successfully navigated directory to instruction management.
+
+        Args:
+            path (Path | str): Directory whose instruction scope is now relevant.
+        """
+        if self.instructions_manager is not None:
+            self.instructions_manager.observe_path(path, directory=True)
+
+    def invalidate_instructions(self, path: Path | str | None = None) -> None:
+        """Report that a discovered instruction source may have changed.
+
+        Args:
+            path (Path | str | None): Changed source, or ``None`` for unconditional invalidation.
+        """
+        if self.instructions_manager is not None:
+            self.instructions_manager.invalidate(path)
 
     def confirm(self, message: str, *, default: bool = False) -> bool:
         """Ask the user to confirm an action through the interaction service.

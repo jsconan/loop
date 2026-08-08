@@ -215,6 +215,61 @@ def test_loop_loads_project_instructions_for_its_normalized_working_directory(tm
     assert loop.instructions == "project rules"
 
 
+def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
+    """Each query prepares current sources and an explicit directory change updates scope."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "AGENTS.md").write_text("First rules.", encoding="utf-8")
+    (second / "AGENTS.md").write_text("Second rules.", encoding="utf-8")
+    backend = Mock(
+        tool_registry=default_tool_registry,
+        default_model="default-model",
+    )
+    backend.get_response.return_value = []
+    loop = Loop(backend=backend, working_directory=first)
+
+    loop.set_working_directory(second)
+    list(loop.query())
+
+    assert loop.working_directory == second.resolve()
+    assert backend.get_response.call_args.kwargs["instructions"] == "Second rules."
+
+
+def test_loop_rejects_a_missing_explicit_working_directory(tmp_path):
+    """Explicit directory changes reject missing targets without altering loop state."""
+    loop = Loop(backend=loop_backend(), working_directory=tmp_path)
+
+    with pytest.raises(NotADirectoryError, match="does not exist"):
+        loop.set_working_directory(tmp_path / "missing")
+
+    assert loop.working_directory == tmp_path.resolve()
+
+
+def test_loop_restores_only_skills_with_the_same_discovered_identity(tmp_path):
+    """Session restoration reloads valid active identities and ignores stale locations."""
+    (tmp_path / ".git").mkdir()
+    location = tmp_path / ".agents" / "skills" / "review" / "SKILL.md"
+    location.parent.mkdir(parents=True)
+    location.write_text(
+        "---\nname: review\ndescription: Review code.\n---\n\nRestored body.\n",
+        encoding="utf-8",
+    )
+    session = Session(
+        instruction_working_directory=str(tmp_path),
+        active_skills=[
+            ("missing", str(tmp_path / "missing" / "SKILL.md")),
+            ("review", str(location.resolve())),
+        ],
+    )
+
+    loop = Loop(backend=loop_backend(), session=session)
+
+    assert loop.working_directory == tmp_path.resolve()
+    assert "Restored body." in loop.instructions
+
+
 def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_path):
     """A skill tool result stays compact while its body enters the next backend request."""
     location = tmp_path / "review" / "SKILL.md"

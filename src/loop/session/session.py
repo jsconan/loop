@@ -10,7 +10,8 @@ from pydantic import ValidationError
 
 from ..models import ConversationItem, Message, Reasoning, Response, ToolCall, ToolResult
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_SUPPORTED_VERSIONS = (1, _SCHEMA_VERSION)
 _ITEM_TYPES = {
     "message": Message,
     "reasoning": Reasoning,
@@ -64,12 +65,16 @@ class SerializedSession(TypedDict):
         tokens (int): Total tokens in the context after the latest response.
         model (str | None): Model identifier reported by the latest response,
             or ``None`` when unknown.
+        instruction_working_directory (str | None): Last effective instruction directory.
+        active_skills (list[list[str]]): Active skill names and canonical locations.
     """
 
     version: int
     messages: list[SerializedMessage]
     tokens: int
     model: str | None
+    instruction_working_directory: str | None
+    active_skills: list[list[str]]
 
 
 class StoredSession(TypedDict):
@@ -102,12 +107,18 @@ class Session:
             Defaults to ``0``.
         model (str | None): Model identifier reported by the latest response,
             or ``None`` when unknown. Defaults to ``None``.
+        instruction_working_directory (str | None): Last effective instruction directory.
+            Defaults to ``None``.
+        active_skills (list[tuple[str, str]]): Active skill names and canonical locations.
+            Defaults to an empty list.
     """
 
     id: str | None = None
     messages: list[ConversationItem] = field(default_factory=list)
     tokens: int = 0
     model: str | None = None
+    instruction_working_directory: str | None = None
+    active_skills: list[tuple[str, str]] = field(default_factory=list)
 
     def add_message(self, message: ConversationItem | Response) -> None:
         """Add one message to the conversation history.
@@ -174,6 +185,8 @@ class Session:
                 messages=messages,
                 tokens=self.tokens,
                 model=self.model,
+                instruction_working_directory=self.instruction_working_directory,
+                active_skills=[list(identity) for identity in self.active_skills],
             ),
             separators=(",", ":"),
         )
@@ -202,7 +215,7 @@ class Session:
             raise ValueError("Invalid serialized session.")
 
         version = payload.get("version")
-        if version != _SCHEMA_VERSION:
+        if version not in _SUPPORTED_VERSIONS:
             raise ValueError(f"Unsupported session version {version}.")
 
         try:
@@ -218,16 +231,39 @@ class Session:
 
             tokens = payload["tokens"]
             model = payload["model"]
+            if version == 1:
+                instruction_working_directory = None
+                active_skills = []
+            else:
+                instruction_working_directory = payload["instruction_working_directory"]
+                active_skills = payload["active_skills"]
 
             if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
                 raise TypeError("Invalid tokens count.")
             if model is not None and not isinstance(model, str):
                 raise TypeError("Invalid serialized model name.")
+            if instruction_working_directory is not None and not isinstance(
+                instruction_working_directory, str
+            ):
+                raise TypeError("Invalid serialized instruction working directory.")
+            if not isinstance(active_skills, list) or any(
+                not isinstance(identity, list)
+                or len(identity) != 2
+                or not all(isinstance(value, str) for value in identity)
+                for identity in active_skills
+            ):
+                raise TypeError("Invalid serialized active skills.")
 
         except (KeyError, TypeError, ValidationError) as error:
             raise ValueError("Invalid serialized session.") from error
 
-        return cls(messages=messages, tokens=tokens, model=model)
+        return cls(
+            messages=messages,
+            tokens=tokens,
+            model=model,
+            instruction_working_directory=instruction_working_directory,
+            active_skills=[tuple(identity) for identity in active_skills],
+        )
 
 
 class SessionStore(Protocol):

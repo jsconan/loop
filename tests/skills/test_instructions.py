@@ -53,6 +53,192 @@ def test_manager_discovers_project_instructions_and_skills(tmp_path):
     assert manager.skill_manager.count == 1
 
 
+def test_discovery_refresh_preserves_an_explicit_skill_manager(tmp_path):
+    """An explicitly supplied catalog remains stable while project instructions refresh."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("First rules.", encoding="utf-8")
+    skill = write_skill(tmp_path / "custom" / "review", "review")
+    manager = InstructionsManager.discover(tmp_path, skill_manager=SkillManager([skill]))
+    manager.activate_skill("review")
+
+    agents.write_text("Second rules are longer.", encoding="utf-8")
+
+    assert manager.prepare() is True
+    assert manager.active_skill_identities == [("review", str(skill.location))]
+    assert "Second rules are longer." in manager.instructions
+    manager.invalidate()
+    assert manager.prepare() is False
+
+    agents.write_text("short", encoding="utf-8")
+    bounded = InstructionsManager.discover(
+        tmp_path,
+        skill_manager=SkillManager(),
+        max_bytes=20,
+    )
+    agents.write_text("x" * 100, encoding="utf-8")
+    with pytest.raises(ValueError, match="Refreshed base instructions exceed"):
+        bounded.prepare()
+
+
+def test_prepare_refreshes_changed_project_instructions_without_churning_stable_state(tmp_path):
+    """Query preparation refreshes changed sources and preserves stable generations."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("First rules.", encoding="utf-8")
+    manager = InstructionsManager.discover(tmp_path)
+
+    assert manager.prepare() is False
+    assert manager.generation == 0
+
+    agents.write_text("Second and longer rules.", encoding="utf-8")
+
+    assert manager.prepare() is True
+    assert manager.instructions == "Second and longer rules."
+    assert manager.generation == 1
+    assert manager.prepare() is False
+    assert manager.generation == 1
+
+
+def test_observed_file_changes_scope_and_rediscovers_nested_sources(tmp_path):
+    """A loaded file establishes its containing directory as the next instruction scope."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "AGENTS.md").write_text("Root rules.", encoding="utf-8")
+    nested = tmp_path / "src"
+    nested.mkdir()
+    (nested / "AGENTS.md").write_text("Nested rules.", encoding="utf-8")
+    target = nested / "module.py"
+    target.touch()
+    manager = InstructionsManager.discover(tmp_path)
+
+    manager.observe_path(target)
+    manager.observe_path(target)
+
+    assert manager.list_skills()["instruction_context"]["dirty"] is True
+    assert manager.prepare() is True
+    assert manager.working_directory == nested.resolve()
+    assert manager.instructions == "Root rules.\n\nNested rules."
+
+
+def test_refresh_preserves_same_skill_identity_and_reloads_changed_body(tmp_path):
+    """Refresh keeps activation for the same canonical skill while loading its new body."""
+    (tmp_path / ".git").mkdir()
+    location = write_skill(tmp_path / ".agents" / "skills" / "review", "review", "First.")
+    manager = InstructionsManager.discover(tmp_path)
+    manager.activate_skill("review")
+
+    location.location.write_text(
+        "---\nname: review\ndescription: Use review.\n---\n\nSecond body is longer.\n",
+        encoding="utf-8",
+    )
+
+    assert manager.prepare() is True
+    assert "Second body is longer." in manager.instructions
+    assert manager.active_skill_identities == [
+        ("review", str(location.location.resolve()))
+    ]
+
+
+def test_refresh_deactivates_a_skill_replaced_by_a_closer_definition(tmp_path):
+    """A newly shadowing definition never inherits activation from the old skill."""
+    (tmp_path / ".git").mkdir()
+    root_skill = write_skill(tmp_path / ".agents" / "skills" / "review", "review")
+    nested = tmp_path / "src"
+    nested.mkdir()
+    manager = InstructionsManager.discover(tmp_path)
+    manager.activate_skill("review")
+    write_skill(nested / ".agents" / "skills" / "review", "review", "Closer body.")
+
+    manager.observe_path(nested, directory=True)
+
+    assert manager.prepare() is True
+    assert manager.active_skill_identities == []
+    assert "Closer body." not in manager.instructions
+    assert str(root_skill.location.resolve()) not in {
+        str(skill.location) for skill in manager.skill_manager.activated_skills
+    }
+    assert "removed or shadowed" in manager.list_skills()["instruction_context"][
+        "diagnostics"
+    ][0]
+
+
+def test_reactivate_skills_restores_only_matching_current_identities(tmp_path):
+    """Restoration activates exact current definitions and ignores missing or stale locations."""
+    skill = write_skill(tmp_path / "skills" / "review", "review")
+    manager = InstructionsManager(skill_manager=SkillManager([skill]))
+
+    results = manager.reactivate_skills(
+        [
+            ("review", str(tmp_path / "stale" / "SKILL.md")),
+            ("missing", str(tmp_path / "missing" / "SKILL.md")),
+            ("review", str(skill.location)),
+        ]
+    )
+
+    assert [result["status"] for result in results] == ["activated"]
+    assert manager.active_skill_identities == [("review", str(skill.location))]
+
+
+def test_refresh_deactivates_invalid_and_oversized_active_skills(tmp_path, monkeypatch):
+    """Refresh safely drops active bodies that fail validation or the instruction budget."""
+    (tmp_path / ".git").mkdir()
+    skill = write_skill(tmp_path / ".agents" / "skills" / "review", "review", "Short.")
+    baseline = InstructionsManager.discover(tmp_path).instructions
+    manager = InstructionsManager.discover(tmp_path, max_bytes=len(baseline.encode()) + 250)
+    assert manager.activate_skill("review")["status"] == "activated"
+
+    skill.location.write_text(
+        "---\nname: review\ndescription: Use review.\n---\n\n" + "x" * 1_000,
+        encoding="utf-8",
+    )
+
+    assert manager.prepare() is True
+    assert manager.active_skill_identities == []
+    assert "instruction budget exceeded" in manager.list_skills()["instruction_context"][
+        "diagnostics"
+    ][0]
+
+    skill.location.write_text(
+        "---\nname: review\ndescription: Use review.\n---\n\nShort again.\n",
+        encoding="utf-8",
+    )
+    manager.prepare()
+    manager.activate_skill("review")
+    original_manager = manager.skill_manager
+    original_activate = SkillManager.activate
+
+    def fail_refreshed_activation(self, name):
+        if self is original_manager:
+            return original_activate(self, name)
+        raise ValueError("changed skill is invalid")
+
+    monkeypatch.setattr(SkillManager, "activate", fail_refreshed_activation)
+    manager.invalidate()
+
+    assert manager.prepare() is True
+    assert "changed skill is invalid" in manager.list_skills()["instruction_context"][
+        "diagnostics"
+    ][0]
+
+
+def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path):
+    """Only instruction sources invalidate, and an invalid candidate preserves prior content."""
+    manager = InstructionsManager.discover(tmp_path, max_bytes=20)
+    manager.invalidate(tmp_path / "ordinary.py")
+    assert manager.list_skills()["instruction_context"]["dirty"] is False
+
+    manager.invalidate()
+    assert manager.prepare() is False
+    assert manager.generation == 0
+
+    (tmp_path / "AGENTS.md").write_text("x" * 100, encoding="utf-8")
+    with pytest.raises(ValueError, match="Refreshed base instructions exceed"):
+        manager.prepare()
+    assert manager.instructions is None
+
+    static = InstructionsManager()
+    static.invalidate()
+    assert static.prepare() is False
+
+
 def test_manager_rejects_invalid_and_oversized_initial_limits():
     """Construction requires a positive limit containing the initial document."""
     for limit in (True, 0, -1, 1.5):

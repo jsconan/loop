@@ -74,10 +74,17 @@ class Loop:
         self._interaction = interaction or self._session_manager.interaction
         self._backend = backend
 
-        self._working_directory = Path(working_directory or Path.cwd()).resolve()
+        restored_directory = self._session_manager.session.instruction_working_directory
+        self._working_directory = Path(
+            working_directory or restored_directory or Path.cwd()
+        ).resolve()
         self._instructions_manager = instructions_manager or InstructionsManager.discover(
             self._working_directory,
         )
+        if instructions_manager is None:
+            self._instructions_manager.reactivate_skills(
+                self._session_manager.session.active_skills
+            )
         self._stream = stream
         self._debug = debug
         self._model = model
@@ -146,6 +153,21 @@ class Loop:
             Path: The resolved working directory.
         """
         return self._working_directory
+
+    def set_working_directory(self, working_directory: Path | str) -> None:
+        """Change the working and instruction-discovery directory.
+
+        Args:
+            working_directory (Path | str): Existing directory to make active.
+
+        Raises:
+            NotADirectoryError: If the resolved path is not an existing directory.
+        """
+        directory = Path(working_directory).resolve()
+        if not directory.is_dir():
+            raise NotADirectoryError(f"Working directory '{directory}' does not exist.")
+        self._working_directory = directory
+        self._instructions_manager.observe_path(directory, directory=True)
 
     @property
     def debug(self) -> bool:
@@ -244,6 +266,13 @@ class Loop:
         selected_model = self._model or self._backend.default_model
         if not selected_model:
             raise ValueError("No model was selected and the backend has no default model.")
+        self._instructions_manager.prepare()
+        self._session_manager.session.instruction_working_directory = str(
+            self._instructions_manager.working_directory or self._working_directory
+        )
+        self._session_manager.session.active_skills = (
+            self._instructions_manager.active_skill_identities
+        )
         self._session_manager.model = selected_model
         return self._backend.get_response(
             input=self._session_manager.messages,

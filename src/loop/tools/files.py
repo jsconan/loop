@@ -19,6 +19,7 @@ class FolderEntry(TypedDict):
 
 @tool_registry.tool
 def list_folder(
+    context: ToolContext,
     path: Annotated[str, Field(description="Path to the folder whose entries should be listed.")],
     entry_type: Annotated[
         Literal["files", "folders", "all"],
@@ -35,7 +36,7 @@ def list_folder(
         if is_path_ignored(folder):
             return f"Error listing folder: Path '{path}' is ignored."
         entries = iter_visible_paths(folder, recursive)
-        return sorted(
+        result = sorted(
             (
                 {
                     "path": str(entry.relative_to(folder)) if recursive else entry.name,
@@ -47,6 +48,8 @@ def list_folder(
             ),
             key=lambda entry: entry["path"],
         )
+        context.observe_directory(folder)
+        return result
     except Exception as exc:  # pylint: disable=broad-except
         return f"Error listing folder: {exc}"
 
@@ -64,6 +67,7 @@ def read_text_file(
             return "Read operation cancelled by user."
 
         content = Path(path).read_bytes()
+        context.observe_file(path)
         if not content:
             return f"File '{path}' is empty."
         if b"\0" in content:
@@ -90,6 +94,7 @@ def write_text_file(
     try:
         with open(path, "w", encoding="utf-8") as file:
             file.write(content)
+        context.invalidate_instructions(path)
         return f"Successfully wrote to file '{path}'."
     except Exception as exc:  # pylint: disable=broad-except
         return f"Error writing to file: {exc}"

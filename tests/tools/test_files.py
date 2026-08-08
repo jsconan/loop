@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, call
 
 from loop import (
     ConsoleInteraction,
-    list_folder,
+    InstructionsManager,
     tool_registry,
 )
 
@@ -28,6 +28,21 @@ def read_text_file(path):
     )
 
 
+def list_folder(path, entry_type="all", recursive=False):
+    """Dispatch the context-aware folder-listing tool."""
+    result = tool_registry.call(
+        "list_folder",
+        json.dumps(
+            {"path": str(path), "entry_type": entry_type, "recursive": recursive}
+        ),
+        interaction=ConsoleInteraction(),
+    )
+    try:
+        return json.loads(result)
+    except json.JSONDecodeError:
+        return result
+
+
 def test_list_folder_filters_and_sorts_immediate_entries(tmp_path):
     """Listing filters immediate entries by type and sorts their names."""
     (tmp_path / "zebra.txt").touch()
@@ -35,7 +50,6 @@ def test_list_folder_filters_and_sorts_immediate_entries(tmp_path):
     (tmp_path / "nested").mkdir()
     (tmp_path / "nested" / "ignored.txt").touch()
 
-    assert list_folder.__name__ == "list_folder"
     assert list_folder(str(tmp_path)) == [
         {"path": "alpha.txt", "type": "file"},
         {"path": "nested", "type": "folder"},
@@ -149,6 +163,48 @@ def test_list_folder_applies_ancestor_and_nested_ignore_files(tmp_path):
 def test_list_folder_reports_failures(tmp_path):
     """Listing reports an invalid folder as a readable tool result."""
     assert list_folder(str(tmp_path / "missing")).startswith("Error listing folder:")
+
+
+def test_file_navigation_reports_successful_instruction_context_changes(tmp_path):
+    """Registered folder and file tools report only successful navigation to their manager."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    target = nested / "file.txt"
+    target.write_text("content", encoding="utf-8")
+    manager = InstructionsManager.discover(tmp_path)
+    interaction = ConsoleInteraction()
+
+    tool_registry.call(
+        "list_folder",
+        json.dumps({"path": str(nested)}),
+        interaction=interaction,
+        instructions_manager=manager,
+    )
+    assert manager.working_directory == nested.resolve()
+
+    tool_registry.call(
+        "read_text_file",
+        json.dumps({"path": str(target)}),
+        interaction=interaction,
+        instructions_manager=manager,
+    )
+    assert manager.working_directory == nested.resolve()
+
+    tool_registry.call(
+        "read_text_file",
+        json.dumps({"path": str(tmp_path / "missing.txt")}),
+        interaction=interaction,
+        instructions_manager=manager,
+    )
+    assert manager.working_directory == nested.resolve()
+
+    tool_registry.call(
+        "list_folder",
+        json.dumps({"path": str(tmp_path / "missing")}),
+        interaction=interaction,
+        instructions_manager=manager,
+    )
+    assert manager.working_directory == nested.resolve()
 
 
 def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads(tmp_path):
