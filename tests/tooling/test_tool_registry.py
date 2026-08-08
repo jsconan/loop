@@ -8,6 +8,7 @@ import pytest
 
 from loop.context import ToolContext
 from loop.interaction import Interaction
+from loop.skills import InstructionsManager
 from loop.tooling import ToolRegistrationError, ToolRegistry
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
@@ -15,6 +16,7 @@ tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
 
 def register(registry: ToolRegistry):
     """Register and return a simple documented function."""
+
     @registry.tool
     def calculate(number: int) -> int:
         """Calculate a number."""
@@ -25,6 +27,7 @@ def register(registry: ToolRegistry):
 
 def test_constructor_registers_tools_in_iteration_order():
     """Construction registers each supplied function through the normal tool path."""
+
     def first() -> str:
         """Return the first result."""
         return "first"
@@ -132,9 +135,12 @@ def test_call_routes_arguments_and_runtime_context(monkeypatch):
     registry = ToolRegistry(interaction=Mock(spec=Interaction))
     register(registry)
     runtime = Mock(spec=Interaction)
-    manager = Mock()
+    manager = Mock(spec=InstructionsManager)
 
-    assert registry.call("calculate", "{}", interaction=runtime, skill_manager=manager) == "result"
+    assert (
+        registry.call("calculate", "{}", interaction=runtime, instructions_manager=manager)
+        == "result"
+    )
     context = tool.call.call_args.args[1]
     assert context == ToolContext(runtime, "calculate", manager)
 

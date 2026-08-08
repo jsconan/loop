@@ -12,7 +12,7 @@ from .models import (
     ResponseEvent,
 )
 from .session import Session, SessionManager
-from .skills import SkillManager, build_instructions, load_agents_instructions
+from .skills import InstructionsManager
 
 
 class Loop:
@@ -21,8 +21,9 @@ class Loop:
     Args:
         backend (Backend): Backend used to request model responses.
         model (str | None): Model selected for requests, or ``None`` to use the backend default.
-        skill_manager (SkillManager | None): Manager used to discover and progressively activate
-            Agent Skills.
+        instructions_manager (InstructionsManager | None): Manager used to compose the complete
+            backend instructions. Defaults to discovering project instructions and Agent Skills
+            for ``working_directory``.
         interaction (Interaction | None): Service used for all user input and output.
         working_directory (Path | str | None): Directory used to discover applicable AGENTS.md
             files.
@@ -33,12 +34,14 @@ class Loop:
         stream (bool): Whether the backend should produce response events incrementally.
         debug (bool): Whether to print raw response events.
 
+    Raises:
+        ValueError: The session is invalid.
+
     """
 
     _backend: Backend
-    _instructions: str | None
+    _instructions_manager: InstructionsManager
     _session_manager: SessionManager
-    _skill_manager: SkillManager
     _interaction: Interaction
     _working_directory: Path
     _debug: bool
@@ -51,7 +54,7 @@ class Loop:
         backend: Backend,
         *,
         model: str | None = None,
-        skill_manager: SkillManager | None = None,
+        instructions_manager: InstructionsManager | None = None,
         interaction: Interaction | None = None,
         working_directory: Path | str | None = None,
         session: Session | str | None = None,
@@ -72,10 +75,8 @@ class Loop:
         self._backend = backend
 
         self._working_directory = Path(working_directory or Path.cwd()).resolve()
-        self._skill_manager = skill_manager or SkillManager.discover(self._working_directory)
-        self._instructions = build_instructions(
-            load_agents_instructions(self._working_directory),
-            self._skill_manager.catalog(),
+        self._instructions_manager = instructions_manager or InstructionsManager.discover(
+            self._working_directory,
         )
         self._stream = stream
         self._debug = debug
@@ -93,12 +94,22 @@ class Loop:
 
     @property
     def instructions(self) -> str | None:
-        """Return the AGENTS.md instructions loaded for this session.
+        """Return the complete instructions for the next backend request.
 
         Returns:
-            str | None: The combined project instructions, or ``None`` when none were found.
+            str | None: Project, catalog, and activated-skill instructions, or ``None`` when no
+                instructions are available.
         """
-        return self._instructions
+        return self._instructions_manager.instructions
+
+    @property
+    def instructions_manager(self) -> InstructionsManager:
+        """Return the instruction manager active for this conversation.
+
+        Returns:
+            InstructionsManager: The active instruction manager.
+        """
+        return self._instructions_manager
 
     @property
     def messages(self) -> list[ConversationItem]:
@@ -117,15 +128,6 @@ class Loop:
             Session: The mutable session used by the loop.
         """
         return self._session_manager.session
-
-    @property
-    def skill_manager(self) -> SkillManager:
-        """Return the skill manager active for this conversation.
-
-        Returns:
-            SkillManager: The active skill manager.
-        """
-        return self._skill_manager
 
     @property
     def interaction(self) -> Interaction:
@@ -225,7 +227,7 @@ class Loop:
                 tool_call.name,
                 tool_call.arguments,
                 interaction=self._interaction,
-                skill_manager=self._skill_manager,
+                instructions_manager=self._instructions_manager,
             )
             self._session_manager.add_tool_call(call_id=tool_call.call_id, output=tool_result)
         return True
@@ -245,7 +247,7 @@ class Loop:
         self._session_manager.model = selected_model
         return self._backend.get_response(
             input=self._session_manager.messages,
-            instructions=self._instructions,
+            instructions=self._instructions_manager.instructions,
             stream=self._stream,
             model=selected_model,
         )

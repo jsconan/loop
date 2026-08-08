@@ -43,8 +43,9 @@ def test_discovery_reads_metadata_and_activation_lazily_loads_and_caches_body(
     first = manager.activate("review")
     second = manager.activate("review")
 
-    assert first["instructions"] == "Follow the review workflow."
     assert first["skill_root"] == str(location.parent.resolve())
+    assert "instructions" not in first
+    assert manager.activated_instructions == ((manager.skills[0], "Follow the review workflow."),)
     assert second["status"] == "activated"
     assert reads == [location.resolve()]
 
@@ -62,6 +63,11 @@ def test_activated_skills_returns_immutable_discovery_ordered_snapshot(tmp_path)
     manager.activate("first")
 
     assert tuple(skill.name for skill in manager.activated_skills) == ("first", "second")
+    assert tuple(skill.name for skill, _ in manager.activated_instructions) == ("first", "second")
+    assert tuple(body for _, body in manager.activated_instructions) == (
+        "Instructions",
+        "Instructions",
+    )
 
 
 def test_counts_and_deactivate_manage_activated_skill_lifecycle(tmp_path):
@@ -84,7 +90,9 @@ def test_counts_and_deactivate_manage_activated_skill_lifecycle(tmp_path):
         "---\nname: first\ndescription: First skill.\n---\n\nNew instructions.\n",
         encoding="utf-8",
     )
-    assert manager.activate("first")["instructions"] == "New instructions."
+    result = manager.activate("first")
+    assert "instructions" not in result
+    assert manager.activated_instructions == ((manager.skills[0], "New instructions."),)
 
 
 def test_deactivate_reports_unknown_names_and_deactivate_all_clears_every_skill(tmp_path):
@@ -153,17 +161,13 @@ def test_default_discovery_prefers_the_closest_project_scope_then_user_skills(
     working_directory.mkdir(parents=True)
     (project / ".git").mkdir()
     root = write_skill(project / ".agents" / "skills" / "root", "root", "Root skill.")
-    local = write_skill(
-        working_directory / ".agents" / "skills" / "local", "local", "Local skill."
-    )
+    local = write_skill(working_directory / ".agents" / "skills" / "local", "local", "Local skill.")
     write_skill(home / ".agents" / "skills" / "user", "user", "User skill.")
     write_skill(project / ".agents" / "skills" / "shared", "shared", "Root definition.")
     winner = write_skill(
         working_directory / ".agents" / "skills" / "shared", "shared", "Local definition."
     )
-    shadowed = write_skill(
-        home / ".agents" / "skills" / "shared", "shared", "User definition."
-    )
+    shadowed = write_skill(home / ".agents" / "skills" / "shared", "shared", "User definition.")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
     manager = SkillManager.discover(working_directory)
@@ -188,7 +192,9 @@ def test_explicit_directory_order_resolves_duplicate_names_and_reports_shadowing
     assert len(listing["skills"]) == 1
     assert not listing["skills"][0]["activated"]
     assert manager.activate("missing")["error"] == "unknown_skill"
-    assert manager.activate("same")["instructions"] == "First instructions."
+    result = manager.activate("same")
+    assert "instructions" not in result
+    assert manager.activated_instructions == ((manager.skills[0], "First instructions."),)
     assert manager.deactivate("same")["location"] == str(winner.resolve())
     assert str(shadowed.resolve()) in listing["diagnostics"][0]
     assert listing["diagnostics"][0].endswith(f"overridden by '{winner.resolve()}'.")

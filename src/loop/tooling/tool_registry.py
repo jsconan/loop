@@ -6,7 +6,7 @@ from typing import Any
 from ..context import ToolContext
 from ..interaction import Interaction
 from ..models import ToolDefinition
-from ..skills import SkillManager
+from ..skills import InstructionsManager
 from .tool import Tool
 from .utils import (
     ToolRegistrationError,
@@ -110,7 +110,7 @@ class ToolRegistry:
         arguments: str,
         *,
         interaction: Interaction | None = None,
-        skill_manager: SkillManager | None = None,
+        instructions_manager: InstructionsManager | None = None,
     ) -> str:
         """Dispatch a synchronous tool call by registered name.
 
@@ -119,7 +119,8 @@ class ToolRegistry:
             arguments (str): JSON-encoded arguments supplied by the model.
             interaction (Interaction | None): Interaction for this invocation. Overrides the
                 registry default.
-            skill_manager (SkillManager | None): Skill manager active for the current conversation.
+            instructions_manager (InstructionsManager | None): Instruction manager active for the
+                current conversation.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -132,7 +133,7 @@ class ToolRegistry:
             return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
         return tool.call(
             arguments,
-            self._context_for(tool, interaction, skill_manager),
+            self._context_for(tool, interaction, instructions_manager),
         )
 
     async def call_async(
@@ -141,7 +142,7 @@ class ToolRegistry:
         arguments: str,
         *,
         interaction: Interaction | None = None,
-        skill_manager: SkillManager | None = None,
+        instructions_manager: InstructionsManager | None = None,
     ) -> str:
         """Dispatch an asynchronous or synchronous tool call by registered name.
 
@@ -150,7 +151,8 @@ class ToolRegistry:
             arguments (str): JSON-encoded arguments supplied by the model.
             interaction (Interaction | None): Interaction for this invocation. Overrides the
                 registry default.
-            skill_manager (SkillManager | None): Skill manager active for the current conversation.
+            instructions_manager (InstructionsManager | None): Instruction manager active for the
+                current conversation.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -163,14 +165,14 @@ class ToolRegistry:
             return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
         return await tool.call_async(
             arguments,
-            self._context_for(tool, interaction, skill_manager),
+            self._context_for(tool, interaction, instructions_manager),
         )
 
     def _context_for(
         self,
         tool: Tool,
         interaction: Interaction | None,
-        skill_manager: SkillManager | None,
+        instructions_manager: InstructionsManager | None,
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""
         if interaction is None:
@@ -180,7 +182,7 @@ class ToolRegistry:
         return ToolContext(
             interaction=interaction,
             tool_name=tool.name,
-            skill_manager=skill_manager,
+            instructions_manager=instructions_manager,
         )
 
 

@@ -15,6 +15,7 @@ __all__ = [
     "find_project_root",
     "format_content_preview",
     "get_current_datetime",
+    "InstructionsManager",
     "Interaction",
     "is_path_ignored",
     "iter_visible_paths",
@@ -99,7 +100,7 @@ from .session import (
     StoredSession,
     UnsupportedConversationItemError,
 )
-from .skills import Skill, SkillManager
+from .skills import InstructionsManager, Skill, SkillManager
 from .tooling import Tool, ToolRegistrationError, ToolRegistry, tool_registry
 from .tools import (
     fetch_content,

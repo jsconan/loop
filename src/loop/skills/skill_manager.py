@@ -75,6 +75,20 @@ class SkillManager:
         return tuple(skill for skill in self._skills if skill.location in self._activated)
 
     @property
+    def activated_instructions(self) -> tuple[tuple[Skill, str], ...]:
+        """Return activated skill bodies in discovery order.
+
+        Returns:
+            tuple[tuple[Skill, str], ...]: Immutable skill and instruction pairs for every
+                activated skill.
+        """
+        return tuple(
+            (skill, self._activated[skill.location])
+            for skill in self._skills
+            if skill.location in self._activated
+        )
+
+    @property
     def count(self) -> int:
         """Return the number of available skills.
 
@@ -144,13 +158,13 @@ class SkillManager:
         }
 
     def activate(self, name: str) -> dict[str, Any]:
-        """Load and return one skill's complete instructions.
+        """Load one skill's complete instructions into managed state.
 
         Args:
             name (str): Exact skill name to activate.
 
         Returns:
-            dict[str, Any]: Activated instructions or a structured missing result.
+            dict[str, Any]: Activation metadata or a structured missing result.
         """
         skill = self._skills_by_name.get(name)
         if skill is None:
@@ -161,7 +175,6 @@ class SkillManager:
         return {
             **self._summary(skill),
             "skill_root": str(skill.location.parent),
-            "instructions": self._activated[skill.location],
             "status": "activated",
         }
 

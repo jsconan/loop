@@ -21,13 +21,14 @@ def manage_skills(
     ] = None,
 ) -> dict:
     """List available skills or activate one skill's instructions on demand."""
-    if context.skill_manager is None:
-        return {"error": "skills_unavailable", "message": "No SkillManager is active."}
+    manager = context.instructions_manager
+    if manager is None:
+        return {"error": "skills_unavailable", "message": "No InstructionsManager is active."}
     if action == "list":
-        return context.skill_manager.list()
+        return manager.list_skills()
     if not name:
         return {
             "error": "missing_skill_name",
             "message": "The activate action requires a skill name.",
         }
-    return context.skill_manager.activate(name)
+    return manager.activate_skill(name)

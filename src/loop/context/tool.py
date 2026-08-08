@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from ..interaction import Interaction
 
 if TYPE_CHECKING:
-    from ..skills import SkillManager
+    from ..skills import InstructionsManager
 
 
 @dataclass(frozen=True)
@@ -16,14 +16,13 @@ class ToolContext:
     Args:
         interaction (Interaction): Service used to communicate with the user.
         tool_name (str): Public name of the tool being invoked.
-        skill_manager (SkillManager | None): Skill manager active for the current conversation,
-            or ``None`` when
-            skills are unavailable.
+        instructions_manager (InstructionsManager | None): Manager for instructions active in the
+            current conversation, or ``None`` when instruction management is unavailable.
     """
 
     interaction: Interaction
     tool_name: str
-    skill_manager: SkillManager | None = None
+    instructions_manager: InstructionsManager | None = None
 
     def confirm(self, message: str, *, default: bool = False) -> bool:
         """Ask the user to confirm an action through the interaction service.

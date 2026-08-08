@@ -9,6 +9,7 @@ import pytest
 from loop import (
     AnswerCompleted,
     AnswerDelta,
+    InstructionsManager,
     Interaction,
     Loop,
     Message,
@@ -16,12 +17,15 @@ from loop import (
     ResponseCompleted,
     Session,
     SessionManager,
+    Skill,
+    SkillManager,
     SQLiteSessionStore,
     ToolCall,
     ToolCallCompleted,
     ToolRegistry,
     ToolResult,
     Usage,
+    manage_skills,
 )
 from loop import tool_registry as default_tool_registry
 
@@ -70,9 +74,9 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.interaction is interaction
     assert loop.working_directory == tmp_path.resolve()
     assert loop.instructions is None
+    assert loop.instructions_manager is not None
     assert loop.session == Session()
     assert loop.model == "requested-model"
-    assert loop.skill_manager is not None
 
     loop.debug = False
     assert loop.debug is False
@@ -201,15 +205,53 @@ def test_loop_prefers_an_explicit_interaction_over_the_manager_interaction():
     assert loop.interaction is interaction
 
 
-def test_loop_loads_project_instructions_once(monkeypatch, tmp_path):
-    """A loop retains instructions loaded for its normalized working directory."""
-    loader = Mock(return_value="project rules")
-    monkeypatch.setattr("loop.loop.load_agents_instructions", loader)
+def test_loop_loads_project_instructions_for_its_normalized_working_directory(tmp_path):
+    """A loop exposes instructions discovered for its normalized working directory."""
+    (tmp_path / "AGENTS.md").write_text("project rules", encoding="utf-8")
 
     loop = Loop(backend=loop_backend(), working_directory=str(tmp_path))
 
     assert loop.instructions == "project rules"
-    loader.assert_called_once_with(tmp_path.resolve())
+
+
+def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_path):
+    """A skill tool result stays compact while its body enters the next backend request."""
+    location = tmp_path / "review" / "SKILL.md"
+    location.parent.mkdir()
+    location.write_text(
+        "---\nname: review\ndescription: Review code.\n---\n\nFollow review instructions.",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry([manage_skills])
+    backend = Mock(tool_registry=registry, default_model="model")
+    backend.get_response.return_value = []
+    manager = SkillManager([Skill("review", "Review code.", location)])
+    instructions_manager = InstructionsManager(skill_manager=manager)
+    loop = Loop(
+        backend=backend,
+        interaction=Mock(spec=Interaction),
+        working_directory=tmp_path,
+        instructions_manager=instructions_manager,
+    )
+    call = ToolCall(
+        call_id="skill-call",
+        name="manage_skills",
+        arguments='{"action":"activate","name":"review"}',
+    )
+    response = Response(
+        answer="",
+        reasoning="",
+        tool_calls=(call,),
+        items=(call,),
+    )
+
+    assert loop.handle_tool_calls(response) is True
+    result = loop.messages[-1]
+    list(loop.query())
+
+    assert isinstance(result, ToolResult)
+    assert "Follow review instructions." not in result.output
+    assert "Follow review instructions." in backend.get_response.call_args.kwargs["instructions"]
 
 
 def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
@@ -301,7 +343,7 @@ def test_handle_tool_calls_uses_local_objects():
         call.name,
         call.arguments,
         interaction=loop.interaction,
-        skill_manager=loop.skill_manager,
+        instructions_manager=loop.instructions_manager,
     )
     assert loop.handle_tool_calls(Response(answer="", reasoning="")) is False
 
