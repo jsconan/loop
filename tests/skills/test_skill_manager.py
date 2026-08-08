@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from loop import SkillManager
+from loop import Skill, SkillManager
 
 
 def write_skill(directory: Path, name: str, description: str, body: str = "Instructions") -> Path:
@@ -87,19 +87,15 @@ def test_counts_and_deactivate_manage_activated_skill_lifecycle(tmp_path):
     assert manager.activate("first")["instructions"] == "New instructions."
 
 
-def test_deactivate_reports_name_errors_and_deactivate_all_clears_every_skill(tmp_path):
-    """Deactivation validates names and bulk deactivation clears cached instructions."""
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    write_skill(first / "same", "same", "First definition.")
-    write_skill(second / "same", "same", "Second definition.")
-    write_skill(first / "unique", "unique", "Unique definition.")
-    manager = SkillManager.discover(tmp_path, [first, second])
+def test_deactivate_reports_unknown_names_and_deactivate_all_clears_every_skill(tmp_path):
+    """Deactivation rejects unknown names and bulk deactivation clears cached instructions."""
+    skills_directory = tmp_path / "skills"
+    write_skill(skills_directory / "unique", "unique", "Unique definition.")
+    manager = SkillManager.discover(tmp_path, [skills_directory])
 
     manager.activate("unique")
 
     assert manager.deactivate("missing")["error"] == "unknown_skill"
-    assert manager.deactivate("same")["error"] == "ambiguous_skill"
     assert manager.deactivate("unique")["status"] == "deactivated"
     assert manager.deactivate("unique")["status"] == "deactivated"
 
@@ -147,37 +143,69 @@ def test_discovery_reports_each_invalid_frontmatter_shape(tmp_path, content, mes
     assert message in manager.diagnostics[0]
 
 
-def test_default_discovery_orders_project_scopes_before_user_skills(tmp_path, monkeypatch):
-    """Default discovery searches every project scope from root to working directory, then home."""
+def test_default_discovery_prefers_the_closest_project_scope_then_user_skills(
+    tmp_path, monkeypatch
+):
+    """Default discovery gives closer project scopes precedence over broader and user scopes."""
     project = tmp_path / "project"
     working_directory = project / "packages" / "app"
     home = tmp_path / "home"
     working_directory.mkdir(parents=True)
     (project / ".git").mkdir()
-    write_skill(project / ".agents" / "skills" / "root", "root", "Root skill.")
-    write_skill(working_directory / ".agents" / "skills" / "local", "local", "Local skill.")
+    root = write_skill(project / ".agents" / "skills" / "root", "root", "Root skill.")
+    local = write_skill(
+        working_directory / ".agents" / "skills" / "local", "local", "Local skill."
+    )
     write_skill(home / ".agents" / "skills" / "user", "user", "User skill.")
+    write_skill(project / ".agents" / "skills" / "shared", "shared", "Root definition.")
+    winner = write_skill(
+        working_directory / ".agents" / "skills" / "shared", "shared", "Local definition."
+    )
+    shadowed = write_skill(
+        home / ".agents" / "skills" / "shared", "shared", "User definition."
+    )
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
     manager = SkillManager.discover(working_directory)
 
-    assert [skill.name for skill in manager.skills] == ["root", "local", "user"]
+    assert [skill.name for skill in manager.skills] == ["local", "shared", "root", "user"]
+    assert manager.activate("shared")["location"] == str(winner.resolve())
+    assert any(str(shadowed.resolve()) in diagnostic for diagnostic in manager.diagnostics)
+    assert all(str(local.resolve()) not in diagnostic for diagnostic in manager.diagnostics)
+    assert all(str(root.resolve()) not in diagnostic for diagnostic in manager.diagnostics)
 
 
-def test_list_activation_errors_and_duplicate_names_are_structured(tmp_path):
-    """The manager lists metadata and reports unknown or ambiguous activation requests."""
+def test_explicit_directory_order_resolves_duplicate_names_and_reports_shadowing(tmp_path):
+    """The first explicit directory wins while shadowed definitions remain diagnosable."""
     first = tmp_path / "first"
     second = tmp_path / "second"
-    write_skill(first / "same", "same", "First definition.")
-    write_skill(second / "same", "same", "Second definition.")
+    winner = write_skill(first / "same", "same", "First definition.", "First instructions.")
+    shadowed = write_skill(second / "same", "same", "Second definition.")
     manager = SkillManager.discover(tmp_path, [first, second])
 
     listing = manager.list()
 
-    assert len(listing["skills"]) == 2
+    assert len(listing["skills"]) == 1
     assert not listing["skills"][0]["activated"]
     assert manager.activate("missing")["error"] == "unknown_skill"
-    assert manager.activate("same")["error"] == "ambiguous_skill"
+    assert manager.activate("same")["instructions"] == "First instructions."
+    assert manager.deactivate("same")["location"] == str(winner.resolve())
+    assert str(shadowed.resolve()) in listing["diagnostics"][0]
+    assert listing["diagnostics"][0].endswith(f"overridden by '{winner.resolve()}'.")
+    assert manager.catalog().count("<name>same</name>") == 1
+
+
+def test_constructor_enforces_unique_names_in_input_order(tmp_path):
+    """Directly injected skills use the same first-definition-wins invariant."""
+    first = Skill("same", "First definition.", tmp_path / "first" / "SKILL.md")
+    second = Skill("same", "Second definition.", tmp_path / "second" / "SKILL.md")
+
+    manager = SkillManager([first, second], ["Existing diagnostic."])
+
+    assert manager.skills == (first,)
+    assert manager.count == 1
+    assert manager.diagnostics[0] == "Existing diagnostic."
+    assert str(second.location) in manager.diagnostics[1]
 
 
 @pytest.mark.parametrize(

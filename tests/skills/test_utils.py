@@ -6,15 +6,15 @@ import pytest
 
 from loop.skills import (
     build_instructions,
-    instruction_directories,
+    default_skill_directories,
     load_agents_instructions,
     read_instruction_body,
     read_instruction_frontmatter,
 )
 
 
-def test_instruction_directories_orders_project_scopes_before_user_directory(tmp_path, monkeypatch):
-    """Instruction directories follow project scope order and end with the user scope."""
+def test_default_skill_directories_order_scopes_by_precedence(tmp_path, monkeypatch):
+    """Default skill directories start with the closest project scope and end with user scope."""
     project = tmp_path / "project"
     working_directory = project / "packages" / "app"
     home = tmp_path / "home"
@@ -22,20 +22,22 @@ def test_instruction_directories_orders_project_scopes_before_user_directory(tmp
     (project / ".git").mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
-    assert instruction_directories(working_directory) == [
-        project / ".agents/skills",
-        project / "packages/.agents/skills",
+    assert default_skill_directories(working_directory) == [
         working_directory / ".agents/skills",
+        project / "packages/.agents/skills",
+        project / ".agents/skills",
         home / ".agents/skills",
     ]
 
 
-def test_instruction_directories_uses_local_and_user_scopes_without_project(tmp_path, monkeypatch):
+def test_default_skill_directories_uses_local_and_user_scopes_outside_project(
+    tmp_path, monkeypatch
+):
     """A directory outside a project contributes only its local and user scopes."""
     home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
-    assert instruction_directories(tmp_path, Path("instructions")) == [
+    assert default_skill_directories(tmp_path, Path("instructions")) == [
         tmp_path / "instructions",
         home / "instructions",
     ]

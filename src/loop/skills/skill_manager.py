@@ -7,21 +7,23 @@ from typing import Any, Self
 import yaml
 
 from .skill import Skill
-from .utils import instruction_directories, read_instruction_body, read_instruction_frontmatter
+from .utils import default_skill_directories, read_instruction_body, read_instruction_frontmatter
 
 MAX_CATALOG_CHARS = 8_000
 
 
 class SkillManager:
-    """Discover skill metadata and load complete instructions on activation.
+    """Discover unique skill metadata and load complete instructions on activation.
 
     Args:
-        skills (list[Skill] | None): Discovered skill metadata. Defaults to an empty list.
+        skills (list[Skill] | None): Skill metadata in descending precedence order. The first
+            definition of each name wins. Defaults to an empty list.
         diagnostics (list[str] | None): Non-fatal discovery errors suitable for inspection.
             Defaults to an empty list.
     """
 
     _skills: list[Skill]
+    _skills_by_name: dict[str, Skill]
     _diagnostics: list[str]
     _activated: dict[Path, str]
 
@@ -30,8 +32,19 @@ class SkillManager:
         skills: list[Skill] | None = None,
         diagnostics: list[str] | None = None,
     ) -> None:
-        self._skills = skills or []
-        self._diagnostics = diagnostics or []
+        self._skills = []
+        self._skills_by_name = {}
+        self._diagnostics = list(diagnostics or [])
+        for skill in skills or []:
+            winner = self._skills_by_name.get(skill.name)
+            if winner is not None:
+                self._diagnostics.append(
+                    f"Ignored '{skill.location}': skill '{skill.name}' "
+                    f"is overridden by '{winner.location}'."
+                )
+                continue
+            self._skills.append(skill)
+            self._skills_by_name[skill.name] = skill
         self._activated = {}
 
     @property
@@ -89,18 +102,18 @@ class SkillManager:
 
         Args:
             working_directory (Path | str): Directory whose repository-scoped skills should apply.
-            skill_directories (list[Path] | None): Explicit skill roots. When omitted, repository
-                and user roots from the Agent Skills convention are searched.
+            skill_directories (list[Path] | None): Explicit skill roots in descending precedence
+                order. When omitted, repository scopes are searched from the working directory
+                outward, followed by the user root from the Agent Skills convention.
 
         Returns:
             SkillManager: A manager containing valid skill metadata and discovery diagnostics.
         """
         working_directory = Path(working_directory).resolve()
-        directories = (
-            skill_directories
-            if skill_directories is not None
-            else instruction_directories(working_directory)
-        )
+        if skill_directories is not None:
+            directories = skill_directories
+        else:
+            directories = default_skill_directories(working_directory)
         skills = []
         diagnostics = []
 
@@ -137,19 +150,11 @@ class SkillManager:
             name (str): Exact skill name to activate.
 
         Returns:
-            dict[str, Any]: Activated instructions, or a structured missing or ambiguous result.
+            dict[str, Any]: Activated instructions or a structured missing result.
         """
-        matches = [skill for skill in self._skills if skill.name == name]
-        if not matches:
+        skill = self._skills_by_name.get(name)
+        if skill is None:
             return {"error": "unknown_skill", "message": f"Skill '{name}' is not available."}
-        if len(matches) > 1:
-            return {
-                "error": "ambiguous_skill",
-                "message": f"Skill '{name}' is declared in more than one location.",
-                "locations": [str(skill.location) for skill in matches],
-            }
-
-        skill = matches[0]
         if skill.location not in self._activated:
             content = skill.location.read_text(encoding="utf-8")
             self._activated[skill.location] = read_instruction_body(content, skill.location.name)
@@ -167,19 +172,11 @@ class SkillManager:
             name (str): Exact skill name to deactivate.
 
         Returns:
-            dict[str, Any]: Deactivated skill metadata, or a structured missing or ambiguous result.
+            dict[str, Any]: Deactivated skill metadata or a structured missing result.
         """
-        matches = [skill for skill in self._skills if skill.name == name]
-        if not matches:
+        skill = self._skills_by_name.get(name)
+        if skill is None:
             return {"error": "unknown_skill", "message": f"Skill '{name}' is not available."}
-        if len(matches) > 1:
-            return {
-                "error": "ambiguous_skill",
-                "message": f"Skill '{name}' is declared in more than one location.",
-                "locations": [str(skill.location) for skill in matches],
-            }
-
-        skill = matches[0]
         self._activated.pop(skill.location, None)
         return {**self._summary(skill), "status": "deactivated"}
 

@@ -13,18 +13,18 @@ DEFAULT_AGENTS_FILENAME = "AGENTS.md"
 DEFAULT_SKILLS_DIRECTORY = Path(".agents/skills")
 
 
-def instruction_directories(
+def default_skill_directories(
     working_directory: Path,
     relative_directory: Path = DEFAULT_SKILLS_DIRECTORY,
 ) -> list[Path]:
-    """Return project instruction directories in scope order, followed by the user directory.
+    """Return default skill directories in descending precedence order.
 
     Args:
         working_directory (Path): Directory whose repository-scoped instructions should apply.
         relative_directory (Path): Instruction directory relative to each project and user scope.
 
     Returns:
-        list[Path]: Project directories from the repository root through ``working_directory``,
+        list[Path]: Project directories from ``working_directory`` through the repository root,
             followed by the directory in the user's home. Outside a repository, only the
             working-directory and user scopes are returned.
     """
@@ -39,7 +39,7 @@ def instruction_directories(
             if directory == project_root:
                 break
             directory = directory.parent
-        directories = list(reversed(scoped))
+        directories = scoped
     directories.append(Path.home() / relative_directory)
     return directories
 
