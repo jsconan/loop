@@ -12,15 +12,17 @@ from ..tooling import tool_registry
 def manage_skills(
     context: ToolContext,
     action: Annotated[
-        Literal["list", "activate"],
-        Field(description="Whether to list available skills or activate one skill."),
+        Literal["list", "activate", "deactivate"],
+        Field(description="Whether to list, activate, or deactivate skills."),
     ],
     name: Annotated[
         str | None,
-        Field(description="Exact skill name for activation; null when listing skills."),
+        Field(
+            description="Exact skill name for activation or deactivation; null when listing."
+        ),
     ] = None,
 ) -> dict:
-    """List available skills or activate one skill's instructions on demand."""
+    """List, activate, or deactivate skill instructions on demand."""
     manager = context.instructions_manager
     if manager is None:
         return {"error": "skills_unavailable", "message": "No InstructionsManager is active."}
@@ -29,6 +31,8 @@ def manage_skills(
     if not name:
         return {
             "error": "missing_skill_name",
-            "message": "The activate action requires a skill name.",
+            "message": f"The {action} action requires a skill name.",
         }
-    return manager.activate_skill(name)
+    if action == "activate":
+        return manager.activate_skill(name)
+    return manager.deactivate_skill(name)

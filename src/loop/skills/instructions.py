@@ -157,7 +157,13 @@ class InstructionsManager:
         Returns:
             dict[str, Any]: Compact deactivation acknowledgement or structured error.
         """
-        return self._skill_manager.deactivate(name)
+        previously_active = any(
+            skill.name == name for skill in self._skill_manager.activated_skills
+        )
+        result = self._skill_manager.deactivate(name)
+        if "error" not in result:
+            result["instructions_updated"] = previously_active
+        return result
 
     def _active_skill_instructions(self) -> str | None:
         """Render active skill bodies in deterministic discovery order."""

@@ -94,17 +94,21 @@ def test_activation_rolls_back_when_complete_instructions_exceed_budget(tmp_path
     assert skill_manager.activated == 0
 
 
-def test_deactivation_removes_skill_instructions_and_reports_unknown_names(tmp_path):
-    """Deactivation updates the rendered document and preserves structured missing errors."""
+def test_deactivation_is_idempotent_and_unknown_skills_remain_errors(tmp_path):
+    """Deactivation reports changes while missing skills do not alter instructions."""
     skill = write_skill(tmp_path / "example", "example")
     manager = InstructionsManager(skill_manager=SkillManager([skill]))
     manager.activate_skill("example")
 
     result = manager.deactivate_skill("example")
+    instructions = manager.instructions
+    repeated = manager.deactivate_skill("example")
     missing = manager.deactivate_skill("missing")
 
     assert result["status"] == "deactivated"
-    instructions = manager.instructions
+    assert result["instructions_updated"] is True
+    assert repeated["instructions_updated"] is False
     assert isinstance(instructions, str)
     assert "Follow the workflow." not in instructions
+    assert manager.instructions == instructions
     assert missing["error"] == "unknown_skill"

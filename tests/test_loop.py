@@ -1,5 +1,6 @@
 """Tests for normalized response handling and conversation orchestration."""
 
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -252,6 +253,43 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
     assert isinstance(result, ToolResult)
     assert "Follow review instructions." not in result.output
     assert "Follow review instructions." in backend.get_response.call_args.kwargs["instructions"]
+
+
+def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_path):
+    """Deactivation removes a skill body from the next backend request."""
+    location = tmp_path / "review" / "SKILL.md"
+    location.parent.mkdir()
+    location.write_text(
+        "---\nname: review\ndescription: Review code.\n---\n\nFollow review instructions.",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry([manage_skills])
+    backend = Mock(tool_registry=registry, default_model="model")
+    backend.get_response.return_value = []
+    manager = SkillManager([Skill("review", "Review code.", location)])
+    instructions_manager = InstructionsManager(skill_manager=manager)
+    instructions_manager.activate_skill("review")
+    loop = Loop(
+        backend=backend,
+        interaction=Mock(spec=Interaction),
+        working_directory=tmp_path,
+        instructions_manager=instructions_manager,
+    )
+    call = ToolCall(
+        call_id="skill-call",
+        name="manage_skills",
+        arguments='{"action":"deactivate","name":"review"}',
+    )
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+
+    assert loop.handle_tool_calls(response) is True
+    result = loop.messages[-1]
+    list(loop.query())
+
+    assert isinstance(result, ToolResult)
+    assert json.loads(result.output)["instructions_updated"] is True
+    updated_instructions = backend.get_response.call_args.kwargs["instructions"]
+    assert "Follow review instructions." not in updated_instructions
 
 
 def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):

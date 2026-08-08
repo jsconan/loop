@@ -210,7 +210,7 @@ class SkillManager:
             return None
         header = (
             "<available_skills>\n"
-            'Use the manage_skills tool with action="activate" before following a skill.\n'
+            "Use manage_skills to activate before use and deactivate when no longer needed.\n"
         )
         footer = "</available_skills>"
         entries = []
