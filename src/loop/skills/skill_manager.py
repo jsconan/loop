@@ -2,7 +2,7 @@
 
 from html import escape
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import yaml
 
@@ -21,6 +21,10 @@ class SkillManager:
             Defaults to an empty list.
     """
 
+    _skills: list[Skill]
+    _diagnostics: list[str]
+    _activated: dict[Path, str]
+
     def __init__(
         self,
         skills: list[Skill] | None = None,
@@ -28,7 +32,7 @@ class SkillManager:
     ) -> None:
         self._skills = skills or []
         self._diagnostics = diagnostics or []
-        self._activated: dict[Path, str] = {}
+        self._activated = {}
 
     @property
     def skills(self) -> tuple[Skill, ...]:
@@ -48,12 +52,21 @@ class SkillManager:
         """
         return tuple(self._diagnostics)
 
+    @property
+    def activated_skills(self) -> tuple[Skill, ...]:
+        """Return activated skills in discovery order.
+
+        Returns:
+            tuple[Skill, ...]: An immutable snapshot of the activated skills.
+        """
+        return tuple(skill for skill in self._skills if skill.location in self._activated)
+
     @classmethod
     def discover(
         cls,
         working_directory: Path | str,
         skill_directories: list[Path] | None = None,
-    ) -> "SkillManager":
+    ) -> Self:
         """Discover available skills while reading only their YAML metadata.
 
         Args:

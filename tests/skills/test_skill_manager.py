@@ -49,6 +49,21 @@ def test_discovery_reads_metadata_and_activation_lazily_loads_and_caches_body(
     assert reads == [location.resolve()]
 
 
+def test_activated_skills_returns_immutable_discovery_ordered_snapshot(tmp_path):
+    """Activated skills are returned as an immutable snapshot in discovery order."""
+    skills_directory = tmp_path / "skills"
+    write_skill(skills_directory / "first", "first", "First skill.")
+    write_skill(skills_directory / "second", "second", "Second skill.")
+    manager = SkillManager.discover(tmp_path, [skills_directory])
+
+    assert manager.activated_skills == ()
+
+    manager.activate("second")
+    manager.activate("first")
+
+    assert tuple(skill.name for skill in manager.activated_skills) == ("first", "second")
+
+
 def test_discovery_skips_invalid_skills_and_reports_diagnostics(tmp_path):
     """Malformed metadata does not prevent valid skills from loading."""
     skills_directory = tmp_path / "skills"
