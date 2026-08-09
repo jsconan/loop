@@ -6,10 +6,12 @@ __all__ = [
     "is_path_ignored",
     "iter_visible_paths",
     "register_shutdown_signals",
+    "sha256_digest",
     "ShutdownRequested",
 ]
 
 
+from .hashing import sha256_digest
 from .path import find_project_root, is_path_ignored, iter_visible_paths
 from .signals import ShutdownRequested, register_shutdown_signals
 from .text import format_content_preview

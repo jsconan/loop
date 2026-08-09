@@ -2,13 +2,13 @@
 
 from base64 import b64encode
 from collections.abc import Iterable
-from hashlib import sha256
 from html import escape
 from pathlib import Path
 from typing import Any, Self
 
 import yaml
 
+from ..utils import sha256_digest
 from .skill import Skill
 from .utils import (
     DEFAULT_SKILL_FILENAME,
@@ -196,7 +196,7 @@ class SkillManager:
         for path in paths:
             try:
                 stat = path.stat()
-                digest = sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+                digest = sha256_digest(path.read_bytes()) if path.is_file() else None
                 fingerprints.append(
                     (str(path.resolve()), stat.st_ino, stat.st_mtime_ns, stat.st_size, digest)
                 )

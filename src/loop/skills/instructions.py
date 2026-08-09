@@ -2,12 +2,12 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from hashlib import sha256
 from html import escape
 from pathlib import Path
 from threading import RLock
 from typing import Any, Self
 
+from ..utils import sha256_digest
 from .skill_manager import SkillManager
 from .utils import (
     DEFAULT_AGENTS_FILENAME,
@@ -52,7 +52,7 @@ class InstructionSection:
         Returns:
             str: SHA-256 hexadecimal digest.
         """
-        return sha256(self.content.encode("utf-8")).hexdigest()
+        return sha256_digest(self.content)
 
 
 class InstructionsManager:
@@ -236,7 +236,7 @@ class InstructionsManager:
             ],
             "size_bytes": self._encoded_size(self._instructions),
             "max_bytes": self._max_bytes,
-            "digest": sha256((self._instructions or "").encode("utf-8")).hexdigest(),
+            "digest": sha256_digest(self._instructions or ""),
             "sections": [
                 {
                     "kind": section.kind,
@@ -538,7 +538,7 @@ class InstructionsManager:
         for path in paths:
             try:
                 stat = path.stat()
-                digest = sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+                digest = sha256_digest(path.read_bytes()) if path.is_file() else None
                 fingerprints.append(
                     (str(path.resolve()), stat.st_ino, stat.st_mtime_ns, stat.st_size, digest)
                 )
