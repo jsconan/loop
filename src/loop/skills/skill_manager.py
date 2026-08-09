@@ -1,5 +1,6 @@
 """Discover and progressively load Agent Skills."""
 
+from base64 import b64encode
 from html import escape
 from pathlib import Path
 from typing import Any, Self
@@ -7,9 +8,16 @@ from typing import Any, Self
 import yaml
 
 from .skill import Skill
-from .utils import default_skill_directories, read_instruction_body, read_instruction_frontmatter
+from .utils import (
+    DEFAULT_SKILL_FILENAME,
+    get_skill_directories,
+    read_instruction_body,
+    read_instruction_frontmatter,
+)
 
 MAX_CATALOG_CHARS = 8_000
+MAX_RESOURCE_BYTES = 64 * 1024
+RESOURCE_DIRECTORIES = ("references", "scripts", "assets")
 
 
 class SkillManager:
@@ -127,14 +135,14 @@ class SkillManager:
         if skill_directories is not None:
             directories = skill_directories
         else:
-            directories = default_skill_directories(working_directory)
+            directories = get_skill_directories(working_directory)
         skills = []
         diagnostics = []
 
         for directory in directories:
             if not directory.is_dir():
                 continue
-            for location in sorted(directory.glob("*/SKILL.md")):
+            for location in sorted(directory.glob(f"*/{DEFAULT_SKILL_FILENAME}")):
                 try:
                     location = location.resolve()
                     metadata = read_instruction_frontmatter(
@@ -197,6 +205,78 @@ class SkillManager:
         """Deactivate all skills and release their instructions."""
         self._activated.clear()
 
+    def list_resources(self, name: str) -> dict[str, Any]:
+        """List bounded on-demand resources belonging to an active skill.
+
+        Args:
+            name (str): Exact active skill name.
+
+        Returns:
+            dict[str, Any]: Resource paths and sizes, or a structured error.
+        """
+        skill = self._skills_by_name.get(name)
+        if skill is None:
+            return {"error": "unknown_skill", "message": f"Skill '{name}' is not available."}
+        if skill.location not in self._activated:
+            return {
+                "error": "skill_not_active",
+                "message": f"Skill '{name}' must be activated before loading its resources.",
+            }
+        root = skill.location.parent.resolve()
+        resources = []
+        for directory_name in RESOURCE_DIRECTORIES:
+            directory = root / directory_name
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.rglob("*")):
+                resolved = path.resolve()
+                if path.is_file() and resolved.is_relative_to(root):
+                    resources.append(
+                        {"path": str(resolved.relative_to(root)), "size_bytes": path.stat().st_size}
+                    )
+        return {"name": name, "skill_root": str(root), "resources": resources}
+
+    def read_resource(self, name: str, resource_path: str) -> dict[str, Any]:
+        """Read one active skill resource without adding it to persistent instructions.
+
+        Args:
+            name (str): Exact active skill name.
+            resource_path (str): Relative path beneath references, scripts, or assets.
+
+        Returns:
+            dict[str, Any]: Text or base64 resource content, or a structured error.
+        """
+        listed = self.list_resources(name)
+        if "error" in listed:
+            return listed
+        root = Path(listed["skill_root"])
+        candidate = (root / resource_path).resolve()
+        allowed = any(
+            candidate.is_relative_to(root / directory) for directory in RESOURCE_DIRECTORIES
+        )
+        if not allowed or not candidate.is_file():
+            return {
+                "error": "invalid_skill_resource",
+                "message": "Resource must be a file beneath references, scripts, or assets.",
+            }
+        content = candidate.read_bytes()
+        if len(content) > MAX_RESOURCE_BYTES:
+            return {
+                "error": "skill_resource_too_large",
+                "message": f"Resource exceeds the {MAX_RESOURCE_BYTES}-byte loading limit.",
+                "size_bytes": len(content),
+            }
+        result = {
+            "name": name,
+            "path": str(candidate.relative_to(root)),
+            "size_bytes": len(content),
+        }
+        try:
+            result.update({"encoding": "utf-8", "content": content.decode("utf-8")})
+        except UnicodeDecodeError:
+            result.update({"encoding": "base64", "content": b64encode(content).decode("ascii")})
+        return result
+
     def catalog(self, max_chars: int = MAX_CATALOG_CHARS) -> str | None:
         """Format a bounded metadata-only catalog for the model's initial instructions.
 
@@ -221,7 +301,6 @@ class SkillManager:
                 "<skill>\n"
                 f"<name>{escape(skill.name)}</name>\n"
                 f"<description>{escape(skill.description)}</description>\n"
-                f"<location>{escape(str(skill.location))}</location>\n"
                 "</skill>\n"
             )
             if used + len(entry) > max_chars:

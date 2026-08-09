@@ -1,6 +1,7 @@
 """Expose the public loop package interface."""
 
 __all__ = [
+    "AgentInstructionsSource",
     "AnswerCompleted",
     "AnswerDelta",
     "Backend",
@@ -15,11 +16,13 @@ __all__ = [
     "find_project_root",
     "format_content_preview",
     "get_current_datetime",
+    "InstructionSection",
     "InstructionsManager",
     "Interaction",
     "is_path_ignored",
     "iter_visible_paths",
     "list_folder",
+    "LoadedAgentInstructions",
     "Loop",
     "manage_skills",
     "MemorySessionStore",
@@ -100,7 +103,14 @@ from .session import (
     StoredSession,
     UnsupportedConversationItemError,
 )
-from .skills import InstructionsManager, Skill, SkillManager
+from .skills import (
+    AgentInstructionsSource,
+    InstructionSection,
+    InstructionsManager,
+    LoadedAgentInstructions,
+    Skill,
+    SkillManager,
+)
 from .tooling import Tool, ToolRegistrationError, ToolRegistry, tool_registry
 from .tools import (
     fetch_content,

@@ -114,6 +114,61 @@ def test_deactivate_reports_unknown_names_and_deactivate_all_clears_every_skill(
     assert manager.activated_skills == ()
 
 
+def test_resources_are_listed_and_loaded_only_for_active_skills(tmp_path):
+    """References, scripts, and assets load on demand without entering skill instructions."""
+    skill_root = tmp_path / "skills" / "resourceful"
+    write_skill(skill_root, "resourceful", "Uses resources.")
+    reference = skill_root / "references" / "guide.md"
+    script = skill_root / "scripts" / "run.py"
+    asset = skill_root / "assets" / "image.bin"
+    reference.parent.mkdir()
+    script.parent.mkdir()
+    asset.parent.mkdir()
+    reference.write_text("Detailed guide.", encoding="utf-8")
+    script.write_text("print('ok')", encoding="utf-8")
+    asset.write_bytes(b"\xff\x00")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("Outside.", encoding="utf-8")
+    (reference.parent / "outside.txt").symlink_to(outside)
+    manager = SkillManager.discover(tmp_path, [tmp_path / "skills"])
+
+    assert manager.list_resources("missing")["error"] == "unknown_skill"
+    assert manager.list_resources("resourceful")["error"] == "skill_not_active"
+    manager.activate("resourceful")
+
+    listed = manager.list_resources("resourceful")
+    assert [resource["path"] for resource in listed["resources"]] == [
+        "references/guide.md",
+        "scripts/run.py",
+        "assets/image.bin",
+    ]
+    text = manager.read_resource("resourceful", "references/guide.md")
+    binary = manager.read_resource("resourceful", "assets/image.bin")
+    assert text["content"] == "Detailed guide."
+    assert text["encoding"] == "utf-8"
+    assert binary["content"] == "/wA="
+    assert binary["encoding"] == "base64"
+    assert "Detailed guide." not in manager.activated_instructions[0][1]
+
+
+def test_resource_loading_rejects_escapes_missing_files_and_oversized_content(tmp_path):
+    """Resource loading confines paths and applies an independent hard size ceiling."""
+    skill_root = tmp_path / "skills" / "safe"
+    write_skill(skill_root, "safe", "Safe resources.")
+    assets = skill_root / "assets"
+    assets.mkdir()
+    (assets / "large.bin").write_bytes(b"x" * (64 * 1024 + 1))
+    manager = SkillManager.discover(tmp_path, [tmp_path / "skills"])
+    manager.activate("safe")
+
+    assert manager.read_resource("missing", "assets/a")["error"] == "unknown_skill"
+    assert manager.read_resource("safe", "../SKILL.md")["error"] == "invalid_skill_resource"
+    assert manager.read_resource("safe", "assets/missing")["error"] == "invalid_skill_resource"
+    oversized = manager.read_resource("safe", "assets/large.bin")
+    assert oversized["error"] == "skill_resource_too_large"
+    assert oversized["size_bytes"] == 64 * 1024 + 1
+
+
 def test_discovery_skips_invalid_skills_and_reports_diagnostics(tmp_path):
     """Malformed metadata does not prevent valid skills from loading."""
     skills_directory = tmp_path / "skills"
@@ -232,7 +287,7 @@ def test_activation_reports_skill_files_that_become_malformed(tmp_path, replacem
 
 
 def test_catalog_is_metadata_only_escaped_and_bounded(tmp_path):
-    """Catalog output is safe structured text that honors its character ceiling."""
+    """Catalog output contains only bounded escaped discovery metadata."""
     skills_directory = tmp_path / "skills"
     write_skill(skills_directory / "one", "one", "Use for <special> work.")
     write_skill(skills_directory / "two", "two", "Use for other work.")
@@ -243,6 +298,8 @@ def test_catalog_is_metadata_only_escaped_and_bounded(tmp_path):
     assert len(catalog) <= 600
     assert "&lt;special&gt;" in catalog
     assert "Instructions" not in catalog
+    assert str(skills_directory) not in catalog
+    assert "<location>" not in catalog
 
 
 def test_catalog_returns_none_without_skills_and_warns_when_entries_are_omitted(tmp_path):

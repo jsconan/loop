@@ -1,21 +1,59 @@
 """Compose the developer instructions used for backend requests."""
 
 from collections.abc import Iterable
+from dataclasses import dataclass
+from hashlib import sha256
 from html import escape
 from pathlib import Path
 from threading import RLock
 from typing import Any, Self
 
-from ..utils import find_project_root
 from .skill_manager import SkillManager
 from .utils import (
     DEFAULT_AGENTS_FILENAME,
+    DEFAULT_SKILL_FILENAME,
+    AgentInstructionsSource,
+    LoadedAgentInstructions,
     build_instructions,
-    default_skill_directories,
+    get_agents_files,
+    get_skill_directories,
     load_agents_instructions,
 )
 
 MAX_INSTRUCTIONS_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class InstructionSection:
+    """Describe one logical section of the composed instruction document.
+
+    Args:
+        kind (str): Stable section category.
+        content (str): Exact rendered section content.
+        source (str | None): Canonical source path or logical producer.
+    """
+
+    kind: str
+    content: str
+    source: str | None = None
+
+    @property
+    def size_bytes(self) -> int:
+        """Return the section's UTF-8 size.
+
+        Returns:
+            int: Encoded section size in bytes.
+        """
+        return len(self.content.encode("utf-8"))
+
+    @property
+    def digest(self) -> str:
+        """Return a stable content digest suitable for cache diagnostics.
+
+        Returns:
+            str: SHA-256 hexadecimal digest.
+        """
+        return sha256(self.content.encode("utf-8")).hexdigest()
 
 
 class InstructionsManager:
@@ -44,8 +82,10 @@ class InstructionsManager:
     _signature: tuple
     _instructions: str | None
     _refresh_diagnostics: list[str]
+    _project_sources: tuple[AgentInstructionsSource, ...]
     _skill_discovery_enabled: bool
     _lock: RLock
+    _refresh_changes: list[str]
 
     def __init__(
         self,
@@ -67,8 +107,10 @@ class InstructionsManager:
         self._generation = 0
         self._signature = self._discovery_signature(self._working_directory)
         self._refresh_diagnostics = []
+        self._project_sources = ()
         self._skill_discovery_enabled = False
         self._lock = RLock()
+        self._refresh_changes = []
         self._instructions = self._build_instructions()
         if self._encoded_size(self._instructions) > self._max_bytes:
             raise ValueError("Initial instructions exceed the configured instruction limit.")
@@ -98,13 +140,16 @@ class InstructionsManager:
             ValueError: The configured limit is invalid or initial instructions exceed it.
         """
         directory = Path(working_directory).resolve()
+        loaded = load_agents_instructions(directory)
         manager = cls(
-            load_agents_instructions(directory),
+            loaded.content,
             skill_manager or SkillManager.discover(directory),
             max_bytes=max_bytes,
             working_directory=directory,
         )
         manager._skill_discovery_enabled = skill_manager is None
+        manager._project_sources = loaded.sources
+        manager._refresh_diagnostics = manager._load_diagnostics(loaded)
         return manager
 
     @property
@@ -169,6 +214,7 @@ class InstructionsManager:
             dict[str, Any]: Model-readable skill summaries and diagnostics.
         """
         result = self._skill_manager.list()
+        sections = self._instruction_sections()
         result["instruction_context"] = {
             "working_directory": (
                 str(self._working_directory) if self._working_directory is not None else None
@@ -176,6 +222,28 @@ class InstructionsManager:
             "generation": self._generation,
             "dirty": self._dirty,
             "diagnostics": list(self._refresh_diagnostics),
+            "refresh_changes": list(self._refresh_changes),
+            "sources": [
+                {
+                    "path": str(source.path),
+                    "size_bytes": source.size_bytes,
+                    "included_bytes": source.included_bytes,
+                    "truncated": source.truncated,
+                }
+                for source in self._project_sources
+            ],
+            "size_bytes": self._encoded_size(self._instructions),
+            "max_bytes": self._max_bytes,
+            "digest": sha256((self._instructions or "").encode("utf-8")).hexdigest(),
+            "sections": [
+                {
+                    "kind": section.kind,
+                    "source": section.source,
+                    "size_bytes": section.size_bytes,
+                    "digest": section.digest,
+                }
+                for section in sections
+            ],
         }
         return result
 
@@ -202,6 +270,10 @@ class InstructionsManager:
             )
             if skill is not None:
                 results.append(self.activate_skill(name))
+            else:
+                self._refresh_diagnostics.append(
+                    f"Could not restore '{name}': its definition was removed or shadowed."
+                )
         return results
 
     def observe_path(self, path: Path | str, *, directory: bool = False) -> None:
@@ -227,7 +299,10 @@ class InstructionsManager:
             path (Path | str | None): Changed source path, or ``None`` for unconditional
                 invalidation. Unrelated paths are ignored when their names cannot affect discovery.
         """
-        if path is not None and Path(path).name not in {DEFAULT_AGENTS_FILENAME, "SKILL.md"}:
+        if path is not None and Path(path).name not in {
+            DEFAULT_AGENTS_FILENAME,
+            DEFAULT_SKILL_FILENAME,
+        }:
             return
         with self._lock:
             if self._working_directory is not None:
@@ -281,7 +356,7 @@ class InstructionsManager:
                 self._skill_manager.deactivate(name)
                 return {
                     "error": "instruction_budget_exceeded",
-                    "message": f"Activating skill '{name}' exceeds the instruction limit.",
+                    "message": f"Activating skill '{name}' exceeds the instruction budget.",
                     "max_bytes": self._max_bytes,
                     "required_bytes": size,
                 }
@@ -314,6 +389,52 @@ class InstructionsManager:
                     self._generation += 1
             return result
 
+    def deactivate_all_skills(self) -> dict[str, Any]:
+        """Deactivate every active skill and rebuild subsequent instructions.
+
+        Returns:
+            dict[str, Any]: Compact acknowledgement with the number of deactivated skills.
+        """
+        with self._lock:
+            self.prepare()
+            count = self._skill_manager.activated
+            self._skill_manager.deactivate_all()
+            if count:
+                self._instructions = self._build_instructions()
+                self._generation += 1
+            return {
+                "status": "deactivated_all",
+                "deactivated": count,
+                "instructions_updated": bool(count),
+            }
+
+    def list_skill_resources(self, name: str) -> dict[str, Any]:
+        """List resources available to one active skill.
+
+        Args:
+            name (str): Exact active skill name.
+
+        Returns:
+            dict[str, Any]: Bounded resource metadata or a structured error.
+        """
+        with self._lock:
+            self.prepare()
+            return self._skill_manager.list_resources(name)
+
+    def read_skill_resource(self, name: str, resource_path: str) -> dict[str, Any]:
+        """Read one active skill resource on demand.
+
+        Args:
+            name (str): Exact active skill name.
+            resource_path (str): Relative resource path beneath the skill root.
+
+        Returns:
+            dict[str, Any]: Resource content or a structured error.
+        """
+        with self._lock:
+            self.prepare()
+            return self._skill_manager.read_resource(name, resource_path)
+
     def _refresh(self, working_directory: Path, signature: tuple) -> bool:
         """Build and atomically install a refreshed instruction snapshot."""
         previous_target = self._signature[0] if self._signature else None
@@ -321,27 +442,21 @@ class InstructionsManager:
         active = {
             (skill.name, skill.location) for skill, _ in self._skill_manager.activated_instructions
         }
-        project_instructions = load_agents_instructions(working_directory)
+        loaded = load_agents_instructions(working_directory)
+        project_instructions = loaded.content
+        refresh_changes = self._describe_refresh(working_directory, loaded)
         if not self._skill_discovery_enabled:
-            instructions = self._compose(project_instructions, self._skill_manager)
-            if self._encoded_size(instructions) > self._max_bytes:
-                raise ValueError(
-                    "Refreshed base instructions exceed the configured instruction limit."
-                )
-            changed = (
-                previous_target != str(working_directory) or previous_instructions != instructions
+            return self._refresh_static(
+                working_directory,
+                signature,
+                loaded,
+                refresh_changes,
+                previous_target,
+                previous_instructions,
             )
-            self._project_instructions = project_instructions
-            self._instructions = instructions
-            self._signature = signature
-            self._refresh_diagnostics = []
-            self._dirty = False
-            if changed:
-                self._generation += 1
-            return changed
 
         skill_manager = SkillManager.discover(working_directory)
-        diagnostics = []
+        diagnostics = self._load_diagnostics(loaded)
 
         for skill in skill_manager.skills:
             identity = (skill.name, skill.location)
@@ -374,10 +489,37 @@ class InstructionsManager:
 
         changed = previous_target != str(working_directory) or previous_instructions != instructions
         self._project_instructions = project_instructions
+        self._project_sources = loaded.sources
         self._skill_manager = skill_manager
         self._instructions = instructions
         self._signature = signature
         self._refresh_diagnostics = diagnostics
+        self._refresh_changes = refresh_changes
+        self._dirty = False
+        if changed:
+            self._generation += 1
+        return changed
+
+    def _refresh_static(
+        self,
+        working_directory: Path,
+        signature: tuple,
+        loaded: LoadedAgentInstructions,
+        refresh_changes: list[str],
+        previous_target: str | None,
+        previous_instructions: str | None,
+    ) -> bool:
+        """Install refreshed project content while preserving an injected skill manager."""
+        instructions = self._compose(loaded.content, self._skill_manager)
+        if self._encoded_size(instructions) > self._max_bytes:
+            raise ValueError("Refreshed base instructions exceed the configured instruction limit.")
+        changed = previous_target != str(working_directory) or previous_instructions != instructions
+        self._project_instructions = loaded.content
+        self._project_sources = loaded.sources
+        self._instructions = instructions
+        self._signature = signature
+        self._refresh_diagnostics = self._load_diagnostics(loaded)
+        self._refresh_changes = refresh_changes
         self._dirty = False
         if changed:
             self._generation += 1
@@ -387,16 +529,30 @@ class InstructionsManager:
         """Render the current instruction sources."""
         return self._compose(self._project_instructions, self._skill_manager)
 
+    def _instruction_sections(self) -> tuple[InstructionSection, ...]:
+        """Return typed provenance for every currently composed section."""
+        sections = [
+            InstructionSection("agents", source.content, str(source.path))
+            for source in self._project_sources
+            if source.content
+        ]
+        if self._project_instructions and not sections:
+            sections.append(InstructionSection("agents", self._project_instructions, "injected"))
+        catalog = self._skill_manager.catalog()
+        if catalog:
+            sections.append(InstructionSection("skill_catalog", catalog, "skill_discovery"))
+        sections.extend(
+            InstructionSection("active_skill", instructions, str(skill.location))
+            for skill, instructions in self._skill_manager.activated_instructions
+        )
+        return tuple(sections)
+
     @classmethod
     def _compose(cls, project_instructions: str | None, skill_manager: SkillManager) -> str | None:
         """Render an instruction document from candidate sources."""
         entries = []
         for skill, instructions in skill_manager.activated_instructions:
-            entries.append(
-                f'<skill name="{escape(skill.name)}" root="{escape(str(skill.location.parent))}">\n'
-                f"{instructions}\n"
-                "</skill>"
-            )
+            entries.append(f'<skill name="{escape(skill.name)}">\n{instructions}\n</skill>')
         active = (
             "<active_skills>\n" + "\n".join(entries) + "\n</active_skills>" if entries else None
         )
@@ -407,26 +563,18 @@ class InstructionsManager:
         """Return cheap metadata identifying discoverable instruction sources."""
         if working_directory is None:
             return ()
-        root = find_project_root(working_directory)
-        if root is None:
-            directories = [working_directory]
-        else:
-            directories = [
-                directory
-                for directory in reversed((working_directory, *working_directory.parents))
-                if directory == root or root in directory.parents
-            ]
-        paths = [directory / DEFAULT_AGENTS_FILENAME for directory in directories]
-        for skill_directory in default_skill_directories(working_directory):
+        paths = get_agents_files(working_directory)
+        for skill_directory in get_skill_directories(working_directory):
             paths.append(skill_directory)
             if skill_directory.is_dir():
-                paths.extend(sorted(skill_directory.glob("*/SKILL.md")))
+                paths.extend(sorted(skill_directory.glob(f"*/{DEFAULT_SKILL_FILENAME}")))
         fingerprints = []
         for path in paths:
             try:
                 stat = path.stat()
+                digest = sha256(path.read_bytes()).hexdigest() if path.is_file() else None
                 fingerprints.append(
-                    (str(path.resolve()), stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                    (str(path.resolve()), stat.st_ino, stat.st_mtime_ns, stat.st_size, digest)
                 )
             except FileNotFoundError:
                 fingerprints.append((str(path.resolve()), None))
@@ -436,3 +584,37 @@ class InstructionsManager:
     def _encoded_size(instructions: str | None) -> int:
         """Return the UTF-8 size of an optional instruction document."""
         return len((instructions or "").encode("utf-8"))
+
+    @staticmethod
+    def _load_diagnostics(loaded: LoadedAgentInstructions) -> list[str]:
+        """Return diagnostics produced while loading project instructions."""
+        if not loaded.truncated:
+            return []
+        omitted = sum(source.size_bytes - source.included_bytes for source in loaded.sources)
+        return [
+            f"AGENTS.md instructions truncated at {loaded.max_bytes} bytes; "
+            f"{omitted} source byte(s) omitted."
+        ]
+
+    def _describe_refresh(
+        self, working_directory: Path, loaded: LoadedAgentInstructions
+    ) -> list[str]:
+        """Describe effective project-source changes for observability."""
+        changes = []
+        previous_target = self._signature[0] if self._signature else None
+        if previous_target != str(working_directory):
+            changes.append(f"Instruction scope changed to '{working_directory}'.")
+        previous = {str(source.path): source for source in self._project_sources}
+        current = {str(source.path): source for source in loaded.sources}
+        for path in sorted(previous.keys() - current.keys()):
+            changes.append(f"Removed instruction source '{path}'.")
+        for path in sorted(current.keys() - previous.keys()):
+            changes.append(f"Added instruction source '{path}'.")
+        for path in sorted(previous.keys() & current.keys()):
+            before = previous[path]
+            after = current[path]
+            if before.content != after.content or before.truncated != after.truncated:
+                changes.append(f"Changed instruction source '{path}'.")
+        if self._signature != self._discovery_signature(working_directory) and not changes:
+            changes.append("Skill catalog or activated skill instructions changed.")
+        return changes

@@ -1,5 +1,6 @@
 """Tests for composing dynamic backend instructions."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,14 @@ def test_manager_combines_project_catalog_and_active_skills_in_stable_order(tmp_
     assert manager.instructions.index("First instructions.") < manager.instructions.index(
         "Second instructions."
     )
+    context = manager.list_skills()["instruction_context"]
+    assert [section["kind"] for section in context["sections"]] == [
+        "agents",
+        "skill_catalog",
+        "active_skill",
+        "active_skill",
+    ]
+    assert len(context["digest"]) == 64
 
 
 def test_manager_discovers_project_instructions_and_skills(tmp_path):
@@ -51,6 +60,19 @@ def test_manager_discovers_project_instructions_and_skills(tmp_path):
 
     assert manager.instructions.startswith("Project rules.")
     assert manager.skill_manager.count == 1
+
+
+def test_manager_reports_truncated_project_instruction_sources(tmp_path):
+    """Discovery exposes bounded source sizes and a persistent truncation diagnostic."""
+    (tmp_path / "AGENTS.md").write_text("x" * 33_000, encoding="utf-8")
+
+    manager = InstructionsManager.discover(tmp_path, max_bytes=40_000)
+    context = manager.list_skills()["instruction_context"]
+
+    assert context["diagnostics"] == [
+        "AGENTS.md instructions truncated at 32768 bytes; 288 source byte(s) omitted."
+    ]
+    assert context["sources"][0]["size_bytes"] == 33_000
 
 
 def test_discovery_refresh_preserves_an_explicit_skill_manager(tmp_path):
@@ -94,8 +116,25 @@ def test_prepare_refreshes_changed_project_instructions_without_churning_stable_
     assert manager.prepare() is True
     assert manager.instructions == "Second and longer rules."
     assert manager.generation == 1
+    assert manager.list_skills()["instruction_context"]["refresh_changes"] == [
+        f"Changed instruction source '{agents.resolve()}'."
+    ]
     assert manager.prepare() is False
     assert manager.generation == 1
+
+
+def test_prepare_detects_content_changes_with_unchanged_file_metadata(tmp_path):
+    """Content hashes detect rewrites even when size and modification time are preserved."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("First rules", encoding="utf-8")
+    manager = InstructionsManager.discover(tmp_path)
+    original = agents.stat()
+
+    agents.write_text("Other rules", encoding="utf-8")
+    os.utime(agents, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    assert manager.prepare() is True
+    assert manager.instructions == "Other rules"
 
 
 def test_observed_file_changes_scope_and_rediscovers_nested_sources(tmp_path):
@@ -116,6 +155,9 @@ def test_observed_file_changes_scope_and_rediscovers_nested_sources(tmp_path):
     assert manager.prepare() is True
     assert manager.working_directory == nested.resolve()
     assert manager.instructions == "Root rules.\n\nNested rules."
+    changes = manager.list_skills()["instruction_context"]["refresh_changes"]
+    assert changes[0] == f"Instruction scope changed to '{nested.resolve()}'."
+    assert changes[1] == f"Added instruction source '{(nested / 'AGENTS.md').resolve()}'."
 
 
 def test_refresh_preserves_same_skill_identity_and_reloads_changed_body(tmp_path):
@@ -132,8 +174,9 @@ def test_refresh_preserves_same_skill_identity_and_reloads_changed_body(tmp_path
 
     assert manager.prepare() is True
     assert "Second body is longer." in manager.instructions
-    assert manager.active_skill_identities == [
-        ("review", str(location.location.resolve()))
+    assert manager.active_skill_identities == [("review", str(location.location.resolve()))]
+    assert manager.list_skills()["instruction_context"]["refresh_changes"] == [
+        "Skill catalog or activated skill instructions changed."
     ]
 
 
@@ -155,9 +198,7 @@ def test_refresh_deactivates_a_skill_replaced_by_a_closer_definition(tmp_path):
     assert str(root_skill.location.resolve()) not in {
         str(skill.location) for skill in manager.skill_manager.activated_skills
     }
-    assert "removed or shadowed" in manager.list_skills()["instruction_context"][
-        "diagnostics"
-    ][0]
+    assert "removed or shadowed" in manager.list_skills()["instruction_context"]["diagnostics"][0]
 
 
 def test_reactivate_skills_restores_only_matching_current_identities(tmp_path):
@@ -175,6 +216,10 @@ def test_reactivate_skills_restores_only_matching_current_identities(tmp_path):
 
     assert [result["status"] for result in results] == ["activated"]
     assert manager.active_skill_identities == [("review", str(skill.location))]
+    assert manager.list_skills()["instruction_context"]["diagnostics"] == [
+        "Could not restore 'review': its definition was removed or shadowed.",
+        "Could not restore 'missing': its definition was removed or shadowed.",
+    ]
 
 
 def test_refresh_deactivates_invalid_and_oversized_active_skills(tmp_path, monkeypatch):
@@ -192,9 +237,10 @@ def test_refresh_deactivates_invalid_and_oversized_active_skills(tmp_path, monke
 
     assert manager.prepare() is True
     assert manager.active_skill_identities == []
-    assert "instruction budget exceeded" in manager.list_skills()["instruction_context"][
-        "diagnostics"
-    ][0]
+    assert (
+        "instruction budget exceeded"
+        in manager.list_skills()["instruction_context"]["diagnostics"][0]
+    )
 
     skill.location.write_text(
         "---\nname: review\ndescription: Use review.\n---\n\nShort again.\n",
@@ -214,9 +260,9 @@ def test_refresh_deactivates_invalid_and_oversized_active_skills(tmp_path, monke
     manager.invalidate()
 
     assert manager.prepare() is True
-    assert "changed skill is invalid" in manager.list_skills()["instruction_context"][
-        "diagnostics"
-    ][0]
+    assert (
+        "changed skill is invalid" in manager.list_skills()["instruction_context"]["diagnostics"][0]
+    )
 
 
 def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path):
@@ -263,6 +309,9 @@ def test_activation_is_idempotent_and_unknown_skills_remain_errors(tmp_path):
     assert second["instructions_updated"] is False
     assert manager.instructions == instructions
     assert missing["error"] == "unknown_skill"
+    assert str(tmp_path) not in instructions
+    assert '<skill name="example">' in instructions
+    assert " root=" not in instructions
 
 
 def test_activation_rolls_back_when_complete_instructions_exceed_budget(tmp_path):
@@ -298,3 +347,7 @@ def test_deactivation_is_idempotent_and_unknown_skills_remain_errors(tmp_path):
     assert "Follow the workflow." not in instructions
     assert manager.instructions == instructions
     assert missing["error"] == "unknown_skill"
+
+    empty = manager.deactivate_all_skills()
+    assert empty["deactivated"] == 0
+    assert empty["instructions_updated"] is False

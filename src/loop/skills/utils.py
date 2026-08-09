@@ -1,6 +1,7 @@
 """Discover and parse project instruction files."""
 
 from collections.abc import Collection
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,14 +11,52 @@ from ..utils import find_project_root
 
 MAX_AGENTS_BYTES = 32 * 1024
 DEFAULT_AGENTS_FILENAME = "AGENTS.md"
+DEFAULT_SKILL_FILENAME = "SKILL.md"
 DEFAULT_SKILLS_DIRECTORY = Path(".agents/skills")
+TRUNCATION_MARKER = "\n\n[AGENTS.md truncated: instruction byte limit reached.]"
 
 
-def default_skill_directories(
+@dataclass(frozen=True)
+class AgentInstructionsSource:
+    """Describe one discovered project instruction source.
+
+    Args:
+        path (Path): Canonical instruction file path.
+        size_bytes (int): Complete stripped source size in UTF-8 bytes.
+        included_bytes (int): Number of source bytes included in the result.
+        truncated (bool): Whether content from this source was omitted.
+        content (str): Included source content before composition separators.
+    """
+
+    path: Path
+    size_bytes: int
+    included_bytes: int
+    truncated: bool
+    content: str
+
+
+@dataclass(frozen=True)
+class LoadedAgentInstructions:
+    """Describe composed project instructions and their provenance.
+
+    Args:
+        content (str | None): Bounded composed content, or ``None`` when no source applies.
+        sources (tuple[AgentInstructionsSource, ...]): Sources in root-to-leaf precedence order.
+        max_bytes (int): Configured source-content byte limit.
+        truncated (bool): Whether any discovered source content was omitted.
+    """
+
+    content: str | None
+    sources: tuple[AgentInstructionsSource, ...]
+    max_bytes: int
+    truncated: bool
+
+
+def get_skill_directories(
     working_directory: Path,
     relative_directory: Path = DEFAULT_SKILLS_DIRECTORY,
 ) -> list[Path]:
-    """Return default skill directories in descending precedence order.
+    """Return skill directories in descending precedence order.
 
     Args:
         working_directory (Path): Directory whose repository-scoped instructions should apply.
@@ -108,53 +147,120 @@ def read_instruction_body(content: str, filename: str) -> str:
     raise ValueError(f"{filename} frontmatter is not terminated")
 
 
-def load_agents_instructions(
+def get_agents_files(
     working_directory: Path | str,
     agents_filename: str = DEFAULT_AGENTS_FILENAME,
-    max_bytes: int = MAX_AGENTS_BYTES,
-) -> str | None:
-    """Load AGENTS.md files from the project root through the working directory.
+) -> list[Path]:
+    """Return discovered agent instruction files in root-to-leaf order.
 
     Args:
-        working_directory (Path | str): Directory whose instruction scope should be loaded.
+        working_directory (Path | str): Directory whose instruction scope should be discovered.
         agents_filename (str): Name of the instruction file to discover.
-        max_bytes (int): Maximum encoded size of the combined instructions.
 
     Returns:
-        str | None: The combined instructions in scope, truncated to ``max_bytes``, or ``None``
-        when no non-empty AGENTS.md file applies.
-
-    Raises:
-        OSError: An applicable instruction file cannot be read.
-        UnicodeError: An applicable instruction file is not valid UTF-8.
+        list[Path]: Canonical paths for existing instruction files in scope.
     """
     working_directory = Path(working_directory)
     project_root = find_project_root(working_directory)
     directories = [working_directory]
-
     if project_root is not None:
         directories = [
             directory
             for directory in reversed((working_directory, *working_directory.parents))
             if directory == project_root or project_root in directory.parents
         ]
+    return [
+        agents_file.resolve()
+        for directory in directories
+        if (agents_file := directory / agents_filename).is_file()
+    ]
 
-    instructions = []
-    for directory in directories:
-        agents_file = directory / agents_filename
-        if agents_file.is_file():
-            content = agents_file.read_text(encoding="utf-8").strip()
-            if content:
-                instructions.append(content)
 
-    if not instructions:
-        return None
+def load_agents_instructions(
+    working_directory: Path | str,
+    agents_filename: str = DEFAULT_AGENTS_FILENAME,
+    max_bytes: int = MAX_AGENTS_BYTES,
+) -> LoadedAgentInstructions:
+    """Load project instructions with source and truncation diagnostics.
 
-    combined = "\n\n".join(instructions)
-    encoded = combined.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return combined
-    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+    Args:
+        working_directory (Path | str): Directory whose instruction scope should be loaded.
+        agents_filename (str): Name of the instruction file to discover.
+        max_bytes (int): Maximum source-content bytes included before a truncation marker.
+
+    Returns:
+        LoadedAgentInstructions: Bounded content and per-source provenance.
+
+    Raises:
+        OSError: An applicable instruction file cannot be read.
+        UnicodeError: An applicable instruction file is not valid UTF-8.
+    """
+    discovered = []
+    for agents_file in get_agents_files(working_directory, agents_filename):
+        content = agents_file.read_text(encoding="utf-8").strip()
+        if content:
+            discovered.append((agents_file, content))
+
+    if not discovered:
+        return LoadedAgentInstructions(
+            content=None,
+            sources=(),
+            max_bytes=max_bytes,
+            truncated=False,
+        )
+
+    complete_size = len("\n\n".join(content for _, content in discovered).encode("utf-8"))
+    marker_size = len(TRUNCATION_MARKER.encode("utf-8"))
+    marker = TRUNCATION_MARKER if marker_size <= max_bytes < complete_size else ""
+    remaining = max_bytes - len(marker.encode("utf-8"))
+    included = []
+    sources = []
+    truncated = False
+    for index, (path, content) in enumerate(discovered):
+        separator = "\n\n" if included else ""
+        separator_size = len(separator.encode("utf-8"))
+        encoded = content.encode("utf-8")
+        available = max(remaining - separator_size, 0)
+        included_content = encoded[:available].decode("utf-8", errors="ignore")
+        included_bytes = len(included_content.encode("utf-8"))
+        source_truncated = included_bytes < len(encoded)
+        if included_content:
+            included.append(f"{separator}{included_content}")
+        remaining -= separator_size + included_bytes
+        truncated = truncated or source_truncated
+        sources.append(
+            AgentInstructionsSource(
+                path=path,
+                size_bytes=len(encoded),
+                included_bytes=included_bytes,
+                truncated=source_truncated,
+                content=included_content,
+            )
+        )
+        if remaining <= 0:
+            for omitted_path, omitted_content in discovered[index + 1 :]:
+                omitted_size = len(omitted_content.encode("utf-8"))
+                sources.append(
+                    AgentInstructionsSource(
+                        path=omitted_path,
+                        size_bytes=omitted_size,
+                        included_bytes=0,
+                        truncated=True,
+                        content="",
+                    )
+                )
+            truncated = truncated or index + 1 < len(discovered)
+            break
+
+    content = "".join(included) or None
+    if truncated and marker:
+        content = f"{content or ''}{marker}"
+    return LoadedAgentInstructions(
+        content=content,
+        sources=tuple(sources),
+        max_bytes=max_bytes,
+        truncated=truncated,
+    )
 
 
 def build_instructions(*sections: str | None) -> str | None:

@@ -6,14 +6,15 @@ import pytest
 
 from loop.skills import (
     build_instructions,
-    default_skill_directories,
+    get_agents_files,
+    get_skill_directories,
     load_agents_instructions,
     read_instruction_body,
     read_instruction_frontmatter,
 )
 
 
-def test_default_skill_directories_order_scopes_by_precedence(tmp_path, monkeypatch):
+def test_get_skill_directories_orders_scopes_by_precedence(tmp_path, monkeypatch):
     """Default skill directories start with the closest project scope and end with user scope."""
     project = tmp_path / "project"
     working_directory = project / "packages" / "app"
@@ -22,7 +23,7 @@ def test_default_skill_directories_order_scopes_by_precedence(tmp_path, monkeypa
     (project / ".git").mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
-    assert default_skill_directories(working_directory) == [
+    assert get_skill_directories(working_directory) == [
         working_directory / ".agents/skills",
         project / "packages/.agents/skills",
         project / ".agents/skills",
@@ -30,14 +31,12 @@ def test_default_skill_directories_order_scopes_by_precedence(tmp_path, monkeypa
     ]
 
 
-def test_default_skill_directories_uses_local_and_user_scopes_outside_project(
-    tmp_path, monkeypatch
-):
+def test_get_skill_directories_uses_local_and_user_scopes_outside_project(tmp_path, monkeypatch):
     """A directory outside a project contributes only its local and user scopes."""
     home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
-    assert default_skill_directories(tmp_path, Path("instructions")) == [
+    assert get_skill_directories(tmp_path, Path("instructions")) == [
         tmp_path / "instructions",
         home / "instructions",
     ]
@@ -104,6 +103,21 @@ def test_read_instruction_body_validates_frontmatter(content, message):
         read_instruction_body(content, "SKILL.md")
 
 
+def test_get_agents_files_returns_existing_files_in_scope_order(tmp_path):
+    """Agent file discovery returns canonical root-to-leaf paths in project scope."""
+    project = tmp_path / "project"
+    working_directory = project / "src" / "feature"
+    working_directory.mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "AGENTS.md").touch()
+    (working_directory / "AGENTS.md").touch()
+
+    assert get_agents_files(working_directory) == [
+        (project / "AGENTS.md").resolve(),
+        (working_directory / "AGENTS.md").resolve(),
+    ]
+
+
 def test_load_agents_instructions_accumulates_only_agents_files_in_scope(tmp_path):
     """Instructions accumulate in scope order and ignore other agent filenames."""
     project = tmp_path / "project"
@@ -115,9 +129,9 @@ def test_load_agents_instructions_accumulates_only_agents_files_in_scope(tmp_pat
     (project / "src" / "AGENTS.md").write_text("source rules", encoding="utf-8")
     (working_directory / "AGENTS.md").write_text("feature rules", encoding="utf-8")
 
-    instructions = load_agents_instructions(working_directory)
+    loaded = load_agents_instructions(working_directory)
 
-    assert instructions == "project rules\n\nsource rules\n\nfeature rules"
+    assert loaded.content == "project rules\n\nsource rules\n\nfeature rules"
 
 
 def test_load_agents_instructions_checks_only_working_directory_without_project(tmp_path):
@@ -128,14 +142,14 @@ def test_load_agents_instructions_checks_only_working_directory_without_project(
     (parent / "AGENTS.md").write_text("parent rules", encoding="utf-8")
     (working_directory / "AGENTS.md").write_text("local rules", encoding="utf-8")
 
-    assert load_agents_instructions(working_directory) == "local rules"
+    assert load_agents_instructions(working_directory).content == "local rules"
 
 
 def test_load_agents_instructions_accepts_a_string_path(tmp_path):
     """String working directories are accepted during instruction discovery."""
     (tmp_path / "AGENTS.md").write_text("local rules", encoding="utf-8")
 
-    assert load_agents_instructions(str(tmp_path)) == "local rules"
+    assert load_agents_instructions(str(tmp_path)).content == "local rules"
 
 
 def test_load_agents_instructions_skips_empty_files(tmp_path):
@@ -147,21 +161,23 @@ def test_load_agents_instructions_skips_empty_files(tmp_path):
     (project / "AGENTS.md").write_text("  \n", encoding="utf-8")
     (working_directory / "AGENTS.md").write_text("source rules", encoding="utf-8")
 
-    assert load_agents_instructions(working_directory) == "source rules"
+    assert load_agents_instructions(working_directory).content == "source rules"
 
 
 def test_load_agents_instructions_returns_none_without_guidance(tmp_path):
     """Missing and empty instruction chains return no guidance."""
-    assert load_agents_instructions(tmp_path) is None
+    assert load_agents_instructions(tmp_path).content is None
 
 
 def test_load_agents_instructions_uses_a_32_kibibyte_default_limit(tmp_path):
     """The default limit truncates oversized instructions without invalid UTF-8."""
     (tmp_path / "AGENTS.md").write_text("a" * 32767 + "€", encoding="utf-8")
 
-    instructions = load_agents_instructions(tmp_path)
+    instructions = load_agents_instructions(tmp_path).content
 
-    assert instructions == "a" * 32767
+    assert instructions is not None
+    assert instructions.startswith("a")
+    assert instructions.endswith("[AGENTS.md truncated: instruction byte limit reached.]")
     assert len(instructions.encode("utf-8")) <= 32 * 1024
 
 
@@ -169,16 +185,53 @@ def test_load_agents_instructions_accepts_a_custom_byte_limit(tmp_path):
     """Callers can override the maximum encoded instruction size."""
     (tmp_path / "AGENTS.md").write_text("abc€", encoding="utf-8")
 
-    instructions = load_agents_instructions(tmp_path, max_bytes=4)
+    instructions = load_agents_instructions(tmp_path, max_bytes=4).content
 
     assert instructions == "abc"
+
+
+def test_load_agents_instructions_exposes_source_provenance_and_truncation(tmp_path):
+    """Structured loading reports exact source sizes and omitted content."""
+    (tmp_path / "AGENTS.md").write_text("abc€", encoding="utf-8")
+
+    loaded = load_agents_instructions(tmp_path, max_bytes=4)
+
+    assert loaded.truncated is True
+    assert loaded.max_bytes == 4
+    assert loaded.sources[0].path == (tmp_path / "AGENTS.md").resolve()
+    assert loaded.sources[0].size_bytes == 6
+    assert loaded.sources[0].included_bytes == 3
+    assert loaded.sources[0].truncated is True
+
+
+def test_load_agents_instructions_records_fully_omitted_sources_and_content(tmp_path):
+    """A consumed budget records later files and unrepresentable characters as omitted."""
+    project = tmp_path / "project"
+    nested = project / "nested"
+    nested.mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "AGENTS.md").write_text("abcd", encoding="utf-8")
+    (nested / "AGENTS.md").write_text("€", encoding="utf-8")
+
+    loaded = load_agents_instructions(nested, max_bytes=4)
+
+    assert loaded.content == "abcd"
+    assert [source.included_bytes for source in loaded.sources] == [4, 0]
+    assert loaded.truncated is True
+
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+    (isolated / "AGENTS.md").write_text("€", encoding="utf-8")
+    tiny = load_agents_instructions(isolated, max_bytes=1)
+    assert tiny.content is None
+    assert tiny.sources[0].included_bytes == 0
 
 
 def test_load_agents_instructions_accepts_a_custom_filename(tmp_path):
     """Callers can override the instruction filename."""
     (tmp_path / "CUSTOM.md").write_text("custom rules", encoding="utf-8")
 
-    instructions = load_agents_instructions(tmp_path, agents_filename="CUSTOM.md")
+    instructions = load_agents_instructions(tmp_path, agents_filename="CUSTOM.md").content
 
     assert instructions == "custom rules"
 
