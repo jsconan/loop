@@ -14,6 +14,8 @@ from loop import (
     Interaction,
     Loop,
     Message,
+    PermissionConfiguration,
+    PermissionManager,
     Response,
     ResponseCompleted,
     Session,
@@ -53,6 +55,7 @@ def output_interaction() -> Mock:
     interaction.output.side_effect = lambda events, **kwargs: Interaction.output(
         interaction, events, **kwargs
     )
+    interaction.confirm.return_value = True
     return interaction
 
 
@@ -76,11 +79,25 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.working_directory == tmp_path.resolve()
     assert loop.instructions is None
     assert loop.instructions_manager is not None
+    assert loop.permission_manager.configuration_path == tmp_path / ".loop" / "permissions.yaml"
     assert loop.session == Session()
     assert loop.model == "requested-model"
 
     loop.debug = False
     assert loop.debug is False
+
+
+def test_loop_uses_an_injected_permission_manager(tmp_path):
+    """An explicit permission manager replaces local policy discovery."""
+    permissions = PermissionManager(configuration=PermissionConfiguration())
+
+    loop = Loop(
+        backend=loop_backend(),
+        permission_manager=permissions,
+        working_directory=tmp_path,
+    )
+
+    assert loop.permission_manager is permissions
 
 
 def test_loops_share_local_conversation_context(tmp_path):
@@ -337,7 +354,14 @@ def test_skill_activation_is_persisted_with_its_tool_result(tmp_path):
     manager = InstructionsManager(
         skill_manager=SkillManager([Skill("review", "Review code.", location)])
     )
-    loop = Loop(backend=backend, instructions_manager=manager, session_manager=sessions)
+    interaction = output_interaction()
+    loop = Loop(
+        backend=backend,
+        instructions_manager=manager,
+        session_manager=sessions,
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
     call = ToolCall(
         call_id="skill-call",
         name="manage_skills",
@@ -485,6 +509,7 @@ def test_handle_tool_calls_delegates_session_updates():
         call.arguments,
         interaction=loop.interaction,
         instructions_manager=loop.instructions_manager,
+        permission_manager=loop.permission_manager,
     )
     assert loop.handle_tool_calls(Response(answer="", reasoning="")) is False
 

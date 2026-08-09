@@ -35,14 +35,22 @@ def test_definition_adapts_the_argument_model(monkeypatch):
     adapt.assert_called_once_with(Arguments.model_json_schema())
 
 
-def test_call_validates_invokes_and_serializes(monkeypatch):
-    """Synchronous dispatch passes validated arguments to the function and serializes its result."""
+def test_validate_arguments_prepares_call_arguments():
+    """Validation converts serialized model input into typed call arguments."""
+    arguments, error = make_tool().validate_arguments('{"number": 3}')
+
+    assert arguments == {"number": 3}
+    assert error is None
+
+
+def test_call_invokes_and_serializes_validated_arguments(monkeypatch):
+    """Synchronous dispatch invokes and serializes arguments prepared by validation."""
     function = Mock(return_value=4)
     serialize = Mock(return_value="serialized")
     monkeypatch.setattr("loop.tooling.tool.takes_tool_context", Mock(return_value=False))
     monkeypatch.setattr("loop.tooling.tool.serialize_tool_result", serialize)
 
-    assert make_tool(function).call('{"number": 3}') == "serialized"
+    assert make_tool(function).call({"number": 3}) == "serialized"
     function.assert_called_once_with(number=3)
     serialize.assert_called_once_with(4)
 
@@ -57,22 +65,25 @@ def test_call_injects_required_context(monkeypatch):
     context = Mock(spec=ToolContext)
     tool = make_tool(function)
 
-    assert tool.call('{"number": 3}', context) == "done"
+    assert tool.call({"number": 3}, context) == "done"
     function.assert_called_once_with(context, number=3)
-    assert tool.call('{"number": 3}') == "error"
+    assert tool.call({"number": 3}) == "error"
     serialize_error.assert_called_once_with(
         "execution_failed",
         "Tool 'calculate' failed: Tool 'calculate' requires a ToolContext.",
     )
 
 
-def test_call_returns_validation_errors_without_invoking(monkeypatch):
+def test_validate_arguments_returns_errors_without_invoking(monkeypatch):
     """Invalid model arguments return structured details without reaching application code."""
     function = Mock()
     serialize_error = Mock(return_value="invalid")
     monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
 
-    assert make_tool(function).call("not json") == "invalid"
+    arguments, error = make_tool(function).validate_arguments("not json")
+
+    assert arguments is None
+    assert error == "invalid"
     function.assert_not_called()
     assert serialize_error.call_args.args == (
         "invalid_arguments",
@@ -90,7 +101,7 @@ def test_call_rejects_coroutine_functions_in_sync_dispatch(monkeypatch):
     serialize_error = Mock(return_value="async error")
     monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
 
-    assert make_tool(calculate).call('{"number": 3}') == "async error"
+    assert make_tool(calculate).call({"number": 3}) == "async error"
     serialize_error.assert_called_once_with(
         "async_tool_in_sync_loop",
         "Tool 'calculate' must be called through call_async().",
@@ -104,7 +115,7 @@ def test_call_serializes_execution_failures(monkeypatch):
     monkeypatch.setattr("loop.tooling.tool.takes_tool_context", Mock(return_value=False))
     monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
 
-    assert make_tool(function).call('{"number": 3}') == "failed"
+    assert make_tool(function).call({"number": 3}) == "failed"
     serialize_error.assert_called_once_with("execution_failed", "Tool 'calculate' failed: boom")
 
 
@@ -117,17 +128,16 @@ def test_call_async_supports_sync_and_awaitable_results(monkeypatch):
     monkeypatch.setattr("loop.tooling.tool.takes_tool_context", Mock(return_value=False))
     monkeypatch.setattr("loop.tooling.tool.serialize_tool_result", lambda result: str(result))
 
-    assert asyncio.run(make_tool(Mock(return_value=4)).call_async('{"number": 3}')) == "4"
-    assert asyncio.run(make_tool(calculate).call_async('{"number": 3}')) == "6"
+    assert asyncio.run(make_tool(Mock(return_value=4)).call_async({"number": 3})) == "4"
+    assert asyncio.run(make_tool(calculate).call_async({"number": 3})) == "6"
 
 
-def test_call_async_handles_validation_and_execution_failures(monkeypatch):
-    """Asynchronous dispatch returns structured errors for invalid input and application failure."""
+def test_call_async_handles_execution_failures(monkeypatch):
+    """Asynchronous dispatch returns structured errors for application failures."""
     function = Mock(side_effect=RuntimeError("boom"))
     serialize_error = Mock(side_effect=lambda kind, message, **details: json.dumps({"error": kind}))
     monkeypatch.setattr("loop.tooling.tool.takes_tool_context", Mock(return_value=False))
     monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
     tool = make_tool(function)
 
-    assert json.loads(asyncio.run(tool.call_async("bad")))["error"] == "invalid_arguments"
-    assert json.loads(asyncio.run(tool.call_async('{"number": 3}')))["error"] == "execution_failed"
+    assert json.loads(asyncio.run(tool.call_async({"number": 3})))["error"] == "execution_failed"

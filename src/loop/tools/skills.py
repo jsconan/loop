@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from ..context import ToolContext
+from ..permissions import Capability, PermissionRequest
 from ..skills.models import (
     PublicSkillOperationResult,
     SkillOperationError,
@@ -43,7 +44,23 @@ def _public_result(action: str, result: SkillOperationResult) -> PublicSkillOper
     return _filter_fields(result, _FIELDS_BY_NAME[action])
 
 
-@tool_registry.tool
+def _skill_permission(arguments: dict[str, Any]) -> tuple[PermissionRequest, ...]:
+    """Classify read-only and mutating skill operations."""
+    action = arguments["action"]
+    capability = (
+        Capability.SESSION_WRITE
+        if action in {"activate", "deactivate", "deactivate_all"}
+        else Capability.FILESYSTEM_READ
+    )
+    resource = str(arguments.get("path") or arguments.get("name") or action)
+    return (
+        PermissionRequest(
+            tool_name="manage_skills", capability=capability, resource=resource
+        ),
+    )
+
+
+@tool_registry.tool(permission_resolver=_skill_permission)
 def manage_skills(
     context: ToolContext,
     action: Annotated[

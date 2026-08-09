@@ -11,15 +11,17 @@ from pydantic import ValidationError
 from ..context import CommandContext
 from .builtins import exit as exit_command
 from .builtins import help as help_command
+from .builtins import permissions as permissions_command
 from .builtins import quit as quit_command
 from .command import Command
 from .utils import CommandRegistrationError, get_command_arguments_model, takes_command_context
 
 if TYPE_CHECKING:
     from ..interaction import Interaction
+    from ..permissions import PermissionManager
 
 
-BUILTIN_COMMANDS = (help_command, exit_command, quit_command)
+BUILTIN_COMMANDS = (help_command, permissions_command, exit_command, quit_command)
 
 
 class CommandManager:
@@ -30,6 +32,8 @@ class CommandManager:
             registered after the built-ins, or ``None`` to register only the built-ins.
         interaction (Interaction | None): Default interaction used during dispatch, or ``None``
             when callers will provide one for each invocation.
+        permission_manager (PermissionManager | None): Tool policy manager exposed to permission
+            management commands.
 
     Raises:
         ValueError: If a command name is invalid or registered more than once.
@@ -44,10 +48,12 @@ class CommandManager:
         self,
         commands: Iterable[Command | Callable[..., None]] | None = None,
         interaction: Interaction | None = None,
+        permission_manager: PermissionManager | None = None,
     ) -> None:
         self._commands = {}
         self._exit_requested = False
         self._interaction = interaction
+        self._permission_manager = permission_manager
         for command in (*BUILTIN_COMMANDS, *(commands or ())):
             self.register(command)
 
@@ -190,7 +196,12 @@ class CommandManager:
         if takes_command_context(command.function):
             if active_interaction is None:
                 raise ValueError(f"Command '{name}' requires an Interaction.")
-            context = CommandContext(name=name, interaction=active_interaction, manager=self)
+            context = CommandContext(
+                name=name,
+                interaction=active_interaction,
+                manager=self,
+                permission_manager=self._permission_manager,
+            )
         try:
             command.call(arguments, context)
         except ValidationError as exc:

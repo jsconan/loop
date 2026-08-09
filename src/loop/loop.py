@@ -11,8 +11,10 @@ from .models import (
     Response,
     ResponseEvent,
 )
+from .permissions import PermissionManager
 from .session import Session, SessionManager
 from .skills import InstructionsManager
+from .utils import find_project_root
 
 
 class Loop:
@@ -25,6 +27,8 @@ class Loop:
             backend instructions. Defaults to discovering project instructions and Agent Skills
             for ``working_directory``.
         interaction (Interaction | None): Service used for all user input and output.
+        permission_manager (PermissionManager | None): Manager used to authorize model tool calls.
+            Defaults to loading local policy from the project ``.loop`` folder.
         working_directory (Path | str | None): Directory used to discover applicable AGENTS.md
             files.
         session (Session | str | None): Session or persisted session identifier to load.
@@ -48,6 +52,7 @@ class Loop:
     _stream: bool
     _model: str | None
     _command_manager: CommandManager
+    _permission_manager: PermissionManager
 
     def __init__(
         self,
@@ -56,6 +61,7 @@ class Loop:
         model: str | None = None,
         instructions_manager: InstructionsManager | None = None,
         interaction: Interaction | None = None,
+        permission_manager: PermissionManager | None = None,
         working_directory: Path | str | None = None,
         session: Session | str | None = None,
         session_manager: SessionManager | None = None,
@@ -88,7 +94,23 @@ class Loop:
         self._stream = stream
         self._debug = debug
         self._model = model
-        self._command_manager = CommandManager(interaction=self._interaction)
+        self._permission_manager = permission_manager or PermissionManager(
+            find_project_root(self._working_directory) or self._working_directory,
+            interaction=self._interaction,
+        )
+        self._command_manager = CommandManager(
+            interaction=self._interaction,
+            permission_manager=self._permission_manager,
+        )
+
+    @property
+    def permission_manager(self) -> PermissionManager:
+        """Return the permission manager guarding model tool calls.
+
+        Returns:
+            PermissionManager: Active local permission manager.
+        """
+        return self._permission_manager
 
     @property
     def backend(self) -> Backend:
@@ -250,6 +272,7 @@ class Loop:
                 tool_call.arguments,
                 interaction=self._interaction,
                 instructions_manager=self._instructions_manager,
+                permission_manager=self._permission_manager,
             )
             self._session_manager.add_tool_call(
                 call_id=tool_call.call_id,

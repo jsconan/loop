@@ -8,7 +8,7 @@ from typing import Annotated
 
 from pydantic import Field
 
-from ..context import ToolContext
+from ..permissions import Capability, PermissionRequest
 from ..tooling import tool_registry
 
 COMMAND_TIMEOUT_SECONDS = 30
@@ -35,15 +35,25 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
         pass
 
 
-@tool_registry.tool
+def _command_permission(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
+    """Describe exact shell execution authority for one command."""
+    return (
+        PermissionRequest(
+            tool_name="run_command",
+            capability=Capability.PROCESS_EXEC,
+            resource=str(arguments["command"]),
+        ),
+    )
+
+
+@tool_registry.tool(
+    capabilities={Capability.PROCESS_EXEC},
+    permission_resolver=_command_permission,
+)
 def run_command(
-    context: ToolContext,
     command: Annotated[str, Field(description="The system command to execute.")],
 ) -> str:
     """Run a system command and return the output."""
-    if not context.confirm(f"Agent wants to run command '{command}'. Proceed?"):
-        return "Command execution cancelled by user."
-
     try:
         with subprocess.Popen(
             command,

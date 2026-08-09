@@ -25,7 +25,7 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.get", get)
 
-    assert fetch_content("https://example.com/file.txt") == "Fetch operation cancelled by user."
+    assert '"error": "tool_call_denied"' in fetch_content("https://example.com/file.txt")
     get.assert_not_called()
 
     assert fetch_content("https://example.com/file.txt") == "<html>fetched content</html>"
@@ -43,11 +43,13 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
     response.raise_for_status.assert_called_once_with()
     assert confirm.call_args_list == [
         call(
-            "Agent wants to fetch content from 'https://example.com/file.txt'. Proceed?",
+            "Agent wants to use 'fetch_content' for network.read on "
+            "'https://example.com/file.txt'. Proceed?",
             default=False,
         ),
         call(
-            "Agent wants to fetch content from 'https://example.com/file.txt'. Proceed?",
+            "Agent wants to use 'fetch_content' for network.read on "
+            "'https://example.com/file.txt'. Proceed?",
             default=False,
         ),
     ]

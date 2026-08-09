@@ -6,12 +6,31 @@ from typing import Annotated, Literal
 from pydantic import Field
 
 from ..context import ToolContext
+from ..permissions import Capability, PermissionRequest
 from .models import FolderEntry
 from ..tooling import tool_registry
 from ..utils import format_content_preview, is_path_ignored, iter_visible_paths
 
 
-@tool_registry.tool
+def _file_permission(capability: Capability):
+    """Return a resolver for one normalized filesystem resource."""
+
+    def _resolve(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
+        path = Path(str(arguments["path"]))
+        if capability is Capability.FILESYSTEM_WRITE and not path.exists():
+            parent = path.parent.resolve()
+            resource = str(parent / path.name)
+        else:
+            resource = str(path.resolve())
+        return (PermissionRequest(tool_name="", capability=capability, resource=resource),)
+
+    return _resolve
+
+
+@tool_registry.tool(
+    capabilities={Capability.FILESYSTEM_READ},
+    permission_resolver=_file_permission(Capability.FILESYSTEM_READ),
+)
 def list_folder(
     context: ToolContext,
     path: Annotated[str, Field(description="Path to the folder whose entries should be listed.")],
@@ -48,18 +67,16 @@ def list_folder(
         return f"Error listing folder: {exc}"
 
 
-@tool_registry.tool
+@tool_registry.tool(
+    capabilities={Capability.FILESYSTEM_READ},
+    permission_resolver=_file_permission(Capability.FILESYSTEM_READ),
+)
 def read_text_file(
     context: ToolContext,
     path: Annotated[str, Field(description="Path to the text file to read.")],
 ) -> str:
     """Read the contents of a text file from the local disk."""
     try:
-        if is_path_ignored(path) and not context.confirm(
-            f"Agent wants to read ignored file '{path}'. Proceed?"
-        ):
-            return "Read operation cancelled by user."
-
         content = Path(path).read_bytes()
         context.observe_file(path)
         if not content:
@@ -71,7 +88,10 @@ def read_text_file(
         return f"Error reading file: {exc}"
 
 
-@tool_registry.tool
+@tool_registry.tool(
+    capabilities={Capability.FILESYSTEM_WRITE},
+    permission_resolver=_file_permission(Capability.FILESYSTEM_WRITE),
+)
 def write_text_file(
     context: ToolContext,
     path: Annotated[str, Field(description="Path to the text file to write.")],
@@ -81,9 +101,6 @@ def write_text_file(
     preview = format_content_preview(content)
 
     context.interaction.info(f"Content to write to '{path}':\n{preview}")
-
-    if not context.confirm("Write the above content?"):
-        return "Write operation cancelled by user."
 
     try:
         with open(path, "w", encoding="utf-8") as file:

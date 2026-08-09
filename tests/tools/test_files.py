@@ -3,11 +3,19 @@
 import json
 from unittest.mock import MagicMock, call
 
+import pytest
+
 from loop import (
     ConsoleInteraction,
     InstructionsManager,
     tool_registry,
 )
+
+
+@pytest.fixture(autouse=True)
+def approve_tool_calls(monkeypatch):
+    """Approve central permission prompts unless a case overrides the decision."""
+    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
 
 
 def write_text_file(path, content):
@@ -220,8 +228,8 @@ def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads
     assert read_text_file(str(tmp_path / "missing.txt")).startswith("Error reading file:")
 
 
-def test_read_text_file_requires_confirmation_for_ignored_files(tmp_path, monkeypatch):
-    """Ignored files are only read after an affirmative confirmation."""
+def test_read_text_file_requires_central_confirmation(tmp_path, monkeypatch):
+    """Every file read is blocked until the central policy receives approval."""
     (tmp_path / ".git").mkdir()
     (tmp_path / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
     secret = tmp_path / "secret.txt"
@@ -229,23 +237,29 @@ def test_read_text_file_requires_confirmation_for_ignored_files(tmp_path, monkey
     confirm = MagicMock(side_effect=[False, True])
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
-    assert read_text_file(secret) == "Read operation cancelled by user."
+    assert '"error": "tool_call_denied"' in read_text_file(secret)
     assert read_text_file(secret) == "sensitive"
     assert confirm.call_args_list == [
-        call(f"Agent wants to read ignored file '{secret}'. Proceed?", default=False),
-        call(f"Agent wants to read ignored file '{secret}'. Proceed?", default=False),
+        call(
+            f"Agent wants to use 'read_text_file' for filesystem.read on '{secret}'. Proceed?",
+            default=False,
+        ),
+        call(
+            f"Agent wants to use 'read_text_file' for filesystem.read on '{secret}'. Proceed?",
+            default=False,
+        ),
     ]
 
 
-def test_read_text_file_does_not_confirm_for_visible_files(tmp_path, monkeypatch):
-    """Visible files remain readable without interrupting the user."""
+def test_read_text_file_confirms_for_visible_files_by_default(tmp_path, monkeypatch):
+    """The confirm-all mode includes ordinary visible files."""
     visible = tmp_path / "visible.txt"
     visible.write_text("hello", encoding="utf-8")
-    confirm = MagicMock()
+    confirm = MagicMock(return_value=True)
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
     assert read_text_file(visible) == "hello"
-    confirm.assert_not_called()
+    confirm.assert_called_once()
 
 
 def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, monkeypatch):
@@ -254,14 +268,20 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
     confirm = MagicMock(side_effect=[False, True])
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
-    assert write_text_file(str(target), "blocked") == "Write operation cancelled by user."
+    assert '"error": "tool_call_denied"' in write_text_file(str(target), "blocked")
     assert not target.exists()
 
     assert write_text_file(str(target), "saved") == f"Successfully wrote to file '{target}'."
     assert target.read_text(encoding="utf-8") == "saved"
     assert confirm.call_args_list == [
-        call("Write the above content?", default=False),
-        call("Write the above content?", default=False),
+        call(
+            f"Agent wants to use 'write_text_file' for filesystem.write on '{target}'. Proceed?",
+            default=False,
+        ),
+        call(
+            f"Agent wants to use 'write_text_file' for filesystem.write on '{target}'. Proceed?",
+            default=False,
+        ),
     ]
 
 

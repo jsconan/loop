@@ -6,7 +6,7 @@ from typing import Annotated
 import httpx
 from pydantic import Field, HttpUrl
 
-from ..context import ToolContext
+from ..permissions import Capability, PermissionRequest
 from ..tooling import tool_registry
 
 _DEFAULT_USER_AGENT = (
@@ -14,9 +14,22 @@ _DEFAULT_USER_AGENT = (
 )
 
 
-@tool_registry.tool
+def _network_permission(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
+    """Describe network-read authority for one validated URL."""
+    return (
+        PermissionRequest(
+            tool_name="fetch_content",
+            capability=Capability.NETWORK_READ,
+            resource=str(arguments["url"]),
+        ),
+    )
+
+
+@tool_registry.tool(
+    capabilities={Capability.NETWORK_READ},
+    permission_resolver=_network_permission,
+)
 def fetch_content(
-    context: ToolContext,
     url: Annotated[
         HttpUrl,
         Field(description="HTTP(S) URL of the content to fetch."),
@@ -24,9 +37,6 @@ def fetch_content(
 ) -> str:
     """Fetch and return text content from a URL."""
     url = str(url)
-    if not context.confirm(f"Agent wants to fetch content from '{url}'. Proceed?"):
-        return "Fetch operation cancelled by user."
-
     try:
         response = httpx.get(
             url,

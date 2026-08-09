@@ -68,9 +68,10 @@ def test_run_command_requires_an_affirmative_confirmation(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", popen)
 
-    assert run_command("echo hello") == "Command execution cancelled by user."
+    assert '"error": "tool_call_denied"' in run_command("echo hello")
     confirm.assert_called_once_with(
-        "Agent wants to run command 'echo hello'. Proceed?", default=False
+        "Agent wants to use 'run_command' for process.exec on 'echo hello'. Proceed?",
+        default=False,
     )
     popen.assert_not_called()
 

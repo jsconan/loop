@@ -7,10 +7,11 @@ __all__ = [
     "CommandRegistrationError",
     "exit",
     "help",
+    "permissions",
     "quit",
 ]
 
-from .builtins import exit, help, quit
+from .builtins import exit, help, permissions, quit
 from .command import Command
 from .command_manager import BUILTIN_COMMANDS, CommandManager
 from .utils import CommandRegistrationError

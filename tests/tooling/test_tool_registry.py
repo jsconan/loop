@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from loop.context import ToolContext
 from loop.interaction import Interaction
 from loop.skills import InstructionsManager
+from loop import PermissionConfiguration, PermissionManager, PermissionMode
 from loop.tooling import ToolRegistrationError, ToolRegistry
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
@@ -36,7 +36,10 @@ def test_constructor_registers_tools_in_iteration_order():
         """Return the second result."""
         return "second"
 
-    registry = ToolRegistry([first, second])
+    permissions = PermissionManager(
+        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
+    )
+    registry = ToolRegistry([first, second], permission_manager=permissions)
 
     assert [definition.name for definition in registry.definitions()] == [
         "first",
@@ -64,6 +67,8 @@ def test_tool_registers_a_function_with_derived_metadata(monkeypatch):
         description="Doc",
         function=function,
         arguments_model=arguments_model,
+        capabilities=frozenset({tool_registry_module.Capability.PURE}),
+        permission_resolver=None,
     )
 
 
@@ -114,6 +119,12 @@ def test_interaction_property_can_be_replaced_and_cleared():
     registry.interaction = None
     assert registry.interaction is None
 
+    replacement = PermissionManager(
+        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
+    )
+    registry.permission_manager = replacement
+    assert registry.permission_manager is replacement
+
 
 def test_call_reports_unknown_tools(monkeypatch):
     """Synchronous routing serializes an unknown-tool error at the registry boundary."""
@@ -128,6 +139,8 @@ def test_call_routes_arguments_and_runtime_context(monkeypatch):
     """Synchronous routing forwards arguments and builds context from the runtime interaction."""
     tool = Mock(name="tool", name_attribute="ignored")
     tool.name = "calculate"
+    tool.validate_arguments.return_value = ({}, None)
+    tool.permission_requests.return_value = ()
     tool.call.return_value = "result"
     monkeypatch.setattr(tool_registry_module, "Tool", Mock(return_value=tool))
     monkeypatch.setattr(tool_registry_module, "get_tool_description", Mock(return_value="Doc"))
@@ -142,13 +155,17 @@ def test_call_routes_arguments_and_runtime_context(monkeypatch):
         == "result"
     )
     context = tool.call.call_args.args[1]
-    assert context == ToolContext(runtime, "calculate", manager)
+    assert context.interaction is runtime
+    assert context.tool_name == "calculate"
+    assert context.instructions_manager is manager
 
 
 def test_call_uses_default_or_no_context(monkeypatch):
     """Synchronous routing uses the default interaction and omits context when none exists."""
     tool = Mock()
     tool.name = "calculate"
+    tool.validate_arguments.return_value = ({}, None)
+    tool.permission_requests.return_value = ()
     monkeypatch.setattr(tool_registry_module, "Tool", Mock(return_value=tool))
     monkeypatch.setattr(tool_registry_module, "get_tool_description", Mock(return_value="Doc"))
     monkeypatch.setattr(tool_registry_module, "get_tool_arguments_model", Mock())
@@ -157,7 +174,7 @@ def test_call_uses_default_or_no_context(monkeypatch):
     register(registry)
 
     registry.call("calculate", "{}")
-    assert tool.call.call_args.args[1] == ToolContext(interaction, "calculate")
+    assert tool.call.call_args.args[1].interaction is interaction
     registry.interaction = None
     registry.call("calculate", "{}")
     assert tool.call.call_args.args[1] is None
@@ -174,6 +191,8 @@ def test_call_async_routes_arguments_and_context(monkeypatch):
     """Asynchronous routing awaits the registered tool with an invocation context."""
     tool = Mock()
     tool.name = "calculate"
+    tool.validate_arguments.return_value = ({}, None)
+    tool.permission_requests.return_value = ()
     tool.call_async = AsyncMock(return_value="result")
     monkeypatch.setattr(tool_registry_module, "Tool", Mock(return_value=tool))
     monkeypatch.setattr(tool_registry_module, "get_tool_description", Mock(return_value="Doc"))
@@ -185,4 +204,18 @@ def test_call_async_routes_arguments_and_context(monkeypatch):
     result = asyncio.run(registry.call_async("calculate", "{}", interaction=interaction))
 
     assert result == "result"
-    assert tool.call_async.call_args.args[1] == ToolContext(interaction, "calculate")
+    assert tool.call_async.call_args.args[1].interaction is interaction
+
+
+def test_call_async_returns_validation_and_permission_denials_before_invocation():
+    """Async dispatch stops before invocation for invalid and rejected calls."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = False
+    registry = ToolRegistry(interaction=interaction)
+    register(registry)
+
+    invalid = asyncio.run(registry.call_async("calculate", "bad"))
+    denied = asyncio.run(registry.call_async("calculate", '{"number": 1}'))
+
+    assert "invalid_arguments" in invalid
+    assert "tool_call_denied" in denied
