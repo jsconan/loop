@@ -4,12 +4,26 @@ from base64 import b64encode
 from collections.abc import Iterable
 from html import escape
 from pathlib import Path
-from typing import Any, Self
+from typing import Self
 
 import yaml
 
 from ..utils import sha256_digest
 from .skill import Skill
+from .types import (
+    SkillActivationResponse,
+    SkillActivationResult,
+    SkillDeactivationResponse,
+    SkillDeactivationResult,
+    SkillListResult,
+    SkillOperationError,
+    SkillResource,
+    SkillResourceContentResponse,
+    SkillResourceContentResult,
+    SkillResourceListResponse,
+    SkillResourceListResult,
+    SkillSummary,
+)
 from .utils import (
     DEFAULT_SKILL_FILENAME,
     get_skill_directories,
@@ -225,59 +239,65 @@ class SkillManager:
         manager.restore(active_identities, refresh=True)
         return manager
 
-    def list(self) -> dict[str, Any]:
+    def list(self) -> SkillListResult:
         """Return available skills, activation state, and discovery diagnostics.
 
         Returns:
-            dict[str, Any]: Model-readable skill summaries and discovery diagnostics.
+            SkillListResult: Model-readable skill summaries and discovery diagnostics.
         """
-        return {
-            "skills": [self._summary(skill) for skill in self._skills],
-            "diagnostics": list(self._diagnostics),
-        }
+        return SkillListResult(
+            skills=[self._summary(skill) for skill in self._skills],
+            diagnostics=list(self._diagnostics),
+        )
 
-    def activate(self, name: str) -> dict[str, Any]:
+    def activate(self, name: str) -> SkillActivationResponse:
         """Load one skill's complete instructions into managed state.
 
         Args:
             name (str): Exact skill name to activate.
 
         Returns:
-            dict[str, Any]: Activation metadata or a structured missing result.
+            SkillActivationResponse: Activation metadata or a structured missing result.
         """
         skill = self._skills_by_name.get(name)
         if skill is None:
-            return {"error": "unknown_skill", "message": f"Skill '{name}' is not available."}
+            return SkillOperationError(
+                error="unknown_skill",
+                message=f"Skill '{name}' is not available.",
+            )
         instructions_updated = skill.location not in self._activated
         if instructions_updated:
             content = skill.location.read_text(encoding="utf-8")
             self._activated[skill.location] = read_instruction_body(content, skill.location.name)
-        return {
+        return SkillActivationResult(
             **self._summary(skill),
-            "skill_root": str(skill.location.parent),
-            "status": "activated",
-            "instructions_updated": instructions_updated,
-        }
+            skill_root=str(skill.location.parent),
+            status="activated",
+            instructions_updated=instructions_updated,
+        )
 
-    def deactivate(self, name: str) -> dict[str, Any]:
+    def deactivate(self, name: str) -> SkillDeactivationResponse:
         """Deactivate one skill and release its instructions.
 
         Args:
             name (str): Exact skill name to deactivate.
 
         Returns:
-            dict[str, Any]: Deactivated skill metadata or a structured missing result.
+            SkillDeactivationResponse: Deactivated skill metadata or a structured missing result.
         """
         skill = self._skills_by_name.get(name)
         if skill is None:
-            return {"error": "unknown_skill", "message": f"Skill '{name}' is not available."}
+            return SkillOperationError(
+                error="unknown_skill",
+                message=f"Skill '{name}' is not available.",
+            )
         instructions_updated = skill.location in self._activated
         self._activated.pop(skill.location, None)
-        return {
+        return SkillDeactivationResult(
             **self._summary(skill),
-            "status": "deactivated",
-            "instructions_updated": instructions_updated,
-        }
+            status="deactivated",
+            instructions_updated=instructions_updated,
+        )
 
     def deactivate_all(self) -> int:
         """Deactivate all skills and release their instructions.
@@ -306,7 +326,7 @@ class SkillManager:
         identities: Iterable[tuple[str, str]],
         *,
         refresh: bool = False,
-    ) -> list[dict[str, Any]]:
+    ) -> list[SkillActivationResult]:
         """Activate definitions that exactly match persisted identities.
 
         Args:
@@ -316,7 +336,7 @@ class SkillManager:
                 session restoration.
 
         Returns:
-            list[dict[str, Any]]: Activation results for definitions that still match.
+            list[SkillActivationResult]: Activation results for definitions that still match.
         """
         results = []
         for name, location in identities:
@@ -343,23 +363,26 @@ class SkillManager:
                     raise
         return results
 
-    def list_resources(self, name: str) -> dict[str, Any]:
+    def list_resources(self, name: str) -> SkillResourceListResponse:
         """List bounded on-demand resources belonging to an active skill.
 
         Args:
             name (str): Exact active skill name.
 
         Returns:
-            dict[str, Any]: Resource paths and sizes, or a structured error.
+            SkillResourceListResponse: Resource paths and sizes, or a structured error.
         """
         skill = self._skills_by_name.get(name)
         if skill is None:
-            return {"error": "unknown_skill", "message": f"Skill '{name}' is not available."}
+            return SkillOperationError(
+                error="unknown_skill",
+                message=f"Skill '{name}' is not available.",
+            )
         if skill.location not in self._activated:
-            return {
-                "error": "skill_not_active",
-                "message": f"Skill '{name}' must be activated before loading its resources.",
-            }
+            return SkillOperationError(
+                error="skill_not_active",
+                message=f"Skill '{name}' must be activated before loading its resources.",
+            )
         root = skill.location.parent.resolve()
         resources = []
         for directory_name in RESOURCE_DIRECTORIES:
@@ -370,11 +393,14 @@ class SkillManager:
                 resolved = path.resolve()
                 if path.is_file() and resolved.is_relative_to(root):
                     resources.append(
-                        {"path": str(resolved.relative_to(root)), "size_bytes": path.stat().st_size}
+                        SkillResource(
+                            path=str(resolved.relative_to(root)),
+                            size_bytes=path.stat().st_size,
+                        )
                     )
-        return {"name": name, "skill_root": str(root), "resources": resources}
+        return SkillResourceListResult(name=name, skill_root=str(root), resources=resources)
 
-    def read_resource(self, name: str, resource_path: str) -> dict[str, Any]:
+    def read_resource(self, name: str, resource_path: str) -> SkillResourceContentResponse:
         """Read one active skill resource without adding it to persistent instructions.
 
         Args:
@@ -382,7 +408,7 @@ class SkillManager:
             resource_path (str): Relative path beneath references, scripts, or assets.
 
         Returns:
-            dict[str, Any]: Text or base64 resource content, or a structured error.
+            SkillResourceContentResponse: Text or base64 resource content, or a structured error.
         """
         listed = self.list_resources(name)
         if "error" in listed:
@@ -393,22 +419,22 @@ class SkillManager:
             candidate.is_relative_to(root / directory) for directory in RESOURCE_DIRECTORIES
         )
         if not allowed or not candidate.is_file():
-            return {
-                "error": "invalid_skill_resource",
-                "message": "Resource must be a file beneath references, scripts, or assets.",
-            }
+            return SkillOperationError(
+                error="invalid_skill_resource",
+                message="Resource must be a file beneath references, scripts, or assets.",
+            )
         content = candidate.read_bytes()
         if len(content) > MAX_RESOURCE_BYTES:
-            return {
-                "error": "skill_resource_too_large",
-                "message": f"Resource exceeds the {MAX_RESOURCE_BYTES}-byte loading limit.",
-                "size_bytes": len(content),
-            }
-        result = {
-            "name": name,
-            "path": str(candidate.relative_to(root)),
-            "size_bytes": len(content),
-        }
+            return SkillOperationError(
+                error="skill_resource_too_large",
+                message=f"Resource exceeds the {MAX_RESOURCE_BYTES}-byte loading limit.",
+                size_bytes=len(content),
+            )
+        result = SkillResourceContentResult(
+            name=name,
+            path=str(candidate.relative_to(root)),
+            size_bytes=len(content),
+        )
         try:
             result.update({"encoding": "utf-8", "content": content.decode("utf-8")})
         except UnicodeDecodeError:
@@ -451,11 +477,11 @@ class SkillManager:
         )
         return f"{header}{''.join(entries)}{warning}{footer}"[:max_chars]
 
-    def _summary(self, skill: Skill) -> dict[str, Any]:
+    def _summary(self, skill: Skill) -> SkillSummary:
         """Return model-readable metadata for one skill."""
-        return {
-            "name": skill.name,
-            "description": skill.description,
-            "location": str(skill.location),
-            "activated": skill.location in self._activated,
-        }
+        return SkillSummary(
+            name=skill.name,
+            description=skill.description,
+            location=str(skill.location),
+            activated=skill.location in self._activated,
+        )

@@ -38,10 +38,10 @@ def list_folder(
         entries = iter_visible_paths(folder, recursive)
         result = sorted(
             (
-                {
-                    "path": str(entry.relative_to(folder)) if recursive else entry.name,
-                    "type": "folder" if entry.is_dir() else "file",
-                }
+                FolderEntry(
+                    path=str(entry.relative_to(folder)) if recursive else entry.name,
+                    type="folder" if entry.is_dir() else "file",
+                )
                 for entry in entries
                 if (entry_type in ("all", "files") and entry.is_file())
                 or (entry_type in ("all", "folders") and entry.is_dir())

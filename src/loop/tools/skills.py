@@ -5,6 +5,11 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from ..context import ToolContext
+from ..skills.types import (
+    PublicSkillOperationResult,
+    SkillOperationError,
+    SkillOperationResult,
+)
 from ..tooling import tool_registry
 
 _FIELDS_BY_NAME = {
@@ -21,7 +26,7 @@ def _filter_fields(result: dict[str, Any], fields: tuple[str, ...]) -> dict[str,
     return {key: result[key] for key in fields if key in result}
 
 
-def _public_result(action: str, result: dict[str, Any]) -> dict[str, Any]:
+def _public_result(action: str, result: SkillOperationResult) -> PublicSkillOperationResult:
     """Return only fields required by the model-facing skill protocol."""
     if "error" in result:
         public = _filter_fields(result, ("error", "message"))
@@ -60,16 +65,19 @@ def manage_skills(
         str | None,
         Field(description="Relative skill resource path when reading a resource."),
     ] = None,
-) -> dict:
+) -> PublicSkillOperationResult:
     """List, activate, or deactivate skill instructions on demand."""
     manager = context.instructions_manager
     if manager is None:
-        return {"error": "skills_unavailable", "message": "No InstructionsManager is active."}
+        return SkillOperationError(
+            error="skills_unavailable",
+            message="No InstructionsManager is active.",
+        )
     if action not in ("list", "deactivate_all") and not name:
-        return {
-            "error": "missing_skill_name",
-            "message": f"The {action} action requires a skill name.",
-        }
+        return SkillOperationError(
+            error="missing_skill_name",
+            message=f"The {action} action requires a skill name.",
+        )
     try:
         if action == "list":
             result = manager.list_skills()
@@ -81,17 +89,17 @@ def manage_skills(
             result = manager.list_skill_resources(name)
         elif action == "read_resource":
             if not path:
-                return {
-                    "error": "missing_resource_path",
-                    "message": "The read_resource action requires a relative path.",
-                }
+                return SkillOperationError(
+                    error="missing_resource_path",
+                    message="The read_resource action requires a relative path.",
+                )
             result = manager.read_skill_resource(name, path)
         else:
             result = manager.deactivate_skill(name)
     except OSError, UnicodeError, ValueError:
         target = f" for skill '{name}'" if name else ""
-        return {
-            "error": "skill_operation_failed",
-            "message": f"The {action} action failed{target}.",
-        }
+        return SkillOperationError(
+            error="skill_operation_failed",
+            message=f"The {action} action failed{target}.",
+        )
     return _public_result(action, result)

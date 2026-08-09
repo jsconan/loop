@@ -5,16 +5,25 @@ from collections.abc import AsyncIterator, Iterable, Iterator
 import httpx
 from openai import APIError, AsyncOpenAI, OpenAI
 from openai.types.model import Model as OpenAIModel
+from openai.types.responses import EasyInputMessageParam as OpenAIMessageParam
+from openai.types.responses import FunctionToolParam as OpenAIFunctionToolParam
 from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses import ResponseCompletedEvent as OpenAIResponseCompletedEvent
 from openai.types.responses import ResponseFunctionToolCall as OpenAIFunctionToolCall
+from openai.types.responses import ResponseFunctionToolCallParam as OpenAIFunctionToolCallParam
+from openai.types.responses import ResponseInputItemParam as OpenAIInputItemParam
 from openai.types.responses import ResponseOutputItem as OpenAIResponseOutputItem
 from openai.types.responses import ResponseOutputItemDoneEvent as OpenAIOutputItemDoneEvent
 from openai.types.responses import ResponseOutputMessage as OpenAIOutputMessage
 from openai.types.responses import ResponseReasoningItem as OpenAIReasoningItem
+from openai.types.responses import ResponseReasoningItemParam as OpenAIReasoningItemParam
 from openai.types.responses import ResponseReasoningTextDeltaEvent as OpenAIReasoningDeltaEvent
 from openai.types.responses import ResponseStreamEvent as OpenAIResponseStreamEvent
 from openai.types.responses import ResponseTextDeltaEvent as OpenAITextDeltaEvent
+from openai.types.responses.response_input_item_param import (
+    FunctionCallOutput as OpenAIFunctionCallOutputParam,
+)
+from openai.types.responses.response_reasoning_item_param import Content as OpenAIReasoningContent
 
 from ..models import (
     AnswerCompleted,
@@ -345,53 +354,61 @@ class OpenAIBackend(Backend):
         return ModelInfo(id=model.id, context_window=context_window)
 
     @classmethod
-    def _serialize_input(cls, input: str | Iterable[ConversationItem]):  # pylint: disable=redefined-builtin
+    def _serialize_input(  # pylint: disable=redefined-builtin
+        cls, input: str | Iterable[ConversationItem]
+    ) -> str | list[OpenAIInputItemParam]:
         """Translate conversation items into OpenAI-compatible request items."""
         if isinstance(input, str):
             return input
         return [cls._serialize_item(item) for item in input]
 
     @staticmethod
-    def _serialize_item(item: ConversationItem) -> dict:
+    def _serialize_item(item: ConversationItem) -> OpenAIInputItemParam:
         """Translate one conversation item into an OpenAI-compatible request item."""
         if isinstance(item, Message):
-            return {"role": item.role, "content": item.content}
+            return OpenAIMessageParam(role=item.role, content=item.content)
         if isinstance(item, Reasoning):
-            content = [{"type": "reasoning_text", "text": item.content}] if item.content else []
-            result = {"type": "reasoning", "summary": [], "content": content}
+            content = (
+                [OpenAIReasoningContent(type="reasoning_text", text=item.content)]
+                if item.content
+                else []
+            )
+            result = OpenAIReasoningItemParam(type="reasoning", summary=[], content=content)
             if item.id is not None:
                 result["id"] = item.id
             return result
         if isinstance(item, ToolCall):
-            result = {
-                "type": "function_call",
-                "call_id": item.call_id,
-                "name": item.name,
-                "arguments": item.arguments,
-                "status": "completed",
-            }
+            result = OpenAIFunctionToolCallParam(
+                type="function_call",
+                call_id=item.call_id,
+                name=item.name,
+                arguments=item.arguments,
+                status="completed",
+            )
             if item.id is not None:
                 result["id"] = item.id
             return result
         if isinstance(item, ToolResult):
-            return {
-                "type": "function_call_output",
-                "call_id": item.call_id,
-                "output": item.output,
-            }
+            return OpenAIFunctionCallOutputParam(
+                type="function_call_output",
+                call_id=item.call_id,
+                output=item.output,
+            )
         raise TypeError(f"Unsupported conversation item: {type(item)}")
 
     @staticmethod
-    def _serialize_tools(definitions: Iterable[ToolDefinition]) -> list[dict]:
+    def _serialize_tools(
+        definitions: Iterable[ToolDefinition],
+    ) -> list[OpenAIFunctionToolParam]:
         """Translate tool definitions into OpenAI-compatible declarations."""
         return [
-            {
-                "type": "function",
-                "name": definition.name,
-                "description": definition.description,
-                "parameters": definition.parameters,
-                "strict": definition.strict,
-            }
+            OpenAIFunctionToolParam(
+                type="function",
+                name=definition.name,
+                description=definition.description,
+                parameters=definition.parameters,
+                strict=definition.strict,
+            )
             for definition in definitions
         ]
 

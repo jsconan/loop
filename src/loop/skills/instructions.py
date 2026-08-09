@@ -5,10 +5,23 @@ from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 from threading import RLock
-from typing import Any, Self
+from typing import Self
 
 from ..utils import sha256_digest
 from .skill_manager import SkillManager
+from .types import (
+    InstructionContext,
+    InstructionSectionSummary,
+    InstructionSourceSummary,
+    ManagedSkillListResult,
+    SkillActivationResponse,
+    SkillActivationResult,
+    SkillDeactivationAllResult,
+    SkillDeactivationResponse,
+    SkillOperationError,
+    SkillResourceContentResponse,
+    SkillResourceListResponse,
+)
 from .utils import (
     DEFAULT_AGENTS_FILENAME,
     DEFAULT_SKILL_FILENAME,
@@ -206,50 +219,53 @@ class InstructionsManager:
         """
         return self._max_bytes
 
-    def list_skills(self) -> dict[str, Any]:
+    def list_skills(self) -> ManagedSkillListResult:
         """Return available skills and activation diagnostics.
 
         Returns:
-            dict[str, Any]: Model-readable skill summaries and diagnostics.
+            ManagedSkillListResult: Model-readable skill summaries and diagnostics.
         """
         result = self._skill_manager.list()
         sections = self._instruction_sections()
-        result["instruction_context"] = {
-            "working_directory": (
+        result["instruction_context"] = InstructionContext(
+            working_directory=(
                 str(self._working_directory) if self._working_directory is not None else None
             ),
-            "generation": self._generation,
-            "dirty": self._dirty,
-            "diagnostics": [
+            generation=self._generation,
+            dirty=self._dirty,
+            diagnostics=[
                 *self._refresh_diagnostics,
                 *self._skill_manager.lifecycle_diagnostics,
             ],
-            "refresh_changes": list(self._refresh_changes),
-            "sources": [
-                {
-                    "path": str(source.path),
-                    "size_bytes": source.size_bytes,
-                    "included_bytes": source.included_bytes,
-                    "truncated": source.truncated,
-                }
+            refresh_changes=list(self._refresh_changes),
+            sources=[
+                InstructionSourceSummary(
+                    path=str(source.path),
+                    size_bytes=source.size_bytes,
+                    included_bytes=source.included_bytes,
+                    truncated=source.truncated,
+                )
                 for source in self._project_sources
             ],
-            "size_bytes": self._encoded_size(self._instructions),
-            "max_bytes": self._max_bytes,
-            "digest": sha256_digest(self._instructions or ""),
-            "sections": [
-                {
-                    "kind": section.kind,
-                    "source": section.source,
-                    "size_bytes": section.size_bytes,
-                    "digest": section.digest,
-                }
+            size_bytes=self._encoded_size(self._instructions),
+            max_bytes=self._max_bytes,
+            digest=sha256_digest(self._instructions or ""),
+            sections=[
+                InstructionSectionSummary(
+                    kind=section.kind,
+                    source=section.source,
+                    size_bytes=section.size_bytes,
+                    digest=section.digest,
+                )
                 for section in sections
             ],
-        }
+        )
+
         return result
 
-    def reactivate_skills(self, identities: Iterable[tuple[str, str]]) -> list[dict[str, Any]]:
+    def reactivate_skills(
+        self, identities: Iterable[tuple[str, str]]
+    ) -> list[SkillActivationResult]:
         """Reactivate skills that still match their persisted identities.
 
         Args:
@@ -257,8 +273,8 @@ class InstructionsManager:
                 ``SKILL.md`` locations.
 
         Returns:
-            list[dict[str, Any]]: Activation results for matching current definitions. Missing or
-                newly shadowed identities are omitted.
+            list[SkillActivationResult]: Activation results for matching current definitions.
+                Missing or newly shadowed identities are omitted.
         """
         with self._lock:
             self.prepare()
@@ -321,15 +337,15 @@ class InstructionsManager:
                 return False
             return self._refresh(working_directory, signature)
 
-    def activate_skill(self, name: str) -> dict[str, Any]:
+    def activate_skill(self, name: str) -> SkillActivationResponse:
         """Activate a skill for subsequent backend requests.
 
         Args:
             name (str): Exact available skill name.
 
         Returns:
-            dict[str, Any]: Compact activation acknowledgement or structured error. The skill body
-                is retained in the instruction document rather than returned in this result.
+            SkillActivationResponse: Compact activation acknowledgement or structured error. The
+                skill body is retained in the instruction document rather than returned here.
 
         Raises:
             OSError: The skill instruction file cannot be read.
@@ -343,14 +359,14 @@ class InstructionsManager:
                 return result
             return self._commit_activation(result)
 
-    def deactivate_skill(self, name: str) -> dict[str, Any]:
+    def deactivate_skill(self, name: str) -> SkillDeactivationResponse:
         """Deactivate a skill and remove it from subsequent backend requests.
 
         Args:
             name (str): Exact available skill name.
 
         Returns:
-            dict[str, Any]: Compact deactivation acknowledgement or structured error.
+            SkillDeactivationResponse: Compact deactivation acknowledgement or structured error.
         """
         with self._lock:
             self.prepare()
@@ -361,11 +377,11 @@ class InstructionsManager:
                     self._generation += 1
             return result
 
-    def deactivate_all_skills(self) -> dict[str, Any]:
+    def deactivate_all_skills(self) -> SkillDeactivationAllResult:
         """Deactivate every active skill and rebuild subsequent instructions.
 
         Returns:
-            dict[str, Any]: Compact acknowledgement with the number of deactivated skills.
+            SkillDeactivationAllResult: Acknowledgement with the number of deactivated skills.
         """
         with self._lock:
             self.prepare()
@@ -373,26 +389,26 @@ class InstructionsManager:
             if count:
                 self._instructions = self._build_instructions()
                 self._generation += 1
-            return {
-                "status": "deactivated_all",
-                "deactivated": count,
-                "instructions_updated": bool(count),
-            }
+            return SkillDeactivationAllResult(
+                status="deactivated_all",
+                deactivated=count,
+                instructions_updated=bool(count),
+            )
 
-    def list_skill_resources(self, name: str) -> dict[str, Any]:
+    def list_skill_resources(self, name: str) -> SkillResourceListResponse:
         """List resources available to one active skill.
 
         Args:
             name (str): Exact active skill name.
 
         Returns:
-            dict[str, Any]: Bounded resource metadata or a structured error.
+            SkillResourceListResponse: Bounded resource metadata or a structured error.
         """
         with self._lock:
             self.prepare()
             return self._skill_manager.list_resources(name)
 
-    def read_skill_resource(self, name: str, resource_path: str) -> dict[str, Any]:
+    def read_skill_resource(self, name: str, resource_path: str) -> SkillResourceContentResponse:
         """Read one active skill resource on demand.
 
         Args:
@@ -400,7 +416,7 @@ class InstructionsManager:
             resource_path (str): Relative resource path beneath the skill root.
 
         Returns:
-            dict[str, Any]: Resource content or a structured error.
+            SkillResourceContentResponse: Resource content or a structured error.
         """
         with self._lock:
             self.prepare()
@@ -481,19 +497,19 @@ class InstructionsManager:
         """Render the current instruction sources."""
         return self._compose(self._project_instructions, self._skill_manager)
 
-    def _commit_activation(self, result: dict[str, Any]) -> dict[str, Any]:
+    def _commit_activation(self, result: SkillActivationResult) -> SkillActivationResponse:
         """Commit an activated skill to the aggregate instruction snapshot or roll it back."""
         instructions = self._build_instructions()
         size = self._encoded_size(instructions)
         if size > self._max_bytes:
             if result["instructions_updated"]:
                 self._skill_manager.deactivate(result["name"])
-            return {
-                "error": "instruction_budget_exceeded",
-                "message": f"Activating skill '{result['name']}' exceeds the instruction budget.",
-                "max_bytes": self._max_bytes,
-                "required_bytes": size,
-            }
+            return SkillOperationError(
+                error="instruction_budget_exceeded",
+                message=f"Activating skill '{result['name']}' exceeds the instruction budget.",
+                max_bytes=self._max_bytes,
+                required_bytes=size,
+            )
         if result["instructions_updated"]:
             self._instructions = instructions
             self._generation += 1
