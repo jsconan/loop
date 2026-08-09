@@ -68,6 +68,10 @@ def test_activated_skills_returns_immutable_discovery_ordered_snapshot(tmp_path)
         "Instructions",
         "Instructions",
     )
+    assert manager.active_identities == (
+        ("first", str((skills_directory / "first" / "SKILL.md").resolve())),
+        ("second", str((skills_directory / "second" / "SKILL.md").resolve())),
+    )
 
 
 def test_counts_and_deactivate_manage_activated_skill_lifecycle(tmp_path):
@@ -79,10 +83,15 @@ def test_counts_and_deactivate_manage_activated_skill_lifecycle(tmp_path):
 
     assert manager.count == 2
     assert manager.activated == 0
+    assert manager.is_active("first") is False
+    assert manager.is_active("missing") is False
 
-    manager.activate("first")
+    assert manager.activate("first")["instructions_updated"] is True
+    assert manager.activate("first")["instructions_updated"] is False
+    assert manager.is_active("first") is True
     assert manager.activated == 1
-    assert manager.deactivate("first")["status"] == "deactivated"
+    assert manager.deactivate("first")["instructions_updated"] is True
+    assert manager.deactivate("first")["instructions_updated"] is False
     assert manager.activated == 0
     assert not manager.list()["skills"][0]["activated"]
 
@@ -108,10 +117,66 @@ def test_deactivate_reports_unknown_names_and_deactivate_all_clears_every_skill(
     assert manager.deactivate("unique")["status"] == "deactivated"
 
     manager.activate("unique")
-    manager.deactivate_all()
+    assert manager.deactivate_all() == 1
+    assert manager.deactivate_all() == 0
 
     assert manager.activated == 0
     assert manager.activated_skills == ()
+
+
+def test_restore_owns_identity_matching_and_lifecycle_diagnostics(tmp_path):
+    """Restoration accepts exact identities and diagnoses missing or shadowed definitions."""
+    skills_directory = tmp_path / "skills"
+    location = write_skill(skills_directory / "review", "review", "Review changes.")
+    manager = SkillManager.discover(tmp_path, [skills_directory])
+
+    results = manager.restore(
+        [
+            ("review", str(tmp_path / "stale" / "SKILL.md")),
+            ("missing", str(tmp_path / "missing" / "SKILL.md")),
+            ("review", str(location.resolve())),
+        ]
+    )
+
+    assert [result["name"] for result in results] == ["review"]
+    assert manager.is_active("review") is True
+    assert manager.lifecycle_diagnostics == (
+        "Could not restore 'review': its definition was removed or shadowed.",
+        "Could not restore 'missing': its definition was removed or shadowed.",
+    )
+
+
+def test_rediscovery_preserves_only_exact_valid_active_definitions(tmp_path, monkeypatch):
+    """Rediscovery reloads exact identities and contains refresh failures as diagnostics."""
+    (tmp_path / ".git").mkdir()
+    location = write_skill(
+        tmp_path / ".agents" / "skills" / "review",
+        "review",
+        "Review changes.",
+    )
+    identity = ("review", str(location.resolve()))
+
+    refreshed = SkillManager.rediscover(tmp_path, [identity, ("missing", "/missing/SKILL.md")])
+
+    assert refreshed.active_identities == (identity,)
+    assert refreshed.lifecycle_diagnostics == (
+        "Deactivated 'missing' during refresh: its definition was removed or shadowed.",
+    )
+
+    def fail_activation(name):
+        raise ValueError("changed skill is invalid")
+
+    invalid = SkillManager.discover(tmp_path)
+    monkeypatch.setattr(invalid, "activate", fail_activation)
+    invalid.restore([identity], refresh=True)
+
+    assert invalid.active_identities == ()
+    assert "changed skill is invalid" in invalid.lifecycle_diagnostics[0]
+
+    restoring = SkillManager.discover(tmp_path)
+    monkeypatch.setattr(restoring, "activate", fail_activation)
+    with pytest.raises(ValueError, match="changed skill is invalid"):
+        restoring.restore([identity])
 
 
 def test_resources_are_listed_and_loaded_only_for_active_skills(tmp_path):

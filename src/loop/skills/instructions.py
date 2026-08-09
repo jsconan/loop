@@ -16,7 +16,6 @@ from .utils import (
     LoadedAgentInstructions,
     build_instructions,
     get_agents_files,
-    get_skill_directories,
     load_agents_instructions,
 )
 
@@ -187,7 +186,7 @@ class InstructionsManager:
         Returns:
             list[tuple[str, str]]: Active identities in discovery order.
         """
-        return [(skill.name, str(skill.location)) for skill in self._skill_manager.activated_skills]
+        return list(self._skill_manager.active_identities)
 
     @property
     def skill_manager(self) -> SkillManager:
@@ -221,7 +220,10 @@ class InstructionsManager:
             ),
             "generation": self._generation,
             "dirty": self._dirty,
-            "diagnostics": list(self._refresh_diagnostics),
+            "diagnostics": [
+                *self._refresh_diagnostics,
+                *self._skill_manager.lifecycle_diagnostics,
+            ],
             "refresh_changes": list(self._refresh_changes),
             "sources": [
                 {
@@ -258,23 +260,15 @@ class InstructionsManager:
             list[dict[str, Any]]: Activation results for matching current definitions. Missing or
                 newly shadowed identities are omitted.
         """
-        results = []
-        for name, location in identities:
-            skill = next(
-                (
-                    candidate
-                    for candidate in self._skill_manager.skills
-                    if candidate.name == name and str(candidate.location) == location
-                ),
-                None,
-            )
-            if skill is not None:
-                results.append(self.activate_skill(name))
-            else:
-                self._refresh_diagnostics.append(
-                    f"Could not restore '{name}': its definition was removed or shadowed."
-                )
-        return results
+        with self._lock:
+            self.prepare()
+            results = []
+            for identity in identities:
+                restored = self._skill_manager.restore([identity])
+                if not restored:
+                    continue
+                results.append(self._commit_activation(restored[0]))
+            return results
 
     def observe_path(self, path: Path | str, *, directory: bool = False) -> None:
         """Record a successfully accessed path as the next instruction scope.
@@ -344,28 +338,10 @@ class InstructionsManager:
         """
         with self._lock:
             self.prepare()
-            previously_active = any(
-                skill.name == name for skill in self._skill_manager.activated_skills
-            )
             result = self._skill_manager.activate(name)
             if "error" in result:
                 return result
-            instructions = self._build_instructions()
-            size = self._encoded_size(instructions)
-            if size > self._max_bytes:
-                self._skill_manager.deactivate(name)
-                return {
-                    "error": "instruction_budget_exceeded",
-                    "message": f"Activating skill '{name}' exceeds the instruction budget.",
-                    "max_bytes": self._max_bytes,
-                    "required_bytes": size,
-                }
-            updated = not previously_active
-            if updated:
-                self._instructions = instructions
-                self._generation += 1
-            result["instructions_updated"] = updated
-            return result
+            return self._commit_activation(result)
 
     def deactivate_skill(self, name: str) -> dict[str, Any]:
         """Deactivate a skill and remove it from subsequent backend requests.
@@ -378,13 +354,9 @@ class InstructionsManager:
         """
         with self._lock:
             self.prepare()
-            previously_active = any(
-                skill.name == name for skill in self._skill_manager.activated_skills
-            )
             result = self._skill_manager.deactivate(name)
             if "error" not in result:
-                result["instructions_updated"] = previously_active
-                if previously_active:
+                if result["instructions_updated"]:
                     self._instructions = self._build_instructions()
                     self._generation += 1
             return result
@@ -397,8 +369,7 @@ class InstructionsManager:
         """
         with self._lock:
             self.prepare()
-            count = self._skill_manager.activated
-            self._skill_manager.deactivate_all()
+            count = self._skill_manager.deactivate_all()
             if count:
                 self._instructions = self._build_instructions()
                 self._generation += 1
@@ -439,9 +410,7 @@ class InstructionsManager:
         """Build and atomically install a refreshed instruction snapshot."""
         previous_target = self._signature[0] if self._signature else None
         previous_instructions = self._instructions
-        active = {
-            (skill.name, skill.location) for skill, _ in self._skill_manager.activated_instructions
-        }
+        active = self._skill_manager.active_identities
         loaded = load_agents_instructions(working_directory)
         project_instructions = loaded.content
         refresh_changes = self._describe_refresh(working_directory, loaded)
@@ -455,18 +424,10 @@ class InstructionsManager:
                 previous_instructions,
             )
 
-        skill_manager = SkillManager.discover(working_directory)
+        skill_manager = SkillManager.rediscover(working_directory, active)
         diagnostics = self._load_diagnostics(loaded)
 
-        for skill in skill_manager.skills:
-            identity = (skill.name, skill.location)
-            if identity not in active:
-                continue
-            try:
-                skill_manager.activate(skill.name)
-            except (OSError, UnicodeError, ValueError) as exc:
-                diagnostics.append(f"Deactivated '{skill.name}' during refresh: {exc}")
-                continue
+        for skill in skill_manager.activated_skills:
             instructions = self._compose(project_instructions, skill_manager)
             if self._encoded_size(instructions) > self._max_bytes:
                 skill_manager.deactivate(skill.name)
@@ -477,15 +438,6 @@ class InstructionsManager:
         instructions = self._compose(project_instructions, skill_manager)
         if self._encoded_size(instructions) > self._max_bytes:
             raise ValueError("Refreshed base instructions exceed the configured instruction limit.")
-
-        preserved = {(skill.name, skill.location) for skill in skill_manager.activated_skills}
-        for name, location in active:
-            if (name, location) not in preserved and not any(
-                diagnostic.startswith(f"Deactivated '{name}'") for diagnostic in diagnostics
-            ):
-                diagnostics.append(
-                    f"Deactivated '{name}' during refresh: its definition was removed or shadowed."
-                )
 
         changed = previous_target != str(working_directory) or previous_instructions != instructions
         self._project_instructions = project_instructions
@@ -529,6 +481,24 @@ class InstructionsManager:
         """Render the current instruction sources."""
         return self._compose(self._project_instructions, self._skill_manager)
 
+    def _commit_activation(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Commit an activated skill to the aggregate instruction snapshot or roll it back."""
+        instructions = self._build_instructions()
+        size = self._encoded_size(instructions)
+        if size > self._max_bytes:
+            if result["instructions_updated"]:
+                self._skill_manager.deactivate(result["name"])
+            return {
+                "error": "instruction_budget_exceeded",
+                "message": f"Activating skill '{result['name']}' exceeds the instruction budget.",
+                "max_bytes": self._max_bytes,
+                "required_bytes": size,
+            }
+        if result["instructions_updated"]:
+            self._instructions = instructions
+            self._generation += 1
+        return result
+
     def _instruction_sections(self) -> tuple[InstructionSection, ...]:
         """Return typed provenance for every currently composed section."""
         sections = [
@@ -564,10 +534,6 @@ class InstructionsManager:
         if working_directory is None:
             return ()
         paths = get_agents_files(working_directory)
-        for skill_directory in get_skill_directories(working_directory):
-            paths.append(skill_directory)
-            if skill_directory.is_dir():
-                paths.extend(sorted(skill_directory.glob(f"*/{DEFAULT_SKILL_FILENAME}")))
         fingerprints = []
         for path in paths:
             try:
@@ -578,7 +544,11 @@ class InstructionsManager:
                 )
             except FileNotFoundError:
                 fingerprints.append((str(path.resolve()), None))
-        return (str(working_directory), *fingerprints)
+        return (
+            str(working_directory),
+            *fingerprints,
+            SkillManager.discovery_signature(working_directory),
+        )
 
     @staticmethod
     def _encoded_size(instructions: str | None) -> int:

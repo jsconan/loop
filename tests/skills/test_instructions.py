@@ -222,6 +222,55 @@ def test_reactivate_skills_restores_only_matching_current_identities(tmp_path):
     ]
 
 
+def test_reactivation_preserves_idempotence_and_aggregate_budget(tmp_path):
+    """Session restoration reports unchanged skills and rejects oversized aggregate instructions."""
+    skill = write_skill(tmp_path / "skills" / "large", "large", "x" * 100)
+    skill_manager = SkillManager([skill])
+    baseline = InstructionsManager(skill_manager=skill_manager).instructions
+    manager = InstructionsManager(skill_manager=skill_manager, max_bytes=len(baseline) + 10)
+    identity = [("large", str(skill.location))]
+
+    rejected = manager.reactivate_skills(identity)
+
+    assert rejected[0]["error"] == "instruction_budget_exceeded"
+    assert manager.active_skill_identities == []
+
+    roomy = InstructionsManager(skill_manager=SkillManager([skill]))
+    roomy.activate_skill("large")
+    repeated = roomy.reactivate_skills(identity)
+
+    assert repeated[0]["instructions_updated"] is False
+
+    externally_activated = SkillManager([skill])
+    constrained = InstructionsManager(
+        skill_manager=externally_activated,
+        max_bytes=len(baseline) + 10,
+    )
+    externally_activated.activate("large")
+
+    repeated_rejection = constrained.reactivate_skills(identity)
+    direct_rejection = constrained.activate_skill("large")
+
+    assert repeated_rejection[0]["error"] == "instruction_budget_exceeded"
+    assert direct_rejection["error"] == "instruction_budget_exceeded"
+    assert externally_activated.is_active("large") is True
+
+
+def test_resource_facades_prepare_before_delegating(tmp_path):
+    """Compatibility resource façades refresh context before low-level skill reads."""
+    skill = write_skill(tmp_path / "skills" / "resourceful", "resourceful")
+    reference = skill.location.parent / "references" / "guide.md"
+    reference.parent.mkdir()
+    reference.write_text("Guide.", encoding="utf-8")
+    manager = InstructionsManager(skill_manager=SkillManager([skill]))
+    manager.activate_skill("resourceful")
+
+    assert manager.list_skill_resources("resourceful")["resources"] == [
+        {"path": "references/guide.md", "size_bytes": 6}
+    ]
+    assert manager.read_skill_resource("resourceful", "references/guide.md")["content"] == "Guide."
+
+
 def test_refresh_deactivates_invalid_and_oversized_active_skills(tmp_path, monkeypatch):
     """Refresh safely drops active bodies that fail validation or the instruction budget."""
     (tmp_path / ".git").mkdir()
@@ -265,7 +314,7 @@ def test_refresh_deactivates_invalid_and_oversized_active_skills(tmp_path, monke
     )
 
 
-def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path):
+def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path, monkeypatch):
     """Only instruction sources invalidate, and an invalid candidate preserves prior content."""
     manager = InstructionsManager.discover(tmp_path, max_bytes=20)
     manager.invalidate(tmp_path / "ordinary.py")
@@ -283,6 +332,17 @@ def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path
     static = InstructionsManager()
     static.invalidate()
     assert static.prepare() is False
+
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    racing = InstructionsManager.discover(clean)
+    missing = clean / "disappeared" / "AGENTS.md"
+    monkeypatch.setattr(
+        "loop.skills.instructions.get_agents_files",
+        lambda working_directory: [missing],
+    )
+    racing.invalidate()
+    assert racing.prepare() is False
 
 
 def test_manager_rejects_invalid_and_oversized_initial_limits():

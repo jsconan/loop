@@ -1,6 +1,8 @@
 """Discover and progressively load Agent Skills."""
 
 from base64 import b64encode
+from collections.abc import Iterable
+from hashlib import sha256
 from html import escape
 from pathlib import Path
 from typing import Any, Self
@@ -33,6 +35,7 @@ class SkillManager:
     _skills: list[Skill]
     _skills_by_name: dict[str, Skill]
     _diagnostics: list[str]
+    _lifecycle_diagnostics: list[str]
     _activated: dict[Path, str]
 
     def __init__(
@@ -43,6 +46,7 @@ class SkillManager:
         self._skills = []
         self._skills_by_name = {}
         self._diagnostics = list(diagnostics or [])
+        self._lifecycle_diagnostics = []
         for skill in skills or []:
             winner = self._skills_by_name.get(skill.name)
             if winner is not None:
@@ -72,6 +76,15 @@ class SkillManager:
             tuple[str, ...]: An immutable snapshot of discovery diagnostics.
         """
         return tuple(self._diagnostics)
+
+    @property
+    def lifecycle_diagnostics(self) -> tuple[str, ...]:
+        """Return non-fatal activation restoration diagnostics.
+
+        Returns:
+            tuple[str, ...]: Immutable lifecycle diagnostics in occurrence order.
+        """
+        return tuple(self._lifecycle_diagnostics)
 
     @property
     def activated_skills(self) -> tuple[Skill, ...]:
@@ -114,6 +127,16 @@ class SkillManager:
         """
         return len(self._activated)
 
+    @property
+    def active_identities(self) -> tuple[tuple[str, str], ...]:
+        """Return persistent identities for all activated skills.
+
+        Returns:
+            tuple[tuple[str, str], ...]: Skill names paired with canonical instruction locations
+                in discovery order.
+        """
+        return tuple((skill.name, str(skill.location)) for skill in self.activated_skills)
+
     @classmethod
     def discover(
         cls,
@@ -154,6 +177,54 @@ class SkillManager:
 
         return cls(skills, diagnostics)
 
+    @staticmethod
+    def discovery_signature(working_directory: Path | str) -> tuple:
+        """Return a content-aware fingerprint of discoverable skill definitions.
+
+        Args:
+            working_directory (Path | str): Directory whose skill scopes should be fingerprinted.
+
+        Returns:
+            tuple: Stable fingerprint of skill roots and instruction files.
+        """
+        paths = []
+        for directory in get_skill_directories(Path(working_directory).resolve()):
+            paths.append(directory)
+            if directory.is_dir():
+                paths.extend(sorted(directory.glob(f"*/{DEFAULT_SKILL_FILENAME}")))
+        fingerprints = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                digest = sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+                fingerprints.append(
+                    (str(path.resolve()), stat.st_ino, stat.st_mtime_ns, stat.st_size, digest)
+                )
+            except FileNotFoundError:
+                fingerprints.append((str(path.resolve()), None))
+        return tuple(fingerprints)
+
+    @classmethod
+    def rediscover(
+        cls,
+        working_directory: Path | str,
+        active_identities: Iterable[tuple[str, str]],
+    ) -> Self:
+        """Rediscover skills and restore only unchanged active definitions.
+
+        Args:
+            working_directory (Path | str): Directory whose skill scopes should apply.
+            active_identities (Iterable[tuple[str, str]]): Previously active names paired with
+                canonical instruction locations.
+
+        Returns:
+            SkillManager: Refreshed manager with matching definitions reactivated and lifecycle
+                diagnostics retained.
+        """
+        manager = cls.discover(working_directory)
+        manager.restore(active_identities, refresh=True)
+        return manager
+
     def list(self) -> dict[str, Any]:
         """Return available skills, activation state, and discovery diagnostics.
 
@@ -177,13 +248,15 @@ class SkillManager:
         skill = self._skills_by_name.get(name)
         if skill is None:
             return {"error": "unknown_skill", "message": f"Skill '{name}' is not available."}
-        if skill.location not in self._activated:
+        instructions_updated = skill.location not in self._activated
+        if instructions_updated:
             content = skill.location.read_text(encoding="utf-8")
             self._activated[skill.location] = read_instruction_body(content, skill.location.name)
         return {
             **self._summary(skill),
             "skill_root": str(skill.location.parent),
             "status": "activated",
+            "instructions_updated": instructions_updated,
         }
 
     def deactivate(self, name: str) -> dict[str, Any]:
@@ -198,12 +271,77 @@ class SkillManager:
         skill = self._skills_by_name.get(name)
         if skill is None:
             return {"error": "unknown_skill", "message": f"Skill '{name}' is not available."}
+        instructions_updated = skill.location in self._activated
         self._activated.pop(skill.location, None)
-        return {**self._summary(skill), "status": "deactivated"}
+        return {
+            **self._summary(skill),
+            "status": "deactivated",
+            "instructions_updated": instructions_updated,
+        }
 
-    def deactivate_all(self) -> None:
-        """Deactivate all skills and release their instructions."""
+    def deactivate_all(self) -> int:
+        """Deactivate all skills and release their instructions.
+
+        Returns:
+            int: Number of skills that were active.
+        """
+        count = len(self._activated)
         self._activated.clear()
+        return count
+
+    def is_active(self, name: str) -> bool:
+        """Return whether an available skill is active.
+
+        Args:
+            name (str): Exact available skill name.
+
+        Returns:
+            bool: Whether the named skill has loaded instructions.
+        """
+        skill = self._skills_by_name.get(name)
+        return skill is not None and skill.location in self._activated
+
+    def restore(
+        self,
+        identities: Iterable[tuple[str, str]],
+        *,
+        refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Activate definitions that exactly match persisted identities.
+
+        Args:
+            identities (Iterable[tuple[str, str]]): Skill names paired with canonical persisted
+                instruction locations.
+            refresh (bool): Whether diagnostics should describe an in-process refresh rather than
+                session restoration.
+
+        Returns:
+            list[dict[str, Any]]: Activation results for definitions that still match.
+        """
+        results = []
+        for name, location in identities:
+            skill = self._skills_by_name.get(name)
+            if skill is None or str(skill.location) != location:
+                if refresh:
+                    self._lifecycle_diagnostics.append(
+                        f"Deactivated '{name}' during refresh: its definition was removed or "
+                        "shadowed."
+                    )
+                else:
+                    self._lifecycle_diagnostics.append(
+                        f"Could not restore '{name}': its definition was removed or shadowed."
+                    )
+                continue
+            try:
+                results.append(self.activate(name))
+            except (OSError, UnicodeError, ValueError) as exc:
+                if refresh:
+                    self._lifecycle_diagnostics.append(
+                        f"Deactivated '{name}' during refresh: {exc}"
+                    )
+                else:
+                    raise
+        return results
 
     def list_resources(self, name: str) -> dict[str, Any]:
         """List bounded on-demand resources belonging to an active skill.
