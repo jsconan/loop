@@ -6,6 +6,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Self
 
+from .. import constants
+from ..utils import sha256_digest
 from .models import (
     AgentInstructionsSource,
     InstructionContext,
@@ -22,17 +24,12 @@ from .models import (
     SkillResourceContentResponse,
     SkillResourceListResponse,
 )
-from ..utils import sha256_digest
 from .skill_manager import SkillManager
 from .utils import (
-    DEFAULT_AGENTS_FILENAME,
-    DEFAULT_SKILL_FILENAME,
     build_instructions,
     get_agents_files,
     load_agents_instructions,
 )
-
-MAX_INSTRUCTIONS_BYTES = 64 * 1024
 
 
 class InstructionsManager:
@@ -71,7 +68,7 @@ class InstructionsManager:
         project_instructions: str | None = None,
         skill_manager: SkillManager | None = None,
         *,
-        max_bytes: int = MAX_INSTRUCTIONS_BYTES,
+        max_bytes: int = constants.MAX_INSTRUCTIONS_BYTES,
         working_directory: Path | str | None = None,
     ) -> None:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
@@ -100,7 +97,7 @@ class InstructionsManager:
         working_directory: Path | str,
         *,
         skill_manager: SkillManager | None = None,
-        max_bytes: int = MAX_INSTRUCTIONS_BYTES,
+        max_bytes: int = constants.MAX_INSTRUCTIONS_BYTES,
     ) -> Self:
         """Discover project instructions and skills for a working directory.
 
@@ -277,8 +274,8 @@ class InstructionsManager:
                 invalidation. Unrelated paths are ignored when their names cannot affect discovery.
         """
         if path is not None and Path(path).name not in {
-            DEFAULT_AGENTS_FILENAME,
-            DEFAULT_SKILL_FILENAME,
+            constants.DEFAULT_AGENTS_FILENAME,
+            constants.DEFAULT_SKILL_FILENAME,
         }:
             return
         with self._lock:

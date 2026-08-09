@@ -1,14 +1,13 @@
 """Provide general text formatting utilities."""
 
-CONTENT_PREVIEW_MAX_LINES = 20
-CONTENT_PREVIEW_MAX_CHARS = 2_000
+from .. import constants
 
 
 def format_content_preview(
     content: str,
     *,
-    max_chars: int = CONTENT_PREVIEW_MAX_CHARS,
-    max_lines: int = CONTENT_PREVIEW_MAX_LINES,
+    max_chars: int = constants.CONTENT_PREVIEW_MAX_CHARS,
+    max_lines: int = constants.CONTENT_PREVIEW_MAX_LINES,
 ) -> str:
     """Format file content for a human-readable preview.
 

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from loop import ConsoleInteraction, tool_registry
-from loop.tools.system import MAX_OUTPUT_CHARS
+from loop.constants import MAX_OUTPUT_CHARS
 
 # pylint: disable=unused-argument, redefined-outer-name
 

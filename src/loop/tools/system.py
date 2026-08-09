@@ -8,16 +8,14 @@ from typing import Annotated
 
 from pydantic import Field
 
+from .. import constants
 from ..permissions import Capability, PermissionRequest
 from ..tooling import tool_registry
-
-COMMAND_TIMEOUT_SECONDS = 30
-MAX_OUTPUT_CHARS = 1_000_000
 
 
 def _read_bounded(stream, chunks: list[str]) -> None:
     """Drain a process stream while retaining only a bounded amount of output."""
-    remaining = MAX_OUTPUT_CHARS
+    remaining = constants.MAX_OUTPUT_CHARS
     while chunk := stream.read(8192):
         if remaining:
             chunks.append(chunk[:remaining])
@@ -80,11 +78,11 @@ def run_command(
                     started_readers.append(reader)
 
                 try:
-                    returncode = process.wait(timeout=COMMAND_TIMEOUT_SECONDS)
+                    returncode = process.wait(timeout=constants.COMMAND_TIMEOUT_SECONDS)
                 except subprocess.TimeoutExpired:
                     _kill_process_group(process)
                     process.wait()
-                    return f"Command timed out after {COMMAND_TIMEOUT_SECONDS} seconds."
+                    return f"Command timed out after {constants.COMMAND_TIMEOUT_SECONDS} seconds."
             finally:
                 if process.poll() is None:
                     _kill_process_group(process)

@@ -8,6 +8,7 @@ from typing import Self
 
 import yaml
 
+from .. import constants
 from ..utils import sha256_digest
 from .models import (
     Skill,
@@ -24,16 +25,7 @@ from .models import (
     SkillResourceListResult,
     SkillSummary,
 )
-from .utils import (
-    DEFAULT_SKILL_FILENAME,
-    get_skill_directories,
-    read_instruction_body,
-    read_instruction_frontmatter,
-)
-
-MAX_CATALOG_CHARS = 8_000
-MAX_RESOURCE_BYTES = 64 * 1024
-RESOURCE_DIRECTORIES = ("references", "scripts", "assets")
+from .utils import get_skill_directories, read_instruction_body, read_instruction_frontmatter
 
 
 class SkillManager:
@@ -179,7 +171,7 @@ class SkillManager:
         for directory in directories:
             if not directory.is_dir():
                 continue
-            for location in sorted(directory.glob(f"*/{DEFAULT_SKILL_FILENAME}")):
+            for location in sorted(directory.glob(f"*/{constants.DEFAULT_SKILL_FILENAME}")):
                 try:
                     location = location.resolve()
                     metadata = read_instruction_frontmatter(
@@ -205,7 +197,9 @@ class SkillManager:
         for directory in get_skill_directories(Path(working_directory).resolve()):
             paths.append(directory)
             if directory.is_dir():
-                paths.extend(sorted(directory.glob(f"*/{DEFAULT_SKILL_FILENAME}")))
+                paths.extend(
+                    sorted(directory.glob(f"*/{constants.DEFAULT_SKILL_FILENAME}"))
+                )
         fingerprints = []
         for path in paths:
             try:
@@ -385,7 +379,7 @@ class SkillManager:
             )
         root = skill.location.parent.resolve()
         resources = []
-        for directory_name in RESOURCE_DIRECTORIES:
+        for directory_name in constants.RESOURCE_DIRECTORIES:
             directory = root / directory_name
             if not directory.is_dir():
                 continue
@@ -416,7 +410,8 @@ class SkillManager:
         root = Path(listed["skill_root"])
         candidate = (root / resource_path).resolve()
         allowed = any(
-            candidate.is_relative_to(root / directory) for directory in RESOURCE_DIRECTORIES
+            candidate.is_relative_to(root / directory)
+            for directory in constants.RESOURCE_DIRECTORIES
         )
         if not allowed or not candidate.is_file():
             return SkillOperationError(
@@ -424,10 +419,12 @@ class SkillManager:
                 message="Resource must be a file beneath references, scripts, or assets.",
             )
         content = candidate.read_bytes()
-        if len(content) > MAX_RESOURCE_BYTES:
+        if len(content) > constants.MAX_RESOURCE_BYTES:
             return SkillOperationError(
                 error="skill_resource_too_large",
-                message=f"Resource exceeds the {MAX_RESOURCE_BYTES}-byte loading limit.",
+                message=(
+                    f"Resource exceeds the {constants.MAX_RESOURCE_BYTES}-byte loading limit."
+                ),
                 size_bytes=len(content),
             )
         result = SkillResourceContentResult(
@@ -441,7 +438,7 @@ class SkillManager:
             result.update({"encoding": "base64", "content": b64encode(content).decode("ascii")})
         return result
 
-    def catalog(self, max_chars: int = MAX_CATALOG_CHARS) -> str | None:
+    def catalog(self, max_chars: int = constants.MAX_CATALOG_CHARS) -> str | None:
         """Format a bounded metadata-only catalog for the model's initial instructions.
 
         Args:

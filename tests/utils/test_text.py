@@ -1,10 +1,10 @@
 """Tests for text formatting utilities."""
 
-from loop.utils.text import (
+from loop.constants import (
     CONTENT_PREVIEW_MAX_CHARS,
     CONTENT_PREVIEW_MAX_LINES,
-    format_content_preview,
 )
+from loop.utils.text import format_content_preview
 
 
 def test_format_content_preview_returns_formatted_lines():

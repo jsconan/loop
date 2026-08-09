@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
+from .. import constants
 from .models import (
     Capability,
     Decision,
@@ -60,7 +61,9 @@ class PermissionManager:
         self._configuration_path = (
             Path(configuration_path)
             if configuration_path is not None
-            else self._working_directory / ".loop" / "permissions.yaml"
+            else self._working_directory
+            / constants.APP_DIRECTORY
+            / constants.PERMISSIONS_FILENAME
             if self._working_directory is not None
             else None
         )
@@ -277,7 +280,7 @@ class PermissionManager:
     def _audit(self, request: PermissionRequest, result: PermissionResult) -> None:
         if self._configuration_path is None:
             return
-        audit_path = self._configuration_path.with_name("permissions-audit.jsonl")
+        audit_path = self._configuration_path.with_name(constants.PERMISSIONS_AUDIT_FILENAME)
         audit_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "request": request.model_dump(mode="json"),

@@ -15,6 +15,7 @@ from loop import (
     find_project_root,
     register_shutdown_signals,
 )
+from loop.constants import APP_DIRECTORY, SESSION_DATABASE_FILENAME
 
 _BASE_URL = "http://localhost:8000/v1"
 _DEFAULT_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
@@ -40,7 +41,9 @@ def main() -> None:
         project_root = find_project_root(working_directory) or working_directory
         session_manager = SessionManager(
             interaction=interaction,
-            session_store=SQLiteSessionStore(project_root / ".loop" / "sessions.db"),
+            session_store=SQLiteSessionStore(
+                project_root / APP_DIRECTORY / SESSION_DATABASE_FILENAME
+            ),
         )
         loop = Loop(
             backend,

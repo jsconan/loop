@@ -6,19 +6,14 @@ from typing import Any
 
 import yaml
 
-from .models import AgentInstructionsSource, LoadedAgentInstructions
+from .. import constants
 from ..utils import find_project_root
-
-MAX_AGENTS_BYTES = 32 * 1024
-DEFAULT_AGENTS_FILENAME = "AGENTS.md"
-DEFAULT_SKILL_FILENAME = "SKILL.md"
-DEFAULT_SKILLS_DIRECTORY = Path(".agents/skills")
-TRUNCATION_MARKER = "\n\n[AGENTS.md truncated: instruction byte limit reached.]"
+from .models import AgentInstructionsSource, LoadedAgentInstructions
 
 
 def get_skill_directories(
     working_directory: Path,
-    relative_directory: Path = DEFAULT_SKILLS_DIRECTORY,
+    relative_directory: Path = constants.DEFAULT_SKILLS_DIRECTORY,
 ) -> list[Path]:
     """Return skill directories in descending precedence order.
 
@@ -113,7 +108,7 @@ def read_instruction_body(content: str, filename: str) -> str:
 
 def get_agents_files(
     working_directory: Path | str,
-    agents_filename: str = DEFAULT_AGENTS_FILENAME,
+    agents_filename: str = constants.DEFAULT_AGENTS_FILENAME,
 ) -> list[Path]:
     """Return discovered agent instruction files in root-to-leaf order.
 
@@ -142,8 +137,8 @@ def get_agents_files(
 
 def load_agents_instructions(
     working_directory: Path | str,
-    agents_filename: str = DEFAULT_AGENTS_FILENAME,
-    max_bytes: int = MAX_AGENTS_BYTES,
+    agents_filename: str = constants.DEFAULT_AGENTS_FILENAME,
+    max_bytes: int = constants.MAX_AGENTS_BYTES,
 ) -> LoadedAgentInstructions:
     """Load project instructions with source and truncation diagnostics.
 
@@ -174,8 +169,8 @@ def load_agents_instructions(
         )
 
     complete_size = len("\n\n".join(content for _, content in discovered).encode("utf-8"))
-    marker_size = len(TRUNCATION_MARKER.encode("utf-8"))
-    marker = TRUNCATION_MARKER if marker_size <= max_bytes < complete_size else ""
+    marker_size = len(constants.TRUNCATION_MARKER.encode("utf-8"))
+    marker = constants.TRUNCATION_MARKER if marker_size <= max_bytes < complete_size else ""
     remaining = max_bytes - len(marker.encode("utf-8"))
     included = []
     sources = []
