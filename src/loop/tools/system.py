@@ -9,6 +9,7 @@ from typing import Annotated
 from pydantic import Field
 
 from .. import constants
+from ..context import ToolContext
 from ..permissions import Capability, PermissionRequest
 from ..tooling import tool_registry
 
@@ -49,6 +50,7 @@ def _command_permission(arguments: dict[str, object]) -> tuple[PermissionRequest
     permission_resolver=_command_permission,
 )
 def run_command(
+    context: ToolContext,
     command: Annotated[str, Field(description="The system command to execute.")],
 ) -> str:
     """Run a system command and return the output."""
@@ -94,6 +96,10 @@ def run_command(
             error_msg = "".join(stderr_chunks).strip()
             if returncode != 0:
                 return f"Command failed with code {returncode}. Output: {output} Error: {error_msg}"
+            # Shell commands may create, remove, or edit instruction files. Their exact effects
+            # are intentionally not inferred from arbitrary shell text; a successful command
+            # therefore triggers a bounded signature refresh on the next request.
+            context.invalidate_instructions()
             return output
     except Exception as exc:  # pylint: disable=broad-except
         return f"Error running command: {exc}"

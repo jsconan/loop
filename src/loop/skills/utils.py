@@ -1,13 +1,13 @@
 """Discover and parse project instruction files."""
 
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .. import constants
-from ..utils import find_project_root
+from ..utils import find_project_root, is_path_ignored
 from .models import AgentInstructionsSource, LoadedAgentInstructions
 
 
@@ -84,40 +84,54 @@ def read_instruction_frontmatter(
     return metadata
 
 
-def read_instruction_body(content: str, filename: str) -> str:
-    """Return the Markdown body following YAML frontmatter.
+def read_instruction_body(
+    content: str,
+    filename: str,
+    *,
+    require_frontmatter: bool = False,
+) -> str:
+    """Return an instruction body, excluding optional YAML frontmatter.
 
     Args:
         content (str): Complete instruction-file content.
         filename (str): Display name used in validation errors.
+        require_frontmatter (bool): Whether a leading YAML frontmatter block is required.
 
     Returns:
-        str: The trimmed Markdown following the closing frontmatter delimiter.
+        str: The trimmed Markdown body, without an optional frontmatter block.
 
     Raises:
-        ValueError: Frontmatter is missing or unterminated.
+        ValueError: Required frontmatter is missing, or present frontmatter is unterminated or
+            is not a mapping.
+        yaml.YAMLError: Present frontmatter contains invalid YAML.
     """
     lines = content.splitlines()
     if not lines or lines[0].strip() != "---":
-        raise ValueError(f"{filename} must start with YAML frontmatter")
+        if require_frontmatter:
+            raise ValueError(f"{filename} must start with YAML frontmatter")
+        return content.strip()
     for index, line in enumerate(lines[1:], start=1):
         if line.strip() == "---":
+            metadata = yaml.safe_load("\n".join(lines[1:index]))
+            if not isinstance(metadata, dict):
+                raise ValueError(f"{filename} frontmatter must be a mapping")
             return "\n".join(lines[index + 1 :]).strip()
     raise ValueError(f"{filename} frontmatter is not terminated")
 
 
 def get_agents_files(
     working_directory: Path | str,
-    agents_filename: str = constants.DEFAULT_AGENTS_FILENAME,
+    agents_filenames: Iterable[str] = (constants.DEFAULT_AGENTS_FILENAME,),
 ) -> list[Path]:
-    """Return discovered agent instruction files in root-to-leaf order.
+    """Return applicable recursively indexed agent instruction files in root-to-leaf order.
 
     Args:
         working_directory (Path | str): Directory whose instruction scope should be discovered.
-        agents_filename (str): Name of the instruction file to discover.
+        agents_filenames (Iterable[str]): Candidate names in precedence order.
 
     Returns:
-        list[Path]: Canonical paths for existing instruction files in scope.
+        list[Path]: Canonical paths for existing instruction files in scope, choosing the first
+            available candidate filename in each directory.
     """
     working_directory = Path(working_directory)
     project_root = find_project_root(working_directory)
@@ -128,23 +142,43 @@ def get_agents_files(
             for directory in reversed((working_directory, *working_directory.parents))
             if directory == project_root or project_root in directory.parents
         ]
-    return [
-        agents_file.resolve()
-        for directory in directories
-        if (agents_file := directory / agents_filename).is_file()
-    ]
+    names = tuple(dict.fromkeys(agents_filenames))
+    if project_root is None:
+        available = {
+            candidate.resolve()
+            for filename in names
+            if (candidate := working_directory / filename).is_file()
+        }
+    else:
+        available = {
+            candidate.resolve()
+            for filename in names
+            for candidate in project_root.rglob(filename)
+            if candidate.is_file()
+        }
+
+    discovered = []
+    for directory in directories:
+        for filename in names:
+            candidate = (directory / filename).resolve()
+            if candidate in available and not is_path_ignored(
+                candidate, root=project_root or directory
+            ):
+                discovered.append(candidate)
+                break
+    return discovered
 
 
 def load_agents_instructions(
     working_directory: Path | str,
-    agents_filename: str = constants.DEFAULT_AGENTS_FILENAME,
+    agents_filenames: Iterable[str] = (constants.DEFAULT_AGENTS_FILENAME,),
     max_bytes: int = constants.MAX_AGENTS_BYTES,
 ) -> LoadedAgentInstructions:
     """Load project instructions with source and truncation diagnostics.
 
     Args:
         working_directory (Path | str): Directory whose instruction scope should be loaded.
-        agents_filename (str): Name of the instruction file to discover.
+        agents_filenames (Iterable[str]): Candidate names in precedence order.
         max_bytes (int): Maximum source-content bytes included before a truncation marker.
 
     Returns:
@@ -155,8 +189,18 @@ def load_agents_instructions(
         UnicodeError: An applicable instruction file is not valid UTF-8.
     """
     discovered = []
-    for agents_file in get_agents_files(working_directory, agents_filename):
-        content = agents_file.read_text(encoding="utf-8").strip()
+    diagnostics = []
+    for agents_file in get_agents_files(working_directory, agents_filenames):
+        try:
+            content = read_instruction_body(
+                agents_file.read_text(encoding="utf-8"),
+                agents_file.name,
+            )
+        except UnicodeError:
+            raise
+        except (ValueError, yaml.YAMLError) as exc:
+            diagnostics.append(f"Skipped '{agents_file}': {exc}")
+            continue
         if content:
             discovered.append((agents_file, content))
 
@@ -166,6 +210,7 @@ def load_agents_instructions(
             sources=(),
             max_bytes=max_bytes,
             truncated=False,
+            diagnostics=tuple(diagnostics),
         )
 
     complete_size = len("\n\n".join(content for _, content in discovered).encode("utf-8"))
@@ -219,6 +264,7 @@ def load_agents_instructions(
         sources=tuple(sources),
         max_bytes=max_bytes,
         truncated=truncated,
+        diagnostics=tuple(diagnostics),
     )
 
 

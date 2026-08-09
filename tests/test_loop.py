@@ -87,6 +87,19 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.debug is False
 
 
+def test_loop_passes_custom_instruction_fallbacks_to_discovery(tmp_path):
+    """Loop discovery exposes configured fallback instruction filenames to library callers."""
+    (tmp_path / "CUSTOM.md").write_text("custom instructions", encoding="utf-8")
+
+    loop = Loop(
+        backend=loop_backend(),
+        working_directory=tmp_path,
+        agents_filenames=("AGENTS.md", "CUSTOM.md"),
+    )
+
+    assert loop.instructions == "custom instructions"
+
+
 def test_loop_uses_an_injected_permission_manager(tmp_path):
     """An explicit permission manager replaces local policy discovery."""
     permissions = PermissionManager(configuration=PermissionConfiguration())

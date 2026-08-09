@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 from pathlib import Path
 
+from . import constants
 from .backend import Backend
 from .commands import CommandManager
 from .interaction import Interaction
@@ -31,6 +32,8 @@ class Loop:
             Defaults to loading local policy from the project ``.loop`` folder.
         working_directory (Path | str | None): Directory used to discover applicable AGENTS.md
             files.
+        agents_filenames (tuple[str, ...]): Ordered instruction filenames, where a later name is
+            used only when earlier names are absent in the same directory.
         session (Session | str | None): Session or persisted session identifier to load.
             Defaults to a fresh session; an injected store persists it after its first query.
         session_manager (SessionManager | None): Manager used to persist and retrieve sessions.
@@ -63,6 +66,7 @@ class Loop:
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
         working_directory: Path | str | None = None,
+        agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
         session: Session | str | None = None,
         session_manager: SessionManager | None = None,
         stream: bool = False,
@@ -86,6 +90,7 @@ class Loop:
         ).resolve()
         self._instructions_manager = instructions_manager or InstructionsManager.discover(
             self._working_directory,
+            agents_filenames=agents_filenames,
         )
         if instructions_manager is None:
             self._instructions_manager.reactivate_skills(

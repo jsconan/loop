@@ -43,6 +43,8 @@ class InstructionsManager:
         max_bytes (int): Maximum encoded size of the complete instruction document.
         working_directory (Path | str | None): Directory whose project instructions can be
             refreshed, or ``None`` for static injected instructions.
+        agents_filenames (tuple[str, ...]): Candidate project instruction filenames in precedence
+            order. Defaults to ``("AGENTS.md",)``.
 
     Raises:
         ValueError: If ``max_bytes`` is not a positive integer or the initial instructions exceed
@@ -62,6 +64,7 @@ class InstructionsManager:
     _skill_discovery_enabled: bool
     _lock: RLock
     _refresh_changes: list[str]
+    _agents_filenames: tuple[str, ...]
 
     def __init__(
         self,
@@ -70,6 +73,7 @@ class InstructionsManager:
         *,
         max_bytes: int = constants.MAX_INSTRUCTIONS_BYTES,
         working_directory: Path | str | None = None,
+        agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
     ) -> None:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise ValueError("Instruction limit must be a positive integer.")
@@ -79,6 +83,7 @@ class InstructionsManager:
         self._working_directory = (
             Path(working_directory).resolve() if working_directory is not None else None
         )
+        self._agents_filenames = tuple(dict.fromkeys(agents_filenames))
         self._dirty = False
         self._generation = 0
         self._signature = self._discovery_signature(self._working_directory)
@@ -98,6 +103,7 @@ class InstructionsManager:
         *,
         skill_manager: SkillManager | None = None,
         max_bytes: int = constants.MAX_INSTRUCTIONS_BYTES,
+        agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
     ) -> Self:
         """Discover project instructions and skills for a working directory.
 
@@ -106,6 +112,8 @@ class InstructionsManager:
             skill_manager (SkillManager | None): Explicit skill manager to use instead of
                 discovering one.
             max_bytes (int): Maximum encoded size of the complete instruction document.
+            agents_filenames (tuple[str, ...]): Candidate instruction filenames in precedence
+                order, deduplicated with ``AGENTS.md`` normally first.
 
         Returns:
             InstructionsManager: Manager containing the discovered instruction sources.
@@ -116,12 +124,13 @@ class InstructionsManager:
             ValueError: The configured limit is invalid or initial instructions exceed it.
         """
         directory = Path(working_directory).resolve()
-        loaded = load_agents_instructions(directory)
+        loaded = load_agents_instructions(directory, agents_filenames)
         manager = cls(
             loaded.content,
             skill_manager or SkillManager.discover(directory),
             max_bytes=max_bytes,
             working_directory=directory,
+            agents_filenames=agents_filenames,
         )
         manager._skill_discovery_enabled = skill_manager is None
         manager._project_sources = loaded.sources
@@ -274,7 +283,7 @@ class InstructionsManager:
                 invalidation. Unrelated paths are ignored when their names cannot affect discovery.
         """
         if path is not None and Path(path).name not in {
-            constants.DEFAULT_AGENTS_FILENAME,
+            *self._agents_filenames,
             constants.DEFAULT_SKILL_FILENAME,
         }:
             return
@@ -391,7 +400,7 @@ class InstructionsManager:
         previous_target = self._signature[0] if self._signature else None
         previous_instructions = self._instructions
         active = self._skill_manager.active_identities
-        loaded = load_agents_instructions(working_directory)
+        loaded = load_agents_instructions(working_directory, self._agents_filenames)
         project_instructions = loaded.content
         refresh_changes = self._describe_refresh(working_directory, loaded)
         if not self._skill_discovery_enabled:
@@ -508,12 +517,11 @@ class InstructionsManager:
         )
         return build_instructions(project_instructions, skill_manager.catalog(), active)
 
-    @staticmethod
-    def _discovery_signature(working_directory: Path | None) -> tuple:
+    def _discovery_signature(self, working_directory: Path | None) -> tuple:
         """Return cheap metadata identifying discoverable instruction sources."""
         if working_directory is None:
             return ()
-        paths = get_agents_files(working_directory)
+        paths = get_agents_files(working_directory, self._agents_filenames)
         fingerprints = []
         for path in paths:
             try:
@@ -538,13 +546,15 @@ class InstructionsManager:
     @staticmethod
     def _load_diagnostics(loaded: LoadedAgentInstructions) -> list[str]:
         """Return diagnostics produced while loading project instructions."""
+        diagnostics = list(loaded.diagnostics)
         if not loaded.truncated:
-            return []
+            return diagnostics
         omitted = sum(source.size_bytes - source.included_bytes for source in loaded.sources)
-        return [
-            f"AGENTS.md instructions truncated at {loaded.max_bytes} bytes; "
+        diagnostics.append(
+            f"Agent instructions truncated at {loaded.max_bytes} bytes; "
             f"{omitted} source byte(s) omitted."
-        ]
+        )
+        return diagnostics
 
     def _describe_refresh(
         self, working_directory: Path, loaded: LoadedAgentInstructions

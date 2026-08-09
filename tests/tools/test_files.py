@@ -202,6 +202,15 @@ def test_file_navigation_reports_successful_instruction_context_changes(tmp_path
     )
     assert manager.working_directory == nested.resolve()
 
+    written = nested / "written.txt"
+    tool_registry.call(
+        "write_text_file",
+        json.dumps({"path": str(written), "content": "content"}),
+        interaction=interaction,
+        instructions_manager=manager,
+    )
+    assert manager.working_directory == nested.resolve()
+
     tool_registry.call(
         "read_text_file",
         json.dumps({"path": str(target)}),

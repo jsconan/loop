@@ -83,12 +83,14 @@ class LoadedAgentInstructions:
         sources (tuple[AgentInstructionsSource, ...]): Sources in root-to-leaf precedence order.
         max_bytes (int): Configured source-content byte limit.
         truncated (bool): Whether any discovered source content was omitted.
+        diagnostics (tuple[str, ...]): Diagnostics for skipped invalid sources.
     """
 
     content: str | None
     sources: tuple[AgentInstructionsSource, ...]
     max_bytes: int
     truncated: bool
+    diagnostics: tuple[str, ...] = ()
 
 
 class SkillSummary(TypedDict):

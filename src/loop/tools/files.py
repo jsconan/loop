@@ -105,6 +105,7 @@ def write_text_file(
     try:
         with open(path, "w", encoding="utf-8") as file:
             file.write(content)
+        context.observe_file(path)
         context.invalidate_instructions(path)
         return f"Successfully wrote to file '{path}'."
     except Exception as exc:  # pylint: disable=broad-except

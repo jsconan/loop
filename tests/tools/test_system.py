@@ -96,6 +96,23 @@ def test_run_command_returns_stripped_stdout_and_passes_safe_process_options(
     assert all(reader.joined for reader in ImmediateThread.instances)
 
 
+def test_successful_run_command_invalidates_instruction_scope(monkeypatch, tmp_path, confirmed):
+    """Successful shell operations request a conservative instruction refresh."""
+    manager = MagicMock()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("loop.tools.system.subprocess.Popen", subprocess.Popen)
+
+    result = tool_registry.call(
+        "run_command",
+        json.dumps({"command": "printf ok"}),
+        interaction=ConsoleInteraction(),
+        instructions_manager=manager,
+    )
+
+    assert result == "ok"
+    manager.invalidate.assert_called_once_with(None)
+
+
 def test_run_command_reports_exit_code_stdout_and_stderr(monkeypatch, confirmed):
     """A failed command exposes its exit code and both captured streams."""
     process = make_process(

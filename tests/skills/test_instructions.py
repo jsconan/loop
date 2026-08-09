@@ -70,7 +70,7 @@ def test_manager_reports_truncated_project_instruction_sources(tmp_path):
     context = manager.list_skills()["instruction_context"]
 
     assert context["diagnostics"] == [
-        "AGENTS.md instructions truncated at 32768 bytes; 288 source byte(s) omitted."
+        "Agent instructions truncated at 32768 bytes; 288 source byte(s) omitted."
     ]
     assert context["sources"][0]["size_bytes"] == 33_000
 
@@ -339,7 +339,7 @@ def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path
     missing = clean / "disappeared" / "AGENTS.md"
     monkeypatch.setattr(
         "loop.skills.instructions.get_agents_files",
-        lambda working_directory: [missing],
+        lambda working_directory, _filenames: [missing],
     )
     racing.invalidate()
     assert racing.prepare() is False

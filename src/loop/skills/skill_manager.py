@@ -262,7 +262,11 @@ class SkillManager:
         instructions_updated = skill.location not in self._activated
         if instructions_updated:
             content = skill.location.read_text(encoding="utf-8")
-            self._activated[skill.location] = read_instruction_body(content, skill.location.name)
+            self._activated[skill.location] = read_instruction_body(
+                content,
+                skill.location.name,
+                require_frontmatter=True,
+            )
         return SkillActivationResult(
             **self._summary(skill),
             skill_root=str(skill.location.parent),

@@ -90,17 +90,22 @@ def test_read_instruction_body_returns_trimmed_markdown():
     assert read_instruction_body("---\nname: review\n---\n\nDo work.\n", "SKILL.md") == ("Do work.")
 
 
+def test_read_instruction_body_preserves_legacy_plain_markdown():
+    """Instruction files without frontmatter retain their complete trimmed body."""
+    assert read_instruction_body("\nDo work.\n", "AGENTS.md") == "Do work."
+
+
 @pytest.mark.parametrize(
     ("content", "message"),
     [
-        ("No frontmatter", "must start with YAML frontmatter"),
         ("---\nname: broken\n", "frontmatter is not terminated"),
+        ("---\n- item\n---\n", "frontmatter must be a mapping"),
     ],
 )
 def test_read_instruction_body_validates_frontmatter(content, message):
     """Body parsing rejects missing and unterminated frontmatter."""
     with pytest.raises(ValueError, match=message):
-        read_instruction_body(content, "SKILL.md")
+        read_instruction_body(content, "SKILL.md", require_frontmatter=True)
 
 
 def test_get_agents_files_returns_existing_files_in_scope_order(tmp_path):
@@ -116,6 +121,19 @@ def test_get_agents_files_returns_existing_files_in_scope_order(tmp_path):
         (project / "AGENTS.md").resolve(),
         (working_directory / "AGENTS.md").resolve(),
     ]
+
+
+def test_get_agents_files_respects_nested_ignore_rules(tmp_path):
+    """Repository discovery excludes instruction files hidden by agent ignore rules."""
+    project = tmp_path / "project"
+    nested = project / "src"
+    nested.mkdir(parents=True)
+    (project / ".git").mkdir()
+    (nested / ".agentignore").write_text("AGENTS.md\n", encoding="utf-8")
+    (project / "AGENTS.md").touch()
+    (nested / "AGENTS.md").touch()
+
+    assert get_agents_files(nested) == [(project / "AGENTS.md").resolve()]
 
 
 def test_load_agents_instructions_accumulates_only_agents_files_in_scope(tmp_path):
@@ -227,13 +245,46 @@ def test_load_agents_instructions_records_fully_omitted_sources_and_content(tmp_
     assert tiny.sources[0].included_bytes == 0
 
 
-def test_load_agents_instructions_accepts_a_custom_filename(tmp_path):
-    """Callers can override the instruction filename."""
+def test_load_agents_instructions_accepts_custom_filenames(tmp_path):
+    """Callers can provide an ordered collection of instruction filenames."""
     (tmp_path / "CUSTOM.md").write_text("custom rules", encoding="utf-8")
 
-    instructions = load_agents_instructions(tmp_path, agents_filename="CUSTOM.md").content
+    instructions = load_agents_instructions(tmp_path, ("CUSTOM.md",)).content
 
     assert instructions == "custom rules"
+
+
+def test_load_agents_instructions_supports_ordered_fallbacks_and_frontmatter(tmp_path):
+    """Fallbacks are deduplicated and use only the first available filename per scope."""
+    (tmp_path / "AGENTS.md").write_text("---\ntitle: root\n---\nroot", encoding="utf-8")
+    (tmp_path / "CUSTOM.md").write_text("---\ntitle: custom\n---\ncustom", encoding="utf-8")
+
+    loaded = load_agents_instructions(tmp_path, ("AGENTS.md", "CUSTOM.md", "AGENTS.md"))
+
+    assert loaded.content == "root"
+    assert [source.path.name for source in loaded.sources] == ["AGENTS.md"]
+
+
+def test_load_agents_instructions_uses_a_fallback_when_the_primary_is_absent(tmp_path):
+    """A custom filename applies when its higher-precedence sibling is unavailable."""
+    (tmp_path / "CUSTOM.md").write_text("custom", encoding="utf-8")
+
+    loaded = load_agents_instructions(tmp_path, ("AGENTS.md", "CUSTOM.md"))
+
+    assert loaded.content == "custom"
+    assert [source.path.name for source in loaded.sources] == ["CUSTOM.md"]
+
+
+@pytest.mark.parametrize("frontmatter", ["---\n- item\n---\nbody", "---\na: [\n"])
+def test_load_agents_instructions_reports_invalid_frontmatter(tmp_path, frontmatter):
+    """Invalid AGENTS metadata is skipped with a source-specific diagnostic."""
+    location = tmp_path / "AGENTS.md"
+    location.write_text(frontmatter, encoding="utf-8")
+
+    loaded = load_agents_instructions(tmp_path)
+
+    assert loaded.content is None
+    assert str(location) in loaded.diagnostics[0]
 
 
 def test_load_agents_instructions_requires_utf8(tmp_path):
