@@ -1,6 +1,94 @@
-"""Define structured dictionary contracts for skill operations."""
+"""Define skill-domain models and structured results."""
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
+
+from ..utils.hashing import sha256_digest
+
+
+@dataclass(frozen=True)
+class InstructionSection:
+    """Describe one logical section of the composed instruction document.
+
+    Args:
+        kind (str): Stable section category.
+        content (str): Exact rendered section content.
+        source (str | None): Canonical source path or logical producer.
+    """
+
+    kind: str
+    content: str
+    source: str | None = None
+
+    @property
+    def size_bytes(self) -> int:
+        """Return the section's UTF-8 size.
+
+        Returns:
+            int: Encoded section size in bytes.
+        """
+        return len(self.content.encode("utf-8"))
+
+    @property
+    def digest(self) -> str:
+        """Return a stable content digest suitable for cache diagnostics.
+
+        Returns:
+            str: SHA-256 hexadecimal digest.
+        """
+        return sha256_digest(self.content)
+
+
+@dataclass(frozen=True)
+class Skill:
+    """Describe an Agent Skill without eagerly loading its instructions.
+
+    Args:
+        name (str): Public name declared by the skill.
+        description (str): Summary used by the model to decide when to activate the skill.
+        location (Path): Absolute path to the skill's ``SKILL.md`` file.
+    """
+
+    name: str
+    description: str
+    location: Path
+
+
+@dataclass(frozen=True)
+class AgentInstructionsSource:
+    """Describe one discovered project instruction source.
+
+    Args:
+        path (Path): Canonical instruction file path.
+        size_bytes (int): Complete stripped source size in UTF-8 bytes.
+        included_bytes (int): Number of source bytes included in the result.
+        truncated (bool): Whether content from this source was omitted.
+        content (str): Included source content before composition separators.
+    """
+
+    path: Path
+    size_bytes: int
+    included_bytes: int
+    truncated: bool
+    content: str
+
+
+@dataclass(frozen=True)
+class LoadedAgentInstructions:
+    """Describe composed project instructions and their provenance.
+
+    Args:
+        content (str | None): Bounded composed content, or ``None`` when no source applies.
+        sources (tuple[AgentInstructionsSource, ...]): Sources in root-to-leaf precedence order.
+        max_bytes (int): Configured source-content byte limit.
+        truncated (bool): Whether any discovered source content was omitted.
+    """
+
+    content: str | None
+    sources: tuple[AgentInstructionsSource, ...]
+    max_bytes: int
+    truncated: bool
 
 
 class SkillSummary(TypedDict):

@@ -1,12 +1,12 @@
 """Discover and parse project instruction files."""
 
 from collections.abc import Collection
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from .models import AgentInstructionsSource, LoadedAgentInstructions
 from ..utils import find_project_root
 
 MAX_AGENTS_BYTES = 32 * 1024
@@ -14,42 +14,6 @@ DEFAULT_AGENTS_FILENAME = "AGENTS.md"
 DEFAULT_SKILL_FILENAME = "SKILL.md"
 DEFAULT_SKILLS_DIRECTORY = Path(".agents/skills")
 TRUNCATION_MARKER = "\n\n[AGENTS.md truncated: instruction byte limit reached.]"
-
-
-@dataclass(frozen=True)
-class AgentInstructionsSource:
-    """Describe one discovered project instruction source.
-
-    Args:
-        path (Path): Canonical instruction file path.
-        size_bytes (int): Complete stripped source size in UTF-8 bytes.
-        included_bytes (int): Number of source bytes included in the result.
-        truncated (bool): Whether content from this source was omitted.
-        content (str): Included source content before composition separators.
-    """
-
-    path: Path
-    size_bytes: int
-    included_bytes: int
-    truncated: bool
-    content: str
-
-
-@dataclass(frozen=True)
-class LoadedAgentInstructions:
-    """Describe composed project instructions and their provenance.
-
-    Args:
-        content (str | None): Bounded composed content, or ``None`` when no source applies.
-        sources (tuple[AgentInstructionsSource, ...]): Sources in root-to-leaf precedence order.
-        max_bytes (int): Configured source-content byte limit.
-        truncated (bool): Whether any discovered source content was omitted.
-    """
-
-    content: str | None
-    sources: tuple[AgentInstructionsSource, ...]
-    max_bytes: int
-    truncated: bool
 
 
 def get_skill_directories(

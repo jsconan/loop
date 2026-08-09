@@ -9,8 +9,8 @@ from typing import Self
 import yaml
 
 from ..utils import sha256_digest
-from .skill import Skill
-from .types import (
+from .models import (
+    Skill,
     SkillActivationResponse,
     SkillActivationResult,
     SkillDeactivationResponse,

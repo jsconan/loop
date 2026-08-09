@@ -1,20 +1,14 @@
 """Provide tools for accessing files and folders on the local disk."""
 
 from pathlib import Path
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Literal
 
 from pydantic import Field
 
 from ..context import ToolContext
+from .models import FolderEntry
 from ..tooling import tool_registry
 from ..utils import format_content_preview, is_path_ignored, iter_visible_paths
-
-
-class FolderEntry(TypedDict):
-    """Describe a listed folder entry."""
-
-    path: str
-    type: Literal["file", "folder"]
 
 
 @tool_registry.tool

@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from ..context import ToolContext
-from ..skills.types import (
+from ..skills.models import (
     PublicSkillOperationResult,
     SkillOperationError,
     SkillOperationResult,

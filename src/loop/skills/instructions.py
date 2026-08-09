@@ -1,18 +1,18 @@
 """Compose the developer instructions used for backend requests."""
 
 from collections.abc import Iterable
-from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 from threading import RLock
 from typing import Self
 
-from ..utils import sha256_digest
-from .skill_manager import SkillManager
-from .types import (
+from .models import (
+    AgentInstructionsSource,
     InstructionContext,
+    InstructionSection,
     InstructionSectionSummary,
     InstructionSourceSummary,
+    LoadedAgentInstructions,
     ManagedSkillListResult,
     SkillActivationResponse,
     SkillActivationResult,
@@ -22,50 +22,17 @@ from .types import (
     SkillResourceContentResponse,
     SkillResourceListResponse,
 )
+from ..utils import sha256_digest
+from .skill_manager import SkillManager
 from .utils import (
     DEFAULT_AGENTS_FILENAME,
     DEFAULT_SKILL_FILENAME,
-    AgentInstructionsSource,
-    LoadedAgentInstructions,
     build_instructions,
     get_agents_files,
     load_agents_instructions,
 )
 
 MAX_INSTRUCTIONS_BYTES = 64 * 1024
-
-
-@dataclass(frozen=True)
-class InstructionSection:
-    """Describe one logical section of the composed instruction document.
-
-    Args:
-        kind (str): Stable section category.
-        content (str): Exact rendered section content.
-        source (str | None): Canonical source path or logical producer.
-    """
-
-    kind: str
-    content: str
-    source: str | None = None
-
-    @property
-    def size_bytes(self) -> int:
-        """Return the section's UTF-8 size.
-
-        Returns:
-            int: Encoded section size in bytes.
-        """
-        return len(self.content.encode("utf-8"))
-
-    @property
-    def digest(self) -> str:
-        """Return a stable content digest suitable for cache diagnostics.
-
-        Returns:
-            str: SHA-256 hexadecimal digest.
-        """
-        return sha256_digest(self.content)
 
 
 class InstructionsManager:

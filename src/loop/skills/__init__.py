@@ -15,12 +15,10 @@ __all__ = [
     "SkillManager",
 ]
 
-from .instructions import InstructionSection, InstructionsManager
-from .skill import Skill
+from .instructions import InstructionsManager
+from .models import AgentInstructionsSource, InstructionSection, LoadedAgentInstructions, Skill
 from .skill_manager import SkillManager
 from .utils import (
-    AgentInstructionsSource,
-    LoadedAgentInstructions,
     build_instructions,
     get_agents_files,
     get_skill_directories,

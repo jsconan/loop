@@ -5,12 +5,10 @@ from typing import Iterator
 
 from pathspec import GitIgnoreSpec
 
+from .models import IgnoreRule, IgnoreRules
+
 
 IGNORE_FILENAMES = (".gitignore", ".agentignore")
-
-type IgnoreRule = tuple[Path, GitIgnoreSpec]
-type IgnoreRules = dict[str, list[IgnoreRule]]
-
 
 def find_project_root(working_directory: Path | str) -> Path | None:
     """Return the closest Git project root containing the working directory.

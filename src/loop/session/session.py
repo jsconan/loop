@@ -3,12 +3,12 @@
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Protocol, Self, TypedDict
+from typing import Protocol, Self
 
 from pydantic import ValidationError
 
 from ..models import ConversationItem, Message, Reasoning, Response, ToolCall, ToolResult
+from .models import SerializedMessage, SerializedSession, SessionInfo
 
 _SCHEMA_VERSION = 2
 _SUPPORTED_VERSIONS = (1, _SCHEMA_VERSION)
@@ -27,72 +27,6 @@ class SessionNotFoundError(ValueError):
 
 class UnsupportedConversationItemError(ValueError):
     """Report an unsupported conversation item type in a serialized context."""
-
-
-@dataclass(frozen=True)
-class SessionInfo:
-    """Describe a persisted session without loading its complete context.
-
-    Args:
-        id (str): Persistent session identifier.
-        updated_at (datetime): Time of the latest persisted update.
-        message_count (int): Number of conversation items in the session.
-    """
-
-    id: str
-    updated_at: datetime
-    message_count: int
-
-
-class SerializedMessage(TypedDict):
-    """Define the JSON format for a serialized conversation item.
-
-    Args:
-        type (str): Type of the conversation item.
-        data (dict): Serialized conversation item data.
-    """
-
-    type: str
-    data: dict
-
-
-class SerializedSession(TypedDict):
-    """Define the JSON format for a persisted session.
-
-    Args:
-        version (int): Version of the serialized session format.
-        messages (list[SerializedMessage]): Serialized conversation items.
-        tokens (int): Total tokens in the context after the latest response.
-        model (str | None): Model identifier reported by the latest response,
-            or ``None`` when unknown.
-        instruction_working_directory (str | None): Last effective instruction directory.
-        active_skills (list[list[str]]): Active skill names and canonical locations.
-    """
-
-    version: int
-    messages: list[SerializedMessage]
-    tokens: int
-    model: str | None
-    instruction_working_directory: str | None
-    active_skills: list[list[str]]
-
-
-class StoredSession(TypedDict):
-    """Define the JSON format for a persisted session snapshot.
-
-    Args:
-        id (str): Persistent session identifier.
-        created_at (datetime): Time of the initial persisted creation.
-        updated_at (datetime): Time of the latest persisted update.
-        message_count (int): Number of conversation items in the session.
-        session (str): Serialized session snapshot.
-    """
-
-    id: str
-    created_at: datetime
-    updated_at: datetime
-    message_count: int
-    session: str
 
 
 @dataclass
