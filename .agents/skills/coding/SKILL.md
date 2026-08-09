@@ -16,6 +16,8 @@ unrelated refactoring or new dependencies.
 - Fix shared root causes when appropriate instead of patching only a reported symptom.
 - Preserve validation, security, accessibility, data-loss prevention, and explicitly required
   behavior.
+- Declare class attributes at class level, including attributes whose values are initialized in
+  `__init__`; keep their value initialization in `__init__`.
 - Do not use `assert` outside unit tests. For runtime validation and error conditions, raise the
   most accurate exception type with a clear, specific message.
 - Remove only imports or code made unused by the current change.
