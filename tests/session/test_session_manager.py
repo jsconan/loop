@@ -123,23 +123,45 @@ def test_manager_adds_and_persists_an_iterable_of_items():
     store.save.assert_called_once_with(session)
 
 
-@pytest.mark.parametrize(
-    ("method", "arguments", "expected"),
-    [
-        ("add_user_message", ("hello",), Message(role="user", content="hello")),
-        ("add_tool_call", ("call-id", "result"), ToolResult(call_id="call-id", output="result")),
-    ],
-)
-def test_manager_builds_and_persists_convenience_messages(method, arguments, expected):
-    """Convenience methods create their conversation item and persist it."""
+def test_manager_builds_and_persists_a_user_message():
+    """The user-message convenience method creates and persists its conversation item."""
     store = Mock(spec=SessionStore)
     session = Session()
     manager = SessionManager(session=session, session_store=store)
 
-    getattr(manager, method)(*arguments)
+    manager.add_user_message("hello")
 
-    assert manager.messages == [expected]
+    assert manager.messages == [Message(role="user", content="hello")]
     store.save.assert_called_once_with(session)
+
+
+def test_manager_adds_a_tool_result_with_its_instruction_state():
+    """Tool results and their effective instruction state are persisted together."""
+    store = Mock(spec=SessionStore)
+    session = Session()
+    manager = SessionManager(session=session, session_store=store)
+    active_skills = iter([("review", "/skills/review/SKILL.md")])
+
+    manager.add_tool_call("call-id", "result", "/project", active_skills)
+
+    assert manager.messages == [ToolResult(call_id="call-id", output="result")]
+    assert session.instruction_working_directory == "/project"
+    assert session.active_skills == [("review", "/skills/review/SKILL.md")]
+    store.save.assert_called_once_with(session)
+
+
+def test_manager_updates_instruction_state_without_persisting_an_incomplete_query():
+    """Instruction state remains in memory until the query response completes."""
+    store = Mock(spec=SessionStore)
+    session = Session()
+    manager = SessionManager(session=session, session_store=store)
+    active_skills = iter([("review", "/skills/review/SKILL.md")])
+
+    manager.update_instruction_state("/project", active_skills)
+
+    assert session.instruction_working_directory == "/project"
+    assert session.active_skills == [("review", "/skills/review/SKILL.md")]
+    store.save.assert_not_called()
 
 
 def test_manager_adds_a_response_and_persists_its_session_updates():

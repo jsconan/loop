@@ -161,14 +161,37 @@ class SessionManager:
         """
         self.add_message(Message(role="user", content=content))
 
-    def add_tool_call(self, call_id: str, output: str) -> None:
-        """Add a tool result to the session.
+    def add_tool_call(
+        self,
+        call_id: str,
+        output: str,
+        working_directory: str,
+        active_skills: Iterable[tuple[str, str]],
+    ) -> None:
+        """Add a tool result and its instruction state to the session.
 
         Args:
             call_id (str): Identifier used to associate the call with its result.
             output (str): The content of the tool result.
+            working_directory (str): Effective instruction directory after the tool call.
+            active_skills (Iterable[tuple[str, str]]): Active skill names and canonical locations
+                after the tool call.
         """
+        self.update_instruction_state(working_directory, active_skills)
         self.add_message(ToolResult(call_id=call_id, output=output))
+
+    def update_instruction_state(
+        self,
+        working_directory: str,
+        active_skills: Iterable[tuple[str, str]],
+    ) -> None:
+        """Update the instruction state associated with the session.
+
+        Args:
+            working_directory (str): Effective instruction directory.
+            active_skills (Iterable[tuple[str, str]]): Active skill names and canonical locations.
+        """
+        self._session.update_instruction_state(working_directory, active_skills)
 
     def add_response(self, response: Response) -> None:
         """Add a response to the session.

@@ -251,7 +251,14 @@ class Loop:
                 interaction=self._interaction,
                 instructions_manager=self._instructions_manager,
             )
-            self._session_manager.add_tool_call(call_id=tool_call.call_id, output=tool_result)
+            self._session_manager.add_tool_call(
+                call_id=tool_call.call_id,
+                output=tool_result,
+                working_directory=str(
+                    self._instructions_manager.working_directory or self._working_directory
+                ),
+                active_skills=self._instructions_manager.active_skill_identities,
+            )
         return True
 
     def query(self) -> Iterable[ResponseEvent]:
@@ -267,11 +274,11 @@ class Loop:
         if not selected_model:
             raise ValueError("No model was selected and the backend has no default model.")
         self._instructions_manager.prepare()
-        self._session_manager.session.instruction_working_directory = str(
-            self._instructions_manager.working_directory or self._working_directory
-        )
-        self._session_manager.session.active_skills = (
-            self._instructions_manager.active_skill_identities
+        self._session_manager.update_instruction_state(
+            working_directory=str(
+                self._instructions_manager.working_directory or self._working_directory
+            ),
+            active_skills=self._instructions_manager.active_skill_identities,
         )
         self._session_manager.model = selected_model
         return self._backend.get_response(

@@ -120,6 +120,20 @@ class Session:
     instruction_working_directory: str | None = None
     active_skills: list[tuple[str, str]] = field(default_factory=list)
 
+    def update_instruction_state(
+        self,
+        working_directory: str,
+        active_skills: Iterable[tuple[str, str]],
+    ) -> None:
+        """Update the effective instruction state.
+
+        Args:
+            working_directory (str): Effective instruction directory.
+            active_skills (Iterable[tuple[str, str]]): Active skill names and canonical locations.
+        """
+        self.instruction_working_directory = working_directory
+        self.active_skills = list(active_skills)
+
     def add_message(self, message: ConversationItem | Response) -> None:
         """Add one message to the conversation history.
 

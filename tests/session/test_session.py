@@ -49,6 +49,17 @@ def test_session_adds_one_or_multiple_messages():
     assert session.messages == [user, function_call(), answer]
 
 
+def test_session_updates_instruction_state():
+    """Sessions replace their effective directory and materialize active skill identities."""
+    session = Session()
+    active_skills = iter([("review", "/skills/review/SKILL.md")])
+
+    session.update_instruction_state("/project", active_skills)
+
+    assert session.instruction_working_directory == "/project"
+    assert session.active_skills == [("review", "/skills/review/SKILL.md")]
+
+
 def test_session_adds_response_items_and_updates_reported_metadata():
     """Completed responses append their items and replace reported session metadata."""
     session = Session(tokens=10, model="model-a")

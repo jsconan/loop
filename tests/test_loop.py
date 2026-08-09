@@ -237,6 +237,19 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     assert backend.get_response.call_args.kwargs["instructions"] == "Second rules."
 
 
+def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
+    """A query forwards byte-bounded instructions without hidden backend preflight calls."""
+    backend = Mock(tool_registry=default_tool_registry, default_model="model")
+    backend.get_response.return_value = []
+    (tmp_path / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
+    loop = Loop(backend=backend, working_directory=tmp_path)
+
+    list(loop.query())
+
+    backend.get_context_window.assert_not_called()
+    backend.count_tokens.assert_not_called()
+
+
 def test_loop_rejects_a_missing_explicit_working_directory(tmp_path):
     """Explicit directory changes reject missing targets without altering loop state."""
     loop = Loop(backend=loop_backend(), working_directory=tmp_path)
@@ -308,6 +321,33 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
     assert isinstance(result, ToolResult)
     assert "Follow review instructions." not in result.output
     assert "Follow review instructions." in backend.get_response.call_args.kwargs["instructions"]
+
+
+def test_skill_activation_is_persisted_with_its_tool_result(tmp_path):
+    """A successful skill mutation is durable without requiring another backend query."""
+    location = tmp_path / "review" / "SKILL.md"
+    location.parent.mkdir()
+    location.write_text(
+        "---\nname: review\ndescription: Review code.\n---\n\nReview.", encoding="utf-8"
+    )
+    registry = ToolRegistry([manage_skills])
+    backend = Mock(tool_registry=registry, default_model="model")
+    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    sessions = SessionManager(session_store=store)
+    manager = InstructionsManager(
+        skill_manager=SkillManager([Skill("review", "Review code.", location)])
+    )
+    loop = Loop(backend=backend, instructions_manager=manager, session_manager=sessions)
+    call = ToolCall(
+        call_id="skill-call",
+        name="manage_skills",
+        arguments='{"action":"activate","name":"review"}',
+    )
+
+    loop.handle_tool_calls(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+
+    restored = store.load(loop.session.id)
+    assert restored.active_skills == [("review", str(location))]
 
 
 def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_path):
@@ -420,18 +460,26 @@ def test_run_exit_commands_end_the_conversation(command):
     interaction.conversation_ended.assert_called_once_with()
 
 
-def test_handle_tool_calls_uses_local_objects():
-    """Tool results remain typed in context."""
+def test_handle_tool_calls_delegates_session_updates():
+    """Tool results and instruction state are delegated to the session manager."""
     registry = Mock()
     registry.call.return_value = "tool result"
     backend = loop_backend(tool_registry=registry, get_response=Mock(return_value=[]))
-    loop = Loop(backend=backend)
+    session_manager = Mock(spec=SessionManager)
+    session_manager.interaction = Mock(spec=Interaction)
+    session_manager.session = Session()
+    loop = Loop(backend=backend, session_manager=session_manager)
     call = function_call()
     response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
 
     assert loop.handle_tool_calls(response) is True
 
-    assert loop.messages == [ToolResult(call_id="call_123", output="tool result")]
+    session_manager.add_tool_call.assert_called_once_with(
+        call_id="call_123",
+        output="tool result",
+        working_directory=str(loop.working_directory),
+        active_skills=[],
+    )
     registry.call.assert_called_once_with(
         call.name,
         call.arguments,
@@ -451,6 +499,23 @@ def test_query_selects_only_the_event_production_mode():
 
     assert backend.get_response.call_args_list[0].kwargs["stream"] is False
     assert backend.get_response.call_args_list[1].kwargs["stream"] is True
+
+
+def test_query_delegates_instruction_state_to_the_session_manager():
+    """Queries delegate their prepared instruction state to the session manager."""
+    backend = loop_backend(get_response=Mock(return_value=[]))
+    session_manager = Mock(spec=SessionManager)
+    session_manager.interaction = Mock(spec=Interaction)
+    session_manager.session = Session()
+    session_manager.messages = []
+    loop = Loop(backend=backend, session_manager=session_manager)
+
+    list(loop.query())
+
+    session_manager.update_instruction_state.assert_called_once_with(
+        working_directory=str(loop.working_directory),
+        active_skills=[],
+    )
 
 
 def test_query_prefers_the_explicit_model_over_response_metadata():
