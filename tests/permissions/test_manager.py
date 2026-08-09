@@ -106,6 +106,63 @@ def test_explicit_rules_match_fields_and_deny_precedes_ask_and_allow():
     assert manager.evaluate(request(tool="other")).decision is Decision.ALLOW
 
 
+def test_ignored_files_are_denied_by_default_before_interactive_approval(
+    tmp_path, monkeypatch
+):
+    """Ignore rules create a default filesystem denial that modes cannot prompt around."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("secret.txt\n", "utf-8")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("sensitive", "utf-8")
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
+
+    result = manager.authorize(
+        request(Capability.FILESYSTEM_READ, resource=str(secret))
+    )
+
+    assert result.decision is Decision.DENY
+    assert result.source == "safety:ignored_path"
+    interaction.confirm.assert_not_called()
+
+    monkeypatch.setattr(
+        "loop.permissions.manager.is_path_ignored",
+        Mock(side_effect=OSError("unreadable ignore policy")),
+    )
+    assert manager.evaluate(
+        request(Capability.FILESYSTEM_READ, resource=str(tmp_path / "other.txt"))
+    ).decision is Decision.DENY
+
+
+def test_explicit_allow_rule_cannot_override_an_ignored_resource(tmp_path):
+    """Hard ignored-path denial takes precedence over explicit allow rules."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("secret.txt\n", "utf-8")
+    secret = tmp_path / "secret.txt"
+    configuration = PermissionConfiguration(
+        rules=[
+            PermissionRule(
+                decision=Decision.ALLOW,
+                tool="read_text_file",
+                capability=Capability.FILESYSTEM_READ,
+                resource=str(secret),
+            )
+        ]
+    )
+    manager = PermissionManager(tmp_path, configuration=configuration)
+
+    result = manager.evaluate(
+        request(
+            Capability.FILESYSTEM_READ,
+            tool="read_text_file",
+            resource=str(secret),
+        )
+    )
+
+    assert result.decision is Decision.DENY
+
+
 @pytest.mark.parametrize(
     "mode,capability,expected",
     [

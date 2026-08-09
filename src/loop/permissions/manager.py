@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
+from ..utils.path import is_path_ignored
 from .. import constants
 from .models import (
     Capability,
@@ -148,6 +149,15 @@ class PermissionManager:
         Returns:
             PermissionResult: Allow, ask, or deny policy outcome.
         """
+        if request.capability in {
+            Capability.FILESYSTEM_READ,
+            Capability.FILESYSTEM_WRITE,
+        } and self._is_ignored_resource(request.resource):
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="Ignored filesystem resources are denied.",
+                source="safety:ignored_path",
+            )
         matching = [
             rule
             for rule in (*self._configuration.rules, *self._session_rules)
@@ -236,6 +246,15 @@ class PermissionManager:
                 and fnmatchcase(request.resource, rule.resource)
             )
         )
+
+    @staticmethod
+    def _is_ignored_resource(resource: str | None) -> bool:
+        if resource is None:
+            return False
+        try:
+            return is_path_ignored(resource)
+        except (OSError, UnicodeError, ValueError):
+            return True
 
     def _mode_result(self, request: PermissionRequest) -> PermissionResult:
         mode = self._configuration.mode

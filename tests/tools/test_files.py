@@ -8,8 +8,10 @@ import pytest
 from loop import (
     ConsoleInteraction,
     InstructionsManager,
+    ToolContext,
     tool_registry,
 )
+from loop.tools.files import list_folder as list_folder_tool
 
 
 @pytest.fixture(autouse=True)
@@ -132,10 +134,24 @@ def test_list_folder_rejects_ignored_folder_as_traversal_root(tmp_path):
     private.mkdir()
     (private / "secret.txt").touch()
 
-    assert list_folder(str(tmp_path / ".git")) == (
-        f"Error listing folder: Path '{tmp_path / '.git'}' is ignored."
+    git_result = list_folder(str(tmp_path / ".git"))
+    private_result = list_folder(str(private))
+
+    assert git_result["error"] == "tool_call_denied"
+    assert private_result["error"] == "tool_call_denied"
+
+
+def test_list_folder_retains_tool_level_ignored_path_protection(tmp_path):
+    """Direct tool invocation independently rejects an ignored traversal root."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("private/\n", "utf-8")
+    private = tmp_path / "private"
+    private.mkdir()
+    context = ToolContext(ConsoleInteraction(), "list_folder")
+
+    assert list_folder_tool(context, str(private)) == (
+        f"Error listing folder: Path '{private}' is ignored."
     )
-    assert list_folder(str(private)) == (f"Error listing folder: Path '{private}' is ignored.")
 
 
 def test_list_folder_applies_ancestor_and_nested_ignore_files(tmp_path):
@@ -228,27 +244,17 @@ def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads
     assert read_text_file(str(tmp_path / "missing.txt")).startswith("Error reading file:")
 
 
-def test_read_text_file_requires_central_confirmation(tmp_path, monkeypatch):
-    """Every file read is blocked until the central policy receives approval."""
+def test_read_text_file_denies_ignored_files_before_confirmation(tmp_path, monkeypatch):
+    """Ignored files are denied centrally without offering a confirmation override."""
     (tmp_path / ".git").mkdir()
     (tmp_path / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
     secret = tmp_path / "secret.txt"
     secret.write_text("sensitive", encoding="utf-8")
-    confirm = MagicMock(side_effect=[False, True])
+    confirm = MagicMock(return_value=True)
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
     assert '"error": "tool_call_denied"' in read_text_file(secret)
-    assert read_text_file(secret) == "sensitive"
-    assert confirm.call_args_list == [
-        call(
-            f"Agent wants to use 'read_text_file' for filesystem.read on '{secret}'. Proceed?",
-            default=False,
-        ),
-        call(
-            f"Agent wants to use 'read_text_file' for filesystem.read on '{secret}'. Proceed?",
-            default=False,
-        ),
-    ]
+    assert confirm.call_args_list == []
 
 
 def test_read_text_file_confirms_for_visible_files_by_default(tmp_path, monkeypatch):
