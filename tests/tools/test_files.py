@@ -29,11 +29,11 @@ def write_text_file(path, content):
     )
 
 
-def read_text_file(path):
+def read_text_file(path, **ranges):
     """Dispatch the context-aware file-reading tool."""
     return tool_registry.call(
         "read_text_file",
-        json.dumps({"path": str(path)}),
+        json.dumps({"path": str(path), **ranges}),
         interaction=ConsoleInteraction(),
     )
 
@@ -245,7 +245,18 @@ def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads
     binary = tmp_path / "binary.dat"
     binary.write_bytes(b"valid UTF-8\0binary payload")
 
-    assert read_text_file(str(populated)) == "hello"
+    result = json.loads(read_text_file(str(populated)))
+    assert result == {
+        "path": str(populated),
+        "content": "hello",
+        "size_bytes": 5,
+        "start_byte": 0,
+        "end_byte": 5,
+        "included_bytes": 5,
+        "truncated": False,
+        "start_line": 1,
+        "end_line": 1,
+    }
     assert read_text_file(str(empty)) == f"File '{empty}' is empty."
     assert read_text_file(str(binary)) == (
         f"Error reading file: File '{binary}' appears to be binary."
@@ -273,8 +284,65 @@ def test_read_text_file_confirms_for_visible_files_by_default(tmp_path, monkeypa
     confirm = MagicMock(return_value=True)
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
-    assert read_text_file(visible) == "hello"
+    assert json.loads(read_text_file(visible))["content"] == "hello"
     confirm.assert_called_once()
+
+
+def test_read_text_file_supports_line_pages_and_byte_continuations(tmp_path):
+    """Line pages retain a hard byte limit and expose efficient byte continuation."""
+    source = tmp_path / "unicode.txt"
+    source.write_text("one\ntwø\nthree\nfour\n", encoding="utf-8")
+
+    first = json.loads(read_text_file(source, max_lines=2, max_bytes=100))
+    second = json.loads(
+        read_text_file(
+            source,
+            start_byte=first["next_start_byte"],
+            start_line=None,
+            max_bytes=100,
+        )
+    )
+
+    assert first["content"] == "one\ntwø\n"
+    assert first["truncation_reason"] == "lines"
+    assert first["next_start_line"] == 3
+    assert second["content"] == "three\nfour\n"
+    assert "start_line" not in second
+
+
+def test_read_text_file_trims_utf8_safely_at_the_byte_ceiling(tmp_path):
+    """A byte ceiling never splits a multibyte UTF-8 character."""
+    source = tmp_path / "unicode.txt"
+    source.write_text("a€b", encoding="utf-8")
+
+    first = json.loads(read_text_file(source, max_bytes=3))
+    second = json.loads(
+        read_text_file(
+            source,
+            start_byte=first["next_start_byte"],
+            start_line=None,
+            max_bytes=4,
+        )
+    )
+
+    assert first["content"] == "a"
+    assert first["end_byte"] == 1
+    assert second["content"] == "€b"
+
+
+def test_read_text_file_accepts_equivalent_origins_and_rejects_conflicts(tmp_path):
+    """Range selection normalizes the origin while rejecting genuine ambiguity."""
+    source = tmp_path / "unicode.txt"
+    source.write_text("€", encoding="utf-8")
+
+    origin = json.loads(read_text_file(source, start_byte=0))
+    conflicting = read_text_file(source, start_byte=1)
+    split_character = read_text_file(source, start_byte=1, start_line=None)
+
+    assert origin["content"] == "€"
+    assert origin["start_byte"] == 0
+    assert "Specify either start_byte or start_line" in conflicting
+    assert "not valid UTF-8" in split_character
 
 
 def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, monkeypatch):

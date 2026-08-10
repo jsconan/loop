@@ -90,6 +90,12 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
         "size_bytes": 14,
         "encoding": "utf-8",
         "content": "Guide content.",
+        "start_byte": 0,
+        "end_byte": 14,
+        "included_bytes": 14,
+        "truncated": False,
+        "start_line": 1,
+        "end_line": 1,
     }
     assert deactivated == {
         "name": "example",
@@ -104,6 +110,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
     assert str(tmp_path) not in json.dumps(
         [listed, activated, resources, resource, deactivated, deactivated_all]
     )
+    assert "skill_root" not in resource
     assert "Do the work." not in instructions_manager.instructions
 
 
@@ -214,8 +221,7 @@ def test_manage_skills_returns_only_public_error_details(tmp_path):
         "error": "unknown_skill",
         "message": "Skill 'missing' is not available.",
     }
-    assert oversized == {
-        "error": "skill_resource_too_large",
-        "message": "Resource exceeds the 65536-byte loading limit.",
-        "size_bytes": 64 * 1024 + 1,
-    }
+    assert oversized["size_bytes"] == 64 * 1024 + 1
+    assert oversized["included_bytes"] == 16 * 1024
+    assert oversized["next_start_byte"] == 16 * 1024
+    assert oversized["truncated"] is True

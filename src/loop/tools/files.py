@@ -5,11 +5,12 @@ from typing import Annotated, Literal
 
 from pydantic import Field
 
+from .. import constants
 from ..context import ToolContext
 from ..permissions import Capability, PermissionRequest
-from .models import FolderEntry
 from ..tooling import tool_registry
-from ..utils import format_content_preview, is_path_ignored, iter_visible_paths
+from ..utils import format_content_preview, is_path_ignored, iter_visible_paths, read_bounded_text
+from .models import FileContentResult, FolderEntry
 
 
 def _file_permission(capability: Capability):
@@ -74,17 +75,52 @@ def list_folder(
 def read_text_file(
     context: ToolContext,
     path: Annotated[str, Field(description="Path to the text file to read.")],
-) -> str:
-    """Read the contents of a text file from the local disk."""
+    start_byte: Annotated[
+        int | None,
+        Field(
+            description="Zero-based byte offset; start_line may remain 1 only at byte zero.", ge=0
+        ),
+    ] = None,
+    start_line: Annotated[
+        int | None,
+        Field(description="One-based starting line; set to null for byte-oriented access.", ge=1),
+    ] = 1,
+    max_lines: Annotated[
+        int | None,
+        Field(
+            description="Optional line ceiling; the first reached line or byte limit wins.", ge=1
+        ),
+    ] = None,
+    max_bytes: Annotated[
+        int,
+        Field(
+            description="Maximum UTF-8 bytes returned, capped by the application hard limit.",
+            ge=1,
+            le=constants.MAX_TOOL_CONTENT_BYTES,
+        ),
+    ] = constants.MAX_TOOL_CONTENT_BYTES,
+) -> FileContentResult | str:
+    """Read a bounded, resumable portion of a UTF-8 text file."""
     try:
-        content = Path(path).read_bytes()
-        context.observe_file(path)
-        if not content:
+        file_path = Path(path)
+        if file_path.stat().st_size == 0:
+            context.observe_file(path)
             return f"File '{path}' is empty."
-        if b"\0" in content:
-            return f"Error reading file: File '{path}' appears to be binary."
-        return content.decode("utf-8")
+        result = FileContentResult(
+            path=path,
+            **read_bounded_text(
+                file_path,
+                start_byte=start_byte,
+                start_line=start_line,
+                max_lines=max_lines,
+                max_bytes=max_bytes,
+            ),
+        )
+        context.observe_file(path)
+        return result
     except Exception as exc:  # pylint: disable=broad-except
+        if str(exc) == "Content appears to be binary.":
+            return f"Error reading file: File '{path}' appears to be binary."
         return f"Error reading file: {exc}"
 
 

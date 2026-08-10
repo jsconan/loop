@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from loop import (
+    ContentArtifact,
     Message,
     Reasoning,
     Response,
@@ -115,7 +116,17 @@ def test_session_serializes_and_deserializes_all_conversation_items():
             Message(role="user", content="hello"),
             Reasoning(content="thinking", id="reasoning", metadata=metadata),
             function_call(),
-            ToolResult(call_id="call_123", output="done"),
+            ToolResult(
+                call_id="call_123",
+                output="done",
+                artifacts=(
+                    ContentArtifact(
+                        handle="0123456789abcdef0123456789abcdef",
+                        source="https://example.com/source.txt",
+                        reloadable=True,
+                    ),
+                ),
+            ),
         ],
         tokens=42,
         model="model-a",

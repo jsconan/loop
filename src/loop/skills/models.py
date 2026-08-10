@@ -165,6 +165,15 @@ class SkillResourceContentResult(TypedDict):
     size_bytes: int
     encoding: Literal["utf-8", "base64"]
     content: str
+    start_byte: int
+    end_byte: int
+    included_bytes: int
+    truncated: bool
+    truncation_reason: NotRequired[Literal["bytes", "lines"]]
+    start_line: NotRequired[int]
+    end_line: NotRequired[int]
+    next_start_byte: NotRequired[int]
+    next_start_line: NotRequired[int]
 
 
 type SkillActivationResponse = SkillActivationResult | SkillOperationError

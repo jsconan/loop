@@ -9,7 +9,7 @@ from typing import Self
 import yaml
 
 from .. import constants
-from ..utils import sha256_digest
+from ..utils import read_bounded_text, sha256_digest
 from .models import (
     Skill,
     SkillActivationResponse,
@@ -197,9 +197,7 @@ class SkillManager:
         for directory in get_skill_directories(Path(working_directory).resolve()):
             paths.append(directory)
             if directory.is_dir():
-                paths.extend(
-                    sorted(directory.glob(f"*/{constants.DEFAULT_SKILL_FILENAME}"))
-                )
+                paths.extend(sorted(directory.glob(f"*/{constants.DEFAULT_SKILL_FILENAME}")))
         fingerprints = []
         for path in paths:
             try:
@@ -398,12 +396,27 @@ class SkillManager:
                     )
         return SkillResourceListResult(name=name, skill_root=str(root), resources=resources)
 
-    def read_resource(self, name: str, resource_path: str) -> SkillResourceContentResponse:
+    def read_resource(
+        self,
+        name: str,
+        resource_path: str,
+        *,
+        start_byte: int | None = None,
+        start_line: int | None = 1,
+        max_lines: int | None = None,
+        max_bytes: int = constants.MAX_TOOL_CONTENT_BYTES,
+    ) -> SkillResourceContentResponse:
         """Read one active skill resource without adding it to persistent instructions.
 
         Args:
             name (str): Exact active skill name.
             resource_path (str): Relative path beneath references, scripts, or assets.
+            start_byte (int | None): Zero-based byte offset, mutually exclusive with a non-default
+                ``start_line``. At the shared origin, ``max_lines`` selects line mode.
+            start_line (int | None): One-based starting line for text resources.
+            max_lines (int | None): Optional maximum text lines returned from either starting mode.
+                Defaults to no line limit; the first reached line or byte ceiling wins.
+            max_bytes (int): Maximum raw bytes returned, subject to the hard content ceiling.
 
         Returns:
             SkillResourceContentResponse: Text or base64 resource content, or a structured error.
@@ -422,25 +435,50 @@ class SkillManager:
                 error="invalid_skill_resource",
                 message="Resource must be a file beneath references, scripts, or assets.",
             )
-        content = candidate.read_bytes()
-        if len(content) > constants.MAX_RESOURCE_BYTES:
-            return SkillOperationError(
-                error="skill_resource_too_large",
-                message=(
-                    f"Resource exceeds the {constants.MAX_RESOURCE_BYTES}-byte loading limit."
-                ),
-                size_bytes=len(content),
-            )
-        result = SkillResourceContentResult(
-            name=name,
-            path=str(candidate.relative_to(root)),
-            size_bytes=len(content),
-        )
         try:
-            result.update({"encoding": "utf-8", "content": content.decode("utf-8")})
-        except UnicodeDecodeError:
-            result.update({"encoding": "base64", "content": b64encode(content).decode("ascii")})
-        return result
+            bounded = read_bounded_text(
+                candidate,
+                start_byte=start_byte,
+                start_line=start_line,
+                max_lines=max_lines,
+                max_bytes=max_bytes,
+            )
+            return SkillResourceContentResult(
+                name=name,
+                path=str(candidate.relative_to(root)),
+                encoding="utf-8",
+                **bounded,
+            )
+        except ValueError as exc:
+            if "binary" not in str(exc):
+                raise
+            if start_byte is None:
+                start_byte = 0
+            if start_line not in (None, 1) or start_byte < 0:
+                raise
+            size = candidate.stat().st_size
+            binary_limit = min(max_bytes, constants.MAX_TOOL_CONTENT_BYTES * 3 // 4)
+            with candidate.open("rb") as resource:
+                resource.seek(start_byte)
+                content = resource.read(binary_limit)
+            end_byte = start_byte + len(content)
+            result = SkillResourceContentResult(
+                name=name,
+                path=str(candidate.relative_to(root)),
+                size_bytes=size,
+                encoding="base64",
+                content=b64encode(content).decode("ascii"),
+                start_byte=start_byte,
+                end_byte=end_byte,
+                included_bytes=len(content),
+                truncated=end_byte < size,
+            )
+            if end_byte < size:
+                result.update(
+                    truncation_reason="bytes",
+                    next_start_byte=end_byte,
+                )
+            return result
 
     def catalog(self, max_chars: int = constants.MAX_CATALOG_CHARS) -> str | None:
         """Format a bounded metadata-only catalog for the model's initial instructions.

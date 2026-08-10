@@ -216,8 +216,8 @@ def test_resources_are_listed_and_loaded_only_for_active_skills(tmp_path):
     assert "Detailed guide." not in manager.activated_instructions[0][1]
 
 
-def test_resource_loading_rejects_escapes_missing_files_and_oversized_content(tmp_path):
-    """Resource loading confines paths and applies an independent hard size ceiling."""
+def test_resource_loading_rejects_escapes_and_bounds_oversized_content(tmp_path):
+    """Resource loading confines paths and returns resumable oversized content."""
     skill_root = tmp_path / "skills" / "safe"
     write_skill(skill_root, "safe", "Safe resources.")
     assets = skill_root / "assets"
@@ -230,8 +230,41 @@ def test_resource_loading_rejects_escapes_missing_files_and_oversized_content(tm
     assert manager.read_resource("safe", "../SKILL.md")["error"] == "invalid_skill_resource"
     assert manager.read_resource("safe", "assets/missing")["error"] == "invalid_skill_resource"
     oversized = manager.read_resource("safe", "assets/large.bin")
-    assert oversized["error"] == "skill_resource_too_large"
     assert oversized["size_bytes"] == 64 * 1024 + 1
+    assert oversized["included_bytes"] == 16 * 1024
+    assert oversized["truncated"] is True
+    assert oversized["next_start_byte"] == 16 * 1024
+
+
+def test_binary_resource_loading_is_bounded_and_validates_ranges(tmp_path):
+    """Binary resources use bounded base64 pages and reject incompatible line access."""
+    skill_root = tmp_path / "skills" / "binary"
+    write_skill(skill_root, "binary", "Binary resources.")
+    assets = skill_root / "assets"
+    assets.mkdir()
+    payload = b"\0" + b"x" * (16 * 1024)
+    (assets / "payload.bin").write_bytes(payload)
+    manager = SkillManager.discover(tmp_path, [tmp_path / "skills"])
+    manager.activate("binary")
+
+    first = manager.read_resource("binary", "assets/payload.bin")
+    second = manager.read_resource(
+        "binary",
+        "assets/payload.bin",
+        start_byte=first["next_start_byte"],
+        start_line=None,
+    )
+
+    assert first["encoding"] == "base64"
+    assert first["truncated"] is True
+    assert first["next_start_byte"] == 12 * 1024
+    assert second["included_bytes"] == 4 * 1024 + 1
+    with pytest.raises(ValueError, match="binary"):
+        manager.read_resource("binary", "assets/payload.bin", start_line=2)
+    with pytest.raises(ValueError, match="start_byte"):
+        manager.read_resource(
+            "binary", "assets/payload.bin", start_byte=-1, start_line=None
+        )
 
 
 def test_discovery_skips_invalid_skills_and_reports_diagnostics(tmp_path):

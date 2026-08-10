@@ -4,6 +4,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from .. import constants
 from ..context import ToolContext
 from ..permissions import Capability, PermissionRequest
 from ..skills.models import (
@@ -18,7 +19,22 @@ _FIELDS_BY_NAME = {
     "deactivate": ("name", "status", "instructions_updated"),
     "deactivate_all": ("status", "deactivated", "instructions_updated"),
     "list_resources": ("name", "resources"),
-    "read_resource": ("name", "path", "size_bytes", "encoding", "content"),
+    "read_resource": (
+        "name",
+        "path",
+        "size_bytes",
+        "encoding",
+        "content",
+        "start_byte",
+        "end_byte",
+        "included_bytes",
+        "truncated",
+        "truncation_reason",
+        "start_line",
+        "end_line",
+        "next_start_byte",
+        "next_start_line",
+    ),
 }
 
 
@@ -30,10 +46,7 @@ def _filter_fields(result: dict[str, Any], fields: tuple[str, ...]) -> dict[str,
 def _public_result(action: str, result: SkillOperationResult) -> PublicSkillOperationResult:
     """Return only fields required by the model-facing skill protocol."""
     if "error" in result:
-        public = _filter_fields(result, ("error", "message"))
-        if action == "read_resource" and "size_bytes" in result:
-            public["size_bytes"] = result["size_bytes"]
-        return public
+        return _filter_fields(result, ("error", "message"))
     if action == "list":
         return {
             "skills": [
@@ -53,11 +66,7 @@ def _skill_permission(arguments: dict[str, Any]) -> tuple[PermissionRequest, ...
         else Capability.FILESYSTEM_READ
     )
     resource = str(arguments.get("path") or arguments.get("name") or action)
-    return (
-        PermissionRequest(
-            tool_name="manage_skills", capability=capability, resource=resource
-        ),
-    )
+    return (PermissionRequest(tool_name="manage_skills", capability=capability, resource=resource),)
 
 
 @tool_registry.tool(permission_resolver=_skill_permission)
@@ -82,6 +91,31 @@ def manage_skills(
         str | None,
         Field(description="Relative skill resource path when reading a resource."),
     ] = None,
+    start_byte: Annotated[
+        int | None,
+        Field(
+            description="Zero-based resource offset; start_line may remain 1 only at byte zero.",
+            ge=0,
+        ),
+    ] = None,
+    start_line: Annotated[
+        int | None,
+        Field(description="One-based resource line; set to null for byte access.", ge=1),
+    ] = 1,
+    max_lines: Annotated[
+        int | None,
+        Field(
+            description="Optional line ceiling; the first reached line or byte limit wins.", ge=1
+        ),
+    ] = None,
+    max_bytes: Annotated[
+        int,
+        Field(
+            description="Maximum raw resource bytes returned.",
+            ge=1,
+            le=constants.MAX_TOOL_CONTENT_BYTES,
+        ),
+    ] = constants.MAX_TOOL_CONTENT_BYTES,
 ) -> PublicSkillOperationResult:
     """List, activate, or deactivate skill instructions on demand."""
     manager = context.instructions_manager
@@ -110,7 +144,14 @@ def manage_skills(
                     error="missing_resource_path",
                     message="The read_resource action requires a relative path.",
                 )
-            result = manager.read_skill_resource(name, path)
+            result = manager.read_skill_resource(
+                name,
+                path,
+                start_byte=start_byte,
+                start_line=start_line,
+                max_lines=max_lines,
+                max_bytes=max_bytes,
+            )
         else:
             result = manager.deactivate_skill(name)
     except OSError, UnicodeError, ValueError:

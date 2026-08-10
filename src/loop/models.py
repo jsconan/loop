@@ -99,18 +99,35 @@ class ToolCall(ConversationItemModel):
     id: str | None = None
 
 
+class ContentArtifact(BaseModel):
+    """Describe session-persisted metadata for one out-of-context artifact.
+
+    Args:
+        handle (str): Opaque canonical artifact handle.
+        source (str): Human-readable source used to reload reproducible content.
+        reloadable (bool): Whether the source can recreate an expired artifact.
+    """
+
+    handle: str
+    source: str
+    reloadable: bool
+
+
 class ToolResult(ConversationItemModel):
     """Represent the serialized result of a function-tool request.
 
     Args:
         call_id (str): Identifier of the corresponding tool call.
         output (str): Serialized tool output.
+        artifacts (tuple[ContentArtifact, ...]): Local persisted artifact metadata. Defaults to an
+            empty tuple and is not sent to the model provider.
         metadata (ResponseMetadata | None): Metadata for the provider response that produced the
             result, or ``None`` for a locally produced result.
     """
 
     call_id: str
     output: str
+    artifacts: tuple[ContentArtifact, ...] = Field(default_factory=tuple)
 
 
 ConversationItem: TypeAlias = Message | Reasoning | ToolCall | ToolResult

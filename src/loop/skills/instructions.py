@@ -381,19 +381,41 @@ class InstructionsManager:
             self.prepare()
             return self._skill_manager.list_resources(name)
 
-    def read_skill_resource(self, name: str, resource_path: str) -> SkillResourceContentResponse:
+    def read_skill_resource(
+        self,
+        name: str,
+        resource_path: str,
+        *,
+        start_byte: int | None = None,
+        start_line: int | None = 1,
+        max_lines: int | None = None,
+        max_bytes: int = constants.MAX_TOOL_CONTENT_BYTES,
+    ) -> SkillResourceContentResponse:
         """Read one active skill resource on demand.
 
         Args:
             name (str): Exact active skill name.
             resource_path (str): Relative resource path beneath the skill root.
+            start_byte (int | None): Zero-based byte offset, mutually exclusive with a non-default
+                ``start_line``. At the shared origin, ``max_lines`` selects line mode.
+            start_line (int | None): One-based starting line for text resources.
+            max_lines (int | None): Optional maximum text lines returned from either starting mode.
+                Defaults to no line limit; the first reached line or byte ceiling wins.
+            max_bytes (int): Maximum raw content bytes returned.
 
         Returns:
             SkillResourceContentResponse: Resource content or a structured error.
         """
         with self._lock:
             self.prepare()
-            return self._skill_manager.read_resource(name, resource_path)
+            return self._skill_manager.read_resource(
+                name,
+                resource_path,
+                start_byte=start_byte,
+                start_line=start_line,
+                max_lines=max_lines,
+                max_bytes=max_bytes,
+            )
 
     def _refresh(self, working_directory: Path, signature: tuple) -> bool:
         """Build and atomically install a refreshed instruction snapshot."""

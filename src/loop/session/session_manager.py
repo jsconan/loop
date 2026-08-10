@@ -1,14 +1,17 @@
 """Session manager for handling user sessions."""
 
+import json
 from typing import Iterable
 
 from ..interaction import ConsoleInteraction, Interaction
 from ..models import (
+    ContentArtifact,
     ConversationItem,
     Message,
     Response,
     ToolResult,
 )
+from ..utils import bound_tool_result, cached_metadata, register_cached_metadata
 from .session import Session, SessionStore
 from .store import MemorySessionStore
 
@@ -128,6 +131,14 @@ class SessionManager:
         if not isinstance(session, Session):
             raise ValueError("Invalid session type.")
         self._session = session
+        for message in session.messages:
+            if isinstance(message, ToolResult):
+                for artifact in message.artifacts:
+                    register_cached_metadata(
+                        artifact.handle,
+                        artifact.source,
+                        artifact.reloadable,
+                    )
 
     def add_message(self, message: ConversationItem | Response) -> None:
         """Add conversation items and persist the resulting complete session.
@@ -178,7 +189,39 @@ class SessionManager:
                 after the tool call.
         """
         self.update_instruction_state(working_directory, active_skills)
-        self.add_message(ToolResult(call_id=call_id, output=output))
+        output, handle = bound_tool_result(output, f"tool result {call_id}")
+        if handle is not None:
+            self._interaction.info(
+                f"Tool result '{call_id}' exceeded the context limit and was cached as '{handle}'."
+            )
+        self.add_message(
+            ToolResult(
+                call_id=call_id,
+                output=output,
+                artifacts=self._content_artifacts(output),
+            )
+        )
+
+    @staticmethod
+    def _content_artifacts(output: str) -> tuple[ContentArtifact, ...]:
+        """Return registered artifact metadata referenced by one serialized result."""
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return ()
+        if not isinstance(payload, dict) or not isinstance(payload.get("handle"), str):
+            return ()
+        handle = payload["handle"]
+        metadata = cached_metadata(handle)
+        if metadata is None:
+            return ()
+        return (
+            ContentArtifact(
+                handle=handle,
+                source=metadata["source"],
+                reloadable=metadata["reloadable"],
+            ),
+        )
 
     def update_instruction_state(
         self,

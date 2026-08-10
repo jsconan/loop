@@ -1,11 +1,14 @@
 """Tests for session coordination and persistence."""
 
+import json
 from unittest.mock import Mock
+from uuid import uuid4
 
 import pytest
 
 from loop import (
     ConsoleInteraction,
+    ContentArtifact,
     MemorySessionStore,
     Message,
     Response,
@@ -15,6 +18,7 @@ from loop import (
 )
 from loop.interaction import Interaction
 from loop.session import SessionStore
+from loop.utils import cached_metadata
 
 
 def test_manager_creates_default_services_and_an_empty_session():
@@ -148,6 +152,66 @@ def test_manager_adds_a_tool_result_with_its_instruction_state():
     assert session.instruction_working_directory == "/project"
     assert session.active_skills == [("review", "/skills/review/SKILL.md")]
     store.save.assert_called_once_with(session)
+
+
+def test_manager_caches_oversized_tool_results_before_persistence():
+    """Oversized results persist only bounded previews with resumable artifact handles."""
+    store = Mock(spec=SessionStore)
+    interaction = Mock(spec=Interaction)
+    session = Session()
+    manager = SessionManager(interaction=interaction, session=session, session_store=store)
+
+    manager.add_tool_call("large-call", "x" * (20 * 1024 + 1), "/project", [])
+
+    output = manager.messages[0].output
+    result = json.loads(output)
+    assert len(output.encode("utf-8")) <= 20 * 1024
+    assert result["size_bytes"] == 20 * 1024 + 1
+    assert result["truncated"] is True
+    assert result["handle"]
+    assert manager.messages[0].artifacts == (
+        ContentArtifact(
+            handle=result["handle"],
+            source="tool result large-call",
+            reloadable=False,
+        ),
+    )
+    interaction.info.assert_called_once()
+    store.save.assert_called_once_with(session)
+
+
+def test_manager_restores_artifact_metadata_from_a_loaded_session():
+    """Loading a session restores reload sources persisted on prior tool results."""
+    handle = uuid4().hex
+    artifact = ContentArtifact(
+        handle=handle,
+        source="https://example.com/source.txt",
+        reloadable=True,
+    )
+    session = Session(
+        messages=[ToolResult(call_id="call", output="result", artifacts=(artifact,))]
+    )
+
+    SessionManager(session=session)
+
+    assert cached_metadata(handle) == {
+        "source": "https://example.com/source.txt",
+        "reloadable": True,
+    }
+
+
+def test_manager_ignores_unregistered_handles_in_tool_output():
+    """Untrusted output cannot invent session artifact metadata without registration."""
+    manager = SessionManager()
+
+    manager.add_tool_call(
+        "call",
+        json.dumps({"handle": uuid4().hex, "source": "private"}),
+        "/project",
+        [],
+    )
+
+    assert manager.messages[0].artifacts == ()
 
 
 def test_manager_updates_instruction_state_without_persisting_an_incomplete_query():
