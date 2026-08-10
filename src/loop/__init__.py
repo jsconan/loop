@@ -15,6 +15,7 @@ __all__ = [
     "ConversationItem",
     "ConversationItemModel",
     "Decision",
+    "delete_path",
     "fetch_content",
     "find_project_root",
     "format_content_diff",
@@ -135,6 +136,7 @@ from .skills import (
 )
 from .tooling import Tool, ToolRegistrationError, ToolRegistry, tool_registry
 from .tools import (
+    delete_path,
     fetch_content,
     get_current_datetime,
     list_folder,

@@ -1,5 +1,6 @@
 """Provide tools for accessing files and folders on the local disk."""
 
+import shutil
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -53,6 +54,39 @@ def _file_permission(capability: Capability):
         )
 
     return _resolve
+
+
+def _delete_permission(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
+    """Return the permanent-deletion request for the supplied path."""
+    path = Path(str(arguments["path"]))
+    kind = _deletion_kind(path)
+    if kind == "symbolic link":
+        reason = "Permanently delete this symbolic link; its target will not be deleted."
+    elif kind == "folder":
+        reason = "Permanently delete this folder and all of its contents."
+    elif kind == "file":
+        reason = "Permanently delete this file."
+    else:
+        reason = "Deletion supports files, symbolic links, and folders only."
+    return (
+        PermissionRequest(
+            tool_name="",
+            capability=Capability.FILESYSTEM_DELETE,
+            resource=str(path.absolute()),
+            reason=reason,
+        ),
+    )
+
+
+def _deletion_kind(path: Path) -> Literal["file", "symbolic link", "folder"] | None:
+    """Return the supported deletion kind for a path, when any."""
+    if path.is_symlink():
+        return "symbolic link"
+    if path.is_dir():
+        return "folder"
+    if path.is_file():
+        return "file"
+    return None
 
 
 @tool_registry.tool(
@@ -169,3 +203,34 @@ def write_text_file(
         return f"Successfully wrote to file '{path}'."
     except Exception as exc:  # pylint: disable=broad-except
         return f"Error writing to file: {exc}"
+
+
+@tool_registry.tool(
+    capabilities={Capability.FILESYSTEM_DELETE},
+    permission_resolver=_delete_permission,
+)
+def delete_path(
+    context: ToolContext,
+    path: Annotated[
+        str,
+        Field(description="Path to the file, symbolic link, or folder to permanently delete."),
+    ],
+) -> str:
+    """Permanently delete a file, symbolic link, or folder tree from the local disk."""
+    try:
+        target = Path(path)
+        kind = _deletion_kind(target)
+        if kind == "folder":
+            shutil.rmtree(target)
+        elif kind in {"file", "symbolic link"}:
+            target.unlink()
+        elif target.exists():
+            return (
+                f"Error deleting path: Path '{path}' is not a file, symbolic link, or folder."
+            )
+        else:
+            return f"Error deleting path: Path '{path}' does not exist."
+        context.invalidate_instructions(target)
+        return f"Successfully deleted path '{path}'."
+    except Exception as exc:  # pylint: disable=broad-except
+        return f"Error deleting path: {exc}"

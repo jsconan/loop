@@ -1,6 +1,8 @@
 """Tests for the built-in file access tools."""
 
 import json
+import os
+from pathlib import Path
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -25,6 +27,15 @@ def write_text_file(path, content):
     return tool_registry.call(
         "write_text_file",
         json.dumps({"path": str(path), "content": content}),
+        interaction=ConsoleInteraction(),
+    )
+
+
+def delete_path(path):
+    """Dispatch the context-aware file-deletion tool."""
+    return tool_registry.call(
+        "delete_path",
+        json.dumps({"path": str(path)}),
         interaction=ConsoleInteraction(),
     )
 
@@ -416,3 +427,95 @@ def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     result = write_text_file(str(tmp_path / "missing" / "file.txt"), "content")
     assert result.startswith("Error writing to file:")
+
+
+def test_delete_path_requires_confirmation_and_removes_files(tmp_path, monkeypatch):
+    """Deleting a file requires approval and permanently removes the selected path."""
+    target = tmp_path / "obsolete.txt"
+    target.write_text("obsolete", encoding="utf-8")
+    confirm = MagicMock(side_effect=[False, True])
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    assert '"error": "tool_call_denied"' in delete_path(target)
+    assert target.exists()
+
+    assert delete_path(target) == f"Successfully deleted path '{target}'."
+    assert not target.exists()
+    assert confirm.call_args_list == [
+        call(
+            f"Agent wants to use 'delete_path' for filesystem.delete on '{target}'. "
+            "Permanently delete this file. Proceed?",
+            default=False,
+        ),
+        call(
+            f"Agent wants to use 'delete_path' for filesystem.delete on '{target}'. "
+            "Permanently delete this file. Proceed?",
+            default=False,
+        ),
+    ]
+
+
+def test_delete_path_removes_folder_trees_without_following_symbolic_links(tmp_path, monkeypatch):
+    """Folder deletion removes descendants while symbolic-link deletion preserves its target."""
+    folder = tmp_path / "obsolete"
+    nested = folder / "nested"
+    nested.mkdir(parents=True)
+    (nested / "child.txt").write_text("obsolete", encoding="utf-8")
+    target = tmp_path / "target.txt"
+    target.write_text("keep", encoding="utf-8")
+    link = tmp_path / "target-link"
+    link.symlink_to(target)
+    confirm = MagicMock(return_value=True)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    assert delete_path(folder) == f"Successfully deleted path '{folder}'."
+    assert not folder.exists()
+    assert delete_path(link) == f"Successfully deleted path '{link}'."
+    assert not link.exists()
+    assert target.read_text(encoding="utf-8") == "keep"
+    assert confirm.call_args_list == [
+        call(
+            f"Agent wants to use 'delete_path' for filesystem.delete on '{folder}'. "
+            "Permanently delete this folder and all of its contents. Proceed?",
+            default=False,
+        ),
+        call(
+            f"Agent wants to use 'delete_path' for filesystem.delete on '{link}'. "
+            "Permanently delete this symbolic link; its target will not be deleted. "
+            "Proceed?",
+            default=False,
+        ),
+    ]
+
+
+def test_delete_path_denies_ignored_paths_and_rejects_unsupported_targets(tmp_path, monkeypatch):
+    """Ignored, missing, and special paths are never deleted as ordinary file targets."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("sensitive", encoding="utf-8")
+    confirm = MagicMock(return_value=True)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    assert '"error": "tool_call_denied"' in delete_path(secret)
+    assert secret.exists()
+    confirm.assert_not_called()
+    assert delete_path(tmp_path / "missing").startswith("Error deleting path:")
+
+    fifo = tmp_path / "events"
+    os.mkfifo(fifo)
+    assert delete_path(fifo) == (
+        f"Error deleting path: Path '{fifo}' is not a file, symbolic link, or folder."
+    )
+    assert fifo.exists()
+
+
+def test_delete_path_reports_removal_failures(tmp_path, monkeypatch):
+    """Filesystem removal failures are returned without reporting a successful deletion."""
+    target = tmp_path / "protected.txt"
+    target.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(Path, "unlink", MagicMock(side_effect=OSError("access denied")))
+
+    assert delete_path(target) == "Error deleting path: access denied"
+    assert target.exists()

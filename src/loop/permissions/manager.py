@@ -150,6 +150,7 @@ class PermissionManager:
         if request.capability in {
             Capability.FILESYSTEM_READ,
             Capability.FILESYSTEM_WRITE,
+            Capability.FILESYSTEM_DELETE,
         } and self._is_ignored_resource(request.resource):
             return PermissionResult(
                 decision=Decision.DENY,
@@ -299,7 +300,12 @@ class PermissionManager:
         if (
             request.resource is None
             or self._working_directory is None
-            or request.capability not in {Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE}
+            or request.capability
+            not in {
+                Capability.FILESYSTEM_READ,
+                Capability.FILESYSTEM_WRITE,
+                Capability.FILESYSTEM_DELETE,
+            }
         ):
             return request.resource
         try:

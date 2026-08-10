@@ -11,6 +11,7 @@ class Capability(StrEnum):
     PURE = "pure"
     FILESYSTEM_READ = "filesystem.read"
     FILESYSTEM_WRITE = "filesystem.write"
+    FILESYSTEM_DELETE = "filesystem.delete"
     PROCESS_EXEC = "process.exec"
     NETWORK_READ = "network.read"
     NETWORK_WRITE = "network.write"

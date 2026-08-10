@@ -209,7 +209,9 @@ def test_explicit_allow_rule_cannot_override_an_ignored_resource(tmp_path):
         (PermissionMode.UNRESTRICTED, Capability.PROCESS_EXEC, Decision.ALLOW),
         (PermissionMode.READ_ONLY, Capability.FILESYSTEM_READ, Decision.ALLOW),
         (PermissionMode.READ_ONLY, Capability.FILESYSTEM_WRITE, Decision.DENY),
+        (PermissionMode.READ_ONLY, Capability.FILESYSTEM_DELETE, Decision.DENY),
         (PermissionMode.WORKSPACE_WRITE, Capability.NETWORK_READ, Decision.ALLOW),
+        (PermissionMode.WORKSPACE_WRITE, Capability.FILESYSTEM_DELETE, Decision.ASK),
         (PermissionMode.WORKSPACE_WRITE, Capability.PROCESS_EXEC, Decision.ASK),
     ],
 )
@@ -235,6 +237,23 @@ def test_workspace_write_allows_only_normalized_paths_below_workspace(tmp_path):
         is Decision.ASK
     )
     assert manager.evaluate(request(Capability.FILESYSTEM_WRITE)).decision is Decision.ASK
+
+
+def test_ignored_delete_paths_are_denied_before_interactive_approval(tmp_path):
+    """Ignore rules prevent deletion even when the user could otherwise approve it."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("secret.txt\n", "utf-8")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("sensitive", "utf-8")
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
+
+    result = manager.authorize(request(Capability.FILESYSTEM_DELETE, resource=str(secret)))
+
+    assert result.decision is Decision.DENY
+    assert result.source == "safety:ignored_path"
+    interaction.confirm.assert_not_called()
 
 
 def test_persisted_and_session_rules_have_distinct_lifetimes(tmp_path):
