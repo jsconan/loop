@@ -13,11 +13,13 @@ from loop.utils.text import (
 )
 
 
-def test_format_tool_call_arguments_preserves_short_values_and_structure():
-    """Tool-call displays retain short nested JSON values and non-string values."""
+def test_format_tool_call_arguments_formats_object_fields_as_parameters():
+    """Tool-call displays render short object fields as named parameters."""
     arguments = '{"query":"term","options":{"limit":2,"exact":true},"paths":["one",null]}'
 
-    assert format_tool_call_arguments(arguments) == arguments
+    assert format_tool_call_arguments(arguments) == (
+        'query="term", options={"limit":2,"exact":true}, paths=["one",null]'
+    )
 
 
 def test_format_tool_call_arguments_truncates_long_nested_string_values():
@@ -25,7 +27,7 @@ def test_format_tool_call_arguments_truncates_long_nested_string_values():
     arguments = '{"content":"0123456789abcdefghijklmnop","items":["abcdefghijklmnopqrstuvwxyz"]}'
 
     assert format_tool_call_arguments(arguments) == (
-        '{"content":"0123456789…hijklmnop","items":["abcdefghij…rstuvwxyz"]}'
+        'content="0123456789…hijklmnop", items=["abcdefghij…rstuvwxyz"]'
     )
 
 
@@ -33,7 +35,7 @@ def test_format_tool_call_arguments_accepts_a_custom_value_limit():
     """Tool-call displays apply a caller-provided limit to every string value."""
     arguments = '{"content":"abcdefgh"}'
 
-    assert format_tool_call_arguments(arguments, max_chars=5) == '{"content":"ab…gh"}'
+    assert format_tool_call_arguments(arguments, max_chars=5) == 'content="ab…gh"'
 
 
 def test_format_tool_call_arguments_rejects_an_insufficient_value_limit():
@@ -47,6 +49,13 @@ def test_format_tool_call_arguments_bounds_invalid_json_as_raw_text():
     arguments = "0123456789abcdefghijklmnop"
 
     assert format_tool_call_arguments(arguments) == "0123456789…hijklmnop"
+
+
+def test_format_tool_call_arguments_bounds_non_object_json_as_raw_text():
+    """Non-object JSON remains a bounded raw display rather than a parameter list."""
+    arguments = '"0123456789abcdefghijklmnop"'
+
+    assert format_tool_call_arguments(arguments) == '"012345678…ijklmnop"'
 
 
 def test_format_content_preview_returns_formatted_lines():

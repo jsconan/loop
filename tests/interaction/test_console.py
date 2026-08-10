@@ -130,14 +130,14 @@ def test_tool_call_displays_its_name_and_arguments(capsys):
     """Tool calls receive a dedicated terminal presentation."""
     ConsoleInteraction().tool_call("search", '{"query":"term"}')
 
-    assert capsys.readouterr().out == '\n[TOOL CALL]: search({"query":"term"})\n'
+    assert capsys.readouterr().out == '\n[TOOL CALL]: search(query="term")\n'
 
 
 def test_tool_call_truncates_each_long_argument_value_in_the_middle(capsys):
     """Tool calls retain the beginning and end of long argument values."""
     ConsoleInteraction().tool_call("write", '{"content":"0123456789abcdefghijklmnop"}')
 
-    assert capsys.readouterr().out == '\n[TOOL CALL]: write({"content":"0123456789…hijklmnop"})\n'
+    assert capsys.readouterr().out == '\n[TOOL CALL]: write(content="0123456789…hijklmnop")\n'
 
 
 @pytest.mark.parametrize(

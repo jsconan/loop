@@ -14,8 +14,9 @@ def format_tool_call_arguments(
 ) -> str:
     """Format tool-call arguments with bounded string values.
 
-    Recursively truncates displayed string values while preserving the JSON structure. Invalid JSON
-    is treated as an opaque string and truncated as a whole.
+    Recursively truncates displayed string values and renders top-level object fields as a
+    comma-separated parameter list. Invalid JSON and non-object JSON are treated as opaque strings
+    and truncated as a whole.
 
     Args:
         arguments (str): JSON arguments supplied to a tool.
@@ -23,7 +24,7 @@ def format_tool_call_arguments(
             ``TOOL_CALL_VALUE_MAX_CHARS``.
 
     Returns:
-        str: Compact JSON with bounded string values, or a bounded raw argument string.
+        str: A parameter list with bounded string values, or a bounded raw argument string.
 
     Raises:
         ValueError: If ``max_chars`` is less than three characters.
@@ -34,6 +35,14 @@ def format_tool_call_arguments(
         value = json.loads(arguments)
     except json.JSONDecodeError:
         return _truncate_middle(arguments, max_chars)
+    if not isinstance(value, dict):
+        return _truncate_middle(arguments, max_chars)
+
+    return ", ".join(f"{key}={_truncate_json(item, max_chars)}" for key, item in value.items())
+
+
+def _truncate_json(value: Any, max_chars: int) -> str:
+    """Return a JSON string with bounded string leaves."""
     return json.dumps(
         _truncate_json_strings(value, max_chars),
         ensure_ascii=False,
