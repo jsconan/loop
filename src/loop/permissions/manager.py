@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from ..utils.path import is_path_ignored
 from .. import constants
+from ..utils.path import is_path_ignored
 from .models import (
     Capability,
     Decision,
@@ -62,9 +62,7 @@ class PermissionManager:
         self._configuration_path = (
             Path(configuration_path)
             if configuration_path is not None
-            else self._working_directory
-            / constants.APP_DIRECTORY
-            / constants.PERMISSIONS_FILENAME
+            else self._working_directory / constants.APP_DIRECTORY / constants.PERMISSIONS_FILENAME
             if self._working_directory is not None
             else None
         )
@@ -253,7 +251,7 @@ class PermissionManager:
             return False
         try:
             return is_path_ignored(resource)
-        except (OSError, UnicodeError, ValueError):
+        except OSError, UnicodeError, ValueError:
             return True
 
     def _mode_result(self, request: PermissionRequest) -> PermissionResult:
@@ -287,14 +285,32 @@ class PermissionManager:
         except ValueError:
             return False
 
-    @staticmethod
-    def _prompt(request: PermissionRequest) -> str:
-        target = f" on '{request.resource}'" if request.resource else ""
+    def _prompt(self, request: PermissionRequest) -> str:
+        resource = self._display_resource(request)
+        target = f" on '{resource}'" if resource else ""
         reason = f" {request.reason}" if request.reason else ""
         return (
             f"Agent wants to use '{request.tool_name}' for {request.capability.value}{target}."
             f"{reason} Proceed?"
         )
+
+    def _display_resource(self, request: PermissionRequest) -> str | None:
+        """Return the resource formatted for an approval prompt."""
+        if (
+            request.resource is None
+            or self._working_directory is None
+            or request.capability not in {Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE}
+        ):
+            return request.resource
+        try:
+            relative_resource = (
+                Path(request.resource).resolve().relative_to(self._working_directory)
+            )
+            if relative_resource == Path("."):
+                return f"workspace root: {self._working_directory}"
+            return str(relative_resource)
+        except ValueError:
+            return request.resource
 
     def _audit(self, request: PermissionRequest, result: PermissionResult) -> None:
         if self._configuration_path is None:

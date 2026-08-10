@@ -74,6 +74,46 @@ def test_confirm_all_prompts_with_normalized_context(tmp_path, approved, decisio
     )
 
 
+@pytest.mark.parametrize(
+    ("resource", "expected"),
+    [
+        ("inside.txt", "inside.txt"),
+        ("folder/inside.txt", "folder/inside.txt"),
+        ("../outside.txt", None),
+    ],
+)
+def test_filesystem_prompt_uses_workspace_relative_paths_unless_resource_escapes(
+    tmp_path, resource, expected
+):
+    """File approval prompts abbreviate in-workspace paths but retain outside absolute paths."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
+    absolute_resource = (tmp_path / resource).resolve()
+
+    manager.authorize(request(Capability.FILESYSTEM_READ, resource=str(absolute_resource)))
+
+    displayed = expected if expected is not None else str(absolute_resource)
+    interaction.confirm.assert_called_once_with(
+        f"Agent wants to use 'demo' for filesystem.read on '{displayed}'. Proceed?",
+        default=False,
+    )
+
+
+def test_filesystem_prompt_identifies_the_workspace_root_unambiguously(tmp_path):
+    """File approval prompts label the workspace root without resembling a child path."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
+
+    manager.authorize(request(Capability.FILESYSTEM_READ, resource=str(tmp_path)))
+
+    interaction.confirm.assert_called_once_with(
+        f"Agent wants to use 'demo' for filesystem.read on 'workspace root: {tmp_path}'. Proceed?",
+        default=False,
+    )
+
+
 def test_explicit_rules_match_fields_and_deny_precedes_ask_and_allow():
     """Matching deny rules dominate weaker decisions regardless of declaration order."""
     configuration = PermissionConfiguration(
@@ -106,9 +146,7 @@ def test_explicit_rules_match_fields_and_deny_precedes_ask_and_allow():
     assert manager.evaluate(request(tool="other")).decision is Decision.ALLOW
 
 
-def test_ignored_files_are_denied_by_default_before_interactive_approval(
-    tmp_path, monkeypatch
-):
+def test_ignored_files_are_denied_by_default_before_interactive_approval(tmp_path, monkeypatch):
     """Ignore rules create a default filesystem denial that modes cannot prompt around."""
     (tmp_path / ".git").mkdir()
     (tmp_path / ".gitignore").write_text("secret.txt\n", "utf-8")
@@ -118,9 +156,7 @@ def test_ignored_files_are_denied_by_default_before_interactive_approval(
     interaction.confirm.return_value = True
     manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
 
-    result = manager.authorize(
-        request(Capability.FILESYSTEM_READ, resource=str(secret))
-    )
+    result = manager.authorize(request(Capability.FILESYSTEM_READ, resource=str(secret)))
 
     assert result.decision is Decision.DENY
     assert result.source == "safety:ignored_path"
@@ -130,9 +166,12 @@ def test_ignored_files_are_denied_by_default_before_interactive_approval(
         "loop.permissions.manager.is_path_ignored",
         Mock(side_effect=OSError("unreadable ignore policy")),
     )
-    assert manager.evaluate(
-        request(Capability.FILESYSTEM_READ, resource=str(tmp_path / "other.txt"))
-    ).decision is Decision.DENY
+    assert (
+        manager.evaluate(
+            request(Capability.FILESYSTEM_READ, resource=str(tmp_path / "other.txt"))
+        ).decision
+        is Decision.DENY
+    )
 
 
 def test_explicit_allow_rule_cannot_override_an_ignored_resource(tmp_path):
@@ -183,12 +222,18 @@ def test_workspace_write_allows_only_normalized_paths_below_workspace(tmp_path):
     """Workspace write mode does not grant missing or escaping filesystem resources."""
     manager = manager_for(PermissionMode.WORKSPACE_WRITE, tmp_path)
 
-    assert manager.evaluate(
-        request(Capability.FILESYSTEM_WRITE, resource=str(tmp_path / "file.txt"))
-    ).decision is Decision.ALLOW
-    assert manager.evaluate(
-        request(Capability.FILESYSTEM_WRITE, resource=str(tmp_path.parent / "outside.txt"))
-    ).decision is Decision.ASK
+    assert (
+        manager.evaluate(
+            request(Capability.FILESYSTEM_WRITE, resource=str(tmp_path / "file.txt"))
+        ).decision
+        is Decision.ALLOW
+    )
+    assert (
+        manager.evaluate(
+            request(Capability.FILESYSTEM_WRITE, resource=str(tmp_path.parent / "outside.txt"))
+        ).decision
+        is Decision.ASK
+    )
     assert manager.evaluate(request(Capability.FILESYSTEM_WRITE)).decision is Decision.ASK
 
 
@@ -219,10 +264,10 @@ def test_describe_covers_empty_and_populated_in_memory_policies():
     )
 
     rule = PermissionRule(
-            decision=Decision.ASK,
-            tool="write_*",
-            capability=Capability.FILESYSTEM_WRITE,
-            resource="/project/*",
+        decision=Decision.ASK,
+        tool="write_*",
+        capability=Capability.FILESYSTEM_WRITE,
+        resource="/project/*",
     )
     manager = PermissionManager(configuration=PermissionConfiguration(rules=[rule]))
     assert "ask tool=write_* capability=filesystem.write resource=/project/*" in manager.describe()
