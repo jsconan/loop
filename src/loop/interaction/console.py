@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from ..commands import Command
+from ..utils import format_tool_call_arguments
 from .interaction import Interaction
 
 
@@ -176,7 +177,9 @@ class ConsoleInteraction(Interaction):
             arguments (str): JSON arguments supplied to the tool.
         """
         self._console.print(
-            f"\n[TOOL CALL]: {name}({arguments})", style="dim magenta", markup=False
+            f"\n[TOOL CALL]: {name}({format_tool_call_arguments(arguments)})",
+            style="dim magenta",
+            markup=False,
         )
 
     def token_usage(

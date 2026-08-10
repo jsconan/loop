@@ -1,10 +1,52 @@
 """Tests for text formatting utilities."""
 
+import pytest
+
 from loop.constants import (
     CONTENT_PREVIEW_MAX_CHARS,
     CONTENT_PREVIEW_MAX_LINES,
 )
-from loop.utils.text import format_content_diff, format_content_preview
+from loop.utils.text import (
+    format_content_diff,
+    format_content_preview,
+    format_tool_call_arguments,
+)
+
+
+def test_format_tool_call_arguments_preserves_short_values_and_structure():
+    """Tool-call displays retain short nested JSON values and non-string values."""
+    arguments = '{"query":"term","options":{"limit":2,"exact":true},"paths":["one",null]}'
+
+    assert format_tool_call_arguments(arguments) == arguments
+
+
+def test_format_tool_call_arguments_truncates_long_nested_string_values():
+    """Tool-call displays retain both ends of long strings at every nesting level."""
+    arguments = '{"content":"0123456789abcdefghijklmnop","items":["abcdefghijklmnopqrstuvwxyz"]}'
+
+    assert format_tool_call_arguments(arguments) == (
+        '{"content":"0123456789…hijklmnop","items":["abcdefghij…rstuvwxyz"]}'
+    )
+
+
+def test_format_tool_call_arguments_accepts_a_custom_value_limit():
+    """Tool-call displays apply a caller-provided limit to every string value."""
+    arguments = '{"content":"abcdefgh"}'
+
+    assert format_tool_call_arguments(arguments, max_chars=5) == '{"content":"ab…gh"}'
+
+
+def test_format_tool_call_arguments_rejects_an_insufficient_value_limit():
+    """Tool-call displays require room for a prefix, suffix, and ellipsis."""
+    with pytest.raises(ValueError, match="at least 3"):
+        format_tool_call_arguments('{"content":"abcdefgh"}', max_chars=2)
+
+
+def test_format_tool_call_arguments_bounds_invalid_json_as_raw_text():
+    """Malformed tool-call arguments still receive a bounded terminal display."""
+    arguments = "0123456789abcdefghijklmnop"
+
+    assert format_tool_call_arguments(arguments) == "0123456789…hijklmnop"
 
 
 def test_format_content_preview_returns_formatted_lines():

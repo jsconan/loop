@@ -1,8 +1,64 @@
 """Provide general text formatting utilities."""
 
+import json
 from difflib import unified_diff
+from typing import Any
 
 from .. import constants
+
+
+def format_tool_call_arguments(
+    arguments: str,
+    *,
+    max_chars: int = constants.TOOL_CALL_VALUE_MAX_CHARS,
+) -> str:
+    """Format tool-call arguments with bounded string values.
+
+    Recursively truncates displayed string values while preserving the JSON structure. Invalid JSON
+    is treated as an opaque string and truncated as a whole.
+
+    Args:
+        arguments (str): JSON arguments supplied to a tool.
+        max_chars (int): Maximum display length for each string value. Defaults to
+            ``TOOL_CALL_VALUE_MAX_CHARS``.
+
+    Returns:
+        str: Compact JSON with bounded string values, or a bounded raw argument string.
+
+    Raises:
+        ValueError: If ``max_chars`` is less than three characters.
+    """
+    if max_chars < 3:
+        raise ValueError("max_chars must be at least 3 to retain a prefix, suffix, and ellipsis.")
+    try:
+        value = json.loads(arguments)
+    except json.JSONDecodeError:
+        return _truncate_middle(arguments, max_chars)
+    return json.dumps(
+        _truncate_json_strings(value, max_chars),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _truncate_json_strings(value: Any, max_chars: int) -> Any:
+    """Return JSON-compatible values with bounded string leaves."""
+    if isinstance(value, str):
+        return _truncate_middle(value, max_chars)
+    if isinstance(value, list):
+        return [_truncate_json_strings(item, max_chars) for item in value]
+    if isinstance(value, dict):
+        return {key: _truncate_json_strings(item, max_chars) for key, item in value.items()}
+    return value
+
+
+def _truncate_middle(value: str, max_chars: int) -> str:
+    """Truncate text at its middle while retaining its start and end."""
+    if len(value) <= max_chars:
+        return value
+    prefix_length = (max_chars - 1 + 1) // 2
+    suffix_length = max_chars - 1 - prefix_length
+    return f"{value[:prefix_length]}…{value[-suffix_length:]}"
 
 
 def format_content_preview(
