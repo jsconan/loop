@@ -4,7 +4,7 @@ from loop.constants import (
     CONTENT_PREVIEW_MAX_CHARS,
     CONTENT_PREVIEW_MAX_LINES,
 )
-from loop.utils.text import format_content_preview
+from loop.utils.text import format_content_diff, format_content_preview
 
 
 def test_format_content_preview_returns_formatted_lines():
@@ -54,7 +54,7 @@ def test_format_content_preview_max_chars_truncation():
     """Content exceeding max_chars shows a truncation notice."""
     long_content = "x" * (CONTENT_PREVIEW_MAX_CHARS + 100)
     result = format_content_preview(long_content)
-    assert f"(truncated, total {CONTENT_PREVIEW_MAX_CHARS} chars)" in result
+    assert f"(truncated, total {len(long_content)} chars)" in result
 
 
 def test_format_content_preview_max_chars_respects_custom_limit():
@@ -62,7 +62,7 @@ def test_format_content_preview_max_chars_respects_custom_limit():
     content = "line1\nline2\nline3\nline4\nline5"
     result = format_content_preview(content, max_chars=10)
     assert "   1 | line1" in result
-    assert "(truncated, total 10 chars)" in result
+    assert f"(truncated, total {len(content)} chars)" in result
 
 
 def test_format_content_preview_max_lines_truncation():
@@ -79,3 +79,37 @@ def test_format_content_preview_max_lines_custom_limit():
     assert "   1 | line0" in result
     assert "   3 | line2" in result
     assert "(47 more lines omitted)" in result
+
+
+def test_format_content_diff_shows_complete_unified_hunks():
+    """Diff previews summarize and show surrounding unchanged context."""
+    result = format_content_diff("one\ntwo\nthree", "one\nchanged\nthree", "notes.txt")
+    assert result.startswith("1 addition(s), 1 deletion(s), 1 changed hunk(s)")
+    assert "--- a/notes.txt" in result
+    assert "+++ b/notes.txt" in result
+    assert "-two" in result
+    assert "+changed" in result
+    assert " one" in result
+
+
+def test_format_content_diff_omits_whole_hunks_at_the_preview_limit():
+    """Diff previews never include a partial hunk when their limit is reached."""
+    before = "\n".join(("first", *("same" for _ in range(10)), "last"))
+    after = "\n".join(("changed first", *("same" for _ in range(10)), "changed last"))
+    result = format_content_diff(before, after, "notes.txt", max_lines=7)
+    assert "... (2 changed hunk(s) omitted; preview limit reached)" in result
+    assert "\n@@" not in result
+
+
+def test_format_content_diff_omits_later_hunks_after_a_complete_hunk():
+    """Diff previews retain an included hunk when later hunks exceed the limit."""
+    before = "\n".join(("first", *("same" for _ in range(10)), "last"))
+    after = "\n".join(("changed first", *("same" for _ in range(10)), "changed last"))
+    result = format_content_diff(before, after, "notes.txt", max_lines=8)
+    assert "... (1 changed hunk(s) omitted; preview limit reached)" in result
+    assert result.count("\n@@") == 1
+
+
+def test_format_content_diff_reports_unchanged_content():
+    """Identical before and after content produces a clear no-change summary."""
+    assert format_content_diff("same", "same", "notes.txt") == "No content changes."

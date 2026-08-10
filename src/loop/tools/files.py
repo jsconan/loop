@@ -9,8 +9,28 @@ from .. import constants
 from ..context import ToolContext
 from ..permissions import Capability, PermissionRequest
 from ..tooling import tool_registry
-from ..utils import format_content_preview, is_path_ignored, iter_visible_paths, read_bounded_text
+from ..utils import (
+    format_content_diff,
+    format_content_preview,
+    is_path_ignored,
+    iter_visible_paths,
+    read_bounded_text,
+)
 from .models import FileContentResult, FolderEntry
+
+
+def _write_preview(path: Path, content: str) -> str:
+    """Return the write preview displayed in a permission prompt."""
+    if not path.exists() or path.stat().st_size == 0:
+        return f"Proposed content:\n{format_content_preview(content)}"
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return (
+            "Existing content could not be previewed; proposed content:\n"
+            f"{format_content_preview(content)}"
+        )
+    return f"Proposed changes:\n{format_content_diff(existing, content, str(path))}"
 
 
 def _file_permission(capability: Capability):
@@ -23,7 +43,14 @@ def _file_permission(capability: Capability):
             resource = str(parent / path.name)
         else:
             resource = str(path.resolve())
-        return (PermissionRequest(tool_name="", capability=capability, resource=resource),)
+        reason = None
+        if capability is Capability.FILESYSTEM_WRITE:
+            reason = _write_preview(path, str(arguments["content"]))
+        return (
+            PermissionRequest(
+                tool_name="", capability=capability, resource=resource, reason=reason
+            ),
+        )
 
     return _resolve
 
@@ -134,10 +161,6 @@ def write_text_file(
     content: Annotated[str, Field(description="Content to write to the file.")],
 ) -> str:
     """Write content to a file on the local disk."""
-    preview = format_content_preview(content)
-
-    context.interaction.info(f"Content to write to '{path}':\n{preview}")
-
     try:
         with open(path, "w", encoding="utf-8") as file:
             file.write(content)

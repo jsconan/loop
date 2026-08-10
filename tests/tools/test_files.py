@@ -358,11 +358,13 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
     assert target.read_text(encoding="utf-8") == "saved"
     assert confirm.call_args_list == [
         call(
-            f"Agent wants to use 'write_text_file' for filesystem.write on '{target}'. Proceed?",
+            f"Agent wants to use 'write_text_file' for filesystem.write on '{target}'. "
+            "Proposed content:\n   1 | blocked Proceed?",
             default=False,
         ),
         call(
-            f"Agent wants to use 'write_text_file' for filesystem.write on '{target}'. Proceed?",
+            f"Agent wants to use 'write_text_file' for filesystem.write on '{target}'. "
+            "Proposed content:\n   1 | saved Proceed?",
             default=False,
         ),
     ]
@@ -376,6 +378,37 @@ def test_write_text_file_truncation_notice_for_large_content(tmp_path, monkeypat
     long_content = "x" * 2001
     assert write_text_file(str(target), long_content) == f"Successfully wrote to file '{target}'."
     assert target.read_text(encoding="utf-8") == long_content
+
+
+def test_write_text_file_includes_a_diff_in_the_confirmation_prompt(tmp_path, monkeypatch):
+    """Replacing UTF-8 text presents the proposed unified diff before approval."""
+    target = tmp_path / "written.txt"
+    target.write_text("before\nunchanged", encoding="utf-8")
+    confirm = MagicMock(return_value=True)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    assert write_text_file(str(target), "after\nunchanged") == (
+        f"Successfully wrote to file '{target}'."
+    )
+    prompt = confirm.call_args.args[0]
+    assert "Proposed changes:" in prompt
+    assert "--- a/" in prompt
+    assert "-before" in prompt
+    assert "+after" in prompt
+    assert target.read_text(encoding="utf-8") == "after\nunchanged"
+
+
+def test_write_text_file_falls_back_to_content_preview_for_binary_destination(tmp_path, monkeypatch):
+    """Unreadable existing content does not prevent a bounded write preview."""
+    target = tmp_path / "written.txt"
+    target.write_bytes(b"\xff")
+    confirm = MagicMock(return_value=True)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    assert write_text_file(str(target), "replacement") == f"Successfully wrote to file '{target}'."
+    prompt = confirm.call_args.args[0]
+    assert "Existing content could not be previewed; proposed content:" in prompt
+    assert "   1 | replacement" in prompt
 
 
 def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):

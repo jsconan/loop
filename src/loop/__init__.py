@@ -17,6 +17,7 @@ __all__ = [
     "Decision",
     "fetch_content",
     "find_project_root",
+    "format_content_diff",
     "format_content_preview",
     "get_current_datetime",
     "InstructionSection",
@@ -146,6 +147,7 @@ from .tools import (
 from .utils import (
     ShutdownRequested,
     find_project_root,
+    format_content_diff,
     format_content_preview,
     is_path_ignored,
     iter_visible_paths,
