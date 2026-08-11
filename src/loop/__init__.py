@@ -7,9 +7,16 @@ __all__ = [
     "Backend",
     "Capability",
     "Command",
+    "CommandCompletion",
+    "CommandCompletionAdapter",
     "CommandContext",
     "CommandManager",
     "CommandRegistrationError",
+    "CompletionAdapter",
+    "CompletionManager",
+    "CompletionMatch",
+    "CompletionProvider",
+    "CompletionValue",
     "ConsoleInteraction",
     "ContentArtifact",
     "ConversationItem",
@@ -30,6 +37,7 @@ __all__ = [
     "LoadedAgentInstructions",
     "Loop",
     "manage_skills",
+    "MarkerCompletionAdapter",
     "MemorySessionStore",
     "Message",
     "ModelInfo",
@@ -40,6 +48,7 @@ __all__ = [
     "PermissionRequest",
     "PermissionResult",
     "PermissionRule",
+    "ProjectPathCompletionAdapter",
     "read_cached_content",
     "read_text_file",
     "Reasoning",
@@ -79,7 +88,22 @@ __all__ = [
 
 
 from .backend import Backend, OpenAIBackend
-from .commands import Command, CommandManager, CommandRegistrationError
+from .commands import (
+    Command,
+    CommandManager,
+    CommandRegistrationError,
+)
+from .completion import (
+    CommandCompletion,
+    CommandCompletionAdapter,
+    CompletionAdapter,
+    CompletionManager,
+    CompletionMatch,
+    CompletionProvider,
+    CompletionValue,
+    MarkerCompletionAdapter,
+    ProjectPathCompletionAdapter,
+)
 from .context import CommandContext, ToolContext
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop, Response

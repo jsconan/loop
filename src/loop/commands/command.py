@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ValidationError
 
+from ..completion import CommandCompletion
 from ..context import CommandContext
 from .utils import takes_command_context
 
@@ -20,12 +21,14 @@ class Command:
         description (str): Short description shown by command discovery.
         function (Callable[..., None]): Python function invoked for the command.
         arguments_model (type[BaseModel]): Pydantic model used to validate arguments.
+        completion (CommandCompletion | None): Optional shell-like argument completion grammar.
     """
 
     name: str
     description: str
     function: Callable[..., None]
     arguments_model: type[BaseModel]
+    completion: CommandCompletion | None = None
 
     def call(self, arguments: str, context: CommandContext | None = None) -> None:
         """Deserialize arguments and invoke the command function.

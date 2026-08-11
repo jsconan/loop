@@ -5,8 +5,34 @@ from typing import Annotated
 
 from pydantic import Field
 
+from ..completion import COMPLETION_ATTRIBUTE, CommandCompletion, CompletionValue
 from ..context import CommandContext
 from ..permissions import Capability, Decision, PermissionMode, PermissionRule
+
+
+def _values(enum_type: type) -> tuple[CompletionValue, ...]:
+    """Return completion values for one string-valued enum."""
+    return tuple(CompletionValue(member.value) for member in enum_type)
+
+
+_RESOURCE_COMPLETION = CommandCompletion(values=(CompletionValue("*", "any resource"),))
+_CAPABILITY_COMPLETION = CommandCompletion(
+    values=(CompletionValue("*", "any capability"), *_values(Capability)),
+    next=_RESOURCE_COMPLETION,
+)
+_TOOL_COMPLETION = CommandCompletion(provider="tools", next=_CAPABILITY_COMPLETION)
+_DECISION_COMPLETION = CommandCompletion(
+    values=_values(Decision),
+    children={decision.value: _TOOL_COMPLETION for decision in Decision},
+)
+PERMISSIONS_COMPLETION = CommandCompletion(
+    values=tuple(CompletionValue(value) for value in ("show", "mode", "add", "session")),
+    children={
+        "mode": CommandCompletion(values=_values(PermissionMode)),
+        "add": _DECISION_COMPLETION,
+        "session": _DECISION_COMPLETION,
+    },
+)
 
 
 def help(context: CommandContext) -> None:  # pylint: disable=redefined-builtin
@@ -57,14 +83,15 @@ def permissions(
             resource=resource,
         )
         manager.add_rule(rule, persist=operation == "add")
-        context.interaction.info(
-            f"Added {operation} {rule.decision.value} rule for '{rule.tool}'."
-        )
+        context.interaction.info(f"Added {operation} {rule.decision.value} rule for '{rule.tool}'.")
         return
     raise ValueError(
         "Usage: /permissions [show | mode <mode> | "
         "add|session <allow|ask|deny> <tool> [capability] [resource]]"
     )
+
+
+setattr(permissions, COMPLETION_ATTRIBUTE, PERMISSIONS_COMPLETION)
 
 
 def exit(context: CommandContext) -> None:  # pylint: disable=redefined-builtin

@@ -66,13 +66,22 @@ class SkillManager:
         self._activated = {}
 
     @property
-    def skills(self) -> tuple[Skill, ...]:
-        """Return discovered skill metadata in discovery order.
+    def skills(self) -> list[Skill]:
+        """Return winning skill metadata sorted alphabetically.
 
         Returns:
-            tuple[Skill, ...]: An immutable snapshot of the discovered skills.
+            list[Skill]: Unique skill metadata after precedence resolution, sorted alphabetically.
         """
-        return tuple(self._skills)
+        return sorted(self._skills, key=lambda skill: skill.name)
+
+    @property
+    def names(self) -> list[str]:
+        """Return winning skill names sorted alphabetically.
+
+        Returns:
+            list[str]: Unique skill names after precedence resolution, sorted alphabetically.
+        """
+        return sorted(skill.name for skill in self._skills)
 
     @property
     def diagnostics(self) -> tuple[str, ...]:

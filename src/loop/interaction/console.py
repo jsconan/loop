@@ -6,11 +6,10 @@ from pprint import pformat
 from typing import Any
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import Completer
 from rich.console import Console
 from rich.prompt import Confirm
 
-from ..commands import Command
 from ..utils import format_tool_call_arguments
 from .interaction import Interaction
 
@@ -50,29 +49,28 @@ class ConsoleInteraction(Interaction):
 
     def input(
         self,
-        commands: tuple[Command, ...] = (),
         message: str | None = None,
+        completer: Completer | None = None,
     ) -> str | False:
         """Prompt for a non-empty user message or an exit command.
 
         Args:
-            commands (tuple[Command, ...]): Commands available for input completion.
             message (str | None): Prompt message displayed before reading input.
                 Defaults to ``None`` for the default prompt.
+            completer (Completer | None): Optional input completer. Defaults to no completion.
 
         Returns:
             str | False: The entered message, or ``False`` when the user requests to exit.
         """
         if message is None:
             message = "\nYou: "
-        completer = WordCompleter(
-            [f"/{command.name}" for command in commands],
-            meta_dict={f"/{command.name}": command.description for command in commands},
-            sentence=True,
-        )
         while True:
             try:
-                user_input = self._session.prompt(message, completer=completer).strip()
+                user_input = self._session.prompt(
+                    message,
+                    completer=completer,
+                    complete_in_thread=True,
+                ).strip()
             except KeyboardInterrupt, EOFError:
                 return False
             if not user_input:

@@ -83,6 +83,24 @@ class ToolRegistry:
         """
         self._permission_manager = manager
 
+    @property
+    def tools(self) -> list[Tool]:
+        """Return registered tools sorted alphabetically by name.
+
+        Returns:
+            list[Tool]: Registered tools.
+        """
+        return sorted(self._tools.values(), key=lambda tool: tool.name)
+
+    @property
+    def names(self) -> list[str]:
+        """Return registered tool names sorted alphabetically.
+
+        Returns:
+            list[str]: Registered tool names.
+        """
+        return sorted(self._tools)
+
     def tool(
         self,
         function: Callable[..., Any] | None = None,
@@ -118,9 +136,7 @@ class ToolRegistry:
             if tool_name in self._tools:
                 raise ToolRegistrationError(f"Tool '{tool_name}' is already registered.")
             declared_capabilities = frozenset(
-                capabilities
-                or getattr(target, "__loop_capabilities__", None)
-                or {Capability.PURE}
+                capabilities or getattr(target, "__loop_capabilities__", None) or {Capability.PURE}
             )
             declared_resolver = (
                 permission_resolver

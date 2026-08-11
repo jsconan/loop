@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from prompt_toolkit.document import Document
 
 from loop import (
     AnswerCompleted,
@@ -85,6 +86,44 @@ def test_loop_exposes_its_configured_state(tmp_path):
 
     loop.debug = False
     assert loop.debug is False
+
+
+def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
+    """Interactive input receives adapters for current commands, files, skills, and tools."""
+    interaction = Mock(spec=Interaction)
+    interaction.input.return_value = False
+    skill = Skill("review", "Review code.", tmp_path / "skills" / "review" / "SKILL.md")
+    instructions = InstructionsManager(
+        skill_manager=SkillManager([skill]), working_directory=tmp_path
+    )
+    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store.save(Session(id="stored-session"))
+    session_manager = SessionManager(interaction=interaction, session_store=store)
+    registry = ToolRegistry()
+
+    @registry.tool
+    def inspect() -> str:
+        """Inspect the project."""
+        return "done"
+
+    loop = Loop(
+        backend=loop_backend(tool_registry=registry),
+        instructions_manager=instructions,
+        interaction=interaction,
+        session_manager=session_manager,
+        working_directory=tmp_path,
+    )
+
+    loop.run()
+
+    completer = interaction.input.call_args.kwargs["completer"]
+
+    def values(text):
+        return [item.text for item in completer.get_completions(Document(text), Mock())]
+
+    assert values("/he") == ["/help"]
+    assert values("$rev") == ["$review"]
+    assert values("/permissions add allow ins") == ["inspect"]
 
 
 def test_loop_passes_custom_instruction_fallbacks_to_discovery(tmp_path):

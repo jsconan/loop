@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from loop import PermissionConfiguration, PermissionManager, PermissionMode
 from loop.interaction import Interaction
 from loop.skills import InstructionsManager
-from loop import PermissionConfiguration, PermissionManager, PermissionMode
 from loop.tooling import ToolRegistrationError, ToolRegistry
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
@@ -25,27 +25,34 @@ def register(registry: ToolRegistry):
     return calculate
 
 
-def test_constructor_registers_tools_in_iteration_order():
-    """Construction registers each supplied function through the normal tool path."""
+def test_constructor_registers_in_order_and_exposes_sorted_snapshots():
+    """Construction preserves definitions while public tool snapshots sort and isolate state."""
 
-    def first() -> str:
-        """Return the first result."""
-        return "first"
+    def zebra() -> str:
+        """Return the zebra result."""
+        return "zebra"
 
-    def second() -> str:
-        """Return the second result."""
-        return "second"
+    def alpha() -> str:
+        """Return the alpha result."""
+        return "alpha"
 
     permissions = PermissionManager(
         configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
     )
-    registry = ToolRegistry([first, second], permission_manager=permissions)
+    registry = ToolRegistry([zebra, alpha], permission_manager=permissions)
+    tools = registry.tools
+    names = registry.names
 
     assert [definition.name for definition in registry.definitions()] == [
-        "first",
-        "second",
+        "zebra",
+        "alpha",
     ]
-    assert registry.call("first", "{}") == "first"
+    assert [tool.name for tool in tools] == ["alpha", "zebra"]
+    assert names == ["alpha", "zebra"]
+    tools.clear()
+    names.clear()
+    assert registry.names == ["alpha", "zebra"]
+    assert registry.call("zebra", "{}") == "zebra"
 
 
 def test_tool_registers_a_function_with_derived_metadata(monkeypatch):
@@ -101,10 +108,11 @@ def test_definitions_delegate_to_registered_tools(monkeypatch):
     register(registry)
 
     @registry.tool(name="second", description="Second")
-    def second() -> None:
+    def _second() -> None:
         pass
 
     assert registry.definitions() == [{"name": "first"}, {"name": "second"}]
+    assert registry.names == ["calculate", "second"]
 
 
 def test_interaction_property_can_be_replaced_and_cleared():

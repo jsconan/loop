@@ -1,8 +1,8 @@
 """Expose interaction classes."""
 
 __all__ = [
-    "Interaction",
     "ConsoleInteraction",
+    "Interaction",
 ]
 
 from .console import ConsoleInteraction

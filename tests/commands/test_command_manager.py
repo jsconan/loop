@@ -4,8 +4,17 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import Command, CommandContext, CommandManager, CommandRegistrationError, Interaction
+from loop import (
+    Command,
+    CommandCompletion,
+    CommandContext,
+    CommandManager,
+    CommandRegistrationError,
+    CompletionValue,
+    Interaction,
+)
 from loop.commands.utils import get_command_arguments_model
+from loop.completion import COMPLETION_ATTRIBUTE
 
 
 def declared_command(name: str = "test") -> Command:
@@ -69,6 +78,26 @@ def test_register_supports_decorators_and_declared_metadata():
     assert manager.commands[-1].description == "Declared description."
 
 
+def test_register_retains_explicit_and_function_declared_completion_metadata():
+    """Registration carries completion grammars from options or decorated functions."""
+    manager = CommandManager()
+    explicit = CommandCompletion(values=(CompletionValue("explicit"),))
+    inherited = CommandCompletion(values=(CompletionValue("inherited"),))
+
+    @manager.register(completion=explicit)
+    def first(value: str) -> None:
+        """Select the first value."""
+
+    def second(value: str) -> None:
+        """Select the second value."""
+
+    setattr(second, COMPLETION_ATTRIBUTE, inherited)
+    manager.register(second)
+
+    assert manager.commands[-2].completion is explicit
+    assert manager.commands[-1].completion is inherited
+
+
 @pytest.mark.parametrize("name", ["", "/test", "bad name", "bad\tname"])
 def test_register_rejects_invalid_command_names(name):
     """Declared command names must be useful slash-free tokens without whitespace."""
@@ -86,6 +115,8 @@ def test_register_rejects_duplicates_and_conflicting_command_metadata():
         manager.register(declared_command("help"))
     with pytest.raises(ValueError, match="cannot override"):
         manager.register(declared_command(), name="renamed")
+    with pytest.raises(ValueError, match="cannot override"):
+        manager.register(declared_command(), completion=CommandCompletion())
 
 
 def test_register_rejects_missing_descriptions_and_invalid_parameters():

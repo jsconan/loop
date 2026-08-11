@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
+from ..completion import COMPLETION_ATTRIBUTE, CommandCompletion
 from ..context import CommandContext
 from .builtins import exit as exit_command
 from .builtins import help as help_command
@@ -99,6 +100,7 @@ class CommandManager:
         *,
         name: str | None = None,
         description: str | None = None,
+        completion: CommandCompletion | None = None,
     ) -> Callable[..., None]:
         """Register a command declaration or function, directly or as a decorator.
 
@@ -107,6 +109,7 @@ class CommandManager:
                 called directly. Omit it when using registration options as a decorator.
             name (str | None): Slash-free command name. Defaults to the function name.
             description (str | None): Display description. Defaults to the docstring summary.
+            completion (CommandCompletion | None): Optional shell-like argument completion grammar.
 
         Returns:
             Callable[..., None]: The registered function, or a decorator when no target is given.
@@ -119,7 +122,7 @@ class CommandManager:
 
         def _register(target: Command | Callable[..., None]) -> Callable[..., None]:
             if isinstance(target, Command):
-                if name is not None or description is not None:
+                if name is not None or description is not None or completion is not None:
                     raise ValueError("Explicit metadata cannot override a Command declaration.")
                 command = target
             else:
@@ -129,6 +132,7 @@ class CommandManager:
                     description=description or self._description_for(target),
                     function=target,
                     arguments_model=get_command_arguments_model(target, command_name),
+                    completion=completion or getattr(target, COMPLETION_ATTRIBUTE, None),
                 )
             if (
                 not command.name

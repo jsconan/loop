@@ -3,10 +3,9 @@
 from unittest.mock import Mock
 
 import pytest
+from prompt_toolkit.completion import DummyCompleter
 from rich.prompt import Confirm
 
-from loop import Command
-from loop.commands.utils import get_command_arguments_model
 from loop.interaction import ConsoleInteraction
 
 
@@ -20,24 +19,16 @@ def test_input_reads_a_trimmed_message_with_a_custom_prompt():
     assert session.prompt.call_args.args == ("Question: ",)
 
 
-def test_input_offers_command_names_and_descriptions_for_completion():
-    """Terminal input derives slash completion metadata from available commands."""
+def test_input_forwards_an_explicit_completer_to_the_prompt_session():
+    """Terminal input forwards the caller's capability manager unchanged."""
     session = Mock()
     session.prompt.return_value = "answer"
+    completer = DummyCompleter()
 
-    def function() -> None:
-        pass
+    ConsoleInteraction(session=session).input(completer=completer)
 
-    commands = (
-        Command("help", "Show help.", function, get_command_arguments_model(function, "help")),
-    )
-
-    ConsoleInteraction(session=session).input(commands=commands)
-
-    completer = session.prompt.call_args.kwargs["completer"]
-    completions = list(completer.get_completions(Mock(text_before_cursor="/h"), Mock()))
-    assert [completion.text for completion in completions] == ["/help"]
-    assert completions[0].display_meta_text == "Show help."
+    assert session.prompt.call_args.kwargs["completer"] is completer
+    assert session.prompt.call_args.kwargs["complete_in_thread"] is True
 
 
 def test_input_reprompts_for_blank_input(capsys):

@@ -18,6 +18,29 @@ def write_skill(directory: Path, name: str, description: str, body: str = "Instr
     return location
 
 
+def test_skills_and_names_resolve_precedence_and_return_sorted_snapshots(tmp_path):
+    """Skill snapshots retain precedence winners, sort names, and isolate manager state."""
+    zebra = Skill("zebra", "Zebra skill.", tmp_path / "zebra" / "SKILL.md")
+    winning_alpha = Skill("alpha", "Winning alpha skill.", tmp_path / "first" / "SKILL.md")
+    manager = SkillManager(
+        [
+            zebra,
+            winning_alpha,
+            Skill("alpha", "Shadowed alpha skill.", tmp_path / "second" / "SKILL.md"),
+        ]
+    )
+
+    names = manager.names
+    skills = manager.skills
+
+    assert names == ["alpha", "zebra"]
+    assert skills == [winning_alpha, zebra]
+    names.clear()
+    skills.clear()
+    assert manager.names == ["alpha", "zebra"]
+    assert manager.skills == [winning_alpha, zebra]
+
+
 def test_discovery_reads_metadata_and_activation_lazily_loads_and_caches_body(
     tmp_path, monkeypatch
 ):
@@ -262,9 +285,7 @@ def test_binary_resource_loading_is_bounded_and_validates_ranges(tmp_path):
     with pytest.raises(ValueError, match="binary"):
         manager.read_resource("binary", "assets/payload.bin", start_line=2)
     with pytest.raises(ValueError, match="start_byte"):
-        manager.read_resource(
-            "binary", "assets/payload.bin", start_byte=-1, start_line=None
-        )
+        manager.read_resource("binary", "assets/payload.bin", start_byte=-1, start_line=None)
 
 
 def test_discovery_skips_invalid_skills_and_reports_diagnostics(tmp_path):
@@ -300,7 +321,7 @@ def test_discovery_reports_each_invalid_frontmatter_shape(tmp_path, content, mes
 
     manager = SkillManager.discover(tmp_path, [tmp_path / "skills"])
 
-    assert manager.skills == ()
+    assert manager.skills == []
     assert message in manager.diagnostics[0]
 
 
@@ -325,7 +346,7 @@ def test_default_discovery_prefers_the_closest_project_scope_then_user_skills(
 
     manager = SkillManager.discover(working_directory)
 
-    assert [skill.name for skill in manager.skills] == ["local", "shared", "root", "user"]
+    assert [skill.name for skill in manager.skills] == ["local", "root", "shared", "user"]
     assert manager.activate("shared")["location"] == str(winner.resolve())
     assert any(str(shadowed.resolve()) in diagnostic for diagnostic in manager.diagnostics)
     assert all(str(local.resolve()) not in diagnostic for diagnostic in manager.diagnostics)
@@ -361,7 +382,7 @@ def test_constructor_enforces_unique_names_in_input_order(tmp_path):
 
     manager = SkillManager([first, second], ["Existing diagnostic."])
 
-    assert manager.skills == (first,)
+    assert manager.skills == [first]
     assert manager.count == 1
     assert manager.diagnostics[0] == "Existing diagnostic."
     assert str(second.location) in manager.diagnostics[1]

@@ -6,6 +6,13 @@ from pathlib import Path
 from . import constants
 from .backend import Backend
 from .commands import CommandManager
+from .completion import (
+    CommandCompletionAdapter,
+    CompletionManager,
+    CompletionValue,
+    MarkerCompletionAdapter,
+    ProjectPathCompletionAdapter,
+)
 from .interaction import Interaction
 from .models import (
     ConversationItem,
@@ -56,6 +63,7 @@ class Loop:
     _model: str | None
     _command_manager: CommandManager
     _permission_manager: PermissionManager
+    _completion_manager: CompletionManager
 
     def __init__(
         self,
@@ -106,6 +114,27 @@ class Loop:
         self._command_manager = CommandManager(
             interaction=self._interaction,
             permission_manager=self._permission_manager,
+        )
+        self._completion_manager = CompletionManager(
+            (
+                CommandCompletionAdapter(
+                    lambda: self._command_manager.commands,
+                    providers={
+                        "tools": lambda: (
+                            CompletionValue(tool.name, tool.description)
+                            for tool in self._backend.tool_registry.tools
+                        )
+                    },
+                ),
+                ProjectPathCompletionAdapter("@", self._working_directory),
+                MarkerCompletionAdapter(
+                    "$",
+                    lambda: (
+                        CompletionValue(skill.name, skill.description)
+                        for skill in self._instructions_manager.skill_manager.skills
+                    ),
+                ),
+            )
         )
 
     @property
@@ -235,7 +264,7 @@ class Loop:
     def run(self):
         """Run the conversation until the user requests to exit."""
         while not self._command_manager.exit_requested:
-            user_input = self._interaction.input(commands=self._command_manager.commands)
+            user_input = self._interaction.input(completer=self._completion_manager)
             if user_input is False:
                 break
             if self._command_manager.handle_user_command(user_input):

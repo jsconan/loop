@@ -5,7 +5,8 @@ from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from typing import Any
 
-from ..commands import Command
+from prompt_toolkit.completion import Completer
+
 from ..models import (
     AnswerCompleted,
     AnswerDelta,
@@ -33,15 +34,15 @@ class Interaction(ABC):
     @abstractmethod
     def input(
         self,
-        commands: tuple[Command, ...] = (),
         message: str | None = None,
+        completer: Completer | None = None,
     ) -> str | False:
         """Read a non-empty user message or an exit command.
 
         Args:
-            commands (tuple[Command, ...]): Commands available for input completion.
             message (str | None): Prompt message displayed before reading input.
                 Defaults to ``None``.
+            completer (Completer | None): Optional input completer. Defaults to no completion.
 
         Returns:
             str | False: The stripped text entered by the user, or ``False`` when the user
