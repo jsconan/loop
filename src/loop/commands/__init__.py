@@ -3,6 +3,7 @@
 __all__ = [
     "BUILTIN_COMMANDS",
     "Command",
+    "CommandArgumentError",
     "CommandManager",
     "CommandRegistrationError",
     "exit",
@@ -12,6 +13,6 @@ __all__ = [
 ]
 
 from .builtins import exit, help, permissions, quit
-from .command import Command
+from .command import Command, CommandArgumentError
 from .command_manager import BUILTIN_COMMANDS, CommandManager
 from .utils import CommandRegistrationError

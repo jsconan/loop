@@ -151,7 +151,7 @@ def test_handle_user_command_deserializes_arguments_and_injects_context():
 
     assert manager.handle_user_command("ordinary /inspect_context") is False
     assert manager.handle_user_command("/inspect_context 3") is True
-    assert manager.call("inspect_context", '{"count": 4}') is None
+    assert manager.call("inspect_context", "count=4") is None
     assert calls == [("inspect_context", 3), ("inspect_context", 4)]
 
 
@@ -166,6 +166,8 @@ def test_handle_user_command_reports_invalid_and_unknown_commands():
 
     assert manager.handle_user_command("/pair invalid") is True
     assert interaction.warning.call_args.args[0].startswith("Invalid arguments for command '/pair'")
+    assert manager.handle_user_command("/pair unknown=1") is True
+    assert "Unknown parameter 'unknown'" in interaction.warning.call_args.args[0]
     assert manager.handle_user_command("/missing argument") is True
     interaction.warning.assert_called_with(
         "Unknown command '/missing'. Type /help for available commands."

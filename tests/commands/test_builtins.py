@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from loop import (
+    CommandArgumentError,
     CommandContext,
     CommandManager,
     Interaction,
@@ -41,8 +42,8 @@ def test_permissions_command_shows_and_changes_local_policy(tmp_path):
     context = CommandContext("permissions", interaction, permission_manager=permissions)
 
     permissions_command(context)
-    permissions_command(context, "mode read_only")
-    permissions_command(context, "add allow 'read_*' filesystem.read '/project/*'")
+    permissions_command(context, "mode", "read_only")
+    permissions_command(context, "add", "allow", "read_*", "filesystem.read", "/project/*")
 
     assert interaction.info.call_args_list[0].args[0].startswith("Permission mode: confirm_all")
     loaded = PermissionManager(tmp_path)
@@ -58,10 +59,19 @@ def test_permissions_command_adds_session_rules_and_validates_usage():
     )
     context = CommandContext("permissions", interaction, permission_manager=permissions)
 
-    permissions_command(context, "session deny dangerous * *")
+    permissions_command(context, "session", "deny", "dangerous", "*", "*")
     assert "Added session deny rule" in interaction.info.call_args.args[0]
-    with pytest.raises(ValueError, match="Usage"):
-        permissions_command(context, "unknown")
+    for arguments in (
+        ("unknown",),
+        ("show", "extra"),
+        ("mode",),
+        ("mode", "invalid"),
+        ("mode", "read_only", "extra"),
+        ("add", "invalid", "tool"),
+        ("add", "allow", "tool", "invalid"),
+    ):
+        with pytest.raises(CommandArgumentError, match="Usage"):
+            permissions_command(context, *arguments)
 
 
 def test_permissions_command_requires_a_policy_manager():

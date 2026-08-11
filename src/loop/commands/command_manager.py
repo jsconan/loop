@@ -14,7 +14,7 @@ from .builtins import exit as exit_command
 from .builtins import help as help_command
 from .builtins import permissions as permissions_command
 from .builtins import quit as quit_command
-from .command import Command
+from .command import Command, CommandArgumentError
 from .utils import CommandRegistrationError, get_command_arguments_model, takes_command_context
 
 if TYPE_CHECKING:
@@ -156,6 +156,13 @@ class CommandManager:
 
         Returns:
             bool: ``True`` when the input was consumed as a command; otherwise ``False``.
+
+        Raises:
+            CommandArgumentError: If argument syntax or binding is invalid and no interaction is
+                available to report it.
+            ValidationError: If arguments fail schema validation and no interaction is available
+                to report it.
+            ValueError: If dispatch requires an unavailable interaction.
         """
         if not user_input.startswith("/"):
             return False
@@ -177,10 +184,14 @@ class CommandManager:
 
         Args:
             name (str): Slash-free registered command name.
-            arguments (str): Raw argument text, or a JSON object for multiple parameters.
+            arguments (str): Shell-like positional and ``name=value`` argument text.
             interaction (Interaction | None): Invocation interaction overriding the default.
 
         Raises:
+            CommandArgumentError: If argument syntax or parameter binding is invalid and no
+                interaction is available to report it.
+            ValidationError: If arguments fail schema validation and no interaction is available
+                to report it.
             ValueError: If a slash-prefixed name is supplied or an interaction required for
                 dispatch is unavailable.
         """
@@ -208,7 +219,7 @@ class CommandManager:
             )
         try:
             command.call(arguments, context)
-        except ValidationError as exc:
+        except (CommandArgumentError, ValidationError) as exc:
             if active_interaction is None:
                 raise
             active_interaction.warning(f"Invalid arguments for command '/{name}': {exc}")

@@ -57,3 +57,16 @@ class CommandCompletion:
     provider: CompletionProvider | str | None = None
     children: Mapping[str, CommandCompletion] = field(default_factory=dict)
     next: CommandCompletion | None = None
+
+
+@dataclass(frozen=True)
+class SchemaCompletionState:
+    """Describe schema-derived completion state for one command field.
+
+    Args:
+        grammar (CommandCompletion): Completion grammar for the active field.
+        prefix (str): Named-argument prefix prepended to completed values.
+    """
+
+    grammar: CommandCompletion
+    prefix: str = ""

@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING, Literal, Union, get_args, get_origin
 from prompt_toolkit.document import Document
 
 from ..utils.path import iter_visible_paths
-from .models import CommandCompletion, CompletionMatch, CompletionProvider, CompletionValue
+from .models import (
+    CommandCompletion,
+    CompletionMatch,
+    CompletionProvider,
+    CompletionValue,
+    SchemaCompletionState,
+)
 
 if TYPE_CHECKING:
     from ..commands.command import Command
@@ -231,10 +237,10 @@ class CommandCompletionAdapter(CompletionAdapter):
         command = next((item for item in commands if item.name == parts[0]), None)
         if command is None:
             return None
-        grammar = command.completion or self._schema_completion(command)
-        if grammar is None:
-            return None
         arguments = parts[1] if len(parts) == 2 else ""
+        if command.completion is None:
+            return self._match_schema_arguments(command, arguments, before)
+        grammar = command.completion
         try:
             tokens = shlex.split(arguments)
         except ValueError:
@@ -261,23 +267,81 @@ class CommandCompletionAdapter(CompletionAdapter):
         """
         if isinstance(match.state, tuple):
             return match.state
+        if isinstance(match.state, SchemaCompletionState):
+            return tuple(
+                CompletionValue(f"{match.state.prefix}{value.value}", value.description)
+                for value in self._grammar_values(match.state.grammar)
+            )
         if not isinstance(match.state, CommandCompletion):
             return ()
-        values = [*match.state.values]
-        provider = match.state.provider
+        return self._grammar_values(match.state)
+
+    def _grammar_values(self, grammar: CommandCompletion) -> tuple[CompletionValue, ...]:
+        """Resolve static and dynamic values for one grammar node."""
+        values = [*grammar.values]
+        provider = grammar.provider
         if isinstance(provider, str):
             provider = self._providers[provider]
         if provider is not None:
             values.extend(provider())
-        return values
+        return tuple(values)
+
+    def _match_schema_arguments(
+        self,
+        command: Command,
+        arguments: str,
+        before: str,
+    ) -> CompletionMatch | None:
+        """Match positional or named input against a command argument schema."""
+        try:
+            tokens = shlex.split(arguments)
+        except ValueError:
+            return None
+        fragment = "" if before[-1].isspace() else (tokens.pop() if tokens else "")
+        fields = command.arguments_model.model_fields
+        assigned = set()
+        for token in tokens:
+            name, separator, _ = token.partition("=")
+            if separator and name.isidentifier():
+                if name not in fields or name in assigned:
+                    return None
+            else:
+                name = next(
+                    (field_name for field_name in fields if field_name not in assigned),
+                    "",
+                )
+                if not name:
+                    return None
+            assigned.add(name)
+
+        name, separator, value_fragment = fragment.partition("=")
+        if separator and name.isidentifier():
+            if name not in fields or name in assigned:
+                return None
+            grammar = self._field_completion(fields[name])
+            if grammar is None:
+                return None
+            return CompletionMatch(
+                value_fragment,
+                fragment,
+                state=SchemaCompletionState(grammar, f"{name}="),
+            )
+
+        remaining = [field_name for field_name in fields if field_name not in assigned]
+        if not remaining:
+            return None
+        values = [
+            CompletionValue(f"{field_name}=", fields[field_name].description or "parameter")
+            for field_name in remaining
+        ]
+        grammar = self._field_completion(fields[remaining[0]])
+        if grammar is not None:
+            values.extend(self._grammar_values(grammar))
+        return CompletionMatch(fragment, fragment, state=tuple(values))
 
     @staticmethod
-    def _schema_completion(command: Command) -> CommandCompletion | None:
-        """Infer finite values when a command has exactly one argument."""
-        fields = command.arguments_model.model_fields
-        if len(fields) != 1:
-            return None
-        field = next(iter(fields.values()))
+    def _field_completion(field) -> CommandCompletion | None:
+        """Return declared or inferred finite completion for one model field."""
         declared = next(
             (metadata for metadata in field.metadata if isinstance(metadata, CommandCompletion)),
             None,

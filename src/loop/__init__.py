@@ -7,6 +7,7 @@ __all__ = [
     "Backend",
     "Capability",
     "Command",
+    "CommandArgumentError",
     "CommandCompletion",
     "CommandCompletionAdapter",
     "CommandContext",
@@ -60,6 +61,7 @@ __all__ = [
     "ResponseEvent",
     "ResponseMetadata",
     "run_command",
+    "SchemaCompletionState",
     "SerializedMessage",
     "SerializedSession",
     "Session",
@@ -90,6 +92,7 @@ __all__ = [
 from .backend import Backend, OpenAIBackend
 from .commands import (
     Command,
+    CommandArgumentError,
     CommandManager,
     CommandRegistrationError,
 )
@@ -103,6 +106,7 @@ from .completion import (
     CompletionValue,
     MarkerCompletionAdapter,
     ProjectPathCompletionAdapter,
+    SchemaCompletionState,
 )
 from .context import CommandContext, ToolContext
 from .interaction import ConsoleInteraction, Interaction

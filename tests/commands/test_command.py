@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 from pydantic import ValidationError
 
-from loop import Command, CommandContext, Interaction
+from loop import Command, CommandArgumentError, CommandContext, Interaction
 from loop.commands.utils import get_command_arguments_model
 
 
@@ -14,17 +14,32 @@ def make_command(function, name: str = "select") -> Command:
     return Command(name, "Select.", function, get_command_arguments_model(function, name))
 
 
-def test_command_deserializes_json_and_raw_single_values():
-    """Commands pass JSON objects and natural raw text to one typed side-effect parameter."""
+def test_command_binds_positional_and_named_arguments_and_decodes_each_value():
+    """Commands bind mixed tokens and independently decode values for annotated fields."""
     selected = []
 
-    def select(count: int) -> None:
-        selected.append(count)
+    def select(
+        count: int,
+        label: str,
+        enabled: bool,
+        numbers: list[int],
+    ) -> None:
+        selected.append((count, label, enabled, numbers))
 
     command = make_command(select)
-    assert command.call('{"count": 2}') is None
-    assert command.call("3") is None
-    assert selected == [2, 3]
+    assert command.call("3 enabled=true numbers='[1, 2]' label=true") is None
+    assert selected == [(3, "true", True, [1, 2])]
+
+
+def test_command_preserves_raw_strings_and_reports_annotation_errors():
+    """Non-JSON text remains a string and invalid decoded structures fail model validation."""
+
+    def select(label: str, numbers: list[int]) -> None:
+        pass
+
+    command = make_command(select)
+    with pytest.raises(ValidationError):
+        command.call("plain null")
 
 
 def test_command_calls_parameterless_function_and_injects_context_when_declared():
@@ -45,11 +60,21 @@ def test_command_calls_parameterless_function_and_injects_context_when_declared(
         make_command(contextual).call("")
 
 
-def test_command_rejects_invalid_multiple_arguments():
-    """Multiple typed parameters require a valid JSON object payload."""
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ("unknown=1", "Unknown parameter 'unknown'"),
+        ("first=1 first=2", "supplied more than once"),
+        ("1 2 3", "Too many positional arguments"),
+        ('{"first": 1, "second": 2}', "Too many positional arguments"),
+        ('"unterminated', "Could not parse arguments"),
+    ],
+)
+def test_command_rejects_invalid_argument_syntax_and_binding(arguments, message):
+    """Commands reject unknown, duplicate, excess, and malformed argument input."""
 
     def pair(first: int, second: int) -> None:
         pass
 
-    with pytest.raises(ValidationError):
-        make_command(pair).call("invalid")
+    with pytest.raises(CommandArgumentError, match=message):
+        make_command(pair).call(arguments)

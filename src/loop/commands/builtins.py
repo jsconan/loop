@@ -1,6 +1,5 @@
 """Define commands available in every conversation loop."""
 
-import shlex
 from typing import Annotated
 
 from pydantic import Field
@@ -8,6 +7,7 @@ from pydantic import Field
 from ..completion import COMPLETION_ATTRIBUTE, CommandCompletion, CompletionValue
 from ..context import CommandContext
 from ..permissions import Capability, Decision, PermissionMode, PermissionRule
+from .command import CommandArgumentError
 
 
 def _values(enum_type: type) -> tuple[CompletionValue, ...]:
@@ -50,42 +50,57 @@ def help(context: CommandContext) -> None:  # pylint: disable=redefined-builtin
 
 def permissions(
     context: CommandContext,
-    action: Annotated[
+    operation: Annotated[
         str,
-        Field(
-            description=(
-                "Permission operation: show, mode <mode>, add <decision> <tool> "
-                "[capability] [resource], or session <decision> <tool> [capability] [resource]."
-            )
-        ),
+        Field(description="Permission operation: show, mode, add, or session."),
     ] = "show",
+    value: Annotated[
+        str | None,
+        Field(description="Mode for mode, or decision for add and session."),
+    ] = None,
+    tool: Annotated[str | None, Field(description="Tool pattern for add and session.")] = None,
+    capability: Annotated[
+        str | None,
+        Field(description="Optional capability pattern for add and session."),
+    ] = None,
+    resource: Annotated[
+        str | None,
+        Field(description="Optional resource pattern for add and session."),
+    ] = None,
 ) -> None:
     """Show or change the local tool permission policy."""
     manager = context.permission_manager
     if manager is None:
         raise ValueError("The permissions command requires a PermissionManager.")
-    parts = shlex.split(action)
-    operation = parts[0] if parts else "show"
-    if operation == "show":
+    if operation == "show" and all(item is None for item in (value, tool, capability, resource)):
         context.interaction.info(manager.describe())
         return
-    if operation == "mode" and len(parts) == 2:
-        manager.set_mode(PermissionMode(parts[1]))
-        context.interaction.info(f"Permission mode set to {parts[1]}.")
-        return
-    if operation in {"add", "session"} and 3 <= len(parts) <= 5:
-        capability = None if len(parts) < 4 or parts[3] == "*" else Capability(parts[3])
-        resource = None if len(parts) < 5 or parts[4] == "*" else parts[4]
-        rule = PermissionRule(
-            decision=Decision(parts[1]),
-            tool=parts[2],
-            capability=capability,
-            resource=resource,
-        )
-        manager.add_rule(rule, persist=operation == "add")
-        context.interaction.info(f"Added {operation} {rule.decision.value} rule for '{rule.tool}'.")
-        return
-    raise ValueError(
+    if operation == "mode" and all(item is None for item in (tool, capability, resource)):
+        try:
+            mode = PermissionMode(value)
+        except (TypeError, ValueError):
+            pass
+        else:
+            manager.set_mode(mode)
+            context.interaction.info(f"Permission mode set to {value}.")
+            return
+    if operation in {"add", "session"} and value is not None and tool is not None:
+        try:
+            rule = PermissionRule(
+                decision=Decision(value),
+                tool=tool,
+                capability=None if capability in {None, "*"} else Capability(capability),
+                resource=None if resource in {None, "*"} else resource,
+            )
+        except ValueError:
+            pass
+        else:
+            manager.add_rule(rule, persist=operation == "add")
+            context.interaction.info(
+                f"Added {operation} {rule.decision.value} rule for '{rule.tool}'."
+            )
+            return
+    raise CommandArgumentError(
         "Usage: /permissions [show | mode <mode> | "
         "add|session <allow|ask|deny> <tool> [capability] [resource]]"
     )

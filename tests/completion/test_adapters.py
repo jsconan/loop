@@ -76,11 +76,15 @@ def test_schema_completion_infers_enum_literal_union_and_boolean_values():
 
     assert [item.text for item in complete(completer, "/mode work")] == ["workspace_write"]
     assert [item.text for item in complete(completer, "/level h")] == ["high"]
-    assert [item.text for item in complete(completer, "/enabled ")] == ["true", "false"]
+    assert [item.text for item in complete(completer, "/enabled ")] == [
+        "true",
+        "false",
+        "value=",
+    ]
 
 
 def test_schema_completion_accepts_annotated_dynamic_metadata():
-    """Annotated fields can declare dynamic completion without changing command registration."""
+    """Annotated fields provide dynamic values for positional and named completion."""
     dynamic = CommandCompletion(provider=lambda: (CompletionValue("session-two", "session"),))
 
     def load(session_id: Annotated[str, dynamic]) -> None:
@@ -89,10 +93,13 @@ def test_schema_completion_accepts_annotated_dynamic_metadata():
     completer = command_completer(command_for(load))
 
     assert [item.text for item in complete(completer, "/load two")] == ["session-two"]
+    assert [item.text for item in complete(completer, "/load session_id=two")] == [
+        "session_id=session-two"
+    ]
 
 
-def test_schema_completion_ignores_open_and_multi_argument_schemas():
-    """Unbounded strings and multi-field JSON commands do not invent argument values."""
+def test_schema_completion_offers_named_fields_and_tracks_positional_binding():
+    """Schema completion offers remaining fields and values after mixed bindings."""
 
     def text(value: str) -> None:
         """Accept text."""
@@ -102,8 +109,21 @@ def test_schema_completion_ignores_open_and_multi_argument_schemas():
 
     completer = command_completer(command_for(text), command_for(pair))
 
-    assert complete(completer, "/text ") == []
-    assert complete(completer, "/pair ") == []
+    assert [item.text for item in complete(completer, "/text ")] == ["value="]
+    assert [item.text for item in complete(completer, "/pair ")] == [
+        "a",
+        "first=",
+        "second=",
+    ]
+    assert [item.text for item in complete(completer, "/pair a ")] == ["b", "second="]
+    assert [item.text for item in complete(completer, "/pair second=b ")] == ["a", "first="]
+    assert [item.text for item in complete(completer, "/pair second=")] == ["second=b"]
+    assert complete(completer, "/pair unknown=a ") == []
+    assert complete(completer, "/pair first=a first=") == []
+    assert complete(completer, "/pair a b ") == []
+    assert complete(completer, '/pair "') == []
+    assert complete(completer, "/pair a b extra ") == []
+    assert complete(completer, "/text value=") == []
 
 
 def test_nested_command_completion_uses_dynamic_values_and_continuations():
