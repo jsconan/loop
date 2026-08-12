@@ -14,15 +14,26 @@ from .builtins import exit as exit_command
 from .builtins import help as help_command
 from .builtins import permissions as permissions_command
 from .builtins import quit as quit_command
+from .builtins import skills as skills_command
+from .builtins import tools as tools_command
 from .command import Command, CommandArgumentError
 from .utils import CommandRegistrationError, get_command_arguments_model, takes_command_context
 
 if TYPE_CHECKING:
     from ..interaction import Interaction
     from ..permissions import PermissionManager
+    from ..skills import SkillManager
+    from ..tooling import ToolRegistry
 
 
-BUILTIN_COMMANDS = (help_command, permissions_command, exit_command, quit_command)
+BUILTIN_COMMANDS = (
+    help_command,
+    permissions_command,
+    exit_command,
+    quit_command,
+    skills_command,
+    tools_command,
+)
 
 
 class CommandManager:
@@ -35,6 +46,8 @@ class CommandManager:
             when callers will provide one for each invocation.
         permission_manager (PermissionManager | None): Tool policy manager exposed to permission
             management commands.
+        skill_manager (SkillManager | None): Skill catalog exposed to skill-discovery commands.
+        tool_registry (ToolRegistry | None): Tool catalog exposed to tool-discovery commands.
 
     Raises:
         ValueError: If a command name is invalid or registered more than once.
@@ -50,11 +63,15 @@ class CommandManager:
         commands: Iterable[Command | Callable[..., None]] | None = None,
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
+        skill_manager: SkillManager | None = None,
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         self._commands = {}
         self._exit_requested = False
         self._interaction = interaction
         self._permission_manager = permission_manager
+        self._skill_manager = skill_manager
+        self._tool_registry = tool_registry
         for command in (*BUILTIN_COMMANDS, *(commands or ())):
             self.register(command)
 
@@ -188,7 +205,7 @@ class CommandManager:
             interaction (Interaction | None): Invocation interaction overriding the default.
 
         Raises:
-            CommandArgumentError: If argument syntax or parameter binding is invalid and no
+            CommandArgumentError: If argument syntax or binding is invalid and no
                 interaction is available to report it.
             ValidationError: If arguments fail schema validation and no interaction is available
                 to report it.
@@ -216,6 +233,8 @@ class CommandManager:
                 interaction=active_interaction,
                 manager=self,
                 permission_manager=self._permission_manager,
+                skill_manager=self._skill_manager,
+                tool_registry=self._tool_registry,
             )
         try:
             command.call(arguments, context)

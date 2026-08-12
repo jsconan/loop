@@ -78,7 +78,7 @@ def permissions(
     if operation == "mode" and all(item is None for item in (tool, capability, resource)):
         try:
             mode = PermissionMode(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             pass
         else:
             manager.set_mode(mode)
@@ -107,6 +107,36 @@ def permissions(
 
 
 setattr(permissions, COMPLETION_ATTRIBUTE, PERMISSIONS_COMPLETION)
+
+
+def tools(context: CommandContext) -> None:
+    """List all registered tools with their descriptions."""
+    registry = context.tool_registry
+    if registry is None:
+        raise ValueError("The tools command requires a ToolRegistry.")
+    tool_list = registry.tools
+    if not tool_list:
+        context.interaction.info("No tools registered.")
+        return
+    name_width = max(len(tool.name) for tool in tool_list) + 1
+    lines = ["Registered tools:", ""]
+    lines.extend(f"  {tool.name:<{name_width}} {tool.description}" for tool in tool_list)
+    context.interaction.info("\n".join(lines))
+
+
+def skills(context: CommandContext) -> None:
+    """List all discovered skills with their descriptions."""
+    manager = context.skill_manager
+    if manager is None:
+        raise ValueError("The skills command requires a SkillManager.")
+    skill_list = manager.skills
+    if not skill_list:
+        context.interaction.info("No skills discovered.")
+        return
+    name_width = max(len(skill.name) for skill in skill_list) + 1
+    lines = ["Discovered skills:", ""]
+    lines.extend(f"  {skill.name:<{name_width}} {skill.description}" for skill in skill_list)
+    context.interaction.info("\n".join(lines))
 
 
 def exit(context: CommandContext) -> None:  # pylint: disable=redefined-builtin

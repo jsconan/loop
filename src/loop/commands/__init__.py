@@ -10,9 +10,11 @@ __all__ = [
     "help",
     "permissions",
     "quit",
+    "skills",
+    "tools",
 ]
 
-from .builtins import exit, help, permissions, quit
+from .builtins import exit, help, permissions, quit, skills, tools
 from .command import Command, CommandArgumentError
 from .command_manager import BUILTIN_COMMANDS, CommandManager
 from .utils import CommandRegistrationError

@@ -12,11 +12,15 @@ from loop import (
     PermissionConfiguration,
     PermissionManager,
     PermissionMode,
+    Skill,
+    Tool,
 )
 from loop.commands import exit as exit_command
 from loop.commands import help as help_command
 from loop.commands import permissions as permissions_command
 from loop.commands import quit as quit_command
+from loop.commands import skills as skills_command
+from loop.commands import tools as tools_command
 
 
 def test_help_displays_slash_prefixed_command_catalog():
@@ -94,3 +98,79 @@ def test_exit_commands_request_termination(function, name):
     manager = CommandManager()
     function(CommandContext(name, Mock(spec=Interaction), manager))
     assert manager.exit_requested is True
+
+
+def test_tools_command_displays_registered_tools():
+    """Tools command shows each registered tool name and description."""
+    interaction = Mock(spec=Interaction)
+    registry = Mock()
+    registry.tools = [
+        Tool("read_file", "Read a file from disk", lambda: None, Mock(), frozenset()),
+        Tool("write_file", "Write content to a file", lambda: None, Mock(), frozenset()),
+    ]
+    context = CommandContext("tools", interaction, tool_registry=registry)
+
+    tools_command(context)
+
+    output = interaction.info.call_args.args[0]
+    assert "Registered tools:" in output
+    assert "read_file" in output
+    assert "Read a file from disk" in output
+    assert "write_file" in output
+    assert "Write content to a file" in output
+
+
+def test_tools_command_reports_empty_when_no_tools():
+    """Tools command reports no tools when the registry is empty."""
+    interaction = Mock(spec=Interaction)
+    registry = Mock()
+    registry.tools = []
+    context = CommandContext("tools", interaction, tool_registry=registry)
+
+    tools_command(context)
+
+    assert "No tools registered." in interaction.info.call_args.args[0]
+
+
+def test_tools_command_requires_tool_registry():
+    """Independent tools command rejects missing registry."""
+    with pytest.raises(ValueError, match="requires a ToolRegistry"):
+        tools_command(CommandContext("tools", Mock(spec=Interaction)))
+
+
+def test_skills_command_discovered_skills():
+    """Skills command shows each discovered skill name and description."""
+    interaction = Mock(spec=Interaction)
+    manager = Mock()
+    manager.skills = [
+        Skill("coding", "Implement and modify code", Mock()),
+        Skill("testing", "Write and run tests", Mock()),
+    ]
+    context = CommandContext("skills", interaction, skill_manager=manager)
+
+    skills_command(context)
+
+    output = interaction.info.call_args.args[0]
+    assert "Discovered skills:" in output
+    assert "coding" in output
+    assert "Implement and modify code" in output
+    assert "testing" in output
+    assert "Write and run tests" in output
+
+
+def test_skills_command_reports_empty_when_no_skills():
+    """Skills command reports no skills when the catalog is empty."""
+    interaction = Mock(spec=Interaction)
+    manager = Mock()
+    manager.skills = []
+    context = CommandContext("skills", interaction, skill_manager=manager)
+
+    skills_command(context)
+
+    assert "No skills discovered." in interaction.info.call_args.args[0]
+
+
+def test_skills_command_requires_skill_manager():
+    """Independent skills command rejects missing manager."""
+    with pytest.raises(ValueError, match="requires a SkillManager"):
+        skills_command(CommandContext("skills", Mock(spec=Interaction)))

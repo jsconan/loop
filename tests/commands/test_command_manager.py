@@ -40,10 +40,12 @@ def test_manager_registers_builtins_before_declared_and_discovered_commands():
         "permissions",
         "exit",
         "quit",
+        "skills",
+        "tools",
         "explicit",
         "discovered",
     ]
-    assert manager.commands[4] is explicit
+    assert manager.commands[6] is explicit
     assert manager.exit_requested is False
 
 

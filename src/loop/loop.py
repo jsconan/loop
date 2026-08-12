@@ -117,6 +117,8 @@ class Loop:
         self._command_manager = CommandManager(
             interaction=self._interaction,
             permission_manager=self._permission_manager,
+            skill_manager=self._instructions_manager.skill_manager,
+            tool_registry=self._backend.tool_registry,
         )
         self._mention_manager = mention_manager or MentionManager(
             (
