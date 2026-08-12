@@ -53,18 +53,43 @@ class ConversationItemModel(BaseModel):
     )
 
 
+class ContextReference(BaseModel):
+    """Describe one resolved, bounded user context snapshot.
+
+    Args:
+        kind (Literal["file", "directory"]): Referenced filesystem object kind.
+        path (str): User-facing project-relative path.
+        content (str): Bounded content captured when the turn was submitted.
+        size_bytes (int): Complete source size in bytes.
+        included_bytes (int): Number of content bytes included in the snapshot.
+        truncated (bool): Whether content was omitted from the snapshot.
+    """
+
+    kind: Literal["file", "directory"]
+    path: str
+    content: str
+    size_bytes: int
+    included_bytes: int
+    truncated: bool
+
+
 class Message(ConversationItemModel):
     """Represent a user or assistant conversation message.
 
     Args:
         role (Literal["user", "assistant"]): Participant that produced the message.
         content (str): Message text.
+        context (tuple[ContextReference, ...]): Explicit resolved context snapshots.
         metadata (ResponseMetadata | None): Metadata for the provider response that produced the
             message.
     """
 
     role: Literal["user", "assistant"]
     content: str
+    context: tuple[ContextReference, ...] = Field(
+        default_factory=tuple,
+        exclude_if=lambda value: not value,
+    )
 
 
 class Reasoning(ConversationItemModel):

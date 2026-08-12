@@ -9,6 +9,7 @@ import pytest
 from loop import (
     ConsoleInteraction,
     ContentArtifact,
+    ContextReference,
     MemorySessionStore,
     Message,
     Response,
@@ -127,15 +128,25 @@ def test_manager_adds_and_persists_an_iterable_of_items():
     store.save.assert_called_once_with(session)
 
 
-def test_manager_builds_and_persists_a_user_message():
-    """The user-message convenience method creates and persists its conversation item."""
+def test_manager_constructs_and_persists_complete_user_messages():
+    """User-message creation remains owned by the session boundary."""
     store = Mock(spec=SessionStore)
     session = Session()
     manager = SessionManager(session=session, session_store=store)
+    reference = ContextReference(
+        kind="file",
+        path="app.py",
+        content="pass\n",
+        size_bytes=5,
+        included_bytes=5,
+        truncated=False,
+    )
 
-    manager.add_user_message("hello")
+    manager.add_user_message("Review @app.py", context=iter([reference]))
 
-    assert manager.messages == [Message(role="user", content="hello")]
+    assert manager.messages == [
+        Message(role="user", content="Review @app.py", context=(reference,))
+    ]
     store.save.assert_called_once_with(session)
 
 

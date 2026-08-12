@@ -6,6 +6,7 @@ from typing import Iterable
 from ..interaction import ConsoleInteraction, Interaction
 from ..models import (
     ContentArtifact,
+    ContextReference,
     ConversationItem,
     Message,
     Response,
@@ -164,13 +165,19 @@ class SessionManager:
         self._session.add_messages(messages)
         self._session_store.save(self._session)
 
-    def add_user_message(self, content: str) -> None:
-        """Add a user message to the session.
+    def add_user_message(
+        self,
+        content: str,
+        context: Iterable[ContextReference] = (),
+    ) -> None:
+        """Construct and persist one complete user message.
 
         Args:
-            content (str): The content of the user message.
+            content (str): Submitted user-message text.
+            context (Iterable[ContextReference]): Resolved context snapshots attached to the
+                message. Defaults to no explicit context.
         """
-        self.add_message(Message(role="user", content=content))
+        self.add_message(Message(role="user", content=content, context=tuple(context)))
 
     def add_tool_call(
         self,

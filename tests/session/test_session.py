@@ -6,6 +6,7 @@ import pytest
 
 from loop import (
     ContentArtifact,
+    ContextReference,
     Message,
     Reasoning,
     Response,
@@ -113,7 +114,20 @@ def test_session_serializes_and_deserializes_all_conversation_items():
     )
     session = Session(
         messages=[
-            Message(role="user", content="hello"),
+            Message(
+                role="user",
+                content="hello",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="src/app.py",
+                        content="print('hello')\n",
+                        size_bytes=15,
+                        included_bytes=15,
+                        truncated=False,
+                    ),
+                ),
+            ),
             Reasoning(content="thinking", id="reasoning", metadata=metadata),
             function_call(),
             ToolResult(
