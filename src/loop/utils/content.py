@@ -231,6 +231,7 @@ def read_bounded_text(
     start_line: int | None = 1,
     max_lines: int | None = None,
     max_bytes: int = constants.MAX_TOOL_CONTENT_BYTES,
+    preserve_line_boundaries: bool = False,
 ) -> BoundedTextContent:
     """Read a UTF-8 text range subject to independent byte and line ceilings.
 
@@ -243,6 +244,8 @@ def read_bounded_text(
         max_lines (int | None): Optional maximum lines returned from either starting mode.
             Defaults to no line limit. When both ceilings are set, the first reached stops reading.
         max_bytes (int): Requested encoded byte ceiling, capped by the application hard limit.
+        preserve_line_boundaries (bool): Whether line-oriented reads stop before consuming a
+            partial line. Defaults to ``False`` for byte-resumable consumers.
 
     Returns:
         BoundedTextContent: Text, exact byte range, and continuation metadata.
@@ -271,6 +274,7 @@ def read_bounded_text(
         remaining = max_bytes
         lines_read = 0
         stopped_by_lines = False
+        line_too_long = False
         while remaining:
             if max_lines is not None and lines_read >= max_lines:
                 stopped_by_lines = True
@@ -279,6 +283,10 @@ def read_bounded_text(
             if not chunk:
                 break
             if len(chunk) > remaining:
+                if start_line is not None and preserve_line_boundaries:
+                    stream.seek(-len(chunk), 1)
+                    line_too_long = not chunks
+                    break
                 stream.seek(-(len(chunk) - remaining), 1)
                 chunk = chunk[:remaining]
             chunks.append(chunk)
@@ -319,8 +327,11 @@ def read_bounded_text(
         else:
             result["end_line"] = current_line - 1
     if more:
-        result["truncation_reason"] = "lines" if stopped_by_lines else "bytes"
+        if line_too_long:
+            result["truncation_reason"] = "line_too_long"
+        else:
+            result["truncation_reason"] = "lines" if stopped_by_lines else "bytes"
         result["next_start_byte"] = end
-        if start_line is not None and stopped_by_lines:
+        if start_line is not None and not line_too_long:
             result["next_start_line"] = current_line + lines_read
     return result

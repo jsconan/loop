@@ -299,61 +299,54 @@ def test_read_text_file_confirms_for_visible_files_by_default(tmp_path, monkeypa
     confirm.assert_called_once()
 
 
-def test_read_text_file_supports_line_pages_and_byte_continuations(tmp_path):
-    """Line pages retain a hard byte limit and expose efficient byte continuation."""
+def test_read_text_file_supports_line_pages_and_line_continuations(tmp_path):
+    """Line pages retain a hard byte limit and continue with one line coordinate."""
     source = tmp_path / "unicode.txt"
     source.write_text("one\ntwø\nthree\nfour\n", encoding="utf-8")
 
     first = json.loads(read_text_file(source, max_lines=2, max_bytes=100))
-    second = json.loads(
-        read_text_file(
-            source,
-            start_byte=first["next_start_byte"],
-            start_line=None,
-            max_bytes=100,
-        )
-    )
+    second = json.loads(read_text_file(source, start_line=first["next_start_line"], max_bytes=100))
 
     assert first["content"] == "one\ntwø\n"
     assert first["truncation_reason"] == "lines"
     assert first["next_start_line"] == 3
     assert second["content"] == "three\nfour\n"
-    assert "start_line" not in second
+    assert second["start_line"] == 3
 
 
-def test_read_text_file_trims_utf8_safely_at_the_byte_ceiling(tmp_path):
-    """A byte ceiling never splits a multibyte UTF-8 character."""
+def test_read_text_file_stops_at_lines_before_the_byte_ceiling(tmp_path):
+    """A byte ceiling preserves complete lines and exposes a line continuation."""
     source = tmp_path / "unicode.txt"
-    source.write_text("a€b", encoding="utf-8")
+    source.write_text("a€\nb\n", encoding="utf-8")
 
-    first = json.loads(read_text_file(source, max_bytes=3))
-    second = json.loads(
-        read_text_file(
-            source,
-            start_byte=first["next_start_byte"],
-            start_line=None,
-            max_bytes=4,
-        )
-    )
+    first = json.loads(read_text_file(source, max_bytes=5))
+    second = json.loads(read_text_file(source, start_line=first["next_start_line"], max_bytes=5))
 
-    assert first["content"] == "a"
-    assert first["end_byte"] == 1
-    assert second["content"] == "€b"
+    assert first["content"] == "a€\n"
+    assert first["end_byte"] == 5
+    assert first["truncation_reason"] == "bytes"
+    assert first["next_start_line"] == 2
+    assert second["content"] == "b\n"
 
 
-def test_read_text_file_accepts_equivalent_origins_and_rejects_conflicts(tmp_path):
-    """Range selection normalizes the origin while rejecting genuine ambiguity."""
+def test_read_text_file_rejects_byte_selection_and_reports_oversized_lines(tmp_path):
+    """The public tool is line-only and reports a line that exceeds its byte ceiling."""
     source = tmp_path / "unicode.txt"
     source.write_text("€", encoding="utf-8")
 
-    origin = json.loads(read_text_file(source, start_byte=0))
-    conflicting = read_text_file(source, start_byte=1)
-    split_character = read_text_file(source, start_byte=1, start_line=None)
+    oversized = json.loads(read_text_file(source, max_bytes=2))
+    invalid = json.loads(read_text_file(source, start_byte=0))
+    definition = next(
+        definition
+        for definition in tool_registry.definitions()
+        if definition.name == "read_text_file"
+    )
 
-    assert origin["content"] == "€"
-    assert origin["start_byte"] == 0
-    assert "Specify either start_byte or start_line" in conflicting
-    assert "not valid UTF-8" in split_character
+    assert oversized["content"] == ""
+    assert oversized["truncation_reason"] == "line_too_long"
+    assert "next_start_line" not in oversized
+    assert invalid["error"] == "invalid_arguments"
+    assert "start_byte" not in definition.parameters["properties"]
 
 
 def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, monkeypatch):
@@ -409,7 +402,9 @@ def test_write_text_file_includes_a_diff_in_the_confirmation_prompt(tmp_path, mo
     assert target.read_text(encoding="utf-8") == "after\nunchanged"
 
 
-def test_write_text_file_falls_back_to_content_preview_for_binary_destination(tmp_path, monkeypatch):
+def test_write_text_file_falls_back_to_content_preview_for_binary_destination(
+    tmp_path, monkeypatch
+):
     """Unreadable existing content does not prevent a bounded write preview."""
     target = tmp_path / "written.txt"
     target.write_bytes(b"\xff")

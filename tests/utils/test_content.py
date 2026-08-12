@@ -139,9 +139,7 @@ def test_bounded_text_applies_both_ceilings_to_byte_started_reads(tmp_path):
     line_first = read_bounded_text(
         source, start_byte=5, start_line=None, max_lines=1, max_bytes=100
     )
-    byte_first = read_bounded_text(
-        source, start_byte=5, start_line=None, max_lines=2, max_bytes=3
-    )
+    byte_first = read_bounded_text(source, start_byte=5, start_line=None, max_lines=2, max_bytes=3)
 
     assert line_first["content"] == "first\n"
     assert line_first["truncation_reason"] == "lines"
@@ -150,6 +148,23 @@ def test_bounded_text_applies_both_ceilings_to_byte_started_reads(tmp_path):
     assert byte_first["content"] == "fir"
     assert byte_first["truncation_reason"] == "bytes"
     assert byte_first["next_start_byte"] == 8
+
+
+def test_bounded_text_trims_utf8_safely_in_byte_resumable_mode(tmp_path):
+    """Byte-resumable reads stop before an incomplete UTF-8 character."""
+    source = tmp_path / "source.txt"
+    source.write_text("a€b", encoding="utf-8")
+
+    first = read_bounded_text(source, max_bytes=3)
+    second = read_bounded_text(
+        source, start_byte=first["next_start_byte"], start_line=None, max_bytes=4
+    )
+
+    assert first["content"] == "a"
+    assert first["end_byte"] == 1
+    assert second["content"] == "€b"
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        read_bounded_text(source, start_byte=2, start_line=None)
 
 
 def test_bounded_text_has_no_default_line_limit(tmp_path):
@@ -162,6 +177,22 @@ def test_bounded_text_has_no_default_line_limit(tmp_path):
 
     assert result["content"] == content
     assert result["truncated"] is False
+
+
+def test_bounded_text_preserves_line_boundaries_at_the_byte_ceiling(tmp_path):
+    """Line reads continue at the next line or report an individually oversized line."""
+    source = tmp_path / "source.txt"
+    source.write_text("first\nsecond\n", encoding="utf-8")
+
+    bounded = read_bounded_text(source, max_bytes=6, preserve_line_boundaries=True)
+    oversized = read_bounded_text(source, start_line=2, max_bytes=3, preserve_line_boundaries=True)
+
+    assert bounded["content"] == "first\n"
+    assert bounded["truncation_reason"] == "bytes"
+    assert bounded["next_start_line"] == 2
+    assert oversized["content"] == ""
+    assert oversized["truncation_reason"] == "line_too_long"
+    assert "next_start_line" not in oversized
 
 
 def test_bounded_text_seeks_directly_to_a_requested_line(tmp_path):

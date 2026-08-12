@@ -136,15 +136,9 @@ def list_folder(
 def read_text_file(
     context: ToolContext,
     path: Annotated[str, Field(description="Path to the text file to read.")],
-    start_byte: Annotated[
-        int | None,
-        Field(
-            description="Zero-based byte offset; start_line may remain 1 only at byte zero.", ge=0
-        ),
-    ] = None,
     start_line: Annotated[
-        int | None,
-        Field(description="One-based starting line; set to null for byte-oriented access.", ge=1),
+        int,
+        Field(description="One-based starting line.", ge=1),
     ] = 1,
     max_lines: Annotated[
         int | None,
@@ -171,10 +165,10 @@ def read_text_file(
             path=path,
             **read_bounded_text(
                 file_path,
-                start_byte=start_byte,
                 start_line=start_line,
                 max_lines=max_lines,
                 max_bytes=max_bytes,
+                preserve_line_boundaries=True,
             ),
         )
         context.observe_file(path)
