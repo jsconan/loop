@@ -10,10 +10,9 @@ from .completion import (
     CommandCompletionAdapter,
     CompletionManager,
     CompletionValue,
-    MarkerCompletionAdapter,
-    ProjectPathCompletionAdapter,
 )
 from .interaction import Interaction
+from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
 from .models import (
     ConversationItem,
     Response,
@@ -37,6 +36,8 @@ class Loop:
         interaction (Interaction | None): Service used for all user input and output.
         permission_manager (PermissionManager | None): Manager used to authorize model tool calls.
             Defaults to loading local policy from the project ``.loop`` folder.
+        mention_manager (MentionManager | None): Injected mention capability registry. Defaults to
+            live project-path and skill handlers.
         working_directory (Path | str | None): Directory used to discover applicable AGENTS.md
             files.
         agents_filenames (tuple[str, ...]): Ordered instruction filenames, where a later name is
@@ -64,6 +65,7 @@ class Loop:
     _command_manager: CommandManager
     _permission_manager: PermissionManager
     _completion_manager: CompletionManager
+    _mention_manager: MentionManager
 
     def __init__(
         self,
@@ -73,6 +75,7 @@ class Loop:
         instructions_manager: InstructionsManager | None = None,
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
+        mention_manager: MentionManager | None = None,
         working_directory: Path | str | None = None,
         agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
         session: Session | str | None = None,
@@ -115,6 +118,12 @@ class Loop:
             interaction=self._interaction,
             permission_manager=self._permission_manager,
         )
+        self._mention_manager = mention_manager or MentionManager(
+            (
+                ProjectPathMentionHandler(lambda: self._working_directory),
+                SkillMentionHandler(self._instructions_manager),
+            )
+        )
         self._completion_manager = CompletionManager(
             (
                 CommandCompletionAdapter(
@@ -126,14 +135,7 @@ class Loop:
                         )
                     },
                 ),
-                ProjectPathCompletionAdapter("@", self._working_directory),
-                MarkerCompletionAdapter(
-                    "$",
-                    lambda: (
-                        CompletionValue(skill.name, skill.description)
-                        for skill in self._instructions_manager.skill_manager.skills
-                    ),
-                ),
+                *self._mention_manager.completion_adapters,
             )
         )
 
@@ -269,7 +271,12 @@ class Loop:
                 break
             if self._command_manager.handle_user_command(user_input):
                 continue
-            self._session_manager.add_user_message(content=user_input)
+            try:
+                context = self._mention_manager.resolve(user_input)
+            except (OSError, UnicodeError, ValueError) as error:
+                self._interaction.error(str(error))
+                continue
+            self._session_manager.add_user_message(user_input, context=context)
 
             while True:
                 events = self.query()

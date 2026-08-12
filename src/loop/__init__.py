@@ -41,6 +41,8 @@ __all__ = [
     "manage_skills",
     "MarkerCompletionAdapter",
     "MemorySessionStore",
+    "MentionHandler",
+    "MentionManager",
     "Message",
     "ModelInfo",
     "OpenAIBackend",
@@ -51,6 +53,7 @@ __all__ = [
     "PermissionResult",
     "PermissionRule",
     "ProjectPathCompletionAdapter",
+    "ProjectPathMentionHandler",
     "read_cached_content",
     "read_text_file",
     "Reasoning",
@@ -73,6 +76,7 @@ __all__ = [
     "ShutdownRequested",
     "Skill",
     "SkillManager",
+    "SkillMentionHandler",
     "SQLiteSessionStore",
     "StoredSession",
     "tool_registry",
@@ -112,6 +116,12 @@ from .completion import (
 from .context import CommandContext, ToolContext
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop, Response
+from .mentions import (
+    MentionHandler,
+    MentionManager,
+    ProjectPathMentionHandler,
+    SkillMentionHandler,
+)
 from .models import (
     AnswerCompleted,
     AnswerDelta,

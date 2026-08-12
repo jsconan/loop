@@ -11,9 +11,11 @@ from prompt_toolkit.document import Document
 from loop import (
     AnswerCompleted,
     AnswerDelta,
+    ContextReference,
     InstructionsManager,
     Interaction,
     Loop,
+    MentionManager,
     Message,
     PermissionConfiguration,
     PermissionManager,
@@ -124,6 +126,90 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
     assert values("/he") == ["/help"]
     assert values("$rev") == ["$review"]
     assert values("/permissions add allow ins") == ["inspect"]
+
+
+def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(tmp_path):
+    """Mentioned files are attached and mentioned skill instructions enter the first request."""
+    source = tmp_path / "app.py"
+    source.write_text("print('hello')\n", encoding="utf-8")
+    location = tmp_path / "skills" / "review" / "SKILL.md"
+    location.parent.mkdir(parents=True)
+    location.write_text(
+        "---\nname: review\ndescription: Review code.\n---\nFollow review instructions.\n",
+        encoding="utf-8",
+    )
+    instructions = InstructionsManager(
+        skill_manager=SkillManager([Skill("review", "Review code.", location)]),
+        working_directory=tmp_path,
+    )
+    backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+    backend.get_context_window.return_value = None
+    backend.get_response.return_value = [ResponseCompleted()]
+    interaction = output_interaction()
+    interaction.input.side_effect = ["Use $review on @app.py", False]
+
+    loop = Loop(
+        backend=backend,
+        interaction=interaction,
+        instructions_manager=instructions,
+        working_directory=tmp_path,
+    )
+    loop.run()
+
+    message = backend.get_response.call_args.kwargs["input"][0]
+    assert message == Message(
+        role="user",
+        content="Use $review on @app.py",
+        context=(
+            ContextReference(
+                kind="file",
+                path="app.py",
+                content="print('hello')\n",
+                size_bytes=15,
+                included_bytes=15,
+                truncated=False,
+            ),
+        ),
+    )
+    assert "Follow review instructions." in backend.get_response.call_args.kwargs["instructions"]
+    assert loop.session.active_skills == [("review", str(location))]
+
+
+def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
+    """Mention resolution failures return to input without storing a partial user turn."""
+    path = tmp_path / "binary.bin"
+    path.write_bytes(b"bad\0data")
+    backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+    interaction = Mock(spec=Interaction)
+    interaction.input.side_effect = ["Read @binary.bin", False]
+    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+
+    loop.run()
+
+    assert loop.messages == []
+    backend.get_response.assert_not_called()
+    interaction.error.assert_called_once_with("Content appears to be binary.")
+
+
+def test_loop_uses_an_injected_mention_registry(tmp_path):
+    """Library callers can replace all default mention semantics and completion."""
+    mentions = Mock(spec=MentionManager)
+    mentions.completion_adapters = ()
+    mentions.resolve.return_value = ()
+    backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+    backend.get_context_window.return_value = None
+    backend.get_response.return_value = [ResponseCompleted()]
+    interaction = output_interaction()
+    interaction.input.side_effect = ["Custom !reference", False]
+
+    Loop(
+        backend=backend,
+        interaction=interaction,
+        mention_manager=mentions,
+        working_directory=tmp_path,
+    ).run()
+
+    mentions.resolve.assert_called_once_with("Custom !reference")
 
 
 def test_loop_passes_custom_instruction_fallbacks_to_discovery(tmp_path):
