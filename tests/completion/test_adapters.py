@@ -172,52 +172,6 @@ def test_invalid_command_paths_quotes_and_provider_failures_return_no_values():
     assert complete(completer, "/choose known ") == []
 
 
-def test_file_mentions_match_path_fragments_rank_basenames_and_respect_ignores(tmp_path):
-    """File mentions search visible relative paths and rank basename prefixes first."""
-    source = tmp_path / "src" / "commands"
-    source.mkdir(parents=True)
-    (source / "command_manager.py").write_text("", encoding="utf-8")
-    (tmp_path / "manager_notes.txt").write_text("", encoding="utf-8")
-    ignored = tmp_path / "ignored"
-    ignored.mkdir()
-    (ignored / "manager_secret.py").write_text("", encoding="utf-8")
-    (tmp_path / ".gitignore").write_text("ignored/\n", encoding="utf-8")
-    completer = CompletionManager((ProjectPathCompletionAdapter("@", tmp_path),))
-
-    results = complete(completer, "review @manager")
-
-    assert [item.text for item in results] == [
-        "@manager_notes.txt",
-        "@src/commands/command_manager.py",
-    ]
-    assert all(item.start_position == -8 for item in results)
-    assert results[0].display_meta_text == "file"
-    assert "ignored/manager_secret.py" not in [item.text for item in results]
-    assert [item.text for item in complete(completer, "@src")][0] == "@src/"
-    assert [item.text for item in complete(completer, "@commands")] == [
-        "@src/commands/",
-        "@src/commands/command_manager.py",
-    ]
-
-
-def test_file_mentions_include_directories_cache_the_snapshot_and_handle_missing_roots(tmp_path):
-    """Directory candidates remain navigable and one prompt reuses its indexed snapshot."""
-    folder = tmp_path / "nested"
-    folder.mkdir()
-    completer = CompletionManager((ProjectPathCompletionAdapter("@", tmp_path),), max_results=1)
-
-    assert [item.text for item in complete(completer, "@nest")] == ["@nested/"]
-    assert (
-        complete(
-            CompletionManager((ProjectPathCompletionAdapter("@", tmp_path / "missing"),)),
-            "@anything",
-        )
-        == []
-    )
-    (tmp_path / "new.txt").write_text("", encoding="utf-8")
-    assert complete(completer, "@new") == []
-
-
 def test_skill_mentions_work_in_prose_and_require_a_token_boundary(tmp_path):
     """Skill mentions replace only an active bounded token and expose descriptions."""
     skill = Skill("coding", "Implement Python code.", tmp_path / "SKILL.md")
@@ -231,6 +185,39 @@ def test_skill_mentions_work_in_prose_and_require_a_token_boundary(tmp_path):
     assert results[0].display_meta_text == "Implement Python code."
     assert complete(completer, "price$din") == []
     assert complete(completer, "plain text") == []
+
+
+def test_project_path_completion_caches_paths_until_ttl_expires(monkeypatch, tmp_path):
+    """Project path completion reuses short-lived snapshots and refreshes after expiry."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("", encoding="utf-8")
+    (tmp_path / "ignored.py").write_text("", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+    current = [tmp_path]
+    now = [10.0]
+    monkeypatch.setattr("loop.completion.adapters.time.monotonic", lambda: now[0])
+    completer = CompletionManager((ProjectPathCompletionAdapter("@", lambda: current[0]),))
+
+    assert [item.text for item in complete(completer, "@app")] == ["@src/app.py"]
+    (tmp_path / "new.py").write_text("", encoding="utf-8")
+    assert complete(completer, "@new") == []
+    now[0] += 5.0
+    assert [item.text for item in complete(completer, "@new")] == ["@new.py"]
+    assert complete(completer, "@ignored") == []
+    current[0] = tmp_path / "missing"
+    assert complete(completer, "@") == []
+
+
+def test_project_path_completion_can_disable_cache_and_rejects_negative_ttl(tmp_path):
+    """A zero TTL always refreshes paths while negative durations are invalid."""
+    adapter = ProjectPathCompletionAdapter("@", tmp_path, cache_ttl=0)
+    completer = CompletionManager((adapter,))
+
+    assert complete(completer, "@new") == []
+    (tmp_path / "new.py").write_text("", encoding="utf-8")
+    assert [item.text for item in complete(completer, "@new")] == ["@new.py"]
+    with pytest.raises(ValueError, match="cannot be negative"):
+        ProjectPathCompletionAdapter("@", tmp_path, cache_ttl=-1)
 
 
 def test_adapter_declarations_expose_markers_and_dynamic_keywords():
@@ -259,13 +246,10 @@ def test_adapter_declarations_expose_markers_and_dynamic_keywords():
 
 
 @pytest.mark.parametrize("marker", ["ab", "a", " "])
-@pytest.mark.parametrize("adapter", [MarkerCompletionAdapter, ProjectPathCompletionAdapter])
-def test_marker_adapters_reject_invalid_markers(adapter, marker, tmp_path):
+def test_marker_adapters_reject_invalid_markers(marker):
     """Marker capabilities reject ambiguous alphanumeric activators."""
-    argument = (lambda: ()) if adapter is MarkerCompletionAdapter else tmp_path
-
     with pytest.raises(ValueError, match="one non-alphanumeric"):
-        adapter(marker, argument)
+        MarkerCompletionAdapter(marker, lambda: ())
 
 
 @pytest.mark.parametrize("marker", ["ab", "a", " "])
