@@ -13,6 +13,15 @@ unrelated refactoring or new dependencies.
 
 - Reuse existing project patterns, standard-library features, and installed dependencies before
   adding new abstractions or packages.
+- Keep domain knowledge behind one cohesive boundary. Let callers express intent without
+  constructing another component's internal models, coordinating its lifecycle or rollback, or
+  duplicating its parsing, validation, and completion rules.
+- Do not add thin convenience methods that merely accept and forward an already-constructed
+  internal object. Give the component that owns construction and invariant enforcement the raw
+  inputs it needs, so callers do not need to know its internal representation or workflow.
+- When a new domain is complex enough to require multiple responsibilities or implementation
+  modules, group it in a package with one deliberate public facade. Keep parsing, models, and
+  orchestration private unless callers independently need those APIs.
 - Fix shared root causes when appropriate instead of patching only a reported symptom.
 - Preserve validation, security, accessibility, data-loss prevention, and explicitly required
   behavior.
