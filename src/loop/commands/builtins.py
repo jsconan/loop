@@ -111,10 +111,13 @@ setattr(permissions, COMPLETION_ATTRIBUTE, PERMISSIONS_COMPLETION)
 
 def tools(context: CommandContext) -> None:
     """List all registered tools with their descriptions."""
-    registry = context.tool_registry
-    if registry is None:
-        raise ValueError("The tools command requires a ToolRegistry.")
-    tool_list = registry.tools
+    manager = context.manager
+    if manager is None:
+        raise ValueError("The tools command requires a CommandManager.")
+    tool_registry = manager.tool_registry
+    if tool_registry is None:
+        raise ValueError("The CommandManager requires a ToolRegistry for the tools command.")
+    tool_list = tool_registry.tools
     if not tool_list:
         context.interaction.info("No tools registered.")
         return
@@ -126,10 +129,13 @@ def tools(context: CommandContext) -> None:
 
 def skills(context: CommandContext) -> None:
     """List all discovered skills with their descriptions."""
-    manager = context.skill_manager
-    if manager is None:
-        raise ValueError("The skills command requires a SkillManager.")
-    skill_list = manager.skills
+    command_manager = context.manager
+    if command_manager is None:
+        raise ValueError("The skills command requires a CommandManager.")
+    skill_manager = command_manager.skill_manager
+    if skill_manager is None:
+        raise ValueError("The CommandManager requires a SkillManager for the skills command.")
+    skill_list = skill_manager.skills
     if not skill_list:
         context.interaction.info("No skills discovered.")
         return

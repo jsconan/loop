@@ -61,6 +61,16 @@ def test_interaction_property_can_be_replaced_and_cleared():
     assert manager.interaction is None
 
 
+def test_manager_exposes_command_catalog_dependencies():
+    """Catalog dependencies remain available through the manager shared with command contexts."""
+    skill_manager = Mock()
+    tool_registry = Mock()
+    manager = CommandManager(skill_manager=skill_manager, tool_registry=tool_registry)
+
+    assert manager.skill_manager is skill_manager
+    assert manager.tool_registry is tool_registry
+
+
 def test_register_supports_decorators_and_declared_metadata():
     """Decorators may discover metadata or receive explicit slash-free values."""
     manager = CommandManager()

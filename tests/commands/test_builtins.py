@@ -108,7 +108,7 @@ def test_tools_command_displays_registered_tools():
         Tool("read_file", "Read a file from disk", lambda: None, Mock(), frozenset()),
         Tool("write_file", "Write content to a file", lambda: None, Mock(), frozenset()),
     ]
-    context = CommandContext("tools", interaction, tool_registry=registry)
+    context = CommandContext("tools", interaction, CommandManager(tool_registry=registry))
 
     tools_command(context)
 
@@ -125,7 +125,7 @@ def test_tools_command_reports_empty_when_no_tools():
     interaction = Mock(spec=Interaction)
     registry = Mock()
     registry.tools = []
-    context = CommandContext("tools", interaction, tool_registry=registry)
+    context = CommandContext("tools", interaction, CommandManager(tool_registry=registry))
 
     tools_command(context)
 
@@ -133,9 +133,11 @@ def test_tools_command_reports_empty_when_no_tools():
 
 
 def test_tools_command_requires_tool_registry():
-    """Independent tools command rejects missing registry."""
-    with pytest.raises(ValueError, match="requires a ToolRegistry"):
+    """Tools commands reject missing manager and registry dependencies."""
+    with pytest.raises(ValueError, match="requires a CommandManager"):
         tools_command(CommandContext("tools", Mock(spec=Interaction)))
+    with pytest.raises(ValueError, match="requires a ToolRegistry"):
+        tools_command(CommandContext("tools", Mock(spec=Interaction), CommandManager()))
 
 
 def test_skills_command_discovered_skills():
@@ -146,7 +148,7 @@ def test_skills_command_discovered_skills():
         Skill("coding", "Implement and modify code", Mock()),
         Skill("testing", "Write and run tests", Mock()),
     ]
-    context = CommandContext("skills", interaction, skill_manager=manager)
+    context = CommandContext("skills", interaction, CommandManager(skill_manager=manager))
 
     skills_command(context)
 
@@ -163,7 +165,7 @@ def test_skills_command_reports_empty_when_no_skills():
     interaction = Mock(spec=Interaction)
     manager = Mock()
     manager.skills = []
-    context = CommandContext("skills", interaction, skill_manager=manager)
+    context = CommandContext("skills", interaction, CommandManager(skill_manager=manager))
 
     skills_command(context)
 
@@ -171,6 +173,8 @@ def test_skills_command_reports_empty_when_no_skills():
 
 
 def test_skills_command_requires_skill_manager():
-    """Independent skills command rejects missing manager."""
-    with pytest.raises(ValueError, match="requires a SkillManager"):
+    """Skills commands reject missing command and skill manager dependencies."""
+    with pytest.raises(ValueError, match="requires a CommandManager"):
         skills_command(CommandContext("skills", Mock(spec=Interaction)))
+    with pytest.raises(ValueError, match="requires a SkillManager"):
+        skills_command(CommandContext("skills", Mock(spec=Interaction), CommandManager()))

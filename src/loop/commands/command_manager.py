@@ -57,6 +57,9 @@ class CommandManager:
     _commands: dict[str, Command]
     _exit_requested: bool
     _interaction: Interaction | None
+    _permission_manager: PermissionManager | None
+    _skill_manager: SkillManager | None
+    _tool_registry: ToolRegistry | None
 
     def __init__(
         self,
@@ -101,6 +104,24 @@ class CommandManager:
             tuple[Command, ...]: Registered command definitions.
         """
         return tuple(self._commands.values())
+
+    @property
+    def skill_manager(self) -> SkillManager | None:
+        """Return the skill catalog exposed to commands.
+
+        Returns:
+            SkillManager | None: The configured skill manager, or ``None`` when unavailable.
+        """
+        return self._skill_manager
+
+    @property
+    def tool_registry(self) -> ToolRegistry | None:
+        """Return the tool catalog exposed to commands.
+
+        Returns:
+            ToolRegistry | None: The configured tool registry, or ``None`` when unavailable.
+        """
+        return self._tool_registry
 
     @property
     def exit_requested(self) -> bool:
@@ -233,8 +254,6 @@ class CommandManager:
                 interaction=active_interaction,
                 manager=self,
                 permission_manager=self._permission_manager,
-                skill_manager=self._skill_manager,
-                tool_registry=self._tool_registry,
             )
         try:
             command.call(arguments, context)
