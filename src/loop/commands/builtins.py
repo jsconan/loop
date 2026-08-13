@@ -7,7 +7,7 @@ from pydantic import Field
 from ..completion import COMPLETION_ATTRIBUTE, CommandCompletion, CompletionValue
 from ..context import CommandContext
 from ..permissions import Capability, Decision, PermissionMode, PermissionRule
-from .command import CommandArgumentError
+from .models import CommandArgumentError, CommandRemainder
 
 
 def _values(enum_type: type) -> tuple[CompletionValue, ...]:
@@ -21,11 +21,16 @@ _CAPABILITY_COMPLETION = CommandCompletion(
     next=_RESOURCE_COMPLETION,
 )
 _TOOL_COMPLETION = CommandCompletion(provider="tools", next=_CAPABILITY_COMPLETION)
+_CALL_COMPLETION = CommandCompletion(
+    provider="tools",
+    next=CommandCompletion(schema_provider="tool_arguments"),
+)
+_USE_COMPLETION = CommandCompletion(provider="skills")
 _DECISION_COMPLETION = CommandCompletion(
     values=_values(Decision),
     children={decision.value: _TOOL_COMPLETION for decision in Decision},
 )
-PERMISSIONS_COMPLETION = CommandCompletion(
+_PERMISSIONS_COMPLETION = CommandCompletion(
     values=tuple(CompletionValue(value) for value in ("show", "mode", "add", "session")),
     children={
         "mode": CommandCompletion(values=_values(PermissionMode)),
@@ -106,9 +111,6 @@ def permissions(
     )
 
 
-setattr(permissions, COMPLETION_ATTRIBUTE, PERMISSIONS_COMPLETION)
-
-
 def tools(context: CommandContext) -> None:
     """List all registered tools with their descriptions."""
     manager = context.manager
@@ -125,6 +127,31 @@ def tools(context: CommandContext) -> None:
     lines = ["Registered tools:", ""]
     lines.extend(f"  {tool.name:<{name_width}} {tool.description}" for tool in tool_list)
     context.interaction.info("\n".join(lines))
+
+
+def call(
+    context: CommandContext,
+    name: Annotated[str, Field(description="Exact registered tool name.")],
+    arguments: Annotated[
+        tuple[str, ...],
+        CommandRemainder(),
+        Field(description="Command-like positional and name=value tool arguments."),
+    ] = (),
+) -> None:
+    """Call a registered tool with command-like arguments."""
+    command_manager = context.manager
+    if command_manager is None:
+        raise ValueError("The call command requires a CommandManager.")
+    tool_registry = command_manager.tool_registry
+    if tool_registry is None:
+        raise ValueError("The CommandManager requires a ToolRegistry for the call command.")
+    result = tool_registry.command(
+        name,
+        arguments,
+        interaction=context.interaction,
+        instructions_manager=command_manager.instructions_manager,
+    )
+    context.interaction.info(result)
 
 
 def skills(context: CommandContext) -> None:
@@ -145,6 +172,29 @@ def skills(context: CommandContext) -> None:
     context.interaction.info("\n".join(lines))
 
 
+def use(
+    context: CommandContext,
+    name: Annotated[str, Field(description="Exact skill name.")],
+) -> None:
+    """Load a skill for subsequent model requests."""
+    command_manager = context.manager
+    if command_manager is None:
+        raise ValueError("The use command requires a CommandManager.")
+    instructions_manager = command_manager.instructions_manager
+    if instructions_manager is None:
+        raise ValueError("The CommandManager requires an InstructionsManager for the use command.")
+    try:
+        result = instructions_manager.activate_skill(name)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise CommandArgumentError(f"Could not load skill '{name}': {exc}") from exc
+    if "error" in result:
+        raise CommandArgumentError(result["message"])
+    if result["instructions_updated"]:
+        context.interaction.info(f"Loaded skill '{name}'.")
+    else:
+        context.interaction.info(f"Skill '{name}' is already loaded.")
+
+
 def exit(context: CommandContext) -> None:  # pylint: disable=redefined-builtin
     """End the conversation."""
     manager = context.manager
@@ -156,3 +206,9 @@ def exit(context: CommandContext) -> None:  # pylint: disable=redefined-builtin
 def quit(context: CommandContext) -> None:  # pylint: disable=redefined-builtin,consider-using-sys-exit
     """End the conversation."""
     exit(context)  # pylint: disable=consider-using-sys-exit
+
+
+# Register completions for built-in commands
+setattr(permissions, COMPLETION_ATTRIBUTE, _PERMISSIONS_COMPLETION)
+setattr(use, COMPLETION_ATTRIBUTE, _USE_COMPLETION)
+setattr(call, COMPLETION_ATTRIBUTE, _CALL_COMPLETION)

@@ -3,6 +3,10 @@
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from pydantic import ValidationError
+
+from ..commands.models import CommandArgumentError
+from ..commands.utils import parse_model_arguments
 from ..context import ToolContext
 from ..interaction import Interaction
 from ..models import ToolDefinition
@@ -249,6 +253,53 @@ class ToolRegistry:
         )
         return await tool.call_async(validated, context)
 
+    def command(
+        self,
+        name: str,
+        arguments: list[str] | tuple[str, ...],
+        *,
+        interaction: Interaction | None = None,
+        instructions_manager: InstructionsManager | None = None,
+    ) -> str:
+        """Dispatch a user-command tool call without permission evaluation.
+
+        Args:
+            name (str): Registered tool name.
+            arguments (list[str] | tuple[str, ...]): Positional and ``name=value`` argument tokens.
+            interaction (Interaction | None): Interaction for this invocation. Overrides the
+                registry default.
+            instructions_manager (InstructionsManager | None): Instruction manager active for the
+                current conversation.
+        Returns:
+            str: The serialized tool result or a model-readable error.
+
+        Raises:
+            ValueError: If the tool requires a context but none is provided.
+        """
+        tool = self._tools.get(name)
+        if tool is None:
+            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
+        try:
+            validated = parse_model_arguments(tool.arguments_model, arguments).model_dump()
+        except (CommandArgumentError, ValidationError) as exc:
+            details = (
+                exc.errors(include_url=False)
+                if isinstance(exc, ValidationError)
+                else [{"type": "argument_binding", "msg": str(exc)}]
+            )
+            return serialize_tool_error(
+                "invalid_arguments",
+                f"Invalid arguments for tool '{name}'.",
+                details=details,
+            )
+        context = self._context_for(
+            tool,
+            interaction,
+            instructions_manager,
+            permission_manager=None,
+        )
+        return tool.call(validated, context)
+
     def _authorize(
         self,
         tool: Tool,
@@ -282,7 +333,7 @@ class ToolRegistry:
         tool: Tool,
         interaction: Interaction | None,
         instructions_manager: InstructionsManager | None,
-        permission_manager: PermissionManager,
+        permission_manager: PermissionManager | None,
         grants: frozenset[PermissionRequest] = frozenset(),
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""

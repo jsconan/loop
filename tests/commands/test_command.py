@@ -1,11 +1,13 @@
 """Tests for individual schema-backed command declarations."""
 
+from typing import Annotated
 from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
 
 from loop import Command, CommandArgumentError, CommandContext, Interaction
+from loop.commands.models import CommandRemainder
 from loop.commands.utils import get_command_arguments_model
 
 
@@ -58,6 +60,18 @@ def test_command_calls_parameterless_function_and_injects_context_when_declared(
     assert calls == ["plain", "select"]
     with pytest.raises(ValueError, match="requires a CommandContext"):
         make_command(contextual).call("")
+
+
+def test_command_collects_all_tokens_in_a_declared_remainder():
+    """A final remainder field receives positional and name-like tokens unchanged."""
+    calls = []
+
+    def collect(arguments: Annotated[tuple[str, ...], CommandRemainder()] = ()) -> None:
+        calls.append(arguments)
+
+    make_command(collect).call("first name=value")
+
+    assert calls == [("first", "name=value")]
 
 
 @pytest.mark.parametrize(

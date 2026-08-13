@@ -2,11 +2,12 @@
 
 import asyncio
 import importlib
+import json
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from loop import PermissionConfiguration, PermissionManager, PermissionMode
+from loop import PermissionConfiguration, PermissionManager, PermissionMode, ToolContext
 from loop.interaction import Interaction
 from loop.skills import InstructionsManager
 from loop.tooling import ToolRegistrationError, ToolRegistry
@@ -186,6 +187,40 @@ def test_call_uses_default_or_no_context(monkeypatch):
     registry.interaction = None
     registry.call("calculate", "{}")
     assert tool.call.call_args.args[1] is None
+
+
+def test_call_command_parses_model_parameters_before_shared_dispatch():
+    """Command routing validates parameters while bypassing the permission policy."""
+    permissions = Mock(spec=PermissionManager)
+    registry = ToolRegistry(interaction=Mock(spec=Interaction), permission_manager=permissions)
+
+    @registry.tool
+    def describe(count: int, label: str = "default") -> dict:
+        """Describe parsed values."""
+        return {"count": count, "label": label}
+
+    @registry.tool
+    def has_no_policy(context: ToolContext) -> bool:
+        """Report whether command dispatch omitted the permission policy."""
+        return context.permission_manager is None
+
+    assert json.loads(registry.command("describe", ("3", "label=two words"))) == {
+        "count": 3,
+        "label": "two words",
+    }
+    assert registry.command("has_no_policy", ()) == "true"
+    permissions.authorize.assert_not_called()
+
+
+def test_call_command_reports_unknown_tools_and_invalid_parameters():
+    """Command routing serializes lookup, binding, and model validation failures."""
+    registry = ToolRegistry()
+    register(registry)
+
+    assert "unknown_tool" in registry.command("missing", ())
+    assert "invalid_arguments" in registry.command("calculate", ("unknown=1",))
+    assert "argument_binding" in registry.command("calculate", ("unknown=1",))
+    assert "invalid_arguments" in registry.command("calculate", ("not-an-integer",))
 
 
 def test_call_async_reports_unknown_tools(monkeypatch):

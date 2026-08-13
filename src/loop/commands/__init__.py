@@ -2,6 +2,7 @@
 
 __all__ = [
     "BUILTIN_COMMANDS",
+    "call",
     "Command",
     "CommandArgumentError",
     "CommandManager",
@@ -12,9 +13,10 @@ __all__ = [
     "quit",
     "skills",
     "tools",
+    "use",
 ]
 
-from .builtins import exit, help, permissions, quit, skills, tools
-from .command import Command, CommandArgumentError
+from .builtins import call, exit, help, permissions, quit, skills, tools, use
+from .command import Command
 from .command_manager import BUILTIN_COMMANDS, CommandManager
-from .utils import CommandRegistrationError
+from .models import CommandArgumentError, CommandRegistrationError

@@ -11,6 +11,7 @@ __all__ = [
     "CompletionValue",
     "MarkerCompletionAdapter",
     "ProjectPathCompletionAdapter",
+    "SchemaCompletionProvider",
     "SchemaCompletionState",
 ]
 
@@ -27,5 +28,6 @@ from .models import (
     CompletionMatch,
     CompletionProvider,
     CompletionValue,
+    SchemaCompletionProvider,
     SchemaCompletionState,
 )

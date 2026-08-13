@@ -10,19 +10,22 @@ from pydantic import ValidationError
 
 from ..completion import COMPLETION_ATTRIBUTE, CommandCompletion
 from ..context import CommandContext
+from .builtins import call as call_command
 from .builtins import exit as exit_command
 from .builtins import help as help_command
 from .builtins import permissions as permissions_command
 from .builtins import quit as quit_command
 from .builtins import skills as skills_command
 from .builtins import tools as tools_command
-from .command import Command, CommandArgumentError
-from .utils import CommandRegistrationError, get_command_arguments_model, takes_command_context
+from .builtins import use as use_command
+from .command import Command
+from .models import CommandArgumentError, CommandRegistrationError
+from .utils import get_command_arguments_model, takes_command_context
 
 if TYPE_CHECKING:
     from ..interaction import Interaction
     from ..permissions import PermissionManager
-    from ..skills import SkillManager
+    from ..skills import InstructionsManager, SkillManager
     from ..tooling import ToolRegistry
 
 
@@ -33,6 +36,8 @@ BUILTIN_COMMANDS = (
     quit_command,
     skills_command,
     tools_command,
+    use_command,
+    call_command,
 )
 
 
@@ -46,7 +51,11 @@ class CommandManager:
             when callers will provide one for each invocation.
         permission_manager (PermissionManager | None): Tool policy manager exposed to permission
             management commands.
+        instructions_manager (InstructionsManager | None): Skill lifecycle owner used to load
+            instructions for subsequent model requests.
         skill_manager (SkillManager | None): Skill catalog exposed to skill-discovery commands.
+            It can be omitted if instructions_manager is provided, as it will be used to access
+            the skill manager.
         tool_registry (ToolRegistry | None): Tool catalog exposed to tool-discovery commands.
 
     Raises:
@@ -58,6 +67,7 @@ class CommandManager:
     _exit_requested: bool
     _interaction: Interaction | None
     _permission_manager: PermissionManager | None
+    _instructions_manager: InstructionsManager | None
     _skill_manager: SkillManager | None
     _tool_registry: ToolRegistry | None
 
@@ -66,6 +76,7 @@ class CommandManager:
         commands: Iterable[Command | Callable[..., None]] | None = None,
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
+        instructions_manager: InstructionsManager | None = None,
         skill_manager: SkillManager | None = None,
         tool_registry: ToolRegistry | None = None,
     ) -> None:
@@ -73,7 +84,12 @@ class CommandManager:
         self._exit_requested = False
         self._interaction = interaction
         self._permission_manager = permission_manager
-        self._skill_manager = skill_manager
+        self._instructions_manager = instructions_manager
+        self._skill_manager = (
+            instructions_manager.skill_manager
+            if instructions_manager is not None
+            else skill_manager
+        )
         self._tool_registry = tool_registry
         for command in (*BUILTIN_COMMANDS, *(commands or ())):
             self.register(command)
@@ -113,6 +129,16 @@ class CommandManager:
             SkillManager | None: The configured skill manager, or ``None`` when unavailable.
         """
         return self._skill_manager
+
+    @property
+    def instructions_manager(self) -> InstructionsManager | None:
+        """Return the skill lifecycle owner exposed to commands.
+
+        Returns:
+            InstructionsManager | None: The configured instructions manager, or ``None`` when
+                unavailable.
+        """
+        return self._instructions_manager
 
     @property
     def tool_registry(self) -> ToolRegistry | None:

@@ -117,7 +117,7 @@ class Loop:
         self._command_manager = CommandManager(
             interaction=self._interaction,
             permission_manager=self._permission_manager,
-            skill_manager=self._instructions_manager.skill_manager,
+            instructions_manager=self._instructions_manager,
             tool_registry=self._backend.tool_registry,
         )
         self._mention_manager = mention_manager or MentionManager(
@@ -134,6 +134,20 @@ class Loop:
                         "tools": lambda: (
                             CompletionValue(tool.name, tool.description)
                             for tool in self._backend.tool_registry.tools
+                        ),
+                        "skills": lambda: (
+                            CompletionValue(skill.name, skill.description)
+                            for skill in self._instructions_manager.skill_manager.skills
+                        ),
+                    },
+                    schema_providers={
+                        "tool_arguments": lambda tokens: next(
+                            (
+                                tool.arguments_model
+                                for tool in self._backend.tool_registry.tools
+                                if tokens and tool.name == tokens[0]
+                            ),
+                            None,
                         )
                     },
                 ),

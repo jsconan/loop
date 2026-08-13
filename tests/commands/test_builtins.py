@@ -8,19 +8,23 @@ from loop import (
     CommandArgumentError,
     CommandContext,
     CommandManager,
+    InstructionsManager,
     Interaction,
     PermissionConfiguration,
     PermissionManager,
     PermissionMode,
     Skill,
+    SkillManager,
     Tool,
 )
+from loop.commands import call as call_command
 from loop.commands import exit as exit_command
 from loop.commands import help as help_command
 from loop.commands import permissions as permissions_command
 from loop.commands import quit as quit_command
 from loop.commands import skills as skills_command
 from loop.commands import tools as tools_command
+from loop.commands import use as use_command
 
 
 def test_help_displays_slash_prefixed_command_catalog():
@@ -178,3 +182,85 @@ def test_skills_command_requires_skill_manager():
         skills_command(CommandContext("skills", Mock(spec=Interaction)))
     with pytest.raises(ValueError, match="requires a SkillManager"):
         skills_command(CommandContext("skills", Mock(spec=Interaction), CommandManager()))
+
+
+def test_use_command_loads_skill_instructions_and_reports_repeated_use(tmp_path):
+    """Use activates a skill through the instruction lifecycle and is idempotent."""
+    location = tmp_path / "SKILL.md"
+    location.write_text("---\nname: review\ndescription: Review code.\n---\nCheck carefully.\n")
+    instructions = InstructionsManager(
+        skill_manager=SkillManager([Skill("review", "Review.", location)])
+    )
+    interaction = Mock(spec=Interaction)
+    manager = CommandManager(interaction=interaction, instructions_manager=instructions)
+
+    manager.call("use", "review")
+    manager.call("use", "review")
+
+    assert "Check carefully." in instructions.instructions
+    assert interaction.info.call_args_list[0].args[0] == "Loaded skill 'review'."
+    assert interaction.info.call_args_list[1].args[0] == "Skill 'review' is already loaded."
+
+
+def test_use_command_reports_unknown_skills_and_missing_dependencies():
+    """Use reports unavailable skills and rejects missing lifecycle dependencies."""
+    interaction = Mock(spec=Interaction)
+    manager = CommandManager(interaction=interaction, instructions_manager=InstructionsManager())
+
+    manager.call("use", "missing")
+
+    assert "Skill 'missing' is not available" in interaction.warning.call_args.args[0]
+    with pytest.raises(ValueError, match="requires a CommandManager"):
+        use_command(CommandContext("use", interaction), "missing")
+    with pytest.raises(ValueError, match="requires an InstructionsManager"):
+        use_command(CommandContext("use", interaction, CommandManager()), "missing")
+
+
+def test_use_command_reports_skill_loading_failures():
+    """Use converts skill loading failures into command argument errors."""
+    interaction = Mock(spec=Interaction)
+    instructions = Mock()
+    instructions.skill_manager = Mock()
+    instructions.activate_skill.side_effect = ValueError("malformed instructions")
+    context = CommandContext("use", interaction, CommandManager(instructions_manager=instructions))
+
+    with pytest.raises(CommandArgumentError, match="Could not load skill 'broken'"):
+        use_command(context, "broken")
+
+
+def test_call_command_invokes_tools_with_command_arguments_and_runtime_context():
+    """Call forwards command tokens, interaction, instructions, and permissions."""
+    interaction = Mock(spec=Interaction)
+    registry = Mock()
+    registry.command.return_value = "42"
+    instructions = InstructionsManager()
+    manager = CommandManager(
+        interaction=interaction, instructions_manager=instructions, tool_registry=registry
+    )
+
+    manager.call("call", 'calculate number=21 label="two words"')
+
+    registry.command.assert_called_once_with(
+        "calculate",
+        ("number=21", "label=two words"),
+        interaction=interaction,
+        instructions_manager=instructions,
+    )
+    interaction.info.assert_called_once_with("42")
+
+
+def test_call_command_defaults_to_empty_json_and_requires_dependencies():
+    """Call supports argument-free tools and rejects missing registry dependencies."""
+    interaction = Mock(spec=Interaction)
+    registry = Mock()
+    registry.command.return_value = "done"
+    call_command(
+        CommandContext("call", interaction, CommandManager(tool_registry=registry)), "ping"
+    )
+    registry.command.assert_called_once_with(
+        "ping", (), interaction=interaction, instructions_manager=None
+    )
+    with pytest.raises(ValueError, match="requires a CommandManager"):
+        call_command(CommandContext("call", interaction), "ping")
+    with pytest.raises(ValueError, match="requires a ToolRegistry"):
+        call_command(CommandContext("call", interaction, CommandManager()), "ping")

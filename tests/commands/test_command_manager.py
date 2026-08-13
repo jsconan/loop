@@ -42,10 +42,12 @@ def test_manager_registers_builtins_before_declared_and_discovered_commands():
         "quit",
         "skills",
         "tools",
+        "use",
+        "call",
         "explicit",
         "discovered",
     ]
-    assert manager.commands[6] is explicit
+    assert manager.commands[8] is explicit
     assert manager.exit_requested is False
 
 
@@ -64,10 +66,13 @@ def test_interaction_property_can_be_replaced_and_cleared():
 def test_manager_exposes_command_catalog_dependencies():
     """Catalog dependencies remain available through the manager shared with command contexts."""
     skill_manager = Mock()
+    instructions_manager = Mock()
+    instructions_manager.skill_manager = skill_manager
     tool_registry = Mock()
-    manager = CommandManager(skill_manager=skill_manager, tool_registry=tool_registry)
+    manager = CommandManager(instructions_manager=instructions_manager, tool_registry=tool_registry)
 
     assert manager.skill_manager is skill_manager
+    assert manager.instructions_manager is instructions_manager
     assert manager.tool_registry is tool_registry
 
 

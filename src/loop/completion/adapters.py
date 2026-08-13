@@ -19,6 +19,7 @@ from .models import (
     CompletionMatch,
     CompletionProvider,
     CompletionValue,
+    SchemaCompletionProvider,
     SchemaCompletionState,
 )
 
@@ -206,6 +207,8 @@ class CommandCompletionAdapter(CompletionAdapter):
         marker (str): Symbol introducing command names. Defaults to ``/``.
         providers (Mapping[str, CompletionProvider] | None): Dynamic providers referenced by name
             from command completion grammars.
+        schema_providers (Mapping[str, SchemaCompletionProvider] | None): Dynamic model providers
+            referenced by name from command completion grammars.
 
     Raises:
         ValueError: If ``marker`` is not one non-alphanumeric, non-whitespace character.
@@ -214,18 +217,21 @@ class CommandCompletionAdapter(CompletionAdapter):
     _commands: Callable[[], Iterable[Command]]
     _marker: str
     _providers: Mapping[str, CompletionProvider]
+    _schema_providers: Mapping[str, SchemaCompletionProvider]
 
     def __init__(
         self,
         commands: Callable[[], Iterable[Command]],
         marker: str = "/",
         providers: Mapping[str, CompletionProvider] | None = None,
+        schema_providers: Mapping[str, SchemaCompletionProvider] | None = None,
     ) -> None:
         if len(marker) != 1 or marker.isalnum() or marker.isspace():
             raise ValueError("A completion marker must be one non-alphanumeric character.")
         self._commands = commands
         self._marker = marker
         self._providers = providers or {}
+        self._schema_providers = schema_providers or {}
 
     @property
     def front_markers(self) -> tuple[str, ...]:
@@ -271,7 +277,7 @@ class CommandCompletionAdapter(CompletionAdapter):
             return None
         arguments = parts[1] if len(parts) == 2 else ""
         if command.completion is None:
-            return self._match_schema_arguments(command, arguments, before)
+            return self._match_model_arguments(command.arguments_model, arguments, before)
         grammar = command.completion
         try:
             tokens = shlex.split(arguments)
@@ -279,10 +285,22 @@ class CommandCompletionAdapter(CompletionAdapter):
             return None
         fragment = "" if before[-1].isspace() else (tokens.pop() if tokens else "")
         node = grammar
+        consumed = []
         for token in tokens:
+            consumed.append(token)
             node = node.children.get(token) or node.next
             if node is None:
                 return None
+            if node.schema_provider is not None:
+                provider = node.schema_provider
+                if isinstance(provider, str):
+                    provider = self._schema_providers[provider]
+                model = provider(tuple(consumed))
+                if model is None:
+                    return None
+                parts = arguments.split(maxsplit=1)
+                remaining = parts[1] if len(consumed) == 1 and len(parts) == 2 else ""
+                return self._match_model_arguments(model, remaining, before)
         return CompletionMatch(fragment, fragment, state=node)
 
     def complete(self, match: CompletionMatch) -> Iterable[CompletionValue]:
@@ -318,19 +336,19 @@ class CommandCompletionAdapter(CompletionAdapter):
             values.extend(provider())
         return tuple(values)
 
-    def _match_schema_arguments(
+    def _match_model_arguments(
         self,
-        command: Command,
+        model,
         arguments: str,
         before: str,
     ) -> CompletionMatch | None:
-        """Match positional or named input against a command argument schema."""
+        """Match positional or named input against a Pydantic model schema."""
         try:
             tokens = shlex.split(arguments)
         except ValueError:
             return None
         fragment = "" if before[-1].isspace() else (tokens.pop() if tokens else "")
-        fields = command.arguments_model.model_fields
+        fields = model.model_fields
         assigned = set()
         for token in tokens:
             name, separator, _ = token.partition("=")

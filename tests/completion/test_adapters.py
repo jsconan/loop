@@ -39,9 +39,19 @@ def command_for(function, *, completion=None) -> Command:
     )
 
 
-def command_completer(*commands: Command, providers=None) -> CompletionManager:
+def command_completer(
+    *commands: Command, providers=None, schema_providers=None
+) -> CompletionManager:
     """Build a manager containing one command completion adapter."""
-    return CompletionManager((CommandCompletionAdapter(lambda: commands, providers=providers),))
+    return CompletionManager(
+        (
+            CommandCompletionAdapter(
+                lambda: commands,
+                providers=providers,
+                schema_providers=schema_providers,
+            ),
+        )
+    )
 
 
 def test_command_names_match_fragments_and_replace_the_complete_slash_token():
@@ -147,6 +157,58 @@ def test_nested_command_completion_uses_dynamic_values_and_continuations():
     results = complete(completer, "/configure add read_file l")
     assert [item.text for item in results] == ["last"]
     assert results[0].display_meta_text == "final value"
+
+
+def test_nested_command_completion_switches_to_a_selected_dynamic_schema():
+    """A grammar can complete fields from the model selected by its leading token."""
+
+    def invoke(tool: str) -> None:
+        """Invoke a tool."""
+
+    def selected(count: int, mode: Literal["fast", "safe"] = "safe") -> None:
+        """Define selected tool arguments."""
+
+    grammar = CommandCompletion(
+        provider="tools",
+        next=CommandCompletion(schema_provider="tool_arguments"),
+    )
+    completer = command_completer(
+        command_for(invoke, completion=grammar),
+        providers={"tools": lambda: (CompletionValue("selected"),)},
+        schema_providers={
+            "tool_arguments": lambda tokens: (
+                get_command_arguments_model(selected, "selected")
+                if tokens == ("selected",)
+                else None
+            )
+        },
+    )
+
+    assert [item.text for item in complete(completer, "/invoke selected ")] == [
+        "mode=",
+        "count=",
+    ]
+    assert [item.text for item in complete(completer, "/invoke selected 2 mode=f")] == [
+        "mode=fast",
+        "mode=safe",
+    ]
+    assert complete(completer, "/invoke missing ") == []
+
+    direct = command_completer(
+        command_for(
+            invoke,
+            completion=CommandCompletion(
+                provider="tools",
+                next=CommandCompletion(
+                    schema_provider=lambda _tokens: get_command_arguments_model(
+                        selected, "selected"
+                    )
+                ),
+            ),
+        ),
+        providers={"tools": lambda: (CompletionValue("selected"),)},
+    )
+    assert complete(direct, "/invoke selected ")
 
 
 def test_invalid_command_paths_quotes_and_provider_failures_return_no_values():

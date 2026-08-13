@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 COMPLETION_ATTRIBUTE = "__completion__"
 
@@ -22,6 +26,7 @@ class CompletionValue:
 
 
 type CompletionProvider = Callable[[], Iterable[CompletionValue]]
+type SchemaCompletionProvider = Callable[[tuple[str, ...]], type[BaseModel] | None]
 
 
 @dataclass(frozen=True)
@@ -51,12 +56,15 @@ class CommandCompletion:
             provider name for this level.
         children (Mapping[str, CommandCompletion]): Next completion level selected by a value.
         next (CommandCompletion | None): Unconditional next completion level.
+        schema_provider (SchemaCompletionProvider | str | None): Runtime model provider selected
+            from tokens consumed before this level.
     """
 
     values: tuple[CompletionValue, ...] = ()
     provider: CompletionProvider | str | None = None
     children: Mapping[str, CommandCompletion] = field(default_factory=dict)
     next: CommandCompletion | None = None
+    schema_provider: SchemaCompletionProvider | str | None = None
 
 
 @dataclass(frozen=True)

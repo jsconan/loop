@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-import json
-import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel
 
 from ..completion import CommandCompletion
 from ..context import CommandContext
-from .utils import takes_command_context
-
-
-class CommandArgumentError(ValueError):
-    """Indicate invalid slash-command argument syntax or binding."""
+from .utils import parse_model_arguments, takes_command_context
 
 
 @dataclass(frozen=True)
@@ -48,56 +42,10 @@ class Command:
             CommandArgumentError: If the argument syntax or parameter binding is invalid.
             ValueError: If the command declares a context but none is provided.
         """
-        values = self._validate_arguments(arguments).model_dump()
+        values = parse_model_arguments(self.arguments_model, arguments).model_dump()
         if takes_command_context(self.function):
             if context is None:
                 raise ValueError(f"Command '{self.name}' requires a CommandContext.")
             self.function(context, **values)
         else:
             self.function(**values)
-
-    def _validate_arguments(self, arguments: str) -> BaseModel:
-        """Bind shell-like tokens and validate their independently decoded values."""
-        try:
-            tokens = shlex.split(arguments)
-        except ValueError as exc:
-            raise CommandArgumentError(f"Could not parse arguments: {exc}") from exc
-
-        fields = self.arguments_model.model_fields
-        values = {}
-        for token in tokens:
-            name, separator, raw_value = token.partition("=")
-            if separator and name.isidentifier():
-                if name not in fields:
-                    raise CommandArgumentError(f"Unknown parameter '{name}'.")
-                if name in values:
-                    raise CommandArgumentError(f"Parameter '{name}' was supplied more than once.")
-            else:
-                unbound = next(
-                    (field_name for field_name in fields if field_name not in values),
-                    None,
-                )
-                if unbound is None:
-                    raise CommandArgumentError("Too many positional arguments.")
-                name = unbound
-                raw_value = token
-            values[name] = self._decode_argument(name, raw_value)
-        return self.arguments_model.model_validate(values)
-
-    def _decode_argument(self, name: str, raw_value: str) -> object:
-        """Decode one JSON-shaped value while preserving valid string input."""
-        try:
-            decoded = json.loads(raw_value)
-        except json.JSONDecodeError:
-            return raw_value
-
-        adapter = TypeAdapter(self.arguments_model.model_fields[name].rebuild_annotation())
-        try:
-            adapter.validate_python(decoded)
-        except ValidationError:
-            try:
-                adapter.validate_python(raw_value)
-            except ValidationError:
-                return decoded
-            return raw_value
-        return decoded
