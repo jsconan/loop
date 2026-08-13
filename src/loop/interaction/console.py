@@ -1,5 +1,6 @@
 """Define user interaction abstractions and tool invocation context."""
 
+import json
 from collections.abc import Generator
 from contextlib import contextmanager
 from pprint import pformat
@@ -8,7 +9,11 @@ from typing import Any
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer
 from rich.console import Console
+from rich.json import JSON
 from rich.prompt import Confirm
+from rich.syntax import Syntax
+from rich.text import Text
+from rich.tree import Tree
 
 from ..utils import format_tool_call_arguments
 from .interaction import Interaction
@@ -178,6 +183,97 @@ class ConsoleInteraction(Interaction):
             f"\n[TOOL CALL]: {name}({format_tool_call_arguments(arguments)})",
             style="dim magenta",
             markup=False,
+        )
+
+    def tool_result(self, name: str, result: str) -> None:
+        """Write a serialized tool result in a user-readable form.
+
+        Args:
+            name (str): Name of the tool that produced the result.
+            result (str): Serialized result returned by the tool.
+        """
+        try:
+            value = json.loads(result)
+        except json.JSONDecodeError:
+            self.info(result)
+            return
+
+        if isinstance(value, str):
+            self.info(value)
+            return
+        if isinstance(value, dict) and "error" in value and "message" in value:
+            self.error(str(value["message"]))
+            details = {key: item for key, item in value.items() if key not in {"error", "message"}}
+            if details:
+                self._console.print(JSON.from_data(details))
+            return
+        if name == "list_folder" and self._is_folder_result(value):
+            self._display_folder_result(value)
+            return
+        if name == "read_text_file" and self._is_content_result(value, cached=False):
+            self._display_content_result(value, identifier=value["path"])
+            return
+        if name in {"fetch_content", "read_cached_content"} and self._is_content_result(
+            value, cached=True
+        ):
+            self._display_content_result(value, identifier=value["source"])
+            return
+        self._console.print(JSON.from_data(value))
+
+    @staticmethod
+    def _is_folder_result(value: Any) -> bool:
+        """Return whether a value is a typed folder-entry list."""
+        return isinstance(value, list) and all(
+            isinstance(entry, dict)
+            and isinstance(entry.get("path"), str)
+            and entry.get("type") in {"file", "folder"}
+            for entry in value
+        )
+
+    @staticmethod
+    def _is_content_result(value: Any, *, cached: bool) -> bool:
+        """Return whether a value is a local or cached bounded-content envelope."""
+        if not isinstance(value, dict):
+            return False
+        required = {"content", "size_bytes", "start_byte", "end_byte", "truncated"}
+        identity = {"handle", "source"} if cached else {"path"}
+        return required | identity <= value.keys() and isinstance(value["content"], str)
+
+    def _display_folder_result(self, entries: list[dict[str, Any]]) -> None:
+        """Write typed folder entries as a hierarchical tree."""
+        root = Tree(Text("."), guide_style="dim")
+        folders = {(): root}
+        entry_types = {tuple(entry["path"].split("/")): entry["type"] for entry in entries}
+        paths = set(entry_types)
+        paths.update(path[:index] for path in entry_types for index in range(1, len(path)))
+
+        for path in sorted(paths, key=lambda item: (len(item), item)):
+            parent = folders[path[:-1]]
+            is_folder = entry_types.get(path, "folder") == "folder"
+            node = parent.add(Text(path[-1], style="bold blue" if is_folder else None))
+            if is_folder:
+                folders[path] = node
+        self._console.print(root)
+
+    def _display_content_result(self, value: dict[str, Any], *, identifier: str) -> None:
+        """Write bounded textual content with its source and range metadata."""
+        range_text = f"bytes {value['start_byte']}–{value['end_byte']} of {value['size_bytes']}"
+        metadata = Text(identifier, style="bold cyan")
+        metadata.append(f" · {range_text}", style="dim")
+        if value["truncated"]:
+            reason = value.get("truncation_reason", "limit")
+            metadata.append(f" · truncated ({reason})", style="yellow")
+        if "handle" in value:
+            metadata.append(f" · handle {value['handle']}", style="dim")
+        self._console.print(metadata)
+        self._console.print(
+            Syntax(
+                value["content"],
+                Syntax.guess_lexer(identifier, value["content"]),
+                line_numbers="start_line" in value,
+                start_line=value.get("start_line", 1),
+                word_wrap=True,
+            )
         )
 
     def token_usage(

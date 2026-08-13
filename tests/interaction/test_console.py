@@ -1,5 +1,6 @@
 """Tests for terminal-backed user interaction."""
 
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -129,6 +130,160 @@ def test_tool_call_truncates_each_long_argument_value_in_the_middle(capsys):
     ConsoleInteraction().tool_call("write", '{"content":"0123456789abcdefghijklmnop"}')
 
     assert capsys.readouterr().out == '\n[TOOL CALL]: write(content="0123456789…hijklmnop")\n'
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ("plain text", "plain text\n"),
+        ('"Unicode: \\u2603"', "Unicode: ☃\n"),
+    ],
+)
+def test_tool_result_displays_text_without_transport_quoting(capsys, result, expected):
+    """Tool results preserve plain text and unwrap JSON-encoded strings."""
+    ConsoleInteraction().tool_result("example", result)
+
+    assert capsys.readouterr().out == expected
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_parts"),
+    [
+        ('{"name":"loop","items":[1,true,null]}', ('"name": "loop"', '"items": [', "true")),
+        ('[{"id":1},{"id":2}]', ('[', '"id": 1', '"id": 2')),
+        ("42", ("42",)),
+        ("null", ("null",)),
+    ],
+)
+def test_tool_result_pretty_prints_structured_json(capsys, result, expected_parts):
+    """Structured and primitive JSON results receive readable JSON presentation."""
+    ConsoleInteraction().tool_result("example", result)
+
+    output = capsys.readouterr().out
+    assert all(part in output for part in expected_parts)
+
+
+def test_tool_result_classifies_error_envelopes_and_displays_details(capsys):
+    """Serialized tool errors emphasize their message and retain diagnostic details."""
+    result = '{"error":"invalid_arguments","message":"Invalid input.","details":[{"field":"x"}]}'
+
+    ConsoleInteraction().tool_result("example", result)
+
+    output = capsys.readouterr().out
+    assert output.startswith("Error: Invalid input.\n")
+    assert '"details": [' in output
+    assert '"field": "x"' in output
+    assert "invalid_arguments" not in output
+
+
+def test_tool_result_classifies_error_envelopes_without_details(capsys):
+    """Minimal serialized tool errors display only their human-readable message."""
+    ConsoleInteraction().tool_result(
+        "example", '{"error":"unknown_tool","message":"Unavailable."}'
+    )
+
+    assert capsys.readouterr().out == "Error: Unavailable.\n"
+
+
+def test_tool_result_displays_local_file_content_with_source_and_line_numbers(capsys):
+    """Local bounded content shows its path, byte range, and source line numbers."""
+    result = json.dumps(
+        {
+            "path": "src/example.py",
+            "content": "first\nsecond\n",
+            "size_bytes": 40,
+            "start_byte": 10,
+            "end_byte": 23,
+            "included_bytes": 13,
+            "truncated": True,
+            "truncation_reason": "lines",
+            "start_line": 3,
+            "end_line": 4,
+            "next_start_line": 5,
+        }
+    )
+
+    ConsoleInteraction().tool_result("read_text_file", result)
+
+    output = capsys.readouterr().out
+    assert "src/example.py · bytes 10–23 of 40 · truncated (lines)" in output
+    assert "3 first" in output
+    assert "4 second" in output
+
+
+@pytest.mark.parametrize("name", ["fetch_content", "read_cached_content"])
+def test_tool_result_displays_cached_content_with_source_and_handle(capsys, name):
+    """Fetched and cached bounded content show their origin, handle, and body."""
+    result = json.dumps(
+        {
+            "handle": "content-123",
+            "source": "https://example.com/article.txt",
+            "content": "article body",
+            "size_bytes": 12,
+            "start_byte": 0,
+            "end_byte": 12,
+            "included_bytes": 12,
+            "truncated": False,
+        }
+    )
+
+    ConsoleInteraction().tool_result(name, result)
+
+    output = capsys.readouterr().out
+    assert "https://example.com/article.txt · bytes 0–12 of 12 · handle content-123" in output
+    assert "article body" in output
+
+
+def test_tool_result_displays_folder_entries_as_a_hierarchical_tree(capsys):
+    """Folder listings group recursive paths beneath inferred parent folders."""
+    result = json.dumps(
+        [
+            {"path": "README.md", "type": "file"},
+            {"path": "src/loop/main.py", "type": "file"},
+            {"path": "src/loop/tools", "type": "folder"},
+        ]
+    )
+
+    ConsoleInteraction().tool_result("list_folder", result)
+
+    output = capsys.readouterr().out
+    assert output == (
+        ".\n"
+        "├── README.md\n"
+        "└── src\n"
+        "    └── loop\n"
+        "        ├── main.py\n"
+        "        └── tools\n"
+    )
+
+
+def test_tool_result_displays_an_empty_folder_as_a_tree(capsys):
+    """An empty list from list_folder remains identifiable as an empty folder tree."""
+    ConsoleInteraction().tool_result("list_folder", "[]")
+
+    assert capsys.readouterr().out == ".\n"
+
+
+@pytest.mark.parametrize(
+    ("name", "result"),
+    [
+        ("list_folder", '[{"path":"missing-type"}]'),
+        ("read_text_file", "[]"),
+        (
+            "read_text_file",
+            '{"path":"file.txt","content":"incomplete"}',
+        ),
+        (
+            "fetch_content",
+            '{"source":"https://example.com","content":"incomplete"}',
+        ),
+    ],
+)
+def test_tool_result_falls_back_for_malformed_well_known_formats(capsys, name, result):
+    """Malformed recognized-tool results retain the generic JSON presentation."""
+    ConsoleInteraction().tool_result(name, result)
+
+    assert capsys.readouterr().out.strip()
 
 
 @pytest.mark.parametrize(

@@ -146,7 +146,7 @@ def call(
         interaction=context.interaction,
         instructions_manager=command_manager.instructions_manager,
     )
-    context.interaction.info(result)
+    context.interaction.tool_result(name, result)
 
 
 def skills(context: CommandContext) -> None:

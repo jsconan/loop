@@ -246,7 +246,7 @@ def test_call_command_invokes_tools_with_command_arguments_and_runtime_context()
         interaction=interaction,
         instructions_manager=instructions,
     )
-    interaction.info.assert_called_once_with("42")
+    interaction.tool_result.assert_called_once_with("calculate", "42")
 
 
 def test_call_command_defaults_to_empty_json_and_requires_dependencies():

@@ -125,6 +125,15 @@ class Interaction(ABC):
         """
 
     @abstractmethod
+    def tool_result(self, name: str, result: str) -> None:
+        """Display a serialized tool result for a user.
+
+        Args:
+            name (str): Name of the tool that produced the result.
+            result (str): Serialized result returned by the tool.
+        """
+
+    @abstractmethod
     def token_usage(
         self,
         model: str | None,
