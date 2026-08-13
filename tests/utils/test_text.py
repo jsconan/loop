@@ -5,6 +5,7 @@ import pytest
 from loop.constants import (
     CONTENT_PREVIEW_MAX_CHARS,
     CONTENT_PREVIEW_MAX_LINES,
+    TABULAR_MAX_WIDTH,
 )
 from loop.utils.text import (
     format_content_diff,
@@ -238,6 +239,11 @@ def test_format_tabular_lines_uses_custom_columns() -> None:
     assert "d" not in result
 
 
+def test_format_tabular_lines_accepts_no_columns() -> None:
+    """An empty column iterable produces no table content."""
+    assert format_tabular_lines([_Item("name", "description")], columns=()) == ""
+
+
 def test_format_tabular_lines_handles_empty_items_list() -> None:
     """An empty list produces just the title (if present) or an empty string."""
     assert format_tabular_lines([]) == ""
@@ -289,3 +295,56 @@ def test_format_tabular_lines_handles_longest_column_first() -> None:
         name_part = rest[desc_width + len(sep) :]
         assert desc_part == getattr(items[i], "description").ljust(desc_width)
         assert name_part == getattr(items[i], "name").ljust(name_width)
+
+
+def test_format_tabular_lines_constrains_width() -> None:
+    """A maximum width wraps long values without producing wider lines."""
+    items = [_Item("long item name", "a long description that must wrap")]
+
+    result = format_tabular_lines(items, max_width=20)
+
+    assert len(result.splitlines()) > 1
+    assert all(len(line) <= 20 for line in result.splitlines())
+
+
+def test_format_tabular_lines_uses_reasonable_default_width() -> None:
+    """Tables default to the shared, terminal-friendly width limit."""
+    items = [_Item("item", "x" * (TABULAR_MAX_WIDTH * 2))]
+
+    result = format_tabular_lines(items)
+
+    assert TABULAR_MAX_WIDTH == 120
+    assert all(len(line) <= TABULAR_MAX_WIDTH for line in result.splitlines())
+
+
+def test_format_tabular_lines_allows_unbounded_width() -> None:
+    """An explicit null width disables the default table constraint."""
+    description = "x" * (TABULAR_MAX_WIDTH * 2)
+
+    result = format_tabular_lines([_Item("item", description)], max_width=None)
+
+    assert len(result.splitlines()) == 1
+    assert description in result
+
+
+def test_format_tabular_lines_constrains_rows() -> None:
+    """A maximum row count excludes objects beyond the requested limit."""
+    items = [_Item("first", "one"), _Item("second", "two")]
+
+    result = format_tabular_lines(items, max_rows=1)
+
+    assert "first" in result
+    assert "second" not in result
+
+
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        ({"max_width": 0}, "max_width must be positive."),
+        ({"max_rows": -1}, "max_rows cannot be negative."),
+    ],
+)
+def test_format_tabular_lines_rejects_invalid_limits(limits, message) -> None:
+    """Invalid width and row limits raise clear errors."""
+    with pytest.raises(ValueError, match=message):
+        format_tabular_lines([], **limits)
