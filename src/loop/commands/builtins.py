@@ -7,6 +7,7 @@ from pydantic import Field
 from ..completion import COMPLETION_ATTRIBUTE, CommandCompletion, CompletionValue
 from ..context import CommandContext
 from ..permissions import Capability, Decision, PermissionMode, PermissionRule
+from ..utils import format_tabular_lines
 from .models import CommandArgumentError, CommandRemainder
 
 
@@ -45,12 +46,8 @@ def help(context: CommandContext) -> None:  # pylint: disable=redefined-builtin
     manager = context.manager
     if manager is None:
         raise ValueError("The help command requires a CommandManager.")
-    command_width = max(len(command.name) for command in manager.commands) + 1
-    lines = ["Available commands:", ""]
-    lines.extend(
-        f"  /{command.name:<{command_width}} {command.description}" for command in manager.commands
-    )
-    context.interaction.info("\n".join(lines))
+    lines = format_tabular_lines(manager.commands, title="Available commands:", prefix="  /")
+    context.interaction.info(lines)
 
 
 def permissions(
@@ -123,10 +120,8 @@ def tools(context: CommandContext) -> None:
     if not tool_list:
         context.interaction.info("No tools registered.")
         return
-    name_width = max(len(tool.name) for tool in tool_list) + 1
-    lines = ["Registered tools:", ""]
-    lines.extend(f"  {tool.name:<{name_width}} {tool.description}" for tool in tool_list)
-    context.interaction.info("\n".join(lines))
+    lines = format_tabular_lines(tool_list, title="Registered tools:")
+    context.interaction.info(lines)
 
 
 def call(
@@ -166,10 +161,8 @@ def skills(context: CommandContext) -> None:
     if not skill_list:
         context.interaction.info("No skills discovered.")
         return
-    name_width = max(len(skill.name) for skill in skill_list) + 1
-    lines = ["Discovered skills:", ""]
-    lines.extend(f"  {skill.name:<{name_width}} {skill.description}" for skill in skill_list)
-    context.interaction.info("\n".join(lines))
+    lines = format_tabular_lines(skill_list, title="Discovered skills:")
+    context.interaction.info(lines)
 
 
 def use(

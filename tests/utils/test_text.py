@@ -9,6 +9,7 @@ from loop.constants import (
 from loop.utils.text import (
     format_content_diff,
     format_content_preview,
+    format_tabular_lines,
     format_tool_call_arguments,
 )
 
@@ -164,3 +165,127 @@ def test_format_content_diff_omits_later_hunks_after_a_complete_hunk():
 def test_format_content_diff_reports_unchanged_content():
     """Identical before and after content produces a clear no-change summary."""
     assert format_content_diff("same", "same", "notes.txt") == "No content changes."
+
+
+class _Item:
+    """Minimal fixture object with ``name`` and ``description`` attributes."""
+
+    def __init__(self, name: str, description: str) -> None:
+        self.name = name
+        self.description = description
+
+
+def test_format_tabular_lines_returns_title_and_blank_line_when_title_provided() -> None:
+    """When a title is set, the output starts with the title followed by a blank line."""
+    result = format_tabular_lines([], title="List")
+    assert result == "List\n"
+
+
+def test_format_tabular_lines_returns_single_line_without_title() -> None:
+    """Without a title, the output starts directly with the prefixed row."""
+    items = [_Item("a", "desc")]
+    result = format_tabular_lines(items)
+    lines = result.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("  ")
+    assert "a" in lines[0]
+
+
+def test_format_tabular_lines_left_aligns_columns_to_max_width() -> None:
+    """Columns are padded on the right to the longest value in each column."""
+    items = [
+        _Item("short", "long description value"),
+        _Item("a_very_long_name", "short"),
+    ]
+    result = format_tabular_lines(items)
+    lines = result.splitlines()
+    assert len(lines) == 2
+    prefix = "  "
+    sep = "  "
+    # width of name column is 16 ("a_very_long_name")
+    name_width = 16
+    # width of description column is 22 ("long description value")
+    desc_width = 22
+
+    for i, line in enumerate(lines):
+        rest = line[len(prefix) :]
+        name_part = rest[:name_width]
+        desc_part = rest[name_width + len(sep) :]
+        assert name_part == getattr(items[i], "name").ljust(name_width)
+        assert desc_part == getattr(items[i], "description").ljust(desc_width)
+
+
+def test_format_tabular_lines_respects_custom_prefix() -> None:
+    """A custom prefix is prepended to every output line."""
+    items = [_Item("item", "desc")]
+    result = format_tabular_lines(items, prefix="-> ")
+    assert result.startswith("-> ")
+
+
+def test_format_tabular_lines_uses_custom_columns() -> None:
+    """Custom columns are read from the specified attributes."""
+
+    class _WithExtra:
+        def __init__(self, name: str, description: str, extra: str) -> None:
+            self.name = name
+            self.description = description
+            self.extra = extra
+
+    items = [_WithExtra("n", "d", "e")]
+    result = format_tabular_lines(items, columns=("name", "extra"))
+    assert "n" in result
+    assert "e" in result
+    assert "d" not in result
+
+
+def test_format_tabular_lines_handles_empty_items_list() -> None:
+    """An empty list produces just the title (if present) or an empty string."""
+    assert format_tabular_lines([]) == ""
+    assert format_tabular_lines([], title="Empty list") == "Empty list\n"
+
+
+def test_format_tabular_lines_handles_missing_attributes_gracefully() -> None:
+    """Items missing an attribute fall back to an empty string."""
+
+    class _Partial:
+        name = "ok"
+
+    result = format_tabular_lines([_Partial()])
+    # Should not raise; missing "description" renders as empty
+    assert "ok" in result
+
+
+def test_format_tabular_lines_handles_non_string_attributes() -> None:
+    """Attribute values that are not strings are converted via str()."""
+
+    class _Mixed:
+        def __init__(self, val: object) -> None:
+            self.value = val
+
+    items = [_Mixed(42), _Mixed("hello")]
+    result = format_tabular_lines(items, columns=("value",))
+    assert "42" in result
+    assert "hello" in result
+
+
+def test_format_tabular_lines_handles_longest_column_first() -> None:
+    """Column order follows the ``columns`` iterable, not column width."""
+    items = [
+        _Item("ab", "a very long description"),
+        _Item("c", "short"),
+    ]
+    result = format_tabular_lines(items, columns=("description", "name"))
+    lines = result.splitlines()
+    assert len(lines) == 2
+    prefix = "  "
+    sep = "  "
+    # First column is description (max width 23), second is name (max width 2)
+    desc_width = 23  # "a very long description"
+    name_width = 2  # "ab"
+
+    for i, line in enumerate(lines):
+        rest = line[len(prefix) :]
+        desc_part = rest[:desc_width]
+        name_part = rest[desc_width + len(sep) :]
+        assert desc_part == getattr(items[i], "description").ljust(desc_width)
+        assert name_part == getattr(items[i], "name").ljust(name_width)

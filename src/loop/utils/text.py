@@ -2,7 +2,7 @@
 
 import json
 from difflib import unified_diff
-from typing import Any
+from typing import Any, Iterable
 
 from .. import constants
 
@@ -178,3 +178,38 @@ def format_content_diff(
     if omitted_hunks:
         preview += f"\n... ({omitted_hunks} changed hunk(s) omitted; preview limit reached)"
     return preview
+
+
+def format_tabular_lines(
+    items: list[object],
+    *,
+    title: str | None = None,
+    prefix: str = "  ",
+    columns: Iterable[str] = ("name", "description"),
+) -> str:
+    """Format a list of objects into aligned tabular lines.
+
+    Args:
+        items (list[object]): List of objects to format.
+        title (str | None): Optional title to display above the table.
+        prefix (str): Optional prefix to prepend to each line.
+        columns (Iterable[str]): Iterable of attribute names to display as columns.
+
+    Returns:
+        str: Formatted string, including the title and table rows.
+    """
+    lines = [title, ""] if title else []
+
+    widths = {
+        column: max(
+            (len(str(getattr(item, column, ""))) for item in items), default=0
+        )
+        for column in columns
+    }
+
+    lines.extend(
+        f"{prefix}"
+        f"{'  '.join(str(getattr(item, column, '')).ljust(widths[column]) for column in columns)}"
+        for item in items
+    )
+    return "\n".join(lines)
