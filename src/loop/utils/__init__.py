@@ -9,7 +9,6 @@ __all__ = [
     "find_project_root",
     "format_content_diff",
     "format_content_preview",
-    "format_tabular_lines",
     "format_tool_call_arguments",
     "IgnoreRule",
     "IgnoreRules",
@@ -41,6 +40,5 @@ from .signals import ShutdownRequested, register_shutdown_signals
 from .text import (
     format_content_diff,
     format_content_preview,
-    format_tabular_lines,
     format_tool_call_arguments,
 )

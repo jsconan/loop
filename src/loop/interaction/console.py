@@ -1,7 +1,7 @@
 """Define user interaction abstractions and tool invocation context."""
 
 import json
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from pprint import pformat
 from typing import Any
@@ -9,12 +9,15 @@ from typing import Any
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer
 from rich.console import Console
+from rich.constrain import Constrain
 from rich.json import JSON
 from rich.prompt import Confirm
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
+from .. import constants
 from ..utils import format_tool_call_arguments
 from .interaction import Interaction
 
@@ -171,6 +174,50 @@ class ConsoleInteraction(Interaction):
             message (str): Status text to write, or an empty string for a blank line.
         """
         self._console.print(message, markup=False, highlight=False)
+
+    def table(
+        self,
+        items: list[object],
+        *,
+        title: str | None = None,
+        prefix: str = "  ",
+        columns: Iterable[str] = ("name", "description"),
+        max_width: int | None = constants.TABULAR_MAX_WIDTH,
+        max_rows: int | None = None,
+    ) -> None:
+        """Write object attributes as a table.
+
+        Args:
+            items (list[object]): Objects whose attributes provide the row values.
+            title (str | None): Optional title to write above the table.
+            prefix (str): Text to prepend to the first value in each row.
+            columns (Iterable[str]): Attribute names to display as columns.
+            max_width (int | None): Maximum table width in characters. Defaults to
+                ``TABULAR_MAX_WIDTH``. Pass ``None`` to use the console's available width.
+            max_rows (int | None): Maximum number of objects to display. Displays every object
+                when unset.
+
+        Raises:
+            ValueError: If ``max_width`` is not positive or ``max_rows`` is negative.
+        """
+        if max_width is not None and max_width < 1:
+            raise ValueError("max_width must be positive.")
+        if max_rows is not None and max_rows < 0:
+            raise ValueError("max_rows cannot be negative.")
+
+        if title:
+            self.info(title)
+        column_names = tuple(columns)
+        table = Table.grid(padding=(0, 2))
+        for _ in column_names:
+            table.add_column(overflow="ellipsis")
+        visible_items = items if max_rows is None else items[:max_rows]
+        for item in visible_items:
+            values = [Text(str(getattr(item, column, ""))) for column in column_names]
+            if values:
+                values[0].plain = f"{prefix}{values[0].plain}"
+            table.add_row(*values)
+        self._console.print(Constrain(table, max_width))
 
     def tool_call(self, name: str, arguments: str) -> None:
         """Write a model-requested tool call to the terminal.

@@ -1,10 +1,12 @@
 """Tests for terminal-backed user interaction."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from prompt_toolkit.completion import DummyCompleter
+from rich.console import Console
 from rich.prompt import Confirm
 
 from loop.interaction import ConsoleInteraction
@@ -116,6 +118,72 @@ def test_info_supports_a_blank_separator(capsys):
     ConsoleInteraction().info()
 
     assert capsys.readouterr().out == "\n"
+
+
+def test_table_displays_a_titled_object_catalog(capsys):
+    """Tables render their title, prefix, ordered attributes, and converted values."""
+    items = [
+        SimpleNamespace(name="alpha", description="first", count=1),
+        SimpleNamespace(name="beta", description="second", count=2),
+    ]
+
+    ConsoleInteraction(console=Console(width=200)).table(
+        items,
+        title="Items:",
+        prefix="/",
+        columns=("name", "count"),
+    )
+
+    output = capsys.readouterr().out
+    assert output.startswith("Items:\n")
+    assert "/alpha" in output
+    assert "1" in output
+    assert "/beta" in output
+    assert "2" in output
+    assert "first" not in output
+
+
+def test_table_handles_missing_attributes_empty_columns_and_row_limits(capsys):
+    """Tables tolerate absent values and columns while honoring a row limit."""
+    interaction = ConsoleInteraction(console=Console(width=200))
+
+    interaction.table(
+        [SimpleNamespace(name="first"), SimpleNamespace(name="second")],
+        max_rows=1,
+    )
+    interaction.table([SimpleNamespace(name="hidden")], columns=())
+
+    output = capsys.readouterr().out
+    assert "first" in output
+    assert "second" not in output
+    assert "hidden" not in output
+
+
+def test_table_constrains_output_width_and_can_use_the_console_width(capsys):
+    """Tables cap rows at an explicit width and accept the console width when unbounded."""
+    item = SimpleNamespace(name="item", description="x" * 100)
+    interaction = ConsoleInteraction(console=Console(width=200))
+
+    interaction.table([item], max_width=20)
+    constrained = capsys.readouterr().out
+    interaction.table([item], max_width=None)
+    unconstrained = capsys.readouterr().out
+
+    assert all(len(line) <= 20 for line in constrained.splitlines())
+    assert "x" * 100 in unconstrained
+
+
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        ({"max_width": 0}, "max_width must be positive."),
+        ({"max_rows": -1}, "max_rows cannot be negative."),
+    ],
+)
+def test_table_rejects_invalid_limits(limits, message):
+    """Tables reject invalid width and row constraints."""
+    with pytest.raises(ValueError, match=message):
+        ConsoleInteraction().table([], **limits)
 
 
 def test_tool_call_displays_its_name_and_arguments(capsys):

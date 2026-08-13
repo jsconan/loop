@@ -2,12 +2,7 @@
 
 import json
 from difflib import unified_diff
-from io import StringIO
-from typing import Any, Iterable
-
-from rich.console import Console
-from rich.table import Table
-from rich.text import Text
+from typing import Any
 
 from .. import constants
 
@@ -118,7 +113,6 @@ def format_content_preview(
 
     return preview
 
-
 def format_content_diff(
     before: str,
     after: str,
@@ -183,62 +177,3 @@ def format_content_diff(
     if omitted_hunks:
         preview += f"\n... ({omitted_hunks} changed hunk(s) omitted; preview limit reached)"
     return preview
-
-
-def format_tabular_lines(
-    items: list[object],
-    *,
-    title: str | None = None,
-    prefix: str = "  ",
-    columns: Iterable[str] = ("name", "description"),
-    max_width: int | None = constants.TABULAR_MAX_WIDTH,
-    max_rows: int | None = None,
-) -> str:
-    """Format a list of objects as a plain-text Rich table.
-
-    Args:
-        items (list[object]): List of objects to format.
-        title (str | None): Optional title to display above the table.
-        prefix (str): Optional prefix to prepend to each table row.
-        columns (Iterable[str]): Iterable of attribute names to display as columns.
-        max_width (int | None): Maximum table width in characters. Defaults to
-            ``TABULAR_MAX_WIDTH``; values wrap or truncate to fit. Pass ``None`` for no practical
-            limit.
-        max_rows (int | None): Maximum number of objects to include. Includes every object when
-            unset.
-
-    Returns:
-        str: Formatted string, including the title and table rows.
-
-    Raises:
-        ValueError: If ``max_width`` is not positive or ``max_rows`` is negative.
-    """
-    if max_width is not None and max_width < 1:
-        raise ValueError("max_width must be positive.")
-    if max_rows is not None and max_rows < 0:
-        raise ValueError("max_rows cannot be negative.")
-
-    column_names = tuple(columns)
-    table = Table.grid(padding=(0, 2))
-    for _ in column_names:
-        table.add_column(overflow="ellipsis")
-
-    visible_items = items if max_rows is None else items[:max_rows]
-    for item in visible_items:
-        values = [Text(str(getattr(item, column, ""))) for column in column_names]
-        if values:
-            values[0].plain = f"{prefix}{values[0].plain}"
-        table.add_row(*values)
-
-    output = StringIO()
-    console = Console(
-        file=output,
-        width=max_width or 10_000,
-        color_system=None,
-        highlight=False,
-    )
-    console.print(table)
-    rendered_table = output.getvalue().rstrip("\n")
-    if title:
-        return f"{title}\n{rendered_table}"
-    return rendered_table

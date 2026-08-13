@@ -42,11 +42,10 @@ def test_help_displays_slash_prefixed_command_catalog():
 
     help_command(CommandContext("help", interaction, manager))
 
-    help_text = interaction.info.call_args.args[0]
-    rows = [line.split()[0] for line in help_text.splitlines()[2:]]
+    displayed = interaction.table.call_args
+    rows = [command.name for command in displayed.args[0]]
     assert rows == sorted(rows, key=str.casefold)
-    assert "  /help         Show the available commands." in help_text
-    assert "  /zebra        Run the last command." in help_text
+    assert displayed.kwargs == {"title": "Available commands:", "prefix": "  /"}
 
 
 def test_permissions_command_shows_and_changes_local_policy(tmp_path):
@@ -122,12 +121,7 @@ def test_tools_command_displays_registered_tools():
 
     tools_command(context)
 
-    output = interaction.info.call_args.args[0]
-    assert "Registered tools:" in output
-    assert "read_file" in output
-    assert "Read a file from disk" in output
-    assert "write_file" in output
-    assert "Write content to a file" in output
+    interaction.table.assert_called_once_with(registry.tools, title="Registered tools:")
 
 
 def test_tools_command_reports_empty_when_no_tools():
@@ -162,12 +156,7 @@ def test_skills_command_discovered_skills():
 
     skills_command(context)
 
-    output = interaction.info.call_args.args[0]
-    assert "Discovered skills:" in output
-    assert "coding" in output
-    assert "Implement and modify code" in output
-    assert "testing" in output
-    assert "Write and run tests" in output
+    interaction.table.assert_called_once_with(manager.skills, title="Discovered skills:")
 
 
 def test_skills_command_reports_empty_when_no_skills():

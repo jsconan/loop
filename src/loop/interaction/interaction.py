@@ -7,6 +7,7 @@ from typing import Any
 
 from prompt_toolkit.completion import Completer
 
+from .. import constants
 from ..models import (
     AnswerCompleted,
     AnswerDelta,
@@ -113,6 +114,33 @@ class Interaction(ABC):
 
         Args:
             message (str): Status text to display, or an empty string for a blank line.
+        """
+
+    @abstractmethod
+    def table(
+        self,
+        items: list[object],
+        *,
+        title: str | None = None,
+        prefix: str = "  ",
+        columns: Iterable[str] = ("name", "description"),
+        max_width: int | None = constants.TABULAR_MAX_WIDTH,
+        max_rows: int | None = None,
+    ) -> None:
+        """Display object attributes as a table.
+
+        Args:
+            items (list[object]): Objects whose attributes provide the row values.
+            title (str | None): Optional title to display above the table.
+            prefix (str): Text to prepend to the first value in each row.
+            columns (Iterable[str]): Attribute names to display as columns.
+            max_width (int | None): Maximum table width in characters. Defaults to
+                ``TABULAR_MAX_WIDTH``. Pass ``None`` to use the interaction's available width.
+            max_rows (int | None): Maximum number of objects to display. Displays every object
+                when unset.
+
+        Raises:
+            ValueError: If ``max_width`` is not positive or ``max_rows`` is negative.
         """
 
     @abstractmethod

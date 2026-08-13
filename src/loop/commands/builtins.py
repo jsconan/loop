@@ -7,7 +7,6 @@ from pydantic import Field
 from ..completion import COMPLETION_ATTRIBUTE, CommandCompletion, CompletionValue
 from ..context import CommandContext
 from ..permissions import Capability, Decision, PermissionMode, PermissionRule
-from ..utils import format_tabular_lines
 from .models import CommandArgumentError, CommandRemainder
 
 
@@ -47,8 +46,7 @@ def help(context: CommandContext) -> None:  # pylint: disable=redefined-builtin
     if manager is None:
         raise ValueError("The help command requires a CommandManager.")
     commands = sorted(manager.commands, key=lambda command: command.name.casefold())
-    lines = format_tabular_lines(commands, title="Available commands:", prefix="  /")
-    context.interaction.info(lines)
+    context.interaction.table(commands, title="Available commands:", prefix="  /")
 
 
 def permissions(
@@ -121,8 +119,7 @@ def tools(context: CommandContext) -> None:
     if not tool_list:
         context.interaction.info("No tools registered.")
         return
-    lines = format_tabular_lines(tool_list, title="Registered tools:")
-    context.interaction.info(lines)
+    context.interaction.table(tool_list, title="Registered tools:")
 
 
 def call(
@@ -162,8 +159,7 @@ def skills(context: CommandContext) -> None:
     if not skill_list:
         context.interaction.info("No skills discovered.")
         return
-    lines = format_tabular_lines(skill_list, title="Discovered skills:")
-    context.interaction.info(lines)
+    context.interaction.table(skill_list, title="Discovered skills:")
 
 
 def use(
