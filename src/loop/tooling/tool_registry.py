@@ -94,7 +94,7 @@ class ToolRegistry:
         Returns:
             list[Tool]: Registered tools.
         """
-        return sorted(self._tools.values(), key=lambda tool: tool.name)
+        return sorted(self._tools.values(), key=lambda tool: tool.name.casefold())
 
     @property
     def names(self) -> list[str]:

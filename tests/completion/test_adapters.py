@@ -67,7 +67,7 @@ def test_command_names_match_fragments_and_replace_the_complete_slash_token():
 
 
 def test_schema_completion_infers_enum_literal_union_and_boolean_values():
-    """Single-argument finite annotations produce command values without custom metadata."""
+    """Finite annotations produce alphabetized command values without custom metadata."""
 
     class Mode(StrEnum):
         READ_ONLY = "read_only"
@@ -87,8 +87,8 @@ def test_schema_completion_infers_enum_literal_union_and_boolean_values():
     assert [item.text for item in complete(completer, "/mode work")] == ["workspace_write"]
     assert [item.text for item in complete(completer, "/level h")] == ["high"]
     assert [item.text for item in complete(completer, "/enabled ")] == [
-        "true",
         "false",
+        "true",
         "value=",
     ]
 
@@ -160,7 +160,7 @@ def test_nested_command_completion_uses_dynamic_values_and_continuations():
 
 
 def test_nested_command_completion_switches_to_a_selected_dynamic_schema():
-    """A grammar can complete fields from the model selected by its leading token."""
+    """A grammar alphabetizes fields from the model selected by its leading token."""
 
     def invoke(tool: str) -> None:
         """Invoke a tool."""
@@ -185,8 +185,8 @@ def test_nested_command_completion_switches_to_a_selected_dynamic_schema():
     )
 
     assert [item.text for item in complete(completer, "/invoke selected ")] == [
-        "mode=",
         "count=",
+        "mode=",
     ]
     assert [item.text for item in complete(completer, "/invoke selected 2 mode=f")] == [
         "mode=fast",

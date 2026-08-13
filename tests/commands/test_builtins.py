@@ -28,19 +28,25 @@ from loop.commands import use as use_command
 
 
 def test_help_displays_slash_prefixed_command_catalog():
-    """Help adds the presentation-only slash to slash-free command metadata."""
+    """Help alphabetizes commands and adds the presentation-only slash."""
     interaction = Mock(spec=Interaction)
     manager = CommandManager(interaction=interaction)
 
-    @manager.register(name="long-command", description="Run a longer command.")
-    def long_command() -> None:
+    @manager.register(name="zebra", description="Run the last command.")
+    def zebra() -> None:
+        pass
+
+    @manager.register(name="alpha", description="Run the first command.")
+    def alpha() -> None:
         pass
 
     help_command(CommandContext("help", interaction, manager))
 
     help_text = interaction.info.call_args.args[0]
-    assert "  /help          Show the available commands." in help_text
-    assert "  /long-command  Run a longer command." in help_text
+    rows = [line.split()[0] for line in help_text.splitlines()[2:]]
+    assert rows == sorted(rows, key=str.casefold)
+    assert "  /help         Show the available commands." in help_text
+    assert "  /zebra        Run the last command." in help_text
 
 
 def test_permissions_command_shows_and_changes_local_policy(tmp_path):

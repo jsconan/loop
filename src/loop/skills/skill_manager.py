@@ -72,7 +72,7 @@ class SkillManager:
         Returns:
             list[Skill]: Unique skill metadata after precedence resolution, sorted alphabetically.
         """
-        return sorted(self._skills, key=lambda skill: skill.name)
+        return sorted(self._skills, key=lambda skill: skill.name.casefold())
 
     @property
     def names(self) -> list[str]:

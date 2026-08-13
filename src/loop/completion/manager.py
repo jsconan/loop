@@ -85,7 +85,7 @@ class CompletionManager(Completer):
                 return
 
     @staticmethod
-    def _score(value: CompletionValue, match: CompletionMatch) -> tuple[int, int, str]:
+    def _score(value: CompletionValue, match: CompletionMatch) -> tuple[int, str]:
         """Return a stable relevance score for one candidate."""
         needle = match.fragment.casefold()
         text = value.value.casefold()
@@ -100,4 +100,4 @@ class CompletionManager(Completer):
             rank = 3
         else:
             rank = 4
-        return rank, len(text), text
+        return rank, text

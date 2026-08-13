@@ -88,6 +88,27 @@ def test_manager_aggregates_ranks_deduplicates_and_bounds_registered_adapters():
     assert results[0].display_meta_text == "first"
 
 
+def test_manager_alphabetizes_browsing_and_equally_relevant_matches():
+    """Browsing catalogs and equally relevant filtered values use alphabetical order."""
+    values = (
+        CompletionValue("zebra"),
+        CompletionValue("Beta"),
+        CompletionValue("alpha"),
+    )
+    browsing = CompletionManager((StaticAdapter(CompletionMatch("", "", "/"), values),))
+    filtered = CompletionManager(
+        (
+            StaticAdapter(
+                CompletionMatch("a", "a", "/"),
+                (CompletionValue("zebra"), CompletionValue("alpha")),
+            ),
+        )
+    )
+
+    assert [result.text for result in complete(browsing)] == ["/alpha", "/Beta", "/zebra"]
+    assert [result.text for result in complete(filtered)] == ["/alpha", "/zebra"]
+
+
 def test_manager_isolates_inactive_and_failed_adapters_and_filters_nonmatches():
     """One unavailable capability cannot suppress valid results from another capability."""
     match = CompletionMatch("hit", "hit")

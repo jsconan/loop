@@ -46,7 +46,8 @@ def help(context: CommandContext) -> None:  # pylint: disable=redefined-builtin
     manager = context.manager
     if manager is None:
         raise ValueError("The help command requires a CommandManager.")
-    lines = format_tabular_lines(manager.commands, title="Available commands:", prefix="  /")
+    commands = sorted(manager.commands, key=lambda command: command.name.casefold())
+    lines = format_tabular_lines(commands, title="Available commands:", prefix="  /")
     context.interaction.info(lines)
 
 
