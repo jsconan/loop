@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable
 
-from ..models import ConversationItem, ModelInfo, ResponseEvent
+from ..models import ConversationItem, ModelInfo, ResponseEvent, StructuredOutputFormat
 from ..tooling import ToolRegistry
 
 
@@ -96,6 +96,7 @@ class Backend(ABC):
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
+        output_format: StructuredOutputFormat | None = None,
     ) -> Iterable[ResponseEvent]:
         """Return normalized response events.
 
@@ -104,6 +105,7 @@ class Backend(ABC):
             instructions (str | None): System or developer instructions for the request.
             stream (bool): Whether events should be produced incrementally.
             model (str | None): Model identifier to use instead of the default model.
+            output_format (StructuredOutputFormat | None): Optional structured output contract.
 
         Returns:
             Iterable[ResponseEvent]: Response events in output order.
@@ -119,6 +121,7 @@ class Backend(ABC):
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
+        output_format: StructuredOutputFormat | None = None,
     ) -> AsyncIterator[ResponseEvent]:
         """Asynchronously yield normalized response events.
 
@@ -127,6 +130,7 @@ class Backend(ABC):
             instructions (str | None): System or developer instructions for the request.
             stream (bool): Whether events should be produced incrementally.
             model (str | None): Model identifier to use instead of the default model.
+            output_format (StructuredOutputFormat | None): Optional structured output contract.
 
         Yields:
             ResponseEvent: Response events in output order.

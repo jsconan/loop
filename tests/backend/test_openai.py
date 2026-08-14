@@ -18,6 +18,7 @@ from openai.types.responses import (
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
 )
+from pydantic import BaseModel
 
 from loop import (
     AnswerCompleted,
@@ -31,12 +32,21 @@ from loop import (
     ReasoningDelta,
     ResponseCompleted,
     ResponseMetadata,
+    StructuredOutputFormat,
+    StructuredOutputValidationError,
     ToolCall,
     ToolCallCompleted,
     ToolRegistry,
     ToolResult,
     Usage,
 )
+
+
+class Person(BaseModel):
+    """Represent a typed structured backend response."""
+
+    name: str
+    age: int
 
 
 @pytest.fixture(autouse=True)
@@ -460,6 +470,107 @@ def test_sync_response_forwards_schema_streaming_and_model_selection():
     )
 
 
+def test_sync_response_requests_and_validates_pydantic_structured_output():
+    """Pydantic formats use the portable wire schema and return a typed result."""
+    sdk = Mock()
+    sdk.responses.create.return_value = SimpleNamespace(
+        output=[],
+        output_text='{"name":"Ada","age":36}',
+        usage=None,
+        model="served-model",
+    )
+    output_format = StructuredOutputFormat.from_model(
+        Person,
+        name="person_record",
+        description="A person record.",
+    )
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        events = list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello", output_format=output_format
+            )
+        )
+
+    assert events[-1].structured_output == Person(name="Ada", age=36)
+    assert sdk.responses.create.call_args.kwargs["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "person_record",
+            "schema": output_format.schema,
+            "strict": True,
+            "description": "A person record.",
+        }
+    }
+
+
+def test_sync_response_uses_raw_schema_validator_without_nullable_description():
+    """Raw schema callbacks validate decoded JSON and omit absent wire descriptions."""
+    sdk = Mock()
+    sdk.responses.create.return_value = SimpleNamespace(
+        output=[], output_text="[1,2]", usage=None, model=None
+    )
+    output_format = StructuredOutputFormat(
+        name="numbers",
+        schema={"type": "array", "items": {"type": "integer"}},
+        validator=tuple,
+    )
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        events = list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello", output_format=output_format
+            )
+        )
+
+    assert events[-1].structured_output == (1, 2)
+    assert "description" not in sdk.responses.create.call_args.kwargs["text"]["format"]
+
+
+def test_structured_response_rejects_empty_final_text():
+    """A final response without JSON fails its requested structured contract."""
+    sdk = Mock()
+    sdk.responses.create.return_value = SimpleNamespace(
+        output=[], output_text="", usage=None, model=None
+    )
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(StructuredOutputValidationError, match="person"),
+    ):
+        list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello",
+                output_format=StructuredOutputFormat.from_model(Person, name="person"),
+            )
+        )
+
+
+def test_structured_response_allows_an_intermediate_tool_only_completion():
+    """Tool-only turns defer structured validation until a later answer is produced."""
+    call = ResponseFunctionToolCall(
+        id="fc_1",
+        call_id="call_1",
+        name="demo",
+        arguments="{}",
+        type="function_call",
+        status="completed",
+    )
+    sdk = Mock()
+    sdk.responses.create.return_value = SimpleNamespace(
+        output=[call], output_text="", usage=None, model=None
+    )
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        events = list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello", output_format=StructuredOutputFormat.from_model(Person)
+            )
+        )
+
+    assert events[-1].structured_output is None
+
+
 def test_async_response_uses_default_model():
     """Asynchronous requests use the default model when none is supplied."""
     registry = Mock()
@@ -483,6 +594,31 @@ def test_async_response_uses_default_model():
         stream=False,
         stream_options={"include_usage": True},
         tools=[],
+    )
+
+
+def test_async_response_forwards_and_validates_structured_output():
+    """Asynchronous structured requests share the synchronous wire and result contract."""
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(
+        return_value=SimpleNamespace(
+            output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None
+        )
+    )
+    output_format = StructuredOutputFormat.from_model(Person)
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        events = asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="default").get_response_async(
+                    "hello", output_format=output_format
+                )
+            )
+        )
+
+    assert events[-1].structured_output == Person(name="Ada", age=36)
+    assert sdk.responses.create.await_args.kwargs["text"]["format"]["schema"] == (
+        output_format.schema
     )
 
 

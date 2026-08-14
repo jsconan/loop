@@ -208,6 +208,7 @@ class Interaction(ABC):
         items = ()
         usage = None
         model = None
+        structured_output = None
         reasoning_started = False
         answer_started = False
 
@@ -246,6 +247,7 @@ class Interaction(ABC):
                     model = event.model
                     answer = event.answer
                     reasoning = event.reasoning
+                    structured_output = event.structured_output
 
         return Response(
             answer=answer,
@@ -254,4 +256,5 @@ class Interaction(ABC):
             items=items,
             usage=usage or Usage(),
             model=model,
+            structured_output=structured_output,
         )

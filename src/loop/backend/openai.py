@@ -44,6 +44,7 @@ from ..models import (
     ResponseCompleted,
     ResponseEvent,
     ResponseMetadata,
+    StructuredOutputFormat,
     ToolCall,
     ToolCallCompleted,
     ToolDefinition,
@@ -159,6 +160,7 @@ class OpenAIBackend(Backend):
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
+        output_format: StructuredOutputFormat | None = None,
     ) -> Iterator[ResponseEvent]:
         """Yield normalized events from a synchronous response.
 
@@ -167,6 +169,7 @@ class OpenAIBackend(Backend):
             instructions (str | None): System or developer instructions to apply to the request.
             stream (bool): Whether to return a streaming response.
             model (str | None): Model identifier to use instead of the default model.
+            output_format (StructuredOutputFormat | None): Optional structured output contract.
 
         Yields:
             ResponseEvent: Response events in output order.
@@ -182,13 +185,14 @@ class OpenAIBackend(Backend):
             stream=stream,
             stream_options={"include_usage": True},
             tools=self._serialize_tools(self._tool_registry.definitions()),
+            **self._structured_output_request(output_format),
         )
         if stream:
             items = []
             for event in response:
-                yield from self._translated_stream_event(event, items)
+                yield from self._translated_stream_event(event, items, output_format)
             return
-        yield from self._response_events(response)
+        yield from self._response_events(response, output_format)
 
     async def get_response_async(
         self,
@@ -196,6 +200,7 @@ class OpenAIBackend(Backend):
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
+        output_format: StructuredOutputFormat | None = None,
     ) -> AsyncIterator[ResponseEvent]:
         """Yield events from an asynchronous response.
 
@@ -204,6 +209,7 @@ class OpenAIBackend(Backend):
             instructions (str | None): System or developer instructions to apply to the request.
             stream (bool): Whether to return a streaming response.
             model (str | None): Model identifier to use instead of the default model.
+            output_format (StructuredOutputFormat | None): Optional structured output contract.
 
         Yields:
             ResponseEvent: Response events in output order.
@@ -219,14 +225,15 @@ class OpenAIBackend(Backend):
             stream=stream,
             stream_options={"include_usage": True},
             tools=self._serialize_tools(self._tool_registry.definitions()),
+            **self._structured_output_request(output_format),
         )
         if not stream:
-            for event in self._response_events(response):
+            for event in self._response_events(response, output_format):
                 yield event
             return
         items = []
         async for event in response:
-            for translated in self._translated_stream_event(event, items):
+            for translated in self._translated_stream_event(event, items, output_format):
                 yield translated
 
     def get_context_window(self, model: str | None = None) -> int | None:
@@ -508,8 +515,29 @@ class OpenAIBackend(Backend):
             for definition in definitions
         ]
 
+    @staticmethod
+    def _structured_output_request(
+        output_format: StructuredOutputFormat | None,
+    ) -> dict[str, object]:
+        """Serialize a structured output contract when one is requested."""
+        if output_format is None:
+            return {}
+        schema_format = {
+            "type": "json_schema",
+            "name": output_format.name,
+            "schema": dict(output_format.schema),
+            "strict": output_format.strict,
+        }
+        if output_format.description is not None:
+            schema_format["description"] = output_format.description
+        return {"text": {"format": schema_format}}
+
     @classmethod
-    def _response_events(cls, response: OpenAIResponse) -> Iterator[ResponseEvent]:
+    def _response_events(
+        cls,
+        response: OpenAIResponse,
+        output_format: StructuredOutputFormat | None,
+    ) -> Iterator[ResponseEvent]:
         """Translate a completed OpenAI response into normalized events."""
         items = [
             translated
@@ -529,13 +557,14 @@ class OpenAIBackend(Backend):
         answer = response.output_text
         if isinstance(answer, str) and answer:
             yield AnswerCompleted(text=answer)
-        yield cls._completion(response, items)
+        yield cls._completion(response, items, output_format)
 
     @classmethod
     def _translated_stream_event(
         cls,
         event: OpenAIResponseStreamEvent,
         items: list[ConversationItem],
+        output_format: StructuredOutputFormat | None,
     ) -> list[ResponseEvent]:
         """Translate one OpenAI stream event and update completed history items."""
         if isinstance(event, OpenAIReasoningDeltaEvent):
@@ -549,7 +578,7 @@ class OpenAIBackend(Backend):
             items.append(item)
             return [ToolCallCompleted(call=item)] if isinstance(item, ToolCall) else []
         if isinstance(event, OpenAIResponseCompletedEvent):
-            return [cls._completion(event.response, items)]
+            return [cls._completion(event.response, items, output_format)]
         return []
 
     @staticmethod
@@ -580,6 +609,7 @@ class OpenAIBackend(Backend):
         cls,
         response: OpenAIResponse,
         items: Iterable[ConversationItem],
+        output_format: StructuredOutputFormat | None,
     ) -> ResponseCompleted:
         """Translate terminal OpenAI response content and metadata."""
         usage = cls._usage(response)
@@ -603,12 +633,19 @@ class OpenAIBackend(Backend):
             ),
             "",
         )
+        answer_text = answer if isinstance(answer, str) else ""
+        structured_output = None
+        if output_format is not None and (
+            answer_text or not any(isinstance(item, ToolCall) for item in completed_items)
+        ):
+            structured_output = output_format.validate(answer_text)
         return ResponseCompleted(
             items=completed_items,
             usage=usage,
             model=model if isinstance(model, str) else None,
-            answer=answer if isinstance(answer, str) else "",
+            answer=answer_text,
             reasoning=reasoning,
+            structured_output=structured_output,
         )
 
     @staticmethod

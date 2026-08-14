@@ -1,8 +1,144 @@
 """Define conversation and response models."""
 
+from collections.abc import Callable, Mapping
+from copy import deepcopy
+from dataclasses import dataclass
+from json import JSONDecodeError, loads
 from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
+
+JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+StructuredOutputValidator: TypeAlias = Callable[[JsonValue], Any]
+
+
+class StructuredOutputValidationError(ValueError):
+    """Report output that does not satisfy its requested structure."""
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredOutputFormat:
+    """Describe and validate a JSON Schema-constrained model response.
+
+    Args:
+        name (str): Portable identifier for the output schema.
+        schema (Mapping[str, object]): JSON Schema sent to the model provider.
+        description (str | None): Optional description of the desired output.
+        strict (bool): Whether the provider should enforce strict schema adherence.
+        model (type[BaseModel] | None): Pydantic model retained for output validation.
+        validator (StructuredOutputValidator | None): Callback that receives decoded JSON and
+            returns its validated or transformed value when no Pydantic model is supplied.
+
+    Raises:
+        ValueError: If the name is empty or both validation mechanisms are supplied.
+    """
+
+    name: str
+    schema: Mapping[str, object]
+    description: str | None = None
+    strict: bool = True
+    model: type[BaseModel] | None = None
+    validator: StructuredOutputValidator | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("Structured output format name must not be empty.")
+        if self.model is not None and self.validator is not None:
+            raise ValueError("Structured output format cannot define both a model and validator.")
+
+    @staticmethod
+    def _strict_json_schema(schema: dict[str, object]) -> dict[str, object]:
+        """Return a copy normalized to the strict structured-output schema subset."""
+        root = deepcopy(schema)
+
+        def resolve(reference: str) -> dict[str, object]:
+            value = root
+            for part in reference[2:].split("/"):
+                value = value[part.replace("~1", "/").replace("~0", "~")]
+            return value
+
+        def normalize(value: dict[str, object]) -> dict[str, object]:
+            reference = value.get("$ref")
+            if isinstance(reference, str) and len(value) > 1:
+                value = {**deepcopy(resolve(reference)), **value}
+                value.pop("$ref")
+            definitions = value.get("$defs")
+            if isinstance(definitions, dict):
+                value["$defs"] = {
+                    key: normalize(definition) for key, definition in definitions.items()
+                }
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                value["required"] = list(properties)
+                value["properties"] = {
+                    key: normalize(property_schema) for key, property_schema in properties.items()
+                }
+            if value.get("type") == "object" and "additionalProperties" not in value:
+                value["additionalProperties"] = False
+            items = value.get("items")
+            if isinstance(items, dict):
+                value["items"] = normalize(items)
+            any_of = value.get("anyOf")
+            if isinstance(any_of, list):
+                value["anyOf"] = [normalize(variant) for variant in any_of]
+            if value.get("default", ...) is None:
+                value.pop("default")
+            return value
+
+        return normalize(root)
+
+    @classmethod
+    def from_model(
+        cls,
+        model: type[BaseModel],
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        strict: bool = True,
+    ) -> "StructuredOutputFormat":
+        """Create a structured output format from a Pydantic model.
+
+        Args:
+            model (type[BaseModel]): Model used to create the schema and validate output.
+            name (str | None): Schema identifier, defaulting to the model class name.
+            description (str | None): Optional description of the desired output.
+            strict (bool): Whether the provider should enforce strict schema adherence.
+
+        Returns:
+            StructuredOutputFormat: Format retaining the model type for validation.
+        """
+        schema = model.model_json_schema()
+        return cls(
+            name=name or model.__name__,
+            schema=(cls._strict_json_schema(schema) if strict else schema),
+            description=description,
+            strict=strict,
+            model=model,
+        )
+
+    def validate(self, text: str) -> Any:
+        """Decode and validate completed response text.
+
+        Args:
+            text (str): Complete JSON response text.
+
+        Returns:
+            Any: Pydantic model, callback result, or decoded JSON value.
+
+        Raises:
+            StructuredOutputValidationError: If JSON decoding or configured validation fails.
+        """
+        try:
+            value = loads(text)
+            if self.model is not None:
+                return self.model.model_validate(value)
+            if self.validator is not None:
+                return self.validator(value)
+            return value
+        except (JSONDecodeError, ValueError, TypeError) as error:
+            raise StructuredOutputValidationError(
+                f"Response does not satisfy structured output format {self.name!r}: {error}"
+            ) from error
 
 
 class Usage(BaseModel):
@@ -245,6 +381,7 @@ class ResponseCompleted(BaseModel):
         model (str | None): Model identifier reported for the response.
         answer (str): Completed answer text.
         reasoning (str): Completed reasoning text.
+        structured_output (Any | None): Validated structured answer, when requested.
     """
 
     items: tuple[ConversationItem, ...] = Field(default_factory=tuple)
@@ -252,6 +389,7 @@ class ResponseCompleted(BaseModel):
     model: str | None = None
     answer: str = ""
     reasoning: str = ""
+    structured_output: Any | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 ResponseEvent: TypeAlias = (
@@ -274,6 +412,7 @@ class Response(BaseModel):
         items (tuple[ConversationItem, ...]): Items to retain in conversation history.
         usage (Usage): Token usage reported for the response.
         model (str | None): Model identifier reported for the response.
+        structured_output (Any | None): Validated structured answer, when requested.
     """
 
     answer: str
@@ -282,3 +421,4 @@ class Response(BaseModel):
     items: tuple[ConversationItem, ...] = Field(default_factory=tuple)
     usage: Usage = Field(default_factory=Usage)
     model: str | None = None
+    structured_output: Any | None = Field(default=None, exclude_if=lambda value: value is None)

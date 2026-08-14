@@ -48,6 +48,7 @@ def test_output_uses_terminal_response_text():
             model="served-model",
             answer="  hello world  ",
             reasoning="  think again  ",
+            structured_output={"message": "hello world"},
         ),
     ]
 
@@ -60,6 +61,7 @@ def test_output_uses_terminal_response_text():
         items=items,
         usage=Usage(total_tokens=230),
         model="served-model",
+        structured_output={"message": "hello world"},
     )
     assert interaction.reasoning_delta.call_args_list[0].kwargs == {"start": True}
     assert interaction.reasoning_delta.call_args_list[1].kwargs == {"start": False}
