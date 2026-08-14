@@ -199,9 +199,7 @@ def test_manager_restores_artifact_metadata_from_a_loaded_session():
         source="https://example.com/source.txt",
         reloadable=True,
     )
-    session = Session(
-        messages=[ToolResult(call_id="call", output="result", artifacts=(artifact,))]
-    )
+    session = Session(messages=[ToolResult(call_id="call", output="result", artifacts=(artifact,))])
 
     SessionManager(session=session)
 

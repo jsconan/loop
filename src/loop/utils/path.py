@@ -70,9 +70,7 @@ def _is_ignored(path: Path, is_directory: bool, rules: IgnoreRules) -> bool:
     if is_directory and path.name == constants.GIT_DIRECTORY.name:
         return True
 
-    agent_decision = _ignore_decision(
-        path, is_directory, rules[constants.AGENT_IGNORE_FILENAME]
-    )
+    agent_decision = _ignore_decision(path, is_directory, rules[constants.AGENT_IGNORE_FILENAME])
     if agent_decision is not None:
         return agent_decision
     return _ignore_decision(path, is_directory, rules[constants.GIT_IGNORE_FILENAME]) is True

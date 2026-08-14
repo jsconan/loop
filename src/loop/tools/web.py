@@ -30,8 +30,8 @@ def _network_permission(arguments: dict[str, object]) -> tuple[PermissionRequest
 
 def _cached_content_permission(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
     """Recover persisted authority requirements for one cached handle."""
-    metadata = None if cached_path(str(arguments["handle"])) else cached_metadata(
-        str(arguments["handle"])
+    metadata = (
+        None if cached_path(str(arguments["handle"])) else cached_metadata(str(arguments["handle"]))
     )
     source = metadata["source"] if metadata and metadata["reloadable"] else None
     return (

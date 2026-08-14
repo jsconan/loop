@@ -218,7 +218,7 @@ def test_tool_result_displays_text_without_transport_quoting(capsys, result, exp
     ("result", "expected_parts"),
     [
         ('{"name":"loop","items":[1,true,null]}', ('"name": "loop"', '"items": [', "true")),
-        ('[{"id":1},{"id":2}]', ('[', '"id": 1', '"id": 2')),
+        ('[{"id":1},{"id":2}]', ("[", '"id": 1', '"id": 2')),
         ("42", ("42",)),
         ("null", ("null",)),
     ],
@@ -246,9 +246,7 @@ def test_tool_result_classifies_error_envelopes_and_displays_details(capsys):
 
 def test_tool_result_classifies_error_envelopes_without_details(capsys):
     """Minimal serialized tool errors display only their human-readable message."""
-    ConsoleInteraction().tool_result(
-        "example", '{"error":"unknown_tool","message":"Unavailable."}'
-    )
+    ConsoleInteraction().tool_result("example", '{"error":"unknown_tool","message":"Unavailable."}')
 
     assert capsys.readouterr().out == "Error: Unavailable.\n"
 
@@ -316,12 +314,7 @@ def test_tool_result_displays_folder_entries_as_a_hierarchical_tree(capsys):
 
     output = capsys.readouterr().out
     assert output == (
-        ".\n"
-        "├── README.md\n"
-        "└── src\n"
-        "    └── loop\n"
-        "        ├── main.py\n"
-        "        └── tools\n"
+        ".\n├── README.md\n└── src\n    └── loop\n        ├── main.py\n        └── tools\n"
     )
 
 

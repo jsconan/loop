@@ -26,7 +26,7 @@ def _write_preview(path: Path, content: str) -> str:
         return f"Proposed content:\n{format_content_preview(content)}"
     try:
         existing = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    except OSError, UnicodeDecodeError:
         return (
             "Existing content could not be previewed; proposed content:\n"
             f"{format_content_preview(content)}"
@@ -219,9 +219,7 @@ def delete_path(
         elif kind in {"file", "symbolic link"}:
             target.unlink()
         elif target.exists():
-            return (
-                f"Error deleting path: Path '{path}' is not a file, symbolic link, or folder."
-            )
+            return f"Error deleting path: Path '{path}' is not a file, symbolic link, or folder."
         else:
             return f"Error deleting path: Path '{path}' does not exist."
         context.invalidate_instructions(target)

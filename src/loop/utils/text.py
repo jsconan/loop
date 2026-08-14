@@ -113,6 +113,7 @@ def format_content_preview(
 
     return preview
 
+
 def format_content_diff(
     before: str,
     after: str,
