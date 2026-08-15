@@ -116,6 +116,7 @@ class ProjectPathMentionHandler(MentionHandler):
         """
         root = self._working_directory().resolve()
         references = []
+        resolved_paths = set()
         remaining = constants.MAX_TOOL_CONTENT_BYTES
         for value in dict.fromkeys(values):
             path = (root / value.rstrip("/")).resolve()
@@ -123,6 +124,9 @@ class ProjectPathMentionHandler(MentionHandler):
                 raise ValueError(f"Mentioned path '{value}' escapes the project.")
             if not path.exists() or is_path_ignored(path, root):
                 raise ValueError(f"Mentioned path '{value}' is unavailable.")
+            if path in resolved_paths:
+                continue
+            resolved_paths.add(path)
             if remaining < 1:
                 raise ValueError("Mentioned paths exceed the context attachment limit.")
             if path.is_dir():

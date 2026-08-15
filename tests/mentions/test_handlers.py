@@ -66,6 +66,18 @@ def test_directory_paths_attach_only_a_visible_bounded_listing(tmp_path):
     assert set(context[0].content.splitlines()) == {"main.py", "nested/"}
 
 
+def test_project_paths_deduplicate_aliases_by_resolved_resource(tmp_path):
+    """Different visible paths to the same resource contribute only one snapshot."""
+    source = tmp_path / "source.txt"
+    source.write_text("content", encoding="utf-8")
+    (tmp_path / "alias.txt").symlink_to(source)
+
+    context = ProjectPathMentionHandler(lambda: tmp_path).resolve(("alias.txt", "source.txt"))
+
+    assert len(context) == 1
+    assert context[0].path == "alias.txt"
+
+
 def test_project_paths_reject_binary_changed_escaping_and_special_files(tmp_path, monkeypatch):
     """Unsafe, unavailable, binary, and unsupported paths cannot become attachments."""
     binary = tmp_path / "data.bin"

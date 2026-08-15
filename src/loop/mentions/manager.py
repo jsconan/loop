@@ -9,7 +9,7 @@ from .parser import parse_mentions
 
 
 class MentionManager:
-    """Parse and dispatch mentions through an injected handler registry.
+    """Parse and dispatch unique mention targets through an injected handler registry.
 
     Args:
         handlers (Iterable[MentionHandler]): Independently owned mention capabilities. Markers
@@ -44,7 +44,7 @@ class MentionManager:
             content (str): Submitted user text.
 
         Returns:
-            tuple[ContextReference, ...]: Context produced by all mentioned capabilities.
+            tuple[ContextReference, ...]: Context produced by all uniquely mentioned capabilities.
 
         Raises:
             OSError: A handler cannot read its referenced resource.
@@ -58,7 +58,9 @@ class MentionManager:
         references = []
         for handler in self._handlers:
             values = tuple(
-                mention.value for mention in mentions if mention.marker == handler.marker
+                dict.fromkeys(
+                    mention.value for mention in mentions if mention.marker == handler.marker
+                )
             )
             if values:
                 references.extend(handler.resolve(values))
