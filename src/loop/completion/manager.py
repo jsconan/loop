@@ -63,11 +63,12 @@ class CompletionManager(Completer):
                 # Completion capabilities are optional, best-effort UI integrations.
                 continue
 
-        ranked = sorted(collected, key=lambda item: (*self._score(item[0], item[1]), item[2]))
+        ranked = sorted(collected, key=self._rank)
         seen = set()
         yielded = 0
         for value, match, _ in ranked:
-            if match.fragment.casefold() not in value.value.casefold():
+            searchable = f"{value.display or ''} {value.value}".casefold()
+            if match.fragment.casefold() not in searchable:
                 continue
             text = f"{match.prefix}{value.value}"
             key = (text, -len(match.replaced))
@@ -77,7 +78,7 @@ class CompletionManager(Completer):
             yield Completion(
                 text,
                 start_position=key[1],
-                display=text,
+                display=f"{match.prefix}{value.display or value.value}",
                 display_meta=value.description,
             )
             yielded += 1
@@ -85,10 +86,21 @@ class CompletionManager(Completer):
                 return
 
     @staticmethod
+    def _rank(
+        item: tuple[CompletionValue, CompletionMatch, int],
+    ) -> tuple[int, int | str, str | int, int]:
+        """Return provider-controlled or relevance-based completion order."""
+        value, match, adapter_index = item
+        if value.sort_order is not None:
+            return 0, value.sort_order, "", adapter_index
+        rank, text = CompletionManager._score(value, match)
+        return 1, rank, text, adapter_index
+
+    @staticmethod
     def _score(value: CompletionValue, match: CompletionMatch) -> tuple[int, str]:
         """Return a stable relevance score for one candidate."""
         needle = match.fragment.casefold()
-        text = value.value.casefold()
+        text = (value.display or value.value).casefold()
         basename = text.rstrip("/").rsplit("/", maxsplit=1)[-1]
         if text == needle:
             rank = 0

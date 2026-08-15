@@ -109,6 +109,17 @@ def test_manager_alphabetizes_browsing_and_equally_relevant_matches():
     assert [result.text for result in complete(filtered)] == ["/alpha", "/zebra"]
 
 
+def test_manager_preserves_explicit_provider_order():
+    """Provider-controlled catalogs retain their domain-specific ordering."""
+    values = (
+        CompletionValue("older-id", display="Alpha", sort_order=1),
+        CompletionValue("newer-id", display="Zebra", sort_order=0),
+    )
+    manager = CompletionManager((StaticAdapter(CompletionMatch("", "", "/"), values),))
+
+    assert [result.text for result in complete(manager)] == ["/newer-id", "/older-id"]
+
+
 def test_manager_isolates_inactive_and_failed_adapters_and_filters_nonmatches():
     """One unavailable capability cannot suppress valid results from another capability."""
     match = CompletionMatch("hit", "hit")

@@ -19,10 +19,14 @@ class CompletionValue:
     Args:
         value (str): Text inserted into the input.
         description (str): Optional explanation displayed beside the value.
+        display (str | None): Optional label displayed instead of the inserted value.
+        sort_order (int | None): Optional provider-controlled order overriding relevance sorting.
     """
 
     value: str
     description: str = ""
+    display: str | None = None
+    sort_order: int | None = None
 
 
 type CompletionProvider = Callable[[], Iterable[CompletionValue]]
