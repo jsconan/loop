@@ -1,15 +1,21 @@
 """Minimal chat loop: prompt -> query -> output."""
 
 import os
+from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
 from loop import (
+    CommandCompletionAdapter,
     CommandManager,
+    CompletionManager,
+    CompletionValue,
     ConsoleInteraction,
-    Message,
+    MemorySessionStore,
+    MentionManager,
     OpenAIBackend,
-    Session,
+    ProjectPathMentionHandler,
+    SessionManager,
     ShutdownRequested,
     ToolRegistry,
     register_shutdown_signals,
@@ -27,7 +33,32 @@ def main() -> None:
 
     try:
         interaction = ConsoleInteraction()
-        command_manager = CommandManager(interaction=interaction)
+        session_manager = SessionManager(
+            interaction=interaction,
+            session_store=MemorySessionStore(),
+        )
+        command_manager = CommandManager(interaction=interaction, session_manager=session_manager)
+
+        mention_manager = MentionManager((ProjectPathMentionHandler(Path.cwd),))
+        completion_manager = CompletionManager(
+            (
+                CommandCompletionAdapter(
+                    lambda: command_manager.commands,
+                    providers={
+                        "sessions": lambda: (
+                            CompletionValue(
+                                session.id,
+                                str(session.updated_at),
+                                display=session.name,
+                                sort_order=index,
+                            )
+                            for index, session in enumerate(session_manager.store.list())
+                        ),
+                    },
+                ),
+                *mention_manager.completion_adapters,
+            )
+        )
 
         context_window = os.getenv("CONTEXT_WINDOW")
         backend = OpenAIBackend(
@@ -40,19 +71,23 @@ def main() -> None:
 
         interaction.info("Hello from Chat!")
 
-        session = Session()
         while not command_manager.exit_requested:
-            prompt = interaction.input(commands=command_manager.commands)
+            prompt = interaction.input(completer=completion_manager)
             if prompt is False:
                 break
             if command_manager.handle_user_command(prompt):
                 continue
 
-            session.add_message(Message(role="user", content=prompt))
+            try:
+                context = mention_manager.resolve(prompt)
+            except (OSError, UnicodeError, ValueError) as error:
+                interaction.error(str(error))
+                continue
+            session_manager.add_user_message(prompt, context=context)
 
-            events = backend.get_response(input=session.messages, stream=True)
+            events = backend.get_response(input=session_manager.messages, stream=True)
             response = interaction.response(events)
-            session.add_message(response)
+            session_manager.add_response(response)
 
         interaction.conversation_ended()
 
