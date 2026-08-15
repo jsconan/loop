@@ -66,12 +66,12 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
     response.raise_for_status.assert_called_once_with()
     assert confirm.call_args_list == [
         call(
-            "Agent wants to use 'fetch_content' for network.read on "
+            "🌐 Agent wants to use 'fetch_content' for network.read on "
             "'https://example.com/file.txt'. Proceed?",
             default=False,
         ),
         call(
-            "Agent wants to use 'fetch_content' for network.read on "
+            "🌐 Agent wants to use 'fetch_content' for network.read on "
             "'https://example.com/file.txt'. Proceed?",
             default=False,
         ),
@@ -135,11 +135,14 @@ def test_fetch_content_is_bounded_and_cached_for_continuation(monkeypatch):
     assert second["start_byte"] == first["end_byte"]
     assert second["source"] == "https://example.com/large.txt"
     assert "next_start_byte" not in first
-    assert "start_byte" not in next(
-        definition
-        for definition in tool_registry.definitions()
-        if definition.name == "read_cached_content"
-    ).parameters["properties"]
+    assert (
+        "start_byte"
+        not in next(
+            definition
+            for definition in tool_registry.definitions()
+            if definition.name == "read_cached_content"
+        ).parameters["properties"]
+    )
 
 
 def test_fetch_content_rejects_unsupported_or_excessive_responses(monkeypatch):

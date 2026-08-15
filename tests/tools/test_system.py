@@ -70,7 +70,7 @@ def test_run_command_requires_an_affirmative_confirmation(monkeypatch):
 
     assert '"error": "tool_call_denied"' in run_command("echo hello")
     confirm.assert_called_once_with(
-        "Agent wants to use 'run_command' for process.exec on 'echo hello'. Proceed?",
+        "⚙️ Agent wants to use 'run_command' for process.exec on 'echo hello'. Proceed?",
         default=False,
     )
     popen.assert_not_called()

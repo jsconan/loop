@@ -17,6 +17,27 @@ class Capability(StrEnum):
     NETWORK_WRITE = "network.write"
     SESSION_WRITE = "session.write"
 
+    @property
+    def icon(self) -> str:
+        """Return the icon used to identify this capability in permission prompts.
+
+        Returns:
+            str: Icon representing the requested authority.
+        """
+        return _CAPABILITY_ICONS[self]
+
+
+_CAPABILITY_ICONS = {
+    Capability.PURE: "🧠",
+    Capability.FILESYSTEM_READ: "📖",
+    Capability.FILESYSTEM_WRITE: "✏️",
+    Capability.FILESYSTEM_DELETE: "🗑️",
+    Capability.PROCESS_EXEC: "⚙️",
+    Capability.NETWORK_READ: "🌐",
+    Capability.NETWORK_WRITE: "📡",
+    Capability.SESSION_WRITE: "💾",
+}
+
 
 class Decision(StrEnum):
     """Identify the outcome of a permission evaluation."""

@@ -68,7 +68,7 @@ def test_confirm_all_prompts_with_normalized_context(tmp_path, approved, decisio
 
     assert result.decision is decision
     interaction.confirm.assert_called_once_with(
-        "Agent wants to use 'demo' for network.read on 'https://example.com'. "
+        "🌐 Agent wants to use 'demo' for network.read on 'https://example.com'. "
         "Needed for documentation. Proceed?",
         default=False,
     )
@@ -95,7 +95,7 @@ def test_filesystem_prompt_uses_workspace_relative_paths_unless_resource_escapes
 
     displayed = expected if expected is not None else str(absolute_resource)
     interaction.confirm.assert_called_once_with(
-        f"Agent wants to use 'demo' for filesystem.read on '{displayed}'. Proceed?",
+        f"📖 Agent wants to use 'demo' for filesystem.read on '{displayed}'. Proceed?",
         default=False,
     )
 
@@ -109,7 +109,8 @@ def test_filesystem_prompt_identifies_the_workspace_root_unambiguously(tmp_path)
     manager.authorize(request(Capability.FILESYSTEM_READ, resource=str(tmp_path)))
 
     interaction.confirm.assert_called_once_with(
-        f"Agent wants to use 'demo' for filesystem.read on 'workspace root: {tmp_path}'. Proceed?",
+        f"📖 Agent wants to use 'demo' for filesystem.read on "
+        f"'workspace root: {tmp_path}'. Proceed?",
         default=False,
     )
 

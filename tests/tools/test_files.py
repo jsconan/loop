@@ -362,12 +362,12 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
     assert target.read_text(encoding="utf-8") == "saved"
     assert confirm.call_args_list == [
         call(
-            f"Agent wants to use 'write_text_file' for filesystem.write on '{target}'. "
+            f"✏️ Agent wants to use 'write_text_file' for filesystem.write on '{target}'. "
             "Proposed content:\n   1 | blocked Proceed?",
             default=False,
         ),
         call(
-            f"Agent wants to use 'write_text_file' for filesystem.write on '{target}'. "
+            f"✏️ Agent wants to use 'write_text_file' for filesystem.write on '{target}'. "
             "Proposed content:\n   1 | saved Proceed?",
             default=False,
         ),
@@ -438,12 +438,12 @@ def test_delete_path_requires_confirmation_and_removes_files(tmp_path, monkeypat
     assert not target.exists()
     assert confirm.call_args_list == [
         call(
-            f"Agent wants to use 'delete_path' for filesystem.delete on '{target}'. "
+            f"🗑️ Agent wants to use 'delete_path' for filesystem.delete on '{target}'. "
             "Permanently delete this file. Proceed?",
             default=False,
         ),
         call(
-            f"Agent wants to use 'delete_path' for filesystem.delete on '{target}'. "
+            f"🗑️ Agent wants to use 'delete_path' for filesystem.delete on '{target}'. "
             "Permanently delete this file. Proceed?",
             default=False,
         ),
@@ -470,12 +470,12 @@ def test_delete_path_removes_folder_trees_without_following_symbolic_links(tmp_p
     assert target.read_text(encoding="utf-8") == "keep"
     assert confirm.call_args_list == [
         call(
-            f"Agent wants to use 'delete_path' for filesystem.delete on '{folder}'. "
+            f"🗑️ Agent wants to use 'delete_path' for filesystem.delete on '{folder}'. "
             "Permanently delete this folder and all of its contents. Proceed?",
             default=False,
         ),
         call(
-            f"Agent wants to use 'delete_path' for filesystem.delete on '{link}'. "
+            f"🗑️ Agent wants to use 'delete_path' for filesystem.delete on '{link}'. "
             "Permanently delete this symbolic link; its target will not be deleted. "
             "Proceed?",
             default=False,

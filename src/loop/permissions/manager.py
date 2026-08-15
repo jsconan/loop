@@ -291,7 +291,8 @@ class PermissionManager:
         target = f" on '{resource}'" if resource else ""
         reason = f" {request.reason}" if request.reason else ""
         return (
-            f"Agent wants to use '{request.tool_name}' for {request.capability.value}{target}."
+            f"{request.capability.icon} Agent wants to use '{request.tool_name}' for "
+            f"{request.capability.value}{target}."
             f"{reason} Proceed?"
         )
 
