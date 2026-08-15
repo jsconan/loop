@@ -16,6 +16,7 @@ from .builtins import help as help_command
 from .builtins import new as new_command
 from .builtins import permissions as permissions_command
 from .builtins import quit as quit_command
+from .builtins import rename as rename_command
 from .builtins import skills as skills_command
 from .builtins import tools as tools_command
 from .builtins import use as use_command
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 BUILTIN_COMMANDS = (
     help_command,
     new_command,
+    rename_command,
     permissions_command,
     exit_command,
     quit_command,

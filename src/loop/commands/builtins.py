@@ -59,6 +59,19 @@ def new(context: CommandContext) -> None:
     context.interaction.info("Started a new session.")
 
 
+def rename(
+    context: CommandContext,
+    name: Annotated[str, Field(description="New human-readable session name.")],
+) -> None:
+    """Rename the active session."""
+    manager = context.manager
+    if manager is None or manager.session_manager is None:
+        raise ValueError("The rename command requires a SessionManager.")
+    session_manager = manager.session_manager
+    session_manager.rename_session(name)
+    context.interaction.info(f"Renamed session to '{session_manager.session.name}'.")
+
+
 def permissions(
     context: CommandContext,
     operation: Annotated[
