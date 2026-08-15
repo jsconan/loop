@@ -150,6 +150,17 @@ def test_manager_constructs_and_persists_complete_user_messages():
     store.save.assert_called_once_with(session)
 
 
+def test_manager_starts_a_fresh_unpersisted_session():
+    """Starting over replaces active state without creating a stored record."""
+    store = Mock(spec=SessionStore)
+    manager = SessionManager(session=Session(id="old"), session_store=store)
+
+    manager.new_session()
+
+    assert manager.session == Session()
+    store.save.assert_not_called()
+
+
 def test_manager_adds_a_tool_result_with_its_instruction_state():
     """Tool results and their effective instruction state are persisted together."""
     store = Mock(spec=SessionStore)

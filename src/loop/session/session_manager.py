@@ -141,6 +141,10 @@ class SessionManager:
                         artifact.reloadable,
                     )
 
+    def new_session(self) -> None:
+        """Replace the active session with a fresh unpersisted session."""
+        self._session = Session()
+
     def add_message(self, message: ConversationItem | Response) -> None:
         """Add conversation items and persist the resulting complete session.
 

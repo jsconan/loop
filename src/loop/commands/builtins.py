@@ -49,6 +49,16 @@ def help(context: CommandContext) -> None:  # pylint: disable=redefined-builtin
     context.interaction.table(commands, title="Available commands:", prefix="  /")
 
 
+def new(context: CommandContext) -> None:
+    """Start a fresh unpersisted session."""
+    manager = context.manager
+    if manager is None or manager.session_manager is None:
+        raise ValueError("The new command requires a SessionManager.")
+    session_manager = manager.session_manager
+    session_manager.new_session()
+    context.interaction.info("Started a new session.")
+
+
 def permissions(
     context: CommandContext,
     operation: Annotated[

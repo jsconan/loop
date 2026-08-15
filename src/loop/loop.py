@@ -119,6 +119,7 @@ class Loop:
             permission_manager=self._permission_manager,
             instructions_manager=self._instructions_manager,
             tool_registry=self._backend.tool_registry,
+            session_manager=self._session_manager,
         )
         self._mention_manager = mention_manager or MentionManager(
             (

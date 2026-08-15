@@ -37,6 +37,7 @@ def test_manager_registers_builtins_before_declared_and_discovered_commands():
 
     assert [item.name for item in manager.commands] == [
         "help",
+        "new",
         "permissions",
         "exit",
         "quit",
@@ -47,7 +48,7 @@ def test_manager_registers_builtins_before_declared_and_discovered_commands():
         "explicit",
         "discovered",
     ]
-    assert manager.commands[8] is explicit
+    assert manager.commands[9] is explicit
     assert manager.exit_requested is False
 
 

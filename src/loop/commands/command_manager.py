@@ -13,6 +13,7 @@ from ..context import CommandContext
 from .builtins import call as call_command
 from .builtins import exit as exit_command
 from .builtins import help as help_command
+from .builtins import new as new_command
 from .builtins import permissions as permissions_command
 from .builtins import quit as quit_command
 from .builtins import skills as skills_command
@@ -25,12 +26,14 @@ from .utils import get_command_arguments_model, takes_command_context
 if TYPE_CHECKING:
     from ..interaction import Interaction
     from ..permissions import PermissionManager
+    from ..session import SessionManager
     from ..skills import InstructionsManager, SkillManager
     from ..tooling import ToolRegistry
 
 
 BUILTIN_COMMANDS = (
     help_command,
+    new_command,
     permissions_command,
     exit_command,
     quit_command,
@@ -57,6 +60,8 @@ class CommandManager:
             It can be omitted if instructions_manager is provided, as it will be used to access
             the skill manager.
         tool_registry (ToolRegistry | None): Tool catalog exposed to tool-discovery commands.
+        session_manager (SessionManager | None): Session lifecycle owner exposed to session
+            commands.
 
     Raises:
         ValueError: If a command name is invalid or registered more than once.
@@ -70,6 +75,7 @@ class CommandManager:
     _instructions_manager: InstructionsManager | None
     _skill_manager: SkillManager | None
     _tool_registry: ToolRegistry | None
+    _session_manager: SessionManager | None
 
     def __init__(
         self,
@@ -79,6 +85,7 @@ class CommandManager:
         instructions_manager: InstructionsManager | None = None,
         skill_manager: SkillManager | None = None,
         tool_registry: ToolRegistry | None = None,
+        session_manager: SessionManager | None = None,
     ) -> None:
         self._commands = {}
         self._exit_requested = False
@@ -91,6 +98,7 @@ class CommandManager:
             else skill_manager
         )
         self._tool_registry = tool_registry
+        self._session_manager = session_manager
         for command in (*BUILTIN_COMMANDS, *(commands or ())):
             self.register(command)
 
@@ -148,6 +156,15 @@ class CommandManager:
             ToolRegistry | None: The configured tool registry, or ``None`` when unavailable.
         """
         return self._tool_registry
+
+    @property
+    def session_manager(self) -> SessionManager | None:
+        """Return the session lifecycle owner exposed to commands.
+
+        Returns:
+            SessionManager | None: Configured session manager, or ``None`` when unavailable.
+        """
+        return self._session_manager
 
     @property
     def exit_requested(self) -> bool:
