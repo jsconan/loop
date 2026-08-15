@@ -1,15 +1,18 @@
 """Define conversation and response models."""
 
+import json
+import re
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from json import JSONDecodeError, loads
 from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
 
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 StructuredOutputValidator: TypeAlias = Callable[[JsonValue], Any]
+
+_JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE | re.DOTALL)
 
 
 class StructuredOutputValidationError(ValueError):
@@ -116,11 +119,39 @@ class StructuredOutputFormat:
             model=model,
         )
 
+    @staticmethod
+    def _normalize_structured_text(text: str) -> str:
+        """Return the text stripped of whitespace and fenced code blocks."""
+        stripped = text.strip()
+        fenced = _JSON_FENCE.fullmatch(stripped)
+        return fenced.group(1) if fenced is not None else stripped
+
+    def _single_string_field(self) -> str | None:
+        """Return the single string field name when the schema is a single string property."""
+        properties = self.schema.get("properties")
+        if self.model is not None and isinstance(properties, Mapping) and len(properties) == 1:
+            field_name, field_schema = next(iter(properties.items()))
+            if isinstance(field_schema, Mapping) and field_schema.get("type") == "string":
+                return field_name
+        return None
+
+    def _decode_structured_text(self, text: str) -> JsonValue:
+        """Decode JSON from the text."""
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            if (string_field := self._single_string_field()) is not None:
+                return {string_field: text}
+            raise
+        if (string_field := self._single_string_field()) is not None and isinstance(value, str):
+            return {string_field: value}
+        return value
+
     def validate(self, text: str) -> Any:
-        """Decode and validate completed response text.
+        """Decode and validate completed JSON response text.
 
         Args:
-            text (str): Complete JSON response text.
+            text (str): Complete raw JSON or JSON-fenced response text.
 
         Returns:
             Any: Pydantic model, callback result, or decoded JSON value.
@@ -129,13 +160,14 @@ class StructuredOutputFormat:
             StructuredOutputValidationError: If JSON decoding or configured validation fails.
         """
         try:
-            value = loads(text)
+            payload = self._normalize_structured_text(text)
+            value = self._decode_structured_text(payload)
             if self.model is not None:
                 return self.model.model_validate(value)
             if self.validator is not None:
                 return self.validator(value)
             return value
-        except (JSONDecodeError, ValueError, TypeError) as error:
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
             raise StructuredOutputValidationError(
                 f"Response does not satisfy structured output format {self.name!r}: {error}"
             ) from error

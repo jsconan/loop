@@ -34,6 +34,18 @@ class Directory(BaseModel):
     nickname: str | None = None
 
 
+class Title(BaseModel):
+    """Represent a one-field structured text response."""
+
+    title: str
+
+
+class Count(BaseModel):
+    """Represent a one-field non-text response."""
+
+    count: int
+
+
 def test_models_serialize_nested_values_to_python_and_json() -> None:
     """Models recursively expose their content as Python and JSON values."""
     response = Response(
@@ -84,7 +96,7 @@ def test_conversation_items_expose_optional_response_metadata() -> None:
 
 
 def test_structured_output_format_retains_and_uses_a_pydantic_model() -> None:
-    """Model-derived formats generate schemas and return validated model instances."""
+    """Model formats generate schemas and validate raw or fenced JSON responses."""
     output_format = StructuredOutputFormat.from_model(
         Person,
         name="person_record",
@@ -98,6 +110,12 @@ def test_structured_output_format_retains_and_uses_a_pydantic_model() -> None:
     assert output_format.schema["additionalProperties"] is False
     assert output_format.schema["required"] == ["name", "age"]
     assert output_format.validate('{"name":"Ada","age":36}') == Person(name="Ada", age=36)
+    assert output_format.validate(
+        '\n```json\n{"name":"Grace","age":37}\n```\n'
+    ) == Person(name="Grace", age=37)
+    assert output_format.validate(
+        '```\n{"name":"Linus","age":38}\n```'
+    ) == Person(name="Linus", age=38)
     assert StructuredOutputFormat.from_model(Person).name == "Person"
     assert StructuredOutputFormat.from_model(Person, strict=False).schema == (
         Person.model_json_schema()
@@ -131,6 +149,21 @@ def test_structured_output_format_uses_a_callback_or_returns_decoded_json() -> N
     assert StructuredOutputFormat(name="numbers", schema=schema).validate("[1, 2]") == [1, 2]
 
 
+def test_single_string_field_format_accepts_scalar_provider_fallbacks() -> None:
+    """One-field text models tolerate JSON-string and plain-text provider fallbacks."""
+    output_format = StructuredOutputFormat.from_model(Title, name="session_name")
+
+    assert output_format.validate('"JSON string title"') == Title(title="JSON string title")
+    assert output_format.validate("\n\nOverview of naming.py session generation'\n") == Title(
+        title="Overview of naming.py session generation'"
+    )
+    assert output_format.validate("```\nPlain fenced title\n```") == Title(
+        title="Plain fenced title"
+    )
+    with pytest.raises(StructuredOutputValidationError, match="Count"):
+        StructuredOutputFormat.from_model(Count).validate("plain text")
+
+
 @pytest.mark.parametrize(
     "output_format",
     [
@@ -148,6 +181,19 @@ def test_structured_output_format_wraps_decoding_and_validation_errors(output_fo
 
     with pytest.raises(StructuredOutputValidationError, match=output_format.name):
         output_format.validate(text)
+
+
+def test_structured_output_format_rejects_json_embedded_in_markdown() -> None:
+    """Structured validation does not extract JSON from prose or non-JSON fences."""
+    output_format = StructuredOutputFormat.from_model(Person)
+
+    for text in (
+        'Result: {"name":"Ada","age":36}',
+        '```text\n{"name":"Ada","age":36}\n```',
+        '```json\n{"name":"Ada","age":36}\n```\nMore text',
+    ):
+        with pytest.raises(StructuredOutputValidationError, match="Person"):
+            output_format.validate(text)
 
 
 def test_structured_output_format_rejects_invalid_configuration() -> None:
