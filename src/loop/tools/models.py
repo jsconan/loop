@@ -1,6 +1,6 @@
 """Define passive file-tool models."""
 
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from ..utils import BoundedTextContent
 
@@ -23,3 +23,4 @@ class CachedContentResult(BoundedTextContent):
 
     handle: str
     source: str
+    next_cursor: NotRequired[str]

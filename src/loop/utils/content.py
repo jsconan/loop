@@ -1,5 +1,7 @@
 """Bound textual tool content and retain oversized artifacts outside model context."""
 
+import base64
+import binascii
 import json
 from codecs import getincrementaldecoder
 from collections.abc import Iterable
@@ -16,6 +18,57 @@ _SOURCES: dict[str, str] = {}
 _METADATA: dict[str, CachedContentMetadata] = {}
 _LOCK = RLock()
 _SCAN_CHUNK_BYTES = 8 * 1024
+
+
+def encode_content_cursor(handle: str, start_byte: int) -> str:
+    """Encode an opaque continuation cursor for cached content.
+
+    Args:
+        handle (str): Canonical handle identifying the cached content.
+        start_byte (int): Non-negative byte offset at which reading should resume.
+
+    Returns:
+        str: URL-safe opaque continuation cursor bound to ``handle``.
+
+    Raises:
+        ValueError: If the handle or byte offset is invalid.
+    """
+    _validate_handle(handle)
+    if start_byte < 0:
+        raise ValueError("Content cursor byte offset must be non-negative.")
+    payload = json.dumps([1, handle, start_byte], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def decode_content_cursor(cursor: str, handle: str) -> int:
+    """Decode a cached-content cursor and return its byte offset.
+
+    Args:
+        cursor (str): Opaque cursor previously returned for cached content.
+        handle (str): Canonical handle of the content being read.
+
+    Returns:
+        int: Non-negative byte offset at which reading should resume.
+
+    Raises:
+        ValueError: If the cursor is malformed, unsupported, or belongs to another handle.
+    """
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        payload = base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
+        value = json.loads(payload)
+        version, cursor_handle, start_byte = value
+        if (
+            version != 1
+            or cursor_handle != handle
+            or not isinstance(start_byte, int)
+            or isinstance(start_byte, bool)
+            or start_byte < 0
+        ):
+            raise ValueError
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("Invalid cached content cursor.") from exc
+    return start_byte
 
 
 def _validate_handle(handle: str) -> None:
@@ -172,7 +225,8 @@ def bound_tool_result(output: str, source: str) -> tuple[str, str | None]:
                 "truncated": True,
                 "truncation_reason": "tool_result_limit",
                 "handle": handle,
-                "message": "Use read_cached_content with this handle to continue reading.",
+                "next_cursor": encode_content_cursor(handle, len(preview.encode("utf-8"))),
+                "message": "Use read_cached_content with this handle and cursor to continue.",
             }
         )
         if len(result.encode("utf-8")) <= constants.MAX_TOOL_RESULT_BYTES:

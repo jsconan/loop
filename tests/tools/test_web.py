@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call
 
 from loop import ConsoleInteraction, tool_registry
 from loop.utils import cached_path as resolve_cached_path
+from loop.utils import encode_content_cursor
 
 
 def stream_response(content, *, content_type="text/plain"):
@@ -125,15 +126,20 @@ def test_fetch_content_is_bounded_and_cached_for_continuation(monkeypatch):
     second = json.loads(
         read_cached_content(
             first["handle"],
-            start_byte=first["next_start_byte"],
-            start_line=None,
+            cursor=first["next_cursor"],
         )
     )
 
     assert first["included_bytes"] <= 16 * 1024
     assert first["truncated"] is True
-    assert second["start_byte"] == first["next_start_byte"]
+    assert second["start_byte"] == first["end_byte"]
     assert second["source"] == "https://example.com/large.txt"
+    assert "next_start_byte" not in first
+    assert "start_byte" not in next(
+        definition
+        for definition in tool_registry.definitions()
+        if definition.name == "read_cached_content"
+    ).parameters["properties"]
 
 
 def test_fetch_content_rejects_unsupported_or_excessive_responses(monkeypatch):
@@ -192,16 +198,24 @@ def test_read_cached_content_reloads_an_expired_web_artifact_with_authorization(
     assert stream.call_count == 2
 
 
-def test_read_cached_content_reports_invalid_ranges(monkeypatch):
-    """Cached reads convert invalid range combinations into readable tool errors."""
+def test_read_cached_content_reports_invalid_cursors_and_selectors(monkeypatch):
+    """Cached reads reject malformed cursors and conflicting selectors."""
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     response = stream_response(b"cached")
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
     fetched = json.loads(fetch_content("https://example.com/content.txt"))
 
-    result = read_cached_content(fetched["handle"], start_byte=1)
+    malformed = read_cached_content(fetched["handle"], cursor="invalid")
+    conflicting = read_cached_content(
+        fetched["handle"], cursor=fetched.get("next_cursor", "invalid"), start_line=1
+    )
+    beyond_end = read_cached_content(
+        fetched["handle"], cursor=encode_content_cursor(fetched["handle"], 7)
+    )
 
-    assert "either start_byte or start_line" in result
+    assert "Invalid cached content cursor" in malformed
+    assert "either cursor or start_line" in conflicting
+    assert "beyond the end" in beyond_end
 
 
 def test_fetch_content_rejects_non_http_urls(monkeypatch):

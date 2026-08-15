@@ -9,12 +9,34 @@ from pydantic import Field, HttpUrl
 from .. import constants
 from ..permissions import Capability, PermissionRequest
 from ..tooling import tool_registry
-from ..utils import cached_metadata, cached_path, read_bounded_text, store_text_stream
+from ..utils import (
+    BoundedTextContent,
+    cached_metadata,
+    cached_path,
+    decode_content_cursor,
+    encode_content_cursor,
+    read_bounded_text,
+    store_text_stream,
+)
 from .models import CachedContentResult
 
 _DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
 )
+
+
+def _cached_result(
+    handle: str,
+    source: str,
+    content: BoundedTextContent,
+) -> CachedContentResult:
+    """Add cached-content identity and an opaque continuation cursor."""
+    next_start_byte = content.pop("next_start_byte", None)
+    content.pop("next_start_line", None)
+    result = CachedContentResult(handle=handle, source=source, **content)
+    if next_start_byte is not None:
+        result["next_cursor"] = encode_content_cursor(handle, next_start_byte)
+    return result
 
 
 def _network_permission(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
@@ -96,11 +118,7 @@ def fetch_content(
         if resolved is None:  # pragma: no cover - store and resolve are atomic
             raise RuntimeError("Fetched content could not be cached.")
         path, source = resolved
-        return CachedContentResult(
-            handle=handle,
-            source=source,
-            **read_bounded_text(path),
-        )
+        return _cached_result(handle, source, read_bounded_text(path))
     except Exception as exc:  # pylint: disable=broad-except
         return f"Error fetching content: {exc}"
 
@@ -108,16 +126,14 @@ def fetch_content(
 @tool_registry.tool(permission_resolver=_cached_content_permission)
 def read_cached_content(
     handle: Annotated[str, Field(description="Opaque handle returned by a bounded tool result.")],
-    start_byte: Annotated[
-        int | None,
-        Field(
-            description="Zero-based byte offset; start_line may remain 1 only at byte zero.", ge=0
-        ),
+    cursor: Annotated[
+        str | None,
+        Field(description="Opaque continuation cursor returned by a previous content result."),
     ] = None,
     start_line: Annotated[
         int | None,
-        Field(description="One-based starting line; set to null for byte access.", ge=1),
-    ] = 1,
+        Field(description="Optional one-based starting line for deliberate random access.", ge=1),
+    ] = None,
     max_lines: Annotated[
         int | None,
         Field(
@@ -145,13 +161,18 @@ def read_cached_content(
             if resolved is None:  # pragma: no cover - cache writes and lookup are atomic
                 raise RuntimeError("Reloaded content could not be cached.")
         path, source = resolved
-        return CachedContentResult(
-            handle=handle,
-            source=source,
-            **read_bounded_text(
+        if cursor is not None and start_line is not None:
+            raise ValueError("Specify either cursor or start_line, not both.")
+        start_byte = decode_content_cursor(cursor, handle) if cursor is not None else None
+        if start_byte is not None and start_byte > path.stat().st_size:
+            raise ValueError("Cached content cursor is beyond the end of the content.")
+        return _cached_result(
+            handle,
+            source,
+            read_bounded_text(
                 path,
                 start_byte=start_byte,
-                start_line=start_line,
+                start_line=None if start_byte is not None else start_line,
                 max_lines=max_lines,
                 max_bytes=max_bytes,
             ),

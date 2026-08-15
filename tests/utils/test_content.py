@@ -9,6 +9,8 @@ from loop.utils.content import (
     bound_tool_result,
     cached_metadata,
     cached_path,
+    decode_content_cursor,
+    encode_content_cursor,
     read_bounded_text,
     register_cached_metadata,
     store_content,
@@ -72,6 +74,22 @@ def test_tool_results_remain_unchanged_or_become_bounded_artifacts():
     assert handle == payload["handle"]
     assert len(bounded.encode()) <= constants.MAX_TOOL_RESULT_BYTES
     assert payload["truncated"] is True
+    assert decode_content_cursor(payload["next_cursor"], handle) == payload["included_bytes"]
+
+
+def test_content_cursors_are_opaque_handle_bound_offsets():
+    """Content cursors round-trip offsets and reject invalid inputs or other handles."""
+    handle = store_content("text", "source")
+    other_handle = store_content("other", "other source")
+    cursor = encode_content_cursor(handle, 3)
+
+    assert decode_content_cursor(cursor, handle) == 3
+    with pytest.raises(ValueError, match="non-negative"):
+        encode_content_cursor(handle, -1)
+    with pytest.raises(ValueError, match="Invalid cached content cursor"):
+        decode_content_cursor(cursor, other_handle)
+    with pytest.raises(ValueError, match="Invalid cached content cursor"):
+        decode_content_cursor("invalid", handle)
 
 
 @pytest.mark.parametrize(

@@ -310,14 +310,15 @@ The default registry exposes these functions to the model:
 | `delete_path`          | Permanently deletes an authorized file, symbolic link, or folder tree    |
 | `get_current_datetime` | Returns the current local date and time                                  |
 | `fetch_content`        | Streams authorized HTTP(S) text into a bounded resumable cache           |
-| `read_cached_content`  | Reads cached ranges, optionally re-fetching an expired authorized URL    |
+| `read_cached_content`  | Reads cached text by line or opaque cursor, optionally re-fetching a URL |
 | `run_command`          | Runs an authorized shell command with a 30-second timeout                |
 | `manage_skills`        | Manages skill activation and progressively loads bounded skill resources |
 
 Text reads report exact source and included byte sizes, returned ranges, truncation reasons, and
 continuation positions. File reads also report line ranges while retaining the byte ceiling. As a
 final safeguard, any serialized tool result above 20 KiB is cached outside conversation history;
-the session receives only a bounded preview and an opaque `read_cached_content` handle.
+the session receives only a bounded preview plus an opaque `read_cached_content` handle and
+continuation cursor.
 Web artifact handles retain source metadata on their persisted session tool result and recover
 automatically after cache expiry or session resume; re-fetching is independently authorized as a
 network read. Other artifact types remain process-local because they do not have a reproducible
