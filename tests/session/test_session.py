@@ -18,6 +18,7 @@ from loop import (
     UnsupportedConversationItemError,
     Usage,
 )
+from loop.session.models import SESSION_NAME_SOURCE_INITIAL, SESSION_NAME_SOURCE_USER
 
 
 def function_call() -> ToolCall:
@@ -34,9 +35,9 @@ def test_session_info_describes_a_persisted_session():
     """Session summaries expose stable persistence metadata."""
     updated_at = datetime(2026, 8, 4, tzinfo=UTC)
 
-    info = SessionInfo(id="session-id", updated_at=updated_at, message_count=2)
+    info = SessionInfo(id="session-id", name="Useful title", updated_at=updated_at, message_count=2)
 
-    assert info == SessionInfo("session-id", updated_at, 2)
+    assert info == SessionInfo("session-id", "Useful title", updated_at, 2)
 
 
 def test_session_adds_one_or_multiple_messages():
@@ -49,6 +50,54 @@ def test_session_adds_one_or_multiple_messages():
     session.add_messages(message for message in [function_call(), answer])
 
     assert session.messages == [user, function_call(), answer]
+
+
+def test_session_rename_validates_name_and_source():
+    """Session renaming rejects empty names and unknown provenance values."""
+    session = Session()
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        session.rename("  ")
+    with pytest.raises(ValueError, match="Invalid session name source"):
+        session.rename("Valid", source="unknown")
+
+
+def test_session_has_name_returns_false_when_no_name_or_source():
+    """A freshly created session has no name and no source."""
+    session = Session()
+
+    assert session.has_name() is False
+
+
+def test_session_has_name_returns_true_when_name_and_source_set():
+    """A renamed session has both a name and a source, so has_name is true."""
+    session = Session()
+    session.rename("My Session", source=SESSION_NAME_SOURCE_USER)
+
+    assert session.has_name() is True
+
+
+def test_session_has_initial_name_returns_false_when_no_source():
+    """A session with no name source does not have an initial name."""
+    session = Session()
+
+    assert session.has_initial_name() is False
+
+
+def test_session_has_initial_name_returns_true_after_initial_rename():
+    """A session renamed with the initial source reports has_initial_name as true."""
+    session = Session()
+    session.rename("Draft", source=SESSION_NAME_SOURCE_INITIAL)
+
+    assert session.has_initial_name() is True
+
+
+def test_session_has_initial_name_returns_false_for_non_initial_sources():
+    """A session renamed with a non-initial source reports has_initial_name as false."""
+    session = Session()
+    session.rename("My Session", source=SESSION_NAME_SOURCE_USER)
+
+    assert session.has_initial_name() is False
 
 
 def test_session_updates_instruction_state():
@@ -159,7 +208,7 @@ def test_session_round_trips_instruction_context_and_reads_version_one_defaults(
     assert Session.deserialize(session.serialize()) == session
     restored = Session.deserialize('{"version":1,"messages":[],"tokens":0,"model":null}')
     assert restored.instruction_working_directory is None
-    assert restored.active_skills == []
+    assert not restored.active_skills
 
 
 def test_session_serialization_identifies_unsupported_item_types():
@@ -178,7 +227,7 @@ def test_session_serialization_identifies_unsupported_item_types():
     [
         ("not-json", "Invalid serialized session"),
         ("[]", "Invalid serialized session"),
-        ('{"version":3,"messages":[],"tokens":0,"model":null}', "Unsupported session version 3"),
+        ('{"version":4,"messages":[],"tokens":0,"model":null}', "Unsupported session version 4"),
         ('{"messages":[],"tokens":0,"model":null}', "Unsupported session version None"),
         (
             '{"version":1,"messages":[{"type":"message","data":{}}],"tokens":0,"model":null}',
@@ -188,6 +237,16 @@ def test_session_serialization_identifies_unsupported_item_types():
         ('{"version":1,"messages":[],"tokens":-1,"model":null}', "Invalid serialized session"),
         ('{"version":1,"messages":[],"tokens":0,"model":42}', "Invalid serialized session"),
         ('{"version":1,"messages":null,"tokens":0,"model":null}', "Invalid serialized session"),
+        (
+            '{"version":3,"name":"","name_source":"initial","messages":[],"tokens":0,'
+            '"model":null,"instruction_working_directory":null,"active_skills":[]}',
+            "Invalid serialized session",
+        ),
+        (
+            '{"version":3,"name":"name","name_source":"unknown","messages":[],"tokens":0,'
+            '"model":null,"instruction_working_directory":null,"active_skills":[]}',
+            r"Invalid session name source ''unknown''\.",
+        ),
         (
             '{"version":2,"messages":[],"tokens":0,"model":null,'
             '"instruction_working_directory":42,"active_skills":[]}',

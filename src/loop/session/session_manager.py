@@ -13,6 +13,8 @@ from ..models import (
     ToolResult,
 )
 from ..utils import bound_tool_result, cached_metadata, register_cached_metadata
+from .models import SESSION_NAME_SOURCE_GENERATED, SESSION_NAME_SOURCE_INITIAL, SessionNameGenerator
+from .naming import initial_session_name
 from .session import Session, SessionStore
 from .store import MemorySessionStore
 
@@ -145,6 +147,50 @@ class SessionManager:
         """Replace the active session with a fresh unpersisted session."""
         self._session = Session()
 
+    def rename_session(self, name: str) -> None:
+        """Assign and persist a user-controlled name to the active session.
+
+        Args:
+            name (str): New non-empty session name.
+
+        Raises:
+            ValueError: If the name is empty after normalization.
+        """
+        self._session.rename(name)
+        self._session_store.save(self._session)
+
+    def generate_session_name(
+        self,
+        generator: SessionNameGenerator,
+    ) -> None:
+        """Generate a session name from the first completed exchange.
+
+        Args:
+            generator (SessionNameGenerator): Auxiliary title generation service.
+        """
+        user_message = next(
+            (
+                message.content
+                for message in self._session.messages
+                if isinstance(message, Message) and message.role == "user"
+            ),
+            "",
+        )
+        assistant_message = next(
+            (
+                message.content
+                for message in self._session.messages
+                if isinstance(message, Message) and message.role == "assistant"
+            ),
+            "",
+        )
+        if not user_message or not assistant_message.strip():
+            return
+        name = generator.generate(user_message, assistant_message, self._session.model)
+        if name:
+            self._session.rename(name, source=SESSION_NAME_SOURCE_GENERATED)
+            self._session_store.save(self._session)
+
     def add_message(self, message: ConversationItem | Response) -> None:
         """Add conversation items and persist the resulting complete session.
 
@@ -181,6 +227,8 @@ class SessionManager:
             context (Iterable[ContextReference]): Resolved context snapshots attached to the
                 message. Defaults to no explicit context.
         """
+        if self._session.name is None:
+            self._session.rename(initial_session_name(content), source=SESSION_NAME_SOURCE_INITIAL)
         self.add_message(Message(role="user", content=content, context=tuple(context)))
 
     def add_tool_call(

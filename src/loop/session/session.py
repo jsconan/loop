@@ -8,10 +8,18 @@ from typing import Protocol, Self
 from pydantic import ValidationError
 
 from ..models import ConversationItem, Message, Reasoning, Response, ToolCall, ToolResult
-from .models import SerializedMessage, SerializedSession, SessionInfo
+from .models import (
+    SESSION_NAME_SOURCE_INITIAL,
+    SESSION_NAME_SOURCE_USER,
+    SerializedMessage,
+    SerializedSession,
+    SessionInfo,
+    SessionNameSource,
+)
+from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 2
-_SUPPORTED_VERSIONS = (1, _SCHEMA_VERSION)
+_SCHEMA_VERSION = 3
+_SUPPORTED_VERSIONS = (1, 2, _SCHEMA_VERSION)
 _ITEM_TYPES = {
     "message": Message,
     "reasoning": Reasoning,
@@ -35,6 +43,8 @@ class Session:
 
     Args:
         id (str): Persistent session identifier.
+        name (str | None): Human-readable display name, or ``None`` before the first message.
+        name_source (SessionNameSource | None): Origin controlling automatic replacement.
         messages (list[ConversationItem]): Conversation items.
             Defaults to an empty list.
         tokens (int): Total tokens in the context after the latest response.
@@ -48,6 +58,8 @@ class Session:
     """
 
     id: str | None = None
+    name: str | None = None
+    name_source: SessionNameSource | None = None
     messages: list[ConversationItem] = field(default_factory=list)
     tokens: int = 0
     model: str | None = None
@@ -67,6 +79,39 @@ class Session:
         """
         self.instruction_working_directory = working_directory
         self.active_skills = list(active_skills)
+
+    def has_name(self) -> bool:
+        """Return whether the session has a human-readable name.
+
+        Returns:
+            bool: ``True`` if the session has a name, ``False`` otherwise.
+        """
+        return self.name is not None and self.name_source is not None
+
+    def has_initial_name(self) -> bool:
+        """Return whether the session has a provisional name from the first user message.
+
+        Returns:
+            bool: ``True`` if the session name is provisional, ``False`` otherwise.
+        """
+        return self.name_source == SESSION_NAME_SOURCE_INITIAL
+
+    def rename(self, name: str, source: SessionNameSource = SESSION_NAME_SOURCE_USER) -> None:
+        """Replace the human-readable session name.
+
+        Args:
+            name (str): New non-empty name.
+            source (SessionNameSource): Origin of the new name. Defaults to ``"user"``.
+
+        Raises:
+            ValueError: If the name is empty after normalization or the source is invalid.
+        """
+        normalized = normalize_session_name(name)
+        if not normalized:
+            raise ValueError("Session name cannot be empty.")
+        validate_session_source(source)
+        self.name = normalized
+        self.name_source = source
 
     def add_message(self, message: ConversationItem | Response) -> None:
         """Add one message to the conversation history.
@@ -130,6 +175,8 @@ class Session:
         return json.dumps(
             SerializedSession(
                 version=_SCHEMA_VERSION,
+                name=self.name,
+                name_source=self.name_source,
                 messages=messages,
                 tokens=self.tokens,
                 model=self.model,
@@ -138,6 +185,33 @@ class Session:
             ),
             separators=(",", ":"),
         )
+
+    @classmethod
+    def _deserialize_name(
+        cls,
+        version: int,
+        payload: dict,
+        messages: list[ConversationItem],
+    ) -> tuple[str | None, SessionNameSource | None]:
+        """Return validated name metadata from one supported snapshot."""
+        if version < 3:
+            first_user_message = next(
+                (
+                    message.content
+                    for message in messages
+                    if isinstance(message, Message) and message.role == "user"
+                ),
+                "",
+            )
+            name = initial_session_name(first_user_message) if first_user_message else None
+            name_source = SESSION_NAME_SOURCE_INITIAL if name is not None else None
+            return name, name_source
+        name = payload["name"]
+        name_source = payload["name_source"]
+        if name is not None and (not isinstance(name, str) or not normalize_session_name(name)):
+            raise TypeError("Invalid serialized session name.")
+        validate_session_source(name_source, allow_none=True)
+        return name, name_source
 
     @classmethod
     def deserialize(cls, value: str) -> Self:
@@ -185,6 +259,7 @@ class Session:
             else:
                 instruction_working_directory = payload["instruction_working_directory"]
                 active_skills = payload["active_skills"]
+            name, name_source = cls._deserialize_name(version, payload, messages)
 
             if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
                 raise TypeError("Invalid tokens count.")
@@ -206,6 +281,8 @@ class Session:
             raise ValueError("Invalid serialized session.") from error
 
         return cls(
+            name=name,
+            name_source=name_source,
             messages=messages,
             tokens=tokens,
             model=model,

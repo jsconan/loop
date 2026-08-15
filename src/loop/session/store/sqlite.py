@@ -6,7 +6,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid7
 
-from ..models import SessionInfo
+from ...models import Message
+from ..models import SESSION_NAME_SOURCE_INITIAL, SessionInfo
+from ..naming import initial_session_name
 from ..session import Session, SessionNotFoundError
 
 
@@ -43,6 +45,9 @@ class SQLiteSessionStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         if session.id is None:
             session.id = str(uuid7())
+        if session.name is None:
+            session.name = initial_session_name()
+            session.name_source = SESSION_NAME_SOURCE_INITIAL
 
         now = datetime.now(UTC).isoformat()
         payload = session.serialize()
@@ -51,14 +56,25 @@ class SQLiteSessionStore:
                 self._create_schema(connection)
                 connection.execute(
                     """
-                    INSERT INTO sessions (id, created_at, updated_at, message_count, session)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO sessions
+                        (id, name, name_source, created_at, updated_at, message_count, session)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
+                        name_source = excluded.name_source,
                         updated_at = excluded.updated_at,
                         message_count = excluded.message_count,
                         session = excluded.session
                     """,
-                    (session.id, now, now, len(session.messages), payload),
+                    (
+                        session.id,
+                        session.name,
+                        session.name_source or SESSION_NAME_SOURCE_INITIAL,
+                        now,
+                        now,
+                        len(session.messages),
+                        payload,
+                    ),
                 )
         return session.id
 
@@ -83,12 +99,14 @@ class SQLiteSessionStore:
         with closing(sqlite3.connect(self._path)) as connection:
             self._create_schema(connection)
             row = connection.execute(
-                "SELECT session FROM sessions WHERE id = ?", (session_id,)
+                "SELECT name, name_source, session FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
         if row is None:
             raise SessionNotFoundError(f"Session '{session_id}' was not found.")
-        session = Session.deserialize(row[0])
+        session = Session.deserialize(row[2])
         session.id = session_id
+        session.name = row[0]
+        session.name_source = row[1]
         return session
 
     def list(self) -> list[SessionInfo]:
@@ -103,13 +121,18 @@ class SQLiteSessionStore:
             self._create_schema(connection)
             rows = connection.execute(
                 """
-                SELECT id, updated_at, message_count
+                SELECT id, name, updated_at, message_count
                 FROM sessions
                 ORDER BY updated_at DESC, id DESC
                 """
             ).fetchall()
         return [
-            SessionInfo(id=row[0], updated_at=datetime.fromisoformat(row[1]), message_count=row[2])
+            SessionInfo(
+                id=row[0],
+                name=row[1],
+                updated_at=datetime.fromisoformat(row[2]),
+                message_count=row[3],
+            )
             for row in rows
         ]
 
@@ -120,6 +143,8 @@ class SQLiteSessionStore:
             """
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                name_source TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 message_count INTEGER NOT NULL,
@@ -127,3 +152,30 @@ class SQLiteSessionStore:
             )
             """
         )
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "name" not in columns:
+            connection.execute("ALTER TABLE sessions ADD COLUMN name TEXT")
+        if "name_source" not in columns:
+            connection.execute("ALTER TABLE sessions ADD COLUMN name_source TEXT")
+        rows = connection.execute(
+            "SELECT id, session FROM sessions WHERE name IS NULL OR name_source IS NULL"
+        ).fetchall()
+        for session_id, payload in rows:
+            session = Session.deserialize(payload)
+            first_message = next(
+                (
+                    message.content
+                    for message in session.messages
+                    if isinstance(message, Message) and message.role == "user"
+                ),
+                "",
+            )
+            name = session.name or initial_session_name(first_message)
+            connection.execute(
+                "UPDATE sessions SET name = ?, name_source = ? WHERE id = ?",
+                (name, session.name_source or SESSION_NAME_SOURCE_INITIAL, session_id),
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS sessions_name_idx ON sessions(name COLLATE NOCASE)"
+        )
+        connection.commit()

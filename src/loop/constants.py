@@ -10,6 +10,11 @@ GIT_DIRECTORY = Path(".git")
 
 # Session-related constants
 SESSION_DATABASE_FILENAME = "sessions.db"
+DEFAULT_SESSION_NAME = "Untitled session"
+INITIAL_SESSION_NAME_MAX_CHARS = 48
+SESSION_NAME_MAX_CHARS = 80
+SESSION_TITLE_CONTEXT_MAX_CHARS = 500
+SESSION_TITLE_MAX_WORDS = 6
 
 # Permissions-related constants
 PERMISSIONS_FILENAME = "permissions.yaml"

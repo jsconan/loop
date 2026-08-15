@@ -83,6 +83,30 @@ def test_store_lists_most_recent_sessions_first(tmp_path):
         store.load("unknown")
 
 
+def test_store_migrates_and_names_existing_sessions(tmp_path):
+    """Opening a legacy database backfills display names without losing snapshots."""
+    path = tmp_path / "sessions.db"
+    session = Session(messages=[Message(role="user", content="Recover legacy sessions")])
+    payload = session.serialize()
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    message_count INTEGER NOT NULL, session TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+                ("legacy", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", 1, payload),
+            )
+
+    store = SQLiteSessionStore(path)
+
+    assert store.list()[0].name == "Recover legacy sessions"
+    assert store.load("legacy").name == "Recover legacy sessions"
+
+
 @pytest.mark.parametrize(
     "payload",
     [

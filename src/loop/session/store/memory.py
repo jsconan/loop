@@ -3,7 +3,8 @@
 from datetime import UTC, datetime
 from uuid import uuid7
 
-from ..models import SessionInfo, StoredSession
+from ..models import SESSION_NAME_SOURCE_INITIAL, SessionInfo, StoredSession
+from ..naming import initial_session_name
 from ..session import Session, SessionNotFoundError
 
 
@@ -29,17 +30,24 @@ class MemorySessionStore:
         """
         if session.id is None:
             session.id = str(uuid7())
+        if session.name is None:
+            session.name = initial_session_name()
+            session.name_source = SESSION_NAME_SOURCE_INITIAL
         now = datetime.now(UTC)
 
         stored_session = self._find_session(session.id)
         if stored_session:
             stored_session["updated_at"] = now
             stored_session["message_count"] = len(session.messages)
+            stored_session["name"] = session.name
+            stored_session["name_source"] = session.name_source or SESSION_NAME_SOURCE_INITIAL
             stored_session["session"] = session.serialize()
         else:
             self._sessions.append(
                 StoredSession(
                     id=session.id,
+                    name=session.name,
+                    name_source=session.name_source or SESSION_NAME_SOURCE_INITIAL,
                     created_at=now,
                     updated_at=now,
                     message_count=len(session.messages),
@@ -68,6 +76,8 @@ class MemorySessionStore:
             raise SessionNotFoundError(f"Session '{session_id}' was not found.")
         session = Session.deserialize(stored_session["session"])
         session.id = session_id
+        session.name = stored_session["name"]
+        session.name_source = stored_session["name_source"]
         return session
 
     def list(self) -> list[SessionInfo]:
@@ -82,6 +92,7 @@ class MemorySessionStore:
         return [
             SessionInfo(
                 id=session["id"],
+                name=session["name"],
                 updated_at=session["updated_at"],
                 message_count=session["message_count"],
             )

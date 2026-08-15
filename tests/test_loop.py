@@ -299,6 +299,25 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
     assert loop.session.model == "served-model"
 
 
+def test_run_does_not_generate_a_name_for_an_already_named_session(tmp_path):
+    """Completed queries retain a non-provisional session name at the loop boundary."""
+    interaction = output_interaction()
+    interaction.input.side_effect = ["hello", False]
+    generator = Mock()
+    loop = Loop(
+        backend=loop_backend(get_response=Mock(return_value=[ResponseCompleted()])),
+        working_directory=tmp_path,
+        interaction=interaction,
+        session=Session(name="My session", name_source="user"),
+        session_name_generator=generator,
+    )
+
+    loop.run()
+
+    generator.generate.assert_not_called()
+    assert loop.session.name == "My session"
+
+
 def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
     """A caller that omits persistence keeps completed queries entirely in memory."""
     interaction = output_interaction()

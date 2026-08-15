@@ -19,7 +19,7 @@ from .models import (
     ResponseEvent,
 )
 from .permissions import PermissionManager
-from .session import Session, SessionManager
+from .session import BackendSessionNameGenerator, Session, SessionManager, SessionNameGenerator
 from .skills import InstructionsManager
 from .utils import find_project_root
 
@@ -46,6 +46,8 @@ class Loop:
             Defaults to a fresh session; an injected store persists it after its first query.
         session_manager (SessionManager | None): Manager used to persist and retrieve sessions.
             Defaults to an instance-local memory store when ``None`` is provided.
+        session_name_generator (SessionNameGenerator | None): Service used to improve the
+            provisional name after the first response. Defaults to the conversation backend.
         stream (bool): Whether the backend should produce response events incrementally.
         debug (bool): Whether to print raw response events.
 
@@ -65,6 +67,7 @@ class Loop:
     _command_manager: CommandManager
     _permission_manager: PermissionManager
     _completion_manager: CompletionManager
+    _session_name_generator: SessionNameGenerator
     _mention_manager: MentionManager
 
     def __init__(
@@ -80,6 +83,7 @@ class Loop:
         agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
         session: Session | str | None = None,
         session_manager: SessionManager | None = None,
+        session_name_generator: SessionNameGenerator | None = None,
         stream: bool = False,
         debug: bool = False,
     ) -> None:
@@ -94,6 +98,9 @@ class Loop:
             )
         self._interaction = interaction or self._session_manager.interaction
         self._backend = backend
+        self._session_name_generator = session_name_generator or BackendSessionNameGenerator(
+            backend
+        )
 
         restored_directory = self._session_manager.session.instruction_working_directory
         self._working_directory = Path(
@@ -302,6 +309,14 @@ class Loop:
 
                 if not self.handle_tool_calls(response):
                     break
+
+            if self._session_manager.session.has_initial_name():
+                try:
+                    self._interaction.info("Generating a session name...")
+                    self._session_manager.generate_session_name(self._session_name_generator)
+                    self._interaction.info(f"Session name: {self._session_manager.session.name}")
+                except Exception as error:  # pylint: disable=broad-exception-caught
+                    self._interaction.warning(f"Could not generate the session name: {error}")
 
             self._interaction.token_usage(
                 self._session_manager.model,

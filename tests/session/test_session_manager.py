@@ -147,13 +147,65 @@ def test_manager_constructs_and_persists_complete_user_messages():
     assert manager.messages == [
         Message(role="user", content="Review @app.py", context=(reference,))
     ]
+    assert session.name == "Review @app.py"
+    assert session.name_source == "initial"
     store.save.assert_called_once_with(session)
+
+
+def test_manager_generates_names_regardless_of_the_current_name_source():
+    """A completed exchange may replace both provisional and user-controlled names."""
+    store = Mock(spec=SessionStore)
+    generator = Mock()
+    generator.generate.return_value = "Review application architecture"
+    session = Session()
+    manager = SessionManager(session=session, session_store=store)
+    manager.add_user_message("Please review this app")
+    manager.add_message(Message(role="assistant", content="The architecture is sound."))
+
+    manager.generate_session_name(generator)
+
+    assert session.name == "Review application architecture"
+    assert session.name_source == "generated"
+    generator.generate.assert_called_once_with(
+        "Please review this app", "The architecture is sound.", None
+    )
+    manager.rename_session("My review")
+    manager.generate_session_name(generator)
+    assert session.name == "Review application architecture"
+    assert session.name_source == "generated"
+    assert generator.generate.call_count == 2
+    assert store.save.call_count == 5
+
+
+def test_manager_keeps_provisional_name_without_a_usable_exchange_or_generated_name():
+    """Missing exchange text and empty generation results do not cause extra persistence."""
+    store = Mock(spec=SessionStore)
+    generator = Mock()
+    generator.generate.return_value = None
+    session = Session(name="Initial", name_source="initial")
+    manager = SessionManager(session=session, session_store=store)
+
+    manager.add_user_message("question")
+    manager.generate_session_name(generator)
+    manager.add_message(Message(role="assistant", content="answer"))
+    manager.generate_session_name(generator)
+
+    assert session.name == "Initial"
+    generator.generate.assert_called_once_with("question", "answer", None)
+    assert store.save.call_count == 2
+
+    empty = SessionManager(
+        session=Session(name="Initial", name_source="initial"), session_store=store
+    )
+    empty.generate_session_name(generator)
 
 
 def test_manager_starts_a_fresh_unpersisted_session():
     """Starting over replaces active state without creating a stored record."""
     store = Mock(spec=SessionStore)
-    manager = SessionManager(session=Session(id="old"), session_store=store)
+    manager = SessionManager(
+        session=Session(id="old", name="Old", name_source="user"), session_store=store
+    )
 
     manager.new_session()
 
