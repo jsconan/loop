@@ -172,7 +172,7 @@ def test_resume_command_reports_an_unknown_session_id(tmp_path):
 
 def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(tmp_path):
     """Mentioned files are attached and mentioned skill instructions enter the first request."""
-    source = tmp_path / "app.py"
+    source = tmp_path / "my app.py"
     source.write_text("print('hello')\n", encoding="utf-8")
     location = tmp_path / "skills" / "review" / "SKILL.md"
     location.parent.mkdir(parents=True)
@@ -188,7 +188,7 @@ def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(t
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
-    interaction.input.side_effect = ["Use $review on @app.py", False]
+    interaction.input.side_effect = ['Use $review on @"my app.py"', False]
 
     loop = Loop(
         backend=backend,
@@ -201,11 +201,11 @@ def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(t
     message = backend.get_response.call_args.kwargs["input"][0]
     assert message == Message(
         role="user",
-        content="Use $review on @app.py",
+        content='Use $review on @"my app.py"',
         context=(
             ContextReference(
                 kind="file",
-                path="app.py",
+                path="my app.py",
                 content="print('hello')\n",
                 size_bytes=15,
                 included_bytes=15,

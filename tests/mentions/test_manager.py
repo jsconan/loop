@@ -37,11 +37,11 @@ def test_manager_dispatches_only_exact_mentions_to_injected_handlers():
 
 def test_manager_dispatches_each_target_once_in_first_mention_order():
     """The registry guarantees unique values even for handlers that do not deduplicate."""
-    files = handler("@", ("file.py", "other.py"))
+    files = handler("@", ("my file.py", "other.py"))
 
-    MentionManager((files,)).resolve("@file.py @other.py @file.py")
+    MentionManager((files,)).resolve("@my file.py @other.py @[my file.py]")
 
-    files.resolve.assert_called_once_with(("file.py", "other.py"))
+    files.resolve.assert_called_once_with(("my file.py", "other.py"))
 
 
 def test_manager_skips_unmentioned_handlers_and_accepts_an_empty_registry():

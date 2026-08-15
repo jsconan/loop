@@ -249,6 +249,32 @@ def test_skill_mentions_work_in_prose_and_require_a_token_boundary(tmp_path):
     assert complete(completer, "plain text") == []
 
 
+def test_marker_completion_quotes_spaces_and_continues_inside_delimiters():
+    """Multi-word targets insert quotes and remain completable inside supported delimiters."""
+    completer = CompletionManager(
+        (MarkerCompletionAdapter("$", lambda: (CompletionValue("code review"),)),)
+    )
+
+    bare = complete(completer, "Use $code")
+    quoted = complete(completer, 'Use $"code rev')
+    single_quoted = complete(completer, "Use $'code rev")
+    bracketed = complete(completer, "Use $[code rev")
+
+    assert [(item.text, item.start_position) for item in bare] == [('$"code review"', -5)]
+    assert [(item.text, item.start_position) for item in quoted] == [('$"code review"', -10)]
+    assert [(item.text, item.start_position) for item in single_quoted] == [("$'code review'", -10)]
+    assert [(item.text, item.start_position) for item in bracketed] == [("$[code review]", -10)]
+    assert complete(completer, 'Use $"code review"') == []
+    assert complete(completer, "Use $[code review]") == []
+
+    escaped = CompletionManager(
+        (MarkerCompletionAdapter("$", lambda: (CompletionValue('say "hi" \\ now'),)),)
+    )
+    assert [item.text for item in complete(escaped, r'Use $"say \"hi\" \\ n')] == [
+        '$"say \\"hi\\" \\\\ now"'
+    ]
+
+
 def test_project_path_completion_caches_paths_until_ttl_expires(monkeypatch, tmp_path):
     """Project path completion reuses short-lived snapshots and refreshes after expiry."""
     (tmp_path / "src").mkdir()
