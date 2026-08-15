@@ -3,7 +3,7 @@
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from prompt_toolkit.document import Document
@@ -51,11 +51,11 @@ def loop_backend(**attributes):
     return SimpleNamespace(**(defaults | attributes))
 
 
-def output_interaction() -> Mock:
+def output_interaction() -> MagicMock:
     """Build an interaction mock that executes the base response collector."""
-    interaction = Mock(spec=Interaction)
-    interaction.response.return_value = nullcontext()
-    interaction.output.side_effect = lambda events, **kwargs: Interaction.output(
+    interaction = MagicMock(spec=Interaction)
+    interaction.response_context.return_value = nullcontext()
+    interaction.response.side_effect = lambda events, **kwargs: Interaction.response(
         interaction, events, **kwargs
     )
     interaction.confirm.return_value = True
@@ -65,7 +65,7 @@ def output_interaction() -> Mock:
 def test_loop_exposes_its_configured_state(tmp_path):
     """Loop accessors expose configured dependencies and mutable state."""
     backend = loop_backend()
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
     loop = Loop(
         backend=backend,
         model="requested-model",
@@ -92,7 +92,7 @@ def test_loop_exposes_its_configured_state(tmp_path):
 
 def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
     """Interactive input receives adapters for current commands, files, skills, and tools."""
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
     interaction.input.return_value = False
     skill = Skill("review", "Review code.", tmp_path / "skills" / "review" / "SKILL.md")
     instructions = InstructionsManager(
@@ -134,7 +134,7 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
 
 def test_resume_command_loads_a_persisted_session_id(tmp_path):
     """Submitting a persisted session ID resumes it without completion state."""
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
     interaction.input.side_effect = ["/resume internal-id", False]
     store = SQLiteSessionStore(tmp_path / "sessions.db")
     selected = Session(id="internal-id", name="Alpha session", name_source="user")
@@ -155,7 +155,7 @@ def test_resume_command_loads_a_persisted_session_id(tmp_path):
 
 def test_resume_command_reports_an_unknown_session_id(tmp_path):
     """An unknown session ID is rejected through normal command feedback."""
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
     interaction.input.side_effect = ["/resume missing-id", False]
     sessions = SessionManager(interaction=interaction)
     loop = Loop(
@@ -222,7 +222,7 @@ def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
     path = tmp_path / "binary.bin"
     path.write_bytes(b"bad\0data")
     backend = Mock(tool_registry=ToolRegistry(), default_model="model")
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
     interaction.input.side_effect = ["Read @binary.bin", False]
     loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
 
@@ -238,7 +238,7 @@ def test_loop_uses_an_injected_mention_registry(tmp_path):
     mentions = Mock(spec=MentionManager)
     mentions.completion_adapters = ()
     mentions.resolve.return_value = ()
-    backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+    backend = MagicMock(tool_registry=ToolRegistry(), default_model="model")
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
@@ -380,7 +380,7 @@ def test_loop_delegates_a_session_identifier_to_an_injected_manager():
     stored = Session(messages=[Message(role="user", content="saved")])
     manager = Mock(spec=SessionManager)
     manager.session = stored
-    manager.interaction = Mock(spec=Interaction)
+    manager.interaction = MagicMock(spec=Interaction)
 
     loop = Loop(backend=loop_backend(), session="session-id", session_manager=manager)
 
@@ -415,7 +415,7 @@ def test_loop_uses_an_injected_manager_session_without_reloading_it():
 def test_loop_prefers_an_explicit_interaction_over_the_manager_interaction():
     """An explicit interaction controls loop I/O when a manager is also supplied."""
     manager = SessionManager(interaction=Mock(spec=Interaction))
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
 
     loop = Loop(backend=loop_backend(), interaction=interaction, session_manager=manager)
 
@@ -658,7 +658,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
 def test_run_keeps_handled_commands_out_of_model_history():
     """The runner skips every command consumed by its command manager."""
     backend = Mock(tool_registry=ToolRegistry(), default_model="model")
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
     interaction.input.side_effect = ["/help", "/missing", False]
 
     loop = Loop(backend=backend, interaction=interaction)
@@ -672,7 +672,7 @@ def test_run_keeps_handled_commands_out_of_model_history():
 def test_run_exit_commands_end_the_conversation(command):
     """Predefined slash exit commands terminate without a backend request."""
     backend = Mock(tool_registry=ToolRegistry(), default_model="model")
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
     interaction.input.return_value = command
 
     loop = Loop(backend=backend, interaction=interaction)
@@ -689,7 +689,7 @@ def test_handle_tool_calls_delegates_session_updates():
     registry.call.return_value = "tool result"
     backend = loop_backend(tool_registry=registry, get_response=Mock(return_value=[]))
     session_manager = Mock(spec=SessionManager)
-    session_manager.interaction = Mock(spec=Interaction)
+    session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
     loop = Loop(backend=backend, session_manager=session_manager)
     call = function_call()
@@ -729,7 +729,7 @@ def test_query_delegates_instruction_state_to_the_session_manager():
     """Queries delegate their prepared instruction state to the session manager."""
     backend = loop_backend(get_response=Mock(return_value=[]))
     session_manager = Mock(spec=SessionManager)
-    session_manager.interaction = Mock(spec=Interaction)
+    session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
     session_manager.messages = []
     loop = Loop(backend=backend, session_manager=session_manager)
@@ -764,6 +764,6 @@ def test_query_rejects_missing_model_selection():
 
 def test_end_uses_the_injected_interaction():
     """Conversation termination is delegated to the configured interaction."""
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
     Loop(backend=loop_backend(), interaction=interaction).end()
     interaction.conversation_ended.assert_called_once_with()

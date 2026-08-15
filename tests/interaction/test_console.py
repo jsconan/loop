@@ -412,7 +412,7 @@ def test_output_styles_prioritize_answers_over_diagnostics():
 def test_response_scope_terminates_streamed_output(capsys):
     """A response scope terminates streamed output before subsequent presentation."""
     interaction = ConsoleInteraction()
-    with interaction.response():
+    with interaction.response_context():
         interaction.answer_delta("partial", start=True)
     interaction.conversation_ended()
 
@@ -422,7 +422,7 @@ def test_response_scope_terminates_streamed_output(capsys):
 def test_response_scope_does_not_extend_complete_output(capsys):
     """A response scope adds no separator when output already terminates itself."""
     interaction = ConsoleInteraction()
-    with interaction.response():
+    with interaction.response_context():
         interaction.answer("complete")
 
     assert capsys.readouterr().out == "\nAnswer:complete\n"
@@ -433,7 +433,7 @@ def test_response_scope_terminates_streamed_output_after_an_error(capsys):
     interaction = ConsoleInteraction()
 
     with pytest.raises(RuntimeError, match="failed"):
-        with interaction.response():
+        with interaction.response_context():
             interaction.answer_delta("partial", start=True)
             raise RuntimeError("failed")
 

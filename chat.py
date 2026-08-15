@@ -51,7 +51,7 @@ def main() -> None:
             session.add_message(Message(role="user", content=prompt))
 
             events = backend.get_response(input=session.messages, stream=True)
-            response = interaction.output(events)
+            response = interaction.response(events)
             session.add_message(response)
 
         interaction.conversation_ended()

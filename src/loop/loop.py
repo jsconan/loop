@@ -313,7 +313,7 @@ class Loop:
 
             while True:
                 events = self.query()
-                response = self._interaction.output(events, debug=self._debug)
+                response = self._interaction.response(events, debug=self._debug)
                 self._session_manager.add_response(response)
 
                 if not self.handle_tool_calls(response):

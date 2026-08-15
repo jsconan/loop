@@ -2,7 +2,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import MagicMock, call
 
 from loop import (
     AnswerCompleted,
@@ -21,9 +21,9 @@ from loop import (
 )
 
 
-def interaction_mock() -> Mock:
+def interaction_mock() -> MagicMock:
     """Build an interaction mock backed by a no-op response scope."""
-    interaction = Mock(spec=Interaction)
+    interaction = MagicMock(spec=Interaction)
     interaction.response.return_value = nullcontext()
     return interaction
 
@@ -53,7 +53,7 @@ def test_output_uses_terminal_response_text():
         ),
     ]
 
-    response = Interaction.output(interaction, events, debug=True)
+    response = Interaction.response(interaction, events, debug=True)
 
     assert response == Response(
         answer="  hello world  ",
@@ -68,7 +68,7 @@ def test_output_uses_terminal_response_text():
     assert interaction.reasoning_delta.call_args_list[1].kwargs == {"start": False}
     assert interaction.answer_delta.call_args_list[0].kwargs == {"start": True}
     assert interaction.answer_delta.call_args_list[1].kwargs == {"start": False}
-    interaction.response.assert_called_once_with()
+    interaction.response_context.assert_called_once_with()
     assert interaction.debug.call_count == len(events)
 
 
@@ -76,7 +76,7 @@ def test_output_displays_non_streaming_completed_text():
     """Completed text is displayed directly when no streaming deltas were received."""
     interaction = interaction_mock()
 
-    response = Interaction.output(
+    response = Interaction.response(
         interaction,
         [
             ReasoningCompleted(text="think"),
@@ -88,17 +88,17 @@ def test_output_displays_non_streaming_completed_text():
     assert response == Response(answer="answer", reasoning="think")
     interaction.reasoning.assert_called_once_with("think")
     interaction.answer.assert_called_once_with("answer")
-    interaction.response.assert_called_once_with()
+    interaction.response_context.assert_called_once_with()
 
 
 def test_empty_output_returns_an_empty_response():
     """A completion without reported metadata returns default response values."""
     interaction = interaction_mock()
 
-    response = Interaction.output(interaction, [ResponseCompleted()])
+    response = Interaction.response(interaction, [ResponseCompleted()])
 
     assert response == Response(answer="", reasoning="")
-    interaction.response.assert_called_once_with()
+    interaction.response_context.assert_called_once_with()
 
 
 def test_history_replays_visible_conversation_items_in_order():

@@ -29,7 +29,7 @@ class Interaction(ABC):
     """Provide semantically classified user interaction independently of a UI."""
 
     @abstractmethod
-    def response(self) -> AbstractContextManager[None]:
+    def response_context(self) -> AbstractContextManager[None]:
         """Create a presentation scope for one model response.
 
         Returns:
@@ -204,7 +204,7 @@ class Interaction(ABC):
             bool: Whether the user approved the operation.
         """
 
-    def output(self, events: Iterable[ResponseEvent], *, debug: bool = False) -> Response:
+    def response(self, events: Iterable[ResponseEvent], *, debug: bool = False) -> Response:
         """Display and collect normalized response events.
 
         Args:
@@ -224,7 +224,7 @@ class Interaction(ABC):
         reasoning_started = False
         answer_started = False
 
-        with self.response():
+        with self.response_context():
             for event in events:
                 if debug:
                     self.debug(event)

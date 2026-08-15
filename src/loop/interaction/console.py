@@ -41,7 +41,7 @@ class ConsoleInteraction(Interaction):
         self._streamed_output = False
 
     @contextmanager
-    def response(self) -> Generator[None]:
+    def response_context(self) -> Generator[None]:
         """Present one model response and finalize streamed output.
 
         Yields:
