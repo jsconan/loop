@@ -16,6 +16,9 @@ from loop import (
     Skill,
     SkillManager,
     Tool,
+    Session,
+    SessionManager,
+    MemorySessionStore,
 )
 from loop.commands import call as call_command
 from loop.commands import exit as exit_command
@@ -25,6 +28,10 @@ from loop.commands import quit as quit_command
 from loop.commands import skills as skills_command
 from loop.commands import tools as tools_command
 from loop.commands import use as use_command
+from loop.commands import new as new_command
+from loop.commands import rename as rename_command
+from loop.commands import resume as resume_command
+from loop.commands import sessions as sessions_command
 
 
 def test_help_displays_slash_prefixed_command_catalog():
@@ -62,6 +69,59 @@ def test_permissions_command_shows_and_changes_local_policy(tmp_path):
     loaded = PermissionManager(tmp_path)
     assert loaded.configuration.mode is PermissionMode.READ_ONLY
     assert loaded.configuration.rules[0].tool == "read_*"
+
+
+def test_session_commands_list_resume_reset_and_rename_sessions():
+    """Session commands render metadata and resume directly by persisted ID."""
+    interaction = Mock(spec=Interaction)
+    store = MemorySessionStore()
+    first = Session(name="First topic", name_source="user")
+    first_id = store.save(first)
+    manager = SessionManager(session_store=store)
+    command_manager = CommandManager(
+        interaction=interaction,
+        session_manager=manager,
+    )
+    context = CommandContext("sessions", interaction, command_manager)
+
+    sessions_command(context)
+    resume_command(context, first_id)
+    rename_command(context, "Renamed topic")
+    new_command(context)
+
+    assert interaction.table.call_args.kwargs["columns"] == (
+        "name", "updated_at", "message_count"
+    )
+    assert store.load(first_id).name == "Renamed topic"
+    assert manager.session == Session()
+
+
+@pytest.mark.parametrize(
+    "function,arguments",
+    [
+        (sessions_command, ()),
+        (resume_command, ("session name",)),
+        (new_command, ()),
+        (rename_command, ("name",)),
+    ],
+)
+def test_session_commands_require_a_session_manager(function, arguments):
+    """Session commands reject invocation without session lifecycle state."""
+    context = CommandContext("session", Mock(spec=Interaction))
+
+    with pytest.raises(ValueError, match="requires a SessionManager"):
+        function(context, *arguments)
+
+
+def test_resume_reports_ids_missing_from_session_state():
+    """Resume reports a selected ID that is absent from persisted session state."""
+    interaction = Mock(spec=Interaction)
+    manager = SessionManager()
+    command_manager = CommandManager(interaction=interaction, session_manager=manager)
+    context = CommandContext("resume", interaction, command_manager)
+
+    with pytest.raises(CommandArgumentError, match="Session 'missing-id' was not found"):
+        resume_command(context, "missing-id")
 
 
 def test_permissions_command_adds_session_rules_and_validates_usage():

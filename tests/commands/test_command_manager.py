@@ -40,6 +40,7 @@ def test_manager_registers_builtins_before_declared_and_discovered_commands():
         "new",
         "rename",
         "sessions",
+        "resume",
         "permissions",
         "exit",
         "quit",

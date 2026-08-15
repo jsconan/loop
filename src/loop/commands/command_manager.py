@@ -17,6 +17,7 @@ from .builtins import new as new_command
 from .builtins import permissions as permissions_command
 from .builtins import quit as quit_command
 from .builtins import rename as rename_command
+from .builtins import resume as resume_command
 from .builtins import sessions as sessions_command
 from .builtins import skills as skills_command
 from .builtins import tools as tools_command
@@ -38,6 +39,7 @@ BUILTIN_COMMANDS = (
     new_command,
     rename_command,
     sessions_command,
+    resume_command,
     permissions_command,
     exit_command,
     quit_command,

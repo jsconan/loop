@@ -99,7 +99,8 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
         skill_manager=SkillManager([skill]), working_directory=tmp_path
     )
     store = SQLiteSessionStore(tmp_path / "sessions.db")
-    store.save(Session(id="stored-session"))
+    store.save(Session(id="older-session", name="Alpha session", name_source="user"))
+    store.save(Session(id="newer-session", name="Zebra session", name_source="user"))
     session_manager = SessionManager(interaction=interaction, session_store=store)
     registry = ToolRegistry()
 
@@ -126,6 +127,47 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
     assert values("/he") == ["/help"]
     assert values("$rev") == ["$review"]
     assert values("/permissions add allow ins") == ["inspect"]
+    resume = list(completer.get_completions(Document("/resume "), Mock()))
+    assert [item.text for item in resume] == ["newer-session", "older-session"]
+    assert [item.display_text for item in resume] == ["Zebra session", "Alpha session"]
+
+
+def test_resume_command_loads_a_persisted_session_id(tmp_path):
+    """Submitting a persisted session ID resumes it without completion state."""
+    interaction = Mock(spec=Interaction)
+    interaction.input.side_effect = ["/resume internal-id", False]
+    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    selected = Session(id="internal-id", name="Alpha session", name_source="user")
+    store.save(selected)
+    sessions = SessionManager(interaction=interaction, session_store=store)
+    loop = Loop(
+        backend=loop_backend(),
+        interaction=interaction,
+        session_manager=sessions,
+        working_directory=tmp_path,
+    )
+
+    loop.run()
+
+    assert sessions.session.id == "internal-id"
+    assert interaction.input.call_args_list[0].args == ()
+
+
+def test_resume_command_reports_an_unknown_session_id(tmp_path):
+    """An unknown session ID is rejected through normal command feedback."""
+    interaction = Mock(spec=Interaction)
+    interaction.input.side_effect = ["/resume missing-id", False]
+    sessions = SessionManager(interaction=interaction)
+    loop = Loop(
+        backend=loop_backend(),
+        interaction=interaction,
+        session_manager=sessions,
+        working_directory=tmp_path,
+    )
+
+    loop.run()
+
+    assert "Session 'missing-id' was not found" in interaction.warning.call_args.args[0]
 
 
 def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(tmp_path):

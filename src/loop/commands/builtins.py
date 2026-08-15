@@ -26,6 +26,7 @@ _CALL_COMPLETION = CommandCompletion(
     next=CommandCompletion(schema_provider="tool_arguments"),
 )
 _USE_COMPLETION = CommandCompletion(provider="skills")
+_RESUME_COMPLETION = CommandCompletion(provider="sessions")
 _DECISION_COMPLETION = CommandCompletion(
     values=_values(Decision),
     children={decision.value: _TOOL_COMPLETION for decision in Decision},
@@ -70,6 +71,22 @@ def rename(
     session_manager = manager.session_manager
     session_manager.rename_session(name)
     context.interaction.info(f"Renamed session to '{session_manager.session.name}'.")
+
+
+def resume(
+    context: CommandContext,
+    session_id: Annotated[str, Field(description="Exact persisted session ID.")],
+) -> None:
+    """Resume a persisted session."""
+    manager = context.manager
+    if manager is None or manager.session_manager is None:
+        raise ValueError("The resume command requires a SessionManager.")
+    session_manager = manager.session_manager
+    try:
+        session_manager.load_session(session_id)
+    except ValueError as error:
+        raise CommandArgumentError(str(error)) from error
+    context.interaction.info(f"Resumed session '{session_manager.session.name}'.")
 
 
 def sessions(context: CommandContext) -> None:
@@ -238,3 +255,4 @@ def quit(context: CommandContext) -> None:  # pylint: disable=redefined-builtin,
 setattr(permissions, COMPLETION_ATTRIBUTE, _PERMISSIONS_COMPLETION)
 setattr(use, COMPLETION_ATTRIBUTE, _USE_COMPLETION)
 setattr(call, COMPLETION_ATTRIBUTE, _CALL_COMPLETION)
+setattr(resume, COMPLETION_ATTRIBUTE, _RESUME_COMPLETION)

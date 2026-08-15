@@ -147,6 +147,15 @@ class Loop:
                             CompletionValue(skill.name, skill.description)
                             for skill in self._instructions_manager.skill_manager.skills
                         ),
+                        "sessions": lambda: (
+                            CompletionValue(
+                                session.id,
+                                str(session.updated_at),
+                                display=session.name,
+                                sort_order=index,
+                            )
+                            for index, session in enumerate(self._session_manager.store.list())
+                        ),
                     },
                     schema_providers={
                         "tool_arguments": lambda tokens: next(
