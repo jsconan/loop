@@ -11,11 +11,15 @@ from .. import constants
 from ..models import (
     AnswerCompleted,
     AnswerDelta,
+    ConversationItem,
+    Message,
+    Reasoning,
     ReasoningCompleted,
     ReasoningDelta,
     Response,
     ResponseCompleted,
     ResponseEvent,
+    ToolCall,
     ToolCallCompleted,
     Usage,
 )
@@ -48,6 +52,14 @@ class Interaction(ABC):
         Returns:
             str | False: The stripped text entered by the user, or ``False`` when the user
             requests to exit.
+        """
+
+    @abstractmethod
+    def user(self, message: str) -> None:
+        """Display a completed user message.
+
+        Args:
+            message (str): Complete user message text to display.
         """
 
     @abstractmethod
@@ -258,3 +270,20 @@ class Interaction(ABC):
             model=model,
             structured_output=structured_output,
         )
+
+    def history(self, items: Iterable[ConversationItem]) -> None:
+        """Display persisted conversation items as prior interaction.
+
+        Args:
+            items (Iterable[ConversationItem]): Ordered conversation items to replay.
+        """
+        for item in items:
+            if isinstance(item, Message):
+                display = self.user if item.role == "user" else self.answer
+                display(item.content)
+                continue
+            if isinstance(item, Reasoning):
+                self.reasoning(item.content)
+                continue
+            if isinstance(item, ToolCall):
+                self.tool_call(item.name, item.arguments)

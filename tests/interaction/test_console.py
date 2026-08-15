@@ -62,6 +62,13 @@ def test_input_returns_false_when_the_prompt_is_interrupted(error):
     assert ConsoleInteraction(session=session).input() is False
 
 
+def test_user_message_has_a_console_presentation(capsys):
+    """Completed user messages retain the interactive prompt label."""
+    ConsoleInteraction().user("complete")
+
+    assert capsys.readouterr().out == "\nYou: complete\n"
+
+
 @pytest.mark.parametrize(
     ("method", "expected"),
     [

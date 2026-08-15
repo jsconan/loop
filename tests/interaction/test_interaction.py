@@ -2,7 +2,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 from loop import (
     AnswerCompleted,
@@ -16,6 +16,7 @@ from loop import (
     ResponseCompleted,
     ToolCall,
     ToolCallCompleted,
+    ToolResult,
     Usage,
 )
 
@@ -98,3 +99,25 @@ def test_empty_output_returns_an_empty_response():
 
     assert response == Response(answer="", reasoning="")
     interaction.response.assert_called_once_with()
+
+
+def test_history_replays_visible_conversation_items_in_order():
+    """Persisted history mirrors live output and omits undisplayed tool results."""
+    interaction = interaction_mock()
+    items = (
+        Message(role="user", content="question"),
+        Reasoning(content="thought"),
+        ToolCall(call_id="known", name="search", arguments='{"query":"term"}'),
+        ToolResult(call_id="known", output="result"),
+        ToolResult(call_id="missing", output="orphaned"),
+        Message(role="assistant", content="answer"),
+    )
+
+    Interaction.history(interaction, items)
+
+    assert interaction.method_calls == [
+        call.user("question"),
+        call.reasoning("thought"),
+        call.tool_call("search", '{"query":"term"}'),
+        call.answer("answer"),
+    ]

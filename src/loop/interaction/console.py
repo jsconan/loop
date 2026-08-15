@@ -88,6 +88,15 @@ class ConsoleInteraction(Interaction):
                 return False
             return user_input
 
+    def user(self, message: str) -> None:
+        """Write a completed user message to the terminal.
+
+        Args:
+            message (str): Complete user message text to write.
+        """
+        self._console.print("\nYou:", end=" ", style="bold bright_blue", markup=False)
+        self._console.print(message, markup=False, highlight=False)
+
     def _reasoning_heading(self) -> None:
         """Write a reasoning heading to the terminal."""
         self._console.print("\nThinking...\n", style="dim cyan", markup=False)

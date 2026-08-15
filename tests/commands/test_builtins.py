@@ -10,28 +10,29 @@ from loop import (
     CommandManager,
     InstructionsManager,
     Interaction,
+    MemorySessionStore,
+    Message,
     PermissionConfiguration,
     PermissionManager,
     PermissionMode,
+    Session,
+    SessionManager,
     Skill,
     SkillManager,
     Tool,
-    Session,
-    SessionManager,
-    MemorySessionStore,
 )
 from loop.commands import call as call_command
 from loop.commands import exit as exit_command
 from loop.commands import help as help_command
+from loop.commands import new as new_command
 from loop.commands import permissions as permissions_command
 from loop.commands import quit as quit_command
-from loop.commands import skills as skills_command
-from loop.commands import tools as tools_command
-from loop.commands import use as use_command
-from loop.commands import new as new_command
 from loop.commands import rename as rename_command
 from loop.commands import resume as resume_command
 from loop.commands import sessions as sessions_command
+from loop.commands import skills as skills_command
+from loop.commands import tools as tools_command
+from loop.commands import use as use_command
 
 
 def test_help_displays_slash_prefixed_command_catalog():
@@ -75,7 +76,8 @@ def test_session_commands_list_resume_reset_and_rename_sessions():
     """Session commands render metadata and resume directly by persisted ID."""
     interaction = Mock(spec=Interaction)
     store = MemorySessionStore()
-    first = Session(name="First topic", name_source="user")
+    first = Session(name="First topic", name_source="user", model="served-model", tokens=1234)
+    first.add_message(Message(role="user", content="Prior question"))
     first_id = store.save(first)
     manager = SessionManager(session_store=store)
     command_manager = CommandManager(
@@ -89,9 +91,22 @@ def test_session_commands_list_resume_reset_and_rename_sessions():
     rename_command(context, "Renamed topic")
     new_command(context)
 
-    assert interaction.table.call_args.kwargs["columns"] == (
-        "name", "updated_at", "message_count"
-    )
+    assert interaction.table.call_args.kwargs["columns"] == ("name", "updated_at", "message_count")
+    interaction.history.assert_called_once_with(first.messages)
+    interaction.token_usage.assert_called_once_with("served-model", 1234, None)
+    assert [item.args[0] for item in interaction.info.call_args_list[:2]] == [
+        "Restoring session history for 'First topic'...",
+        "Resumed session 'First topic'.",
+    ]
+    resume_calls = [
+        item for item in interaction.method_calls if item[0] in {"info", "history", "token_usage"}
+    ]
+    assert [item[0] for item in resume_calls[:4]] == [
+        "info",
+        "history",
+        "token_usage",
+        "info",
+    ]
     assert store.load(first_id).name == "Renamed topic"
     assert manager.session == Session()
 

@@ -86,6 +86,9 @@ def resume(
         session_manager.load_session(session_id)
     except ValueError as error:
         raise CommandArgumentError(str(error)) from error
+    context.interaction.info(f"Restoring session history for '{session_manager.session.name}'...")
+    context.interaction.history(session_manager.messages)
+    context.interaction.token_usage(session_manager.model, session_manager.tokens, None)
     context.interaction.info(f"Resumed session '{session_manager.session.name}'.")
 
 
