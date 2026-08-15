@@ -72,6 +72,19 @@ def rename(
     context.interaction.info(f"Renamed session to '{session_manager.session.name}'.")
 
 
+def sessions(context: CommandContext) -> None:
+    """List persisted sessions."""
+    manager = context.manager
+    if manager is None or manager.session_manager is None:
+        raise ValueError("The sessions command requires a SessionManager.")
+    session_manager = manager.session_manager
+    context.interaction.table(
+        session_manager.store.list(),
+        title="Persisted sessions:",
+        columns=("name", "updated_at", "message_count"),
+    )
+
+
 def permissions(
     context: CommandContext,
     operation: Annotated[

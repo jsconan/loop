@@ -39,6 +39,7 @@ def test_manager_registers_builtins_before_declared_and_discovered_commands():
         "help",
         "new",
         "rename",
+        "sessions",
         "permissions",
         "exit",
         "quit",
