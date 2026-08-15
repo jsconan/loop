@@ -3,7 +3,6 @@
 __all__ = [
     "CommandCompletion",
     "CommandCompletionAdapter",
-    "COMPLETION_ATTRIBUTE",
     "CompletionAdapter",
     "CompletionManager",
     "CompletionMatch",
@@ -23,7 +22,6 @@ from .adapters import (
 )
 from .manager import CompletionManager
 from .models import (
-    COMPLETION_ATTRIBUTE,
     CommandCompletion,
     CompletionMatch,
     CompletionProvider,

@@ -14,7 +14,6 @@ from loop import (
     Interaction,
 )
 from loop.commands.utils import get_command_arguments_model
-from loop.completion import COMPLETION_ATTRIBUTE
 
 
 def declared_command(name: str = "test") -> Command:
@@ -112,7 +111,7 @@ def test_register_retains_explicit_and_function_declared_completion_metadata():
     def second(value: str) -> None:
         """Select the second value."""
 
-    setattr(second, COMPLETION_ATTRIBUTE, inherited)
+    CommandCompletion.set_completion(second, inherited)
     manager.register(second)
 
     assert manager.commands[-2].completion is explicit

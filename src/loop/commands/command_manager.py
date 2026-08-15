@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
-from ..completion import COMPLETION_ATTRIBUTE, CommandCompletion
+from ..completion import CommandCompletion
 from ..context import CommandContext
 from .builtins import call as call_command
 from .builtins import exit as exit_command
@@ -219,7 +219,7 @@ class CommandManager:
                     description=description or self._description_for(target),
                     function=target,
                     arguments_model=get_command_arguments_model(target, command_name),
-                    completion=completion or getattr(target, COMPLETION_ATTRIBUTE, None),
+                    completion=completion or CommandCompletion.get_completion(target),
                 )
             if (
                 not command.name

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
 
-COMPLETION_ATTRIBUTE = "__completion__"
+_COMPLETION_ATTRIBUTE = "__completion__"
 
 
 @dataclass(frozen=True)
@@ -69,6 +69,28 @@ class CommandCompletion:
     children: Mapping[str, CommandCompletion] = field(default_factory=dict)
     next: CommandCompletion | None = None
     schema_provider: SchemaCompletionProvider | str | None = None
+
+    @staticmethod
+    def set_completion(target: object, completion: Self) -> None:
+        """Attach a completion grammar to a target object.
+
+        Args:
+            target (object): Object to which the completion grammar is attached.
+            completion (CommandCompletion): Completion grammar to attach.
+        """
+        setattr(target, _COMPLETION_ATTRIBUTE, completion)
+
+    @staticmethod
+    def get_completion(target: object) -> CommandCompletion | None:
+        """Retrieve a completion grammar from a target object.
+
+        Args:
+            target (object): Object from which the completion grammar is retrieved.
+
+        Returns:
+            CommandCompletion | None: Completion grammar attached to the target, or None if not set.
+        """
+        return getattr(target, _COMPLETION_ATTRIBUTE, None)
 
 
 @dataclass(frozen=True)

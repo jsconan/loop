@@ -4,41 +4,10 @@ from typing import Annotated
 
 from pydantic import Field
 
-from ..completion import COMPLETION_ATTRIBUTE, CommandCompletion, CompletionValue
+from ..completion import CommandCompletion, CompletionValue
 from ..context import CommandContext
 from ..permissions import Capability, Decision, PermissionMode, PermissionRule
 from .models import CommandArgumentError, CommandRemainder
-
-
-def _values(enum_type: type) -> tuple[CompletionValue, ...]:
-    """Return completion values for one string-valued enum."""
-    return tuple(CompletionValue(member.value) for member in enum_type)
-
-
-_RESOURCE_COMPLETION = CommandCompletion(values=(CompletionValue("*", "any resource"),))
-_CAPABILITY_COMPLETION = CommandCompletion(
-    values=(CompletionValue("*", "any capability"), *_values(Capability)),
-    next=_RESOURCE_COMPLETION,
-)
-_TOOL_COMPLETION = CommandCompletion(provider="tools", next=_CAPABILITY_COMPLETION)
-_CALL_COMPLETION = CommandCompletion(
-    provider="tools",
-    next=CommandCompletion(schema_provider="tool_arguments"),
-)
-_USE_COMPLETION = CommandCompletion(provider="skills")
-_RESUME_COMPLETION = CommandCompletion(provider="sessions")
-_DECISION_COMPLETION = CommandCompletion(
-    values=_values(Decision),
-    children={decision.value: _TOOL_COMPLETION for decision in Decision},
-)
-_PERMISSIONS_COMPLETION = CommandCompletion(
-    values=tuple(CompletionValue(value) for value in ("show", "mode", "add", "session")),
-    children={
-        "mode": CommandCompletion(values=_values(PermissionMode)),
-        "add": _DECISION_COMPLETION,
-        "session": _DECISION_COMPLETION,
-    },
-)
 
 
 def help(context: CommandContext) -> None:  # pylint: disable=redefined-builtin
@@ -254,8 +223,38 @@ def quit(context: CommandContext) -> None:  # pylint: disable=redefined-builtin,
     exit(context)  # pylint: disable=consider-using-sys-exit
 
 
+def _values(enum_type: type) -> tuple[CompletionValue, ...]:
+    """Return completion values for one string-valued enum."""
+    return tuple(CompletionValue(member.value) for member in enum_type)
+
+
+_RESOURCE_COMPLETION = CommandCompletion(values=(CompletionValue("*", "any resource"),))
+_CAPABILITY_COMPLETION = CommandCompletion(
+    values=(CompletionValue("*", "any capability"), *_values(Capability)),
+    next=_RESOURCE_COMPLETION,
+)
+_TOOL_COMPLETION = CommandCompletion(provider="tools", next=_CAPABILITY_COMPLETION)
+_CALL_COMPLETION = CommandCompletion(
+    provider="tools",
+    next=CommandCompletion(schema_provider="tool_arguments"),
+)
+_USE_COMPLETION = CommandCompletion(provider="skills")
+_RESUME_COMPLETION = CommandCompletion(provider="sessions")
+_DECISION_COMPLETION = CommandCompletion(
+    values=_values(Decision),
+    children={decision.value: _TOOL_COMPLETION for decision in Decision},
+)
+_PERMISSIONS_COMPLETION = CommandCompletion(
+    values=tuple(CompletionValue(value) for value in ("show", "mode", "add", "session")),
+    children={
+        "mode": CommandCompletion(values=_values(PermissionMode)),
+        "add": _DECISION_COMPLETION,
+        "session": _DECISION_COMPLETION,
+    },
+)
+
 # Register completions for built-in commands
-setattr(permissions, COMPLETION_ATTRIBUTE, _PERMISSIONS_COMPLETION)
-setattr(use, COMPLETION_ATTRIBUTE, _USE_COMPLETION)
-setattr(call, COMPLETION_ATTRIBUTE, _CALL_COMPLETION)
-setattr(resume, COMPLETION_ATTRIBUTE, _RESUME_COMPLETION)
+CommandCompletion.set_completion(permissions, _PERMISSIONS_COMPLETION)
+CommandCompletion.set_completion(use, _USE_COMPLETION)
+CommandCompletion.set_completion(call, _CALL_COMPLETION)
+CommandCompletion.set_completion(resume, _RESUME_COMPLETION)
