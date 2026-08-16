@@ -119,6 +119,28 @@ def test_project_paths_enforce_one_aggregate_attachment_budget(tmp_path):
         handler.resolve(("first.txt", "second.txt"))
 
 
+def test_project_paths_gracefully_resolve_valid_markdown_link_destinations(tmp_path):
+    """Optional links attach safe project files and ignore invalid or unsupported destinations."""
+    (tmp_path / "guide.md").write_text("Guide", encoding="utf-8")
+    (tmp_path / "binary.bin").write_bytes(b"binary\0data")
+    handler = ProjectPathMentionHandler(lambda: tmp_path)
+
+    context = handler.resolve_optional(
+        ("https://example.com", "missing.md", "binary.bin", "guide.md")
+    )
+
+    assert context == (
+        ContextReference(
+            kind="file",
+            path="guide.md",
+            content="Guide",
+            size_bytes=5,
+            included_bytes=5,
+            truncated=False,
+        ),
+    )
+
+
 def test_skill_handler_exposes_live_candidates_and_rolls_back_failed_activation(tmp_path):
     """Skill completion is live and a multi-skill activation is atomic."""
     skills = [
@@ -152,5 +174,8 @@ def test_skill_handler_preserves_already_active_skills(tmp_path):
     )
     instructions.activate_skill("review")
 
-    assert SkillMentionHandler(instructions).resolve(("review", "review")) == ()
+    handler = SkillMentionHandler(instructions)
+
+    assert not handler.resolve(("review", "review"))
+    assert not handler.resolve_optional(("review",))
     assert instructions.active_skill_identities == [("review", str(location))]

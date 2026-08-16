@@ -38,7 +38,9 @@ def test_parser_decodes_exact_bounded_mentions_and_preserves_legacy_matching():
         Mention("$", "code review", 20, 34),
         Mention("@", r"docs/a]b\c.md", 40, 58),
     )
-    assert parse_mentions("$[unknown] $[unclosed", {"$": ("unknown skill",)}) == ()
+    assert parse_mentions("$[unknown] $[unclosed", {"$": ("unknown skill",)}) == (
+        Mention("$", "unknown", 0, 10),
+    )
 
     assert parse_mentions(
         r'''$"double \" quote" $'single \' quote' @"back\\slash.md"''',
@@ -64,9 +66,21 @@ def test_parser_resolves_markdown_link_destinations():
     )
 
 
-def test_parser_rejects_unknown_or_malformed_markdown_link_destinations():
-    """Link display text cannot resolve in place of an unknown or malformed destination."""
+def test_parser_accepts_explicit_unknown_targets_but_rejects_malformed_destinations():
+    """Explicit targets reach handler validation while malformed destinations remain text."""
     assert parse_mentions(
         "@[name](unknown) @[name](path with spaces) @[name](unclosed",
         {"@": ("name",)},
-    ) == ()
+    ) == (Mention("@", "unknown", 0, 16),)
+
+
+def test_parser_marks_ordinary_markdown_links_as_optional_mentions():
+    """Ordinary links resolve optionally while images and malformed links remain ordinary text."""
+    text = (
+        "Read [guide](docs/guide.md), ![image](image.png), [label] text, "
+        "[bad](path with spaces), and [unclosed"
+    )
+
+    assert parse_mentions(text, {"@": ()}, optional_link_marker="@") == (
+        Mention("@", "docs/guide.md", 5, 27, required=False),
+    )

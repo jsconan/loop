@@ -8,14 +8,17 @@ from .models import Mention
 def parse_mentions(
     text: str,
     candidates: Mapping[str, Sequence[str]],
+    optional_link_marker: str | None = None,
 ) -> tuple[Mention, ...]:
-    """Return exact known bare, quoted, bracketed, or Markdown-linked mentions in source order.
+    """Return bare, explicit, and optional Markdown-link mentions in source order.
 
     Args:
         text (str): Submitted user text.
         candidates (Mapping[str, Sequence[str]]): Exact values accepted for each marker. Bounded
-            values may escape their closing delimiter and backslashes. Markdown links resolve
-            their destination rather than their display text.
+            values may escape their closing delimiter and backslashes. Only legacy bare mentions
+            require a known candidate.
+        optional_link_marker (str | None): Marker namespace that should gracefully resolve ordinary
+            Markdown link destinations. Defaults to ignoring ordinary links.
 
     Returns:
         tuple[Mention, ...]: Non-overlapping exact mentions.
@@ -24,6 +27,17 @@ def parse_mentions(
     index = 0
     while index < len(text):
         marker = text[index]
+        if (
+            marker == "["
+            and optional_link_marker is not None
+            and (not index or text[index - 1] != "!")
+        ):
+            linked = _linked_value(text, index)
+            if linked is not None:
+                value, end = linked
+                mentions.append(Mention(optional_link_marker, value, index, end, required=False))
+                index = end
+                continue
         if marker not in candidates or (index and text[index - 1].isalnum()):
             index += 1
             continue
@@ -36,10 +50,9 @@ def parse_mentions(
                     index += 1
                     continue
                 value, end = linked
-            if value in candidates[marker]:
-                mentions.append(Mention(marker, value, index, end))
-                index = end
-                continue
+            mentions.append(Mention(marker, value, index, end))
+            index = end
+            continue
         match = next(
             (
                 value
@@ -103,3 +116,14 @@ def _markdown_link_destination(text: str, start: int) -> tuple[str, int] | None:
         value.append(character)
         index += 1
     return None
+
+
+def _linked_value(text: str, start: int) -> tuple[str, int] | None:
+    """Decode one ordinary Markdown link destination and its exclusive end offset."""
+    bounded = _bounded_value(text, start)
+    if bounded is None:
+        return None
+    _, end = bounded
+    if end >= len(text) or text[end] != "(":
+        return None
+    return _markdown_link_destination(text, end)

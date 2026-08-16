@@ -7,12 +7,14 @@ import pytest
 from loop import CompletionAdapter, ContextReference, MentionHandler, MentionManager
 
 
-def handler(marker, candidates, references=()):
+def handler(marker, candidates, references=(), *, accepts_markdown_links=False):
     """Build one injectable handler mock."""
     result = Mock(spec=MentionHandler)
     result.marker = marker
+    result.accepts_markdown_links = accepts_markdown_links
     result.candidates.return_value = candidates
     result.resolve.return_value = references
+    result.resolve_optional.return_value = ()
     result.completion_adapter = Mock(spec=CompletionAdapter)
     return result
 
@@ -33,6 +35,17 @@ def test_manager_dispatches_only_exact_mentions_to_injected_handlers():
         files.completion_adapter,
         people.completion_adapter,
     )
+
+
+def test_manager_validates_explicit_mentions_and_gracefully_dispatches_markdown_links():
+    """Explicit targets bypass completion candidates while ordinary links remain optional."""
+    files = handler("#", (), accepts_markdown_links=True)
+    manager = MentionManager((files,))
+
+    manager.resolve("Read #[copy](new.md), [copy](new.md), and [guide](docs/guide.md).")
+
+    files.resolve.assert_called_once_with(("new.md",))
+    files.resolve_optional.assert_called_once_with(("docs/guide.md",))
 
 
 def test_manager_dispatches_each_target_once_in_first_mention_order():
@@ -57,3 +70,14 @@ def test_manager_rejects_duplicate_handler_markers():
     """Ambiguous injected namespaces fail at registry construction."""
     with pytest.raises(ValueError, match="unique"):
         MentionManager((handler("#", ()), handler("#", ())))
+
+
+def test_manager_rejects_multiple_markdown_link_handlers():
+    """Ordinary Markdown links cannot ambiguously target multiple handler namespaces."""
+    with pytest.raises(ValueError, match="Only one"):
+        MentionManager(
+            (
+                handler("#", (), accepts_markdown_links=True),
+                handler("+", (), accepts_markdown_links=True),
+            )
+        )

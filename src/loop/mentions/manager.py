@@ -13,20 +13,27 @@ class MentionManager:
 
     Args:
         handlers (Iterable[MentionHandler]): Independently owned mention capabilities. Markers
-            must be unique.
+            must be unique, and at most one handler may accept ordinary Markdown links.
 
     Raises:
-        ValueError: If more than one handler declares the same marker.
+        ValueError: If handlers declare duplicate markers or multiple Markdown-link owners.
     """
 
     _handlers: tuple[MentionHandler, ...]
     _handlers_by_marker: dict[str, MentionHandler]
+    _link_handler: MentionHandler | None
 
     def __init__(self, handlers: Iterable[MentionHandler] = ()) -> None:
         self._handlers = tuple(handlers)
         self._handlers_by_marker = {handler.marker: handler for handler in self._handlers}
         if len(self._handlers_by_marker) != len(self._handlers):
             raise ValueError("Mention handler markers must be unique.")
+        link_handlers = tuple(
+            handler for handler in self._handlers if handler.accepts_markdown_links
+        )
+        if len(link_handlers) > 1:
+            raise ValueError("Only one mention handler may accept ordinary Markdown links.")
+        self._link_handler = link_handlers[0] if link_handlers else None
 
     @property
     def completion_adapters(self) -> tuple[CompletionAdapter, ...]:
@@ -54,14 +61,32 @@ class MentionManager:
         mentions = parse_mentions(
             content,
             {handler.marker: handler.candidates() for handler in self._handlers},
+            optional_link_marker=self._link_handler.marker
+            if self._link_handler is not None
+            else None,
         )
         references = []
         for handler in self._handlers:
             values = tuple(
                 dict.fromkeys(
-                    mention.value for mention in mentions if mention.marker == handler.marker
+                    mention.value
+                    for mention in mentions
+                    if mention.marker == handler.marker and mention.required
                 )
             )
             if values:
                 references.extend(handler.resolve(values))
+            optional_values = tuple(
+                dict.fromkeys(
+                    mention.value
+                    for mention in mentions
+                    if (
+                        mention.marker == handler.marker
+                        and not mention.required
+                        and mention.value not in values
+                    )
+                )
+            )
+            if optional_values:
+                references.extend(handler.resolve_optional(optional_values))
         return tuple(references)

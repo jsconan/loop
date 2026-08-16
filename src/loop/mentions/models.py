@@ -12,9 +12,11 @@ class Mention:
         value (str): Exact referenced value without the marker.
         start (int): Inclusive source-text offset.
         end (int): Exclusive source-text offset.
+        required (bool): Whether resolution failure must reject the submitted message.
     """
 
     marker: str
     value: str
     start: int
     end: int
+    required: bool = True
