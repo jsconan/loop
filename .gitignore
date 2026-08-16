@@ -21,6 +21,7 @@ env/
 config.local.toml
 .local/
 .loop/
+.env
 
 # Test artifacts
 .pytest_cache/
