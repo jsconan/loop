@@ -9,6 +9,14 @@ import main
 from loop import SessionManager, ShutdownRequested
 
 
+@pytest.fixture(autouse=True)
+def isolate_main_environment(monkeypatch):
+    """Keep CLI configuration independent of process variables and local dotenv files."""
+    monkeypatch.setattr(main, "load_dotenv", Mock())
+    for variable in ("BASE_URL", "DEFAULT_MODEL", "OPENAI_API_KEY", "CONTEXT_WINDOW"):
+        monkeypatch.delenv(variable, raising=False)
+
+
 @pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt, ShutdownRequested])
 def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     """Interrupts stop the CLI with a friendly message and no exception."""
@@ -30,10 +38,6 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     monkeypatch.setattr(main, "SessionManager", session_manager_factory)
     monkeypatch.setattr(main, "find_project_root", Mock(return_value=Path("/project")))
     monkeypatch.setattr(main, "register_shutdown_signals", register_shutdown_signals)
-    monkeypatch.delenv("BASE_URL", raising=False)
-    monkeypatch.delenv("DEFAULT_MODEL", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("CONTEXT_WINDOW", raising=False)
 
     main.main()
 
