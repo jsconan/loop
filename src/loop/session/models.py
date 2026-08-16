@@ -7,6 +7,7 @@ from typing import Literal, Protocol, TypedDict
 from pydantic import BaseModel, Field
 
 from .. import constants
+from ..models import CompactionContextItem
 
 SessionNameSource = Literal["initial", "generated", "user"]
 
@@ -26,6 +27,48 @@ class GeneratedSessionName(BaseModel):
     title: str = Field(
         description=(f"Concise session title of at most {constants.SESSION_TITLE_MAX_WORDS} words.")
     )
+
+
+class InstructionSnapshot(BaseModel):
+    """Preserve the effective instruction state at a compaction boundary.
+
+    Args:
+        working_directory (str): Effective instruction-discovery directory.
+        content (str | None): Complete instructions supplied to the backend.
+        digest (str): SHA-256 digest of the complete instruction content.
+        active_skills (tuple[tuple[str, str], ...]): Active skill names and canonical locations.
+    """
+
+    working_directory: str
+    content: str | None
+    digest: str
+    active_skills: tuple[tuple[str, str], ...] = ()
+
+
+class Compaction(BaseModel):
+    """Record one durable replacement-context checkpoint.
+
+    Args:
+        id (str): Stable compaction identifier.
+        boundary (int): Exclusive full-history index represented by the checkpoint.
+        created_at (datetime): Time at which the checkpoint was created.
+        provider (str): Backend namespace that produced the replacement items.
+        model (str): Model used to create the checkpoint.
+        context (tuple[CompactionContextItem, ...]): Exact replacement context.
+        instructions (InstructionSnapshot): Instruction state used for compaction.
+        input_tokens_before (int | None): Last known context usage before compaction.
+        input_tokens_after (int | None): Context usage reported by compaction.
+    """
+
+    id: str
+    boundary: int = Field(ge=0)
+    created_at: datetime
+    provider: str
+    model: str
+    context: tuple[CompactionContextItem, ...]
+    instructions: InstructionSnapshot
+    input_tokens_before: int | None = Field(default=None, ge=0)
+    input_tokens_after: int | None = Field(default=None, ge=0)
 
 
 class SessionNameGenerator(Protocol):
@@ -75,8 +118,10 @@ class SerializedSession(TypedDict):
     name: str | None
     name_source: SessionNameSource | None
     messages: list[SerializedMessage]
+    compactions: list[dict]
     tokens: int
     model: str | None
+    context_window: int | None
     instruction_working_directory: str | None
     active_skills: list[list[str]]
 

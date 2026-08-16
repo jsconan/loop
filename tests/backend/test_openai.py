@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
-from openai import APIConnectionError
+from openai import APIConnectionError, APIStatusError
 from openai.types.responses import (
     ResponseCompletedEvent,
     ResponseFunctionToolCall,
@@ -23,6 +23,8 @@ from pydantic import BaseModel
 from loop import (
     AnswerCompleted,
     AnswerDelta,
+    CompactionContextItem,
+    CompactionResult,
     ContextReference,
     Message,
     ModelInfo,
@@ -47,6 +49,14 @@ class Person(BaseModel):
 
     name: str
     age: int
+
+
+class CompactItem(BaseModel):
+    """Provide a serializable SDK compaction output fixture."""
+
+    type: str
+    id: str
+    encrypted_content: str
 
 
 @pytest.fixture(autouse=True)
@@ -166,6 +176,115 @@ def test_response_requires_an_explicit_or_default_model():
 
     with pytest.raises(ValueError, match="No model was selected"):
         asyncio.run(collect_events(backend.get_response_async("hello")))
+
+
+def test_native_compaction_round_trips_exact_provider_items():
+    """OpenAI compaction returns durable opaque items that can seed the next request."""
+    item = CompactItem(type="compaction", id="cmp", encrypted_content="opaque")
+    sdk = Mock()
+    sdk.responses.compact.return_value = SimpleNamespace(
+        output=[item],
+        usage=SimpleNamespace(input_tokens=90, output_tokens=20, total_tokens=110),
+    )
+    sdk.responses.create.return_value = SimpleNamespace(
+        output=[], output_text="", usage=None, model="model"
+    )
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        backend = OpenAIBackend(default_model="model")
+        result = backend.compact(
+            [Message(role="user", content="hello")], instructions="rules", model="model"
+        )
+        list(backend.get_response(result.items, instructions="rules"))
+
+    assert result.items == (
+        CompactionContextItem(
+            provider="openai",
+            data={"type": "compaction", "id": "cmp", "encrypted_content": "opaque"},
+        ),
+    )
+    assert result.usage.total_tokens == 110
+    assert result.context_tokens == 20
+    sdk.responses.compact.assert_called_once()
+    assert sdk.responses.create.call_args.kwargs["input"] == [result.items[0].data]
+
+
+def test_native_compaction_falls_back_only_for_unsupported_endpoints():
+    """Compatible servers without the compact endpoint use portable summarization."""
+    sdk = Mock()
+    sdk.responses.compact.side_effect = APIStatusError(
+        "missing",
+        response=httpx.Response(404, request=httpx.Request("POST", "https://example.test")),
+        body=None,
+    )
+    fallback = CompactionResult(
+        items=(CompactionContextItem(provider="loop", data={"role": "user", "content": "sum"}),)
+    )
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        patch("loop.backend.openai.Backend.compact", return_value=fallback) as compact,
+    ):
+        result = OpenAIBackend(default_model="model").compact(
+            [Message(role="user", content="hello")], instructions="rules", model="model"
+        )
+
+    assert result is fallback
+    compact.assert_called_once()
+
+
+def test_native_compaction_propagates_operational_api_failures():
+    """Native compaction does not hide endpoint failures unrelated to unsupported capability."""
+    sdk = Mock()
+    error = APIStatusError(
+        "failed",
+        response=httpx.Response(500, request=httpx.Request("POST", "https://example.test")),
+        body=None,
+    )
+    sdk.responses.compact.side_effect = error
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        with pytest.raises(APIStatusError) as raised:
+            OpenAIBackend(default_model="model").compact([], instructions=None, model="model")
+
+    assert raised.value is error
+
+
+def test_portable_compaction_context_serializes_as_a_user_checkpoint():
+    """Portable checkpoints cross the OpenAI request boundary as ordinary messages."""
+    sdk = Mock()
+    sdk.responses.create.return_value = SimpleNamespace(
+        output=[], output_text="", usage=None, model="model"
+    )
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        list(
+            OpenAIBackend(default_model="model").get_response(
+                [CompactionContextItem(provider="loop", data={"role": "user", "content": "sum"})]
+            )
+        )
+
+    assert sdk.responses.create.call_args.kwargs["input"] == [{"role": "user", "content": "sum"}]
+
+
+def test_openai_rejects_malformed_portable_compaction_context():
+    """Portable checkpoints validate their role and text before reaching the provider."""
+    backend = OpenAIBackend(default_model="model", api_key="test-key")
+
+    with pytest.raises(TypeError, match="Invalid portable compacted context item"):
+        list(backend.get_response([CompactionContextItem(provider="loop", data={})]))
+
+
+def test_openai_rejects_foreign_compaction_context():
+    """Provider-specific checkpoints cannot silently cross incompatible backends."""
+    backend = OpenAIBackend(default_model="model", api_key="test-key")
+
+    with pytest.raises(TypeError, match="Unsupported compacted context provider"):
+        list(
+            backend.get_response(
+                [CompactionContextItem(provider="other", data={"type": "compaction"})]
+            )
+        )
 
 
 @pytest.mark.parametrize("context_window", [0, -1])

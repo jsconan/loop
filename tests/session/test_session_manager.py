@@ -7,6 +7,8 @@ from uuid import uuid4
 import pytest
 
 from loop import (
+    CompactionContextItem,
+    CompactionResult,
     ConsoleInteraction,
     ContentArtifact,
     ContextReference,
@@ -16,6 +18,7 @@ from loop import (
     Session,
     SessionManager,
     ToolResult,
+    Usage,
 )
 from loop.interaction import Interaction
 from loop.session import SessionStore
@@ -31,6 +34,39 @@ def test_manager_creates_default_services_and_an_empty_session():
     assert manager.session == Session()
     assert manager.messages == []
     assert manager.model is None
+    assert manager.compaction_threshold == 0.8
+
+
+@pytest.mark.parametrize("threshold", [0, 1, -0.1, 1.1])
+def test_manager_rejects_invalid_compaction_thresholds(threshold):
+    """Automatic compaction utilization must remain strictly between zero and one."""
+    with pytest.raises(ValueError, match="between zero and one"):
+        SessionManager(compaction_threshold=threshold)
+
+
+def test_manager_detects_compaction_only_for_known_capacity_and_new_history():
+    """Threshold detection requires known capacity, sufficient usage, and uncompacted items."""
+    session = Session(messages=[Message(role="user", content="hello")], tokens=79)
+    manager = SessionManager(session=session, compaction_threshold=0.8)
+
+    assert manager.can_compact() is True
+    assert manager.compaction_needed() is False
+    manager.context_window = 100
+    assert manager.compaction_needed() is False
+    session.tokens = 80
+    assert manager.compaction_needed() is True
+    manager.add_compaction(
+        CompactionResult(
+            items=(CompactionContextItem(provider="openai", data={"type": "compaction"}),),
+            usage=Usage(total_tokens=20),
+        ),
+        model="model",
+        instructions=None,
+        working_directory="/project",
+        active_skills=(),
+    )
+    assert manager.can_compact() is False
+    assert manager.compaction_needed() is False
 
 
 def test_manager_uses_injected_services_and_session():
@@ -315,15 +351,104 @@ def test_manager_adds_a_response_and_persists_its_session_updates():
     store.save.assert_called_once_with(session)
 
 
-def test_manager_exposes_token_usage_and_allows_model_selection():
-    """Session metadata remains available and model selection updates the active session."""
+def test_manager_exposes_context_metadata_and_validates_window_selection():
+    """Session usage, model, and context-window metadata remain available and validated."""
     session = Session(tokens=17)
     manager = SessionManager(session=session)
 
     manager.model = "selected-model"
+    manager.context_window = 128000
 
     assert manager.model == "selected-model"
     assert manager.tokens == 17
+    assert manager.context_window == 128000
+    with pytest.raises(ValueError, match="must be positive"):
+        manager.context_window = 0
+
+
+def test_manager_persists_compaction_with_instruction_and_skill_snapshot():
+    """Compaction atomically records replacement context and exact instruction state."""
+    store = Mock(spec=SessionStore)
+    session = Session(messages=[Message(role="user", content="hello")], tokens=90)
+    manager = SessionManager(session=session, session_store=store)
+    result = CompactionResult(
+        items=(
+            CompactionContextItem(
+                provider="openai",
+                data={"type": "compaction", "encrypted_content": "opaque"},
+            ),
+        ),
+        usage=Usage(input_tokens=90, output_tokens=20, total_tokens=110),
+        context_tokens=20,
+    )
+
+    manager.add_compaction(
+        result,
+        model="model",
+        instructions="project rules",
+        working_directory="/project",
+        active_skills=iter([("review", "/skills/review/SKILL.md")]),
+    )
+
+    checkpoint = session.compactions[0]
+    assert manager.model_context == [*checkpoint.context]
+    assert checkpoint.boundary == 1
+    assert checkpoint.instructions.content == "project rules"
+    assert checkpoint.instructions.active_skills == (("review", "/skills/review/SKILL.md"),)
+    assert checkpoint.input_tokens_before == 90
+    assert checkpoint.input_tokens_after == 20
+    assert session.tokens == 20
+    store.save.assert_called_once_with(session)
+
+
+def test_manager_preserves_usage_when_compaction_omits_token_counts():
+    """A compactor without usage metadata does not erase the latest known context usage."""
+    session = Session(messages=[Message(role="user", content="hello")], tokens=90)
+    manager = SessionManager(session=session)
+
+    manager.add_compaction(
+        CompactionResult(
+            items=(CompactionContextItem(provider="openai", data={"type": "compaction"}),)
+        ),
+        model="model",
+        instructions=None,
+        working_directory="/project",
+        active_skills=(),
+    )
+
+    assert session.tokens == 90
+    assert session.compactions[0].input_tokens_after is None
+
+
+def test_manager_rolls_back_compaction_when_persistence_fails():
+    """A failed checkpoint write restores all prior in-memory session state."""
+    store = Mock(spec=SessionStore)
+    store.save.side_effect = OSError("disk full")
+    session = Session(
+        messages=[Message(role="user", content="hello")],
+        tokens=90,
+        instruction_working_directory="/old",
+        active_skills=[("old", "/skills/old/SKILL.md")],
+    )
+    manager = SessionManager(session=session, session_store=store)
+
+    with pytest.raises(OSError, match="disk full"):
+        manager.add_compaction(
+            CompactionResult(
+                items=(CompactionContextItem(provider="openai", data={"type": "compaction"}),),
+                usage=Usage(total_tokens=110),
+                context_tokens=20,
+            ),
+            model="model",
+            instructions="new rules",
+            working_directory="/new",
+            active_skills=(("new", "/skills/new/SKILL.md"),),
+        )
+
+    assert session.compactions == []
+    assert session.tokens == 90
+    assert session.instruction_working_directory == "/old"
+    assert session.active_skills == [("old", "/skills/old/SKILL.md")]
 
 
 @pytest.mark.parametrize("method", ["add_message", "add_messages"])

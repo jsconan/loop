@@ -52,7 +52,7 @@ class Loop:
         debug (bool): Whether to print raw response events.
 
     Raises:
-        ValueError: The session is invalid.
+        ValueError: If the session is invalid.
 
     """
 
@@ -117,6 +117,9 @@ class Loop:
         self._stream = stream
         self._debug = debug
         self._model = model
+        selected_model = self._model or self._backend.default_model
+        if selected_model:
+            self._report_context_window(selected_model)
         self._permission_manager = permission_manager or PermissionManager(
             find_project_root(self._working_directory) or self._working_directory,
             interaction=self._interaction,
@@ -127,6 +130,7 @@ class Loop:
             instructions_manager=self._instructions_manager,
             tool_registry=self._backend.tool_registry,
             session_manager=self._session_manager,
+            compaction_handler=self.compact,
         )
         self._mention_manager = mention_manager or MentionManager(
             (
@@ -330,7 +334,7 @@ class Loop:
             self._interaction.token_usage(
                 self._session_manager.model,
                 self._session_manager.tokens,
-                self._backend.get_context_window(self._model),
+                self._session_manager.context_window,
             )
 
         self.end()
@@ -375,9 +379,7 @@ class Loop:
         Raises:
             ValueError: If neither the loop nor the backend selects a model.
         """
-        selected_model = self._model or self._backend.default_model
-        if not selected_model:
-            raise ValueError("No model was selected and the backend has no default model.")
+        selected_model = self._get_selected_model()
         self._instructions_manager.prepare()
         self._session_manager.update_instruction_state(
             working_directory=str(
@@ -385,14 +387,86 @@ class Loop:
             ),
             active_skills=self._instructions_manager.active_skill_identities,
         )
-        self._session_manager.model = selected_model
+        self._report_context_window(selected_model)
+        if self._session_manager.compaction_needed():
+            self._compact(selected_model)
         return self._backend.get_response(
-            input=self._session_manager.messages,
+            input=self._session_manager.model_context,
             instructions=self._instructions_manager.instructions,
             stream=self._stream,
             model=selected_model,
         )
 
+    def compact(self) -> bool:
+        """Manually compact the active session using current model and instructions.
+
+        Returns:
+            bool: ``True`` when a new compaction checkpoint was persisted, otherwise ``False``.
+
+        Raises:
+            ValueError: If neither the loop nor backend selects a model.
+        """
+        if not self._session_manager.can_compact():
+            self._interaction.warning("There is no new session context to compact.")
+            return False
+        self._instructions_manager.prepare()
+        model = self._get_selected_model()
+        self._report_context_window(model)
+        return self._compact(model)
+
     def end(self) -> None:
         """Display the conversation termination message."""
         self._interaction.conversation_ended()
+
+    def _get_selected_model(self) -> str:
+        """Return the model selected for requests, or the backend default."""
+        selected_model = self._model or self._backend.default_model
+        if not selected_model:
+            raise ValueError("No model was selected and the backend has no default model.")
+        return selected_model
+
+    def _report_context_window(self, model: str) -> None:
+        """Report the context window for the selected model."""
+        self._session_manager.model = model
+        reported_context_window = self._backend.get_context_window(model)
+        self._session_manager.context_window = (
+            reported_context_window
+            if isinstance(reported_context_window, int)
+            and not isinstance(reported_context_window, bool)
+            else None
+        )
+
+    def _compact(self, model: str) -> bool:
+        """Request, report, and persist one replacement-context checkpoint."""
+        self._interaction.info("Compacting session context...")
+        try:
+            result = self._backend.compact(
+                self._session_manager.model_context,
+                instructions=self._instructions_manager.instructions,
+                model=model,
+            )
+        except NotImplementedError:
+            self._interaction.warning("The selected backend does not support context compaction.")
+            return False
+        if result is None or not result.items:
+            self._interaction.warning("The selected backend did not produce compacted context.")
+            return False
+        working_directory = str(
+            self._instructions_manager.working_directory or self._working_directory
+        )
+        previous_tokens = self._session_manager.tokens
+        self._session_manager.add_compaction(
+            result,
+            model=model,
+            instructions=self._instructions_manager.instructions,
+            working_directory=working_directory,
+            active_skills=self._instructions_manager.active_skill_identities,
+        )
+        current_tokens = self._session_manager.tokens
+        if current_tokens != previous_tokens:
+            self._interaction.info(
+                f"Compacted session context from {previous_tokens:,} to {current_tokens:,} tokens."
+            )
+        else:
+            self._interaction.info("Compacted session context.")
+        return True

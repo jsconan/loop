@@ -7,10 +7,19 @@ from typing import Protocol, Self
 
 from pydantic import ValidationError
 
-from ..models import ConversationItem, Message, Reasoning, Response, ToolCall, ToolResult
+from ..models import (
+    ConversationItem,
+    Message,
+    ModelContextItem,
+    Reasoning,
+    Response,
+    ToolCall,
+    ToolResult,
+)
 from .models import (
     SESSION_NAME_SOURCE_INITIAL,
     SESSION_NAME_SOURCE_USER,
+    Compaction,
     SerializedMessage,
     SerializedSession,
     SessionInfo,
@@ -18,8 +27,8 @@ from .models import (
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 3
-_SUPPORTED_VERSIONS = (1, 2, _SCHEMA_VERSION)
+_SCHEMA_VERSION = 4
+_SUPPORTED_VERSIONS = (1, 2, 3, _SCHEMA_VERSION)
 _ITEM_TYPES = {
     "message": Message,
     "reasoning": Reasoning,
@@ -47,9 +56,13 @@ class Session:
         name_source (SessionNameSource | None): Origin controlling automatic replacement.
         messages (list[ConversationItem]): Conversation items.
             Defaults to an empty list.
+        compactions (list[Compaction]): Durable replacement-context checkpoints.
+            Defaults to an empty list.
         tokens (int): Total tokens in the context after the latest response.
             Defaults to ``0``.
         model (str | None): Model identifier reported by the latest response,
+            or ``None`` when unknown. Defaults to ``None``.
+        context_window (int | None): Context-window size for the latest selected model,
             or ``None`` when unknown. Defaults to ``None``.
         instruction_working_directory (str | None): Last effective instruction directory.
             Defaults to ``None``.
@@ -61,8 +74,10 @@ class Session:
     name: str | None = None
     name_source: SessionNameSource | None = None
     messages: list[ConversationItem] = field(default_factory=list)
+    compactions: list[Compaction] = field(default_factory=list)
     tokens: int = 0
     model: str | None = None
+    context_window: int | None = None
     instruction_working_directory: str | None = None
     active_skills: list[tuple[str, str]] = field(default_factory=list)
 
@@ -142,6 +157,35 @@ class Session:
         """
         self.messages.extend([self._get_message(message) for message in messages])
 
+    def add_compaction(self, compaction: Compaction) -> None:
+        """Append a validated compaction checkpoint.
+
+        Args:
+            compaction (Compaction): Checkpoint covering a prefix of the complete history.
+
+        Raises:
+            ValueError: If the checkpoint is empty, exceeds history, or moves backward.
+        """
+        if not compaction.context:
+            raise ValueError("Compaction context cannot be empty.")
+        if compaction.boundary > len(self.messages):
+            raise ValueError("Compaction boundary exceeds the complete history.")
+        if self.compactions and compaction.boundary <= self.compactions[-1].boundary:
+            raise ValueError("Compaction boundary must advance beyond the previous checkpoint.")
+        self.compactions.append(compaction)
+
+    def model_context(self) -> list[ModelContextItem]:
+        """Return bounded context for the next model request.
+
+        Returns:
+            list[ModelContextItem]: Complete history, or the latest replacement context followed
+                by items added after its boundary.
+        """
+        if not self.compactions:
+            return self.messages
+        checkpoint = self.compactions[-1]
+        return [*checkpoint.context, *self.messages[checkpoint.boundary :]]
+
     @staticmethod
     def _get_message(message: ConversationItem) -> ConversationItem:
         """Return a validated conversation item for storage."""
@@ -178,8 +222,10 @@ class Session:
                 name=self.name,
                 name_source=self.name_source,
                 messages=messages,
+                compactions=[compaction.model_dump(mode="json") for compaction in self.compactions],
                 tokens=self.tokens,
                 model=self.model,
+                context_window=self.context_window,
                 instruction_working_directory=self.instruction_working_directory,
                 active_skills=[list(identity) for identity in self.active_skills],
             ),
@@ -253,6 +299,12 @@ class Session:
 
             tokens = payload["tokens"]
             model = payload["model"]
+            context_window = payload["context_window"] if version >= 4 else None
+            compactions = (
+                [Compaction.model_validate(item) for item in payload["compactions"]]
+                if version >= 4
+                else []
+            )
             if version == 1:
                 instruction_working_directory = None
                 active_skills = []
@@ -265,6 +317,19 @@ class Session:
                 raise TypeError("Invalid tokens count.")
             if model is not None and not isinstance(model, str):
                 raise TypeError("Invalid serialized model name.")
+            if context_window is not None and (
+                not isinstance(context_window, int)
+                or isinstance(context_window, bool)
+                or context_window <= 0
+            ):
+                raise TypeError("Invalid serialized context window.")
+            previous_boundary = -1
+            for compaction in compactions:
+                if not compaction.context or compaction.boundary > len(messages):
+                    raise TypeError("Invalid serialized compaction.")
+                if compaction.boundary <= previous_boundary:
+                    raise TypeError("Invalid serialized compaction order.")
+                previous_boundary = compaction.boundary
             if instruction_working_directory is not None and not isinstance(
                 instruction_working_directory, str
             ):
@@ -284,8 +349,10 @@ class Session:
             name=name,
             name_source=name_source,
             messages=messages,
+            compactions=compactions,
             tokens=tokens,
             model=model,
+            context_window=context_window,
             instruction_working_directory=instruction_working_directory,
             active_skills=[tuple(identity) for identity in active_skills],
         )

@@ -326,6 +326,36 @@ class ToolResult(ConversationItemModel):
 ConversationItem: TypeAlias = Message | Reasoning | ToolCall | ToolResult
 
 
+class CompactionContextItem(BaseModel):
+    """Preserve one provider-specific item used to resume compacted context.
+
+    Args:
+        provider (str): Backend namespace that can interpret the item.
+        data (dict[str, Any]): Serialized provider input item.
+    """
+
+    provider: str
+    data: dict[str, Any]
+
+
+ModelContextItem: TypeAlias = ConversationItem | CompactionContextItem
+
+
+class CompactionResult(BaseModel):
+    """Describe replacement context produced by a backend compactor.
+
+    Args:
+        items (tuple[CompactionContextItem, ...]): Provider items replacing earlier context.
+        usage (Usage): Token usage reported for the compaction operation.
+        context_tokens (int | None): Tokens in the replacement context, excluding the source
+            context consumed by the compaction request.
+    """
+
+    items: tuple[CompactionContextItem, ...]
+    usage: Usage = Field(default_factory=Usage)
+    context_tokens: int | None = Field(default=None, ge=0)
+
+
 class ToolDefinition(BaseModel):
     """Describe a function tool exposed to a model.
 

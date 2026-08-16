@@ -47,10 +47,11 @@ def test_manager_registers_builtins_before_declared_and_discovered_commands():
         "tools",
         "use",
         "call",
+        "compact",
         "explicit",
         "discovered",
     ]
-    assert manager.commands[12] is explicit
+    assert manager.commands[13] is explicit
     assert manager.exit_requested is False
 
 
@@ -77,6 +78,16 @@ def test_manager_exposes_command_catalog_dependencies():
     assert manager.skill_manager is skill_manager
     assert manager.instructions_manager is instructions_manager
     assert manager.tool_registry is tool_registry
+
+
+def test_manager_delegates_manual_compaction_and_requires_a_handler():
+    """Manual compaction invokes the configured loop callback and rejects missing wiring."""
+    handler = Mock(return_value=True)
+
+    assert CommandManager(compaction_handler=handler).compact_session() is True
+    handler.assert_called_once_with()
+    with pytest.raises(ValueError, match="requires a compaction handler"):
+        CommandManager().compact_session()
 
 
 def test_register_supports_decorators_and_declared_metadata():

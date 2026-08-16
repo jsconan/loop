@@ -22,6 +22,7 @@ from loop import (
     Tool,
 )
 from loop.commands import call as call_command
+from loop.commands import compact as compact_command
 from loop.commands import exit as exit_command
 from loop.commands import help as help_command
 from loop.commands import new as new_command
@@ -92,7 +93,7 @@ def test_session_commands_list_resume_reset_and_rename_sessions():
     new_command(context)
 
     assert interaction.table.call_args.kwargs["columns"] == ("name", "updated_at", "message_count")
-    interaction.history.assert_called_once_with(first.messages)
+    interaction.history.assert_called_once_with(first.messages, first.compactions)
     interaction.token_usage.assert_called_once_with("served-model", 1234, None)
     assert [item.args[0] for item in interaction.info.call_args_list[:2]] == [
         "Restoring session history for 'First topic'...",
@@ -126,6 +127,24 @@ def test_session_commands_require_a_session_manager(function, arguments):
 
     with pytest.raises(ValueError, match="requires a SessionManager"):
         function(context, *arguments)
+
+
+def test_compact_command_delegates_to_the_loop_handler():
+    """The manual command invokes configured session compaction through its manager."""
+    handler = Mock(return_value=True)
+    interaction = Mock(spec=Interaction)
+
+    compact_command(
+        CommandContext(
+            "compact",
+            interaction,
+            CommandManager(interaction=interaction, compaction_handler=handler),
+        )
+    )
+
+    handler.assert_called_once_with()
+    with pytest.raises(ValueError, match="requires a CommandManager"):
+        compact_command(CommandContext("compact", interaction))
 
 
 def test_resume_reports_ids_missing_from_session_state():

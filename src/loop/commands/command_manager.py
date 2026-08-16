@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from ..completion import CommandCompletion
 from ..context import CommandContext
 from .builtins import call as call_command
+from .builtins import compact as compact_command
 from .builtins import exit as exit_command
 from .builtins import help as help_command
 from .builtins import new as new_command
@@ -47,6 +48,7 @@ BUILTIN_COMMANDS = (
     tools_command,
     use_command,
     call_command,
+    compact_command,
 )
 
 
@@ -68,6 +70,8 @@ class CommandManager:
         tool_registry (ToolRegistry | None): Tool catalog exposed to tool-discovery commands.
         session_manager (SessionManager | None): Session lifecycle owner exposed to session
             commands.
+        compaction_handler (Callable[[], bool] | None): Callback used by the manual compaction
+            command, or ``None`` when compaction is unavailable.
 
     Raises:
         ValueError: If a command name is invalid or registered more than once.
@@ -82,6 +86,7 @@ class CommandManager:
     _skill_manager: SkillManager | None
     _tool_registry: ToolRegistry | None
     _session_manager: SessionManager | None
+    _compaction_handler: Callable[[], bool] | None
 
     def __init__(
         self,
@@ -92,6 +97,7 @@ class CommandManager:
         skill_manager: SkillManager | None = None,
         tool_registry: ToolRegistry | None = None,
         session_manager: SessionManager | None = None,
+        compaction_handler: Callable[[], bool] | None = None,
     ) -> None:
         self._commands = {}
         self._exit_requested = False
@@ -105,6 +111,7 @@ class CommandManager:
         )
         self._tool_registry = tool_registry
         self._session_manager = session_manager
+        self._compaction_handler = compaction_handler
         for command in (*BUILTIN_COMMANDS, *(commands or ())):
             self.register(command)
 
@@ -171,6 +178,19 @@ class CommandManager:
             SessionManager | None: Configured session manager, or ``None`` when unavailable.
         """
         return self._session_manager
+
+    def compact_session(self) -> bool:
+        """Invoke the configured manual session compaction handler.
+
+        Returns:
+            bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
+
+        Raises:
+            ValueError: If no compaction handler is configured.
+        """
+        if self._compaction_handler is None:
+            raise ValueError("The CommandManager requires a compaction handler.")
+        return self._compaction_handler()
 
     @property
     def exit_requested(self) -> bool:

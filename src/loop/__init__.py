@@ -14,6 +14,9 @@ __all__ = [
     "CommandContext",
     "CommandManager",
     "CommandRegistrationError",
+    "Compaction",
+    "CompactionContextItem",
+    "CompactionResult",
     "CompletionAdapter",
     "CompletionManager",
     "CompletionMatch",
@@ -34,6 +37,7 @@ __all__ = [
     "initial_session_name",
     "InstructionSection",
     "InstructionsManager",
+    "InstructionSnapshot",
     "Interaction",
     "is_path_ignored",
     "iter_visible_paths",
@@ -133,6 +137,8 @@ from .mentions import (
 from .models import (
     AnswerCompleted,
     AnswerDelta,
+    CompactionContextItem,
+    CompactionResult,
     ContentArtifact,
     ContextReference,
     ConversationItem,
@@ -165,6 +171,8 @@ from .permissions import (
 )
 from .session import (
     BackendSessionNameGenerator,
+    Compaction,
+    InstructionSnapshot,
     MemorySessionStore,
     SerializedMessage,
     SerializedSession,

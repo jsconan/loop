@@ -56,8 +56,12 @@ def resume(
     except ValueError as error:
         raise CommandArgumentError(str(error)) from error
     context.interaction.info(f"Restoring session history for '{session_manager.session.name}'...")
-    context.interaction.history(session_manager.messages)
-    context.interaction.token_usage(session_manager.model, session_manager.tokens, None)
+    context.interaction.history(session_manager.messages, session_manager.session.compactions)
+    context.interaction.token_usage(
+        session_manager.model,
+        session_manager.tokens,
+        session_manager.context_window,
+    )
     context.interaction.info(f"Resumed session '{session_manager.session.name}'.")
 
 
@@ -72,6 +76,14 @@ def sessions(context: CommandContext) -> None:
         title="Persisted sessions:",
         columns=("name", "updated_at", "message_count"),
     )
+
+
+def compact(context: CommandContext) -> None:
+    """Compact the active session context now."""
+    manager = context.manager
+    if manager is None:
+        raise ValueError("The compact command requires a CommandManager.")
+    manager.compact_session()
 
 
 def permissions(

@@ -3,6 +3,7 @@
 __all__ = [
     "BUILTIN_COMMANDS",
     "call",
+    "compact",
     "Command",
     "CommandArgumentError",
     "CommandManager",
@@ -22,6 +23,7 @@ __all__ = [
 
 from .builtins import (
     call,
+    compact,
     exit,
     help,
     new,

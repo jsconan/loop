@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit.completion import Completer
 
@@ -23,6 +23,9 @@ from ..models import (
     ToolCallCompleted,
     Usage,
 )
+
+if TYPE_CHECKING:
+    from ..session.models import Compaction
 
 
 class Interaction(ABC):
@@ -271,13 +274,32 @@ class Interaction(ABC):
             structured_output=structured_output,
         )
 
-    def history(self, items: Iterable[ConversationItem]) -> None:
+    def history(
+        self,
+        items: Iterable[ConversationItem],
+        compactions: Iterable["Compaction"] = (),
+    ) -> None:
         """Display persisted conversation items as prior interaction.
 
         Args:
             items (Iterable[ConversationItem]): Ordered conversation items to replay.
+            compactions (Iterable[Compaction]): Ordered compaction checkpoints to replay at their
+                full-history boundaries.
         """
-        for item in items:
+        def display_compaction(compaction: "Compaction") -> None:
+            before = compaction.input_tokens_before
+            after = compaction.input_tokens_after
+            if before is not None and after is not None and before != after:
+                self.info(f"Compacted session context from {before:,} to {after:,} tokens.")
+            else:
+                self.info("Compacted session context.")
+
+        checkpoints = iter(compactions)
+        checkpoint = next(checkpoints, None)
+        for index, item in enumerate(items):
+            while checkpoint is not None and checkpoint.boundary == index:
+                display_compaction(checkpoint)
+                checkpoint = next(checkpoints, None)
             if isinstance(item, Message):
                 display = self.user if item.role == "user" else self.answer
                 display(item.content)
@@ -287,3 +309,6 @@ class Interaction(ABC):
                 continue
             if isinstance(item, ToolCall):
                 self.tool_call(item.name, item.arguments)
+        while checkpoint is not None:
+            display_compaction(checkpoint)
+            checkpoint = next(checkpoints, None)

@@ -2,8 +2,10 @@
 
 __all__ = [
     "BackendSessionNameGenerator",
+    "Compaction",
     "GeneratedSessionName",
     "initial_session_name",
+    "InstructionSnapshot",
     "MemorySessionStore",
     "normalize_session_name",
     "SerializedMessage",
@@ -30,7 +32,9 @@ from .models import (
     SESSION_NAME_SOURCE_INITIAL,
     SESSION_NAME_SOURCE_USER,
     SESSION_NAME_SOURCES,
+    Compaction,
     GeneratedSessionName,
+    InstructionSnapshot,
     SerializedMessage,
     SerializedSession,
     SessionInfo,

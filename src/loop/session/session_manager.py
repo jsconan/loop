@@ -1,19 +1,30 @@
 """Session manager for handling user sessions."""
 
 import json
+from datetime import UTC, datetime
 from typing import Iterable
+from uuid import uuid7
 
+from .. import constants
 from ..interaction import ConsoleInteraction, Interaction
 from ..models import (
     ContentArtifact,
+    CompactionResult,
     ContextReference,
     ConversationItem,
     Message,
+    ModelContextItem,
     Response,
     ToolResult,
 )
-from ..utils import bound_tool_result, cached_metadata, register_cached_metadata
-from .models import SESSION_NAME_SOURCE_GENERATED, SESSION_NAME_SOURCE_INITIAL, SessionNameGenerator
+from ..utils import bound_tool_result, cached_metadata, register_cached_metadata, sha256_digest
+from .models import (
+    SESSION_NAME_SOURCE_GENERATED,
+    SESSION_NAME_SOURCE_INITIAL,
+    Compaction,
+    InstructionSnapshot,
+    SessionNameGenerator,
+)
 from .naming import initial_session_name
 from .session import Session, SessionStore
 from .store import MemorySessionStore
@@ -29,25 +40,32 @@ class SessionManager:
             Defaults to a fresh session.
         session_store (SessionStore | None): Store used to persist and retrieve sessions. Defaults
             to an instance-local memory store.
+        compaction_threshold (float): Context-window utilization that requires compaction.
+            Defaults to ``0.8``.
 
     Raises:
         SessionNotFoundError: If the requested persisted session does not exist.
         UnsupportedConversationItemError: If a serialized conversation item type is unsupported.
-        ValueError: If the session or its persisted format is invalid or unsupported.
+        ValueError: If the session, persisted format, or compaction threshold is invalid.
     """
 
     _interaction: Interaction
     _session: Session
     _session_store: SessionStore
+    _compaction_threshold: float
 
     def __init__(
         self,
         interaction: Interaction | None = None,
         session: Session | str | None = None,
         session_store: SessionStore | None = None,
+        compaction_threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
     ) -> None:
+        if not 0 < compaction_threshold < 1:
+            raise ValueError("Compaction threshold must be between zero and one.")
         self._interaction = interaction or ConsoleInteraction()
         self._session_store = session_store or MemorySessionStore()
+        self._compaction_threshold = compaction_threshold
 
         if session and isinstance(session, (str, Session)):
             self.load_session(session)
@@ -91,6 +109,16 @@ class SessionManager:
         return self._session.messages
 
     @property
+    def model_context(self) -> list[ModelContextItem]:
+        """Return context bounded by the latest compaction checkpoint.
+
+        Returns:
+            list[ModelContextItem]: Replacement context and subsequent history, or complete
+                history when the session has not been compacted.
+        """
+        return self._session.model_context()
+
+    @property
     def model(self) -> str | None:
         """Return the model explicitly selected for requests.
 
@@ -116,6 +144,116 @@ class SessionManager:
             int: The number of tokens used in the current session.
         """
         return self._session.tokens
+
+    @property
+    def context_window(self) -> int | None:
+        """Return the persisted context-window size for the selected model.
+
+        Returns:
+            int | None: Context-window size, or ``None`` when unknown.
+        """
+        return self._session.context_window
+
+    @context_window.setter
+    def context_window(self, value: int | None) -> None:
+        """Set the context-window size associated with the selected model.
+
+        Args:
+            value (int | None): Positive context-window size, or ``None`` when unknown.
+
+        Raises:
+            ValueError: If a non-positive size is provided.
+        """
+        if value is not None and value <= 0:
+            raise ValueError("Context window must be positive.")
+        self._session.context_window = value
+
+    @property
+    def compaction_threshold(self) -> float:
+        """Return the configured context-window utilization threshold.
+
+        Returns:
+            float: Utilization ratio that requires compaction.
+        """
+        return self._compaction_threshold
+
+    def can_compact(self) -> bool:
+        """Return whether complete history advanced beyond the latest checkpoint.
+
+        Returns:
+            bool: ``True`` when at least one uncompacted history item exists.
+        """
+        boundary = self._session.compactions[-1].boundary if self._session.compactions else 0
+        return boundary < len(self._session.messages)
+
+    def compaction_needed(self) -> bool:
+        """Return whether current usage reached the automatic compaction threshold.
+
+        Returns:
+            bool: ``True`` when capacity is known, usage reached the threshold, and new history
+                can be compacted.
+        """
+        context_window = self._session.context_window
+        return (
+            context_window is not None
+            and self._session.tokens >= context_window * self._compaction_threshold
+            and self.can_compact()
+        )
+
+    def add_compaction(
+        self,
+        result: CompactionResult,
+        *,
+        model: str,
+        instructions: str | None,
+        working_directory: str,
+        active_skills: Iterable[tuple[str, str]],
+    ) -> None:
+        """Persist one compaction checkpoint and its exact instruction state.
+
+        Args:
+            result (CompactionResult): Replacement context and reported token usage.
+            model (str): Model used to compact the active context.
+            instructions (str | None): Complete instructions supplied to the compactor.
+            working_directory (str): Effective instruction-discovery directory.
+            active_skills (Iterable[tuple[str, str]]): Active skill identities.
+
+        Raises:
+            ValueError: If the checkpoint does not advance or has invalid context.
+        """
+        identities = tuple(active_skills)
+        provider = result.items[0].provider if result.items else ""
+        compaction = Compaction(
+            id=str(uuid7()),
+            boundary=len(self._session.messages),
+            created_at=datetime.now(UTC),
+            provider=provider,
+            model=model,
+            context=result.items,
+            instructions=InstructionSnapshot(
+                working_directory=working_directory,
+                content=instructions,
+                digest=sha256_digest(instructions or ""),
+                active_skills=identities,
+            ),
+            input_tokens_before=self._session.tokens,
+            input_tokens_after=result.context_tokens,
+        )
+        previous_tokens = self._session.tokens
+        previous_directory = self._session.instruction_working_directory
+        previous_skills = list(self._session.active_skills)
+        self._session.add_compaction(compaction)
+        try:
+            if result.context_tokens is not None:
+                self._session.tokens = result.context_tokens
+            self._session.update_instruction_state(working_directory, identities)
+            self._session_store.save(self._session)
+        except Exception:
+            self._session.compactions.pop()
+            self._session.tokens = previous_tokens
+            self._session.instruction_working_directory = previous_directory
+            self._session.active_skills = previous_skills
+            raise
 
     def load_session(self, session: Session | str) -> None:
         """Load a session from the store.

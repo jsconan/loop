@@ -1,13 +1,17 @@
 """Tests for the interaction base class."""
 
 from contextlib import nullcontext
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 from loop import (
     AnswerCompleted,
     AnswerDelta,
+    Compaction,
+    CompactionContextItem,
     Interaction,
+    InstructionSnapshot,
     Message,
     Reasoning,
     ReasoningCompleted,
@@ -102,7 +106,7 @@ def test_empty_output_returns_an_empty_response():
 
 
 def test_history_replays_visible_conversation_items_in_order():
-    """Persisted history mirrors live output and omits undisplayed tool results."""
+    """Persisted history mirrors live output, including compaction checkpoints."""
     interaction = interaction_mock()
     items = (
         Message(role="user", content="question"),
@@ -112,12 +116,49 @@ def test_history_replays_visible_conversation_items_in_order():
         ToolResult(call_id="missing", output="orphaned"),
         Message(role="assistant", content="answer"),
     )
+    instructions = InstructionSnapshot(working_directory="/project", content=None, digest="digest")
+    compactions = (
+        Compaction(
+            id="first",
+            boundary=0,
+            created_at=datetime(2026, 8, 16, tzinfo=UTC),
+            provider="test",
+            model="model",
+            context=(CompactionContextItem(provider="test", data={}),),
+            instructions=instructions,
+        ),
+        Compaction(
+            id="second",
+            boundary=3,
+            created_at=datetime(2026, 8, 16, tzinfo=UTC),
+            provider="test",
+            model="model",
+            context=(CompactionContextItem(provider="test", data={}),),
+            instructions=instructions,
+            input_tokens_before=12_345,
+            input_tokens_after=678,
+        ),
+        Compaction(
+            id="third",
+            boundary=len(items),
+            created_at=datetime(2026, 8, 16, tzinfo=UTC),
+            provider="test",
+            model="model",
+            context=(CompactionContextItem(provider="test", data={}),),
+            instructions=instructions,
+            input_tokens_before=678,
+            input_tokens_after=678,
+        ),
+    )
 
-    Interaction.history(interaction, items)
+    Interaction.history(interaction, items, compactions)
 
     assert interaction.method_calls == [
+        call.info("Compacted session context."),
         call.user("question"),
         call.reasoning("thought"),
         call.tool_call("search", '{"query":"term"}'),
+        call.info("Compacted session context from 12,345 to 678 tokens."),
         call.answer("answer"),
+        call.info("Compacted session context."),
     ]

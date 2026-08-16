@@ -3,7 +3,7 @@
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, call
 
 import pytest
 from prompt_toolkit.document import Document
@@ -11,6 +11,8 @@ from prompt_toolkit.document import Document
 from loop import (
     AnswerCompleted,
     AnswerDelta,
+    CompactionContextItem,
+    CompactionResult,
     ContextReference,
     InstructionsManager,
     Interaction,
@@ -83,7 +85,7 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.instructions is None
     assert loop.instructions_manager is not None
     assert loop.permission_manager.configuration_path == tmp_path / ".loop" / "permissions.yaml"
-    assert loop.session == Session()
+    assert loop.session == Session(model="requested-model")
     assert loop.model == "requested-model"
 
     loop.debug = False
@@ -281,7 +283,7 @@ def test_loop_uses_an_injected_permission_manager(tmp_path):
 
 
 def test_loops_share_local_conversation_context(tmp_path):
-    """Injected context carries local history and metadata between loop modes."""
+    """Injected context keeps history while each loop applies its backend metadata."""
     session = Session(
         messages=[Message(role="user", content="hello")], tokens=12, model="served-model"
     )
@@ -293,7 +295,7 @@ def test_loops_share_local_conversation_context(tmp_path):
     assert first.session is second.session is session
     assert second.messages == [Message(role="user", content="hello")]
     assert second.session.tokens == 12
-    assert second.session.model == "served-model"
+    assert second.session.model == "other-model"
     assert list(second.query()) == []
     second_backend.get_response.assert_called_once_with(
         input=session.messages,
@@ -389,7 +391,7 @@ def test_loop_delegates_a_session_identifier_to_an_injected_manager():
 
 
 def test_loop_loads_a_persisted_session_identifier(tmp_path):
-    """The constructor accepts a session identifier and resumes its complete state."""
+    """The constructor resumes persisted state under the attached backend model."""
     store = SQLiteSessionStore(tmp_path / "sessions.db")
     stored = Session(
         messages=[Message(role="user", content="saved")], tokens=4, model="saved-model"
@@ -399,7 +401,9 @@ def test_loop_loads_a_persisted_session_identifier(tmp_path):
     manager = SessionManager(session_store=store)
     loop = Loop(backend=loop_backend(), session=session_id, session_manager=manager)
 
-    assert loop.session == stored
+    assert loop.session.messages == stored.messages
+    assert loop.session.tokens == stored.tokens
+    assert loop.session.model == "default-model"
 
 
 def test_loop_uses_an_injected_manager_session_without_reloading_it():
@@ -454,16 +458,161 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
 
 
 def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
-    """A query forwards byte-bounded instructions without hidden backend preflight calls."""
+    """A query persists model context capacity without hidden tokenization calls."""
     backend = Mock(tool_registry=default_tool_registry, default_model="model")
+    backend.get_context_window.return_value = 128000
     backend.get_response.return_value = []
     (tmp_path / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
     loop = Loop(backend=backend, working_directory=tmp_path)
 
     list(loop.query())
 
-    backend.get_context_window.assert_not_called()
+    assert backend.get_context_window.call_args_list == [call("model"), call("model")]
     backend.count_tokens.assert_not_called()
+    assert loop.session.context_window == 128000
+
+
+def test_loop_aligns_injected_session_capacity_with_backend(tmp_path):
+    """Loop construction replaces stale persisted capacity with backend runtime metadata."""
+    session = Session(model="old-model", context_window=32768)
+    manager = SessionManager(session=session)
+    backend = loop_backend(
+        default_model="active-model",
+        get_context_window=Mock(return_value=128000),
+    )
+
+    Loop(backend=backend, session_manager=manager, working_directory=tmp_path)
+
+    backend.get_context_window.assert_called_once_with("active-model")
+    assert session.model == "active-model"
+    assert session.context_window == 128000
+
+
+def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tmp_path):
+    """Threshold compaction persists full history while replacing the next provider input."""
+    messages = [
+        Message(role="user", content="old question"),
+        Message(role="assistant", content="old answer"),
+        Message(role="user", content="new question"),
+    ]
+    session = Session(messages=messages, tokens=85)
+    compacted = CompactionContextItem(
+        provider="openai",
+        data={"type": "compaction", "encrypted_content": "opaque"},
+    )
+    backend = loop_backend(
+        get_context_window=Mock(return_value=100),
+        compact=Mock(
+            return_value=CompactionResult(
+                items=(compacted,),
+                usage=Usage(input_tokens=85, output_tokens=20, total_tokens=105),
+                context_tokens=20,
+            )
+        ),
+        get_response=Mock(return_value=[]),
+    )
+    interaction = MagicMock(spec=Interaction)
+    loop = Loop(
+        backend=backend,
+        session=session,
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+
+    list(loop.query())
+
+    assert session.messages == messages
+    assert len(session.compactions) == 1
+    assert session.compactions[0].boundary == 3
+    assert session.compactions[0].instructions.working_directory == str(tmp_path)
+    assert session.tokens == 20
+    assert session.context_window == 100
+    backend.compact.assert_called_once_with(
+        messages, instructions=None, model="default-model"
+    )
+    assert backend.get_response.call_args.kwargs["input"] == [compacted]
+    assert [call.args[0] for call in interaction.info.call_args_list] == [
+        "Compacting session context...",
+        "Compacted session context from 85 to 20 tokens.",
+    ]
+
+
+@pytest.mark.parametrize("unsupported", ["error", "empty", "no_items"])
+def test_query_warns_when_backend_cannot_compact(tmp_path, unsupported):
+    """Unavailable compaction warns while leaving history and provider input unchanged."""
+    message = Message(role="user", content="hello")
+    session = Session(messages=[message], tokens=85)
+    result = CompactionResult(items=()) if unsupported == "no_items" else None
+    compact = Mock(
+        side_effect=NotImplementedError if unsupported == "error" else None,
+        return_value=result,
+    )
+    backend = loop_backend(
+        get_context_window=Mock(return_value=100),
+        compact=compact,
+        get_response=Mock(return_value=[]),
+    )
+    interaction = MagicMock(spec=Interaction)
+
+    list(
+        Loop(
+            backend=backend,
+            session=session,
+            interaction=interaction,
+            working_directory=tmp_path,
+        ).query()
+    )
+
+    assert session.compactions == []
+    assert backend.get_response.call_args.kwargs["input"] == [message]
+    assert interaction.warning.call_args.args[0].startswith("The selected backend")
+
+
+def test_manual_compaction_reports_when_no_new_context_exists(tmp_path):
+    """Manual compaction declines an empty checkpoint without contacting the backend."""
+    backend = loop_backend(compact=Mock())
+    interaction = MagicMock(spec=Interaction)
+    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+
+    assert loop.compact() is False
+
+    interaction.warning.assert_called_once_with("There is no new session context to compact.")
+    backend.compact.assert_not_called()
+
+
+def test_manual_compaction_prepares_metadata_and_reports_unmeasured_success(tmp_path):
+    """Manual compaction prepares current state and confirms checkpoints without usage counts."""
+    message = Message(role="user", content="hello")
+    compacted = CompactionContextItem(provider="openai", data={"type": "compaction"})
+    backend = loop_backend(
+        get_context_window=Mock(return_value=100),
+        compact=Mock(return_value=CompactionResult(items=(compacted,))),
+    )
+    interaction = MagicMock(spec=Interaction)
+    loop = Loop(
+        backend=backend,
+        session=Session(messages=[message], tokens=20),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+
+    assert loop.compact() is True
+
+    assert loop.session.context_window == 100
+    assert loop.session.model == "default-model"
+    interaction.info.assert_any_call("Compacted session context.")
+
+
+def test_manual_compaction_requires_a_selected_model(tmp_path):
+    """Manual compaction rejects sessions without an explicit or backend-default model."""
+    loop = Loop(
+        backend=loop_backend(default_model=None),
+        session=Session(messages=[Message(role="user", content="hello")]),
+        working_directory=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="No model was selected"):
+        loop.compact()
 
 
 def test_loop_rejects_a_missing_explicit_working_directory(tmp_path):
@@ -732,6 +881,8 @@ def test_query_delegates_instruction_state_to_the_session_manager():
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
     session_manager.messages = []
+    session_manager.model_context = []
+    session_manager.compaction_needed.return_value = False
     loop = Loop(backend=backend, session_manager=session_manager)
 
     list(loop.query())

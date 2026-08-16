@@ -1,12 +1,16 @@
 """Tests for session state, serialization, and persistence contracts."""
 
+import json
 from datetime import UTC, datetime
 
 import pytest
 
 from loop import (
+    Compaction,
+    CompactionContextItem,
     ContentArtifact,
     ContextReference,
+    InstructionSnapshot,
     Message,
     Reasoning,
     Response,
@@ -193,6 +197,7 @@ def test_session_serializes_and_deserializes_all_conversation_items():
         ],
         tokens=42,
         model="model-a",
+        context_window=128000,
     )
 
     assert Session.deserialize(session.serialize()) == session
@@ -211,6 +216,131 @@ def test_session_round_trips_instruction_context_and_reads_version_one_defaults(
     assert not restored.active_skills
 
 
+def test_session_retains_full_history_while_latest_compaction_bounds_model_context():
+    """Multiple checkpoints persist while only the latest seeds subsequent model input."""
+    messages = [Message(role="user", content=str(index)) for index in range(4)]
+    session = Session(messages=messages)
+    instructions = InstructionSnapshot(
+        working_directory="/project",
+        content="rules",
+        digest="digest",
+        active_skills=(("review", "/skills/review/SKILL.md"),),
+    )
+    first = Compaction(
+        id="first",
+        boundary=2,
+        created_at=datetime(2026, 8, 16, tzinfo=UTC),
+        provider="openai",
+        model="model",
+        context=(CompactionContextItem(provider="openai", data={"type": "compaction"}),),
+        instructions=instructions,
+    )
+    second = first.model_copy(
+        update={
+            "id": "second",
+            "boundary": 3,
+            "context": (
+                CompactionContextItem(provider="openai", data={"type": "compaction", "id": "2"}),
+            ),
+        }
+    )
+
+    session.add_compaction(first)
+    session.add_compaction(second)
+    restored = Session.deserialize(session.serialize())
+
+    assert restored.messages == messages
+    assert restored.compactions == [first, second]
+    assert restored.model_context() == [*second.context, messages[3]]
+
+
+@pytest.mark.parametrize(
+    "compaction, message",
+    [
+        (
+            Compaction(
+                id="empty",
+                boundary=0,
+                created_at=datetime(2026, 8, 16, tzinfo=UTC),
+                provider="openai",
+                model="model",
+                context=(),
+                instructions=InstructionSnapshot(
+                    working_directory="/project", content=None, digest="digest"
+                ),
+            ),
+            "cannot be empty",
+        ),
+        (
+            Compaction(
+                id="past-end",
+                boundary=2,
+                created_at=datetime(2026, 8, 16, tzinfo=UTC),
+                provider="openai",
+                model="model",
+                context=(CompactionContextItem(provider="openai", data={}),),
+                instructions=InstructionSnapshot(
+                    working_directory="/project", content=None, digest="digest"
+                ),
+            ),
+            "exceeds",
+        ),
+    ],
+)
+def test_session_rejects_invalid_compaction_boundaries(compaction, message):
+    """Checkpoints must contain replacement context and cover only stored history."""
+    session = Session(messages=[Message(role="user", content="one")])
+
+    with pytest.raises(ValueError, match=message):
+        session.add_compaction(compaction)
+
+
+def test_session_rejects_a_checkpoint_that_does_not_advance():
+    """A later checkpoint must cover new full-history items."""
+    session = Session(messages=[Message(role="user", content="one")])
+    checkpoint = Compaction(
+        id="first",
+        boundary=1,
+        created_at=datetime(2026, 8, 16, tzinfo=UTC),
+        provider="openai",
+        model="model",
+        context=(CompactionContextItem(provider="openai", data={}),),
+        instructions=InstructionSnapshot(working_directory="/project", content=None, digest="d"),
+    )
+    session.add_compaction(checkpoint)
+
+    with pytest.raises(ValueError, match="must advance"):
+        session.add_compaction(checkpoint.model_copy(update={"id": "second"}))
+
+
+@pytest.mark.parametrize("mutation", ["window", "empty", "boundary", "order"])
+def test_session_deserialization_validates_compaction_metadata(mutation):
+    """Version-four snapshots reject invalid capacity, boundaries, and checkpoint ordering."""
+    session = Session(messages=[Message(role="user", content="one")], context_window=100)
+    checkpoint = Compaction(
+        id="first",
+        boundary=1,
+        created_at=datetime(2026, 8, 16, tzinfo=UTC),
+        provider="openai",
+        model="model",
+        context=(CompactionContextItem(provider="openai", data={}),),
+        instructions=InstructionSnapshot(working_directory="/project", content=None, digest="d"),
+    )
+    session.add_compaction(checkpoint)
+    payload = json.loads(session.serialize())
+    if mutation == "window":
+        payload["context_window"] = 0
+    elif mutation == "empty":
+        payload["compactions"][0]["context"] = []
+    elif mutation == "boundary":
+        payload["compactions"][0]["boundary"] = 2
+    else:
+        payload["compactions"].append(payload["compactions"][0] | {"id": "second"})
+
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        Session.deserialize(json.dumps(payload))
+
+
 def test_session_serialization_identifies_unsupported_item_types():
     """Serialization reports the unsupported Python conversation item type."""
     session = Session(messages=[object()])
@@ -227,7 +357,7 @@ def test_session_serialization_identifies_unsupported_item_types():
     [
         ("not-json", "Invalid serialized session"),
         ("[]", "Invalid serialized session"),
-        ('{"version":4,"messages":[],"tokens":0,"model":null}', "Unsupported session version 4"),
+        ('{"version":5,"messages":[],"tokens":0,"model":null}', "Unsupported session version 5"),
         ('{"messages":[],"tokens":0,"model":null}', "Unsupported session version None"),
         (
             '{"version":1,"messages":[{"type":"message","data":{}}],"tokens":0,"model":null}',
