@@ -368,33 +368,46 @@ def test_session_serialization_identifies_unsupported_item_types():
         ('{"version":1,"messages":[],"tokens":0,"model":42}', "Invalid serialized session"),
         ('{"version":1,"messages":null,"tokens":0,"model":null}', "Invalid serialized session"),
         (
-            '{"version":3,"name":"","name_source":"initial","messages":[],"tokens":0,'
-            '"model":null,"instruction_working_directory":null,"active_skills":[]}',
+            (
+                '{"version":3,"name":"","name_source":"initial","messages":[],"tokens":0,'
+                '"model":null,"instruction_working_directory":null,"active_skills":[]}'
+            ),
             "Invalid serialized session",
         ),
         (
-            '{"version":3,"name":"name","name_source":"unknown","messages":[],"tokens":0,'
-            '"model":null,"instruction_working_directory":null,"active_skills":[]}',
+            (
+                '{"version":3,"name":"name","name_source":"unknown","messages":[],'
+                '"tokens":0,"model":null,"instruction_working_directory":null,'
+                '"active_skills":[]}'
+            ),
             r"Invalid session name source ''unknown''\.",
         ),
         (
-            '{"version":2,"messages":[],"tokens":0,"model":null,'
-            '"instruction_working_directory":42,"active_skills":[]}',
+            (
+                '{"version":2,"messages":[],"tokens":0,"model":null,'
+                '"instruction_working_directory":42,"active_skills":[]}'
+            ),
             "Invalid serialized session",
         ),
         (
-            '{"version":2,"messages":[],"tokens":0,"model":null,'
-            '"instruction_working_directory":null,"active_skills":null}',
+            (
+                '{"version":2,"messages":[],"tokens":0,"model":null,'
+                '"instruction_working_directory":null,"active_skills":null}'
+            ),
             "Invalid serialized session",
         ),
         (
-            '{"version":2,"messages":[],"tokens":0,"model":null,'
-            '"instruction_working_directory":null,"active_skills":[["name"]]}',
+            (
+                '{"version":2,"messages":[],"tokens":0,"model":null,'
+                '"instruction_working_directory":null,"active_skills":[["name"]]}'
+            ),
             "Invalid serialized session",
         ),
         (
-            '{"version":2,"messages":[],"tokens":0,"model":null,'
-            '"instruction_working_directory":null,"active_skills":[["name",1]]}',
+            (
+                '{"version":2,"messages":[],"tokens":0,"model":null,'
+                '"instruction_working_directory":null,"active_skills":[["name",1]]}'
+            ),
             "Invalid serialized session",
         ),
     ],

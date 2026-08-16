@@ -2,12 +2,12 @@
 
 __all__ = [
     "BUILTIN_COMMANDS",
-    "call",
-    "compact",
     "Command",
     "CommandArgumentError",
     "CommandManager",
     "CommandRegistrationError",
+    "call",
+    "compact",
     "exit",
     "help",
     "new",

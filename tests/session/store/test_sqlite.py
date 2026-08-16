@@ -71,12 +71,11 @@ def test_store_lists_most_recent_sessions_first(tmp_path):
     store = SQLiteSessionStore(tmp_path / "sessions.db")
     first_id = store.save(Session())
     second_id = store.save(Session())
-    with closing(sqlite3.connect(store.path)) as connection:
-        with connection:
-            connection.execute(
-                "UPDATE sessions SET updated_at = ? WHERE id = ?",
-                ("2000-01-01T00:00:00+00:00", first_id),
-            )
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        connection.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", first_id),
+        )
 
     assert [item.id for item in store.list()] == [second_id, first_id]
     with pytest.raises(SessionNotFoundError, match="unknown"):
@@ -88,18 +87,17 @@ def test_store_migrates_and_names_existing_sessions(tmp_path):
     path = tmp_path / "sessions.db"
     session = Session(messages=[Message(role="user", content="Recover legacy sessions")])
     payload = session.serialize()
-    with closing(sqlite3.connect(path)) as connection:
-        with connection:
-            connection.execute(
-                """CREATE TABLE sessions (
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            """CREATE TABLE sessions (
                     id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     message_count INTEGER NOT NULL, session TEXT NOT NULL
                 )"""
-            )
-            connection.execute(
-                "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
-                ("legacy", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", 1, payload),
-            )
+        )
+        connection.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+            ("legacy", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", 1, payload),
+        )
 
     store = SQLiteSessionStore(path)
 
@@ -121,9 +119,8 @@ def test_store_rejects_invalid_or_unsupported_persisted_data(tmp_path, payload):
     """Loading rejects corrupt, unknown, and incorrectly typed snapshot data."""
     store = SQLiteSessionStore(tmp_path / "sessions.db")
     session_id = store.save(Session())
-    with closing(sqlite3.connect(store.path)) as connection:
-        with connection:
-            connection.execute("UPDATE sessions SET session = ?", (payload,))
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        connection.execute("UPDATE sessions SET session = ?", (payload,))
 
     with pytest.raises(ValueError):
         store.load(session_id)

@@ -264,13 +264,12 @@ class PermissionManager:
             decision = Decision.ALLOW
         elif mode is PermissionMode.READ_ONLY:
             decision = Decision.ALLOW if request.capability in _READ_CAPABILITIES else Decision.DENY
-        elif mode is PermissionMode.WORKSPACE_WRITE:
-            if request.capability in _READ_CAPABILITIES:
-                decision = Decision.ALLOW
-            elif request.capability is Capability.FILESYSTEM_WRITE and self._in_workspace(
-                request.resource
-            ):
-                decision = Decision.ALLOW
+        elif mode is PermissionMode.WORKSPACE_WRITE and (
+            request.capability in _READ_CAPABILITIES
+            or request.capability is Capability.FILESYSTEM_WRITE
+            and self._in_workspace(request.resource)
+        ):
+            decision = Decision.ALLOW
         return PermissionResult(
             decision=decision,
             reason=f"Permission mode '{mode.value}' selected {decision.value}.",

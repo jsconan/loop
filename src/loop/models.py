@@ -9,10 +9,11 @@ from typing import Any, Literal, TypeAlias
 
 from jsonschema import FormatChecker, SchemaError
 from jsonschema.validators import validator_for
-from pydantic import BaseModel, Field, ValidationError as PydanticValidationError
+from pydantic import BaseModel, Field
+from pydantic import ValidationError as PydanticValidationError
 
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
-StructuredOutputValidator: TypeAlias = Callable[[JsonValue], Any]
+type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
+type StructuredOutputValidator = Callable[[JsonValue], Any]
 
 _JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE | re.DOTALL)
 
@@ -40,7 +41,7 @@ class StructuredOutputValidationError(ValueError):
         attempt: int | None = None,
         model: str | None = None,
         mode: str | None = None,
-        usage: "Usage | None" = None,
+        usage: Usage | None = None,
         category: str = "validation",
     ) -> None:
         self.format_name = format_name
@@ -149,7 +150,7 @@ class StructuredOutputFormat:
         name: str | None = None,
         description: str | None = None,
         strict: bool = True,
-    ) -> "StructuredOutputFormat":
+    ) -> StructuredOutputFormat:
         """Create a structured output format from a Pydantic model.
 
         Args:
@@ -417,7 +418,7 @@ class ToolResult(ConversationItemModel):
     artifacts: tuple[ContentArtifact, ...] = Field(default_factory=tuple)
 
 
-ConversationItem: TypeAlias = Message | Reasoning | ToolCall | ToolResult
+ConversationItem: TypeAlias = Message | Reasoning | ToolCall | ToolResult  # noqa: UP040
 
 
 class CompactionContextItem(BaseModel):
@@ -432,7 +433,7 @@ class CompactionContextItem(BaseModel):
     data: dict[str, Any]
 
 
-ModelContextItem: TypeAlias = ConversationItem | CompactionContextItem
+type ModelContextItem = ConversationItem | CompactionContextItem
 
 
 class CompactionResult(BaseModel):
@@ -548,7 +549,7 @@ class ResponseCompleted(BaseModel):
     structured_output: Any | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
-ResponseEvent: TypeAlias = (
+type ResponseEvent = (
     ReasoningDelta
     | AnswerDelta
     | ReasoningCompleted

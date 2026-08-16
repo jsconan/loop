@@ -55,7 +55,7 @@ def main() -> None:
         loop.run()
     except EOFError, KeyboardInterrupt, ShutdownRequested:
         interaction.info("\nStopping loop. Goodbye!")
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:  # noqa: BLE001  # pylint: disable=broad-except
         interaction.error(f"An unexpected error occurred: {e}")
 
 

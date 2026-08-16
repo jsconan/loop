@@ -3,6 +3,7 @@
 from unittest.mock import Mock
 
 import pytest
+from pydantic import ValidationError
 
 from loop import (
     Command,
@@ -230,7 +231,7 @@ def test_call_requires_interaction_only_when_dispatch_needs_it():
         manager.call("contextual")
     with pytest.raises(ValueError, match="dispatch requires an Interaction"):
         manager.call("missing")
-    with pytest.raises(Exception):  # Pydantic exposes its concrete validation exception.
+    with pytest.raises(ValidationError):
         manager.call("count", "invalid")
     with pytest.raises(ValueError, match="must not start"):
         manager.call("/plain")

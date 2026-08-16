@@ -328,7 +328,7 @@ class Loop:
                     self._interaction.info("Generating a session name...")
                     self._session_manager.generate_session_name(self._session_name_generator)
                     self._interaction.info(f"Session name: {self._session_manager.session.name}")
-                except Exception as error:  # pylint: disable=broad-exception-caught
+                except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                     self._interaction.warning(f"Could not generate the session name: {error}")
 
             self._interaction.token_usage(

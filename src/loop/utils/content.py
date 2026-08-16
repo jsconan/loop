@@ -94,7 +94,9 @@ def register_cached_metadata(handle: str, source: str, reloadable: bool) -> None
     """
     _validate_handle(handle)
     if not isinstance(source, str) or not isinstance(reloadable, bool):
-        raise ValueError("Invalid cached content metadata.")
+        raise ValueError(  # noqa: TRY004 - cached metadata has one validation contract.
+            "Invalid cached content metadata."
+        )
     with _LOCK:
         _METADATA[handle] = CachedContentMetadata(source=source, reloadable=reloadable)
 
@@ -345,9 +347,7 @@ def read_bounded_text(
                 chunk = chunk[:remaining]
             chunks.append(chunk)
             remaining -= len(chunk)
-            if chunk.endswith((b"\n", b"\r")):
-                lines_read += 1
-            elif remaining:
+            if chunk.endswith((b"\n", b"\r")) or remaining:
                 lines_read += 1
 
         end = stream.tell()

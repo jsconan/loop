@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+from typing import ClassVar
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -24,7 +25,7 @@ def run_command(command):
 class ImmediateThread:
     """Run a thread target synchronously so stream behavior is deterministic."""
 
-    instances = []
+    instances: ClassVar[list[ImmediateThread]] = []
 
     def __init__(self, *, target, args, daemon):
         self.target = target

@@ -16,8 +16,10 @@ class Arguments(BaseModel):
     number: int
 
 
-def make_tool(function=Mock(return_value=2)) -> Tool:
+def make_tool(function=None) -> Tool:
     """Build a tool with the shared argument model."""
+    if function is None:
+        function = Mock(return_value=2)
     return Tool("calculate", "Calculate a value.", function, Arguments)
 
 

@@ -125,7 +125,7 @@ def list_folder(
         )
         context.observe_directory(folder)
         return result
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         return f"Error listing folder: {exc}"
 
 
@@ -173,7 +173,7 @@ def read_text_file(
         )
         context.observe_file(path)
         return result
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         if str(exc) == "Content appears to be binary.":
             return f"Error reading file: File '{path}' appears to be binary."
         return f"Error reading file: {exc}"
@@ -195,7 +195,7 @@ def write_text_file(
         context.observe_file(path)
         context.invalidate_instructions(path)
         return f"Successfully wrote to file '{path}'."
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         return f"Error writing to file: {exc}"
 
 
@@ -224,5 +224,5 @@ def delete_path(
             return f"Error deleting path: Path '{path}' does not exist."
         context.invalidate_instructions(target)
         return f"Successfully deleted path '{path}'."
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         return f"Error deleting path: {exc}"

@@ -264,9 +264,11 @@ def test_native_compaction_propagates_operational_api_failures():
     )
     sdk.responses.compact.side_effect = error
 
-    with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        with pytest.raises(APIStatusError) as raised:
-            OpenAIBackend(default_model="model").compact([], instructions=None, model="model")
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(APIStatusError) as raised,
+    ):
+        OpenAIBackend(default_model="model").compact([], instructions=None, model="model")
 
     assert raised.value is error
 
@@ -770,16 +772,12 @@ def test_explicit_prompt_mode_uses_serialized_history_for_correction():
     sdk = Mock()
     sdk.responses.create.side_effect = [
         SimpleNamespace(output=[], output_text="{}", usage=None, model=None),
-        SimpleNamespace(
-            output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None
-        ),
+        SimpleNamespace(output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None),
     ]
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
         events = list(
-            OpenAIBackend(
-                default_model="default", structured_output_mode="prompt"
-            ).get_response(
+            OpenAIBackend(default_model="default", structured_output_mode="prompt").get_response(
                 [Message(role="user", content="hello")],
                 output_format=StructuredOutputFormat.from_model(Person),
             )
@@ -797,9 +795,7 @@ def test_explicit_prompt_mode_uses_serialized_history_for_correction():
 def test_native_schema_errors_only_fall_back_when_auto_and_recognized(mode, message):
     """Explicit native mode and unrelated provider errors remain visible to callers."""
     request = httpx.Request("POST", "https://compatible.test/v1/responses")
-    rejected = APIStatusError(
-        message, response=httpx.Response(400, request=request), body=None
-    )
+    rejected = APIStatusError(message, response=httpx.Response(400, request=request), body=None)
     sdk = Mock()
     sdk.responses.create.side_effect = rejected
 
@@ -808,9 +804,9 @@ def test_native_schema_errors_only_fall_back_when_auto_and_recognized(mode, mess
         pytest.raises(APIStatusError),
     ):
         list(
-            OpenAIBackend(
-                default_model="default", structured_output_mode=mode
-            ).get_response("hello", output_format=StructuredOutputFormat.from_model(Person))
+            OpenAIBackend(default_model="default", structured_output_mode=mode).get_response(
+                "hello", output_format=StructuredOutputFormat.from_model(Person)
+            )
         )
 
 

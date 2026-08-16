@@ -75,7 +75,9 @@ def read_instruction_frontmatter(
 
     metadata = yaml.safe_load("".join(frontmatter))
     if not isinstance(metadata, dict):
-        raise ValueError(f"{location.name} frontmatter must be a mapping")
+        raise ValueError(  # noqa: TRY004 - malformed frontmatter has one validation contract.
+            f"{location.name} frontmatter must be a mapping"
+        )
     for field in required_fields:
         value = metadata.get(field)
         if not isinstance(value, str) or not value.strip():

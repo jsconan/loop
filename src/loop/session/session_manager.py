@@ -1,15 +1,15 @@
 """Session manager for handling user sessions."""
 
 import json
+from collections.abc import Iterable
 from datetime import UTC, datetime
-from typing import Iterable
 from uuid import uuid7
 
 from .. import constants
 from ..interaction import ConsoleInteraction, Interaction
 from ..models import (
-    ContentArtifact,
     CompactionResult,
+    ContentArtifact,
     ContextReference,
     ConversationItem,
     Message,
@@ -277,7 +277,7 @@ class SessionManager:
         if isinstance(session, str):
             session = self._session_store.load(session)
         if not isinstance(session, Session):
-            raise ValueError("Invalid session type.")
+            raise ValueError("Invalid session type.")  # noqa: TRY004 - public API contract.
         self._session = session
         for message in session.messages:
             if isinstance(message, Message):

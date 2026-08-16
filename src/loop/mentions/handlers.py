@@ -200,7 +200,7 @@ class ProjectPathMentionHandler(MentionHandler):
                         f"Mentioned path '{value}' exceeds the "
                         f"{constants.MAX_FETCH_BYTES}-byte snapshot limit."
                     )
-            except (OSError, UnicodeError, ValueError):
+            except OSError, UnicodeError, ValueError:
                 if ignore_invalid:
                     continue
                 raise

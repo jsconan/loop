@@ -93,7 +93,7 @@ def main() -> None:
 
     except EOFError, KeyboardInterrupt, ShutdownRequested:
         interaction.conversation_ended()
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:  # noqa: BLE001  # pylint: disable=broad-except
         interaction.error(f"An unexpected error occurred: {e}")
 
 

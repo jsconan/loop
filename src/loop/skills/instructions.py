@@ -344,10 +344,9 @@ class InstructionsManager:
         with self._lock:
             self.prepare()
             result = self._skill_manager.deactivate(name)
-            if "error" not in result:
-                if result["instructions_updated"]:
-                    self._instructions = self._build_instructions()
-                    self._generation += 1
+            if "error" not in result and result["instructions_updated"]:
+                self._instructions = self._build_instructions()
+                self._generation += 1
             return result
 
     def deactivate_all_skills(self) -> SkillDeactivationAllResult:

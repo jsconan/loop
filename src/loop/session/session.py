@@ -190,7 +190,9 @@ class Session:
     def _get_message(message: ConversationItem) -> ConversationItem:
         """Return a validated conversation item for storage."""
         if not isinstance(message, ConversationItem):
-            raise ValueError(f"Expected a conversation item, got {type(message)}")
+            raise ValueError(  # noqa: TRY004 - preserve the public deserialization contract.
+                f"Expected a conversation item, got {type(message)}"
+            )
         return message
 
     def serialize(self) -> str:
@@ -280,7 +282,9 @@ class Session:
             raise ValueError("Invalid serialized session.") from error
 
         if not isinstance(payload, dict):
-            raise ValueError("Invalid serialized session.")
+            raise ValueError(  # noqa: TRY004 - all malformed snapshots share one error contract.
+                "Invalid serialized session."
+            )
 
         version = payload.get("version")
         if version not in _SUPPORTED_VERSIONS:

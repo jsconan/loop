@@ -59,7 +59,7 @@ class CompletionManager(Completer):
                     collected.extend(
                         (value, match, adapter_index) for value in adapter.complete(match)
                     )
-            except Exception:  # pylint: disable=broad-exception-caught
+            except Exception:  # noqa: BLE001,S112  # pylint: disable=broad-exception-caught
                 # Completion capabilities are optional, best-effort UI integrations.
                 continue
 

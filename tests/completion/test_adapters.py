@@ -314,7 +314,7 @@ def test_adapter_declarations_expose_markers_and_dynamic_keywords():
     class KeywordAdapter(CompletionAdapter):
         def match(self, document):
             """Remain inactive for this declaration-only capability."""
-            return None
+            return
 
         def complete(self, match):
             """Return no values for this declaration-only capability."""

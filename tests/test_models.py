@@ -124,12 +124,12 @@ def test_structured_output_format_retains_and_uses_a_pydantic_model() -> None:
     assert output_format.schema["additionalProperties"] is False
     assert output_format.schema["required"] == ["name", "age"]
     assert output_format.validate('{"name":"Ada","age":36}') == Person(name="Ada", age=36)
-    assert output_format.validate(
-        '\n```json\n{"name":"Grace","age":37}\n```\n'
-    ) == Person(name="Grace", age=37)
-    assert output_format.validate(
-        '```\n{"name":"Linus","age":38}\n```'
-    ) == Person(name="Linus", age=38)
+    assert output_format.validate('\n```json\n{"name":"Grace","age":37}\n```\n') == Person(
+        name="Grace", age=37
+    )
+    assert output_format.validate('```\n{"name":"Linus","age":38}\n```') == Person(
+        name="Linus", age=38
+    )
     assert StructuredOutputFormat.from_model(Person).name == "Person"
     assert StructuredOutputFormat.from_model(Person, strict=False).schema == (
         Person.model_json_schema()

@@ -432,10 +432,9 @@ def test_response_scope_terminates_streamed_output_after_an_error(capsys):
     """A response scope terminates streamed output when presentation fails."""
     interaction = ConsoleInteraction()
 
-    with pytest.raises(RuntimeError, match="failed"):
-        with interaction.response_context():
-            interaction.answer_delta("partial", start=True)
-            raise RuntimeError("failed")
+    with pytest.raises(RuntimeError, match="failed"), interaction.response_context():
+        interaction.answer_delta("partial", start=True)
+        raise RuntimeError("failed")
 
     assert capsys.readouterr().out == "\nAnswer:partial\n"
 

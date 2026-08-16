@@ -101,5 +101,5 @@ def run_command(
             # therefore triggers a bounded signature refresh on the next request.
             context.invalidate_instructions()
             return output
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         return f"Error running command: {exc}"

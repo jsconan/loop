@@ -119,7 +119,7 @@ def fetch_content(
             raise RuntimeError("Fetched content could not be cached.")
         path, source = resolved
         return _cached_result(handle, source, read_bounded_text(path))
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         return f"Error fetching content: {exc}"
 
 
@@ -177,5 +177,5 @@ def read_cached_content(
                 max_bytes=max_bytes,
             ),
         )
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         return f"Error reading cached content: {exc}"

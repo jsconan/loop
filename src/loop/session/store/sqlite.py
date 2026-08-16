@@ -51,7 +51,7 @@ class SQLiteSessionStore:
 
         now = datetime.now(UTC).isoformat()
         payload = session.serialize()
-        with closing(sqlite3.connect(self._path)) as connection:
+        with closing(sqlite3.connect(self._path)) as connection:  # noqa: SIM117
             with connection:
                 self._create_schema(connection)
                 connection.execute(

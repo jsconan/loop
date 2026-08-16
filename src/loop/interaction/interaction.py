@@ -277,7 +277,7 @@ class Interaction(ABC):
     def history(
         self,
         items: Iterable[ConversationItem],
-        compactions: Iterable["Compaction"] = (),
+        compactions: Iterable[Compaction] = (),
     ) -> None:
         """Display persisted conversation items as prior interaction.
 
@@ -286,7 +286,8 @@ class Interaction(ABC):
             compactions (Iterable[Compaction]): Ordered compaction checkpoints to replay at their
                 full-history boundaries.
         """
-        def display_compaction(compaction: "Compaction") -> None:
+
+        def display_compaction(compaction: Compaction) -> None:
             before = compaction.input_tokens_before
             after = compaction.input_tokens_after
             if before is not None and after is not None and before != after:

@@ -68,7 +68,7 @@ class Tool:
             )
         try:
             return serialize_tool_result(self._call_function(arguments, context))
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
             return serialize_tool_error("execution_failed", f"Tool '{self.name}' failed: {exc}")
 
     async def call_async(
@@ -88,7 +88,7 @@ class Tool:
             if inspect.isawaitable(result):
                 result = await result
             return serialize_tool_result(result)
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
             return serialize_tool_error("execution_failed", f"Tool '{self.name}' failed: {exc}")
 
     def validate_arguments(self, arguments: str) -> tuple[dict[str, Any] | None, str | None]:

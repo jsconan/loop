@@ -527,9 +527,7 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
     assert session.compactions[0].instructions.working_directory == str(tmp_path)
     assert session.tokens == 20
     assert session.context_window == 100
-    backend.compact.assert_called_once_with(
-        messages, instructions=None, model="default-model"
-    )
+    backend.compact.assert_called_once_with(messages, instructions=None, model="default-model")
     assert backend.get_response.call_args.kwargs["input"] == [compacted]
     assert [call.args[0] for call in interaction.info.call_args_list] == [
         "Compacting session context...",

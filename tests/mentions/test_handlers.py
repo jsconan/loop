@@ -15,8 +15,8 @@ from loop import (
     Skill,
     SkillManager,
     SkillMentionHandler,
+    constants,
 )
-from loop import constants
 from loop.utils import cached_path, decode_content_cursor
 
 
@@ -132,9 +132,7 @@ def test_project_paths_reclaim_unused_attachment_shares(tmp_path):
     (tmp_path / "small.txt").write_text("small", encoding="utf-8")
     (tmp_path / "large.txt").write_text("x" * size, encoding="utf-8")
 
-    small, large = ProjectPathMentionHandler(lambda: tmp_path).resolve(
-        ("small.txt", "large.txt")
-    )
+    small, large = ProjectPathMentionHandler(lambda: tmp_path).resolve(("small.txt", "large.txt"))
 
     assert small.content == "small"
     assert small.handle is None
@@ -153,9 +151,7 @@ def test_project_paths_reject_snapshots_above_the_hard_source_limit(monkeypatch,
     with pytest.raises(ValueError, match="snapshot limit"):
         ProjectPathMentionHandler(lambda: tmp_path).resolve(("huge.txt",))
     child = Mock()
-    child.relative_to.return_value.as_posix.return_value = "x" * (
-        constants.MAX_FETCH_BYTES + 1
-    )
+    child.relative_to.return_value.as_posix.return_value = "x" * (constants.MAX_FETCH_BYTES + 1)
     child.is_dir.return_value = False
     monkeypatch.setattr(
         "loop.mentions.handlers.iter_visible_paths",
