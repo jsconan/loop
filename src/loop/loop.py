@@ -1,6 +1,5 @@
 """Run an interactive conversation with an LLM backend."""
 
-from collections.abc import Iterable
 from pathlib import Path
 
 from . import constants
@@ -16,7 +15,6 @@ from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHan
 from .models import (
     ConversationItem,
     Response,
-    ResponseEvent,
 )
 from .permissions import PermissionManager
 from .session import BackendSessionNameGenerator, Session, SessionManager, SessionNameGenerator
@@ -316,8 +314,7 @@ class Loop:
             self._session_manager.add_user_message(user_input, context=context)
 
             while True:
-                events = self.query()
-                response = self._interaction.response(events, debug=self._debug)
+                response = self.query()
                 self._session_manager.add_response(response)
 
                 if not self.handle_tool_calls(response):
@@ -370,11 +367,11 @@ class Loop:
             )
         return True
 
-    def query(self) -> Iterable[ResponseEvent]:
-        """Request normalized events for the current conversation history.
+    def query(self) -> Response:
+        """Request a response from the backend using the current session context and instructions.
 
         Returns:
-            Iterable[ResponseEvent]: Events returned by the configured backend.
+            Response: The response from the backend, wrapped in a ``Response`` object.
 
         Raises:
             ValueError: If neither the loop nor the backend selects a model.
@@ -390,12 +387,13 @@ class Loop:
         self._report_context_window(selected_model)
         if self._session_manager.compaction_needed():
             self._compact(selected_model)
-        return self._backend.get_response(
+        events = self._backend.get_response(
             input=self._session_manager.model_context,
             instructions=self._instructions_manager.instructions,
             stream=self._stream,
             model=selected_model,
         )
+        return self._interaction.response(events, debug=self._debug)
 
     def compact(self) -> bool:
         """Manually compact the active session using current model and instructions.

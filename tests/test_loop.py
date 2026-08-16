@@ -296,7 +296,7 @@ def test_loops_share_local_conversation_context(tmp_path):
     assert second.messages == [Message(role="user", content="hello")]
     assert second.session.tokens == 12
     assert second.session.model == "other-model"
-    assert list(second.query()) == []
+    assert second.query() == Response(answer='', reasoning='')
     second_backend.get_response.assert_called_once_with(
         input=session.messages,
         instructions=None,
@@ -451,7 +451,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     loop = Loop(backend=backend, working_directory=first)
 
     loop.set_working_directory(second)
-    list(loop.query())
+    loop.query()
 
     assert loop.working_directory == second.resolve()
     assert backend.get_response.call_args.kwargs["instructions"] == "Second rules."
@@ -465,7 +465,7 @@ def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
     (tmp_path / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
     loop = Loop(backend=backend, working_directory=tmp_path)
 
-    list(loop.query())
+    loop.query()
 
     assert backend.get_context_window.call_args_list == [call("model"), call("model")]
     backend.count_tokens.assert_not_called()
@@ -519,7 +519,7 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
         working_directory=tmp_path,
     )
 
-    list(loop.query())
+    loop.query()
 
     assert session.messages == messages
     assert len(session.compactions) == 1
@@ -552,14 +552,12 @@ def test_query_warns_when_backend_cannot_compact(tmp_path, unsupported):
     )
     interaction = MagicMock(spec=Interaction)
 
-    list(
-        Loop(
-            backend=backend,
-            session=session,
-            interaction=interaction,
-            working_directory=tmp_path,
-        ).query()
-    )
+    Loop(
+        backend=backend,
+        session=session,
+        interaction=interaction,
+        working_directory=tmp_path,
+    ).query()
 
     assert session.compactions == []
     assert backend.get_response.call_args.kwargs["input"] == [message]
@@ -679,7 +677,7 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
 
     assert loop.handle_tool_calls(response) is True
     result = loop.messages[-1]
-    list(loop.query())
+    loop.query()
 
     assert isinstance(result, ToolResult)
     assert "Follow review instructions." not in result.output
@@ -749,7 +747,7 @@ def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_p
 
     assert loop.handle_tool_calls(response) is True
     result = loop.messages[-1]
-    list(loop.query())
+    loop.query()
 
     assert isinstance(result, ToolResult)
     assert json.loads(result.output)["instructions_updated"] is True
@@ -865,8 +863,8 @@ def test_query_selects_only_the_event_production_mode():
     backend = loop_backend(get_response=Mock(return_value=[]))
     session = Session(messages=[Message(role="user", content="hello")])
 
-    list(Loop(backend=backend, session=session).query())
-    list(Loop(backend=backend, session=session, stream=True).query())
+    Loop(backend=backend, session=session).query()
+    Loop(backend=backend, session=session, stream=True).query()
 
     assert backend.get_response.call_args_list[0].kwargs["stream"] is False
     assert backend.get_response.call_args_list[1].kwargs["stream"] is True
@@ -883,7 +881,7 @@ def test_query_delegates_instruction_state_to_the_session_manager():
     session_manager.compaction_needed.return_value = False
     loop = Loop(backend=backend, session_manager=session_manager)
 
-    list(loop.query())
+    loop.query()
 
     session_manager.update_instruction_state.assert_called_once_with(
         working_directory=str(loop.working_directory),
@@ -896,7 +894,7 @@ def test_query_prefers_the_explicit_model_over_response_metadata():
     backend = loop_backend(get_response=Mock(return_value=[]))
     session = Session(model="served-model")
 
-    list(Loop(backend=backend, model="requested-model", session=session).query())
+    Loop(backend=backend, model="requested-model", session=session).query()
 
     assert backend.get_response.call_args.kwargs["model"] == "requested-model"
 
