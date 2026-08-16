@@ -9,12 +9,13 @@ def parse_mentions(
     text: str,
     candidates: Mapping[str, Sequence[str]],
 ) -> tuple[Mention, ...]:
-    """Return exact known bare, quoted, or bracket-bounded mentions in source order.
+    """Return exact known bare, quoted, bracketed, or Markdown-linked mentions in source order.
 
     Args:
         text (str): Submitted user text.
-        candidates (Mapping[str, Sequence[str]]): Exact values accepted for each marker. Quoted
-            and bracket-bounded values may escape their closing delimiter and backslashes.
+        candidates (Mapping[str, Sequence[str]]): Exact values accepted for each marker. Bounded
+            values may escape their closing delimiter and backslashes. Markdown links resolve
+            their destination rather than their display text.
 
     Returns:
         tuple[Mention, ...]: Non-overlapping exact mentions.
@@ -29,6 +30,12 @@ def parse_mentions(
         bounded = _bounded_value(text, index + 1)
         if bounded is not None:
             value, end = bounded
+            if text[index + 1] == "[" and end < len(text) and text[end] == "(":
+                linked = _markdown_link_destination(text, end)
+                if linked is None:
+                    index += 1
+                    continue
+                value, end = linked
             if value in candidates[marker]:
                 mentions.append(Mention(marker, value, index, end))
                 index = end
@@ -73,3 +80,26 @@ def _bounded_value(text: str, start: int) -> tuple[str, int] | None:
 def _is_end_boundary(text: str, end: int) -> bool:
     """Return whether an exact candidate ends at a mention boundary."""
     return end == len(text) or text[end].isspace() or text[end] in ",.;:!?)]}"
+
+
+def _markdown_link_destination(text: str, start: int) -> tuple[str, int] | None:
+    """Decode a Markdown link destination and its exclusive end offset."""
+    value = []
+    depth = 0
+    index = start + 1
+    while index < len(text):
+        character = text[index]
+        if character.isspace() or character in "<>\x00":
+            return None
+        if character == "\\" and index + 1 < len(text):
+            index += 1
+            character = text[index]
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                return "".join(value), index + 1
+            depth -= 1
+        value.append(character)
+        index += 1
+    return None

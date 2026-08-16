@@ -48,3 +48,25 @@ def test_parser_decodes_exact_bounded_mentions_and_preserves_legacy_matching():
         Mention("$", "single ' quote", 19, 37),
         Mention("@", r"back\slash.md", 38, 55),
     )
+
+
+def test_parser_resolves_markdown_link_destinations():
+    """Markdown mention links resolve exact destinations and include the full link span."""
+    text = r"Read @[guide](docs/guide.md), @[API docs](docs/api_(v2).md), and @[x](a\(b\).md)."
+
+    assert parse_mentions(
+        text,
+        {"@": ("docs/guide.md", "docs/api_(v2).md", "a(b).md")},
+    ) == (
+        Mention("@", "docs/guide.md", 5, 28),
+        Mention("@", "docs/api_(v2).md", 30, 59),
+        Mention("@", "a(b).md", 65, 80),
+    )
+
+
+def test_parser_rejects_unknown_or_malformed_markdown_link_destinations():
+    """Link display text cannot resolve in place of an unknown or malformed destination."""
+    assert parse_mentions(
+        "@[name](unknown) @[name](path with spaces) @[name](unclosed",
+        {"@": ("name",)},
+    ) == ()
