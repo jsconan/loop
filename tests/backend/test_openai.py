@@ -13,6 +13,7 @@ from openai.types.responses import (
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseReasoningItem,
+    ResponseReasoningSummaryTextDeltaEvent,
     ResponseReasoningTextDeltaEvent,
     ResponseReasoningTextDoneEvent,
     ResponseTextDeltaEvent,
@@ -1417,6 +1418,36 @@ def test_completed_response_emits_only_final_reasoning():
     ]
 
 
+def test_completed_response_uses_reasoning_summary_when_content_is_absent():
+    """A summary-only reasoning item retains the text exposed by compatible servers."""
+    reasoning = ResponseReasoningItem.model_validate(
+        {
+            "id": "reasoning_1",
+            "type": "reasoning",
+            "summary": [
+                {"type": "summary_text", "text": "first"},
+                {"type": "summary_text", "text": " thought"},
+            ],
+            "content": [],
+        }
+    )
+    sdk = Mock()
+    sdk.responses.create.return_value = SimpleNamespace(
+        output=[reasoning], output_text="", usage=None, model=None
+    )
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        events = list(OpenAIBackend(default_model="default").get_response("hello"))
+
+    assert events == [
+        ReasoningCompleted(text="first thought"),
+        ResponseCompleted(
+            items=(Reasoning(content="first thought", id="reasoning_1"),),
+            reasoning="first thought",
+        ),
+    ]
+
+
 def test_completed_response_ignores_empty_text_and_invalid_metadata():
     """Empty output items remain history while malformed metadata stays unknown."""
     reasoning = ResponseReasoningItem(id="r", type="reasoning", summary=[], content=[])
@@ -1572,12 +1603,36 @@ def test_streaming_response_normalizes_provider_events():
 def test_async_streaming_response_uses_the_normalized_event_contract():
     """Asynchronous streaming returns the same local response events."""
     provider_events = [
+        ResponseReasoningSummaryTextDeltaEvent(
+            delta="think",
+            item_id="r",
+            output_index=0,
+            summary_index=0,
+            sequence_number=1,
+            type="response.reasoning_summary_text.delta",
+        ),
+        ResponseReasoningSummaryTextDeltaEvent(
+            delta="ing",
+            item_id="r",
+            output_index=0,
+            summary_index=0,
+            sequence_number=2,
+            type="response.reasoning_summary_text.delta",
+        ),
+        ResponseReasoningTextDeltaEvent(
+            delta="duplicate",
+            item_id="r",
+            output_index=0,
+            content_index=0,
+            sequence_number=3,
+            type="response.reasoning_text.delta",
+        ),
         ResponseTextDeltaEvent(
             delta="answer",
             item_id="m",
-            output_index=0,
+            output_index=1,
             content_index=0,
-            sequence_number=1,
+            sequence_number=4,
             type="response.output_text.delta",
             logprobs=[],
         ),
@@ -1593,7 +1648,12 @@ def test_async_streaming_response_uses_the_normalized_event_contract():
             )
         )
 
-    assert events == [AnswerDelta(text="answer"), ResponseCompleted(model="served-model")]
+    assert events == [
+        ReasoningDelta(text="think"),
+        ReasoningDelta(text="ing"),
+        AnswerDelta(text="answer"),
+        ResponseCompleted(model="served-model"),
+    ]
 
 
 def test_structured_streaming_buffers_and_discards_invalid_attempts():

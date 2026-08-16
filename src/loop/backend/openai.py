@@ -23,6 +23,9 @@ from openai.types.responses import ResponseOutputItemDoneEvent as OpenAIOutputIt
 from openai.types.responses import ResponseOutputMessage as OpenAIOutputMessage
 from openai.types.responses import ResponseReasoningItem as OpenAIReasoningItem
 from openai.types.responses import ResponseReasoningItemParam as OpenAIReasoningItemParam
+from openai.types.responses import (
+    ResponseReasoningSummaryTextDeltaEvent as OpenAIReasoningSummaryDeltaEvent,
+)
 from openai.types.responses import ResponseReasoningTextDeltaEvent as OpenAIReasoningDeltaEvent
 from openai.types.responses import ResponseStreamEvent as OpenAIResponseStreamEvent
 from openai.types.responses import ResponseTextDeltaEvent as OpenAITextDeltaEvent
@@ -59,6 +62,8 @@ from ..models import (
 from ..tooling import ToolRegistry
 from ..tooling import tool_registry as default_tool_registry
 from .backend import Backend
+
+_ReasoningChannel = Literal["content", "summary"]
 
 
 class OpenAIBackend(Backend):
@@ -218,8 +223,9 @@ class OpenAIBackend(Backend):
             )
             if stream:
                 items = []
+                reasoning_channels = {}
                 for event in response:
-                    yield from self._translated_stream_event(event, items, None)
+                    yield from self._translated_stream_event(event, items, None, reasoning_channels)
                 return
             yield from self._response_events(response, None)
             return
@@ -319,8 +325,11 @@ class OpenAIBackend(Backend):
                     yield event
                 return
             items = []
+            reasoning_channels = {}
             async for event in response:
-                for translated in self._translated_stream_event(event, items, None):
+                for translated in self._translated_stream_event(
+                    event, items, None, reasoning_channels
+                ):
                     yield translated
             return
 
@@ -840,10 +849,13 @@ class OpenAIBackend(Backend):
         events: list[ResponseEvent],
         items: list[ConversationItem],
         output_format: StructuredOutputFormat,
+        reasoning_channels: dict[str, _ReasoningChannel],
     ) -> None:
         """Buffer one structured stream event until terminal validation succeeds."""
         try:
-            events.extend(cls._translated_stream_event(event, items, output_format))
+            events.extend(
+                cls._translated_stream_event(event, items, output_format, reasoning_channels)
+            )
         except StructuredOutputValidationError as error:
             completed_response = getattr(event, "response", None)
             error.usage = cls._usage(completed_response)
@@ -858,8 +870,9 @@ class OpenAIBackend(Backend):
         """Buffer structured stream events until terminal validation succeeds."""
         items = []
         events = []
+        reasoning_channels = {}
         for provider_event in response:
-            cls._buffer_event(provider_event, events, items, output_format)
+            cls._buffer_event(provider_event, events, items, output_format, reasoning_channels)
         return events
 
     @classmethod
@@ -871,8 +884,9 @@ class OpenAIBackend(Backend):
         """Asynchronously buffer structured events until terminal validation succeeds."""
         items = []
         events = []
+        reasoning_channels = {}
         async for provider_event in response:
-            cls._buffer_event(provider_event, events, items, output_format)
+            cls._buffer_event(provider_event, events, items, output_format, reasoning_channels)
         return events
 
     @staticmethod
@@ -941,9 +955,18 @@ class OpenAIBackend(Backend):
         event: OpenAIResponseStreamEvent,
         items: list[ConversationItem],
         output_format: StructuredOutputFormat | None,
+        reasoning_channels: dict[str, _ReasoningChannel],
     ) -> list[ResponseEvent]:
         """Translate one OpenAI stream event and update completed history items."""
-        if isinstance(event, OpenAIReasoningDeltaEvent):
+        if isinstance(event, (OpenAIReasoningDeltaEvent, OpenAIReasoningSummaryDeltaEvent)):
+            channel: _ReasoningChannel = (
+                "summary" if isinstance(event, OpenAIReasoningSummaryDeltaEvent) else "content"
+            )
+            selected_channel = reasoning_channels.get(event.item_id)
+            if selected_channel is not None and selected_channel != channel:
+                return []
+            if event.delta and selected_channel is None:
+                reasoning_channels[event.item_id] = channel
             return [ReasoningDelta(text=event.delta)]
         if isinstance(event, OpenAITextDeltaEvent):
             return [AnswerDelta(text=event.delta)]
@@ -962,7 +985,7 @@ class OpenAIBackend(Backend):
         """Translate a supported OpenAI output item into a conversation item."""
         if isinstance(item, OpenAIReasoningItem):
             return Reasoning(
-                content="".join(content.text for content in item.content or []),
+                content=OpenAIBackend._reasoning_text(item),
                 id=item.id,
             )
         if isinstance(item, OpenAIOutputMessage):
@@ -979,6 +1002,14 @@ class OpenAIBackend(Backend):
                 arguments=item.arguments,
             )
         return None
+
+    @staticmethod
+    def _reasoning_text(item: OpenAIReasoningItem) -> str:
+        """Return full reasoning content, falling back to its shareable summary."""
+        content = "".join(part.text for part in item.content or [])
+        if content:
+            return content
+        return "".join(part.text for part in item.summary or [])
 
     @classmethod
     def _completion(

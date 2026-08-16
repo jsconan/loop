@@ -296,7 +296,7 @@ def test_loops_share_local_conversation_context(tmp_path):
     assert second.messages == [Message(role="user", content="hello")]
     assert second.session.tokens == 12
     assert second.session.model == "other-model"
-    assert second.query() == Response(answer='', reasoning='')
+    assert second.query() == Response(answer="", reasoning="")
     second_backend.get_response.assert_called_once_with(
         input=session.messages,
         instructions=None,
