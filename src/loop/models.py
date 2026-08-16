@@ -7,7 +7,9 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field
+from jsonschema import FormatChecker, SchemaError
+from jsonschema.validators import validator_for
+from pydantic import BaseModel, Field, ValidationError as PydanticValidationError
 
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 StructuredOutputValidator: TypeAlias = Callable[[JsonValue], Any]
@@ -16,7 +18,43 @@ _JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE |
 
 
 class StructuredOutputValidationError(ValueError):
-    """Report output that does not satisfy its requested structure."""
+    """Report output that does not satisfy its requested structure.
+
+    Args:
+        format_name (str): Name of the structured output contract.
+        raw_output (str): Complete rejected provider output.
+        errors (tuple[str, ...]): Machine-readable-path validation diagnostics.
+        attempt (int | None): One-based generation attempt, when assigned by a backend.
+        model (str | None): Provider model that generated the rejected output.
+        mode (str | None): Structured-output transport used for the failed attempt.
+        usage (Usage | None): Aggregate usage across failed attempts, when available.
+        category (str): Failure category, such as validation, refusal, or incomplete.
+    """
+
+    def __init__(
+        self,
+        format_name: str,
+        raw_output: str,
+        errors: tuple[str, ...],
+        *,
+        attempt: int | None = None,
+        model: str | None = None,
+        mode: str | None = None,
+        usage: "Usage | None" = None,
+        category: str = "validation",
+    ) -> None:
+        self.format_name = format_name
+        self.raw_output = raw_output
+        self.errors = errors
+        self.attempt = attempt
+        self.model = model
+        self.mode = mode
+        self.usage = usage
+        self.category = category
+        details = "; ".join(errors) if errors else "unknown validation error"
+        super().__init__(
+            f"Response does not satisfy structured output format {format_name!r}: {details}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,15 +63,18 @@ class StructuredOutputFormat:
 
     Args:
         name (str): Portable identifier for the output schema.
-        schema (Mapping[str, object]): JSON Schema sent to the model provider.
+        schema (Mapping[str, object]): Provider-facing JSON Schema, also used for local validation
+            when no separate canonical schema is supplied.
         description (str | None): Optional description of the desired output.
         strict (bool): Whether the provider should enforce strict schema adherence.
         model (type[BaseModel] | None): Pydantic model retained for output validation.
         validator (StructuredOutputValidator | None): Callback that receives decoded JSON and
             returns its validated or transformed value when no Pydantic model is supplied.
+        validation_schema (Mapping[str, object] | None): Canonical schema used for local
+            validation when ``schema`` is a provider-specific strict representation.
 
     Raises:
-        ValueError: If the name is empty or both validation mechanisms are supplied.
+        ValueError: If the name or schema is invalid, or both validation mechanisms are supplied.
     """
 
     name: str
@@ -42,12 +83,22 @@ class StructuredOutputFormat:
     strict: bool = True
     model: type[BaseModel] | None = None
     validator: StructuredOutputValidator | None = None
+    validation_schema: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("Structured output format name must not be empty.")
         if self.model is not None and self.validator is not None:
             raise ValueError("Structured output format cannot define both a model and validator.")
+        object.__setattr__(self, "schema", deepcopy(dict(self.schema)))
+        if self.validation_schema is not None:
+            object.__setattr__(self, "validation_schema", deepcopy(dict(self.validation_schema)))
+        canonical_schema = dict(self.validation_schema or self.schema)
+        try:
+            schema_validator = validator_for(canonical_schema)
+            schema_validator.check_schema(canonical_schema)
+        except SchemaError as error:
+            raise ValueError(f"Invalid structured output JSON Schema: {error.message}") from error
 
     @staticmethod
     def _strict_json_schema(schema: dict[str, object]) -> dict[str, object]:
@@ -117,6 +168,7 @@ class StructuredOutputFormat:
             description=description,
             strict=strict,
             model=model,
+            validation_schema=schema,
         )
 
     @staticmethod
@@ -148,7 +200,7 @@ class StructuredOutputFormat:
         return value
 
     def validate(self, text: str) -> Any:
-        """Decode and validate completed JSON response text.
+        """Decode and locally validate completed JSON response text.
 
         Args:
             text (str): Complete raw JSON or JSON-fenced response text.
@@ -162,15 +214,50 @@ class StructuredOutputFormat:
         try:
             payload = self._normalize_structured_text(text)
             value = self._decode_structured_text(payload)
+            canonical_schema = dict(self.validation_schema or self.schema)
+            schema_validator = validator_for(canonical_schema)(
+                canonical_schema, format_checker=FormatChecker()
+            )
+            schema_errors = sorted(
+                schema_validator.iter_errors(value), key=lambda error: list(error.absolute_path)
+            )
+            if schema_errors:
+                errors = tuple(
+                    "$"
+                    + "".join(
+                        f"[{part}]" if isinstance(part, int) else f".{part}"
+                        for part in schema_error.absolute_path
+                    )
+                    + f": {schema_error.message}"
+                    for schema_error in schema_errors
+                )
+                raise StructuredOutputValidationError(self.name, text, errors)
             if self.model is not None:
                 return self.model.model_validate(value)
             if self.validator is not None:
                 return self.validator(value)
             return value
-        except (json.JSONDecodeError, ValueError, TypeError) as error:
-            raise StructuredOutputValidationError(
-                f"Response does not satisfy structured output format {self.name!r}: {error}"
-            ) from error
+        except StructuredOutputValidationError:
+            raise
+        except (
+            json.JSONDecodeError,
+            PydanticValidationError,
+            ValueError,
+            TypeError,
+        ) as error:
+            if isinstance(error, PydanticValidationError):
+                errors = tuple(
+                    "$"
+                    + "".join(
+                        f"[{part}]" if isinstance(part, int) else f".{part}"
+                        for part in detail["loc"]
+                    )
+                    + f": {detail['msg']}"
+                    for detail in error.errors(include_url=False)
+                )
+            else:
+                errors = (str(error),)
+            raise StructuredOutputValidationError(self.name, text, errors) from error
 
 
 class Usage(BaseModel):

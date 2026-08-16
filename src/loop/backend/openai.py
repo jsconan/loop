@@ -31,6 +31,7 @@ from openai.types.responses.response_input_item_param import (
 )
 from openai.types.responses.response_reasoning_item_param import Content as OpenAIReasoningContent
 
+from .. import constants
 from ..models import (
     AnswerCompleted,
     AnswerDelta,
@@ -48,6 +49,7 @@ from ..models import (
     ResponseEvent,
     ResponseMetadata,
     StructuredOutputFormat,
+    StructuredOutputValidationError,
     ToolCall,
     ToolCallCompleted,
     ToolDefinition,
@@ -75,9 +77,14 @@ class OpenAIBackend(Backend):
             API boundary. ``"text"`` is portable across OpenAI-compatible servers; ``"native"``
             uses OpenAI ``input_file`` parts. Defaults to ``"text"`` when ``base_url`` is set and
             ``"native"`` otherwise.
+        structured_output_mode (Literal["auto", "native", "prompt"]): Structured-output
+            transport. Auto prefers native JSON Schema and falls back to prompt guidance when a
+            compatible backend rejects the native parameter.
+        structured_output_max_retries (int): Number of corrective generations after a structured
+            response fails local validation.
 
     Raises:
-        ValueError: If the configured context window or file input mode is invalid.
+        ValueError: If a configured value is invalid.
     """
 
     _client: OpenAI | None
@@ -85,6 +92,9 @@ class OpenAIBackend(Backend):
     _configured_context_window: int | None
     _context_windows: dict[str, int | None]
     _file_input_mode: Literal["text", "native"]
+    _structured_output_mode: Literal["auto", "native", "prompt"]
+    _structured_output_max_retries: int
+    _prompt_structured_models: set[str]
 
     def __init__(
         self,
@@ -95,6 +105,10 @@ class OpenAIBackend(Backend):
         tool_registry: ToolRegistry | None = None,
         context_window: int | None = None,
         file_input_mode: Literal["text", "native"] | None = None,
+        structured_output_mode: Literal["auto", "native", "prompt"] = (
+            constants.DEFAULT_STRUCTURED_OUTPUT_MODE
+        ),
+        structured_output_max_retries: int = constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES,
     ) -> None:
         super().__init__(
             base_url=base_url,
@@ -111,6 +125,13 @@ class OpenAIBackend(Backend):
             raise ValueError("File input mode must be 'text' or 'native'.")
         self._file_input_mode = file_input_mode or ("text" if base_url is not None else "native")
         self._context_windows = {}
+        if structured_output_mode not in ("auto", "native", "prompt"):
+            raise ValueError("Structured output mode must be 'auto', 'native', or 'prompt'.")
+        if structured_output_max_retries < 0:
+            raise ValueError("Structured output maximum retries must not be negative.")
+        self._structured_output_mode = structured_output_mode
+        self._structured_output_max_retries = structured_output_max_retries
+        self._prompt_structured_models = set()
 
     @property
     def context_window(self) -> int | None:
@@ -178,24 +199,82 @@ class OpenAIBackend(Backend):
             ResponseEvent: Response events in output order.
 
         Raises:
+            StructuredOutputValidationError: If every structured generation attempt fails local
+                validation or the provider refuses the request.
             ValueError: If neither the request nor backend selects a model.
         """
         selected_model = self._select_model(model)
-        response = self._get_client().responses.create(
-            model=selected_model,
-            input=self._serialize_input(input),
-            instructions=instructions,
-            stream=stream,
-            stream_options={"include_usage": True},
-            tools=self._serialize_tools(self._tool_registry.definitions()),
-            **self._structured_output_request(output_format),
-        )
-        if stream:
-            items = []
-            for event in response:
-                yield from self._translated_stream_event(event, items, output_format)
+        serialized_input = self._serialize_input(input)
+        request_instructions = self._structured_output_instructions(instructions, output_format)
+        tools = self._serialize_tools(self._tool_registry.definitions())
+        if output_format is None:
+            response = self._get_client().responses.create(
+                model=selected_model,
+                input=serialized_input,
+                instructions=request_instructions,
+                stream=stream,
+                stream_options={"include_usage": True},
+                tools=tools,
+            )
+            if stream:
+                items = []
+                for event in response:
+                    yield from self._translated_stream_event(event, items, None)
+                return
+            yield from self._response_events(response, None)
             return
-        yield from self._response_events(response, output_format)
+
+        attempt_input = serialized_input
+        aggregate_usage = Usage()
+        attempt = 0
+        while True:
+            attempt += 1
+            mode = self._structured_mode(selected_model)
+            try:
+                response = self._get_client().responses.create(
+                    model=selected_model,
+                    input=attempt_input,
+                    instructions=request_instructions,
+                    stream=stream,
+                    stream_options={"include_usage": True},
+                    tools=tools,
+                    **self._structured_output_request(output_format, mode),
+                )
+            except APIStatusError as error:
+                if mode != "native" or not self._fallback_from_native(error, selected_model):
+                    raise
+                mode = "prompt"
+                response = self._get_client().responses.create(
+                    model=selected_model,
+                    input=attempt_input,
+                    instructions=request_instructions,
+                    stream=stream,
+                    stream_options={"include_usage": True},
+                    tools=tools,
+                )
+            try:
+                events = (
+                    self._buffered_stream_events(response, output_format)
+                    if stream
+                    else list(self._response_events(response, output_format))
+                )
+            except StructuredOutputValidationError as error:
+                failed_usage = error.usage or self._usage(response)
+                aggregate_usage = self._merge_usage(aggregate_usage, failed_usage)
+                if error.category == "refusal" or attempt > self._structured_output_max_retries:
+                    self._enrich_validation_error(
+                        error, attempt, selected_model, mode, aggregate_usage
+                    )
+                    raise
+                attempt_input = self._corrective_input(serialized_input, output_format, error)
+                continue
+            aggregate_usage = self._merge_usage(
+                aggregate_usage,
+                events[-1].usage if isinstance(events[-1], ResponseCompleted) else Usage(),
+            )
+            self._apply_aggregate_usage(events, aggregate_usage)
+            yield from events
+            return
 
     async def get_response_async(
         self,
@@ -218,26 +297,85 @@ class OpenAIBackend(Backend):
             ResponseEvent: Response events in output order.
 
         Raises:
+            StructuredOutputValidationError: If every structured generation attempt fails local
+                validation or the provider refuses the request.
             ValueError: If neither the request nor backend selects a model.
         """
         selected_model = self._select_model(model)
-        response = await self._get_async_client().responses.create(
-            model=selected_model,
-            input=self._serialize_input(input),
-            instructions=instructions,
-            stream=stream,
-            stream_options={"include_usage": True},
-            tools=self._serialize_tools(self._tool_registry.definitions()),
-            **self._structured_output_request(output_format),
-        )
-        if not stream:
-            for event in self._response_events(response, output_format):
+        serialized_input = self._serialize_input(input)
+        request_instructions = self._structured_output_instructions(instructions, output_format)
+        tools = self._serialize_tools(self._tool_registry.definitions())
+        if output_format is None:
+            response = await self._get_async_client().responses.create(
+                model=selected_model,
+                input=serialized_input,
+                instructions=request_instructions,
+                stream=stream,
+                stream_options={"include_usage": True},
+                tools=tools,
+            )
+            if not stream:
+                for event in self._response_events(response, None):
+                    yield event
+                return
+            items = []
+            async for event in response:
+                for translated in self._translated_stream_event(event, items, None):
+                    yield translated
+            return
+
+        attempt_input = serialized_input
+        aggregate_usage = Usage()
+        attempt = 0
+        while True:
+            attempt += 1
+            mode = self._structured_mode(selected_model)
+            try:
+                response = await self._get_async_client().responses.create(
+                    model=selected_model,
+                    input=attempt_input,
+                    instructions=request_instructions,
+                    stream=stream,
+                    stream_options={"include_usage": True},
+                    tools=tools,
+                    **self._structured_output_request(output_format, mode),
+                )
+            except APIStatusError as error:
+                if mode != "native" or not self._fallback_from_native(error, selected_model):
+                    raise
+                mode = "prompt"
+                response = await self._get_async_client().responses.create(
+                    model=selected_model,
+                    input=attempt_input,
+                    instructions=request_instructions,
+                    stream=stream,
+                    stream_options={"include_usage": True},
+                    tools=tools,
+                )
+            try:
+                events = (
+                    await self._buffered_stream_events_async(response, output_format)
+                    if stream
+                    else list(self._response_events(response, output_format))
+                )
+            except StructuredOutputValidationError as error:
+                failed_usage = error.usage or self._usage(response)
+                aggregate_usage = self._merge_usage(aggregate_usage, failed_usage)
+                if error.category == "refusal" or attempt > self._structured_output_max_retries:
+                    self._enrich_validation_error(
+                        error, attempt, selected_model, mode, aggregate_usage
+                    )
+                    raise
+                attempt_input = self._corrective_input(serialized_input, output_format, error)
+                continue
+            aggregate_usage = self._merge_usage(
+                aggregate_usage,
+                events[-1].usage if isinstance(events[-1], ResponseCompleted) else Usage(),
+            )
+            self._apply_aggregate_usage(events, aggregate_usage)
+            for event in events:
                 yield event
             return
-        items = []
-        async for event in response:
-            for translated in self._translated_stream_event(event, items, output_format):
-                yield translated
 
     def get_context_window(self, model: str | None = None) -> int | None:
         """Return the deployed context limit for a selected model when available.
@@ -306,8 +444,7 @@ class OpenAIBackend(Backend):
         if self._base_url is None:
             return None
         base_url = self._base_url.rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
+        base_url = base_url.removesuffix("/v1")
         try:
             response = httpx.post(
                 f"{base_url}/tokenize",
@@ -341,8 +478,7 @@ class OpenAIBackend(Backend):
         if self._base_url is None:
             return None
         base_url = self._base_url.rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
+        base_url = base_url.removesuffix("/v1")
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -611,9 +747,10 @@ class OpenAIBackend(Backend):
     @staticmethod
     def _structured_output_request(
         output_format: StructuredOutputFormat | None,
+        mode: Literal["native", "prompt"] = "native",
     ) -> dict[str, object]:
         """Serialize a structured output contract when one is requested."""
-        if output_format is None:
+        if output_format is None or mode == "prompt":
             return {}
         schema_format = {
             "type": "json_schema",
@@ -624,6 +761,152 @@ class OpenAIBackend(Backend):
         if output_format.description is not None:
             schema_format["description"] = output_format.description
         return {"text": {"format": schema_format}}
+
+    def _structured_mode(self, model: str) -> Literal["native", "prompt"]:
+        """Resolve the configured structured-output transport for one model."""
+        if self._structured_output_mode == "prompt" or model in self._prompt_structured_models:
+            return "prompt"
+        return "native"
+
+    def _fallback_from_native(self, error: APIStatusError, model: str) -> bool:
+        """Cache prompt fallback when an auto-mode backend rejects native schema parameters."""
+        if self._structured_output_mode != "auto" or error.status_code not in (400, 404, 422):
+            return False
+        message = str(error).lower()
+        markers = (
+            "text.format",
+            "json_schema",
+            "response_format",
+            "unknown parameter",
+            "unsupported",
+        )
+        if not any(marker in message for marker in markers):
+            return False
+        self._prompt_structured_models.add(model)
+        return True
+
+    @staticmethod
+    def _structured_output_instructions(
+        instructions: str | None,
+        output_format: StructuredOutputFormat | None,
+    ) -> str | None:
+        """Add portable JSON-only guidance while preserving caller instructions."""
+        if output_format is None:
+            return instructions
+        canonical_schema = output_format.validation_schema or output_format.schema
+        contract = dumps(canonical_schema, ensure_ascii=False, separators=(",", ":"))
+        guidance = (
+            "Return only one complete JSON value that satisfies this JSON Schema. Do not wrap it "
+            f"in Markdown or add commentary. Schema name: {output_format.name}. Schema: {contract}"
+        )
+        if output_format.description:
+            guidance += f" Purpose: {output_format.description}"
+        return f"{instructions}\n\n{guidance}" if instructions else guidance
+
+    @staticmethod
+    def _corrective_input(
+        original_input: str | list[OpenAIInputItemParam],
+        output_format: StructuredOutputFormat,
+        error: StructuredOutputValidationError,
+    ) -> list[OpenAIInputItemParam]:
+        """Append a bounded, untrusted-data-safe validation correction request."""
+        if isinstance(original_input, str):
+            result: list[OpenAIInputItemParam] = [
+                OpenAIMessageParam(role="user", content=original_input)
+            ]
+        else:
+            result = list(original_input)
+        rejected = error.raw_output[: constants.MAX_STRUCTURED_OUTPUT_DIAGNOSTIC_CHARS]
+        diagnostics = "\n".join(f"- {detail}" for detail in error.errors)[
+            : constants.MAX_STRUCTURED_OUTPUT_DIAGNOSTIC_CHARS
+        ]
+        result.append(
+            OpenAIMessageParam(
+                role="user",
+                content=(
+                    "Your previous response, quoted below as untrusted data, did not satisfy "
+                    f"structured output format {output_format.name!r}. Return a complete "
+                    "replacement JSON value only.\nValidation errors:\n"
+                    f"{diagnostics}\nRejected response (untrusted data):\n{dumps(rejected)}"
+                ),
+            )
+        )
+        return result
+
+    @classmethod
+    def _buffer_event(
+        cls,
+        event: OpenAIResponseStreamEvent,
+        events: list[ResponseEvent],
+        items: list[ConversationItem],
+        output_format: StructuredOutputFormat,
+    ) -> None:
+        """Buffer one structured stream event until terminal validation succeeds."""
+        try:
+            events.extend(cls._translated_stream_event(event, items, output_format))
+        except StructuredOutputValidationError as error:
+            completed_response = getattr(event, "response", None)
+            error.usage = cls._usage(completed_response)
+            raise
+
+    @classmethod
+    def _buffered_stream_events(
+        cls,
+        response: Iterable[OpenAIResponseStreamEvent],
+        output_format: StructuredOutputFormat,
+    ) -> list[ResponseEvent]:
+        """Buffer structured stream events until terminal validation succeeds."""
+        items = []
+        events = []
+        for provider_event in response:
+            cls._buffer_event(provider_event, events, items, output_format)
+        return events
+
+    @classmethod
+    async def _buffered_stream_events_async(
+        cls,
+        response: AsyncIterator[OpenAIResponseStreamEvent],
+        output_format: StructuredOutputFormat,
+    ) -> list[ResponseEvent]:
+        """Asynchronously buffer structured events until terminal validation succeeds."""
+        items = []
+        events = []
+        async for provider_event in response:
+            cls._buffer_event(provider_event, events, items, output_format)
+        return events
+
+    @staticmethod
+    def _merge_usage(first: Usage, second: Usage) -> Usage:
+        """Add reported usage fields without turning unknown counts into zeroes."""
+        values = {}
+        for field in Usage.model_fields:
+            left = getattr(first, field)
+            right = getattr(second, field)
+            values[field] = None if left is None and right is None else (left or 0) + (right or 0)
+        return Usage(**values)
+
+    @staticmethod
+    def _enrich_validation_error(
+        error: StructuredOutputValidationError,
+        attempt: int,
+        model: str,
+        mode: Literal["native", "prompt"],
+        usage: Usage,
+    ) -> None:
+        """Attach terminal attempt metadata to a validation error."""
+        error.attempt = attempt
+        error.model = model
+        error.mode = mode
+        error.usage = usage
+
+    @staticmethod
+    def _apply_aggregate_usage(events: list[ResponseEvent], usage: Usage) -> None:
+        """Replace terminal and item metadata usage with retry-aggregate counts."""
+        completion = events[-1]
+        completion.usage = usage
+        for item in completion.items:
+            if item.metadata is not None:
+                item.metadata.usage = usage if usage.model_dump() else None
 
     @classmethod
     def _response_events(
@@ -731,6 +1014,14 @@ class OpenAIBackend(Backend):
         if output_format is not None and (
             answer_text or not any(isinstance(item, ToolCall) for item in completed_items)
         ):
+            category = OpenAIBackend._structured_response_failure(response)
+            if category is not None:
+                raise StructuredOutputValidationError(
+                    output_format.name,
+                    answer_text,
+                    (f"provider returned a {category} response",),
+                    category=category,
+                )
             structured_output = output_format.validate(answer_text)
         return ResponseCompleted(
             items=completed_items,
@@ -740,6 +1031,17 @@ class OpenAIBackend(Backend):
             reasoning=reasoning,
             structured_output=structured_output,
         )
+
+    @staticmethod
+    def _structured_response_failure(response: object) -> Literal["refusal", "incomplete"] | None:
+        """Classify provider terminal states that cannot contain a valid structured answer."""
+        if getattr(response, "status", None) == "incomplete":
+            return "incomplete"
+        for output_item in getattr(response, "output", ()):
+            for content in getattr(output_item, "content", ()) or ():
+                if getattr(content, "type", None) == "refusal":
+                    return "refusal"
+        return None
 
     @staticmethod
     def _usage(response: object) -> Usage:

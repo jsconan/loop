@@ -96,6 +96,19 @@ def sdk_completion_event(total_tokens=12, model="served-model", output=None):
     )
 
 
+def sdk_output_message(text, item_id="m"):
+    """Build a completed provider text item."""
+    return ResponseOutputMessage.model_validate(
+        {
+            "id": item_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+    )
+
+
 class AsyncEvents:
     """Adapt a finite event sequence to an asynchronous iterator."""
 
@@ -152,6 +165,14 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
 
     openai.assert_called_once_with(base_url="https://example.test/v1", api_key="secret")
     async_openai.assert_called_once_with(base_url="https://example.test/v1", api_key="secret")
+
+
+def test_configuration_rejects_invalid_structured_output_policy():
+    """Structured-output transport and retry defaults reject invalid overrides."""
+    with pytest.raises(ValueError, match="mode"):
+        OpenAIBackend(structured_output_mode="invalid")
+    with pytest.raises(ValueError, match="retries"):
+        OpenAIBackend(structured_output_max_retries=-1)
 
 
 def test_backend_does_not_read_process_configuration(monkeypatch):
@@ -646,6 +667,228 @@ def test_sync_response_uses_raw_schema_validator_without_nullable_description():
     assert "description" not in sdk.responses.create.call_args.kwargs["text"]["format"]
 
 
+def test_structured_response_retries_with_diagnostics_and_aggregates_usage():
+    """Invalid output is replaced through one bounded corrective generation."""
+    sdk = Mock()
+    sdk.responses.create.side_effect = [
+        SimpleNamespace(
+            output=[],
+            output_text='{"name":"Ada","age":"old"}',
+            usage=SimpleNamespace(input_tokens=5, output_tokens=2, total_tokens=7),
+            model="served-model",
+        ),
+        SimpleNamespace(
+            output=[],
+            output_text='{"name":"Ada","age":36}',
+            usage=SimpleNamespace(input_tokens=8, output_tokens=3, total_tokens=11),
+            model="served-model",
+        ),
+    ]
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        events = list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello", output_format=StructuredOutputFormat.from_model(Person)
+            )
+        )
+
+    assert events == [
+        AnswerCompleted(text='{"name":"Ada","age":36}'),
+        ResponseCompleted(
+            usage=Usage(input_tokens=13, output_tokens=5, total_tokens=18),
+            model="served-model",
+            answer='{"name":"Ada","age":36}',
+            structured_output=Person(name="Ada", age=36),
+        ),
+    ]
+    correction = sdk.responses.create.call_args_list[1].kwargs["input"][-1]["content"]
+    assert "$.age" in correction
+    assert "untrusted data" in correction
+    assert "JSON Schema" in sdk.responses.create.call_args_list[0].kwargs["instructions"]
+
+
+def test_structured_retry_applies_aggregate_usage_to_item_metadata():
+    """Accepted history items carry usage aggregated across every generation attempt."""
+    valid_text = '{"name":"Ada","age":36}'
+    sdk = Mock()
+    sdk.responses.create.side_effect = [
+        SimpleNamespace(
+            output=[],
+            output_text="{}",
+            usage=SimpleNamespace(total_tokens=2),
+            model="served-model",
+        ),
+        SimpleNamespace(
+            id="response_2",
+            output=[sdk_output_message(valid_text)],
+            output_text=valid_text,
+            usage=SimpleNamespace(total_tokens=3),
+            model="served-model",
+        ),
+    ]
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        events = list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello", output_format=StructuredOutputFormat.from_model(Person)
+            )
+        )
+
+    assert events[-1].usage.total_tokens == 5
+    assert events[-1].items[0].metadata.usage.total_tokens == 5
+
+
+def test_prompt_mode_omits_native_format_and_auto_mode_caches_rejection():
+    """Prompt transport is portable and auto mode remembers native parameter rejection."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "Unknown parameter: text.format json_schema",
+        response=httpx.Response(400, request=request),
+        body=None,
+    )
+    valid = SimpleNamespace(
+        output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None
+    )
+    sdk = Mock()
+    sdk.responses.create.side_effect = [rejected, valid, valid]
+    output_format = StructuredOutputFormat.from_model(Person)
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        backend = OpenAIBackend(default_model="default")
+        first = list(backend.get_response("one", output_format=output_format))
+        second = list(backend.get_response("two", output_format=output_format))
+
+    assert first[-1].structured_output == Person(name="Ada", age=36)
+    assert second[-1].structured_output == Person(name="Ada", age=36)
+    assert "text" in sdk.responses.create.call_args_list[0].kwargs
+    assert "text" not in sdk.responses.create.call_args_list[1].kwargs
+    assert "text" not in sdk.responses.create.call_args_list[2].kwargs
+
+
+def test_explicit_prompt_mode_uses_serialized_history_for_correction():
+    """Prompt mode retries iterable context without sending a native schema parameter."""
+    sdk = Mock()
+    sdk.responses.create.side_effect = [
+        SimpleNamespace(output=[], output_text="{}", usage=None, model=None),
+        SimpleNamespace(
+            output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None
+        ),
+    ]
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        events = list(
+            OpenAIBackend(
+                default_model="default", structured_output_mode="prompt"
+            ).get_response(
+                [Message(role="user", content="hello")],
+                output_format=StructuredOutputFormat.from_model(Person),
+            )
+        )
+
+    assert events[-1].structured_output == Person(name="Ada", age=36)
+    assert all("text" not in call.kwargs for call in sdk.responses.create.call_args_list)
+    assert sdk.responses.create.call_args_list[1].kwargs["input"][0]["content"] == "hello"
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [("native", "unsupported text.format"), ("auto", "unrelated bad request")],
+)
+def test_native_schema_errors_only_fall_back_when_auto_and_recognized(mode, message):
+    """Explicit native mode and unrelated provider errors remain visible to callers."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        message, response=httpx.Response(400, request=request), body=None
+    )
+    sdk = Mock()
+    sdk.responses.create.side_effect = rejected
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(APIStatusError),
+    ):
+        list(
+            OpenAIBackend(
+                default_model="default", structured_output_mode=mode
+            ).get_response("hello", output_format=StructuredOutputFormat.from_model(Person))
+        )
+
+
+def test_structured_provider_refusal_fails_without_retry():
+    """Provider refusals are classified and are not regenerated as validation mistakes."""
+    refusal = SimpleNamespace(type="refusal")
+    sdk = Mock()
+    sdk.responses.create.return_value = SimpleNamespace(
+        status="completed",
+        output=[SimpleNamespace(content=[refusal])],
+        output_text="",
+        usage=None,
+        model=None,
+    )
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(StructuredOutputValidationError) as captured,
+    ):
+        list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello", output_format=StructuredOutputFormat.from_model(Person)
+            )
+        )
+
+    assert captured.value.category == "refusal"
+    assert captured.value.attempt == 1
+    assert sdk.responses.create.call_count == 1
+
+
+def test_incomplete_structured_response_is_classified_after_retry():
+    """Incomplete terminal responses remain distinguishable after retry exhaustion."""
+    sdk = Mock()
+    sdk.responses.create.return_value = SimpleNamespace(
+        status="incomplete", output=[], output_text="", usage=None, model=None
+    )
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(StructuredOutputValidationError) as captured,
+    ):
+        list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello", output_format=StructuredOutputFormat.from_model(Person)
+            )
+        )
+
+    assert captured.value.category == "incomplete"
+    assert captured.value.attempt == 2
+
+
+def test_structured_failure_exposes_terminal_attempt_context():
+    """Retry exhaustion reports the model, mode, attempt, output, and aggregate usage."""
+    sdk = Mock()
+    sdk.responses.create.return_value = SimpleNamespace(
+        output=[],
+        output_text="not-json",
+        usage=SimpleNamespace(input_tokens=2, output_tokens=1, total_tokens=3),
+        model="served-model",
+    )
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(StructuredOutputValidationError) as captured,
+    ):
+        list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello", output_format=StructuredOutputFormat.from_model(Person)
+            )
+        )
+
+    assert captured.value.attempt == 2
+    assert captured.value.model == "default"
+    assert captured.value.mode == "native"
+    assert captured.value.raw_output == "not-json"
+    assert captured.value.usage == Usage(input_tokens=4, output_tokens=2, total_tokens=6)
+
+
 def test_structured_response_rejects_empty_final_text():
     """A final response without JSON fails its requested structured contract."""
     sdk = Mock()
@@ -739,6 +982,86 @@ def test_async_response_forwards_and_validates_structured_output():
     assert sdk.responses.create.await_args.kwargs["text"]["format"]["schema"] == (
         output_format.schema
     )
+
+
+def test_async_structured_response_retries_invalid_output():
+    """Asynchronous structured requests apply the same corrective retry policy."""
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(
+        side_effect=[
+            SimpleNamespace(output=[], output_text="{}", usage=None, model=None),
+            SimpleNamespace(
+                output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None
+            ),
+        ]
+    )
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        events = asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="default").get_response_async(
+                    "hello", output_format=StructuredOutputFormat.from_model(Person)
+                )
+            )
+        )
+
+    assert events[-1].structured_output == Person(name="Ada", age=36)
+    assert sdk.responses.create.await_count == 2
+
+
+def test_async_auto_mode_falls_back_and_reports_terminal_validation_failure():
+    """Async auto mode falls back to prompting and enriches retry exhaustion errors."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "unsupported json_schema",
+        response=httpx.Response(422, request=request),
+        body=None,
+    )
+    invalid = SimpleNamespace(output=[], output_text="bad", usage=None, model=None)
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(side_effect=[rejected, invalid, invalid])
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(StructuredOutputValidationError) as captured,
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="default").get_response_async(
+                    "hello", output_format=StructuredOutputFormat.from_model(Person)
+                )
+            )
+        )
+
+    assert captured.value.mode == "prompt"
+    assert captured.value.attempt == 2
+    assert sdk.responses.create.await_count == 3
+
+
+def test_async_native_mode_preserves_provider_schema_errors():
+    """Async explicit native transport does not hide provider parameter failures."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "unsupported json_schema",
+        response=httpx.Response(400, request=request),
+        body=None,
+    )
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(side_effect=rejected)
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(APIStatusError),
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(
+                    default_model="default", structured_output_mode="native"
+                ).get_response_async(
+                    "hello", output_format=StructuredOutputFormat.from_model(Person)
+                )
+            )
+        )
 
 
 def test_completed_response_normalizes_items_and_serializes_local_history():
@@ -1275,6 +1598,109 @@ def test_async_streaming_response_uses_the_normalized_event_contract():
         )
 
     assert events == [AnswerDelta(text="answer"), ResponseCompleted(model="served-model")]
+
+
+def test_structured_streaming_buffers_and_discards_invalid_attempts():
+    """Structured streaming exposes only events belonging to the validated attempt."""
+    invalid_message = sdk_output_message("not-json", "invalid")
+    valid_text = '{"name":"Ada","age":36}'
+    valid_message = sdk_output_message(valid_text, "valid")
+    invalid_stream = [
+        ResponseTextDeltaEvent(
+            delta="invalid-fragment",
+            item_id="invalid",
+            output_index=0,
+            content_index=0,
+            sequence_number=1,
+            type="response.output_text.delta",
+            logprobs=[],
+        ),
+        sdk_completion_event(total_tokens=3, output=[invalid_message]),
+    ]
+    valid_stream = [
+        ResponseTextDeltaEvent(
+            delta=valid_text,
+            item_id="valid",
+            output_index=0,
+            content_index=0,
+            sequence_number=1,
+            type="response.output_text.delta",
+            logprobs=[],
+        ),
+        sdk_completion_event(total_tokens=4, output=[valid_message]),
+    ]
+    sdk = Mock()
+    sdk.responses.create.side_effect = [invalid_stream, valid_stream]
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        events = list(
+            OpenAIBackend(default_model="default").get_response(
+                "hello",
+                stream=True,
+                output_format=StructuredOutputFormat.from_model(Person),
+            )
+        )
+
+    assert events[0] == AnswerDelta(text=valid_text)
+    assert all(
+        not isinstance(event, AnswerDelta) or event.text != "invalid-fragment" for event in events
+    )
+    assert events[-1].structured_output == Person(name="Ada", age=36)
+    assert events[-1].usage.total_tokens == 7
+
+
+def test_async_structured_streaming_is_transactional():
+    """Asynchronous structured streams also hide failed generation deltas."""
+    valid_text = '{"name":"Ada","age":36}'
+    streams = [
+        AsyncEvents(
+            [
+                ResponseTextDeltaEvent(
+                    delta="bad",
+                    item_id="bad",
+                    output_index=0,
+                    content_index=0,
+                    sequence_number=1,
+                    type="response.output_text.delta",
+                    logprobs=[],
+                ),
+                sdk_completion_event(total_tokens=None, output=[sdk_output_message("bad", "bad")]),
+            ]
+        ),
+        AsyncEvents(
+            [
+                ResponseTextDeltaEvent(
+                    delta=valid_text,
+                    item_id="valid",
+                    output_index=0,
+                    content_index=0,
+                    sequence_number=1,
+                    type="response.output_text.delta",
+                    logprobs=[],
+                ),
+                sdk_completion_event(
+                    total_tokens=None, output=[sdk_output_message(valid_text, "valid")]
+                ),
+            ]
+        ),
+    ]
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(side_effect=streams)
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        events = asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="default").get_response_async(
+                    "hello",
+                    stream=True,
+                    output_format=StructuredOutputFormat.from_model(Person),
+                )
+            )
+        )
+
+    assert events[0] == AnswerDelta(text=valid_text)
+    assert events[-1].structured_output == Person(name="Ada", age=36)
+    assert sdk.responses.create.await_count == 2
 
 
 def test_async_streaming_yields_before_the_provider_stream_completes():

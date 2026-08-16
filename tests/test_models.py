@@ -3,7 +3,7 @@
 import json
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from loop import (
     Message,
@@ -44,6 +44,20 @@ class Count(BaseModel):
     """Represent a one-field non-text response."""
 
     count: int
+
+
+class OrderedRange(BaseModel):
+    """Represent a semantic constraint not expressible by the generated schema."""
+
+    start: int
+    end: int
+
+    @model_validator(mode="after")
+    def validate_order(self):
+        """Require the range end to follow its start."""
+        if self.end <= self.start:
+            raise ValueError("end must be greater than start")
+        return self
 
 
 def test_models_serialize_nested_values_to_python_and_json() -> None:
@@ -149,6 +163,21 @@ def test_structured_output_format_uses_a_callback_or_returns_decoded_json() -> N
     assert StructuredOutputFormat(name="numbers", schema=schema).validate("[1, 2]") == [1, 2]
 
 
+def test_structured_output_format_locally_enforces_raw_json_schema() -> None:
+    """Raw formats reject schema-invalid JSON even when no custom validator is supplied."""
+    output_format = StructuredOutputFormat(
+        name="numbers",
+        schema={"type": "array", "items": {"type": "integer"}},
+    )
+
+    with pytest.raises(StructuredOutputValidationError) as captured:
+        output_format.validate('[1, "two"]')
+
+    assert captured.value.format_name == "numbers"
+    assert captured.value.raw_output == '[1, "two"]'
+    assert captured.value.errors == ("$[1]: 'two' is not of type 'integer'",)
+
+
 def test_single_string_field_format_accepts_scalar_provider_fallbacks() -> None:
     """One-field text models tolerate JSON-string and plain-text provider fallbacks."""
     output_format = StructuredOutputFormat.from_model(Title, name="session_name")
@@ -183,6 +212,14 @@ def test_structured_output_format_wraps_decoding_and_validation_errors(output_fo
         output_format.validate(text)
 
 
+def test_structured_output_format_reports_pydantic_semantic_validation_paths() -> None:
+    """Model-only semantic failures retain Pydantic diagnostics after schema validation."""
+    with pytest.raises(StructuredOutputValidationError) as captured:
+        StructuredOutputFormat.from_model(OrderedRange).validate('{"start":2,"end":1}')
+
+    assert captured.value.errors == ("$: Value error, end must be greater than start",)
+
+
 def test_structured_output_format_rejects_json_embedded_in_markdown() -> None:
     """Structured validation does not extract JSON from prose or non-JSON fences."""
     output_format = StructuredOutputFormat.from_model(Person)
@@ -207,3 +244,5 @@ def test_structured_output_format_rejects_invalid_configuration() -> None:
             model=Person,
             validator=int,
         )
+    with pytest.raises(ValueError, match="Invalid structured output JSON Schema"):
+        StructuredOutputFormat(name="invalid", schema={"type": "not-a-json-type"})
