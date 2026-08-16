@@ -17,7 +17,14 @@ from ..models import (
     Response,
     ToolResult,
 )
-from ..utils import bound_tool_result, cached_metadata, register_cached_metadata, sha256_digest
+from ..utils import (
+    bound_tool_result,
+    cached_metadata,
+    cached_path,
+    register_cached_metadata,
+    sha256_digest,
+    store_text_stream,
+)
 from .models import (
     SESSION_NAME_SOURCE_GENERATED,
     SESSION_NAME_SOURCE_INITIAL,
@@ -273,6 +280,20 @@ class SessionManager:
             raise ValueError("Invalid session type.")
         self._session = session
         for message in session.messages:
+            if isinstance(message, Message):
+                for reference in message.context:
+                    cached = cached_path(reference.handle) if reference.handle is not None else None
+                    if (
+                        reference.handle is not None
+                        and reference.snapshot_content is not None
+                        and (cached is None or not cached[0].exists())
+                    ):
+                        store_text_stream(
+                            [reference.snapshot_content.encode("utf-8")],
+                            f"mentioned {reference.kind} {reference.path}",
+                            constants.MAX_FETCH_BYTES,
+                            handle=reference.handle,
+                        )
             if isinstance(message, ToolResult):
                 for artifact in message.artifacts:
                     register_cached_metadata(

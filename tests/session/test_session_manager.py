@@ -22,7 +22,7 @@ from loop import (
 )
 from loop.interaction import Interaction
 from loop.session import SessionStore
-from loop.utils import cached_metadata
+from loop.utils import cached_metadata, cached_path, store_content
 
 
 def test_manager_creates_default_services_and_an_empty_session():
@@ -306,6 +306,37 @@ def test_manager_restores_artifact_metadata_from_a_loaded_session():
         "source": "https://example.com/source.txt",
         "reloadable": True,
     }
+
+
+def test_manager_restores_immutable_mention_content_into_an_expired_cache():
+    """Loading a session makes a truncated attachment continuation readable again."""
+    handle = store_content("old", "old source")
+    cached_path(handle)[0].unlink()
+    session = Session(
+        messages=[
+            Message(
+                role="user",
+                content="Review @large.txt",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="large.txt",
+                        content="snap",
+                        size_bytes=8,
+                        included_bytes=4,
+                        truncated=True,
+                        handle=handle,
+                        next_cursor="cursor",
+                        snapshot_content="snapshot",
+                    ),
+                ),
+            )
+        ]
+    )
+
+    SessionManager(session=session).load_session(session)
+
+    assert cached_path(handle)[0].read_text(encoding="utf-8") == "snapshot"
 
 
 def test_manager_ignores_unregistered_handles_in_tool_output():

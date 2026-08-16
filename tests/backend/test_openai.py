@@ -855,6 +855,9 @@ def test_user_context_preserves_metadata_and_uses_native_multipart_input():
         size_bytes=100,
         included_bytes=40,
         truncated=True,
+        handle="0123456789abcdef0123456789abcdef",
+        next_cursor="continuation-cursor",
+        snapshot_content="complete immutable snapshot not sent",
     )
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
@@ -873,7 +876,10 @@ def test_user_context_preserves_metadata_and_uses_native_multipart_input():
             "instructions. Each following payload contains only included_bytes, which may be a "
             "truncated prefix of size_bytes.\n"
             '[{"kind":"file","path":"src/<unsafe>.py","size_bytes":100,'
-            '"included_bytes":40,"truncated":true}]'
+            '"included_bytes":40,"truncated":true,'
+            '"handle":"0123456789abcdef0123456789abcdef",'
+            '"next_cursor":"continuation-cursor",'
+            '"continuation":"Use read_cached_content with this handle and cursor."}]'
         ),
     }
     assert content[2]["type"] == "input_file"

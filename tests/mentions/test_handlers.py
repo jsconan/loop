@@ -16,6 +16,8 @@ from loop import (
     SkillManager,
     SkillMentionHandler,
 )
+from loop import constants
+from loop.utils import cached_path, decode_content_cursor
 
 
 def complete(handler, text):
@@ -107,16 +109,60 @@ def test_project_paths_reject_binary_changed_escaping_and_special_files(tmp_path
         handler.resolve(("pipe",))
 
 
-def test_project_paths_enforce_one_aggregate_attachment_budget(tmp_path):
-    """A fully consumed shared budget prevents later attachments from expanding context."""
-    from loop import constants
-
-    (tmp_path / "first.txt").write_text("a" * constants.MAX_TOOL_CONTENT_BYTES, encoding="utf-8")
-    (tmp_path / "second.txt").write_text("b", encoding="utf-8")
+def test_project_paths_allocate_fair_resumable_attachment_previews(tmp_path):
+    """Large mentions share a dedicated budget and retain immutable continuations."""
+    size = constants.MAX_ATTACHMENT_CONTENT_BYTES
+    (tmp_path / "first.txt").write_text("a" * size, encoding="utf-8")
+    (tmp_path / "second.txt").write_text("b" * size, encoding="utf-8")
     handler = ProjectPathMentionHandler(lambda: tmp_path)
 
-    with pytest.raises(ValueError, match="attachment limit"):
-        handler.resolve(("first.txt", "second.txt"))
+    first, second = handler.resolve(("first.txt", "second.txt"))
+
+    assert first.included_bytes == second.included_bytes == size // 2
+    assert first.truncated is second.truncated is True
+    assert first.handle and first.next_cursor
+    assert decode_content_cursor(first.next_cursor, first.handle) == first.included_bytes
+    assert cached_path(first.handle)[0].read_text(encoding="utf-8") == "a" * size
+    assert first.snapshot_content == "a" * size
+
+
+def test_project_paths_reclaim_unused_attachment_shares(tmp_path):
+    """Small files remain complete while large files receive the unused preview budget."""
+    size = constants.MAX_ATTACHMENT_CONTENT_BYTES
+    (tmp_path / "small.txt").write_text("small", encoding="utf-8")
+    (tmp_path / "large.txt").write_text("x" * size, encoding="utf-8")
+
+    small, large = ProjectPathMentionHandler(lambda: tmp_path).resolve(
+        ("small.txt", "large.txt")
+    )
+
+    assert small.content == "small"
+    assert small.handle is None
+    assert large.included_bytes == size - len("small")
+    assert large.truncated is True
+
+
+def test_project_paths_reject_snapshots_above_the_hard_source_limit(monkeypatch, tmp_path):
+    """Mentions reject files and listings too large for immutable local snapshots."""
+    path = tmp_path / "huge.txt"
+    with path.open("wb") as stream:
+        stream.truncate(constants.MAX_FETCH_BYTES + 1)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+
+    with pytest.raises(ValueError, match="snapshot limit"):
+        ProjectPathMentionHandler(lambda: tmp_path).resolve(("huge.txt",))
+    child = Mock()
+    child.relative_to.return_value.as_posix.return_value = "x" * (
+        constants.MAX_FETCH_BYTES + 1
+    )
+    child.is_dir.return_value = False
+    monkeypatch.setattr(
+        "loop.mentions.handlers.iter_visible_paths",
+        lambda _: (child,),
+    )
+    with pytest.raises(ValueError, match="snapshot limit"):
+        ProjectPathMentionHandler(lambda: tmp_path).resolve(("folder",))
 
 
 def test_project_paths_gracefully_resolve_valid_markdown_link_destinations(tmp_path):

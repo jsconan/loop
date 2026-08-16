@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Literal
 
 from .. import constants
 from ..completion import (
@@ -13,7 +14,7 @@ from ..completion import (
 )
 from ..models import ContextReference
 from ..skills import InstructionsManager
-from ..utils import is_path_ignored, iter_visible_paths, read_bounded_text
+from ..utils import encode_content_cursor, is_path_ignored, iter_visible_paths, store_content
 
 
 class MentionHandler(ABC):
@@ -164,9 +165,8 @@ class ProjectPathMentionHandler(MentionHandler):
     ) -> tuple[ContextReference, ...]:
         """Resolve unique paths under one shared attachment budget."""
         root = self._working_directory().resolve()
-        references = []
+        sources = []
         resolved_paths = set()
-        remaining = constants.MAX_TOOL_CONTENT_BYTES
         for value in dict.fromkeys(values):
             try:
                 path = (root / value.rstrip("/")).resolve()
@@ -176,48 +176,86 @@ class ProjectPathMentionHandler(MentionHandler):
                     raise ValueError(f"Mentioned path '{value}' is unavailable.")
                 if path in resolved_paths:
                     continue
-                if remaining < 1:
-                    raise ValueError("Mentioned paths exceed the context attachment limit.")
                 if path.is_dir():
-                    reference = self._directory_reference(path, value, remaining)
-                elif path.is_file():
-                    result = read_bounded_text(path, max_bytes=remaining)
-                    reference = ContextReference(
-                        kind="file",
-                        path=value,
-                        content=result["content"],
-                        size_bytes=result["size_bytes"],
-                        included_bytes=result["included_bytes"],
-                        truncated=result["truncated"],
+                    content = "\n".join(
+                        child.relative_to(path).as_posix() + ("/" if child.is_dir() else "")
+                        for child in iter_visible_paths(path)
                     )
+                    kind = "directory"
+                elif path.is_file():
+                    if path.stat().st_size > constants.MAX_FETCH_BYTES:
+                        raise ValueError(
+                            f"Mentioned path '{value}' exceeds the "
+                            f"{constants.MAX_FETCH_BYTES}-byte snapshot limit."
+                        )
+                    encoded = path.read_bytes()
+                    if b"\0" in encoded:
+                        raise ValueError("Content appears to be binary.")
+                    content = encoded.decode("utf-8")
+                    kind = "file"
                 else:
                     raise ValueError(f"Mentioned path '{value}' is not a file or directory.")
+                if len(content.encode("utf-8")) > constants.MAX_FETCH_BYTES:
+                    raise ValueError(
+                        f"Mentioned path '{value}' exceeds the "
+                        f"{constants.MAX_FETCH_BYTES}-byte snapshot limit."
+                    )
             except (OSError, UnicodeError, ValueError):
                 if ignore_invalid:
                     continue
                 raise
             resolved_paths.add(path)
-            references.append(reference)
-            remaining -= reference.included_bytes
-        return tuple(references)
+            sources.append((kind, value, content))
+        allocations = self._allocate_preview_bytes(
+            tuple(len(content.encode("utf-8")) for _, _, content in sources)
+        )
+        return tuple(
+            self._reference(kind, value, content, allocation)
+            for (kind, value, content), allocation in zip(sources, allocations, strict=True)
+        )
 
     @staticmethod
-    def _directory_reference(path: Path, display_path: str, max_bytes: int) -> ContextReference:
-        """Build one bounded immediate directory-listing snapshot."""
-        content = "\n".join(
-            child.relative_to(path).as_posix() + ("/" if child.is_dir() else "")
-            for child in iter_visible_paths(path)
-        )
+    def _allocate_preview_bytes(sizes: tuple[int, ...]) -> tuple[int, ...]:
+        """Allocate the attachment preview budget fairly while reclaiming unused shares."""
+        allocations = [0] * len(sizes)
+        remaining = constants.MAX_ATTACHMENT_CONTENT_BYTES
+        pending = set(range(len(sizes)))
+        while pending and remaining:
+            share = max(1, remaining // len(pending))
+            completed = {index for index in pending if sizes[index] <= share}
+            if not completed:
+                for index in pending:
+                    allocations[index] = share
+                break
+            for index in completed:
+                allocations[index] = sizes[index]
+                remaining -= sizes[index]
+            pending -= completed
+        return tuple(allocations)
+
+    @staticmethod
+    def _reference(
+        kind: Literal["file", "directory"],
+        display_path: str,
+        content: str,
+        max_bytes: int,
+    ) -> ContextReference:
+        """Build one bounded preview with a resumable immutable snapshot when truncated."""
         encoded = content.encode("utf-8")
         included = encoded[:max_bytes].decode("utf-8", errors="ignore")
         included_bytes = len(included.encode("utf-8"))
+        truncated = included_bytes < len(encoded)
+        handle = store_content(encoded, f"mentioned {kind} {display_path}") if truncated else None
         return ContextReference(
-            kind="directory",
+            kind=kind,
             path=display_path,
             content=included,
             size_bytes=len(encoded),
             included_bytes=included_bytes,
-            truncated=included_bytes < len(encoded),
+            truncated=truncated,
+            handle=handle,
+            next_cursor=(encode_content_cursor(handle, included_bytes) if handle else None),
+            snapshot_content=content if handle else None,
         )
 
 

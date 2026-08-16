@@ -508,6 +508,17 @@ class OpenAIBackend(Backend):
                                 "size_bytes": reference.size_bytes,
                                 "included_bytes": reference.included_bytes,
                                 "truncated": reference.truncated,
+                                **(
+                                    {
+                                        "handle": reference.handle,
+                                        "next_cursor": reference.next_cursor,
+                                        "continuation": (
+                                            "Use read_cached_content with this handle and cursor."
+                                        ),
+                                    }
+                                    if reference.handle is not None
+                                    else {}
+                                ),
                             }
                             for reference in item.context
                         ],

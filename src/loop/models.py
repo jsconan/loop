@@ -231,6 +231,10 @@ class ContextReference(BaseModel):
         size_bytes (int): Complete source size in bytes.
         included_bytes (int): Number of content bytes included in the snapshot.
         truncated (bool): Whether content was omitted from the snapshot.
+        handle (str | None): Opaque handle for reading an omitted immutable remainder.
+        next_cursor (str | None): Opaque cursor at which the first continuation starts.
+        snapshot_content (str | None): Complete immutable content retained for cache restoration;
+            never sent to the model provider.
     """
 
     kind: Literal["file", "directory"]
@@ -239,6 +243,9 @@ class ContextReference(BaseModel):
     size_bytes: int
     included_bytes: int
     truncated: bool
+    handle: str | None = None
+    next_cursor: str | None = None
+    snapshot_content: str | None = None
 
 
 class Message(ConversationItemModel):
