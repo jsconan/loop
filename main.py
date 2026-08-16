@@ -35,7 +35,7 @@ def main() -> None:
             base_url=os.getenv("BASE_URL", _BASE_URL),
             default_model=os.getenv("DEFAULT_MODEL", _DEFAULT_MODEL),
             api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
-            context_window=int(context_window) if context_window is not None else None,
+            context_window=int(context_window) if context_window else None,
         )
         working_directory = Path.cwd()
         project_root = find_project_root(working_directory) or working_directory
