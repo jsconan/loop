@@ -13,6 +13,7 @@ from loop import (
     AnswerDelta,
     BackendAuthenticationError,
     BackendConnectionError,
+    BackendNotFoundError,
     BackendServerError,
     CompactionContextItem,
     CompactionResult,
@@ -22,6 +23,7 @@ from loop import (
     Loop,
     MentionManager,
     Message,
+    ModelInfo,
     PermissionConfiguration,
     PermissionManager,
     Response,
@@ -219,7 +221,7 @@ def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(t
         ),
     )
     assert "Follow review instructions." in backend.get_response.call_args.kwargs["instructions"]
-    assert loop.session.active_skills == [("review", str(location))]
+    assert loop.session.active_skills == [("review", str(location))]\
 
 
 def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
@@ -331,6 +333,123 @@ def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):
 
     interaction.error.assert_called_once_with("invalid key (HTTP 401)")
     interaction.confirm.assert_not_called()
+
+
+def test_run_selects_an_available_model_after_not_found(tmp_path):
+    """A missing model delegates replacement selection to the interaction."""
+    error = BackendNotFoundError(
+        "model missing", provider="openai", operation="create_response", status_code=404
+    )
+    models = [ModelInfo(id="first"), ModelInfo(id="second")]
+    backend = Mock(tool_registry=ToolRegistry(), default_model="missing")
+    backend.get_context_window.return_value = None
+    backend.get_models.return_value = models
+    backend.get_response.side_effect = [error, [ResponseCompleted(model="second")]]
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", "second", False]
+
+    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+    loop.run()
+
+    assert loop.model == "second"
+    assert loop.session.model == "second"
+    assert backend.get_response.call_args_list[1].kwargs["model"] == "second"
+    assert interaction.prompt.call_args_list[1].args == (
+        "Select a replacement model, or enter 'q' to stop: ",
+    )
+    assert interaction.prompt.call_args_list[1].kwargs == {
+        "choices": {"first": "first", "second": "second"},
+    }
+    interaction.info.assert_any_call("Using model: second")
+
+
+def test_run_re_prompts_when_user_selects_same_failed_model(tmp_path):
+    """The fallback selector re-prompts when the user selects the already-failed model."""
+    error = BackendNotFoundError("missing", provider="openai", operation="create_response")
+    backend = Mock(tool_registry=ToolRegistry(), default_model="missing")
+    backend.get_context_window.return_value = None
+    backend.get_models.return_value = [ModelInfo(id="second"), ModelInfo(id="missing")]
+    backend.get_response.side_effect = [error, [ResponseCompleted()], [ResponseCompleted()]]
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", "missing", "second", False]
+    # First call returns False (re-prompt), second call returns True (accept)
+    interaction.confirm.side_effect = [False, True]
+
+    loop = Loop(
+        backend=backend, interaction=interaction, model="missing", working_directory=tmp_path
+    )
+    loop.run()
+
+    assert loop.model == "second"
+    interaction.warning.assert_any_call(
+        "Model 'missing' was already unavailable; the same failure is "
+        "likely to re-occur unless the backend is updated."
+    )
+    interaction.confirm.assert_called()
+
+
+def test_run_accepts_same_failed_model_on_confirm(tmp_path):
+    """Selecting the failed model and confirming accepts it, breaking immediately."""
+    error = BackendNotFoundError("missing", provider="openai", operation="create_response")
+    backend = Mock(tool_registry=ToolRegistry(), default_model="missing")
+    backend.get_context_window.return_value = None
+    backend.get_models.return_value = [ModelInfo(id="second"), ModelInfo(id="missing")]
+    backend.get_response.side_effect = [error, [ResponseCompleted()]]
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", "missing", False]
+    # confirm returns True to accept the same failed model
+    interaction.confirm.return_value = True
+
+    loop = Loop(
+        backend=backend, interaction=interaction, model="missing", working_directory=tmp_path
+    )
+    loop.run()
+
+    assert loop.model == "missing"
+    assert loop.session.model == "missing"
+    interaction.warning.assert_called_once_with(
+        "Model 'missing' was already unavailable; the same failure is "
+        "likely to re-occur unless the backend is updated."
+    )
+
+
+@pytest.mark.parametrize(
+    "models", [[], BackendConnectionError("offline", provider="openai", operation="list_models")]
+)
+def test_run_stops_model_fallback_when_discovery_fails(tmp_path, models):
+    """Unavailable or empty model discovery returns safely to the conversation prompt."""
+    missing = BackendNotFoundError("missing", provider="openai", operation="create_response")
+    backend = Mock(tool_registry=ToolRegistry(), default_model="missing")
+    backend.get_context_window.return_value = None
+    backend.get_response.side_effect = missing
+    if isinstance(models, Exception):
+        backend.get_models.side_effect = models
+    else:
+        backend.get_models.return_value = models
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", False]
+
+    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+
+    if isinstance(models, Exception):
+        interaction.error.assert_any_call("Could not list available models: offline")
+    else:
+        interaction.warning.assert_called_once_with("The backend reported no available models.")
+
+
+def test_run_can_stop_model_selection(tmp_path):
+    """Exiting the fallback selector abandons only the failed response turn."""
+    missing = BackendNotFoundError("missing", provider="openai", operation="create_response")
+    backend = Mock(tool_registry=ToolRegistry(), default_model="missing")
+    backend.get_context_window.return_value = None
+    backend.get_models.return_value = [ModelInfo(id="replacement")]
+    backend.get_response.side_effect = missing
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", False, False]
+
+    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+
+    assert backend.get_response.call_count == 1
 
 
 def test_loop_uses_an_injected_mention_registry(tmp_path):

@@ -4,7 +4,7 @@ from pathlib import Path
 from time import sleep
 
 from . import constants
-from .backend import Backend, BackendError
+from .backend import Backend, BackendError, BackendNotFoundError
 from .commands import CommandManager
 from .completion import (
     CommandCompletionAdapter,
@@ -352,6 +352,10 @@ class Loop:
         while True:
             try:
                 return self.query()
+            except BackendNotFoundError as error:
+                self._report_backend_error(error)
+                if not self._select_fallback_model():
+                    return None
             except BackendError as error:
                 self._report_backend_error(error)
                 if not error.recoverable or not self._prompt_on_recoverable_error:
@@ -379,6 +383,44 @@ class Loop:
         if diagnostics:
             message = f"{message} ({', '.join(diagnostics)})"
         self._interaction.error(message)
+
+    def _select_fallback_model(self) -> bool:
+        """List available models and let the user replace a missing selection.
+
+        Re-prompts when the user selects the already-failed model; only returns
+        when the user picks a different model or cancels.
+        """
+        try:
+            models = self._backend.get_models()
+        except BackendError as error:
+            self._interaction.error(f"Could not list available models: {error}")
+            return False
+        if not models:
+            self._interaction.warning("The backend reported no available models.")
+            return False
+        failing_model = self._model
+        while True:
+            selection = self._interaction.prompt(
+                "Select a replacement model, or enter 'q' to stop: ",
+                choices={model.id: model.id for model in models},
+            )
+            if selection is False:
+                return False
+            if selection != failing_model:
+                break
+            self._interaction.warning(
+                f"Model '{selection}' was already unavailable; the same "
+                "failure is likely to re-occur unless the backend is updated."
+            )
+            if self._interaction.confirm(
+                "Continue with this model, or select a different one?",
+                default=True,
+            ):
+                break
+        self._model = selection
+        self._session_manager.model = selection
+        self._interaction.info(f"Using model: {selection}")
+        return True
 
     def handle_tool_calls(self, response: Response) -> bool:
         """Handle tool calls made by the LLM during reasoning.
