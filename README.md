@@ -246,6 +246,7 @@ backend = OpenAIBackend(
     base_url="https://example.com/v1",
     api_key="your-api-key",
     default_model="your-model-id",
+    max_retries=2,
 )
 ```
 
@@ -257,14 +258,21 @@ manifest.
 
 The executable in `main.py` resolves environment variables and applies these application defaults:
 
-| Setting  | Environment variable | Built-in default               |
-| -------- | -------------------- | ------------------------------ |
-| Base URL | `BASE_URL`           | `http://localhost:8000/v1`     |
-| Model    | `DEFAULT_MODEL`      | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
-| API key  | `OPENAI_API_KEY`     | `local-api-key`                |
+| Setting           | Environment variable  | Built-in default               |
+| ----------------- | --------------------- | ------------------------------ |
+| Base URL          | `BASE_URL`            | `http://localhost:8000/v1`     |
+| Model             | `DEFAULT_MODEL`       | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
+| API key           | `OPENAI_API_KEY`      | `local-api-key`                |
+| Automatic retries | `OPENAI_MAX_RETRIES`  | `2`                            |
 
 `OpenAIBackend` itself does not read environment variables or provide deployment defaults. Library
 callers configure it explicitly, and credentials remain private backend state.
+
+Transient connection, timeout, conflict, rate-limit, and server failures use the OpenAI SDK's
+bounded exponential-backoff retries. When those attempts are exhausted, the interactive loop
+offers to retry the complete response. A missing selected model triggers model discovery and lets
+the user choose an available replacement. Library callers still receive normalized backend
+exceptions and can apply their own recovery policy.
 
 The `fetch_content` tool sends a browser-like user agent by default. Set `USER_AGENT` to override
 it for web requests.

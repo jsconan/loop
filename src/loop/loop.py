@@ -1,9 +1,10 @@
 """Run an interactive conversation with an LLM backend."""
 
 from pathlib import Path
+from time import sleep
 
 from . import constants
-from .backend import Backend
+from .backend import Backend, BackendError
 from .commands import CommandManager
 from .completion import (
     CommandCompletionAdapter,
@@ -48,6 +49,8 @@ class Loop:
             provisional name after the first response. Defaults to the conversation backend.
         stream (bool): Whether the backend should produce response events incrementally.
         debug (bool): Whether to print raw response events.
+        prompt_on_recoverable_error (bool): Whether to offer an interactive retry after automatic
+            retries exhaust a recoverable backend failure.
 
     Raises:
         ValueError: If the session is invalid.
@@ -67,6 +70,7 @@ class Loop:
     _completion_manager: CompletionManager
     _session_name_generator: SessionNameGenerator
     _mention_manager: MentionManager
+    _prompt_on_recoverable_error: bool
 
     def __init__(
         self,
@@ -84,6 +88,7 @@ class Loop:
         session_name_generator: SessionNameGenerator | None = None,
         stream: bool = False,
         debug: bool = False,
+        prompt_on_recoverable_error: bool = True,
     ) -> None:
         if session_manager is not None:
             self._session_manager = session_manager
@@ -115,6 +120,7 @@ class Loop:
         self._stream = stream
         self._debug = debug
         self._model = model
+        self._prompt_on_recoverable_error = prompt_on_recoverable_error
         selected_model = self._model or self._backend.default_model
         if selected_model:
             self._report_context_window(selected_model)
@@ -314,11 +320,16 @@ class Loop:
             self._session_manager.add_user_message(user_input, context=context)
 
             while True:
-                response = self.query()
+                response = self._query_with_recovery()
+                if response is None:
+                    break
                 self._session_manager.add_response(response)
 
                 if not self.handle_tool_calls(response):
                     break
+
+            if response is None:
+                continue
 
             if self._session_manager.session.has_initial_name():
                 try:
@@ -335,6 +346,39 @@ class Loop:
             )
 
         self.end()
+
+    def _query_with_recovery(self) -> Response | None:
+        """Request one response while escalating exhausted failures to the user."""
+        while True:
+            try:
+                return self.query()
+            except BackendError as error:
+                self._report_backend_error(error)
+                if not error.recoverable or not self._prompt_on_recoverable_error:
+                    return None
+                prompt = "Retry the complete response?"
+                if error.response_started:
+                    prompt = "Partial output was discarded. Retry the complete response?"
+                if error.retry_after is not None and error.retry_after > 0:
+                    prompt = f"{prompt[:-1]} after at least {error.retry_after:g} seconds?"
+                if not self._interaction.confirm(prompt, default=False):
+                    return None
+                if error.retry_after is not None and error.retry_after > 0:
+                    delay = min(error.retry_after, 60.0)
+                    self._interaction.info(f"Retrying in {delay:g} seconds...")
+                    sleep(delay)
+
+    def _report_backend_error(self, error: BackendError) -> None:
+        """Display a normalized backend failure and useful diagnostic identifiers."""
+        message = str(error)
+        diagnostics = []
+        if error.status_code is not None:
+            diagnostics.append(f"HTTP {error.status_code}")
+        if error.request_id:
+            diagnostics.append(f"request {error.request_id}")
+        if diagnostics:
+            message = f"{message} ({', '.join(diagnostics)})"
+        self._interaction.error(message)
 
     def handle_tool_calls(self, response: Response) -> bool:
         """Handle tool calls made by the LLM during reasoning.

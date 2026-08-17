@@ -3,7 +3,7 @@
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, call
+from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 from prompt_toolkit.document import Document
@@ -11,6 +11,9 @@ from prompt_toolkit.document import Document
 from loop import (
     AnswerCompleted,
     AnswerDelta,
+    BackendAuthenticationError,
+    BackendConnectionError,
+    BackendServerError,
     CompactionContextItem,
     CompactionResult,
     ContextReference,
@@ -233,6 +236,101 @@ def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
     assert loop.messages == []
     backend.get_response.assert_not_called()
     interaction.error.assert_called_once_with("Content appears to be binary.")
+
+
+def test_run_retries_an_exhausted_recoverable_failure(tmp_path):
+    """Interactive approval retries the unchanged turn after automatic recovery is exhausted."""
+    error = BackendServerError(
+        "temporarily unavailable",
+        provider="openai",
+        operation="create_response",
+        status_code=503,
+        request_id="request-1",
+        retry_after=2.5,
+    )
+    backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+    backend.get_context_window.return_value = None
+    backend.get_response.side_effect = [error, [ResponseCompleted(answer="done")]]
+    interaction = output_interaction()
+    interaction.input.side_effect = ["hello", False]
+
+    with patch("loop.loop.sleep") as sleep:
+        Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+
+    assert backend.get_response.call_count == 2
+    interaction.error.assert_called_once_with(
+        "temporarily unavailable (HTTP 503, request request-1)"
+    )
+    interaction.confirm.assert_called_once_with(
+        "Retry the complete response after at least 2.5 seconds?", default=False
+    )
+    interaction.info.assert_any_call("Retrying in 2.5 seconds...")
+    sleep.assert_called_once_with(2.5)
+    assert [
+        item for item in backend.get_response.call_args.kwargs["input"] if item.role == "user"
+    ] == [Message(role="user", content="hello")]
+
+
+def test_run_describes_partial_output_before_retrying(tmp_path):
+    """A failed streamed attempt warns that retrying replaces its discarded partial output."""
+    error = BackendConnectionError(
+        "stream ended",
+        provider="openai",
+        operation="stream_response",
+        response_started=True,
+    )
+    backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+    backend.get_context_window.return_value = None
+    backend.get_response.side_effect = [error, [ResponseCompleted()]]
+    interaction = output_interaction()
+    interaction.input.side_effect = ["hello", False]
+
+    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+
+    interaction.confirm.assert_called_once_with(
+        "Partial output was discarded. Retry the complete response?", default=False
+    )
+
+
+def test_run_declines_or_disables_recoverable_retries(tmp_path):
+    """Declined and disabled recovery return to input without committing assistant output."""
+    for enabled in (True, False):
+        error = BackendConnectionError("offline", provider="openai", operation="create_response")
+        backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+        backend.get_context_window.return_value = None
+        backend.get_response.side_effect = error
+        interaction = output_interaction()
+        interaction.confirm.return_value = False
+        interaction.input.side_effect = ["hello", False]
+
+        loop = Loop(
+            backend=backend,
+            interaction=interaction,
+            working_directory=tmp_path,
+            prompt_on_recoverable_error=enabled,
+        )
+        loop.run()
+
+        assert loop.messages == [Message(role="user", content="hello")]
+        assert interaction.confirm.call_count == int(enabled)
+        interaction.token_usage.assert_not_called()
+
+
+def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):
+    """Permanent backend failures are reported once and leave the application running."""
+    error = BackendAuthenticationError(
+        "invalid key", provider="openai", operation="create_response", status_code=401
+    )
+    backend = Mock(tool_registry=ToolRegistry(), default_model="model")
+    backend.get_context_window.return_value = None
+    backend.get_response.side_effect = error
+    interaction = output_interaction()
+    interaction.input.side_effect = ["hello", False]
+
+    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+
+    interaction.error.assert_called_once_with("invalid key (HTTP 401)")
+    interaction.confirm.assert_not_called()
 
 
 def test_loop_uses_an_injected_mention_registry(tmp_path):

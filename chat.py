@@ -61,11 +61,13 @@ def main() -> None:
         )
 
         context_window = os.getenv("CONTEXT_WINDOW")
+        max_retries = os.getenv("OPENAI_MAX_RETRIES")
         backend = OpenAIBackend(
             base_url=os.getenv("BASE_URL", _BASE_URL),
             default_model=os.getenv("DEFAULT_MODEL", _DEFAULT_MODEL),
             api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
             context_window=int(context_window) if context_window else None,
+            max_retries=int(max_retries) if max_retries else 2,
             tool_registry=ToolRegistry(),
         )
 
