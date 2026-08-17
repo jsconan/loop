@@ -310,7 +310,10 @@ class Loop:
             user_input = self._interaction.prompt(completer=self._completion_manager)
             if user_input is False:
                 break
+            session = self.session
             if self._command_manager.handle_user_command(user_input):
+                if self.session is not session and self.session.model:
+                    self._model = self.session.model
                 continue
             try:
                 context = self._mention_manager.resolve(user_input)

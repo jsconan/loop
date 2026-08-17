@@ -140,11 +140,16 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
 
 
 def test_resume_command_loads_a_persisted_session_id(tmp_path):
-    """Submitting a persisted session ID resumes it without completion state."""
+    """Submitting a persisted session ID resumes its history and selected model."""
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.side_effect = ["/resume internal-id", False]
     store = SQLiteSessionStore(tmp_path / "sessions.db")
-    selected = Session(id="internal-id", name="Alpha session", name_source="user")
+    selected = Session(
+        id="internal-id",
+        name="Alpha session",
+        name_source="user",
+        model="session-model",
+    )
     store.save(selected)
     sessions = SessionManager(interaction=interaction, session_store=store)
     loop = Loop(
@@ -157,7 +162,40 @@ def test_resume_command_loads_a_persisted_session_id(tmp_path):
     loop.run()
 
     assert sessions.session.id == "internal-id"
+    assert loop.model == "session-model"
     assert interaction.prompt.call_args_list[0].args == ()
+
+
+def test_resumed_missing_model_uses_existing_query_fallback(tmp_path):
+    """A resumed model is tried first and replaced through normal query recovery."""
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["/resume internal-id", "hello", "replacement", False]
+    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store.save(Session(id="internal-id", model="missing"))
+    sessions = SessionManager(interaction=interaction, session_store=store)
+    backend = Mock(tool_registry=ToolRegistry(), default_model="default-model")
+    backend.get_context_window.return_value = None
+    backend.get_models.return_value = [ModelInfo(id="replacement")]
+    backend.get_response.side_effect = [
+        BackendNotFoundError(
+            "model missing", provider="openai", operation="create_response", status_code=404
+        ),
+        [ResponseCompleted(model="replacement")],
+    ]
+    loop = Loop(
+        backend=backend,
+        interaction=interaction,
+        session_manager=sessions,
+        working_directory=tmp_path,
+    )
+
+    loop.run()
+
+    assert [request.kwargs["model"] for request in backend.get_response.call_args_list] == [
+        "missing",
+        "replacement",
+    ]
+    assert loop.model == "replacement"
 
 
 def test_resume_command_reports_an_unknown_session_id(tmp_path):
