@@ -1,6 +1,8 @@
 """Tests for terminal-backed user interaction."""
 
 import json
+import sys
+import termios
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -560,3 +562,52 @@ def test_confirm_uses_rich_with_the_configured_default(monkeypatch, default, exp
 
     assert interaction.confirm("Continue?", default=default) is expected
     ask.assert_called_once_with("Continue?", default=default, console=console)
+
+
+def test_confirm_discards_terminal_input_before_asking_its_question(monkeypatch):
+    """Confirmation discards queued terminal input before delegating to Rich."""
+    events = []
+    console = Mock()
+    ask = Mock(side_effect=lambda *args, **kwargs: events.append("ask") or True)
+    monkeypatch.setattr(Confirm, "ask", ask)
+    stdin = Mock()
+    stdin.isatty.return_value = True
+    stdin.fileno.return_value = 42
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(
+        termios,
+        "tcflush",
+        lambda descriptor, queue: events.append(("flush", descriptor, queue)),
+    )
+
+    assert ConsoleInteraction(console=console).confirm("Continue?") is True
+    assert events == [("flush", 42, termios.TCIFLUSH), "ask"]
+
+
+def test_confirm_does_not_flush_redirected_input(monkeypatch):
+    """Confirmation preserves input when standard input is not an interactive terminal."""
+    console = Mock()
+    console.input.return_value = "n"
+    stdin = Mock()
+    stdin.isatty.return_value = False
+    monkeypatch.setattr(sys, "stdin", stdin)
+    flush = Mock()
+    monkeypatch.setattr(termios, "tcflush", flush)
+
+    assert ConsoleInteraction(console=console).confirm("Continue?") is False
+    flush.assert_not_called()
+
+
+def test_confirm_reads_input_when_the_terminal_cannot_be_flushed(monkeypatch):
+    """Confirmation remains usable when its terminal does not support queue flushing."""
+    console = Mock()
+    ask = Mock(return_value=True)
+    monkeypatch.setattr(Confirm, "ask", ask)
+    stdin = Mock()
+    stdin.isatty.return_value = True
+    stdin.fileno.return_value = 42
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(termios, "tcflush", Mock(side_effect=OSError("unsupported")))
+
+    assert ConsoleInteraction(console=console).confirm("Continue?") is True
+    ask.assert_called_once_with("Continue?", default=False, console=console)

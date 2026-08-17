@@ -1,6 +1,8 @@
 """Define user interaction abstractions and tool invocation context."""
 
 import json
+import sys
+import termios
 from collections.abc import Generator, Iterable, Mapping
 from contextlib import contextmanager
 from pprint import pformat
@@ -461,4 +463,15 @@ class ConsoleInteraction(Interaction):
         Returns:
             bool: Whether the user approved the operation.
         """
+        self._discard_pending_terminal_input()
         return Confirm.ask(message, default=default, console=self._console)
+
+    @staticmethod
+    def _discard_pending_terminal_input() -> None:
+        """Discard unread input from an interactive terminal when supported."""
+        if not sys.stdin.isatty():
+            return
+        try:
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        except AttributeError, OSError, ValueError:
+            pass
