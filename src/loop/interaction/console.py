@@ -55,10 +55,11 @@ class ConsoleInteraction(Interaction):
                 self.info()
             self._streamed_output = False
 
-    def input(
+    def prompt(
         self,
         message: str | None = None,
         completer: Completer | None = None,
+        exit_commands: str | Iterable[str] | None = "q",
     ) -> str | False:
         """Prompt for a non-empty user message or an exit command.
 
@@ -66,12 +67,24 @@ class ConsoleInteraction(Interaction):
             message (str | None): Prompt message displayed before reading input.
                 Defaults to ``None`` for the default prompt.
             completer (Completer | None): Optional input completer. Defaults to no completion.
+            exit_commands (str | Iterable[str] | None): Optional list of exit terms that end the
+                prompt. Defaults to ``"q"``.
 
         Returns:
             str | False: The entered message, or ``False`` when the user requests to exit.
         """
         if message is None:
             message = "\nYou: "
+        if isinstance(exit_commands, str):
+            exit_commands = exit_commands.strip()
+            if exit_commands:
+                exit_commands = (exit_commands.casefold(),)
+        elif exit_commands:
+            exit_commands = tuple(
+                command.strip().casefold() for command in exit_commands if command.strip()
+            )
+        if not exit_commands:
+            exit_commands = ()
         while True:
             try:
                 user_input = self._session.prompt(
@@ -84,7 +97,7 @@ class ConsoleInteraction(Interaction):
             if not user_input:
                 self.warning("Please enter a message!")
                 continue
-            if user_input.lower() in ["exit", "quit", "bye", "q"]:
+            if user_input.casefold() in exit_commands:
                 return False
             return user_input
 

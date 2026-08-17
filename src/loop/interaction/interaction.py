@@ -40,10 +40,11 @@ class Interaction(ABC):
         """
 
     @abstractmethod
-    def input(
+    def prompt(
         self,
         message: str | None = None,
         completer: Completer | None = None,
+        exit_commands: str | Iterable[str] | None = None,
     ) -> str | False:
         """Read a non-empty user message or an exit command.
 
@@ -51,6 +52,8 @@ class Interaction(ABC):
             message (str | None): Prompt message displayed before reading input.
                 Defaults to ``None``.
             completer (Completer | None): Optional input completer. Defaults to no completion.
+            exit_commands (str | Iterable[str] | None): Optional list of exit terms that end the
+                prompt. Defaults to ``None``.
 
         Returns:
             str | False: The stripped text entered by the user, or ``False`` when the user

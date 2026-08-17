@@ -12,54 +12,77 @@ from rich.prompt import Confirm
 from loop.interaction import ConsoleInteraction
 
 
-def test_input_reads_a_trimmed_message_with_a_custom_prompt():
+def test_prompt_reads_a_trimmed_message_with_a_custom_prompt():
     """Input forwards its prompt message and strips the terminal response."""
     session = Mock()
     session.prompt.return_value = "  answer  \n"
 
-    assert ConsoleInteraction(session=session).input(message="Question: ") == "answer"
+    assert ConsoleInteraction(session=session).prompt(message="Question: ") == "answer"
     session.prompt.assert_called_once()
     assert session.prompt.call_args.args == ("Question: ",)
 
 
-def test_input_forwards_an_explicit_completer_to_the_prompt_session():
+def test_prompt_forwards_an_explicit_completer_to_the_prompt_session():
     """Terminal input forwards the caller's capability manager unchanged."""
     session = Mock()
     session.prompt.return_value = "answer"
     completer = DummyCompleter()
 
-    ConsoleInteraction(session=session).input(completer=completer)
+    ConsoleInteraction(session=session).prompt(completer=completer)
 
     assert session.prompt.call_args.kwargs["completer"] is completer
     assert session.prompt.call_args.kwargs["complete_in_thread"] is True
 
 
-def test_input_reprompts_for_blank_input(capsys):
+def test_prompt_reprompts_for_blank_input(capsys):
     """Input warns and prompts again until the terminal provides a message."""
     session = Mock()
     session.prompt.side_effect = ["   ", "answer"]
 
-    assert ConsoleInteraction(session=session).input() == "answer"
+    assert ConsoleInteraction(session=session).prompt() == "answer"
     assert capsys.readouterr().out == "Warning: Please enter a message!\n"
     assert session.prompt.call_count == 2
 
 
-@pytest.mark.parametrize("command", ["exit", "QUIT", " Bye ", "q"])
-def test_input_returns_false_for_exit_commands(command):
-    """Input recognizes supported exit commands without case or surrounding whitespace."""
+def test_prompt_returns_false_for_its_default_exit_command():
+    """Input treats the default exit command as an exit request."""
+    session = Mock()
+    session.prompt.return_value = " Q "
+
+    assert ConsoleInteraction(session=session).prompt() is False
+
+
+@pytest.mark.parametrize(
+    ("command", "exit_commands"),
+    [
+        (" QuIt ", ("EXIT", "QUIT")),
+        ("EXIT", "exit"),
+    ],
+)
+def test_prompt_returns_false_for_configured_exit_commands(command, exit_commands):
+    """Configured strings and iterables match commands without case or surrounding whitespace."""
     session = Mock()
     session.prompt.return_value = command
 
-    assert ConsoleInteraction(session=session).input() is False
+    assert ConsoleInteraction(session=session).prompt(exit_commands=exit_commands) is False
+
+
+@pytest.mark.parametrize("exit_commands", [None, "", ()])
+def test_prompt_accepts_messages_when_exit_commands_are_disabled(exit_commands):
+    """Absent or empty exit commands leave otherwise valid input available to callers."""
+    session = Mock()
+    session.prompt.return_value = "q"
+
+    assert ConsoleInteraction(session=session).prompt(exit_commands=exit_commands) == "q"
 
 
 @pytest.mark.parametrize("error", [KeyboardInterrupt, EOFError])
-def test_input_returns_false_when_the_prompt_is_interrupted(error):
+def test_prompt_returns_false_when_the_prompt_is_interrupted(error):
     """Input treats terminal interruption and end-of-file as exit requests."""
     session = Mock()
     session.prompt.side_effect = error
 
-    assert ConsoleInteraction(session=session).input() is False
+    assert ConsoleInteraction(session=session).prompt() is False
 
 
 def test_user_message_has_a_console_presentation(capsys):

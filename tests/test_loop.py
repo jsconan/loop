@@ -98,7 +98,7 @@ def test_loop_exposes_its_configured_state(tmp_path):
 def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
     """Interactive input receives adapters for current commands, files, skills, and tools."""
     interaction = MagicMock(spec=Interaction)
-    interaction.input.return_value = False
+    interaction.prompt.return_value = False
     skill = Skill("review", "Review code.", tmp_path / "skills" / "review" / "SKILL.md")
     instructions = InstructionsManager(
         skill_manager=SkillManager([skill]), working_directory=tmp_path
@@ -124,7 +124,7 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
 
     loop.run()
 
-    completer = interaction.input.call_args.kwargs["completer"]
+    completer = interaction.prompt.call_args.kwargs["completer"]
 
     def values(text):
         return [item.text for item in completer.get_completions(Document(text), Mock())]
@@ -140,7 +140,7 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
 def test_resume_command_loads_a_persisted_session_id(tmp_path):
     """Submitting a persisted session ID resumes it without completion state."""
     interaction = MagicMock(spec=Interaction)
-    interaction.input.side_effect = ["/resume internal-id", False]
+    interaction.prompt.side_effect = ["/resume internal-id", False]
     store = SQLiteSessionStore(tmp_path / "sessions.db")
     selected = Session(id="internal-id", name="Alpha session", name_source="user")
     store.save(selected)
@@ -155,13 +155,13 @@ def test_resume_command_loads_a_persisted_session_id(tmp_path):
     loop.run()
 
     assert sessions.session.id == "internal-id"
-    assert interaction.input.call_args_list[0].args == ()
+    assert interaction.prompt.call_args_list[0].args == ()
 
 
 def test_resume_command_reports_an_unknown_session_id(tmp_path):
     """An unknown session ID is rejected through normal command feedback."""
     interaction = MagicMock(spec=Interaction)
-    interaction.input.side_effect = ["/resume missing-id", False]
+    interaction.prompt.side_effect = ["/resume missing-id", False]
     sessions = SessionManager(interaction=interaction)
     loop = Loop(
         backend=loop_backend(),
@@ -193,7 +193,7 @@ def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(t
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
-    interaction.input.side_effect = ['Use $review on @"my app.py"', False]
+    interaction.prompt.side_effect = ['Use $review on @"my app.py"', False]
 
     loop = Loop(
         backend=backend,
@@ -228,7 +228,7 @@ def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
     path.write_bytes(b"bad\0data")
     backend = Mock(tool_registry=ToolRegistry(), default_model="model")
     interaction = MagicMock(spec=Interaction)
-    interaction.input.side_effect = ["Read @binary.bin", False]
+    interaction.prompt.side_effect = ["Read @binary.bin", False]
     loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
 
     loop.run()
@@ -252,7 +252,7 @@ def test_run_retries_an_exhausted_recoverable_failure(tmp_path):
     backend.get_context_window.return_value = None
     backend.get_response.side_effect = [error, [ResponseCompleted(answer="done")]]
     interaction = output_interaction()
-    interaction.input.side_effect = ["hello", False]
+    interaction.prompt.side_effect = ["hello", False]
 
     with patch("loop.loop.sleep") as sleep:
         Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
@@ -283,7 +283,7 @@ def test_run_describes_partial_output_before_retrying(tmp_path):
     backend.get_context_window.return_value = None
     backend.get_response.side_effect = [error, [ResponseCompleted()]]
     interaction = output_interaction()
-    interaction.input.side_effect = ["hello", False]
+    interaction.prompt.side_effect = ["hello", False]
 
     Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
@@ -301,7 +301,7 @@ def test_run_declines_or_disables_recoverable_retries(tmp_path):
         backend.get_response.side_effect = error
         interaction = output_interaction()
         interaction.confirm.return_value = False
-        interaction.input.side_effect = ["hello", False]
+        interaction.prompt.side_effect = ["hello", False]
 
         loop = Loop(
             backend=backend,
@@ -325,7 +325,7 @@ def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):
     backend.get_context_window.return_value = None
     backend.get_response.side_effect = error
     interaction = output_interaction()
-    interaction.input.side_effect = ["hello", False]
+    interaction.prompt.side_effect = ["hello", False]
 
     Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
@@ -342,7 +342,7 @@ def test_loop_uses_an_injected_mention_registry(tmp_path):
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
-    interaction.input.side_effect = ["Custom !reference", False]
+    interaction.prompt.side_effect = ["Custom !reference", False]
 
     Loop(
         backend=backend,
@@ -417,7 +417,7 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
         )
     )
     interaction = output_interaction()
-    interaction.input.side_effect = ["hello", False]
+    interaction.prompt.side_effect = ["hello", False]
     store = SQLiteSessionStore(tmp_path / ".loop" / "sessions.db")
     session_manager = SessionManager(interaction=interaction, session_store=store)
     loop = Loop(
@@ -444,7 +444,7 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
 def test_run_does_not_generate_a_name_for_an_already_named_session(tmp_path):
     """Completed queries retain a non-provisional session name at the loop boundary."""
     interaction = output_interaction()
-    interaction.input.side_effect = ["hello", False]
+    interaction.prompt.side_effect = ["hello", False]
     generator = Mock()
     loop = Loop(
         backend=loop_backend(get_response=Mock(return_value=[ResponseCompleted()])),
@@ -463,7 +463,7 @@ def test_run_does_not_generate_a_name_for_an_already_named_session(tmp_path):
 def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
     """A caller that omits persistence keeps completed queries entirely in memory."""
     interaction = output_interaction()
-    interaction.input.side_effect = ["hello", False]
+    interaction.prompt.side_effect = ["hello", False]
     loop = Loop(
         backend=loop_backend(get_response=Mock(return_value=[ResponseCompleted()])),
         working_directory=tmp_path,
@@ -881,7 +881,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
         ],
     ]
     interaction = output_interaction()
-    interaction.input.side_effect = ["hello", False]
+    interaction.prompt.side_effect = ["hello", False]
 
     Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
@@ -902,7 +902,7 @@ def test_run_keeps_handled_commands_out_of_model_history():
     """The runner skips every command consumed by its command manager."""
     backend = Mock(tool_registry=ToolRegistry(), default_model="model")
     interaction = MagicMock(spec=Interaction)
-    interaction.input.side_effect = ["/help", "/missing", False]
+    interaction.prompt.side_effect = ["/help", "/missing", False]
 
     loop = Loop(backend=backend, interaction=interaction)
     loop.run()
@@ -916,7 +916,7 @@ def test_run_exit_commands_end_the_conversation(command):
     """Predefined slash exit commands terminate without a backend request."""
     backend = Mock(tool_registry=ToolRegistry(), default_model="model")
     interaction = MagicMock(spec=Interaction)
-    interaction.input.return_value = command
+    interaction.prompt.return_value = command
 
     loop = Loop(backend=backend, interaction=interaction)
     loop.run()

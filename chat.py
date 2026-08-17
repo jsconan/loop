@@ -74,7 +74,7 @@ def main() -> None:
         interaction.info("Hello from Chat!")
 
         while not command_manager.exit_requested:
-            prompt = interaction.input(completer=completion_manager)
+            prompt = interaction.prompt(completer=completion_manager)
             if prompt is False:
                 break
             if command_manager.handle_user_command(prompt):

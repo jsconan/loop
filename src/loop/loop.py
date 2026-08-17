@@ -307,7 +307,7 @@ class Loop:
     def run(self):
         """Run the conversation until the user requests to exit."""
         while not self._command_manager.exit_requested:
-            user_input = self._interaction.input(completer=self._completion_manager)
+            user_input = self._interaction.prompt(completer=self._completion_manager)
             if user_input is False:
                 break
             if self._command_manager.handle_user_command(user_input):
