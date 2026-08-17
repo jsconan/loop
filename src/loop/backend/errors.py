@@ -1,6 +1,6 @@
 """Define provider-neutral backend failures."""
 
-from typing import Any
+from typing import Any, ClassVar
 
 
 class BackendError(Exception):
@@ -14,6 +14,7 @@ class BackendError(Exception):
         code (str | None): Provider error code when available.
         request_id (str | None): Provider request identifier when available.
         retry_after (float | None): Suggested retry delay in seconds when available.
+        response_started (bool): Whether response events were emitted before the failure.
         details (Any | None): Opaque provider diagnostic details when available.
     """
 
@@ -23,7 +24,9 @@ class BackendError(Exception):
     code: str | None
     request_id: str | None
     retry_after: float | None
+    response_started: bool
     details: Any | None
+    recoverable: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -35,6 +38,7 @@ class BackendError(Exception):
         code: str | None = None,
         request_id: str | None = None,
         retry_after: float | None = None,
+        response_started: bool = False,
         details: Any | None = None,
     ) -> None:
         super().__init__(message)
@@ -44,11 +48,14 @@ class BackendError(Exception):
         self.code = code
         self.request_id = request_id
         self.retry_after = retry_after
+        self.response_started = response_started
         self.details = details
 
 
 class BackendConnectionError(BackendError):
     """Indicate that a backend could not be reached."""
+
+    recoverable = True
 
 
 class BackendTimeoutError(BackendConnectionError):
@@ -82,10 +89,16 @@ class BackendNotFoundError(BackendStatusError):
 class BackendConflictError(BackendStatusError):
     """Indicate that the backend request conflicted with current state."""
 
+    recoverable = True
+
 
 class BackendRateLimitError(BackendStatusError):
     """Indicate that the backend rate limit was exceeded."""
 
+    recoverable = True
+
 
 class BackendServerError(BackendStatusError):
     """Indicate that the backend encountered a server-side failure."""
+
+    recoverable = True

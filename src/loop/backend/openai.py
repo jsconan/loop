@@ -2,6 +2,8 @@
 
 from base64 import b64encode
 from collections.abc import AsyncIterator, Iterable, Iterator
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from json import dumps
 from mimetypes import guess_type
 from typing import Any, Literal
@@ -109,6 +111,7 @@ class OpenAIBackend(Backend):
             compatible backend rejects the native parameter.
         structured_output_max_retries (int): Number of corrective generations after a structured
             response fails local validation.
+        max_retries (int): Number of automatic SDK retries for transient request failures.
 
     Raises:
         ValueError: If a configured value is invalid.
@@ -122,6 +125,7 @@ class OpenAIBackend(Backend):
     _structured_output_mode: Literal["auto", "native", "prompt"]
     _structured_output_max_retries: int
     _prompt_structured_models: set[str]
+    _max_retries: int
 
     def __init__(
         self,
@@ -136,6 +140,7 @@ class OpenAIBackend(Backend):
             constants.DEFAULT_STRUCTURED_OUTPUT_MODE
         ),
         structured_output_max_retries: int = constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES,
+        max_retries: int = constants.DEFAULT_MAX_RETRIES,
     ) -> None:
         super().__init__(
             base_url=base_url,
@@ -156,9 +161,12 @@ class OpenAIBackend(Backend):
             raise ValueError("Structured output mode must be 'auto', 'native', or 'prompt'.")
         if structured_output_max_retries < 0:
             raise ValueError("Structured output maximum retries must not be negative.")
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError("Maximum retries must be a non-negative integer.")
         self._structured_output_mode = structured_output_mode
         self._structured_output_max_retries = structured_output_max_retries
         self._prompt_structured_models = set()
+        self._max_retries = max_retries
 
     @property
     def context_window(self) -> int | None:
@@ -175,6 +183,7 @@ class OpenAIBackend(Backend):
             self._client = OpenAI(
                 base_url=self._base_url,
                 api_key=self._api_key,
+                max_retries=self._max_retries,
             )
         return self._client
 
@@ -184,20 +193,17 @@ class OpenAIBackend(Backend):
             self._async_client = AsyncOpenAI(
                 base_url=self._base_url,
                 api_key=self._api_key,
+                max_retries=self._max_retries,
             )
         return self._async_client
 
-    @staticmethod
-    def _translated_error(error: OpenAIError, operation: str) -> BackendError:  # pylint: disable=too-many-branches
+    @classmethod
+    def _translated_error(cls, error: OpenAIError, operation: str) -> BackendError:  # pylint: disable=too-many-branches
         """Translate an OpenAI SDK failure into the backend error contract."""
         status_code = getattr(error, "status_code", None)
         response = getattr(error, "response", None)
         headers = response.headers if response is not None else {}
-        retry_after = None
-        try:
-            retry_after = float(headers["retry-after"])
-        except KeyError, TypeError, ValueError:
-            pass
+        retry_after = cls._retry_after(headers)
         attributes = {
             "provider": "openai",
             "operation": operation,
@@ -232,6 +238,26 @@ class OpenAIBackend(Backend):
         else:
             error_type = BackendError
         return error_type(str(error), **attributes)
+
+    @staticmethod
+    def _retry_after(headers: dict) -> float | None:
+        """Return a provider retry delay from millisecond, second, or HTTP-date headers."""
+        try:
+            return max(0.0, float(headers["retry-after-ms"]) / 1000)
+        except KeyError, TypeError, ValueError:
+            pass
+        value = headers.get("retry-after")
+        try:
+            return max(0.0, float(value))
+        except TypeError, ValueError:
+            pass
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except TypeError, ValueError:
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
 
     def get_models(self) -> list[ModelInfo]:
         """Return the models available from the configured backend.
@@ -290,10 +316,15 @@ class OpenAIBackend(Backend):
             ValueError: If neither the request nor backend selects a model.
         """
         operation = "stream_response" if stream else "create_response"
+        response_started = False
         try:
-            yield from self._get_response(input, instructions, stream, model, output_format)
+            for event in self._get_response(input, instructions, stream, model, output_format):
+                response_started = True
+                yield event
         except OpenAIError as error:
-            raise self._translated_error(error, operation) from error
+            translated = self._translated_error(error, operation)
+            translated.response_started = response_started
+            raise translated from error
 
     def _get_response(
         self,
@@ -405,13 +436,17 @@ class OpenAIBackend(Backend):
             ValueError: If neither the request nor backend selects a model.
         """
         operation = "stream_response" if stream else "create_response"
+        response_started = False
         try:
             async for event in self._get_response_async(
                 input, instructions, stream, model, output_format
             ):
+                response_started = True
                 yield event
         except OpenAIError as error:
-            raise self._translated_error(error, operation) from error
+            translated = self._translated_error(error, operation)
+            translated.response_started = response_started
+            raise translated from error
 
     async def _get_response_async(
         self,

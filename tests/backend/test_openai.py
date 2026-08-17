@@ -81,7 +81,13 @@ class CompactItem(BaseModel):
 @pytest.fixture(autouse=True)
 def isolate_backend_environment(monkeypatch):
     """Prevent host configuration from influencing backend tests."""
-    for variable in ("DEFAULT_MODEL", "BASE_URL", "OPENAI_API_KEY", "CONTEXT_WINDOW"):
+    for variable in (
+        "DEFAULT_MODEL",
+        "BASE_URL",
+        "OPENAI_API_KEY",
+        "CONTEXT_WINDOW",
+        "OPENAI_MAX_RETRIES",
+    ):
         monkeypatch.delenv(variable, raising=False)
 
 
@@ -182,8 +188,12 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
         assert asyncio.run(client.get_models_async()) == []
         assert asyncio.run(client.get_models_async()) == []
 
-    openai.assert_called_once_with(base_url="https://example.test/v1", api_key="secret")
-    async_openai.assert_called_once_with(base_url="https://example.test/v1", api_key="secret")
+    openai.assert_called_once_with(
+        base_url="https://example.test/v1", api_key="secret", max_retries=2
+    )
+    async_openai.assert_called_once_with(
+        base_url="https://example.test/v1", api_key="secret", max_retries=2
+    )
 
 
 def test_configuration_rejects_invalid_structured_output_policy():
@@ -192,6 +202,28 @@ def test_configuration_rejects_invalid_structured_output_policy():
         OpenAIBackend(structured_output_mode="invalid")
     with pytest.raises(ValueError, match="retries"):
         OpenAIBackend(structured_output_max_retries=-1)
+    for value in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="Maximum retries"):
+            OpenAIBackend(max_retries=value)
+
+
+def test_configured_transport_retries_reach_both_clients():
+    """A retry override is forwarded consistently to synchronous and asynchronous SDK clients."""
+    sync_sdk = Mock()
+    sync_sdk.models.list.return_value = []
+    async_sdk = Mock()
+    async_sdk.models.list = AsyncMock(return_value=[])
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sync_sdk) as openai,
+        patch("loop.backend.openai.AsyncOpenAI", return_value=async_sdk) as async_openai,
+    ):
+        backend = OpenAIBackend(max_retries=5)
+        backend.get_models()
+        asyncio.run(backend.get_models_async())
+
+    openai.assert_called_once_with(base_url=None, api_key=None, max_retries=5)
+    async_openai.assert_called_once_with(base_url=None, api_key=None, max_retries=5)
 
 
 def test_backend_does_not_read_process_configuration(monkeypatch):
@@ -449,7 +481,65 @@ def test_model_listing_translates_provider_status_errors(status_code, error_type
     assert raised.value.request_id == "request-123"
     assert raised.value.retry_after == 2.5
     assert raised.value.details == {"code": "provider_code"}
+    assert raised.value.response_started is False
+    assert raised.value.recoverable == (status_code in (408, 409, 429, 500))
     assert raised.value.__cause__ is provider_error
+
+
+def test_retry_delay_supports_milliseconds_and_ignores_invalid_dates():
+    """Normalized failures preserve precise retry delays and tolerate malformed headers."""
+    request = httpx.Request("GET", "https://example.test/v1/models")
+    sdk = Mock()
+    sdk.models.list.side_effect = [
+        APIStatusError(
+            "limited",
+            response=httpx.Response(
+                429, request=request, headers={"retry-after-ms": "1250", "retry-after": "9"}
+            ),
+            body=None,
+        ),
+        APIStatusError(
+            "limited",
+            response=httpx.Response(429, request=request, headers={"retry-after": "invalid"}),
+            body=None,
+        ),
+    ]
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        with pytest.raises(BackendRateLimitError) as precise:
+            OpenAIBackend().get_models()
+        with pytest.raises(BackendRateLimitError) as missing:
+            OpenAIBackend().get_models()
+
+    assert precise.value.retry_after == 1.25
+    assert missing.value.retry_after is None
+
+
+def test_retry_delay_supports_http_dates_with_optional_timezones():
+    """Past HTTP dates with or without a timezone normalize to a non-negative delay."""
+    request = httpx.Request("GET", "https://example.test/v1/models")
+    sdk = Mock()
+    sdk.models.list.side_effect = [
+        APIStatusError(
+            "limited",
+            response=httpx.Response(
+                429,
+                request=request,
+                headers={"retry-after": value},
+            ),
+            body=None,
+        )
+        for value in ("Wed, 21 Oct 2015 07:28:00", "Wed, 21 Oct 2015 07:28:00 GMT")
+    ]
+
+    delays = []
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        for _ in range(2):
+            with pytest.raises(BackendRateLimitError) as raised:
+                OpenAIBackend().get_models()
+            delays.append(raised.value.retry_after)
+
+    assert delays == [0.0, 0.0]
 
 
 @pytest.mark.parametrize(
@@ -1727,6 +1817,35 @@ def test_stream_iteration_translates_deferred_provider_errors():
 
     assert raised.value.operation == "stream_response"
     assert isinstance(raised.value.__cause__, APIConnectionError)
+    assert raised.value.response_started is False
+
+
+def test_stream_failure_records_that_normalized_output_started():
+    """Deferred stream failures identify attempts that already exposed local events."""
+
+    def failing_stream():
+        """Emit one delta before raising a provider connection error."""
+        yield ResponseTextDeltaEvent(
+            delta="partial",
+            item_id="m",
+            output_index=0,
+            content_index=0,
+            sequence_number=1,
+            type="response.output_text.delta",
+            logprobs=[],
+        )
+        raise APIConnectionError(request=httpx.Request("GET", "https://example.test"))
+
+    sdk = Mock()
+    sdk.responses.create.return_value = failing_stream()
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendConnectionError) as raised,
+    ):
+        list(OpenAIBackend(default_model="model").get_response("hello", stream=True))
+
+    assert raised.value.response_started is True
 
 
 def test_async_streaming_response_uses_the_normalized_event_contract():
@@ -1808,6 +1927,39 @@ def test_async_stream_iteration_translates_deferred_provider_errors():
 
     assert raised.value.operation == "stream_response"
     assert isinstance(raised.value.__cause__, APITimeoutError)
+    assert raised.value.response_started is False
+
+
+def test_async_stream_failure_records_that_normalized_output_started():
+    """Async deferred failures retain whether consumers received normalized output."""
+
+    async def failing_stream():
+        """Emit one delta before raising a provider timeout."""
+        yield ResponseTextDeltaEvent(
+            delta="partial",
+            item_id="m",
+            output_index=0,
+            content_index=0,
+            sequence_number=1,
+            type="response.output_text.delta",
+            logprobs=[],
+        )
+        raise APITimeoutError(httpx.Request("GET", "https://example.test"))
+
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=failing_stream())
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(BackendTimeoutError) as raised,
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async("hello", stream=True)
+            )
+        )
+
+    assert raised.value.response_started is True
 
 
 def test_structured_streaming_buffers_and_discards_invalid_attempts():

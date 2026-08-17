@@ -56,3 +56,6 @@ TABULAR_MAX_WIDTH = 120
 
 # Command execution timeout in seconds
 COMMAND_TIMEOUT_SECONDS = 30
+
+# Error handling and recovery
+DEFAULT_MAX_RETRIES = 2
