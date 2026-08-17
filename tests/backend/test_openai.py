@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
-from openai import APIConnectionError, APIStatusError
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIResponseValidationError,
+    APIStatusError,
+    APITimeoutError,
+)
 from openai.types.responses import (
     ResponseCompletedEvent,
     ResponseFunctionToolCall,
@@ -24,6 +30,18 @@ from pydantic import BaseModel
 from loop import (
     AnswerCompleted,
     AnswerDelta,
+    BackendAuthenticationError,
+    BackendBadRequestError,
+    BackendConflictError,
+    BackendConnectionError,
+    BackendError,
+    BackendNotFoundError,
+    BackendPermissionDeniedError,
+    BackendRateLimitError,
+    BackendResponseError,
+    BackendServerError,
+    BackendStatusError,
+    BackendTimeoutError,
     CompactionContextItem,
     CompactionResult,
     ContextReference,
@@ -267,11 +285,12 @@ def test_native_compaction_propagates_operational_api_failures():
 
     with (
         patch("loop.backend.openai.OpenAI", return_value=sdk),
-        pytest.raises(APIStatusError) as raised,
+        pytest.raises(BackendServerError) as raised,
     ):
         OpenAIBackend(default_model="model").compact([], instructions=None, model="model")
 
-    assert raised.value is error
+    assert raised.value.__cause__ is error
+    assert raised.value.operation == "compact"
 
 
 def test_portable_compaction_context_serializes_as_a_user_checkpoint():
@@ -386,6 +405,95 @@ def test_models_are_listed_asynchronously_from_the_backend():
         ]
 
     sdk.models.list.assert_awaited_once_with(timeout=2.0)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_type"),
+    [
+        (400, BackendBadRequestError),
+        (401, BackendAuthenticationError),
+        (403, BackendPermissionDeniedError),
+        (404, BackendNotFoundError),
+        (408, BackendTimeoutError),
+        (409, BackendConflictError),
+        (418, BackendStatusError),
+        (422, BackendBadRequestError),
+        (429, BackendRateLimitError),
+        (500, BackendServerError),
+    ],
+)
+def test_model_listing_translates_provider_status_errors(status_code, error_type):
+    """HTTP failures expose stable backend categories and normalized diagnostics."""
+    request = httpx.Request("GET", "https://example.test/v1/models")
+    response = httpx.Response(
+        status_code,
+        request=request,
+        headers={"x-request-id": "request-123", "retry-after": "2.5"},
+    )
+    provider_error = APIStatusError(
+        "provider failed", response=response, body={"code": "provider_code"}
+    )
+    sdk = Mock()
+    sdk.models.list.side_effect = provider_error
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(error_type) as raised,
+    ):
+        OpenAIBackend().get_models()
+
+    assert raised.value.provider == "openai"
+    assert raised.value.operation == "list_models"
+    assert raised.value.status_code == status_code
+    assert raised.value.code == "provider_code"
+    assert raised.value.request_id == "request-123"
+    assert raised.value.retry_after == 2.5
+    assert raised.value.details == {"code": "provider_code"}
+    assert raised.value.__cause__ is provider_error
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "error_type"),
+    [
+        (
+            APIConnectionError(request=httpx.Request("GET", "https://example.test")),
+            BackendConnectionError,
+        ),
+        (
+            APITimeoutError(httpx.Request("GET", "https://example.test")),
+            BackendTimeoutError,
+        ),
+        (
+            APIResponseValidationError(
+                httpx.Response(200, request=httpx.Request("GET", "https://example.test")),
+                {"unexpected": True},
+            ),
+            BackendResponseError,
+        ),
+        (
+            APIError(
+                "provider failed",
+                httpx.Request("GET", "https://example.test"),
+                body=None,
+            ),
+            BackendError,
+        ),
+    ],
+)
+def test_async_model_listing_translates_non_status_provider_errors(provider_error, error_type):
+    """Async non-status SDK failures use the provider-neutral backend hierarchy."""
+    sdk = Mock()
+    sdk.models.list = AsyncMock(side_effect=provider_error)
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(error_type) as raised,
+    ):
+        asyncio.run(OpenAIBackend().get_models_async())
+
+    assert raised.value.status_code == getattr(provider_error, "status_code", None)
+    assert raised.value.retry_after is None
+    assert raised.value.__cause__ is provider_error
 
 
 def test_context_window_is_discovered_from_matching_model_metadata():
@@ -802,7 +910,7 @@ def test_native_schema_errors_only_fall_back_when_auto_and_recognized(mode, mess
 
     with (
         patch("loop.backend.openai.OpenAI", return_value=sdk),
-        pytest.raises(APIStatusError),
+        pytest.raises(BackendBadRequestError),
     ):
         list(
             OpenAIBackend(default_model="default", structured_output_mode=mode).get_response(
@@ -1048,7 +1156,7 @@ def test_async_native_mode_preserves_provider_schema_errors():
 
     with (
         patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
-        pytest.raises(APIStatusError),
+        pytest.raises(BackendBadRequestError),
     ):
         asyncio.run(
             collect_events(
@@ -1600,6 +1708,27 @@ def test_streaming_response_normalizes_provider_events():
     assert events[2].call is events[3].items[2]
 
 
+def test_stream_iteration_translates_deferred_provider_errors():
+    """Provider failures raised during sync iteration remain behind the backend boundary."""
+
+    def failing_stream():
+        """Raise a connection failure when the consumer advances the stream."""
+        raise APIConnectionError(request=httpx.Request("GET", "https://example.test"))
+        yield
+
+    sdk = Mock()
+    sdk.responses.create.return_value = failing_stream()
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendConnectionError) as raised,
+    ):
+        list(OpenAIBackend(default_model="model").get_response("hello", stream=True))
+
+    assert raised.value.operation == "stream_response"
+    assert isinstance(raised.value.__cause__, APIConnectionError)
+
+
 def test_async_streaming_response_uses_the_normalized_event_contract():
     """Asynchronous streaming returns the same local response events."""
     provider_events = [
@@ -1654,6 +1783,31 @@ def test_async_streaming_response_uses_the_normalized_event_contract():
         AnswerDelta(text="answer"),
         ResponseCompleted(model="served-model"),
     ]
+
+
+def test_async_stream_iteration_translates_deferred_provider_errors():
+    """Provider failures raised during async iteration use backend-neutral errors."""
+
+    async def failing_stream():
+        """Raise a timeout when the consumer advances the asynchronous stream."""
+        raise APITimeoutError(httpx.Request("GET", "https://example.test"))
+        yield
+
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=failing_stream())
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(BackendTimeoutError) as raised,
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async("hello", stream=True)
+            )
+        )
+
+    assert raised.value.operation == "stream_response"
+    assert isinstance(raised.value.__cause__, APITimeoutError)
 
 
 def test_structured_streaming_buffers_and_discards_invalid_attempts():

@@ -5,7 +5,19 @@ __all__ = [
     "AnswerCompleted",
     "AnswerDelta",
     "Backend",
+    "BackendAuthenticationError",
+    "BackendBadRequestError",
+    "BackendConflictError",
+    "BackendConnectionError",
+    "BackendError",
+    "BackendNotFoundError",
+    "BackendPermissionDeniedError",
+    "BackendRateLimitError",
+    "BackendResponseError",
+    "BackendServerError",
     "BackendSessionNameGenerator",
+    "BackendStatusError",
+    "BackendTimeoutError",
     "Capability",
     "Command",
     "CommandArgumentError",
@@ -106,7 +118,22 @@ __all__ = [
 ]
 
 
-from .backend import Backend, OpenAIBackend
+from .backend import (
+    Backend,
+    BackendAuthenticationError,
+    BackendBadRequestError,
+    BackendConflictError,
+    BackendConnectionError,
+    BackendError,
+    BackendNotFoundError,
+    BackendPermissionDeniedError,
+    BackendRateLimitError,
+    BackendResponseError,
+    BackendServerError,
+    BackendStatusError,
+    BackendTimeoutError,
+    OpenAIBackend,
+)
 from .commands import (
     Command,
     CommandArgumentError,

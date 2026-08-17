@@ -90,6 +90,9 @@ class Backend(ABC):
 
         Returns:
             list[ModelInfo]: Available model descriptions.
+
+        Raises:
+            BackendError: If the provider cannot list its models.
         """
 
     @abstractmethod
@@ -98,6 +101,9 @@ class Backend(ABC):
 
         Returns:
             list[ModelInfo]: Available model descriptions.
+
+        Raises:
+            BackendError: If the provider cannot list its models.
         """
 
     @abstractmethod
@@ -122,6 +128,7 @@ class Backend(ABC):
             Iterable[ResponseEvent]: Response events in output order.
 
         Raises:
+            BackendError: If the provider request or response fails.
             ValueError: If neither the request nor backend selects a model.
         """
 
@@ -147,6 +154,7 @@ class Backend(ABC):
             ResponseEvent: Response events in output order.
 
         Raises:
+            BackendError: If the provider request or response fails.
             ValueError: If neither the request nor backend selects a model.
         """
 
@@ -167,6 +175,9 @@ class Backend(ABC):
         Returns:
             CompactionResult | None: Summarized replacement context, or ``None`` when the backend
                 does not produce a completed textual summary.
+
+        Raises:
+            BackendError: If the provider request or response fails.
         """
         history = json.dumps(
             {

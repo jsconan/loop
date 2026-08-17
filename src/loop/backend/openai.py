@@ -7,7 +7,15 @@ from mimetypes import guess_type
 from typing import Any, Literal
 
 import httpx
-from openai import APIError, APIStatusError, AsyncOpenAI, OpenAI
+from openai import (
+    APIConnectionError,
+    APIResponseValidationError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    OpenAI,
+    OpenAIError,
+)
 from openai.types.model import Model as OpenAIModel
 from openai.types.responses import EasyInputMessageParam as OpenAIMessageParam
 from openai.types.responses import FunctionToolParam as OpenAIFunctionToolParam
@@ -62,6 +70,20 @@ from ..models import (
 from ..tooling import ToolRegistry
 from ..tooling import tool_registry as default_tool_registry
 from .backend import Backend
+from .errors import (
+    BackendAuthenticationError,
+    BackendBadRequestError,
+    BackendConflictError,
+    BackendConnectionError,
+    BackendError,
+    BackendNotFoundError,
+    BackendPermissionDeniedError,
+    BackendRateLimitError,
+    BackendResponseError,
+    BackendServerError,
+    BackendStatusError,
+    BackendTimeoutError,
+)
 
 _ReasoningChannel = Literal["content", "summary"]
 
@@ -165,23 +187,81 @@ class OpenAIBackend(Backend):
             )
         return self._async_client
 
+    @staticmethod
+    def _translated_error(error: OpenAIError, operation: str) -> BackendError:  # pylint: disable=too-many-branches
+        """Translate an OpenAI SDK failure into the backend error contract."""
+        status_code = getattr(error, "status_code", None)
+        response = getattr(error, "response", None)
+        headers = response.headers if response is not None else {}
+        retry_after = None
+        try:
+            retry_after = float(headers["retry-after"])
+        except KeyError, TypeError, ValueError:
+            pass
+        attributes = {
+            "provider": "openai",
+            "operation": operation,
+            "status_code": status_code,
+            "code": getattr(error, "code", None),
+            "request_id": getattr(error, "request_id", None),
+            "retry_after": retry_after,
+            "details": getattr(error, "body", None),
+        }
+        if isinstance(error, APITimeoutError) or status_code == 408:
+            error_type = BackendTimeoutError
+        elif isinstance(error, APIConnectionError):
+            error_type = BackendConnectionError
+        elif isinstance(error, APIResponseValidationError):
+            error_type = BackendResponseError
+        elif status_code in (400, 422):
+            error_type = BackendBadRequestError
+        elif status_code == 401:
+            error_type = BackendAuthenticationError
+        elif status_code == 403:
+            error_type = BackendPermissionDeniedError
+        elif status_code == 404:
+            error_type = BackendNotFoundError
+        elif status_code == 409:
+            error_type = BackendConflictError
+        elif status_code == 429:
+            error_type = BackendRateLimitError
+        elif status_code is not None and status_code >= 500:
+            error_type = BackendServerError
+        elif isinstance(error, APIStatusError):
+            error_type = BackendStatusError
+        else:
+            error_type = BackendError
+        return error_type(str(error), **attributes)
+
     def get_models(self) -> list[ModelInfo]:
         """Return the models available from the configured backend.
 
         Returns:
             list[ModelInfo]: The available models.
+
+        Raises:
+            BackendError: If the provider cannot list its models.
         """
-        models = self._get_client().models.list(timeout=2.0)
-        return [self._model_info(model) for model in models]
+        try:
+            models = self._get_client().models.list(timeout=2.0)
+            return [self._model_info(model) for model in models]
+        except OpenAIError as error:
+            raise self._translated_error(error, "list_models") from error
 
     async def get_models_async(self) -> list[ModelInfo]:
         """Asynchronously return the models available from the configured backend.
 
         Returns:
             list[ModelInfo]: The available models.
+
+        Raises:
+            BackendError: If the provider cannot list its models.
         """
-        models = await self._get_async_client().models.list(timeout=2.0)
-        return [self._model_info(model) for model in models]
+        try:
+            models = await self._get_async_client().models.list(timeout=2.0)
+            return [self._model_info(model) for model in models]
+        except OpenAIError as error:
+            raise self._translated_error(error, "list_models") from error
 
     def get_response(
         self,
@@ -204,10 +284,26 @@ class OpenAIBackend(Backend):
             ResponseEvent: Response events in output order.
 
         Raises:
+            BackendError: If the provider request or response fails.
             StructuredOutputValidationError: If every structured generation attempt fails local
                 validation or the provider refuses the request.
             ValueError: If neither the request nor backend selects a model.
         """
+        operation = "stream_response" if stream else "create_response"
+        try:
+            yield from self._get_response(input, instructions, stream, model, output_format)
+        except OpenAIError as error:
+            raise self._translated_error(error, operation) from error
+
+    def _get_response(
+        self,
+        input: str | Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
+        instructions: str | None,
+        stream: bool,
+        model: str | None,
+        output_format: StructuredOutputFormat | None,
+    ) -> Iterator[ResponseEvent]:
+        """Yield response events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
         serialized_input = self._serialize_input(input)
         request_instructions = self._structured_output_instructions(instructions, output_format)
@@ -303,10 +399,29 @@ class OpenAIBackend(Backend):
             ResponseEvent: Response events in output order.
 
         Raises:
+            BackendError: If the provider request or response fails.
             StructuredOutputValidationError: If every structured generation attempt fails local
                 validation or the provider refuses the request.
             ValueError: If neither the request nor backend selects a model.
         """
+        operation = "stream_response" if stream else "create_response"
+        try:
+            async for event in self._get_response_async(
+                input, instructions, stream, model, output_format
+            ):
+                yield event
+        except OpenAIError as error:
+            raise self._translated_error(error, operation) from error
+
+    async def _get_response_async(
+        self,
+        input: str | Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
+        instructions: str | None,
+        stream: bool,
+        model: str | None,
+        output_format: StructuredOutputFormat | None,
+    ) -> AsyncIterator[ResponseEvent]:
+        """Asynchronously yield events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
         serialized_input = self._serialize_input(input)
         request_instructions = self._structured_output_instructions(instructions, output_format)
@@ -404,7 +519,7 @@ class OpenAIBackend(Backend):
         if selected_model not in self._context_windows:
             try:
                 models = self.get_models()
-            except APIError:
+            except BackendError:
                 models = []
             self._context_windows[selected_model] = self._context_window_from_models(
                 models, selected_model
@@ -429,7 +544,7 @@ class OpenAIBackend(Backend):
         if selected_model not in self._context_windows:
             try:
                 models = await self.get_models_async()
-            except APIError:
+            except BackendError:
                 models = []
             self._context_windows[selected_model] = self._context_window_from_models(
                 models, selected_model
@@ -539,8 +654,25 @@ class OpenAIBackend(Backend):
             model (str): Model selected for the operation.
 
         Returns:
-            CompactionResult: Exact provider replacement items and reported usage.
+            CompactionResult | None: Exact provider replacement items and reported usage, or
+                ``None`` when portable fallback does not produce a summary.
+
+        Raises:
+            BackendError: If native and portable compaction fail operationally.
         """
+        try:
+            return self._compact(input, instructions=instructions, model=model)
+        except OpenAIError as error:
+            raise self._translated_error(error, "compact") from error
+
+    def _compact(
+        self,
+        input: Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
+        *,
+        instructions: str | None,
+        model: str,
+    ) -> CompactionResult | None:
+        """Compact context while retaining provider errors for endpoint fallback."""
         active_context = list(input)
         try:
             response = self._get_client().responses.compact(
