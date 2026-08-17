@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from prompt_toolkit.completion import DummyCompleter
+from prompt_toolkit.completion import CompleteEvent, DummyCompleter
+from prompt_toolkit.document import Document
 from rich.console import Console
 from rich.prompt import Confirm
 
@@ -32,6 +33,93 @@ def test_prompt_forwards_an_explicit_completer_to_the_prompt_session():
 
     assert session.prompt.call_args.kwargs["completer"] is completer
     assert session.prompt.call_args.kwargs["complete_in_thread"] is True
+
+
+def test_prompt_displays_choices_and_returns_a_mapped_value_for_a_number(capsys):
+    """Numbered choice input returns the key associated with its displayed label."""
+    session = Mock()
+    session.prompt.return_value = "2"
+
+    result = ConsoleInteraction(console=Console(width=80), session=session).prompt(
+        "Select: ",
+        choices={"first": "First choice", "second": "Second choice"},
+    )
+
+    assert result == "second"
+    output = capsys.readouterr().out
+    assert "1. First choice" in output
+    assert "2. Second choice" in output
+    assert "complete_while_typing" not in session.prompt.call_args.kwargs
+
+
+def test_prompt_returns_a_choice_value_entered_without_its_number():
+    """Case-insensitive typed labels return their mapped values."""
+    session = Mock()
+    session.prompt.return_value = "SECOND CHOICE"
+
+    assert ConsoleInteraction(session=session).prompt(
+        choices={"first": "First choice", "second": "Second choice"}
+    ) == "second"
+
+
+def test_prompt_autocompletes_display_labels():
+    """Choice completion replaces a typed label fragment with the displayed value."""
+    session = Mock()
+    session.prompt.return_value = "First choice"
+
+    ConsoleInteraction(session=session).prompt(choices=["First choice", "Second choice"])
+
+    completer = session.prompt.call_args.kwargs["completer"]
+    completions = list(completer.get_completions(Document("sec"), CompleteEvent()))
+
+    assert [(completion.text, completion.start_position) for completion in completions] == [
+        ("Second choice", -3)
+    ]
+
+
+def test_prompt_reprompts_until_a_choice_is_selected(capsys):
+    """Choice prompts reject values outside the displayed catalog."""
+    session = Mock()
+    session.prompt.side_effect = ["0", "unknown", "first"]
+
+    assert ConsoleInteraction(session=session).prompt(choices=["first"]) == "first"
+    assert capsys.readouterr().out.endswith(
+        "Warning: Select one of the listed choices by number or value.\n"
+    )
+    assert session.prompt.call_count == 3
+
+
+@pytest.mark.parametrize(
+    ("choices", "message"),
+    [
+        ([], "choices cannot be empty."),
+        ([""], "choice labels cannot be empty."),
+        (["same", "SAME"], "choice labels must be unique ignoring case."),
+        (["1"], "choice labels cannot conflict with selection numbers."),
+    ],
+)
+def test_prompt_rejects_ambiguous_choices(choices, message):
+    """Choice prompts reject catalog shapes that cannot be selected unambiguously."""
+    with pytest.raises(ValueError, match=message):
+        ConsoleInteraction().prompt(choices=choices)
+
+
+def test_prompt_rejects_a_custom_completer_when_it_manages_choices():
+    """Choice prompts own completion so accepted input stays constrained to the catalog."""
+    with pytest.raises(ValueError, match="choices cannot be combined"):
+        ConsoleInteraction().prompt(choices=["first"], completer=DummyCompleter())
+
+
+def test_columns_displays_unumbered_mapping_labels_without_exposing_keys(capsys):
+    """Column display keeps mapping keys separate from their user-facing labels."""
+    ConsoleInteraction(console=Console(width=80)).columns(
+        {"internal-one": "First", "internal-two": "Second"}
+    )
+
+    output = capsys.readouterr().out
+    assert "First" in output
+    assert "Second" in output
+    assert "internal-one" not in output
 
 
 def test_prompt_reprompts_for_blank_input(capsys):

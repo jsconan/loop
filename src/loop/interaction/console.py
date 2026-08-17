@@ -1,13 +1,14 @@
 """Define user interaction abstractions and tool invocation context."""
 
 import json
-from collections.abc import Generator, Iterable
+from collections.abc import Generator, Iterable, Mapping
 from contextlib import contextmanager
 from pprint import pformat
 from typing import Any
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import Completer
+from prompt_toolkit.completion import Completer, WordCompleter
+from rich.columns import Columns
 from rich.console import Console
 from rich.constrain import Constrain
 from rich.json import JSON
@@ -60,7 +61,8 @@ class ConsoleInteraction(Interaction):
         message: str | None = None,
         completer: Completer | None = None,
         exit_commands: str | Iterable[str] | None = "q",
-    ) -> str | False:
+        choices: Iterable[str] | Mapping[object, str] | None = None,
+    ) -> object | False:
         """Prompt for a non-empty user message or an exit command.
 
         Args:
@@ -69,10 +71,28 @@ class ConsoleInteraction(Interaction):
             completer (Completer | None): Optional input completer. Defaults to no completion.
             exit_commands (str | Iterable[str] | None): Optional list of exit terms that end the
                 prompt. Defaults to ``"q"``.
+            choices (Iterable[str] | Mapping[object, str] | None): Optional selectable values.
+                Mapping keys are returned while their values are displayed and accepted as input.
+                Defaults to ``None``.
 
         Returns:
-            str | False: The entered message, or ``False`` when the user requests to exit.
+            object | False: The selected value or entered message, or ``False`` when the user
+            requests to exit.
+
+        Raises:
+            ValueError: If ``choices`` are invalid or used with a custom ``completer``.
         """
+        choice_items = self._choice_items(choices) if choices is not None else None
+        if choice_items is not None:
+            if completer is not None:
+                raise ValueError("choices cannot be combined with a custom completer.")
+            self.columns(dict(choice_items), numbered=True)
+            completer = WordCompleter(
+                [label for _, label in choice_items],
+                ignore_case=True,
+                sentence=True,
+                match_middle=True,
+            )
         if message is None:
             message = "\nYou: "
         if isinstance(exit_commands, str):
@@ -99,7 +119,66 @@ class ConsoleInteraction(Interaction):
                 continue
             if user_input.casefold() in exit_commands:
                 return False
+            if choice_items is not None:
+                if user_input.isdecimal():
+                    index = int(user_input) - 1
+                    if 0 <= index < len(choice_items):
+                        return choice_items[index][0]
+                for value, label in choice_items:
+                    if user_input.casefold() == label.casefold():
+                        return value
+                self.warning("Select one of the listed choices by number or value.")
+                continue
             return user_input
+
+    @staticmethod
+    def _choice_items(
+        values: Iterable[str] | Mapping[object, str],
+    ) -> tuple[tuple[object, str], ...]:
+        """Normalize selectable values and enforce unambiguous input."""
+        items = (
+            tuple(values.items())
+            if isinstance(values, Mapping)
+            else tuple((value, value) for value in values)
+        )
+        if not items:
+            raise ValueError("choices cannot be empty.")
+        labels = tuple(label for _, label in items)
+        if any(not label for label in labels):
+            raise ValueError("choice labels cannot be empty.")
+        if len({label.casefold() for label in labels}) != len(labels):
+            raise ValueError("choice labels must be unique ignoring case.")
+        numbers = {str(index) for index in range(1, len(items) + 1)}
+        if any(label in numbers for label in labels):
+            raise ValueError("choice labels cannot conflict with selection numbers.")
+        return items
+
+    def columns(
+        self,
+        values: Iterable[str] | Mapping[object, str],
+        *,
+        numbered: bool = False,
+    ) -> None:
+        """Write values in terminal-width-aware columns.
+
+        Args:
+            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+                displayed while their keys remain available to callers that also retain the
+                mapping.
+            numbered (bool): Whether to prefix displayed values with one-based numbers.
+
+        Raises:
+            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
+                label conflicts with a displayed number.
+        """
+        items = self._choice_items(values)
+        renderables = [
+            Text(f"{index}. {label}" if numbered else label)
+            for index, (_, label) in enumerate(items, start=1)
+        ]
+        self._console.print(
+            Columns(renderables, padding=(0, 2), equal=True, expand=True, column_first=True)
+        )
 
     def user(self, message: str) -> None:
         """Write a completed user message to the terminal.

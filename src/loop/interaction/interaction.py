@@ -1,7 +1,7 @@
 """Define user interaction abstractions."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
@@ -45,7 +45,8 @@ class Interaction(ABC):
         message: str | None = None,
         completer: Completer | None = None,
         exit_commands: str | Iterable[str] | None = None,
-    ) -> str | False:
+        choices: Iterable[str] | Mapping[object, str] | None = None,
+    ) -> object | False:
         """Read a non-empty user message or an exit command.
 
         Args:
@@ -54,10 +55,33 @@ class Interaction(ABC):
             completer (Completer | None): Optional input completer. Defaults to no completion.
             exit_commands (str | Iterable[str] | None): Optional list of exit terms that end the
                 prompt. Defaults to ``None``.
+            choices (Iterable[str] | Mapping[object, str] | None): Optional selectable values.
+                Mapping keys are returned while their values are displayed and accepted as input.
+                Defaults to ``None``.
 
         Returns:
-            str | False: The stripped text entered by the user, or ``False`` when the user
-            requests to exit.
+            object | False: The selected value or stripped text entered by the user, or ``False``
+            when the user requests to exit.
+        """
+
+    @abstractmethod
+    def columns(
+        self,
+        values: Iterable[str] | Mapping[object, str],
+        *,
+        numbered: bool = False,
+    ) -> None:
+        """Display values in terminal-width-aware columns.
+
+        Args:
+            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+                displayed while their keys remain available to callers that also retain the
+                mapping.
+            numbered (bool): Whether to prefix displayed values with one-based numbers.
+
+        Raises:
+            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
+                label conflicts with a displayed number.
         """
 
     @abstractmethod
