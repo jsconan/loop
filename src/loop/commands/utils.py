@@ -4,11 +4,11 @@ import inspect
 import json
 import shlex
 from collections.abc import Callable
-from typing import get_type_hints
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, create_model
 
 from ..context import CommandContext
+from ..utils import callable_hints
 from .models import CommandArgumentError, CommandRegistrationError, CommandRemainder
 
 
@@ -121,7 +121,7 @@ def get_command_arguments_model(
         CommandRegistrationError: If a parameter cannot be represented by a schema or
             ``CommandContext`` is declared anywhere except first.
     """
-    hints = get_type_hints(function, include_extras=True)
+    hints = callable_hints(function)
     parameters = list(inspect.signature(function).parameters.values())
     if parameters and hints.get(parameters[0].name) is CommandContext:
         parameters = parameters[1:]
@@ -177,5 +177,5 @@ def takes_command_context(function: Callable[..., None]) -> bool:
     parameters = list(inspect.signature(function).parameters.values())
     if not parameters:
         return False
-    hints = get_type_hints(function, include_extras=True)
+    hints = callable_hints(function)
     return hints.get(parameters[0].name) is CommandContext

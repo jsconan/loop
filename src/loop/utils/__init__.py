@@ -9,6 +9,8 @@ __all__ = [
     "bound_tool_result",
     "cached_metadata",
     "cached_path",
+    "callable_hints",
+    "callable_name",
     "decode_content_cursor",
     "encode_content_cursor",
     "find_project_root",
@@ -26,6 +28,7 @@ __all__ = [
 ]
 
 
+from .callables import callable_hints, callable_name
 from .content import (
     bound_tool_result,
     cached_metadata,
