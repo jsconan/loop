@@ -239,6 +239,16 @@ def test_backend_does_not_read_process_configuration(monkeypatch):
     assert not hasattr(client, "api_key")
 
 
+def test_backend_without_injected_tools_owns_an_empty_registry():
+    """Tool-less backends receive distinct empty registries rather than shared package state."""
+    first = OpenAIBackend()
+    second = OpenAIBackend()
+
+    assert first.tool_registry.names == []
+    assert second.tool_registry.names == []
+    assert first.tool_registry is not second.tool_registry
+
+
 def test_response_requires_an_explicit_or_default_model():
     """Synchronous and asynchronous requests reject missing model selection."""
     backend = OpenAIBackend()

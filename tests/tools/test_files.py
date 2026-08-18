@@ -8,17 +8,22 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from loop import (
+    BUILTIN_TOOLS,
     ConsoleInteraction,
     InstructionsManager,
     ToolContext,
-    tool_registry,
+    ToolRegistry,
 )
 from loop.tools.files import list_folder as list_folder_tool
+
+tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
 
 @pytest.fixture(autouse=True)
 def approve_tool_calls(monkeypatch):
     """Approve central permission prompts unless a case overrides the decision."""
+    global tool_registry  # pylint: disable=global-statement
+    tool_registry = ToolRegistry(BUILTIN_TOOLS)
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
 
 

@@ -9,7 +9,7 @@ from pydantic import Field
 from .. import constants
 from ..context import ToolContext
 from ..permissions import Capability, PermissionRequest
-from ..tooling import tool_registry
+from ..tooling import tool
 from ..utils import (
     format_content_diff,
     format_content_preview,
@@ -89,7 +89,7 @@ def _deletion_kind(path: Path) -> Literal["file", "symbolic link", "folder"] | N
     return None
 
 
-@tool_registry.tool(
+@tool(
     capabilities={Capability.FILESYSTEM_READ},
     permission_resolver=_file_permission(Capability.FILESYSTEM_READ),
 )
@@ -129,7 +129,7 @@ def list_folder(
         return f"Error listing folder: {exc}"
 
 
-@tool_registry.tool(
+@tool(
     capabilities={Capability.FILESYSTEM_READ},
     permission_resolver=_file_permission(Capability.FILESYSTEM_READ),
 )
@@ -179,7 +179,7 @@ def read_text_file(
         return f"Error reading file: {exc}"
 
 
-@tool_registry.tool(
+@tool(
     capabilities={Capability.FILESYSTEM_WRITE},
     permission_resolver=_file_permission(Capability.FILESYSTEM_WRITE),
 )
@@ -199,7 +199,7 @@ def write_text_file(
         return f"Error writing to file: {exc}"
 
 
-@tool_registry.tool(
+@tool(
     capabilities={Capability.FILESYSTEM_DELETE},
     permission_resolver=_delete_permission,
 )

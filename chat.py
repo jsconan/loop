@@ -17,7 +17,7 @@ from loop import (
     ProjectPathMentionHandler,
     SessionManager,
     ShutdownRequested,
-    ToolRegistry,
+    create_default_tool_registry,
     register_shutdown_signals,
 )
 
@@ -68,7 +68,7 @@ def main() -> None:
             api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
             context_window=int(context_window) if context_window else None,
             max_retries=int(max_retries) if max_retries else 2,
-            tool_registry=ToolRegistry(),
+            tool_registry=create_default_tool_registry(),
         )
 
         interaction.info("Hello from Chat!")

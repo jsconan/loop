@@ -7,26 +7,24 @@ from pydantic import ValidationError
 
 from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
+from ..constants import OMIT, Omit
 from ..context import ToolContext
 from ..interaction import Interaction
 from ..models import ToolDefinition
 from ..permissions import Capability, Decision, PermissionManager, PermissionRequest
 from ..skills import InstructionsManager
-from .tool import Tool
-from .utils import (
-    ToolRegistrationError,
-    get_tool_arguments_model,
-    get_tool_description,
-    serialize_tool_error,
-)
+from ..utils import callable_name
+from .tool import PermissionResolver, Tool, ToolRegistration
+from .utils import ToolRegistrationError, serialize_tool_error
 
 
 class ToolRegistry:
     """Collect tool declarations and route model calls to their implementations.
 
     Args:
-        tools (Iterable[Callable[..., Any]] | None): Functions to register in iteration order, or
-            ``None`` to construct an empty registry.
+        tools (Iterable[Callable[..., Any] | ToolRegistration] | None): Functions or configured
+            registrations to add in iteration order, or ``None`` to construct an empty registry.
+            Functions may optionally carry metadata from the standalone ``@tool`` decorator.
         interaction (Interaction | None): Default interaction used by context-aware tools when
             dispatch does not provide one, or ``None`` to require an invocation-specific
             interaction.
@@ -40,15 +38,15 @@ class ToolRegistry:
 
     def __init__(
         self,
-        tools: Iterable[Callable[..., Any]] | None = None,
+        tools: Iterable[Callable[..., Any] | ToolRegistration] | None = None,
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
     ) -> None:
         self._tools = {}
         self._interaction = interaction
         self._permission_manager = permission_manager or PermissionManager(interaction=interaction)
-        for function in tools or ():
-            self.tool(function)
+        for tool in tools or ():
+            self.register(tool)
 
     @property
     def interaction(self) -> Interaction | None:
@@ -103,63 +101,59 @@ class ToolRegistry:
         Returns:
             list[str]: Registered tool names.
         """
-        return sorted(self._tools)
+        return sorted(self._tools.keys(), key=str.casefold)
 
-    def tool(
+    def register(
         self,
-        function: Callable[..., Any] | None = None,
+        function: Callable[..., Any] | ToolRegistration,
         *,
         name: str | None = None,
         description: str | None = None,
         capabilities: Iterable[Capability] | None = None,
-        permission_resolver: Callable[[dict[str, Any]], Iterable[PermissionRequest]] | None = None,
-    ) -> Callable[..., Any]:
-        """Register a function, usable as ``@tool_registry.tool`` or with options.
+        permission_resolver: PermissionResolver | None | Omit = OMIT,
+    ) -> None:
+        """Create and register a tool from a callable or configured registration.
 
         Args:
-            function (Callable[..., Any] | None): Function to register when the decorator is used
-                without options.
-            name (str | None): Public tool name. Defaults to the function name.
-            description (str | None): Public description. Defaults to the docstring summary.
-            capabilities (Iterable[Capability] | None): Static authority required by each call.
-                Defaults to the tool's inherited declaration or ``pure``.
-            permission_resolver (Callable[[dict[str, Any]], Iterable[PermissionRequest]] | None):
-                Optional resolver producing resource-specific requests from validated arguments.
-
-        Returns:
-            Callable[..., Any]: The registered function, or a decorator when ``function`` is
-                omitted.
+            function (Callable[..., Any] | ToolRegistration): Function to expose as a tool, or a
+                registration that supplies its local metadata.
+            name (str | None): Container-specific public name. Defaults to the declared name or
+                function name.
+            description (str | None): Container-specific public description. Defaults to the
+                declared description or docstring summary.
+            capabilities (Iterable[Capability] | None): Container-specific static authority.
+                Defaults to declared capabilities or ``pure``.
+            permission_resolver (PermissionResolver | None | object): Container-specific resolver
+                for resource permission requests. Omit it to inherit the declared resolver; pass
+                ``None`` to remove one.
 
         Raises:
-            ToolRegistrationError: If the name is already registered, the function has no
-                description, or its parameters cannot be represented by an arguments model.
+            ToolRegistrationError: If the resolved name is already registered, the function has
+                no description, or its parameters cannot be represented by an arguments model.
         """
-
-        def _register(target: Callable[..., Any]) -> Callable[..., Any]:
-            tool_name = name or target.__name__
-            if tool_name in self._tools:
-                raise ToolRegistrationError(f"Tool '{tool_name}' is already registered.")
-            declared_capabilities = frozenset(
-                capabilities or getattr(target, "__loop_capabilities__", None) or {Capability.PURE}
+        if isinstance(function, ToolRegistration):
+            registration = function
+            function = registration.function
+            name = name or registration.name
+            description = description or registration.description
+            capabilities = capabilities if capabilities is not None else registration.capabilities
+            permission_resolver = (
+                registration.permission_resolver
+                if isinstance(permission_resolver, Omit)
+                else permission_resolver
             )
-            declared_resolver = (
-                permission_resolver
-                if permission_resolver is not None
-                else getattr(target, "__loop_permission_resolver__", None)
-            )
-            self._tools[tool_name] = Tool(
-                name=tool_name,
-                description=description or get_tool_description(target),
-                function=target,
-                arguments_model=get_tool_arguments_model(target, tool_name),
-                capabilities=declared_capabilities,
-                permission_resolver=declared_resolver,
-            )
-            target.__loop_capabilities__ = declared_capabilities
-            target.__loop_permission_resolver__ = declared_resolver
-            return target
-
-        return _register(function) if function is not None else _register
+        declared_tool = Tool.get_declaration(function)
+        if declared_tool is None:
+            declared_tool = Tool(function=function)
+        tool_name = name or declared_tool.name or callable_name(function)
+        if tool_name in self._tools:
+            raise ToolRegistrationError(f"Tool '{tool_name}' is already registered.")
+        self._tools[tool_name] = declared_tool.registered(
+            name=name,
+            description=description,
+            capabilities=capabilities,
+            permission_resolver=permission_resolver,
+        )
 
     def definitions(self) -> list[ToolDefinition]:
         """Return definitions for all registered tools.
@@ -348,6 +342,3 @@ class ToolRegistry:
             permission_manager=permission_manager,
             grants=grants,
         )
-
-
-tool_registry = ToolRegistry()

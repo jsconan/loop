@@ -3,9 +3,20 @@
 import json
 from unittest.mock import MagicMock, call
 
-from loop import ConsoleInteraction, tool_registry
+import pytest
+
+from loop import BUILTIN_TOOLS, ConsoleInteraction, ToolRegistry
 from loop.utils import cached_path as resolve_cached_path
 from loop.utils import encode_content_cursor
+
+tool_registry = ToolRegistry(BUILTIN_TOOLS)
+
+
+@pytest.fixture(autouse=True)
+def fresh_tool_registry():
+    """Provide an isolated built-in registry for each web-tool case."""
+    global tool_registry  # pylint: disable=global-statement
+    tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
 
 def stream_response(content, *, content_type="text/plain"):

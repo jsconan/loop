@@ -1,6 +1,7 @@
 """Expose the public loop package interface."""
 
 __all__ = [
+    "BUILTIN_TOOLS",
     "OMIT",
     "AgentInstructionsSource",
     "AnswerCompleted",
@@ -93,11 +94,13 @@ __all__ = [
     "ToolCallCompleted",
     "ToolContext",
     "ToolDefinition",
+    "ToolRegistration",
     "ToolRegistrationError",
     "ToolRegistry",
     "ToolResult",
     "UnsupportedConversationItemError",
     "Usage",
+    "create_default_tool_registry",
     "delete_path",
     "fetch_content",
     "find_project_root",
@@ -114,7 +117,7 @@ __all__ = [
     "read_text_file",
     "register_shutdown_signals",
     "run_command",
-    "tool_registry",
+    "tool",
     "validate_session_source",
     "write_text_file",
 ]
@@ -228,8 +231,16 @@ from .skills import (
     Skill,
     SkillManager,
 )
-from .tooling import Tool, ToolRegistrationError, ToolRegistry, tool_registry
+from .tooling import (
+    Tool,
+    ToolRegistration,
+    ToolRegistrationError,
+    ToolRegistry,
+    tool,
+)
 from .tools import (
+    BUILTIN_TOOLS,
+    create_default_tool_registry,
     delete_path,
     fetch_content,
     get_current_datetime,

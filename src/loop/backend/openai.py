@@ -70,7 +70,6 @@ from ..models import (
     Usage,
 )
 from ..tooling import ToolRegistry
-from ..tooling import tool_registry as default_tool_registry
 from .backend import Backend
 from .errors import (
     BackendAuthenticationError,
@@ -97,9 +96,8 @@ class OpenAIBackend(Backend):
         default_model (str | None): Model identifier used when a request does not specify one.
         base_url (str | None): Base URL of the OpenAI-compatible backend.
         api_key (str | None): API key used privately by the backend client.
-        tool_registry (ToolRegistry | None): Registry supplying tool schemas for requests.
-            Defaults to the package
-            registry.
+        tool_registry (ToolRegistry | None): Registry supplying tool schemas for requests, or
+            ``None`` to construct an empty registry.
         context_window (int | None): Deployed model context limit, or ``None`` to use best-effort
             model metadata discovery.
         file_input_mode (Literal["text", "native"] | None): How referenced text files cross the
@@ -146,7 +144,7 @@ class OpenAIBackend(Backend):
             base_url=base_url,
             default_model=default_model,
             api_key=api_key,
-            tool_registry=tool_registry or default_tool_registry,
+            tool_registry=tool_registry if tool_registry is not None else ToolRegistry(),
         )
         self._client = None
         self._async_client = None

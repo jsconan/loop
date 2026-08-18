@@ -12,6 +12,7 @@ from loop import (
     SessionManager,
     ShutdownRequested,
     SQLiteSessionStore,
+    create_default_tool_registry,
     find_project_root,
     register_shutdown_signals,
 )
@@ -38,6 +39,7 @@ def main() -> None:
             api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
             context_window=int(context_window) if context_window else None,
             max_retries=int(max_retries) if max_retries else 2,
+            tool_registry=create_default_tool_registry(),
         )
         working_directory = Path.cwd()
         project_root = find_project_root(working_directory) or working_directory

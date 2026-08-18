@@ -11,7 +11,7 @@ from pydantic import Field
 from .. import constants
 from ..context import ToolContext
 from ..permissions import Capability, PermissionRequest
-from ..tooling import tool_registry
+from ..tooling import tool
 
 
 def _read_bounded(stream, chunks: list[str]) -> None:
@@ -45,7 +45,7 @@ def _command_permission(arguments: dict[str, object]) -> tuple[PermissionRequest
     )
 
 
-@tool_registry.tool(
+@tool(
     capabilities={Capability.PROCESS_EXEC},
     permission_resolver=_command_permission,
 )

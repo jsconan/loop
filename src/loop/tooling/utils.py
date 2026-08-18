@@ -3,15 +3,28 @@
 import inspect
 import json
 from collections.abc import Callable
-from typing import Any, get_type_hints
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, create_model
 
 from ..context import ToolContext
+from ..utils import callable_hints, callable_name
 
 
 class ToolRegistrationError(ValueError):
     """Indicate that a Python function cannot be registered as a tool."""
+
+
+def is_async_callable(function: Callable[..., Any]) -> bool:
+    """Return whether invoking a function or callable object produces a coroutine directly.
+
+    Args:
+        function (Callable[..., Any]): Callable whose implementation should be inspected.
+
+    Returns:
+        bool: Whether the callable is implemented as a coroutine function.
+    """
+    return inspect.iscoroutinefunction(function) or inspect.iscoroutinefunction(function.__call__)
 
 
 def get_tool_description(function: Callable[..., Any]) -> str:
@@ -28,7 +41,7 @@ def get_tool_description(function: Callable[..., Any]) -> str:
     """
     docstring = inspect.getdoc(function)
     if not docstring:
-        raise ToolRegistrationError(f"Tool '{function.__name__}' must have a docstring.")
+        raise ToolRegistrationError(f"Tool '{callable_name(function)}' must have a docstring.")
     return docstring.split("\n\n", maxsplit=1)[0].replace("\n", " ")
 
 
@@ -46,7 +59,7 @@ def get_tool_arguments_model(function: Callable[..., Any], tool_name: str) -> ty
         ToolRegistrationError: If a parameter kind is unsupported or lacks a type annotation.
     """
     signature = inspect.signature(function)
-    hints = get_type_hints(function, include_extras=True)
+    hints = callable_hints(function)
     fields = {}
 
     parameters = list(signature.parameters.values())
@@ -94,7 +107,7 @@ def takes_tool_context(function: Callable[..., Any]) -> bool:
     parameters = list(inspect.signature(function).parameters.values())
     if not parameters:
         return False
-    hints = get_type_hints(function, include_extras=True)
+    hints = callable_hints(function)
     return hints.get(parameters[0].name) is ToolContext
 
 

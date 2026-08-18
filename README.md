@@ -63,8 +63,7 @@ Run the chat loop, which enables streaming in `main.py`:
 uv run python main.py
 ```
 
-Enter a message at the `You:` prompt. To stop, enter `exit`, `quit`, `bye`, or
-`q`.
+Enter a message at the `You:` prompt. To stop, enter `/exit`, `/quit`, or `q`.
 
 Terminal completion is available while typing. Use `/` for commands and their known values, `@`
 for visible files and directories relative to the working directory, and `$` for discovered skill
@@ -140,12 +139,13 @@ require confirmation.
 ### Use the backend directly
 
 ```python
-from loop import AnswerDelta, OpenAIBackend
+from loop import AnswerDelta, OpenAIBackend, create_default_tool_registry
 
 backend = OpenAIBackend(
     base_url="http://localhost:8000/v1",
     api_key="local-api-key",
     default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
+    tool_registry=create_default_tool_registry(),
 )
 events = backend.get_response(
     input="Explain why the sky is blue in two sentences.",
@@ -160,7 +160,7 @@ print(answer)
 ```python
 import asyncio
 
-from loop import AnswerDelta, OpenAIBackend
+from loop import AnswerDelta, OpenAIBackend, create_default_tool_registry
 
 
 async def main() -> None:
@@ -168,6 +168,7 @@ async def main() -> None:
         base_url="http://localhost:8000/v1",
         api_key="local-api-key",
         default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
+        tool_registry=create_default_tool_registry(),
     )
     answer_parts = []
     async for event in backend.get_response_async(
@@ -188,19 +189,59 @@ A decorated function can request an explicit `ToolContext`. The registry injects
 dispatch, while the context parameter is omitted from the schema exposed to the model:
 
 ```python
-from loop import ToolContext, ToolRegistry
-
-registry = ToolRegistry()
+from loop import Capability, ToolContext, ToolRegistry, tool
 
 
-@registry.tool
+@tool
 def describe_tool(context: ToolContext, value: str) -> str:
     """Return a value labeled with its registered tool name."""
     return f"{context.tool_name}: {value}"
+
+
+registry = ToolRegistry([describe_tool])
 ```
+
+Registries can also create tools from undecorated callables and override metadata locally without
+changing the callable or another registry:
+
+```python
+registry = ToolRegistry()
+registry.register(
+    describe_tool,
+    name="describe_value",
+    description="Describe one value.",
+    capabilities={Capability.PURE},
+)
+```
+
+For declarative bulk composition, wrap locally configured entries in `ToolRegistration`:
+
+```python
+from loop import ToolRegistration
+
+registry = ToolRegistry(
+    [
+        ToolRegistration(
+            describe_tool,
+            name="describe_value",
+            description="Describe one value.",
+            capabilities=frozenset({Capability.PURE}),
+            permission_resolver=None,
+        )
+    ]
+)
+```
+
+Omitting `permission_resolver` inherits the passive declaration; explicitly passing `None` removes
+the declared resolver for that registry only.
 
 The context provides invocation metadata and access to the injected user interaction service.
 For loop-managed calls it also exposes the active `SkillManager`.
+
+Tool declaration is passive: importing a tool does not register it anywhere. Compose the desired
+capabilities explicitly with `ToolRegistry(BUILTIN_TOOLS)` for all bundled tools, a selected tuple
+for a restricted backend, or no registry argument for a tool-less backend. Every backend without
+an injected registry receives its own empty registry; no registry state is shared globally.
 
 ### Agent Skills
 
@@ -258,12 +299,12 @@ manifest.
 
 The executable in `main.py` resolves environment variables and applies these application defaults:
 
-| Setting           | Environment variable  | Built-in default               |
-| ----------------- | --------------------- | ------------------------------ |
-| Base URL          | `BASE_URL`            | `http://localhost:8000/v1`     |
-| Model             | `DEFAULT_MODEL`       | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
-| API key           | `OPENAI_API_KEY`      | `local-api-key`                |
-| Automatic retries | `OPENAI_MAX_RETRIES`  | `2`                            |
+| Setting           | Environment variable | Built-in default               |
+| ----------------- | -------------------- | ------------------------------ |
+| Base URL          | `BASE_URL`           | `http://localhost:8000/v1`     |
+| Model             | `DEFAULT_MODEL`      | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
+| API key           | `OPENAI_API_KEY`     | `local-api-key`                |
+| Automatic retries | `OPENAI_MAX_RETRIES` | `2`                            |
 
 `OpenAIBackend` itself does not read environment variables or provide deployment defaults. Library
 callers configure it explicitly, and credentials remain private backend state.

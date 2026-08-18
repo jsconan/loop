@@ -9,6 +9,7 @@ import pytest
 from prompt_toolkit.document import Document
 
 from loop import (
+    BUILTIN_TOOLS,
     AnswerCompleted,
     AnswerDelta,
     BackendAuthenticationError,
@@ -39,8 +40,8 @@ from loop import (
     ToolResult,
     Usage,
     manage_skills,
+    tool,
 )
-from loop import tool_registry as default_tool_registry
 
 
 def function_call() -> ToolCall:
@@ -51,7 +52,7 @@ def function_call() -> ToolCall:
 def loop_backend(**attributes):
     """Build a minimal backend satisfying the loop contract."""
     defaults = {
-        "tool_registry": default_tool_registry,
+        "tool_registry": ToolRegistry(BUILTIN_TOOLS),
         "default_model": "default-model",
         "get_context_window": lambda _model: None,
     }
@@ -111,11 +112,12 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
     session_manager = SessionManager(interaction=interaction, session_store=store)
     registry = ToolRegistry()
 
-    @registry.tool
+    @tool
     def inspect() -> str:
         """Inspect the project."""
         return "done"
 
+    registry.register(inspect)
     loop = Loop(
         backend=loop_backend(tool_registry=registry),
         instructions_manager=instructions,
@@ -259,7 +261,7 @@ def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(t
         ),
     )
     assert "Follow review instructions." in backend.get_response.call_args.kwargs["instructions"]
-    assert loop.session.active_skills == [("review", str(location))]\
+    assert loop.session.active_skills == [("review", str(location))]
 
 
 def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
@@ -699,7 +701,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     (first / "AGENTS.md").write_text("First rules.", encoding="utf-8")
     (second / "AGENTS.md").write_text("Second rules.", encoding="utf-8")
     backend = Mock(
-        tool_registry=default_tool_registry,
+        tool_registry=ToolRegistry(BUILTIN_TOOLS),
         default_model="default-model",
     )
     backend.get_response.return_value = []
@@ -714,7 +716,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
 
 def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
     """A query persists model context capacity without hidden tokenization calls."""
-    backend = Mock(tool_registry=default_tool_registry, default_model="model")
+    backend = Mock(tool_registry=ToolRegistry(BUILTIN_TOOLS), default_model="model")
     backend.get_context_window.return_value = 128000
     backend.get_response.return_value = []
     (tmp_path / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
@@ -1014,11 +1016,12 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
     """The runner records a tool result, requeries, reports usage, and exits."""
     registry = ToolRegistry()
 
-    @registry.tool
+    @tool
     def echo(text: str) -> str:
         """Echo text."""
         return text
 
+    registry.register(echo)
     call = ToolCall(call_id="call", name="echo", arguments='{"text":"done"}', id="fc")
     backend = Mock(tool_registry=registry, default_model="requested-model")
     backend.get_context_window.return_value = 1000

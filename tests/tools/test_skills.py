@@ -4,7 +4,18 @@ import json
 from pathlib import Path
 from unittest.mock import Mock
 
-from loop import InstructionsManager, Interaction, Skill, SkillManager, tool_registry
+import pytest
+
+from loop import BUILTIN_TOOLS, InstructionsManager, Interaction, Skill, SkillManager, ToolRegistry
+
+tool_registry = ToolRegistry(BUILTIN_TOOLS)
+
+
+@pytest.fixture(autouse=True)
+def fresh_tool_registry():
+    """Provide an isolated built-in registry for each skill-tool case."""
+    global tool_registry  # pylint: disable=global-statement
+    tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
 
 def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path):

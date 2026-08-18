@@ -32,6 +32,8 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     loop_factory = Mock(return_value=loop)
     backend = Mock()
     backend_factory = Mock(return_value=backend)
+    tool_registry = Mock()
+    registry_factory = Mock(return_value=tool_registry)
     session_store = Mock()
     session_store_factory = Mock(return_value=session_store)
     session_manager = Mock()
@@ -40,6 +42,7 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
     monkeypatch.setattr(main, "Loop", loop_factory)
     monkeypatch.setattr(main, "OpenAIBackend", backend_factory)
+    monkeypatch.setattr(main, "create_default_tool_registry", registry_factory)
     monkeypatch.setattr(main, "SQLiteSessionStore", session_store_factory)
     monkeypatch.setattr(main, "SessionManager", session_manager_factory)
     monkeypatch.setattr(main, "find_project_root", Mock(return_value=Path("/project")))
@@ -48,12 +51,14 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     main.main()
 
     register_shutdown_signals.assert_called_once_with()
+    registry_factory.assert_called_once_with()
     backend_factory.assert_called_once_with(
         base_url="http://localhost:8000/v1",
         default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
         api_key="local-api-key",
         context_window=None,
         max_retries=2,
+        tool_registry=tool_registry,
     )
     session_store_factory.assert_called_once_with(Path("/project/.loop/sessions.db"))
     session_manager_factory.assert_called_once_with(
@@ -80,6 +85,8 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
     loop_factory = Mock(return_value=loop)
     backend = Mock()
     backend_factory = Mock(return_value=backend)
+    tool_registry = Mock()
+    registry_factory = Mock(return_value=tool_registry)
     session_store = Mock()
     session_store_factory = Mock(return_value=session_store)
     session_manager = Mock(spec=SessionManager)
@@ -87,6 +94,7 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
     monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
     monkeypatch.setattr(main, "Loop", loop_factory)
     monkeypatch.setattr(main, "OpenAIBackend", backend_factory)
+    monkeypatch.setattr(main, "create_default_tool_registry", registry_factory)
     monkeypatch.setattr(main, "SQLiteSessionStore", session_store_factory)
     monkeypatch.setattr(main, "SessionManager", session_manager_factory)
     monkeypatch.setattr(main, "find_project_root", Mock(return_value=None))
@@ -100,12 +108,14 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
 
     main.main()
 
+    registry_factory.assert_called_once_with()
     backend_factory.assert_called_once_with(
         base_url="https://example.test/v1",
         default_model="configured-model",
         api_key="configured-key",
         context_window=32768,
         max_retries=5,
+        tool_registry=tool_registry,
     )
     session_store_factory.assert_called_once_with(tmp_path / ".loop" / "sessions.db")
     session_manager_factory.assert_called_once_with(

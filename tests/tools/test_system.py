@@ -7,10 +7,19 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from loop import ConsoleInteraction, tool_registry
+from loop import BUILTIN_TOOLS, ConsoleInteraction, ToolRegistry
 from loop.constants import MAX_OUTPUT_CHARS
 
 # pylint: disable=unused-argument, redefined-outer-name
+
+tool_registry = ToolRegistry(BUILTIN_TOOLS)
+
+
+@pytest.fixture(autouse=True)
+def fresh_tool_registry():
+    """Provide an isolated built-in registry for each system-tool case."""
+    global tool_registry  # pylint: disable=global-statement
+    tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
 
 def run_command(command):

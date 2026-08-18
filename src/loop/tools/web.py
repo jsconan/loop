@@ -8,7 +8,7 @@ from pydantic import Field, HttpUrl
 
 from .. import constants
 from ..permissions import Capability, PermissionRequest
-from ..tooling import tool_registry
+from ..tooling import tool
 from ..utils import (
     BoundedTextContent,
     cached_metadata,
@@ -100,7 +100,7 @@ def _cache_url(url: str, handle: str | None = None) -> str:
     return handle
 
 
-@tool_registry.tool(
+@tool(
     capabilities={Capability.NETWORK_READ},
     permission_resolver=_network_permission,
 )
@@ -123,7 +123,7 @@ def fetch_content(
         return f"Error fetching content: {exc}"
 
 
-@tool_registry.tool(permission_resolver=_cached_content_permission)
+@tool(permission_resolver=_cached_content_permission)
 def read_cached_content(
     handle: Annotated[str, Field(description="Opaque handle returned by a bounded tool result.")],
     cursor: Annotated[

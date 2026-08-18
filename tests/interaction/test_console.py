@@ -59,9 +59,12 @@ def test_prompt_returns_a_choice_value_entered_without_its_number():
     session = Mock()
     session.prompt.return_value = "SECOND CHOICE"
 
-    assert ConsoleInteraction(session=session).prompt(
-        choices={"first": "First choice", "second": "Second choice"}
-    ) == "second"
+    assert (
+        ConsoleInteraction(session=session).prompt(
+            choices={"first": "First choice", "second": "Second choice"}
+        )
+        == "second"
+    )
 
 
 def test_prompt_autocompletes_display_labels():

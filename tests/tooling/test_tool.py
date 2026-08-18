@@ -1,13 +1,19 @@
-"""Tests for individual tool validation and dispatch."""
+"""Tests for passive tool declaration, validation, and dispatch."""
 
 import asyncio
+import importlib
 import json
+from dataclasses import FrozenInstanceError
 from unittest.mock import Mock
 
+import pytest
 from pydantic import BaseModel
 
+from loop import Capability, ToolRegistrationError, ToolRegistry, tool
 from loop.context import ToolContext
 from loop.tooling import Tool
+
+tool_module = importlib.import_module("loop.tooling.tool")
 
 
 class Arguments(BaseModel):
@@ -20,13 +26,78 @@ def make_tool(function=None) -> Tool:
     """Build a tool with the shared argument model."""
     if function is None:
         function = Mock(return_value=2)
-    return Tool("calculate", "Calculate a value.", function, Arguments)
+    return Tool(
+        function=function,
+        name="calculate",
+        description="Calculate a value.",
+        arguments_model=Arguments,
+    )
+
+
+def test_tool_returns_the_original_function_with_pure_defaults():
+    """Bare declaration preserves callability and supplies pure registration metadata."""
+
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    declared = tool(calculate)
+    registered = ToolRegistry([declared]).tools[0]
+
+    assert declared is calculate
+    assert calculate(3) == 3
+    assert registered.name == "calculate"
+    assert registered.capabilities == frozenset({Capability.PURE})
+
+
+def test_tool_options_preserve_an_explicitly_empty_capability_set():
+    """Configured declarations retain names, descriptions, and empty capability collections."""
+
+    @tool(name="selected", description="Selected tool.", capabilities=())
+    def calculate(number: int) -> int:
+        return number
+
+    registered = ToolRegistry([calculate]).tools[0]
+
+    assert registered.name == "selected"
+    assert registered.description == "Selected tool."
+    assert registered.capabilities == frozenset()
+
+
+def test_tools_are_immutable():
+    """Tool declarations cannot be modified after construction."""
+    declaration = Tool(function=lambda: None)
+
+    with pytest.raises(FrozenInstanceError):
+        declaration.name = "changed"
+
+
+def test_passive_tools_require_registration_for_model_operations():
+    """Passive definitions reject definition and argument-validation operations."""
+    declaration = Tool(function=lambda: None)
+
+    with pytest.raises(ValueError, match="must be registered"):
+        declaration.definition()
+    with pytest.raises(ValueError, match="must be registered"):
+        declaration.validate_arguments("{}")
+
+
+def test_tool_rejects_redeclaring_the_same_function():
+    """A function has one unambiguous passive declaration."""
+
+    @tool
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    with pytest.raises(ToolRegistrationError, match="already declared"):
+        tool(name="other")(calculate)
 
 
 def test_definition_adapts_the_argument_model(monkeypatch):
     """Definition exposes neutral tool metadata and delegates schema adaptation."""
     adapt = Mock(return_value={"adapted": True})
-    monkeypatch.setattr("loop.tooling.tool.get_tool_schema", adapt)
+    monkeypatch.setattr(tool_module, "get_tool_schema", adapt)
 
     definition = make_tool().definition()
 
@@ -49,8 +120,8 @@ def test_call_invokes_and_serializes_validated_arguments(monkeypatch):
     """Synchronous dispatch invokes and serializes arguments prepared by validation."""
     function = Mock(return_value=4)
     serialize = Mock(return_value="serialized")
-    monkeypatch.setattr("loop.tooling.tool.takes_tool_context", Mock(return_value=False))
-    monkeypatch.setattr("loop.tooling.tool.serialize_tool_result", serialize)
+    monkeypatch.setattr(tool_module, "takes_tool_context", Mock(return_value=False))
+    monkeypatch.setattr(tool_module, "serialize_tool_result", serialize)
 
     assert make_tool(function).call({"number": 3}) == "serialized"
     function.assert_called_once_with(number=3)
@@ -61,9 +132,9 @@ def test_call_injects_required_context(monkeypatch):
     """Context-aware dispatch injects context and reports a missing context as an execution error."""
     function = Mock(return_value="done")
     serialize_error = Mock(return_value="error")
-    monkeypatch.setattr("loop.tooling.tool.takes_tool_context", Mock(return_value=True))
-    monkeypatch.setattr("loop.tooling.tool.serialize_tool_result", lambda result: result)
-    monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
+    monkeypatch.setattr(tool_module, "takes_tool_context", Mock(return_value=True))
+    monkeypatch.setattr(tool_module, "serialize_tool_result", lambda result: result)
+    monkeypatch.setattr(tool_module, "serialize_tool_error", serialize_error)
     context = Mock(spec=ToolContext)
     tool = make_tool(function)
 
@@ -80,7 +151,7 @@ def test_validate_arguments_returns_errors_without_invoking(monkeypatch):
     """Invalid model arguments return structured details without reaching application code."""
     function = Mock()
     serialize_error = Mock(return_value="invalid")
-    monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
+    monkeypatch.setattr(tool_module, "serialize_tool_error", serialize_error)
 
     arguments, error = make_tool(function).validate_arguments("not json")
 
@@ -101,7 +172,7 @@ def test_call_rejects_coroutine_functions_in_sync_dispatch(monkeypatch):
         return number * 2
 
     serialize_error = Mock(return_value="async error")
-    monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
+    monkeypatch.setattr(tool_module, "serialize_tool_error", serialize_error)
 
     assert make_tool(calculate).call({"number": 3}) == "async error"
     serialize_error.assert_called_once_with(
@@ -114,8 +185,8 @@ def test_call_serializes_execution_failures(monkeypatch):
     """Synchronous application failures become model-readable execution errors."""
     function = Mock(side_effect=RuntimeError("boom"))
     serialize_error = Mock(return_value="failed")
-    monkeypatch.setattr("loop.tooling.tool.takes_tool_context", Mock(return_value=False))
-    monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
+    monkeypatch.setattr(tool_module, "takes_tool_context", Mock(return_value=False))
+    monkeypatch.setattr(tool_module, "serialize_tool_error", serialize_error)
 
     assert make_tool(function).call({"number": 3}) == "failed"
     serialize_error.assert_called_once_with("execution_failed", "Tool 'calculate' failed: boom")
@@ -127,8 +198,8 @@ def test_call_async_supports_sync_and_awaitable_results(monkeypatch):
     async def calculate(number: int) -> int:
         return number * 2
 
-    monkeypatch.setattr("loop.tooling.tool.takes_tool_context", Mock(return_value=False))
-    monkeypatch.setattr("loop.tooling.tool.serialize_tool_result", lambda result: str(result))
+    monkeypatch.setattr(tool_module, "takes_tool_context", Mock(return_value=False))
+    monkeypatch.setattr(tool_module, "serialize_tool_result", lambda result: str(result))
 
     assert asyncio.run(make_tool(Mock(return_value=4)).call_async({"number": 3})) == "4"
     assert asyncio.run(make_tool(calculate).call_async({"number": 3})) == "6"
@@ -138,8 +209,8 @@ def test_call_async_handles_execution_failures(monkeypatch):
     """Asynchronous dispatch returns structured errors for application failures."""
     function = Mock(side_effect=RuntimeError("boom"))
     serialize_error = Mock(side_effect=lambda kind, message, **details: json.dumps({"error": kind}))
-    monkeypatch.setattr("loop.tooling.tool.takes_tool_context", Mock(return_value=False))
-    monkeypatch.setattr("loop.tooling.tool.serialize_tool_error", serialize_error)
+    monkeypatch.setattr(tool_module, "takes_tool_context", Mock(return_value=False))
+    monkeypatch.setattr(tool_module, "serialize_tool_error", serialize_error)
     tool = make_tool(function)
 
     assert json.loads(asyncio.run(tool.call_async({"number": 3})))["error"] == "execution_failed"

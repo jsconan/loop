@@ -12,7 +12,7 @@ from ..skills.models import (
     SkillOperationError,
     SkillOperationResult,
 )
-from ..tooling import tool_registry
+from ..tooling import tool
 
 _FIELDS_BY_NAME = {
     "activate": ("name", "status", "instructions_updated"),
@@ -69,7 +69,7 @@ def _skill_permission(arguments: dict[str, Any]) -> tuple[PermissionRequest, ...
     return (PermissionRequest(tool_name="manage_skills", capability=capability, resource=resource),)
 
 
-@tool_registry.tool(permission_resolver=_skill_permission)
+@tool(permission_resolver=_skill_permission)
 def manage_skills(
     context: ToolContext,
     action: Annotated[
