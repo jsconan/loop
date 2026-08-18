@@ -2,6 +2,14 @@
 
 from pathlib import Path
 
+
+class Omit:
+    """Represent an omitted value."""
+
+
+OMIT = Omit()
+
+
 # Application home directory, used for storing session data and other application state.
 APP_DIRECTORY = Path(".loop")
 

@@ -1,6 +1,7 @@
 """Expose the public loop package interface."""
 
 __all__ = [
+    "OMIT",
     "AgentInstructionsSource",
     "AnswerCompleted",
     "AnswerDelta",
@@ -52,6 +53,7 @@ __all__ = [
     "MentionManager",
     "Message",
     "ModelInfo",
+    "Omit",
     "OpenAIBackend",
     "PermissionConfiguration",
     "PermissionManager",
@@ -152,6 +154,7 @@ from .completion import (
     ProjectPathCompletionAdapter,
     SchemaCompletionState,
 )
+from .constants import OMIT, Omit
 from .context import CommandContext, ToolContext
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop, Response
