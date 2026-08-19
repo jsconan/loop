@@ -7,8 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, create_model
 
-from ..context import ToolContext
 from ..utils import callable_hints, callable_name
+from .context import ToolContext
 
 
 class ToolRegistrationError(ValueError):

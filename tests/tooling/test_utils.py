@@ -6,8 +6,8 @@ from typing import Annotated
 import pytest
 from pydantic import BaseModel, Field
 
-from loop.context import ToolContext
 from loop.tooling import (
+    ToolContext,
     ToolRegistrationError,
     get_tool_arguments_model,
     get_tool_description,

@@ -158,7 +158,7 @@ from .completion import (
     SchemaCompletionState,
 )
 from .constants import OMIT, Omit
-from .context import CommandContext, ToolContext
+from .context import CommandContext
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop, Response
 from .mentions import (
@@ -233,6 +233,7 @@ from .skills import (
 )
 from .tooling import (
     Tool,
+    ToolContext,
     ToolRegistration,
     ToolRegistrationError,
     ToolRegistry,

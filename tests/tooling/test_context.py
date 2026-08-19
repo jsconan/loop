@@ -2,7 +2,7 @@
 
 from unittest.mock import Mock
 
-from loop.context import ToolContext
+from loop import InstructionsManager, ToolContext
 from loop.interaction import Interaction
 from loop.permissions import (
     Capability,
@@ -11,7 +11,6 @@ from loop.permissions import (
     PermissionMode,
     PermissionRequest,
 )
-from loop.skills import InstructionsManager
 
 
 def test_confirm_delegates_to_the_interaction():

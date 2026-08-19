@@ -11,9 +11,9 @@ from loop import (
     BUILTIN_TOOLS,
     ConsoleInteraction,
     InstructionsManager,
-    ToolContext,
     ToolRegistry,
 )
+from loop.tooling import ToolContext
 from loop.tools.files import list_folder as list_folder_tool
 
 tool_registry = ToolRegistry(BUILTIN_TOOLS)

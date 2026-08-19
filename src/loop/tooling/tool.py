@@ -8,10 +8,10 @@ from typing import Any, overload
 from pydantic import BaseModel, ValidationError
 
 from ..constants import OMIT, Omit
-from ..context import ToolContext
 from ..models import ToolDefinition
 from ..permissions import Capability, PermissionRequest
 from ..utils import callable_name
+from .context import ToolContext
 from .utils import (
     ToolRegistrationError,
     get_tool_arguments_model,

@@ -8,12 +8,12 @@ from pydantic import ValidationError
 from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
 from ..constants import OMIT, Omit
-from ..context import ToolContext
 from ..interaction import Interaction
 from ..models import ToolDefinition
 from ..permissions import Capability, Decision, PermissionManager, PermissionRequest
 from ..skills import InstructionsManager
 from ..utils import callable_name
+from .context import ToolContext
 from .tool import PermissionResolver, Tool, ToolRegistration
 from .utils import ToolRegistrationError, serialize_tool_error
 

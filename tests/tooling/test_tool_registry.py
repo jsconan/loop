@@ -8,10 +8,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import Capability, PermissionConfiguration, PermissionManager, PermissionMode, ToolContext
+from loop import Capability, PermissionConfiguration, PermissionManager, PermissionMode
 from loop.interaction import Interaction
 from loop.skills import InstructionsManager
-from loop.tooling import ToolRegistration, ToolRegistrationError, ToolRegistry
+from loop.tooling import ToolContext, ToolRegistration, ToolRegistrationError, ToolRegistry
 from loop.tooling import tool as declare_tool
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")

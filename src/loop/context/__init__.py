@@ -2,8 +2,6 @@
 
 __all__ = [
     "CommandContext",
-    "ToolContext",
 ]
 
 from .command import CommandContext
-from .tool import ToolContext

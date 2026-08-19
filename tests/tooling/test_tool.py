@@ -10,8 +10,7 @@ import pytest
 from pydantic import BaseModel
 
 from loop import Capability, ToolRegistrationError, ToolRegistry, tool
-from loop.context import ToolContext
-from loop.tooling import Tool
+from loop.tooling import Tool, ToolContext
 
 tool_module = importlib.import_module("loop.tooling.tool")
 

@@ -7,9 +7,8 @@ from typing import Annotated, Literal
 from pydantic import Field
 
 from .. import constants
-from ..context import ToolContext
 from ..permissions import Capability, PermissionRequest
-from ..tooling import tool
+from ..tooling import ToolContext, tool
 from ..utils import (
     format_content_diff,
     format_content_preview,

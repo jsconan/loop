@@ -5,14 +5,13 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from .. import constants
-from ..context import ToolContext
 from ..permissions import Capability, PermissionRequest
 from ..skills.models import (
     PublicSkillOperationResult,
     SkillOperationError,
     SkillOperationResult,
 )
-from ..tooling import tool
+from ..tooling import ToolContext, tool
 
 _FIELDS_BY_NAME = {
     "activate": ("name", "status", "instructions_updated"),
