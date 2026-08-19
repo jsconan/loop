@@ -1,41 +1,18 @@
 """Expose local user-command definitions and dispatch."""
 
 __all__ = [
-    "BUILTIN_COMMANDS",
     "Command",
     "CommandArgumentError",
+    "CommandContext",
     "CommandManager",
+    "CommandRegistration",
     "CommandRegistrationError",
-    "call",
-    "compact",
-    "exit",
-    "help",
-    "new",
-    "permissions",
-    "quit",
-    "rename",
-    "resume",
-    "sessions",
-    "skills",
-    "tools",
-    "use",
+    "CommandRemainder",
+    "CommandsProvider",
+    "command",
 ]
 
-from .builtins import (
-    call,
-    compact,
-    exit,
-    help,
-    new,
-    permissions,
-    quit,
-    rename,
-    resume,
-    sessions,
-    skills,
-    tools,
-    use,
-)
-from .command import Command
-from .command_manager import BUILTIN_COMMANDS, CommandManager
-from .models import CommandArgumentError, CommandRegistrationError
+from .command import Command, CommandRegistration, CommandsProvider, command
+from .command_manager import CommandManager
+from .context import CommandContext
+from .models import CommandArgumentError, CommandRegistrationError, CommandRemainder

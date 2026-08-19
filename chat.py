@@ -20,6 +20,7 @@ from loop import (
     create_default_tool_registry,
     register_shutdown_signals,
 )
+from loop.session import SessionCommands
 
 _BASE_URL = "http://localhost:8000/v1"
 _DEFAULT_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
@@ -37,7 +38,8 @@ def main() -> None:
             interaction=interaction,
             session_store=MemorySessionStore(),
         )
-        command_manager = CommandManager(interaction=interaction, session_manager=session_manager)
+        command_manager = CommandManager(interaction=interaction)
+        command_manager.register_provider(SessionCommands(session_manager))
 
         mention_manager = MentionManager((ProjectPathMentionHandler(Path.cwd),))
         completion_manager = CompletionManager(

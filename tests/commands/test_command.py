@@ -6,14 +6,29 @@ from unittest.mock import Mock
 import pytest
 from pydantic import ValidationError
 
-from loop import Command, CommandArgumentError, CommandContext, Interaction
+from loop import (
+    Command,
+    CommandArgumentError,
+    CommandCompletion,
+    CommandContext,
+    CommandManager,
+    CommandRegistration,
+    CompletionValue,
+    Interaction,
+    command,
+)
 from loop.commands.models import CommandRemainder
 from loop.commands.utils import get_command_arguments_model
 
 
 def make_command(function, name: str = "select") -> Command:
     """Build a command schema from a test function."""
-    return Command(name, "Select.", function, get_command_arguments_model(function, name))
+    return Command(
+        function,
+        name=name,
+        description="Select.",
+        arguments_model=get_command_arguments_model(function, name),
+    )
 
 
 def test_command_binds_positional_and_named_arguments_and_decodes_each_value():
@@ -74,6 +89,19 @@ def test_command_collects_all_tokens_in_a_declared_remainder():
     assert calls == [("first", "name=value")]
 
 
+def test_command_declaration_can_be_attached_to_and_retrieved_from_a_function():
+    """Command declarations can be stored on a function and retrieved unchanged."""
+
+    def select() -> None:
+        """Select a value."""
+
+    declaration = Command(select)
+
+    Command.set_declaration(select, declaration)
+
+    assert Command.get_declaration(select) is declaration
+
+
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
@@ -92,3 +120,52 @@ def test_command_rejects_invalid_argument_syntax_and_binding(arguments, message)
 
     with pytest.raises(CommandArgumentError, match=message):
         make_command(pair).call(arguments)
+
+
+def test_command_decorator_declares_passive_metadata_for_registration():
+    """Passive declarations preserve identity while managers resolve their metadata."""
+    completion = CommandCompletion(values=(CompletionValue("one"),))
+
+    @command(name="choose", description="Choose explicitly.", completion=completion)
+    def select(value: str) -> None:
+        """Select a value."""
+
+    manager = CommandManager((select,))
+
+    assert manager.commands[-1].name == "choose"
+    assert manager.commands[-1].description == "Choose explicitly."
+    assert manager.commands[-1].completion is completion
+    with pytest.raises(ValueError, match="already declared"):
+        command(select)
+
+
+def test_passive_command_resolves_to_an_independent_registered_copy():
+    """A passive command resolves metadata and validation without mutating its declaration."""
+
+    def select(value: str) -> None:
+        """Select a value."""
+
+    declaration = Command(select)
+    registered = declaration.registered(name="choose")
+
+    assert declaration.arguments_model is None
+    assert registered.name == "choose"
+    assert registered.description == "Select a value."
+    assert registered.arguments_model is not None
+    with pytest.raises(ValueError, match="must be registered"):
+        declaration.call("value")
+
+
+def test_registration_metadata_overrides_passive_declarations():
+    """Container registrations can specialize passive command declarations."""
+
+    @command(name="declared")
+    def select() -> None:
+        """Select a value."""
+
+    manager = CommandManager(
+        (CommandRegistration(select, name="local", description="Local selection."),)
+    )
+
+    assert manager.commands[-1].name == "local"
+    assert manager.commands[-1].description == "Local selection."

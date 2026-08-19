@@ -6,6 +6,7 @@ __all__ = [
     "InstructionsManager",
     "LoadedAgentInstructions",
     "Skill",
+    "SkillCommands",
     "SkillManager",
     "build_instructions",
     "get_agents_files",
@@ -15,6 +16,7 @@ __all__ = [
     "read_instruction_frontmatter",
 ]
 
+from .commands import SkillCommands
 from .instructions import InstructionsManager
 from .models import AgentInstructionsSource, InstructionSection, LoadedAgentInstructions, Skill
 from .skill_manager import SkillManager

@@ -27,7 +27,9 @@ __all__ = [
     "CommandCompletionAdapter",
     "CommandContext",
     "CommandManager",
+    "CommandRegistration",
     "CommandRegistrationError",
+    "CommandsProvider",
     "Compaction",
     "CompactionContextItem",
     "CompactionResult",
@@ -100,6 +102,7 @@ __all__ = [
     "ToolResult",
     "UnsupportedConversationItemError",
     "Usage",
+    "command",
     "create_default_tool_registry",
     "delete_path",
     "fetch_content",
@@ -142,8 +145,12 @@ from .backend import (
 from .commands import (
     Command,
     CommandArgumentError,
+    CommandContext,
     CommandManager,
+    CommandRegistration,
     CommandRegistrationError,
+    CommandsProvider,
+    command,
 )
 from .completion import (
     CommandCompletion,
@@ -158,7 +165,6 @@ from .completion import (
     SchemaCompletionState,
 )
 from .constants import OMIT, Omit
-from .context import CommandContext
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop, Response
 from .mentions import (

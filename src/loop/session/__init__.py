@@ -14,6 +14,7 @@ __all__ = [
     "SerializedMessage",
     "SerializedSession",
     "Session",
+    "SessionCommands",
     "SessionInfo",
     "SessionManager",
     "SessionNameGenerator",
@@ -27,6 +28,7 @@ __all__ = [
     "validate_session_source",
 ]
 
+from .commands import SessionCommands
 from .models import (
     SESSION_NAME_SOURCE_GENERATED,
     SESSION_NAME_SOURCE_INITIAL,

@@ -17,10 +17,12 @@ from loop import (
     CompletionMatch,
     CompletionValue,
     MarkerCompletionAdapter,
+    PermissionManager,
     ProjectPathCompletionAdapter,
     Skill,
 )
 from loop.commands.utils import get_command_arguments_model
+from loop.permissions import PermissionCommands
 
 
 def complete(completer: CompletionManager, text: str):
@@ -31,11 +33,11 @@ def complete(completer: CompletionManager, text: str):
 def command_for(function, *, completion=None) -> Command:
     """Build a command declaration from a typed function."""
     return Command(
-        function.__name__,
-        function.__doc__ or "Command.",
         function,
-        get_command_arguments_model(function, function.__name__),
-        completion,
+        name=function.__name__,
+        description=function.__doc__ or "Command.",
+        arguments_model=get_command_arguments_model(function, function.__name__),
+        completion=completion,
     )
 
 
@@ -350,6 +352,7 @@ def test_command_adapter_rejects_invalid_markers(marker):
 def test_registered_permissions_grammar_completes_modes_decisions_tools_and_capabilities():
     """The built-in permissions mini-language exposes every known positional domain."""
     manager = CommandManager()
+    manager.register_provider(PermissionCommands(PermissionManager()))
     completer = CompletionManager(
         (
             CommandCompletionAdapter(

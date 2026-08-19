@@ -2,6 +2,7 @@
 
 __all__ = [
     "Tool",
+    "ToolCommands",
     "ToolContext",
     "ToolRegistration",
     "ToolRegistrationError",
@@ -16,6 +17,7 @@ __all__ = [
     "tool",
 ]
 
+from .commands import ToolCommands
 from .context import ToolContext
 from .tool import Tool, ToolRegistration, tool
 from .tool_registry import ToolRegistry

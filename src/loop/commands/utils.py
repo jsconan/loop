@@ -7,8 +7,8 @@ from collections.abc import Callable
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, create_model
 
-from ..context import CommandContext
 from ..utils import callable_hints
+from .context import CommandContext
 from .models import CommandArgumentError, CommandRegistrationError, CommandRemainder
 
 

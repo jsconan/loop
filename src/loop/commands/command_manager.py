@@ -2,76 +2,33 @@
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
 from ..completion import CommandCompletion
-from ..context import CommandContext
-from .builtins import call as call_command
-from .builtins import compact as compact_command
-from .builtins import exit as exit_command
-from .builtins import help as help_command
-from .builtins import new as new_command
-from .builtins import permissions as permissions_command
-from .builtins import quit as quit_command
-from .builtins import rename as rename_command
-from .builtins import resume as resume_command
-from .builtins import sessions as sessions_command
-from .builtins import skills as skills_command
-from .builtins import tools as tools_command
-from .builtins import use as use_command
-from .command import Command
-from .models import CommandArgumentError, CommandRegistrationError
-from .utils import get_command_arguments_model, takes_command_context
+from .command import Command, CommandRegistration, CommandsProvider
+from .context import CommandContext
+from .models import CommandArgumentError
+from .utils import takes_command_context
 
 if TYPE_CHECKING:
     from ..interaction import Interaction
-    from ..permissions import PermissionManager
-    from ..session import SessionManager
-    from ..skills import InstructionsManager, SkillManager
-    from ..tooling import ToolRegistry
-
-
-BUILTIN_COMMANDS = (
-    help_command,
-    new_command,
-    rename_command,
-    sessions_command,
-    resume_command,
-    permissions_command,
-    exit_command,
-    quit_command,
-    skills_command,
-    tools_command,
-    use_command,
-    call_command,
-    compact_command,
-)
 
 
 class CommandManager:
     """Collect command declarations and route user input to their functions.
 
     Args:
-        commands (Iterable[Command | Callable[..., None]] | None): Additional command declarations
-            registered after the built-ins, or ``None`` to register only the built-ins.
+        commands (Iterable[CommandRegistration | Callable[..., None]] | None): Commands
+            registered after the built-in commands in iteration order, or ``None`` to register
+            only built-ins.
         interaction (Interaction | None): Default interaction used during dispatch, or ``None``
             when callers will provide one for each invocation.
-        permission_manager (PermissionManager | None): Tool policy manager exposed to permission
-            management commands.
-        instructions_manager (InstructionsManager | None): Skill lifecycle owner used to load
-            instructions for subsequent model requests.
-        skill_manager (SkillManager | None): Skill catalog exposed to skill-discovery commands.
-            It can be omitted if instructions_manager is provided, as it will be used to access
-            the skill manager.
-        tool_registry (ToolRegistry | None): Tool catalog exposed to tool-discovery commands.
-        session_manager (SessionManager | None): Session lifecycle owner exposed to session
-            commands.
-        compaction_handler (Callable[[], bool] | None): Callback used by the manual compaction
-            command, or ``None`` when compaction is unavailable.
+        exit_command_names (tuple[str, ...] | None): Names that request conversation termination.
+            Defaults to ``("exit", "quit")``. Pass ``None`` to expose no exit command. The help
+            command is always registered.
 
     Raises:
         ValueError: If a command name is invalid or registered more than once.
@@ -81,38 +38,32 @@ class CommandManager:
     _commands: dict[str, Command]
     _exit_requested: bool
     _interaction: Interaction | None
-    _permission_manager: PermissionManager | None
-    _instructions_manager: InstructionsManager | None
-    _skill_manager: SkillManager | None
-    _tool_registry: ToolRegistry | None
-    _session_manager: SessionManager | None
-    _compaction_handler: Callable[[], bool] | None
 
     def __init__(
         self,
-        commands: Iterable[Command | Callable[..., None]] | None = None,
+        commands: Iterable[CommandRegistration | Callable[..., None]] | None = None,
         interaction: Interaction | None = None,
-        permission_manager: PermissionManager | None = None,
-        instructions_manager: InstructionsManager | None = None,
-        skill_manager: SkillManager | None = None,
-        tool_registry: ToolRegistry | None = None,
-        session_manager: SessionManager | None = None,
-        compaction_handler: Callable[[], bool] | None = None,
+        exit_command_names: tuple[str, ...] | None = ("exit", "quit"),
     ) -> None:
         self._commands = {}
         self._exit_requested = False
         self._interaction = interaction
-        self._permission_manager = permission_manager
-        self._instructions_manager = instructions_manager
-        self._skill_manager = (
-            instructions_manager.skill_manager
-            if instructions_manager is not None
-            else skill_manager
+        self.register(
+            CommandRegistration(
+                self.help,
+                name="help",
+                description="Show the available commands.",
+            )
         )
-        self._tool_registry = tool_registry
-        self._session_manager = session_manager
-        self._compaction_handler = compaction_handler
-        for command in (*BUILTIN_COMMANDS, *(commands or ())):
+        for name in exit_command_names or ():
+            self.register(
+                CommandRegistration(
+                    self.request_exit,
+                    name=name,
+                    description="End the conversation.",
+                )
+            )
+        for command in commands or ():
             self.register(command)
 
     @property
@@ -143,56 +94,6 @@ class CommandManager:
         return tuple(self._commands.values())
 
     @property
-    def skill_manager(self) -> SkillManager | None:
-        """Return the skill catalog exposed to commands.
-
-        Returns:
-            SkillManager | None: The configured skill manager, or ``None`` when unavailable.
-        """
-        return self._skill_manager
-
-    @property
-    def instructions_manager(self) -> InstructionsManager | None:
-        """Return the skill lifecycle owner exposed to commands.
-
-        Returns:
-            InstructionsManager | None: The configured instructions manager, or ``None`` when
-                unavailable.
-        """
-        return self._instructions_manager
-
-    @property
-    def tool_registry(self) -> ToolRegistry | None:
-        """Return the tool catalog exposed to commands.
-
-        Returns:
-            ToolRegistry | None: The configured tool registry, or ``None`` when unavailable.
-        """
-        return self._tool_registry
-
-    @property
-    def session_manager(self) -> SessionManager | None:
-        """Return the session lifecycle owner exposed to commands.
-
-        Returns:
-            SessionManager | None: Configured session manager, or ``None`` when unavailable.
-        """
-        return self._session_manager
-
-    def compact_session(self) -> bool:
-        """Invoke the configured manual session compaction handler.
-
-        Returns:
-            bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
-
-        Raises:
-            ValueError: If no compaction handler is configured.
-        """
-        if self._compaction_handler is None:
-            raise ValueError("The CommandManager requires a compaction handler.")
-        return self._compaction_handler()
-
-    @property
     def exit_requested(self) -> bool:
         """Return whether a command requested conversation termination.
 
@@ -203,7 +104,7 @@ class CommandManager:
 
     def register(
         self,
-        function: Command | Callable[..., None] | None = None,
+        function: CommandRegistration | Callable[..., None],
         *,
         name: str | None = None,
         description: str | None = None,
@@ -212,47 +113,67 @@ class CommandManager:
         """Register a command declaration or function, directly or as a decorator.
 
         Args:
-            function (Command | Callable[..., None] | None): Command or function to register when
-                called directly. Omit it when using registration options as a decorator.
+            function (Command | CommandRegistration | Callable[..., None] | None): Command,
+                registration, or function to register. Omit it when using options as a decorator.
             name (str | None): Slash-free command name. Defaults to the function name.
             description (str | None): Display description. Defaults to the docstring summary.
             completion (CommandCompletion | None): Optional shell-like argument completion grammar.
 
-        Returns:
-            Callable[..., None]: The registered function, or a decorator when no target is given.
-
         Raises:
-            ValueError: If the command name is invalid, duplicated, or conflicts with explicit
-                metadata supplied for a ``Command`` instance.
+            ValueError: If the command name is invalid or duplicated.
             CommandRegistrationError: If metadata or parameters cannot produce a schema.
         """
+        if isinstance(function, CommandRegistration):
+            registration = function
+            function = registration.function
+            name = name if name is not None else registration.name
+            description = description if description is not None else registration.description
+            completion = completion if completion is not None else registration.completion
+        declaration = Command.get_declaration(function) or Command(function)
+        command = declaration.registered(
+            name=name,
+            description=description,
+            completion=completion,
+        )
+        if (
+            not command.name
+            or command.name.startswith("/")
+            or any(character.isspace() for character in command.name)
+        ):
+            raise ValueError(f"Invalid command name '{command.name}'.")
+        if command.name in self._commands:
+            raise ValueError(f"Command '{command.name}' is already registered.")
+        self._commands[command.name] = command
 
-        def _register(target: Command | Callable[..., None]) -> Callable[..., None]:
-            if isinstance(target, Command):
-                if name is not None or description is not None or completion is not None:
-                    raise ValueError("Explicit metadata cannot override a Command declaration.")
-                command = target
-            else:
-                command_name = name or target.__name__
-                command = Command(
-                    name=command_name,
-                    description=description or self._description_for(target),
-                    function=target,
-                    arguments_model=get_command_arguments_model(target, command_name),
-                    completion=completion or CommandCompletion.get_completion(target),
-                )
-            if (
-                not command.name
-                or command.name.startswith("/")
-                or any(character.isspace() for character in command.name)
-            ):
-                raise ValueError(f"Invalid command name '{command.name}'.")
-            if command.name in self._commands:
-                raise ValueError(f"Command '{command.name}' is already registered.")
-            self._commands[command.name] = command
-            return command.function
+    def register_all(
+        self,
+        commands: Iterable[CommandRegistration | Callable[..., None]],
+    ) -> None:
+        """Register commands in iteration order.
 
-        return _register(function) if function is not None else _register
+        Args:
+            commands (Iterable[Command | CommandRegistration | Callable[..., None]]): Commands to
+                register.
+        """
+        for command in commands:
+            self.register(command)
+
+    def register_provider(self, provider: CommandsProvider) -> None:
+        """Register all commands exposed by one provider.
+
+        Args:
+            provider (CommandsProvider): Provider whose registrations should be added.
+        """
+        self.register_all(provider.get_commands())
+
+    def register_providers(self, providers: Iterable[CommandsProvider]) -> None:
+        """Register commands exposed by multiple providers in order.
+
+        Args:
+            providers (Iterable[CommandsProvider]): Providers to register.
+        """
+        for provider in providers:
+            self.register_provider(provider)
 
     def handle_user_command(self, user_input: str, interaction: Interaction | None = None) -> bool:
         """Classify and dispatch slash-prefixed user input.
@@ -321,8 +242,6 @@ class CommandManager:
             context = CommandContext(
                 name=name,
                 interaction=active_interaction,
-                manager=self,
-                permission_manager=self._permission_manager,
             )
         try:
             command.call(arguments, context)
@@ -335,10 +254,7 @@ class CommandManager:
         """Request termination of the active conversation loop."""
         self._exit_requested = True
 
-    @staticmethod
-    def _description_for(function: Callable[..., None]) -> str:
-        """Return a command description from its docstring summary."""
-        docstring = inspect.getdoc(function)
-        if not docstring:
-            raise CommandRegistrationError(f"Command '{function.__name__}' must have a docstring.")
-        return docstring.split("\n\n", maxsplit=1)[0].replace("\n", " ")
+    def help(self, context: CommandContext) -> None:
+        """Display the complete command catalog in alphabetical order."""
+        commands = sorted(self.commands, key=lambda command: command.name.casefold())
+        context.interaction.table(commands, title="Available commands:", prefix="  /")

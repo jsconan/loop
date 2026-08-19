@@ -3,6 +3,7 @@
 __all__ = [
     "Capability",
     "Decision",
+    "PermissionCommands",
     "PermissionConfiguration",
     "PermissionManager",
     "PermissionMode",
@@ -11,6 +12,7 @@ __all__ = [
     "PermissionRule",
 ]
 
+from .commands import PermissionCommands
 from .manager import PermissionManager
 from .models import (
     Capability,

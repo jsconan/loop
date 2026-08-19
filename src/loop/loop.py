@@ -5,7 +5,7 @@ from time import sleep
 
 from . import constants
 from .backend import Backend, BackendError, BackendNotFoundError
-from .commands import CommandManager
+from .commands import CommandManager, CommandRegistration
 from .completion import (
     CommandCompletionAdapter,
     CompletionManager,
@@ -13,13 +13,17 @@ from .completion import (
 )
 from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
-from .models import (
-    ConversationItem,
-    Response,
+from .models import ConversationItem, Response
+from .permissions import PermissionCommands, PermissionManager
+from .session import (
+    BackendSessionNameGenerator,
+    Session,
+    SessionCommands,
+    SessionManager,
+    SessionNameGenerator,
 )
-from .permissions import PermissionManager
-from .session import BackendSessionNameGenerator, Session, SessionManager, SessionNameGenerator
-from .skills import InstructionsManager
+from .skills import InstructionsManager, SkillCommands
+from .tooling import ToolCommands
 from .utils import find_project_root
 
 
@@ -128,14 +132,16 @@ class Loop:
             find_project_root(self._working_directory) or self._working_directory,
             interaction=self._interaction,
         )
-        self._command_manager = CommandManager(
-            interaction=self._interaction,
-            permission_manager=self._permission_manager,
-            instructions_manager=self._instructions_manager,
-            tool_registry=self._backend.tool_registry,
-            session_manager=self._session_manager,
-            compaction_handler=self.compact,
+        self._command_manager = CommandManager(interaction=self._interaction)
+        self._command_manager.register_providers(
+            (
+                SessionCommands(self._session_manager),
+                PermissionCommands(self._permission_manager),
+                SkillCommands(self._instructions_manager),
+                ToolCommands(self._backend.tool_registry, self._instructions_manager),
+            )
         )
+        self._command_manager.register(CommandRegistration(self.compact, name="compact"))
         self._mention_manager = mention_manager or MentionManager(
             (
                 ProjectPathMentionHandler(lambda: self._working_directory),
