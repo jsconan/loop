@@ -56,6 +56,7 @@ __all__ = [
     "MentionManager",
     "Message",
     "ModelInfo",
+    "ModelSelection",
     "Omit",
     "OpenAIBackend",
     "PermissionConfiguration",
@@ -173,6 +174,7 @@ from .mentions import (
     ProjectPathMentionHandler,
     SkillMentionHandler,
 )
+from .model_selection import ModelSelection
 from .models import (
     AnswerCompleted,
     AnswerDelta,

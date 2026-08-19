@@ -13,6 +13,7 @@ from .completion import (
 )
 from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
+from .model_selection import ModelCommands, ModelSelection
 from .models import ConversationItem, Response
 from .permissions import PermissionCommands, PermissionManager
 from .session import (
@@ -68,7 +69,7 @@ class Loop:
     _working_directory: Path
     _debug: bool
     _stream: bool
-    _model: str | None
+    _model_selection: ModelSelection
     _command_manager: CommandManager
     _permission_manager: PermissionManager
     _completion_manager: CompletionManager
@@ -123,11 +124,12 @@ class Loop:
             )
         self._stream = stream
         self._debug = debug
-        self._model = model
+        self._model_selection = ModelSelection(
+            self._backend,
+            self._session_manager,
+            selected=model,
+        )
         self._prompt_on_recoverable_error = prompt_on_recoverable_error
-        selected_model = self._model or self._backend.default_model
-        if selected_model:
-            self._report_context_window(selected_model)
         self._permission_manager = permission_manager or PermissionManager(
             find_project_root(self._working_directory) or self._working_directory,
             interaction=self._interaction,
@@ -139,6 +141,7 @@ class Loop:
                 PermissionCommands(self._permission_manager),
                 SkillCommands(self._instructions_manager),
                 ToolCommands(self._backend.tool_registry, self._instructions_manager),
+                ModelCommands(self._model_selection),
             )
         )
         self._command_manager.register(CommandRegistration(self.compact, name="compact"))
@@ -169,6 +172,9 @@ class Loop:
                                 sort_order=index,
                             )
                             for index, session in enumerate(self._session_manager.store.list())
+                        ),
+                        "models": lambda: (
+                            CompletionValue(model.id) for model in self._model_selection.available()
                         ),
                     },
                     schema_providers={
@@ -308,7 +314,15 @@ class Loop:
         Returns:
             str | None: The selected model, or ``None`` when the backend default is used.
         """
-        return self._model
+        return self._model_selection.selected
+
+    def select_model(self, model: str) -> None:
+        """Select a model for subsequent requests and refresh its context limit.
+
+        Args:
+            model (str): Exact backend model identifier to select.
+        """
+        self._model_selection.select(model)
 
     def run(self):
         """Run the conversation until the user requests to exit."""
@@ -318,8 +332,8 @@ class Loop:
                 break
             session = self.session
             if self._command_manager.handle_user_command(user_input):
-                if self.session is not session and self.session.model:
-                    self._model = self.session.model
+                if self.session is not session:
+                    self._model_selection.restore(self.session.model)
                 continue
             try:
                 context = self._mention_manager.resolve(user_input)
@@ -400,14 +414,14 @@ class Loop:
         when the user picks a different model or cancels.
         """
         try:
-            models = self._backend.get_models()
+            models = self._model_selection.available()
         except BackendError as error:
             self._interaction.error(f"Could not list available models: {error}")
             return False
         if not models:
             self._interaction.warning("The backend reported no available models.")
             return False
-        failing_model = self._model
+        failing_model = self._model_selection.selected
         while True:
             selection = self._interaction.prompt(
                 "Select a replacement model, or enter 'q' to stop: ",
@@ -426,8 +440,7 @@ class Loop:
                 default=True,
             ):
                 break
-        self._model = selection
-        self._session_manager.model = selection
+        self._model_selection.select(selection)
         self._interaction.info(f"Using model: {selection}")
         return True
 
@@ -471,7 +484,7 @@ class Loop:
         Raises:
             ValueError: If neither the loop nor the backend selects a model.
         """
-        selected_model = self._get_selected_model()
+        selected_model = self._model_selection.effective
         self._instructions_manager.prepare()
         self._session_manager.update_instruction_state(
             working_directory=str(
@@ -479,7 +492,7 @@ class Loop:
             ),
             active_skills=self._instructions_manager.active_skill_identities,
         )
-        self._report_context_window(selected_model)
+        self._model_selection.synchronize_session()
         if self._session_manager.compaction_needed():
             self._compact(selected_model)
         events = self._backend.get_response(
@@ -503,31 +516,13 @@ class Loop:
             self._interaction.warning("There is no new session context to compact.")
             return False
         self._instructions_manager.prepare()
-        model = self._get_selected_model()
-        self._report_context_window(model)
+        model = self._model_selection.effective
+        self._model_selection.synchronize_session()
         return self._compact(model)
 
     def end(self) -> None:
         """Display the conversation termination message."""
         self._interaction.conversation_ended()
-
-    def _get_selected_model(self) -> str:
-        """Return the model selected for requests, or the backend default."""
-        selected_model = self._model or self._backend.default_model
-        if not selected_model:
-            raise ValueError("No model was selected and the backend has no default model.")
-        return selected_model
-
-    def _report_context_window(self, model: str) -> None:
-        """Report the context window for the selected model."""
-        self._session_manager.model = model
-        reported_context_window = self._backend.get_context_window(model)
-        self._session_manager.context_window = (
-            reported_context_window
-            if isinstance(reported_context_window, int)
-            and not isinstance(reported_context_window, bool)
-            else None
-        )
 
     def _compact(self, model: str) -> bool:
         """Request, report, and persist one replacement-context checkpoint."""

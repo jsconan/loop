@@ -98,6 +98,33 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.debug is False
 
 
+def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_path):
+    """Model commands update loop state and normalize model-list failures as command feedback."""
+    interaction = MagicMock(spec=Interaction)
+    backend = Mock(tool_registry=ToolRegistry(), default_model="default-model")
+    backend.get_context_window.return_value = 8192
+    backend.get_models.return_value = [ModelInfo(id="selected-model")]
+    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+
+    loop.select_model("direct-model")
+    assert loop.model == "direct-model"
+    assert loop.session.context_window == 8192
+
+    interaction.prompt.side_effect = ["/model selected-model", False]
+    loop.run()
+    assert loop.model == "selected-model"
+    assert interaction.info.call_args.args[0] == "Using model: selected-model"
+
+    backend.get_models.side_effect = BackendConnectionError(
+        "offline",
+        provider="test",
+        operation="list_models",
+    )
+    interaction.prompt.side_effect = ["/model unavailable", False]
+    loop.run()
+    assert "Could not list available models: offline" in interaction.warning.call_args.args[0]
+
+
 def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
     """Interactive input receives adapters for current commands, files, skills, and tools."""
     interaction = MagicMock(spec=Interaction)

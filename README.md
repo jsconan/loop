@@ -406,15 +406,15 @@ src/loop/backend/     Backend contract and OpenAI-compatible adapter
 src/loop/commands/    User-command definitions and dispatch
 src/loop/completion/  Declarative completion models, adapters, and aggregation
 src/loop/constants.py Shared application constants
-src/loop/context/     Tool invocation context definitions
 src/loop/interaction/ User interaction interfaces
 src/loop/loop.py      Interactive conversation loop and streaming configuration
 src/loop/mentions/    User-mention resolution
-src/loop/models.py    Conversation and response events
+src/loop/model_selection/ Active model selection and model commands
+src/loop/models.py    Conversation and response models
 src/loop/permissions/ Permission capabilities, requests, and policy management
 src/loop/session/     Session persistence contracts and implementations
 src/loop/skills/      Agent Skills, catalog, and instruction management
-src/loop/tooling/     Tool registration, definitions, and dispatch
+src/loop/tooling/     Tool context, registration, definitions, and dispatch
 src/loop/tools/       Built-in tool implementations
 src/loop/utils/       Common utilities
 ```
