@@ -9,10 +9,7 @@ from pydantic import BaseModel, ConfigDict, create_model
 
 from ..utils import callable_hints, callable_name
 from .context import ToolContext
-
-
-class ToolRegistrationError(ValueError):
-    """Indicate that a Python function cannot be registered as a tool."""
+from .models import ToolRegistrationError
 
 
 def is_async_callable(function: Callable[..., Any]) -> bool:

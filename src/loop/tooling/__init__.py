@@ -19,10 +19,10 @@ __all__ = [
 
 from .commands import ToolCommands
 from .context import ToolContext
+from .models import ToolRegistrationError
 from .tool import Tool, ToolRegistration, tool
 from .tool_registry import ToolRegistry
 from .utils import (
-    ToolRegistrationError,
     get_tool_arguments_model,
     get_tool_description,
     get_tool_schema,

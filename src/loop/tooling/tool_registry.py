@@ -14,8 +14,9 @@ from ..permissions import Capability, Decision, PermissionManager, PermissionReq
 from ..skills import InstructionsManager
 from ..utils import callable_name
 from .context import ToolContext
+from .models import ToolRegistrationError
 from .tool import PermissionResolver, Tool, ToolRegistration
-from .utils import ToolRegistrationError, serialize_tool_error
+from .utils import serialize_tool_error
 
 
 class ToolRegistry:
