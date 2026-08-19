@@ -40,6 +40,7 @@ __all__ = [
     "CompletionValue",
     "ConsoleInteraction",
     "ContentArtifact",
+    "ContextCompaction",
     "ContextReference",
     "ConversationItem",
     "ConversationItemModel",
@@ -153,6 +154,7 @@ from .commands import (
     CommandsProvider,
     command,
 )
+from .compaction import ContextCompaction
 from .completion import (
     CommandCompletion,
     CommandCompletionAdapter,

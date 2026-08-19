@@ -98,6 +98,16 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.debug is False
 
 
+def test_loop_rejects_an_invalid_compaction_threshold(tmp_path):
+    """Loop construction validates automatic compaction policy at its composition boundary."""
+    with pytest.raises(ValueError, match="between zero and one"):
+        Loop(
+            backend=loop_backend(),
+            working_directory=tmp_path,
+            compaction_threshold=1,
+        )
+
+
 def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_path):
     """Model commands update loop state and normalize model-list failures as command feedback."""
     interaction = MagicMock(spec=Interaction)
@@ -819,80 +829,13 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
     ]
 
 
-@pytest.mark.parametrize("unsupported", ["error", "empty", "no_items"])
-def test_query_warns_when_backend_cannot_compact(tmp_path, unsupported):
-    """Unavailable compaction warns while leaving history and provider input unchanged."""
-    message = Message(role="user", content="hello")
-    session = Session(messages=[message], tokens=85)
-    result = CompactionResult(items=()) if unsupported == "no_items" else None
-    compact = Mock(
-        side_effect=NotImplementedError if unsupported == "error" else None,
-        return_value=result,
-    )
-    backend = loop_backend(
-        get_context_window=Mock(return_value=100),
-        compact=compact,
-        get_response=Mock(return_value=[]),
-    )
-    interaction = MagicMock(spec=Interaction)
-
-    Loop(
-        backend=backend,
-        session=session,
-        interaction=interaction,
-        working_directory=tmp_path,
-    ).query()
-
-    assert session.compactions == []
-    assert backend.get_response.call_args.kwargs["input"] == [message]
-    assert interaction.warning.call_args.args[0].startswith("The selected backend")
-
-
-def test_manual_compaction_reports_when_no_new_context_exists(tmp_path):
-    """Manual compaction declines an empty checkpoint without contacting the backend."""
+def test_loop_compact_preserves_the_public_manual_entry_point(tmp_path):
+    """The legacy loop method delegates manual requests to the compaction feature."""
     backend = loop_backend(compact=Mock())
-    interaction = MagicMock(spec=Interaction)
-    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
 
-    assert loop.compact() is False
+    assert Loop(backend=backend, working_directory=tmp_path).compact() is False
 
-    interaction.warning.assert_called_once_with("There is no new session context to compact.")
     backend.compact.assert_not_called()
-
-
-def test_manual_compaction_prepares_metadata_and_reports_unmeasured_success(tmp_path):
-    """Manual compaction prepares current state and confirms checkpoints without usage counts."""
-    message = Message(role="user", content="hello")
-    compacted = CompactionContextItem(provider="openai", data={"type": "compaction"})
-    backend = loop_backend(
-        get_context_window=Mock(return_value=100),
-        compact=Mock(return_value=CompactionResult(items=(compacted,))),
-    )
-    interaction = MagicMock(spec=Interaction)
-    loop = Loop(
-        backend=backend,
-        session=Session(messages=[message], tokens=20),
-        interaction=interaction,
-        working_directory=tmp_path,
-    )
-
-    assert loop.compact() is True
-
-    assert loop.session.context_window == 100
-    assert loop.session.model == "default-model"
-    interaction.info.assert_any_call("Compacted session context.")
-
-
-def test_manual_compaction_requires_a_selected_model(tmp_path):
-    """Manual compaction rejects sessions without an explicit or backend-default model."""
-    loop = Loop(
-        backend=loop_backend(default_model=None),
-        session=Session(messages=[Message(role="user", content="hello")]),
-        working_directory=tmp_path,
-    )
-
-    with pytest.raises(ValueError, match="No model was selected"):
-        loop.compact()
 
 
 def test_loop_rejects_a_missing_explicit_working_directory(tmp_path):
@@ -1163,7 +1106,7 @@ def test_query_delegates_instruction_state_to_the_session_manager():
     session_manager.session = Session()
     session_manager.messages = []
     session_manager.model_context = []
-    session_manager.compaction_needed.return_value = False
+    session_manager.context_window = None
     loop = Loop(backend=backend, session_manager=session_manager)
 
     loop.query()

@@ -47,32 +47,25 @@ class SessionManager:
             Defaults to a fresh session.
         session_store (SessionStore | None): Store used to persist and retrieve sessions. Defaults
             to an instance-local memory store.
-        compaction_threshold (float): Context-window utilization that requires compaction.
-            Defaults to ``0.8``.
 
     Raises:
         SessionNotFoundError: If the requested persisted session does not exist.
         UnsupportedConversationItemError: If a serialized conversation item type is unsupported.
-        ValueError: If the session, persisted format, or compaction threshold is invalid.
+        ValueError: If the session or persisted format is invalid.
     """
 
     _interaction: Interaction
     _session: Session
     _session_store: SessionStore
-    _compaction_threshold: float
 
     def __init__(
         self,
         interaction: Interaction | None = None,
         session: Session | str | None = None,
         session_store: SessionStore | None = None,
-        compaction_threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
     ) -> None:
-        if not 0 < compaction_threshold < 1:
-            raise ValueError("Compaction threshold must be between zero and one.")
         self._interaction = interaction or ConsoleInteraction()
         self._session_store = session_store or MemorySessionStore()
-        self._compaction_threshold = compaction_threshold
 
         if session and isinstance(session, (str, Session)):
             self.load_session(session)
@@ -174,38 +167,6 @@ class SessionManager:
         if value is not None and value <= 0:
             raise ValueError("Context window must be positive.")
         self._session.context_window = value
-
-    @property
-    def compaction_threshold(self) -> float:
-        """Return the configured context-window utilization threshold.
-
-        Returns:
-            float: Utilization ratio that requires compaction.
-        """
-        return self._compaction_threshold
-
-    def can_compact(self) -> bool:
-        """Return whether complete history advanced beyond the latest checkpoint.
-
-        Returns:
-            bool: ``True`` when at least one uncompacted history item exists.
-        """
-        boundary = self._session.compactions[-1].boundary if self._session.compactions else 0
-        return boundary < len(self._session.messages)
-
-    def compaction_needed(self) -> bool:
-        """Return whether current usage reached the automatic compaction threshold.
-
-        Returns:
-            bool: ``True`` when capacity is known, usage reached the threshold, and new history
-                can be compacted.
-        """
-        context_window = self._session.context_window
-        return (
-            context_window is not None
-            and self._session.tokens >= context_window * self._compaction_threshold
-            and self.can_compact()
-        )
 
     def add_compaction(
         self,

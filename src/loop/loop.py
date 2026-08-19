@@ -5,7 +5,8 @@ from time import sleep
 
 from . import constants
 from .backend import Backend, BackendError, BackendNotFoundError
-from .commands import CommandManager, CommandRegistration
+from .commands import CommandManager
+from .compaction import CompactionCommands, ContextCompaction
 from .completion import (
     CommandCompletionAdapter,
     CompletionManager,
@@ -54,6 +55,8 @@ class Loop:
             provisional name after the first response. Defaults to the conversation backend.
         stream (bool): Whether the backend should produce response events incrementally.
         debug (bool): Whether to print raw response events.
+        compaction_threshold (float): Context-window utilization that triggers automatic
+            compaction. Defaults to ``0.8``.
         prompt_on_recoverable_error (bool): Whether to offer an interactive retry after automatic
             retries exhaust a recoverable backend failure.
 
@@ -70,6 +73,7 @@ class Loop:
     _debug: bool
     _stream: bool
     _model_selection: ModelSelection
+    _compaction: ContextCompaction
     _command_manager: CommandManager
     _permission_manager: PermissionManager
     _completion_manager: CompletionManager
@@ -93,6 +97,7 @@ class Loop:
         session_name_generator: SessionNameGenerator | None = None,
         stream: bool = False,
         debug: bool = False,
+        compaction_threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
         prompt_on_recoverable_error: bool = True,
     ) -> None:
         if session_manager is not None:
@@ -129,6 +134,15 @@ class Loop:
             self._session_manager,
             selected=model,
         )
+        self._compaction = ContextCompaction(
+            self._backend,
+            self._session_manager,
+            self._model_selection,
+            self._instructions_manager,
+            self._interaction,
+            lambda: self._working_directory,
+            threshold=compaction_threshold,
+        )
         self._prompt_on_recoverable_error = prompt_on_recoverable_error
         self._permission_manager = permission_manager or PermissionManager(
             find_project_root(self._working_directory) or self._working_directory,
@@ -142,9 +156,9 @@ class Loop:
                 SkillCommands(self._instructions_manager),
                 ToolCommands(self._backend.tool_registry, self._instructions_manager),
                 ModelCommands(self._model_selection),
+                CompactionCommands(self._compaction),
             )
         )
-        self._command_manager.register(CommandRegistration(self.compact, name="compact"))
         self._mention_manager = mention_manager or MentionManager(
             (
                 ProjectPathMentionHandler(lambda: self._working_directory),
@@ -493,8 +507,7 @@ class Loop:
             active_skills=self._instructions_manager.active_skill_identities,
         )
         self._model_selection.synchronize_session()
-        if self._session_manager.compaction_needed():
-            self._compact(selected_model)
+        self._compaction.compact_if_needed()
         events = self._backend.get_response(
             input=self._session_manager.model_context,
             instructions=self._instructions_manager.instructions,
@@ -512,49 +525,8 @@ class Loop:
         Raises:
             ValueError: If neither the loop nor backend selects a model.
         """
-        if not self._session_manager.can_compact():
-            self._interaction.warning("There is no new session context to compact.")
-            return False
-        self._instructions_manager.prepare()
-        model = self._model_selection.effective
-        self._model_selection.synchronize_session()
-        return self._compact(model)
+        return self._compaction.compact()
 
     def end(self) -> None:
         """Display the conversation termination message."""
         self._interaction.conversation_ended()
-
-    def _compact(self, model: str) -> bool:
-        """Request, report, and persist one replacement-context checkpoint."""
-        self._interaction.info("Compacting session context...")
-        try:
-            result = self._backend.compact(
-                self._session_manager.model_context,
-                instructions=self._instructions_manager.instructions,
-                model=model,
-            )
-        except NotImplementedError:
-            self._interaction.warning("The selected backend does not support context compaction.")
-            return False
-        if result is None or not result.items:
-            self._interaction.warning("The selected backend did not produce compacted context.")
-            return False
-        working_directory = str(
-            self._instructions_manager.working_directory or self._working_directory
-        )
-        previous_tokens = self._session_manager.tokens
-        self._session_manager.add_compaction(
-            result,
-            model=model,
-            instructions=self._instructions_manager.instructions,
-            working_directory=working_directory,
-            active_skills=self._instructions_manager.active_skill_identities,
-        )
-        current_tokens = self._session_manager.tokens
-        if current_tokens != previous_tokens:
-            self._interaction.info(
-                f"Compacted session context from {previous_tokens:,} to {current_tokens:,} tokens."
-            )
-        else:
-            self._interaction.info("Compacted session context.")
-        return True

@@ -34,39 +34,6 @@ def test_manager_creates_default_services_and_an_empty_session():
     assert manager.session == Session()
     assert manager.messages == []
     assert manager.model is None
-    assert manager.compaction_threshold == 0.8
-
-
-@pytest.mark.parametrize("threshold", [0, 1, -0.1, 1.1])
-def test_manager_rejects_invalid_compaction_thresholds(threshold):
-    """Automatic compaction utilization must remain strictly between zero and one."""
-    with pytest.raises(ValueError, match="between zero and one"):
-        SessionManager(compaction_threshold=threshold)
-
-
-def test_manager_detects_compaction_only_for_known_capacity_and_new_history():
-    """Threshold detection requires known capacity, sufficient usage, and uncompacted items."""
-    session = Session(messages=[Message(role="user", content="hello")], tokens=79)
-    manager = SessionManager(session=session, compaction_threshold=0.8)
-
-    assert manager.can_compact() is True
-    assert manager.compaction_needed() is False
-    manager.context_window = 100
-    assert manager.compaction_needed() is False
-    session.tokens = 80
-    assert manager.compaction_needed() is True
-    manager.add_compaction(
-        CompactionResult(
-            items=(CompactionContextItem(provider="openai", data={"type": "compaction"}),),
-            usage=Usage(total_tokens=20),
-        ),
-        model="model",
-        instructions=None,
-        working_directory="/project",
-        active_skills=(),
-    )
-    assert manager.can_compact() is False
-    assert manager.compaction_needed() is False
 
 
 def test_manager_uses_injected_services_and_session():
