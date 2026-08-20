@@ -216,7 +216,6 @@ def test_manager_starts_a_fresh_unpersisted_session():
     store.save.assert_not_called()
 
 
-
 def test_manager_new_session_forwards_model():
     """Starting over forwards the current model to the new session."""
     store = Mock(spec=SessionStore)
@@ -239,6 +238,8 @@ def test_manager_new_session_forwards_none_model():
 
     assert manager.session.model is None
     store.save.assert_not_called()
+
+
 def test_manager_adds_a_tool_result_with_its_instruction_state():
     """Tool results and their effective instruction state are persisted together."""
     store = Mock(spec=SessionStore)

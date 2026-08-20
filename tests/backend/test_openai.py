@@ -1299,9 +1299,7 @@ def test_completed_response_normalizes_items_and_serializes_local_history():
     ]
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        events = list(
-            OpenAIBackend(default_model="default").get_response(history)
-        )
+        events = list(OpenAIBackend(default_model="default").get_response(history))
 
     local_call = ToolCall(call_id="call_1", name="demo", arguments="{}", id="fc_1")
     metadata = ResponseMetadata(model="served-model", usage=Usage(total_tokens=21))
