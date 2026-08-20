@@ -27,12 +27,13 @@ class AgentRunner:
         working_directory (Callable[[], Path]): Provider of the current instruction directory.
         stream (bool): Whether backend response events should be streamed.
         debug (bool): Whether raw response events should be displayed.
-        max_turns (int): Maximum completed model turns allowed in one run. Defaults to ``25``.
+        max_turns (int): Maximum completed model turns allowed in one run. Set to ``0`` to disable
+            the turn limit (unlimited). Defaults to ``25``.
         prompt_on_recoverable_error (bool): Whether exhausted recoverable backend failures should
             be offered to the user for another attempt.
 
     Raises:
-        ValueError: If ``max_turns`` is not positive.
+        ValueError: If ``max_turns`` is negative.
     """
 
     _agent: Agent
@@ -60,8 +61,8 @@ class AgentRunner:
         max_turns: int = constants.DEFAULT_AGENT_MAX_TURNS,
         prompt_on_recoverable_error: bool = True,
     ) -> None:
-        if max_turns <= 0:
-            raise ValueError("Agent max turns must be greater than zero.")
+        if max_turns < 0:
+            raise ValueError("Agent max turns must be non-negative.")
         self._agent = agent
         self._session_manager = session_manager
         self._model_selection = model_selection
@@ -114,7 +115,7 @@ class AgentRunner:
         """Return the model-turn limit for one run.
 
         Returns:
-            int: Positive maximum number of completed model turns.
+            int: Maximum number of completed model turns. 0 means unlimited.
         """
         return self._max_turns
 
@@ -144,7 +145,7 @@ class AgentRunner:
                     stop_reason="completed",
                 )
 
-            if turn >= self._max_turns:
+            if self._max_turns > 0 and turn >= self._max_turns:
                 prompt = (
                     f"Agent has reached the {self._max_turns}-turn safety limit. "
                     "Do you want to continue?"

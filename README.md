@@ -126,9 +126,10 @@ Each submitted user message starts one bounded agent run. The configured `Agent`
 dynamic instructions, tool registry, and permission policy; `AgentRunner` performs repeated model
 and tool turns until the model returns a final response. `Loop` remains responsible for user input,
 commands, mentions, session naming, and usage display. Runs default to at most 25 model turns so a
-model that repeatedly requests tools cannot continue indefinitely; library callers can change the
-limit with `Loop(..., max_agent_turns=10)` and inspect the configured identity through
-`loop.agent`.
+model that repeatedly requests tools cannot continue indefinitely; set `max_agent_turns=0` to
+disable the limit (unlimited turns). Library callers can change the limit with
+`Loop(..., max_agent_turns=10)` and inspect the configured identity through `loop.agent`. When the
+turn limit is reached, the user is prompted to confirm whether to continue.
 
 At startup, the loop recursively indexes instruction files in the Git repository and loads the
 files applicable to the current working directory, from the project root through that directory.

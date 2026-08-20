@@ -79,10 +79,10 @@ def test_runner_stops_repeated_tool_calls_at_the_safety_limit():
     )
 
 
-def test_runner_rejects_a_non_positive_turn_limit():
-    """Runner construction rejects limits that could never execute an agent."""
-    with pytest.raises(ValueError, match="greater than zero"):
-        agent_runner(responses=[], max_turns=0)
+def test_runner_rejects_a_negative_turn_limit():
+    """Runner construction rejects negative turn limits."""
+    with pytest.raises(ValueError, match="non-negative"):
+        agent_runner(responses=[], max_turns=-1)
 
 
 def test_runner_continues_after_max_turns_when_user_affirms():
