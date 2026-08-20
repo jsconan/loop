@@ -377,7 +377,7 @@ def test_run_describes_partial_output_before_retrying(tmp_path):
 
 
 def test_run_declines_or_disables_recoverable_retries(tmp_path):
-    """Declined and disabled recovery return to input without committing assistant output."""
+    """Declined and disabled recovery report retained usage without assistant output."""
     for enabled in (True, False):
         error = BackendConnectionError("offline", provider="openai", operation="create_response")
         backend = Mock(default_model="model")
@@ -872,15 +872,6 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
     ]
 
 
-def test_loop_compact_preserves_the_public_manual_entry_point(tmp_path):
-    """The legacy loop method delegates manual requests to the compaction feature."""
-    backend = loop_backend(compact=Mock())
-
-    assert Loop(backend=backend, working_directory=tmp_path).compact() is False
-
-    backend.compact.assert_not_called()
-
-
 def test_loop_rejects_a_missing_explicit_working_directory(tmp_path):
     """Explicit directory changes reject missing targets without altering loop state."""
     loop = Loop(backend=loop_backend(), working_directory=tmp_path)
@@ -1188,10 +1179,3 @@ def test_query_rejects_missing_model_selection():
         Loop(backend=backend).agent_runner.query()
 
     backend.get_response.assert_not_called()
-
-
-def test_end_uses_the_injected_interaction():
-    """Conversation termination is delegated to the configured interaction."""
-    interaction = MagicMock(spec=Interaction)
-    Loop(backend=loop_backend(), interaction=interaction).end()
-    interaction.conversation_ended.assert_called_once_with()

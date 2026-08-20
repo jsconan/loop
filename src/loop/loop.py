@@ -435,19 +435,4 @@ class Loop:
                 self._session_manager.context_window,
             )
 
-        self.end()
-
-    def compact(self) -> bool:
-        """Manually compact the active session using current model and instructions.
-
-        Returns:
-            bool: ``True`` when a new compaction checkpoint was persisted, otherwise ``False``.
-
-        Raises:
-            ValueError: If neither the loop nor backend selects a model.
-        """
-        return self._compaction.compact()
-
-    def end(self) -> None:
-        """Display the conversation termination message."""
         self._interaction.conversation_ended()
