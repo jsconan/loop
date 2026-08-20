@@ -145,10 +145,11 @@ backend = OpenAIBackend(
     base_url="http://localhost:8000/v1",
     api_key="local-api-key",
     default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
-    tool_registry=create_default_tool_registry(),
 )
+tools = create_default_tool_registry()
 events = backend.get_response(
     input="Explain why the sky is blue in two sentences.",
+    tools=tools.definitions(),
 )
 
 answer = "".join(event.text for event in events if isinstance(event, AnswerDelta))
@@ -168,11 +169,13 @@ async def main() -> None:
         base_url="http://localhost:8000/v1",
         api_key="local-api-key",
         default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
-        tool_registry=create_default_tool_registry(),
     )
+    tools = create_default_tool_registry()
     answer_parts = []
     async for event in backend.get_response_async(
-        input="Give me three names for a lunar rover.", stream=True
+        input="Give me three names for a lunar rover.",
+        stream=True,
+        tools=tools.definitions(),
     ):
         if isinstance(event, AnswerDelta):
             answer_parts.append(event.text)

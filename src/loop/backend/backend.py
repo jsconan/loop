@@ -14,8 +14,8 @@ from ..models import (
     ResponseCompleted,
     ResponseEvent,
     StructuredOutputFormat,
+    ToolDefinition,
 )
-from ..tooling import ToolRegistry
 
 
 class Backend(ABC):
@@ -25,7 +25,6 @@ class Backend(ABC):
         base_url (str | None): Service URL used by the backend.
         default_model (str | None): Model used when a request does not specify one.
         api_key (str | None): Credential used privately by the backend implementation.
-        tool_registry (ToolRegistry): Registry used for declarations and dispatch.
     """
 
     def __init__(
@@ -34,21 +33,10 @@ class Backend(ABC):
         base_url: str | None,
         default_model: str | None,
         api_key: str | None,
-        tool_registry: ToolRegistry,
     ) -> None:
         self._base_url = base_url
         self._default_model = default_model
         self._api_key = api_key
-        self._tool_registry = tool_registry
-
-    @property
-    def tool_registry(self) -> ToolRegistry:
-        """Return the registry used for declarations and dispatch.
-
-        Returns:
-            ToolRegistry: The configured tool registry.
-        """
-        return self._tool_registry
 
     @property
     def base_url(self) -> str | None:
@@ -110,10 +98,12 @@ class Backend(ABC):
     def get_response(
         self,
         input: str | Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
+        *,
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
         output_format: StructuredOutputFormat | None = None,
+        tools: Iterable[ToolDefinition] = (),
     ) -> Iterable[ResponseEvent]:
         """Return normalized response events.
 
@@ -123,6 +113,7 @@ class Backend(ABC):
             stream (bool): Whether events should be produced incrementally.
             model (str | None): Model identifier to use instead of the default model.
             output_format (StructuredOutputFormat | None): Optional structured output contract.
+            tools (Iterable[ToolDefinition]): Tool definitions available for this request.
 
         Returns:
             Iterable[ResponseEvent]: Response events in output order.
@@ -136,10 +127,12 @@ class Backend(ABC):
     async def get_response_async(
         self,
         input: str | Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
+        *,
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
         output_format: StructuredOutputFormat | None = None,
+        tools: Iterable[ToolDefinition] = (),
     ) -> AsyncIterator[ResponseEvent]:
         """Asynchronously yield normalized response events.
 
@@ -149,6 +142,7 @@ class Backend(ABC):
             stream (bool): Whether events should be produced incrementally.
             model (str | None): Model identifier to use instead of the default model.
             output_format (StructuredOutputFormat | None): Optional structured output contract.
+            tools (Iterable[ToolDefinition]): Tool definitions available for this request.
 
         Yields:
             ResponseEvent: Response events in output order.

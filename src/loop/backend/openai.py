@@ -69,7 +69,6 @@ from ..models import (
     ToolResult,
     Usage,
 )
-from ..tooling import ToolRegistry
 from .backend import Backend
 from .errors import (
     BackendAuthenticationError,
@@ -96,8 +95,6 @@ class OpenAIBackend(Backend):
         default_model (str | None): Model identifier used when a request does not specify one.
         base_url (str | None): Base URL of the OpenAI-compatible backend.
         api_key (str | None): API key used privately by the backend client.
-        tool_registry (ToolRegistry | None): Registry supplying tool schemas for requests, or
-            ``None`` to construct an empty registry.
         context_window (int | None): Deployed model context limit, or ``None`` to use best-effort
             model metadata discovery.
         file_input_mode (Literal["text", "native"] | None): How referenced text files cross the
@@ -131,7 +128,6 @@ class OpenAIBackend(Backend):
         default_model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
-        tool_registry: ToolRegistry | None = None,
         context_window: int | None = None,
         file_input_mode: Literal["text", "native"] | None = None,
         structured_output_mode: Literal["auto", "native", "prompt"] = (
@@ -144,7 +140,6 @@ class OpenAIBackend(Backend):
             base_url=base_url,
             default_model=default_model,
             api_key=api_key,
-            tool_registry=tool_registry if tool_registry is not None else ToolRegistry(),
         )
         self._client = None
         self._async_client = None
@@ -290,10 +285,12 @@ class OpenAIBackend(Backend):
     def get_response(
         self,
         input: str | Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
+        *,
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
         output_format: StructuredOutputFormat | None = None,
+        tools: Iterable[ToolDefinition] = (),
     ) -> Iterator[ResponseEvent]:
         """Yield normalized events from a synchronous response.
 
@@ -303,6 +300,7 @@ class OpenAIBackend(Backend):
             stream (bool): Whether to return a streaming response.
             model (str | None): Model identifier to use instead of the default model.
             output_format (StructuredOutputFormat | None): Optional structured output contract.
+            tools (Iterable[ToolDefinition]): Tool definitions available for this request.
 
         Yields:
             ResponseEvent: Response events in output order.
@@ -316,7 +314,9 @@ class OpenAIBackend(Backend):
         operation = "stream_response" if stream else "create_response"
         response_started = False
         try:
-            for event in self._get_response(input, instructions, stream, model, output_format):
+            for event in self._get_response(
+                input, instructions, stream, model, output_format, tuple(tools)
+            ):
                 response_started = True
                 yield event
         except OpenAIError as error:
@@ -331,12 +331,13 @@ class OpenAIBackend(Backend):
         stream: bool,
         model: str | None,
         output_format: StructuredOutputFormat | None,
+        tools: tuple[ToolDefinition, ...],
     ) -> Iterator[ResponseEvent]:
         """Yield response events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
         serialized_input = self._serialize_input(input)
         request_instructions = self._structured_output_instructions(instructions, output_format)
-        tools = self._serialize_tools(self._tool_registry.definitions())
+        serialized_tools = self._serialize_tools(tools)
         if output_format is None:
             response = self._get_client().responses.create(
                 model=selected_model,
@@ -344,7 +345,7 @@ class OpenAIBackend(Backend):
                 instructions=request_instructions,
                 stream=stream,
                 stream_options={"include_usage": True},
-                tools=tools,
+                tools=serialized_tools,
             )
             if stream:
                 items = []
@@ -368,7 +369,7 @@ class OpenAIBackend(Backend):
                     instructions=request_instructions,
                     stream=stream,
                     stream_options={"include_usage": True},
-                    tools=tools,
+                    tools=serialized_tools,
                     **self._structured_output_request(output_format, mode),
                 )
             except APIStatusError as error:
@@ -381,7 +382,7 @@ class OpenAIBackend(Backend):
                     instructions=request_instructions,
                     stream=stream,
                     stream_options={"include_usage": True},
-                    tools=tools,
+                    tools=serialized_tools,
                 )
             try:
                 events = (
@@ -410,10 +411,12 @@ class OpenAIBackend(Backend):
     async def get_response_async(
         self,
         input: str | Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
+        *,
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
         output_format: StructuredOutputFormat | None = None,
+        tools: Iterable[ToolDefinition] = (),
     ) -> AsyncIterator[ResponseEvent]:
         """Yield events from an asynchronous response.
 
@@ -423,6 +426,7 @@ class OpenAIBackend(Backend):
             stream (bool): Whether to return a streaming response.
             model (str | None): Model identifier to use instead of the default model.
             output_format (StructuredOutputFormat | None): Optional structured output contract.
+            tools (Iterable[ToolDefinition]): Tool definitions available for this request.
 
         Yields:
             ResponseEvent: Response events in output order.
@@ -437,7 +441,7 @@ class OpenAIBackend(Backend):
         response_started = False
         try:
             async for event in self._get_response_async(
-                input, instructions, stream, model, output_format
+                input, instructions, stream, model, output_format, tuple(tools)
             ):
                 response_started = True
                 yield event
@@ -453,12 +457,13 @@ class OpenAIBackend(Backend):
         stream: bool,
         model: str | None,
         output_format: StructuredOutputFormat | None,
+        tools: tuple[ToolDefinition, ...],
     ) -> AsyncIterator[ResponseEvent]:
         """Asynchronously yield events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
         serialized_input = self._serialize_input(input)
         request_instructions = self._structured_output_instructions(instructions, output_format)
-        tools = self._serialize_tools(self._tool_registry.definitions())
+        serialized_tools = self._serialize_tools(tools)
         if output_format is None:
             response = await self._get_async_client().responses.create(
                 model=selected_model,
@@ -466,7 +471,7 @@ class OpenAIBackend(Backend):
                 instructions=request_instructions,
                 stream=stream,
                 stream_options={"include_usage": True},
-                tools=tools,
+                tools=serialized_tools,
             )
             if not stream:
                 for event in self._response_events(response, None):
@@ -494,7 +499,7 @@ class OpenAIBackend(Backend):
                     instructions=request_instructions,
                     stream=stream,
                     stream_options={"include_usage": True},
-                    tools=tools,
+                    tools=serialized_tools,
                     **self._structured_output_request(output_format, mode),
                 )
             except APIStatusError as error:
@@ -507,7 +512,7 @@ class OpenAIBackend(Backend):
                     instructions=request_instructions,
                     stream=stream,
                     stream_options={"include_usage": True},
-                    tools=tools,
+                    tools=serialized_tools,
                 )
             try:
                 events = (

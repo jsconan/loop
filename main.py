@@ -39,7 +39,6 @@ def main() -> None:
             api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
             context_window=int(context_window) if context_window else None,
             max_retries=int(max_retries) if max_retries else 2,
-            tool_registry=create_default_tool_registry(),
         )
         working_directory = Path.cwd()
         project_root = find_project_root(working_directory) or working_directory
@@ -52,6 +51,7 @@ def main() -> None:
         loop = Loop(
             backend,
             interaction=interaction,
+            tool_registry=create_default_tool_registry(),
             working_directory=working_directory,
             session_manager=session_manager,
             stream=True,

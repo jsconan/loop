@@ -57,7 +57,6 @@ from loop import (
     StructuredOutputValidationError,
     ToolCall,
     ToolCallCompleted,
-    ToolRegistry,
     ToolResult,
     Usage,
 )
@@ -163,7 +162,6 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
     monkeypatch.setenv("DEFAULT_MODEL", "environment-model")
     monkeypatch.setenv("BASE_URL", "https://environment.test/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
-    registry = ToolRegistry()
     sync_sdk = Mock()
     async_sdk = Mock()
     sync_sdk.models.list.return_value = []
@@ -177,12 +175,10 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
             default_model="chosen-model",
             base_url="https://example.test/v1",
             api_key="secret",
-            tool_registry=registry,
         )
 
         assert client.default_model == "chosen-model"
         assert client.base_url == "https://example.test/v1"
-        assert client.tool_registry is registry
         assert client.get_models() == []
         assert client.get_models() == []
         assert asyncio.run(client.get_models_async()) == []
@@ -237,16 +233,6 @@ def test_backend_does_not_read_process_configuration(monkeypatch):
     assert client.default_model is None
     assert client.base_url is None
     assert not hasattr(client, "api_key")
-
-
-def test_backend_without_injected_tools_owns_an_empty_registry():
-    """Tool-less backends receive distinct empty registries rather than shared package state."""
-    first = OpenAIBackend()
-    second = OpenAIBackend()
-
-    assert first.tool_registry.names == []
-    assert second.tool_registry.names == []
-    assert first.tool_registry is not second.tool_registry
 
 
 def test_response_requires_an_explicit_or_default_model():
@@ -783,14 +769,12 @@ def test_prompt_counting_gracefully_handles_unavailable_counts(payload):
 
 def test_sync_response_forwards_schema_streaming_and_model_selection():
     """Synchronous requests include tool schemas and honor a model override."""
-    registry = Mock()
     definition = SimpleNamespace(
         name="demo", description="Demo.", parameters={"type": "object"}, strict=True
     )
-    registry.definitions.return_value = [definition]
     sdk = Mock()
     sdk.responses.create.return_value = []
-    client = OpenAIBackend(default_model="default", tool_registry=registry)
+    client = OpenAIBackend(default_model="default")
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
         result = list(
@@ -799,6 +783,7 @@ def test_sync_response_forwards_schema_streaming_and_model_selection():
                 instructions="Follow the project rules.",
                 stream=True,
                 model="override",
+                tools=(item for item in [definition]),
             )
         )
 
@@ -1140,13 +1125,11 @@ def test_structured_response_allows_an_intermediate_tool_only_completion():
 
 def test_async_response_uses_default_model():
     """Asynchronous requests use the default model when none is supplied."""
-    registry = Mock()
-    registry.definitions.return_value = []
     sdk = Mock()
     sdk.responses.create = AsyncMock(
         return_value=SimpleNamespace(output=[], output_text="", usage=None, model="served-model")
     )
-    client = OpenAIBackend(default_model="default", tool_registry=registry)
+    client = OpenAIBackend(default_model="default")
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
         result = asyncio.run(
@@ -1306,8 +1289,6 @@ def test_completed_response_normalizes_items_and_serializes_local_history():
         usage=SimpleNamespace(total_tokens=21),
         model="served-model",
     )
-    registry = Mock()
-    registry.definitions.return_value = []
     history = [
         Message(role="user", content="hello"),
         Reasoning(content="", id="reasoning_old"),
@@ -1319,7 +1300,7 @@ def test_completed_response_normalizes_items_and_serializes_local_history():
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
         events = list(
-            OpenAIBackend(default_model="default", tool_registry=registry).get_response(history)
+            OpenAIBackend(default_model="default").get_response(history)
         )
 
     local_call = ToolCall(call_id="call_1", name="demo", arguments="{}", id="fc_1")

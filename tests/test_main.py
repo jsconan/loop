@@ -58,7 +58,6 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
         api_key="local-api-key",
         context_window=None,
         max_retries=2,
-        tool_registry=tool_registry,
     )
     session_store_factory.assert_called_once_with(Path("/project/.loop/sessions.db"))
     session_manager_factory.assert_called_once_with(
@@ -68,6 +67,7 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     loop_factory.assert_called_once_with(
         backend,
         interaction=interaction,
+        tool_registry=tool_registry,
         session_manager=session_manager,
         stream=True,
         working_directory=Path.cwd(),
@@ -115,7 +115,6 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
         api_key="configured-key",
         context_window=32768,
         max_retries=5,
-        tool_registry=tool_registry,
     )
     session_store_factory.assert_called_once_with(tmp_path / ".loop" / "sessions.db")
     session_manager_factory.assert_called_once_with(
@@ -125,6 +124,7 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
     loop_factory.assert_called_once_with(
         backend,
         interaction=interaction,
+        tool_registry=tool_registry,
         session_manager=session_manager,
         stream=True,
         working_directory=tmp_path,

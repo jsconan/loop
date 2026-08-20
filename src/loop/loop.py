@@ -25,7 +25,7 @@ from .session import (
     SessionNameGenerator,
 )
 from .skills import InstructionsManager, SkillCommands
-from .tooling import ToolCommands
+from .tooling import ToolCommands, ToolRegistry
 from .utils import find_project_root
 
 
@@ -41,6 +41,8 @@ class Loop:
         interaction (Interaction | None): Service used for all user input and output.
         permission_manager (PermissionManager | None): Manager used to authorize model tool calls.
             Defaults to loading local policy from the project ``.loop`` folder.
+        tool_registry (ToolRegistry | None): Agent-scoped tools exposed to the model and used to
+            dispatch its calls. Defaults to an empty registry.
         mention_manager (MentionManager | None): Injected mention capability registry. Defaults to
             live project-path and skill handlers.
         working_directory (Path | str | None): Directory used to discover applicable AGENTS.md
@@ -76,6 +78,7 @@ class Loop:
     _compaction: ContextCompaction
     _command_manager: CommandManager
     _permission_manager: PermissionManager
+    _tool_registry: ToolRegistry
     _completion_manager: CompletionManager
     _session_name_generator: SessionNameGenerator
     _mention_manager: MentionManager
@@ -89,6 +92,7 @@ class Loop:
         instructions_manager: InstructionsManager | None = None,
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
+        tool_registry: ToolRegistry | None = None,
         mention_manager: MentionManager | None = None,
         working_directory: Path | str | None = None,
         agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
@@ -148,13 +152,14 @@ class Loop:
             find_project_root(self._working_directory) or self._working_directory,
             interaction=self._interaction,
         )
+        self._tool_registry = tool_registry or ToolRegistry()
         self._command_manager = CommandManager(interaction=self._interaction)
         self._command_manager.register_providers(
             (
                 SessionCommands(self._session_manager),
                 PermissionCommands(self._permission_manager),
                 SkillCommands(self._instructions_manager),
-                ToolCommands(self._backend.tool_registry, self._instructions_manager),
+                ToolCommands(self._tool_registry, self._instructions_manager),
                 ModelCommands(self._model_selection),
                 CompactionCommands(self._compaction),
             )
@@ -172,7 +177,7 @@ class Loop:
                     providers={
                         "tools": lambda: (
                             CompletionValue(tool.name, tool.description)
-                            for tool in self._backend.tool_registry.tools
+                            for tool in self._tool_registry.tools
                         ),
                         "skills": lambda: (
                             CompletionValue(skill.name, skill.description)
@@ -195,7 +200,7 @@ class Loop:
                         "tool_arguments": lambda tokens: next(
                             (
                                 tool.arguments_model
-                                for tool in self._backend.tool_registry.tools
+                                for tool in self._tool_registry.tools
                                 if tokens and tool.name == tokens[0]
                             ),
                             None,
@@ -214,6 +219,15 @@ class Loop:
             PermissionManager: Active local permission manager.
         """
         return self._permission_manager
+
+    @property
+    def tool_registry(self) -> ToolRegistry:
+        """Return the tools active for this conversation.
+
+        Returns:
+            ToolRegistry: Agent-scoped tool declarations and implementations.
+        """
+        return self._tool_registry
 
     @property
     def backend(self) -> Backend:
@@ -472,7 +486,7 @@ class Loop:
 
         for tool_call in response.tool_calls:
             self._interaction.tool_call(tool_call.name, tool_call.arguments)
-            tool_result = self._backend.tool_registry.call(
+            tool_result = self._tool_registry.call(
                 tool_call.name,
                 tool_call.arguments,
                 interaction=self._interaction,
@@ -513,6 +527,7 @@ class Loop:
             instructions=self._instructions_manager.instructions,
             stream=self._stream,
             model=selected_model,
+            tools=self._tool_registry.definitions(),
         )
         return self._interaction.response(events, debug=self._debug)
 
