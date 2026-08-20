@@ -3,7 +3,11 @@
 __all__ = [
     "BUILTIN_TOOLS",
     "OMIT",
+    "Agent",
     "AgentInstructionsSource",
+    "AgentRunResult",
+    "AgentRunStopReason",
+    "AgentRunner",
     "AnswerCompleted",
     "AnswerDelta",
     "Backend",
@@ -128,6 +132,7 @@ __all__ = [
 ]
 
 
+from .agent import Agent, AgentRunner, AgentRunResult, AgentRunStopReason
 from .backend import (
     Backend,
     BackendAuthenticationError,
@@ -169,7 +174,7 @@ from .completion import (
 )
 from .constants import OMIT, Omit
 from .interaction import ConsoleInteraction, Interaction
-from .loop import Loop, Response
+from .loop import Loop
 from .mentions import (
     MentionHandler,
     MentionManager,
@@ -191,6 +196,7 @@ from .models import (
     Reasoning,
     ReasoningCompleted,
     ReasoningDelta,
+    Response,
     ResponseCompleted,
     ResponseEvent,
     ResponseMetadata,

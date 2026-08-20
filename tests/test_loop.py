@@ -75,6 +75,7 @@ def test_loop_exposes_its_configured_state(tmp_path):
     interaction = MagicMock(spec=Interaction)
     loop = Loop(
         backend=backend,
+        agent_name="Reviewer",
         model="requested-model",
         debug=True,
         interaction=interaction,
@@ -82,6 +83,9 @@ def test_loop_exposes_its_configured_state(tmp_path):
     )
 
     assert loop.backend is backend
+    assert loop.agent.backend is backend
+    assert loop.agent.name == "Reviewer"
+    assert loop.agent_runner.agent is loop.agent
     assert loop.messages == []
     assert loop.debug is True
     assert loop.stream is False
@@ -334,7 +338,7 @@ def test_run_retries_an_exhausted_recoverable_failure(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
 
-    with patch("loop.loop.sleep") as sleep:
+    with patch("loop.agent.runner.sleep") as sleep:
         Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     assert backend.get_response.call_count == 2
@@ -591,7 +595,7 @@ def test_loops_share_local_conversation_context(tmp_path):
     assert second.messages == [Message(role="user", content="hello")]
     assert second.session.tokens == 12
     assert second.session.model == "other-model"
-    assert second.query() == Response(answer="", reasoning="")
+    assert second.agent_runner.query() == Response(answer="", reasoning="")
     second_backend.get_response.assert_called_once_with(
         input=session.messages,
         instructions=None,
@@ -748,7 +752,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     )
 
     loop.set_working_directory(second)
-    loop.query()
+    loop.agent_runner.query()
 
     assert loop.working_directory == second.resolve()
     assert backend.get_response.call_args.kwargs["instructions"] == "Second rules."
@@ -766,7 +770,7 @@ def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
         working_directory=tmp_path,
     )
 
-    loop.query()
+    loop.agent_runner.query()
 
     assert backend.get_context_window.call_args_list == [call("model"), call("model")]
     backend.count_tokens.assert_not_called()
@@ -794,8 +798,8 @@ def test_shared_backend_receives_each_loops_agent_scoped_tools(tmp_path):
     first = Loop(backend=backend, tool_registry=first_registry, working_directory=tmp_path)
     second = Loop(backend=backend, tool_registry=second_registry, working_directory=tmp_path)
 
-    first.query()
-    second.query()
+    first.agent_runner.query()
+    second.agent_runner.query()
 
     assert first.tool_registry is first_registry
     assert second.tool_registry is second_registry
@@ -852,7 +856,7 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
         working_directory=tmp_path,
     )
 
-    loop.query()
+    loop.agent_runner.query()
 
     assert session.messages == messages
     assert len(session.compactions) == 1
@@ -942,9 +946,9 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
         items=(call,),
     )
 
-    assert loop.handle_tool_calls(response) is True
+    assert loop.agent_runner.handle_tool_calls(response) is True
     result = loop.messages[-1]
-    loop.query()
+    loop.agent_runner.query()
 
     assert isinstance(result, ToolResult)
     assert "Follow review instructions." not in result.output
@@ -980,7 +984,9 @@ def test_skill_activation_is_persisted_with_its_tool_result(tmp_path):
         arguments='{"action":"activate","name":"review"}',
     )
 
-    loop.handle_tool_calls(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    loop.agent_runner.handle_tool_calls(
+        Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    )
 
     restored = store.load(loop.session.id)
     assert restored.active_skills == [("review", str(location))]
@@ -1014,9 +1020,9 @@ def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_p
     )
     response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
 
-    assert loop.handle_tool_calls(response) is True
+    assert loop.agent_runner.handle_tool_calls(response) is True
     result = loop.messages[-1]
-    loop.query()
+    loop.agent_runner.query()
 
     assert isinstance(result, ToolResult)
     assert json.loads(result.output)["instructions_updated"] is True
@@ -1115,7 +1121,7 @@ def test_handle_tool_calls_delegates_session_updates():
     call = function_call()
     response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
 
-    assert loop.handle_tool_calls(response) is True
+    assert loop.agent_runner.handle_tool_calls(response) is True
 
     session_manager.add_tool_call.assert_called_once_with(
         call_id="call_123",
@@ -1130,7 +1136,7 @@ def test_handle_tool_calls_delegates_session_updates():
         instructions_manager=loop.instructions_manager,
         permission_manager=loop.permission_manager,
     )
-    assert loop.handle_tool_calls(Response(answer="", reasoning="")) is False
+    assert loop.agent_runner.handle_tool_calls(Response(answer="", reasoning="")) is False
 
 
 def test_query_selects_only_the_event_production_mode():
@@ -1138,8 +1144,8 @@ def test_query_selects_only_the_event_production_mode():
     backend = loop_backend(get_response=Mock(return_value=[]))
     session = Session(messages=[Message(role="user", content="hello")])
 
-    Loop(backend=backend, session=session).query()
-    Loop(backend=backend, session=session, stream=True).query()
+    Loop(backend=backend, session=session).agent_runner.query()
+    Loop(backend=backend, session=session, stream=True).agent_runner.query()
 
     assert backend.get_response.call_args_list[0].kwargs["stream"] is False
     assert backend.get_response.call_args_list[1].kwargs["stream"] is True
@@ -1156,7 +1162,7 @@ def test_query_delegates_instruction_state_to_the_session_manager():
     session_manager.context_window = None
     loop = Loop(backend=backend, session_manager=session_manager)
 
-    loop.query()
+    loop.agent_runner.query()
 
     session_manager.update_instruction_state.assert_called_once_with(
         working_directory=str(loop.working_directory),
@@ -1169,7 +1175,7 @@ def test_query_prefers_the_explicit_model_over_response_metadata():
     backend = loop_backend(get_response=Mock(return_value=[]))
     session = Session(model="served-model")
 
-    Loop(backend=backend, model="requested-model", session=session).query()
+    Loop(backend=backend, model="requested-model", session=session).agent_runner.query()
 
     assert backend.get_response.call_args.kwargs["model"] == "requested-model"
 
@@ -1179,7 +1185,7 @@ def test_query_rejects_missing_model_selection():
     backend = loop_backend(default_model=None, get_response=Mock())
 
     with pytest.raises(ValueError, match="No model was selected"):
-        Loop(backend=backend).query()
+        Loop(backend=backend).agent_runner.query()
 
     backend.get_response.assert_not_called()
 

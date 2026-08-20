@@ -1,10 +1,10 @@
 """Run an interactive conversation with an LLM backend."""
 
 from pathlib import Path
-from time import sleep
 
 from . import constants
-from .backend import Backend, BackendError, BackendNotFoundError
+from .agent import Agent, AgentRunner
+from .backend import Backend
 from .commands import CommandManager
 from .compaction import CompactionCommands, ContextCompaction
 from .completion import (
@@ -15,7 +15,7 @@ from .completion import (
 from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
 from .model_selection import ModelCommands, ModelSelection
-from .models import ConversationItem, Response
+from .models import ConversationItem
 from .permissions import PermissionCommands, PermissionManager
 from .session import (
     BackendSessionNameGenerator,
@@ -34,6 +34,8 @@ class Loop:
 
     Args:
         backend (Backend): Backend used to request model responses.
+        agent_name (str): Human-readable identity for the configured agent. Defaults to
+            ``"Assistant"``.
         model (str | None): Model selected for requests, or ``None`` to use the backend default.
         instructions_manager (InstructionsManager | None): Manager used to compose the complete
             backend instructions. Defaults to discovering project instructions and Agent Skills
@@ -61,9 +63,12 @@ class Loop:
             compaction. Defaults to ``0.8``.
         prompt_on_recoverable_error (bool): Whether to offer an interactive retry after automatic
             retries exhaust a recoverable backend failure.
+        max_agent_turns (int): Maximum model turns permitted for one user input. Defaults to
+            ``25``.
 
     Raises:
-        ValueError: If the session is invalid.
+        ValueError: If the session, agent name, compaction threshold, or model-turn limit is
+            invalid.
 
     """
 
@@ -83,11 +88,14 @@ class Loop:
     _session_name_generator: SessionNameGenerator
     _mention_manager: MentionManager
     _prompt_on_recoverable_error: bool
+    _agent: Agent
+    _agent_runner: AgentRunner
 
     def __init__(
         self,
         backend: Backend,
         *,
+        agent_name: str = "Assistant",
         model: str | None = None,
         instructions_manager: InstructionsManager | None = None,
         interaction: Interaction | None = None,
@@ -103,6 +111,7 @@ class Loop:
         debug: bool = False,
         compaction_threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
         prompt_on_recoverable_error: bool = True,
+        max_agent_turns: int = constants.DEFAULT_AGENT_MAX_TURNS,
     ) -> None:
         if session_manager is not None:
             self._session_manager = session_manager
@@ -153,6 +162,25 @@ class Loop:
             interaction=self._interaction,
         )
         self._tool_registry = tool_registry or ToolRegistry()
+        self._agent = Agent(
+            agent_name,
+            self._backend,
+            self._instructions_manager,
+            self._tool_registry,
+            self._permission_manager,
+        )
+        self._agent_runner = AgentRunner(
+            self._agent,
+            self._session_manager,
+            self._model_selection,
+            self._compaction,
+            self._interaction,
+            lambda: self._working_directory,
+            stream=stream,
+            debug=debug,
+            max_turns=max_agent_turns,
+            prompt_on_recoverable_error=prompt_on_recoverable_error,
+        )
         self._command_manager = CommandManager(interaction=self._interaction)
         self._command_manager.register_providers(
             (
@@ -219,6 +247,24 @@ class Loop:
             PermissionManager: Active local permission manager.
         """
         return self._permission_manager
+
+    @property
+    def agent(self) -> Agent:
+        """Return the agent used for model and tool execution.
+
+        Returns:
+            Agent: Agent configured for this conversation.
+        """
+        return self._agent
+
+    @property
+    def agent_runner(self) -> AgentRunner:
+        """Return the runner responsible for model and tool turns.
+
+        Returns:
+            AgentRunner: Runner configured for this conversation.
+        """
+        return self._agent_runner
 
     @property
     def tool_registry(self) -> ToolRegistry:
@@ -315,7 +361,7 @@ class Loop:
         Returns:
             bool: Whether debug output is enabled.
         """
-        return self._debug
+        return self._agent_runner.debug
 
     @debug.setter
     def debug(self, debug: bool) -> None:
@@ -325,6 +371,7 @@ class Loop:
             debug (bool): Whether to enable debug output.
         """
         self._debug = debug
+        self._agent_runner.debug = debug
 
     @property
     def stream(self) -> bool:
@@ -333,7 +380,7 @@ class Loop:
         Returns:
             bool: Whether response streaming is enabled.
         """
-        return self._stream
+        return self._agent_runner.stream
 
     @property
     def model(self) -> str | None:
@@ -370,16 +417,8 @@ class Loop:
                 continue
             self._session_manager.add_user_message(user_input, context=context)
 
-            while True:
-                response = self._query_with_recovery()
-                if response is None:
-                    break
-                self._session_manager.add_response(response)
-
-                if not self.handle_tool_calls(response):
-                    break
-
-            if response is None:
+            result = self._agent_runner.run()
+            if result.stop_reason != "completed":
                 continue
 
             if self._session_manager.session.has_initial_name():
@@ -397,139 +436,6 @@ class Loop:
             )
 
         self.end()
-
-    def _query_with_recovery(self) -> Response | None:
-        """Request one response while escalating exhausted failures to the user."""
-        while True:
-            try:
-                return self.query()
-            except BackendNotFoundError as error:
-                self._report_backend_error(error)
-                if not self._select_fallback_model():
-                    return None
-            except BackendError as error:
-                self._report_backend_error(error)
-                if not error.recoverable or not self._prompt_on_recoverable_error:
-                    return None
-                prompt = "Retry the complete response?"
-                if error.response_started:
-                    prompt = "Partial output was discarded. Retry the complete response?"
-                if error.retry_after is not None and error.retry_after > 0:
-                    prompt = f"{prompt[:-1]} after at least {error.retry_after:g} seconds?"
-                if not self._interaction.confirm(prompt, default=False):
-                    return None
-                if error.retry_after is not None and error.retry_after > 0:
-                    delay = min(error.retry_after, 60.0)
-                    self._interaction.info(f"Retrying in {delay:g} seconds...")
-                    sleep(delay)
-
-    def _report_backend_error(self, error: BackendError) -> None:
-        """Display a normalized backend failure and useful diagnostic identifiers."""
-        message = str(error)
-        diagnostics = []
-        if error.status_code is not None:
-            diagnostics.append(f"HTTP {error.status_code}")
-        if error.request_id:
-            diagnostics.append(f"request {error.request_id}")
-        if diagnostics:
-            message = f"{message} ({', '.join(diagnostics)})"
-        self._interaction.error(message)
-
-    def _select_fallback_model(self) -> bool:
-        """List available models and let the user replace a missing selection.
-
-        Re-prompts when the user selects the already-failed model; only returns
-        when the user picks a different model or cancels.
-        """
-        try:
-            models = self._model_selection.available()
-        except BackendError as error:
-            self._interaction.error(f"Could not list available models: {error}")
-            return False
-        if not models:
-            self._interaction.warning("The backend reported no available models.")
-            return False
-        failing_model = self._model_selection.selected
-        while True:
-            selection = self._interaction.prompt(
-                "Select a replacement model, or enter 'q' to stop: ",
-                choices={model.id: model.id for model in models},
-            )
-            if selection is False:
-                return False
-            if selection != failing_model:
-                break
-            self._interaction.warning(
-                f"Model '{selection}' was already unavailable; the same "
-                "failure is likely to re-occur unless the backend is updated."
-            )
-            if self._interaction.confirm(
-                "Continue with this model, or select a different one?",
-                default=True,
-            ):
-                break
-        self._model_selection.select(selection)
-        self._interaction.info(f"Using model: {selection}")
-        return True
-
-    def handle_tool_calls(self, response: Response) -> bool:
-        """Handle tool calls made by the LLM during reasoning.
-
-        Args:
-            response (Response): The LLM response containing tool call events.
-
-        Returns:
-            bool: ``True`` if at least one tool call was handled; otherwise ``False``.
-        """
-        if not response.tool_calls:
-            return False
-
-        for tool_call in response.tool_calls:
-            self._interaction.tool_call(tool_call.name, tool_call.arguments)
-            tool_result = self._tool_registry.call(
-                tool_call.name,
-                tool_call.arguments,
-                interaction=self._interaction,
-                instructions_manager=self._instructions_manager,
-                permission_manager=self._permission_manager,
-            )
-            self._session_manager.add_tool_call(
-                call_id=tool_call.call_id,
-                output=tool_result,
-                working_directory=str(
-                    self._instructions_manager.working_directory or self._working_directory
-                ),
-                active_skills=self._instructions_manager.active_skill_identities,
-            )
-        return True
-
-    def query(self) -> Response:
-        """Request a response from the backend using the current session context and instructions.
-
-        Returns:
-            Response: The response from the backend, wrapped in a ``Response`` object.
-
-        Raises:
-            ValueError: If neither the loop nor the backend selects a model.
-        """
-        selected_model = self._model_selection.effective
-        self._instructions_manager.prepare()
-        self._session_manager.update_instruction_state(
-            working_directory=str(
-                self._instructions_manager.working_directory or self._working_directory
-            ),
-            active_skills=self._instructions_manager.active_skill_identities,
-        )
-        self._model_selection.synchronize_session()
-        self._compaction.compact_if_needed()
-        events = self._backend.get_response(
-            input=self._session_manager.model_context,
-            instructions=self._instructions_manager.instructions,
-            stream=self._stream,
-            model=selected_model,
-            tools=self._tool_registry.definitions(),
-        )
-        return self._interaction.response(events, debug=self._debug)
 
     def compact(self) -> bool:
         """Manually compact the active session using current model and instructions.

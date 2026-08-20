@@ -12,6 +12,7 @@ The project defaults to a local server at `http://localhost:8000/v1` running
 ## Features
 
 - Interactive, multi-turn conversations
+- Agent-scoped instructions, tools, permissions, and bounded model/tool execution
 - Streaming response and reasoning output
 - Synchronous and asynchronous backend access
 - Responses API function-call handling
@@ -120,6 +121,14 @@ resumed = Loop(backend, session="019c...", session_manager=sessions)
 
 `Loop` does not choose or create a session file. Library callers opt into persistence by supplying
 a session manager configured with a durable store; without one, the session remains in memory.
+
+Each submitted user message starts one bounded agent run. The configured `Agent` owns the backend,
+dynamic instructions, tool registry, and permission policy; `AgentRunner` performs repeated model
+and tool turns until the model returns a final response. `Loop` remains responsible for user input,
+commands, mentions, session naming, and usage display. Runs default to at most 25 model turns so a
+model that repeatedly requests tools cannot continue indefinitely; library callers can change the
+limit with `Loop(..., max_agent_turns=10)` and inspect the configured identity through
+`loop.agent`.
 
 At startup, the loop recursively indexes instruction files in the Git repository and loads the
 files applicable to the current working directory, from the project root through that directory.
