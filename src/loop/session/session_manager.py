@@ -265,7 +265,7 @@ class SessionManager:
 
     def new_session(self) -> None:
         """Replace the active session with a fresh unpersisted session."""
-        self._session = Session()
+        self._session = Session(model=self._session.model)
 
     def rename_session(self, name: str) -> None:
         """Assign and persist a user-controlled name to the active session.

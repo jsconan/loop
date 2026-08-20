@@ -37,7 +37,10 @@ def test_session_commands_list_resume_rename_and_reset_sessions():
     interaction.history.assert_called_once_with(first.messages, first.compactions)
     interaction.token_usage.assert_called_once_with("served-model", 1234, None)
     assert store.load(first_id).name == "Renamed topic"
-    assert sessions.session == Session()
+    # Model is preserved across new session, but other state is reset
+    assert sessions.session.model == 'served-model'
+    assert sessions.session.messages == []
+    assert sessions.session.tokens == 0
     assert manager.commands[-1].completion.provider == "sessions"
 
 
