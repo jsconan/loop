@@ -418,6 +418,13 @@ class Loop:
             self._session_manager.add_user_message(user_input, context=context)
 
             result = self._agent_runner.run()
+
+            self._interaction.token_usage(
+                self._session_manager.model,
+                self._session_manager.tokens,
+                self._session_manager.context_window,
+            )
+
             if result.stop_reason != "completed":
                 continue
 
@@ -428,11 +435,5 @@ class Loop:
                     self._interaction.info(f"Session name: {self._session_manager.session.name}")
                 except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                     self._interaction.warning(f"Could not generate the session name: {error}")
-
-            self._interaction.token_usage(
-                self._session_manager.model,
-                self._session_manager.tokens,
-                self._session_manager.context_window,
-            )
 
         self._interaction.conversation_ended()

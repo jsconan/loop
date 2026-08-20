@@ -397,7 +397,7 @@ def test_run_declines_or_disables_recoverable_retries(tmp_path):
 
         assert loop.messages == [Message(role="user", content="hello")]
         assert interaction.confirm.call_count == int(enabled)
-        interaction.token_usage.assert_not_called()
+        interaction.token_usage.assert_called_with("model", 0, None)
 
 
 def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):
