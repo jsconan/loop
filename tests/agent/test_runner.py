@@ -83,3 +83,30 @@ def test_runner_rejects_a_non_positive_turn_limit():
     """Runner construction rejects limits that could never execute an agent."""
     with pytest.raises(ValueError, match="greater than zero"):
         agent_runner(responses=[], max_turns=0)
+
+
+def test_runner_continues_after_max_turns_when_user_affirms():
+    """When the safety limit is reached and the user confirms, another round starts."""
+    call = ToolCall(call_id="call", name="echo", arguments="{}")
+    response_with_tools = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    response_without_tools = Response(answer="finished", reasoning="")
+    interaction = MagicMock(spec=Interaction)
+    interaction.confirm.return_value = True
+    backend = Mock()
+    agent = Agent("Assistant", backend, InstructionsManager(), Mock(), Mock())
+    session_manager = Mock()
+    runner = AgentRunner(
+        agent,
+        session_manager,
+        Mock(),
+        Mock(),
+        interaction,
+        lambda: Path.cwd(),
+        max_turns=1,
+    )
+    runner.query = Mock(side_effect=[response_with_tools, response_without_tools])
+    result = runner.run()
+    assert result.final_response is response_without_tools
+    assert result.turns == 1
+    assert result.stop_reason == "completed"
+    assert interaction.confirm.call_count == 1

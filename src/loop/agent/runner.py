@@ -124,7 +124,11 @@ class AgentRunner:
         Returns:
             AgentRunResult: Final response, completed turn count, and termination reason.
         """
-        for turn in range(1, self._max_turns + 1):
+        turn = 0
+        response = None
+        while True:
+            turn += 1
+
             response = self._query_with_recovery()
             if response is None:
                 return AgentRunResult(
@@ -139,6 +143,15 @@ class AgentRunner:
                     turns=turn,
                     stop_reason="completed",
                 )
+
+            if turn >= self._max_turns:
+                prompt = (
+                    f"Agent has reached the {self._max_turns}-turn safety limit. "
+                    "Do you want to continue?"
+                )
+                if self._interaction.confirm(prompt, default=False) is not True:
+                    break
+                turn = 0  # reset counter to allow another round
 
         self._interaction.warning(
             f"Agent stopped after reaching the {self._max_turns}-turn safety limit."
