@@ -29,6 +29,11 @@ unrelated refactoring or new dependencies.
   `__init__`; keep their value initialization in `__init__`.
 - Do not use `assert` outside unit tests. For runtime validation and error conditions, raise the
   most accurate exception type with a clear, specific message.
+- Do not use local or otherwise lazy imports to work around cyclic dependencies. A local import
+  is still a cyclic dependency and is forbidden for that purpose; resolve the underlying design
+  or module-boundary problem instead. Local or lazy imports are allowed only when they prevent
+  systematically loading a genuinely heavy resource or loading an optional resource. Imports
+  used only for annotations may be placed under `if TYPE_CHECKING:`.
 - Remove only imports or code made unused by the current change.
 - State material assumptions, tradeoffs, and deliberately accepted limitations.
 
