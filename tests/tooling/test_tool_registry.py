@@ -461,3 +461,56 @@ def test_call_async_returns_validation_and_permission_denials_before_invocation(
 
     assert "invalid_arguments" in invalid
     assert "tool_call_denied" in denied
+
+
+def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
+    """Async tool timing spans awaited execution but excludes permission confirmation."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    recorder = Mock()
+    permissions = PermissionManager(interaction=interaction, recorder=recorder)
+    registry = ToolRegistry(interaction=interaction, permission_manager=permissions)
+
+    @declare_tool(capabilities={Capability.NETWORK_READ})
+    async def calculate(number: int) -> int:
+        """Calculate a number asynchronously."""
+        return number
+
+    registry.register(calculate)
+    clock = Mock(side_effect=[10.0, 12.0])
+    monkeypatch.setattr(tool_registry_module, "perf_counter", clock)
+
+    output, duration = asyncio.run(
+        registry.call_with_timing_async("calculate", '{"number": 3}')
+    )
+
+    assert output == "3"
+    assert duration == 2
+    interaction.confirm.assert_called_once()
+    recorder.record_permission.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "error"),
+    [
+        ("missing", "{}", "unknown_tool"),
+        ("calculate", "bad", "invalid_arguments"),
+        ("calculate", '{"number": 1}', "tool_call_denied"),
+    ],
+)
+def test_call_with_timing_async_returns_zero_before_invocation(
+    name, arguments, error, monkeypatch
+):
+    """Async timing remains zero when lookup, validation, or authorization stops dispatch."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = False
+    registry = ToolRegistry(interaction=interaction)
+    register(registry)
+    clock = Mock()
+    monkeypatch.setattr(tool_registry_module, "perf_counter", clock)
+
+    output, duration = asyncio.run(registry.call_with_timing_async(name, arguments))
+
+    assert error in output
+    assert duration == 0
+    clock.assert_not_called()

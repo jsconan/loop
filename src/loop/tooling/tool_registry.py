@@ -279,16 +279,50 @@ class ToolRegistry:
         Raises:
             ValueError: If the tool requires a context but none is provided.
         """
+        output, _ = await self.call_with_timing_async(
+            name,
+            arguments,
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+            permission_manager=permission_manager,
+        )
+        return output
+
+    async def call_with_timing_async(
+        self,
+        name: str,
+        arguments: str,
+        *,
+        interaction: Interaction | None = None,
+        instructions_manager: InstructionsManager | None = None,
+        permission_manager: PermissionManager | None = None,
+    ) -> tuple[str, float]:
+        """Dispatch a tool asynchronously and measure only its function execution.
+
+        Args:
+            name (str): Registered tool name.
+            arguments (str): JSON-encoded arguments supplied by the model.
+            interaction (Interaction | None): Interaction for this invocation.
+            instructions_manager (InstructionsManager | None): Active instruction manager.
+            permission_manager (PermissionManager | None): Invocation permission policy.
+
+        Returns:
+            tuple[str, float]: Serialized result and tool-function duration in seconds. Validation
+                and authorization failures have a zero duration because no tool ran.
+
+        Raises:
+            ValueError: If the tool requires a context but none is provided.
+        """
         tool = self._tools.get(name)
         if tool is None:
-            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
+            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available."), 0
         validated, error = tool.validate_arguments(arguments)
         if error is not None:
-            return error
+            return error, 0
         active_permissions = permission_manager or self._permission_manager
         denied, grants = self._authorize(tool, validated, interaction, active_permissions)
         if denied is not None:
-            return denied
+            return denied, 0
         context = self._context_for(
             tool,
             interaction,
@@ -296,7 +330,9 @@ class ToolRegistry:
             active_permissions,
             grants,
         )
-        return await tool.call_async(validated, context)
+        started = perf_counter()
+        output = await tool.call_async(validated, context)
+        return output, perf_counter() - started
 
     def command(
         self,
