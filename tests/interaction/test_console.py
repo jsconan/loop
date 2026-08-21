@@ -494,7 +494,7 @@ def test_run_metrics_have_a_complete_console_presentation(capsys):
         "Model: served-model · Context: 18,432 / 262,144 tokens\n"
         "Run: 1 model calls · 2 messages · 4 items · 2.50s active\n"
         "Tokens: 100 input · 20 output · 40 cached · 5 reasoning\n"
-        "Performance: 2.00s model · 0.50s tools · 10.0 end-to-end output tokens/s\n"
+        "Performance: 2.00s model · 0.50s tools · 10.0 output tokens/s\n"
     )
 
 
