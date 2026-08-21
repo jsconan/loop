@@ -34,6 +34,7 @@ class PermissionManager:
         configuration_path (Path | str | None): YAML configuration path. Defaults to
             ``<working_directory>/.loop/permissions.yaml`` when a directory is supplied.
         interaction (Interaction | None): User interaction used for approval prompts.
+        recorder (PermissionRecorder | None): Default sink for authorization observations.
         configuration (PermissionConfiguration | None): Explicit configuration used instead of
             loading the local file.
 
@@ -46,6 +47,7 @@ class PermissionManager:
     _working_directory: Path | None
     _configuration_path: Path | None
     _interaction: Interaction | None
+    _recorder: PermissionRecorder | None
     _configuration: PermissionConfiguration
     _session_rules: list[PermissionRule]
 
@@ -55,6 +57,7 @@ class PermissionManager:
         *,
         configuration_path: Path | str | None = None,
         interaction: Interaction | None = None,
+        recorder: PermissionRecorder | None = None,
         configuration: PermissionConfiguration | None = None,
     ) -> None:
         self._working_directory = (
@@ -68,6 +71,7 @@ class PermissionManager:
             else None
         )
         self._interaction = interaction
+        self._recorder = recorder
         self._configuration = configuration or self._load()
         self._session_rules = []
 
@@ -107,6 +111,24 @@ class PermissionManager:
         """
         self._interaction = interaction
 
+    @property
+    def recorder(self) -> PermissionRecorder | None:
+        """Return the default permission observation sink.
+
+        Returns:
+            PermissionRecorder | None: Configured recorder, when available.
+        """
+        return self._recorder
+
+    @recorder.setter
+    def recorder(self, recorder: PermissionRecorder | None) -> None:
+        """Set the default permission observation sink.
+
+        Args:
+            recorder (PermissionRecorder | None): New recorder or ``None`` to disable recording.
+        """
+        self._recorder = recorder
+
     def authorize(
         self,
         request: PermissionRequest,
@@ -120,7 +142,8 @@ class PermissionManager:
             request (PermissionRequest): Normalized operation to authorize.
             interaction (Interaction | None): Invocation-scoped interaction overriding the
                 configured default.
-            recorder (PermissionRecorder | None): Invocation-scoped permission observation sink.
+            recorder (PermissionRecorder | None): Invocation-scoped permission observation sink
+                overriding the configured default.
 
         Returns:
             PermissionResult: Effective allow or deny result.
@@ -152,8 +175,9 @@ class PermissionManager:
                         source="user",
                     )
         self._audit(request, result)
-        if recorder is not None:
-            recorder.record_permission(request, result, prompted, prompt)
+        active_recorder = recorder if recorder is not None else self._recorder
+        if active_recorder is not None:
+            active_recorder.record_permission(request, result, prompted, prompt)
         return result
 
     def evaluate(self, request: PermissionRequest) -> PermissionResult:

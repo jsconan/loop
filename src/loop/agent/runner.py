@@ -222,7 +222,6 @@ class AgentRunner:
                 interaction=self._interaction,
                 instructions_manager=instructions,
                 permission_manager=self._agent.permission_manager,
-                permission_recorder=self._session_manager,
             )
             try:
                 payload = json.loads(tool_result)

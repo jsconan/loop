@@ -53,19 +53,21 @@ def test_default_configuration_is_local_and_fail_closed_without_a_user(tmp_path)
     assert json.loads(audit.read_text("utf-8"))["result"]["source"] == "headless"
 
 
-def test_authorization_records_structured_prompt_and_result(tmp_path):
-    """Authorization forwards exact prompt metadata to an invocation-scoped recorder."""
+def test_authorization_uses_default_recorder_and_allows_an_override(tmp_path):
+    """Authorization uses its configured recorder unless the call supplies another one."""
     interaction = Mock(spec=Interaction)
     interaction.confirm.return_value = True
     recorder = Mock()
+    override = Mock()
     manager = PermissionManager(
         tmp_path,
         interaction=interaction,
+        recorder=recorder,
         configuration=PermissionConfiguration(mode=PermissionMode.CONFIRM_ALL),
     )
     operation = request(Capability.NETWORK_READ, resource="https://example.com")
 
-    result = manager.authorize(operation, recorder=recorder)
+    result = manager.authorize(operation)
 
     recorder.record_permission.assert_called_once_with(
         operation,
@@ -73,6 +75,12 @@ def test_authorization_records_structured_prompt_and_result(tmp_path):
         True,
         "🌐 Agent wants to use 'demo' for network.read on 'https://example.com'. Proceed?",
     )
+    assert manager.recorder is recorder
+
+    manager.authorize(operation, recorder=override)
+
+    override.record_permission.assert_called_once()
+    assert recorder.record_permission.call_count == 1
 
 
 @pytest.mark.parametrize("approved,decision", [(True, Decision.ALLOW), (False, Decision.DENY)])

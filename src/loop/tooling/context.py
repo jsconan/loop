@@ -9,7 +9,6 @@ from ..permissions import (
     Capability,
     Decision,
     PermissionManager,
-    PermissionRecorder,
     PermissionRequest,
 )
 
@@ -27,7 +26,6 @@ class ToolContext:
         instructions_manager (InstructionsManager | None): Manager for instructions active in the
             current conversation, or ``None`` when instruction management is unavailable.
         permission_manager (PermissionManager | None): Central manager for additional authorization.
-        permission_recorder (PermissionRecorder | None): Invocation-scoped observation sink.
         grants (frozenset[PermissionRequest]): Requests authorized before tool execution.
     """
 
@@ -35,7 +33,6 @@ class ToolContext:
     tool_name: str
     instructions_manager: InstructionsManager | None = None
     permission_manager: PermissionManager | None = None
-    permission_recorder: PermissionRecorder | None = None
     grants: frozenset[PermissionRequest] = frozenset()
 
     def observe_file(self, path: Path | str) -> None:
@@ -104,9 +101,5 @@ class ToolContext:
             return True
         if self.permission_manager is None:
             return False
-        result = self.permission_manager.authorize(
-            request,
-            interaction=self.interaction,
-            recorder=self.permission_recorder,
-        )
+        result = self.permission_manager.authorize(request, interaction=self.interaction)
         return result.decision is Decision.ALLOW

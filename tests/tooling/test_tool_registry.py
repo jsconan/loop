@@ -367,18 +367,17 @@ def test_call_uses_default_or_no_context():
 
 
 def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
-    """Tool timing begins after authorization and records permissions in the invocation scope."""
+    """Tool timing begins after authorization and uses the policy manager's recorder."""
     interaction = Mock(spec=Interaction)
     interaction.confirm.return_value = True
     recorder = Mock()
-    registry = ToolRegistry(interaction=interaction)
+    permissions = PermissionManager(interaction=interaction, recorder=recorder)
+    registry = ToolRegistry(interaction=interaction, permission_manager=permissions)
     register(registry)
     clock = Mock(side_effect=[10.0, 12.0])
     monkeypatch.setattr(tool_registry_module, "perf_counter", clock)
 
-    output, duration = registry.call_with_timing(
-        "calculate", '{"number": 3}', permission_recorder=recorder
-    )
+    output, duration = registry.call_with_timing("calculate", '{"number": 3}')
 
     assert output == "3"
     assert duration == 2

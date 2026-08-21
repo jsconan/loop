@@ -1167,8 +1167,8 @@ def test_handle_tool_calls_delegates_session_updates():
         interaction=loop.interaction,
         instructions_manager=loop.instructions_manager,
         permission_manager=loop.permission_manager,
-        permission_recorder=session_manager,
     )
+    assert loop.permission_manager.recorder is session_manager
     assert loop.agent_runner.handle_tool_calls(Response(answer="", reasoning="")) == ()
 
 

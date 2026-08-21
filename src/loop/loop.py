@@ -161,6 +161,7 @@ class Loop:
             find_project_root(self._working_directory) or self._working_directory,
             interaction=self._interaction,
         )
+        self._permission_manager.recorder = self._session_manager
         self._tool_registry = tool_registry or ToolRegistry()
         self._agent = Agent(
             agent_name,
