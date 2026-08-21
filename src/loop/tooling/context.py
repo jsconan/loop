@@ -5,7 +5,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..interaction import Interaction
-from ..permissions import Capability, Decision, PermissionManager, PermissionRequest
+from ..permissions import (
+    Capability,
+    Decision,
+    PermissionManager,
+    PermissionRecorder,
+    PermissionRequest,
+)
 
 if TYPE_CHECKING:
     from ..skills import InstructionsManager
@@ -21,6 +27,7 @@ class ToolContext:
         instructions_manager (InstructionsManager | None): Manager for instructions active in the
             current conversation, or ``None`` when instruction management is unavailable.
         permission_manager (PermissionManager | None): Central manager for additional authorization.
+        permission_recorder (PermissionRecorder | None): Invocation-scoped observation sink.
         grants (frozenset[PermissionRequest]): Requests authorized before tool execution.
     """
 
@@ -28,6 +35,7 @@ class ToolContext:
     tool_name: str
     instructions_manager: InstructionsManager | None = None
     permission_manager: PermissionManager | None = None
+    permission_recorder: PermissionRecorder | None = None
     grants: frozenset[PermissionRequest] = frozenset()
 
     def observe_file(self, path: Path | str) -> None:
@@ -96,5 +104,9 @@ class ToolContext:
             return True
         if self.permission_manager is None:
             return False
-        result = self.permission_manager.authorize(request)
+        result = self.permission_manager.authorize(
+            request,
+            interaction=self.interaction,
+            recorder=self.permission_recorder,
+        )
         return result.decision is Decision.ALLOW

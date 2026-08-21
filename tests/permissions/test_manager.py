@@ -47,9 +47,32 @@ def test_default_configuration_is_local_and_fail_closed_without_a_user(tmp_path)
 
     assert manager.configuration.mode is PermissionMode.CONFIRM_ALL
     assert manager.configuration_path == tmp_path / ".loop" / "permissions.yaml"
+    assert manager.interaction is None
     assert result.decision is Decision.DENY
     audit = tmp_path / ".loop" / "permissions-audit.jsonl"
     assert json.loads(audit.read_text("utf-8"))["result"]["source"] == "headless"
+
+
+def test_authorization_records_structured_prompt_and_result(tmp_path):
+    """Authorization forwards exact prompt metadata to an invocation-scoped recorder."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    recorder = Mock()
+    manager = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        configuration=PermissionConfiguration(mode=PermissionMode.CONFIRM_ALL),
+    )
+    operation = request(Capability.NETWORK_READ, resource="https://example.com")
+
+    result = manager.authorize(operation, recorder=recorder)
+
+    recorder.record_permission.assert_called_once_with(
+        operation,
+        result,
+        True,
+        "🌐 Agent wants to use 'demo' for network.read on 'https://example.com'. Proceed?",
+    )
 
 
 @pytest.mark.parametrize("approved,decision", [(True, Decision.ALLOW), (False, Decision.DENY)])

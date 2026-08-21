@@ -1,5 +1,6 @@
 """Tests for SQLite session persistence."""
 
+import json
 import sqlite3
 from contextlib import closing
 from datetime import UTC
@@ -53,7 +54,7 @@ def test_store_round_trips_complete_typed_contexts_and_updates_metadata(tmp_path
     )
 
     session_id = store.save(session)
-    session.messages.append(Message(role="assistant", content="answer"))
+    session.add_message(Message(role="assistant", content="answer"))
     session.tokens = 18
     session.model = "model-b"
     assert store.save(session) == session_id
@@ -105,14 +106,73 @@ def test_store_migrates_and_names_existing_sessions(tmp_path):
     assert store.load("legacy").name == "Recover legacy sessions"
 
 
+def test_store_upcasts_version_four_without_rewriting_the_snapshot(tmp_path):
+    """Loading preserves legacy bytes while presenting current replay ordering in memory."""
+    path = tmp_path / "sessions.db"
+    session = Session(messages=[Message(role="user", content="question")])
+    payload = json.loads(session.serialize())
+    payload["version"] = 4
+    payload.pop("events")
+    payload["compactions"] = [
+        {
+            "id": "checkpoint",
+            "boundary": 1,
+            "created_at": "2026-08-20T00:00:00Z",
+            "provider": "test",
+            "model": "model",
+            "context": [{"provider": "test", "data": {}}],
+            "instructions": {
+                "working_directory": "/project",
+                "content": None,
+                "digest": "digest",
+                "active_skills": [],
+            },
+            "input_tokens_before": 10,
+            "input_tokens_after": 5,
+        }
+    ]
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            """CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, name_source TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                message_count INTEGER NOT NULL, session TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy",
+                "Legacy",
+                "user",
+                "2026-08-20T00:00:00+00:00",
+                "2026-08-20T00:00:00+00:00",
+                1,
+                json.dumps(payload),
+            ),
+        )
+
+    restored = SQLiteSessionStore(path).load("legacy")
+
+    assert [event.type for event in restored.events] == ["conversation_item", "compaction"]
+    with closing(sqlite3.connect(path)) as connection:
+        stored = json.loads(
+            connection.execute("SELECT session FROM sessions WHERE id = 'legacy'").fetchone()[0]
+        )
+    assert stored["version"] == 4
+    assert "events" not in stored
+
+
 @pytest.mark.parametrize(
     "payload",
     [
         "not-json",
-        '{"version":2,"messages":[],"tokens":0,"model":null}',
+        '{"version":7,"messages":[],"tokens":0,"model":null}',
         '{"version":1,"messages":[{"type":"unknown","data":{}}],"tokens":0,"model":null}',
         '{"version":1,"messages":[],"tokens":true,"model":null}',
         '{"version":1,"messages":[],"tokens":0,"model":42}',
+        '{"version":1,"messages":null,"tokens":0,"model":null}',
+        '{"version":4,"messages":[],"compactions":[1],"tokens":0,"model":null}',
     ],
 )
 def test_store_rejects_invalid_or_unsupported_persisted_data(tmp_path, payload):

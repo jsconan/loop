@@ -1,6 +1,7 @@
 """Define permission capabilities, requests, rules, and decisions."""
 
 from enum import StrEnum
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -121,3 +122,23 @@ class PermissionResult(BaseModel):
     decision: Decision
     reason: str
     source: str
+
+
+class PermissionRecorder(Protocol):
+    """Record permission observations for one invocation scope."""
+
+    def record_permission(
+        self,
+        request: PermissionRequest,
+        result: PermissionResult,
+        prompted: bool,
+        prompt: str | None,
+    ) -> None:
+        """Record one evaluated permission request.
+
+        Args:
+            request (PermissionRequest): Normalized requested authority.
+            result (PermissionResult): Effective authorization result.
+            prompted (bool): Whether an interactive prompt was displayed.
+            prompt (str | None): Exact displayed prompt, when applicable.
+        """

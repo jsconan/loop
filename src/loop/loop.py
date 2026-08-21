@@ -418,13 +418,9 @@ class Loop:
             self._session_manager.add_user_message(user_input, context=context)
 
             result = self._agent_runner.run()
-
-            self._interaction.token_usage(
-                self._session_manager.model,
-                self._session_manager.tokens,
-                self._session_manager.context_window,
-            )
-
+            if result.metrics is None:
+                raise TypeError("Agent run did not produce completion metrics.")
+            self._interaction.run_metrics(result.metrics)
             if result.stop_reason != "completed":
                 continue
 

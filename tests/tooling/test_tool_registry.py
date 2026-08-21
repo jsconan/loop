@@ -366,6 +366,26 @@ def test_call_uses_default_or_no_context():
     assert len(seen) == 1
 
 
+def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
+    """Tool timing begins after authorization and records permissions in the invocation scope."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    recorder = Mock()
+    registry = ToolRegistry(interaction=interaction)
+    register(registry)
+    clock = Mock(side_effect=[10.0, 12.0])
+    monkeypatch.setattr(tool_registry_module, "perf_counter", clock)
+
+    output, duration = registry.call_with_timing(
+        "calculate", '{"number": 3}', permission_recorder=recorder
+    )
+
+    assert output == "3"
+    assert duration == 2
+    interaction.confirm.assert_called_once()
+    recorder.record_permission.assert_called_once()
+
+
 def test_call_command_parses_model_parameters_before_shared_dispatch():
     """Command routing validates parameters while bypassing the permission policy."""
     permissions = Mock(spec=PermissionManager)

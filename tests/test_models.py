@@ -78,6 +78,7 @@ def test_models_serialize_nested_values_to_python_and_json() -> None:
         "items": [{"role": "assistant", "content": "done"}],
         "usage": {"total_tokens": 12},
         "model": "served-model",
+        "metrics": {"duration_seconds": 0.0, "time_to_first_chunk_seconds": None},
     }
     assert response.model_dump(mode="json") == expected
     assert json.loads(response.model_dump_json()) == expected

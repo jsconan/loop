@@ -17,7 +17,6 @@ from loop import (
     ProjectPathMentionHandler,
     SessionManager,
     ShutdownRequested,
-    create_default_tool_registry,
     register_shutdown_signals,
 )
 from loop.session import SessionCommands
@@ -70,7 +69,6 @@ def main() -> None:
             api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
             context_window=int(context_window) if context_window else None,
             max_retries=int(max_retries) if max_retries else 2,
-            tool_registry=create_default_tool_registry(),
         )
 
         interaction.info("Hello from Chat!")
@@ -90,7 +88,7 @@ def main() -> None:
             session_manager.add_user_message(prompt, context=context)
 
             events = backend.get_response(input=session_manager.messages, stream=True)
-            response = interaction.response(events)
+            response = session_manager.response(events)
             session_manager.add_response(response)
 
         interaction.conversation_ended()

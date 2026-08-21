@@ -12,7 +12,9 @@ from prompt_toolkit.document import Document
 from rich.console import Console
 from rich.prompt import Confirm
 
+from loop import ModelCallMetrics, RunMetrics
 from loop.interaction import ConsoleInteraction
+from loop.models import Usage
 
 
 def test_prompt_reads_a_trimmed_message_with_a_custom_prompt():
@@ -470,35 +472,59 @@ def test_tool_result_falls_back_for_malformed_well_known_formats(capsys, name, r
     assert capsys.readouterr().out.strip()
 
 
-@pytest.mark.parametrize(
-    ("model", "context_tokens", "context_window", "expected"),
-    [
-        (
-            None,
-            None,
-            262144,
-            "Model: ? · Context: ? / 262,144 tokens\n",
-        ),
-        (
-            "served-model",
-            18432,
-            262144,
-            "Model: served-model · Context: 18,432 / 262,144 tokens\n",
-        ),
-        (
-            "local-model",
-            12,
-            None,
-            "Model: local-model · Context: 12 / ? tokens\n",
-        ),
-    ],
-)
-def test_token_usage_has_a_console_presentation(
-    capsys, model, context_tokens, context_window, expected
-):
-    """Token usage presents the current model and context against maximum context."""
-    ConsoleInteraction().token_usage(model, context_tokens, context_window)
-    assert capsys.readouterr().out == expected
+def test_run_metrics_have_a_complete_console_presentation(capsys):
+    """Run statistics present context, counts, usage, duration, and throughput."""
+    usage = Usage(input_tokens=100, output_tokens=20, cached_tokens=40, reasoning_tokens=5)
+    metrics = RunMetrics(
+        active_duration_seconds=2.5,
+        model_duration_seconds=2,
+        tool_duration_seconds=0.5,
+        model_calls=(ModelCallMetrics(model="served-model", duration_seconds=2, usage=usage),),
+        message_count=2,
+        item_count=4,
+        usage=usage,
+        model="served-model",
+        context_tokens=18_432,
+        context_window=262_144,
+    )
+
+    ConsoleInteraction().run_metrics(metrics)
+
+    assert capsys.readouterr().out == (
+        "Model: served-model · Context: 18,432 / 262,144 tokens\n"
+        "Run: 1 model calls · 2 messages · 4 items · 2.50s active\n"
+        "Tokens: 100 input · 20 output · 40 cached · 5 reasoning\n"
+        "Performance: 2.00s model · 0.50s tools · 10.0 end-to-end output tokens/s\n"
+    )
+
+
+def test_run_metrics_omit_unknown_usage_and_throughput(capsys):
+    """Unknown token counts do not produce fabricated usage or throughput values."""
+    metrics = RunMetrics(
+        active_duration_seconds=0,
+        model_duration_seconds=0,
+        tool_duration_seconds=0,
+        message_count=0,
+        item_count=0,
+        context_window=100,
+    )
+
+    ConsoleInteraction().run_metrics(metrics)
+
+    assert capsys.readouterr().out == (
+        "Model: ? · Context: ? / 100 tokens\n"
+        "Run: 0 model calls · 0 messages · 0 items · 0.00s active\n"
+        "Performance: 0.00s model · 0.00s tools\n"
+    )
+
+
+def test_permission_replay_uses_the_stored_prompt_or_a_fallback(capsys):
+    """Permission replay preserves exact prompts and handles absent historical text."""
+    interaction = ConsoleInteraction()
+    interaction.permission("Proceed?", "allow")
+    interaction.permission("Permission requested.", "allow")
+
+    assert capsys.readouterr().out == "Proceed? [allow]\nPermission requested. [allow]\n"
 
 
 def test_debug_formats_raw_values(capsys):

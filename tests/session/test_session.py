@@ -15,6 +15,7 @@ from loop import (
     Reasoning,
     Response,
     ResponseMetadata,
+    RunMetrics,
     Session,
     SessionInfo,
     ToolCall,
@@ -22,7 +23,11 @@ from loop import (
     UnsupportedConversationItemError,
     Usage,
 )
-from loop.session.models import SESSION_NAME_SOURCE_INITIAL, SESSION_NAME_SOURCE_USER
+from loop.session.models import (
+    SESSION_NAME_SOURCE_INITIAL,
+    SESSION_NAME_SOURCE_USER,
+    RunCompletedEvent,
+)
 
 
 def function_call() -> ToolCall:
@@ -134,6 +139,33 @@ def test_session_adds_response_items_and_updates_reported_metadata():
     assert session.model == "model-b"
 
 
+def test_session_places_response_tool_calls_when_they_are_executed():
+    """Multiple model tool calls replay beside their sequential local results."""
+    first = ToolCall(call_id="first", name="one", arguments="{}")
+    second = ToolCall(call_id="second", name="two", arguments="{}")
+    session = Session()
+    session.add_message(
+        Response(answer="", reasoning="", tool_calls=(first, second), items=(first, second))
+    )
+
+    assert session.events == []
+    session.add_tool_call_event("first")
+    session.add_message(ToolResult(call_id="first", output="one"))
+    session.add_tool_call_event("second")
+    session.add_message(ToolResult(call_id="second", output="two"))
+
+    assert [session.messages[event.item_index] for event in session.events] == [
+        first,
+        ToolResult(call_id="first", output="one"),
+        second,
+        ToolResult(call_id="second", output="two"),
+    ]
+    with pytest.raises(ValueError, match="already"):
+        session.add_tool_call_event("first")
+    with pytest.raises(ValueError, match="Unknown"):
+        session.add_tool_call_event("missing")
+
+
 def test_session_preserves_metadata_omitted_from_a_response():
     """Completed responses retain existing metadata when replacements are unavailable."""
     session = Session(tokens=10, model="model-a")
@@ -203,17 +235,72 @@ def test_session_serializes_and_deserializes_all_conversation_items():
     assert Session.deserialize(session.serialize()) == session
 
 
-def test_session_round_trips_instruction_context_and_reads_version_one_defaults():
-    """Persistence retains refresh intent while older snapshots receive safe defaults."""
+def test_session_round_trips_instruction_context_and_events():
+    """Persistence retains instruction state and the durable replay timeline."""
     session = Session(
         instruction_working_directory="/project/src",
         active_skills=[("review", "/project/.agents/skills/review/SKILL.md")],
     )
 
     assert Session.deserialize(session.serialize()) == session
-    restored = Session.deserialize('{"version":1,"messages":[],"tokens":0,"model":null}')
-    assert restored.instruction_working_directory is None
-    assert not restored.active_skills
+
+
+def test_session_upcasts_version_five_run_metrics_without_rewriting_history():
+    """Legacy wall duration remains distinct from reconstructed active checkpoint time."""
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    metrics = RunMetrics(
+        active_duration_seconds=3,
+        model_duration_seconds=2,
+        tool_duration_seconds=1,
+        message_count=0,
+        item_count=0,
+    )
+    session = Session(messages=[Message(role="user", content="question")])
+    session.events.append(
+        RunCompletedEvent(
+            id="run",
+            created_at=now,
+            started_at=now,
+            stop_reason="completed",
+            metrics=metrics,
+        )
+    )
+    payload = json.loads(session.serialize())
+    payload["version"] = 5
+    event = payload["events"][1]
+    legacy_metrics = event.pop("metrics")
+    event.update(legacy_metrics, duration_seconds=8)
+    event.pop("active_duration_seconds")
+    event.pop("elapsed_duration_seconds")
+
+    restored = Session.deserialize(json.dumps(payload))
+
+    restored_metrics = restored.events[1].metrics
+    assert restored_metrics.active_duration_seconds == 3
+    assert restored_metrics.elapsed_duration_seconds == 8
+
+
+def test_session_rejects_malformed_version_five_run_metrics():
+    """Legacy run upcasting normalizes invalid arithmetic fields to the session error contract."""
+    payload = json.loads(Session().serialize())
+    payload["version"] = 5
+    payload["events"] = [
+        {
+            "id": "run",
+            "created_at": "2026-08-20T00:00:00Z",
+            "type": "run_completed",
+            "stop_reason": "completed",
+            "started_at": "2026-08-20T00:00:00Z",
+            "duration_seconds": 1,
+            "model_duration_seconds": "invalid",
+            "tool_duration_seconds": 0,
+            "message_count": 0,
+            "item_count": 0,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        Session.deserialize(json.dumps(payload))
 
 
 def test_session_retains_full_history_while_latest_compaction_bounds_model_context():
@@ -357,59 +444,9 @@ def test_session_serialization_identifies_unsupported_item_types():
     [
         ("not-json", "Invalid serialized session"),
         ("[]", "Invalid serialized session"),
-        ('{"version":5,"messages":[],"tokens":0,"model":null}', "Unsupported session version 5"),
+        ('{"version":7,"messages":[],"tokens":0,"model":null}', "Unsupported session version 7"),
         ('{"messages":[],"tokens":0,"model":null}', "Unsupported session version None"),
-        (
-            '{"version":1,"messages":[{"type":"message","data":{}}],"tokens":0,"model":null}',
-            "Invalid serialized session",
-        ),
-        ('{"version":1,"messages":[],"tokens":true,"model":null}', "Invalid serialized session"),
-        ('{"version":1,"messages":[],"tokens":-1,"model":null}', "Invalid serialized session"),
-        ('{"version":1,"messages":[],"tokens":0,"model":42}', "Invalid serialized session"),
-        ('{"version":1,"messages":null,"tokens":0,"model":null}', "Invalid serialized session"),
-        (
-            (
-                '{"version":3,"name":"","name_source":"initial","messages":[],"tokens":0,'
-                '"model":null,"instruction_working_directory":null,"active_skills":[]}'
-            ),
-            "Invalid serialized session",
-        ),
-        (
-            (
-                '{"version":3,"name":"name","name_source":"unknown","messages":[],'
-                '"tokens":0,"model":null,"instruction_working_directory":null,'
-                '"active_skills":[]}'
-            ),
-            r"Invalid session name source ''unknown''\.",
-        ),
-        (
-            (
-                '{"version":2,"messages":[],"tokens":0,"model":null,'
-                '"instruction_working_directory":42,"active_skills":[]}'
-            ),
-            "Invalid serialized session",
-        ),
-        (
-            (
-                '{"version":2,"messages":[],"tokens":0,"model":null,'
-                '"instruction_working_directory":null,"active_skills":null}'
-            ),
-            "Invalid serialized session",
-        ),
-        (
-            (
-                '{"version":2,"messages":[],"tokens":0,"model":null,'
-                '"instruction_working_directory":null,"active_skills":[["name"]]}'
-            ),
-            "Invalid serialized session",
-        ),
-        (
-            (
-                '{"version":2,"messages":[],"tokens":0,"model":null,'
-                '"instruction_working_directory":null,"active_skills":[["name",1]]}'
-            ),
-            "Invalid serialized session",
-        ),
+        ('{"version":5,"messages":[]}', "Invalid serialized session"),
     ],
 )
 def test_session_deserialization_rejects_invalid_data(payload, message):
@@ -420,10 +457,65 @@ def test_session_deserialization_rejects_invalid_data(payload, message):
 
 def test_session_deserialization_identifies_unsupported_item_types():
     """Deserialization reports the unsupported serialized conversation item type."""
-    payload = '{"version":1,"messages":[{"type":"unknown","data":{}}],"tokens":0,"model":null}'
+    payload = json.loads(Session().serialize())
+    payload["messages"] = [{"type": "unknown", "data": {}}]
 
     with pytest.raises(
         UnsupportedConversationItemError,
         match="Unsupported conversation item type: 'unknown'\\.",
     ):
-        Session.deserialize(payload)
+        Session.deserialize(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "name",
+        "tokens",
+        "model",
+        "window",
+        "directory",
+        "skills",
+        "item_range",
+        "item_coverage",
+        "compaction_range",
+        "compaction_coverage",
+    ],
+)
+def test_session_deserialization_rejects_invalid_event_and_snapshot_metadata(mutation):
+    """Current snapshots reject malformed metadata and incomplete event references."""
+    session = Session(messages=[Message(role="user", content="question")])
+    checkpoint = Compaction(
+        id="checkpoint",
+        boundary=1,
+        created_at=datetime(2026, 8, 20, tzinfo=UTC),
+        provider="test",
+        model="model",
+        context=(CompactionContextItem(provider="test", data={}),),
+        instructions=InstructionSnapshot(working_directory="/project", content=None, digest="d"),
+    )
+    session.add_compaction(checkpoint)
+    payload = json.loads(session.serialize())
+    if mutation == "name":
+        payload["name"] = ""
+    elif mutation == "tokens":
+        payload["tokens"] = True
+    elif mutation == "model":
+        payload["model"] = 42
+    elif mutation == "window":
+        payload["context_window"] = 0
+    elif mutation == "directory":
+        payload["instruction_working_directory"] = 42
+    elif mutation == "skills":
+        payload["active_skills"] = [["incomplete"]]
+    elif mutation == "item_range":
+        payload["events"][0]["item_index"] = 2
+    elif mutation == "item_coverage":
+        payload["events"] = payload["events"][1:]
+    elif mutation == "compaction_range":
+        payload["events"][1]["compaction_index"] = 2
+    else:
+        payload["events"] = payload["events"][:1]
+
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        Session.deserialize(json.dumps(payload))

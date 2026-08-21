@@ -10,6 +10,7 @@ from prompt_toolkit.document import Document
 
 from loop import (
     BUILTIN_TOOLS,
+    AgentRunResult,
     AnswerCompleted,
     AnswerDelta,
     BackendAuthenticationError,
@@ -59,12 +60,9 @@ def loop_backend(**attributes):
 
 
 def output_interaction() -> MagicMock:
-    """Build an interaction mock that executes the base response collector."""
+    """Build an interaction mock with a no-op response scope."""
     interaction = MagicMock(spec=Interaction)
     interaction.response_context.return_value = nullcontext()
-    interaction.response.side_effect = lambda events, **kwargs: Interaction.response(
-        interaction, events, **kwargs
-    )
     interaction.confirm.return_value = True
     return interaction
 
@@ -397,7 +395,25 @@ def test_run_declines_or_disables_recoverable_retries(tmp_path):
 
         assert loop.messages == [Message(role="user", content="hello")]
         assert interaction.confirm.call_count == int(enabled)
-        interaction.token_usage.assert_called_with("model", 0, None)
+        interaction.run_metrics.assert_called_once()
+        assert interaction.run_metrics.call_args.args[0].active_duration_seconds == 0
+
+
+def test_run_rejects_a_runner_result_without_metrics(tmp_path):
+    """The loop rejects an incomplete runner result before presenting statistics."""
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello"]
+    loop = Loop(
+        backend=loop_backend(get_response=Mock(return_value=[])),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop.agent_runner.run = Mock(
+        return_value=AgentRunResult(final_response=None, turns=0, stop_reason="cancelled")
+    )
+
+    with pytest.raises(TypeError, match="completion metrics"):
+        loop.run()
 
 
 def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):
@@ -595,7 +611,10 @@ def test_loops_share_local_conversation_context(tmp_path):
     assert second.messages == [Message(role="user", content="hello")]
     assert second.session.tokens == 12
     assert second.session.model == "other-model"
-    assert second.agent_runner.query() == Response(answer="", reasoning="")
+    response = second.agent_runner.query()
+    assert response.answer == ""
+    assert response.reasoning == ""
+    assert response.metrics.duration_seconds >= 0
     second_backend.get_response.assert_called_once_with(
         input=session.messages,
         instructions=None,
@@ -718,7 +737,7 @@ def test_loop_uses_an_injected_manager_session_without_reloading_it():
 
 def test_loop_prefers_an_explicit_interaction_over_the_manager_interaction():
     """An explicit interaction controls loop I/O when a manager is also supplied."""
-    manager = SessionManager(interaction=Mock(spec=Interaction))
+    manager = SessionManager(interaction=output_interaction())
     interaction = MagicMock(spec=Interaction)
 
     loop = Loop(backend=loop_backend(), interaction=interaction, session_manager=manager)
@@ -921,7 +940,7 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
     loop = Loop(
         backend=backend,
         tool_registry=registry,
-        interaction=Mock(spec=Interaction),
+        interaction=output_interaction(),
         working_directory=tmp_path,
         instructions_manager=instructions_manager,
     )
@@ -936,8 +955,9 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
         tool_calls=(call,),
         items=(call,),
     )
+    loop.session.add_message(response)
 
-    assert loop.agent_runner.handle_tool_calls(response) is True
+    assert len(loop.agent_runner.handle_tool_calls(response)) == 1
     result = loop.messages[-1]
     loop.agent_runner.query()
 
@@ -975,9 +995,9 @@ def test_skill_activation_is_persisted_with_its_tool_result(tmp_path):
         arguments='{"action":"activate","name":"review"}',
     )
 
-    loop.agent_runner.handle_tool_calls(
-        Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
-    )
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    sessions.add_response(response)
+    loop.agent_runner.handle_tool_calls(response)
 
     restored = store.load(loop.session.id)
     assert restored.active_skills == [("review", str(location))]
@@ -1000,7 +1020,7 @@ def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_p
     loop = Loop(
         backend=backend,
         tool_registry=registry,
-        interaction=Mock(spec=Interaction),
+        interaction=output_interaction(),
         working_directory=tmp_path,
         instructions_manager=instructions_manager,
     )
@@ -1010,8 +1030,9 @@ def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_p
         arguments='{"action":"deactivate","name":"review"}',
     )
     response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    loop.session.add_message(response)
 
-    assert loop.agent_runner.handle_tool_calls(response) is True
+    assert len(loop.agent_runner.handle_tool_calls(response)) == 1
     result = loop.messages[-1]
     loop.agent_runner.query()
 
@@ -1052,12 +1073,13 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
 
-    Loop(
+    loop = Loop(
         backend=backend,
         interaction=interaction,
         tool_registry=registry,
         working_directory=tmp_path,
-    ).run()
+    )
+    loop.run()
 
     second_input = backend.get_response.call_args_list[1].kwargs["input"]
     assert second_input[:3] == [
@@ -1067,8 +1089,27 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
     ]
     assert second_input[-1] == Message(role="assistant", content="done")
     interaction.answer_delta.assert_called_once_with("done", start=True)
-    assert interaction.response.call_count == 2
-    interaction.token_usage.assert_called_once_with("requested-model", 12, 1000)
+    assert interaction.response_context.call_count == 2
+    interaction.run_metrics.assert_called_once()
+    metrics = interaction.run_metrics.call_args.args[0]
+    assert metrics.model == "requested-model"
+    assert metrics.context_tokens == 12
+    assert metrics.context_window == 1000
+    assert len(metrics.model_calls) == 2
+    assert [event.type for event in loop.session.events] == [
+        "conversation_item",
+        "conversation_item",
+        "permission",
+        "conversation_item",
+        "conversation_item",
+        "run_completed",
+    ]
+    visible_items = [
+        loop.messages[event.item_index]
+        for event in loop.session.events
+        if event.type == "conversation_item"
+    ]
+    assert [type(item) for item in visible_items] == [Message, ToolCall, ToolResult, Message]
     interaction.conversation_ended.assert_called_once_with()
 
 
@@ -1103,7 +1144,7 @@ def test_run_exit_commands_end_the_conversation(command):
 def test_handle_tool_calls_delegates_session_updates():
     """Tool results and instruction state are delegated to the session manager."""
     registry = Mock()
-    registry.call.return_value = "tool result"
+    registry.call_with_timing.return_value = ("tool result", 0.25)
     backend = loop_backend(get_response=Mock(return_value=[]))
     session_manager = Mock(spec=SessionManager)
     session_manager.interaction = MagicMock(spec=Interaction)
@@ -1112,7 +1153,7 @@ def test_handle_tool_calls_delegates_session_updates():
     call = function_call()
     response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
 
-    assert loop.agent_runner.handle_tool_calls(response) is True
+    assert len(loop.agent_runner.handle_tool_calls(response)) == 1
 
     session_manager.add_tool_call.assert_called_once_with(
         call_id="call_123",
@@ -1120,14 +1161,15 @@ def test_handle_tool_calls_delegates_session_updates():
         working_directory=str(loop.working_directory),
         active_skills=[],
     )
-    registry.call.assert_called_once_with(
+    registry.call_with_timing.assert_called_once_with(
         call.name,
         call.arguments,
         interaction=loop.interaction,
         instructions_manager=loop.instructions_manager,
         permission_manager=loop.permission_manager,
+        permission_recorder=session_manager,
     )
-    assert loop.agent_runner.handle_tool_calls(Response(answer="", reasoning="")) is False
+    assert loop.agent_runner.handle_tool_calls(Response(answer="", reasoning="")) == ()
 
 
 def test_query_selects_only_the_event_production_mode():

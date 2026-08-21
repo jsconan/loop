@@ -34,8 +34,7 @@ def test_session_commands_list_resume_rename_and_reset_sessions():
         "updated_at",
         "message_count",
     )
-    interaction.history.assert_called_once_with(first.messages, first.compactions)
-    interaction.token_usage.assert_called_once_with("served-model", 1234, None)
+    interaction.user.assert_called_once_with("Prior question")
     assert store.load(first_id).name == "Renamed topic"
     # Model is preserved across new session, but other state is reset
     assert sessions.session.model == "served-model"

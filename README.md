@@ -100,6 +100,16 @@ session. After the first completed answer, a separate structured-output request 
 descriptive name without adding the title request to conversation history. A failed title request
 leaves the provisional name intact.
 
+Each session also owns an ordered event timeline for faithful replay. It records conversation-item
+placement, compactions, permission decisions, and completed-run statistics. Run statistics include
+per-model token usage and latency, tool-function durations and outcomes, active checkpoint time,
+message and item counts, model identity, and context occupancy. Human permission and recovery
+waits are excluded from active time. `/resume` renders this timeline, including the
+metrics originally shown after each run and any permission prompts originally presented to the
+user. Historical permission decisions are informational and are never reapplied as grants.
+Legacy session schemas are upcast in memory when read; loading or listing sessions never rewrites
+their stored payloads. A modified session is written using the current schema on its next save.
+
 Use `/sessions` to show names, stable IDs, update times, and message counts in a table. Use
 `/resume` with name-based completion to select a session; a captured name-to-ID resolver keeps its
 stable ID internal. `/new` starts a fresh unpersisted session, and `/rename` assigns a name that
@@ -125,7 +135,7 @@ a session manager configured with a durable store; without one, the session rema
 Each submitted user message starts one bounded agent run. The configured `Agent` owns the backend,
 dynamic instructions, tool registry, and permission policy; `AgentRunner` performs repeated model
 and tool turns until the model returns a final response. `Loop` remains responsible for user input,
-commands, mentions, session naming, and usage display. Runs default to at most 25 model turns so a
+commands, mentions, session naming, and metrics display. Runs default to at most 25 model turns so a
 model that repeatedly requests tools cannot continue indefinitely; set `max_agent_turns=0` to
 disable the limit (unlimited turns). Library callers can change the limit with
 `Loop(..., max_agent_turns=10)` and inspect the configured identity through `loop.agent`. When the
@@ -338,8 +348,10 @@ before its function is invoked. The default `confirm_all` mode asks about every 
 read-only and pure tools. A required approval is denied when no interactive user is available.
 
 The local policy is stored at `.loop/permissions.yaml` under the Git project root. It is created
-when the policy is first changed. Decisions are appended to
-`.loop/permissions-audit.jsonl`. Use `/permissions` to display the active policy:
+when the policy is first changed. Decisions are appended to `.loop/permissions-audit.jsonl` and
+recorded as structured events in the active session. The session event includes the normalized
+request, effective result and source, whether the user was prompted, and the exact displayed
+prompt. Use `/permissions` to display the active policy:
 
 ```text
 /permissions

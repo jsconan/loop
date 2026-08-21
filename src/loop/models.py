@@ -14,6 +14,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 type StructuredOutputValidator = Callable[[JsonValue], Any]
+type AgentRunStopReason = Literal["completed", "cancelled", "max_turns"]
 
 _JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE | re.DOTALL)
 
@@ -277,6 +278,83 @@ class Usage(BaseModel):
     total_tokens: int | None = Field(default=None, exclude_if=lambda value: value is None)
     cached_tokens: int | None = Field(default=None, exclude_if=lambda value: value is None)
     reasoning_tokens: int | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class ResponseMetrics(BaseModel):
+    """Describe client-observed timing for one completed response.
+
+    Args:
+        duration_seconds (float): End-to-end response duration in seconds.
+        time_to_first_chunk_seconds (float | None): Time to the first streamed event, when known.
+    """
+
+    duration_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
+    time_to_first_chunk_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+class ModelCallMetrics(BaseModel):
+    """Describe one completed model operation.
+
+    Args:
+        model (str | None): Model reported for the operation, when known.
+        duration_seconds (float): Client-observed operation duration in seconds.
+        time_to_first_chunk_seconds (float | None): Time from request issuance to the first
+            streamed chunk, when known.
+        usage (Usage): Provider-reported token usage.
+    """
+
+    model: str | None = None
+    duration_seconds: float = Field(ge=0, allow_inf_nan=False)
+    time_to_first_chunk_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    usage: Usage = Field(default_factory=Usage)
+
+
+class ToolExecutionMetrics(BaseModel):
+    """Describe one local tool execution.
+
+    Args:
+        name (str): Public tool name.
+        duration_seconds (float): Tool-function execution duration in seconds, excluding
+            permission prompts.
+        succeeded (bool): Whether the serialized result did not report an error.
+    """
+
+    name: str
+    duration_seconds: float = Field(ge=0, allow_inf_nan=False)
+    succeeded: bool
+
+
+class RunMetrics(BaseModel):
+    """Describe durable statistics for one completed agent run.
+
+    Args:
+        active_duration_seconds (float): Sum of measured machine-controlled checkpoints.
+        elapsed_duration_seconds (float | None): Historical end-to-end wall duration when a
+            legacy record supplied it; this may include human wait time.
+        model_duration_seconds (float): Sum of completed model-operation durations.
+        tool_duration_seconds (float): Sum of tool-function execution durations.
+        model_calls (tuple[ModelCallMetrics, ...]): Completed model operations.
+        tools (tuple[ToolExecutionMetrics, ...]): Dispatched tool operations.
+        message_count (int): Total user and assistant messages after the run.
+        item_count (int): Total canonical conversation items after the run.
+        usage (Usage): Exact aggregate provider usage for completed calls.
+        model (str | None): Current response model after the run.
+        context_tokens (int | None): Current occupied context size.
+        context_window (int | None): Current model context capacity.
+    """
+
+    active_duration_seconds: float = Field(ge=0, allow_inf_nan=False)
+    elapsed_duration_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    model_duration_seconds: float = Field(ge=0, allow_inf_nan=False)
+    tool_duration_seconds: float = Field(ge=0, allow_inf_nan=False)
+    model_calls: tuple[ModelCallMetrics, ...] = ()
+    tools: tuple[ToolExecutionMetrics, ...] = ()
+    message_count: int = Field(ge=0)
+    item_count: int = Field(ge=0)
+    usage: Usage = Field(default_factory=Usage)
+    model: str | None = None
+    context_tokens: int | None = Field(default=None, ge=0)
+    context_window: int | None = Field(default=None, gt=0)
 
 
 class ResponseMetadata(BaseModel):
@@ -570,6 +648,7 @@ class Response(BaseModel):
         usage (Usage): Token usage reported for the response.
         model (str | None): Model identifier reported for the response.
         structured_output (Any | None): Validated structured answer, when requested.
+        metrics (ResponseMetrics): Client-observed operation timing.
     """
 
     answer: str
@@ -579,3 +658,4 @@ class Response(BaseModel):
     usage: Usage = Field(default_factory=Usage)
     model: str | None = None
     structured_output: Any | None = Field(default=None, exclude_if=lambda value: value is None)
+    metrics: ResponseMetrics = Field(default_factory=ResponseMetrics)

@@ -3,9 +3,11 @@
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Protocol, Self
+from uuid import uuid7
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from ..models import (
     ConversationItem,
@@ -20,15 +22,18 @@ from .models import (
     SESSION_NAME_SOURCE_INITIAL,
     SESSION_NAME_SOURCE_USER,
     Compaction,
+    CompactionEvent,
+    ConversationItemEvent,
     SerializedMessage,
     SerializedSession,
+    SessionEvent,
     SessionInfo,
     SessionNameSource,
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 4
-_SUPPORTED_VERSIONS = (1, 2, 3, _SCHEMA_VERSION)
+_SCHEMA_VERSION = 6
+_EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
     "reasoning": Reasoning,
@@ -68,6 +73,8 @@ class Session:
             Defaults to ``None``.
         active_skills (list[tuple[str, str]]): Active skill names and canonical locations.
             Defaults to an empty list.
+        events (list[SessionEvent]): Ordered durable replay and observability events.
+            Defaults to an empty list.
     """
 
     id: str | None = None
@@ -80,6 +87,32 @@ class Session:
     context_window: int | None = None
     instruction_working_directory: str | None = None
     active_skills: list[tuple[str, str]] = field(default_factory=list)
+    events: list[SessionEvent] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.events:
+            return
+        created_at = datetime.now(UTC)
+        checkpoints = {
+            compaction.boundary: index for index, compaction in enumerate(self.compactions)
+        }
+        for index in range(len(self.messages) + 1):
+            if index in checkpoints:
+                self.events.append(
+                    CompactionEvent(
+                        id=str(uuid7()),
+                        created_at=created_at,
+                        compaction_index=checkpoints[index],
+                    )
+                )
+            if index < len(self.messages):
+                self.events.append(
+                    ConversationItemEvent(
+                        id=str(uuid7()),
+                        created_at=created_at,
+                        item_index=index,
+                    )
+                )
 
     def update_instruction_state(
         self,
@@ -138,13 +171,17 @@ class Session:
             ValueError: If the value is not a supported conversation item.
         """
         if isinstance(message, Response):
-            self.add_messages(message.items)
+            validated = [self._get_message(item) for item in message.items]
+            for item in validated:
+                self.messages.append(item)
+                if not isinstance(item, ToolCall):
+                    self._add_conversation_event(len(self.messages) - 1)
             if message.usage.total_tokens is not None:
                 self.tokens = message.usage.total_tokens
             if isinstance(message.model, str):
                 self.model = message.model
         else:
-            self.messages.append(self._get_message(message))
+            self.add_messages((message,))
 
     def add_messages(self, messages: Iterable[ConversationItem]) -> None:
         """Add messages to the conversation history.
@@ -155,7 +192,49 @@ class Session:
         Raises:
             ValueError: If any value is not a supported conversation item.
         """
-        self.messages.extend([self._get_message(message) for message in messages])
+        validated = [self._get_message(message) for message in messages]
+        for message in validated:
+            self.messages.append(message)
+            self._add_conversation_event(len(self.messages) - 1)
+
+    def add_tool_call_event(self, call_id: str) -> None:
+        """Place one persisted model tool call in the replay timeline.
+
+        Args:
+            call_id (str): Identifier of the canonical tool call to place.
+
+        Raises:
+            ValueError: If the call is unknown or already present in the timeline.
+        """
+        item_index = next(
+            (
+                index
+                for index in range(len(self.messages) - 1, -1, -1)
+                if isinstance(self.messages[index], ToolCall)
+                and self.messages[index].call_id == call_id
+            ),
+            None,
+        )
+        recorded = {
+            event.item_index
+            for event in self.events
+            if isinstance(event, ConversationItemEvent)
+        }
+        if item_index is None:
+            raise ValueError(f"Unknown tool call '{call_id}'.")
+        if item_index in recorded:
+            raise ValueError(f"Tool call '{call_id}' is already in the session timeline.")
+        self._add_conversation_event(item_index)
+
+    def _add_conversation_event(self, item_index: int) -> None:
+        """Append one canonical conversation item to the replay timeline."""
+        self.events.append(
+            ConversationItemEvent(
+                id=str(uuid7()),
+                created_at=datetime.now(UTC),
+                item_index=item_index,
+            )
+        )
 
     def add_compaction(self, compaction: Compaction) -> None:
         """Append a validated compaction checkpoint.
@@ -173,6 +252,13 @@ class Session:
         if self.compactions and compaction.boundary <= self.compactions[-1].boundary:
             raise ValueError("Compaction boundary must advance beyond the previous checkpoint.")
         self.compactions.append(compaction)
+        self.events.append(
+            CompactionEvent(
+                id=str(uuid7()),
+                created_at=datetime.now(UTC),
+                compaction_index=len(self.compactions) - 1,
+            )
+        )
 
     def model_context(self) -> list[ModelContextItem]:
         """Return bounded context for the next model request.
@@ -230,36 +316,82 @@ class Session:
                 context_window=self.context_window,
                 instruction_working_directory=self.instruction_working_directory,
                 active_skills=[list(identity) for identity in self.active_skills],
+                events=[event.model_dump(mode="json") for event in self.events],
             ),
             separators=(",", ":"),
         )
 
-    @classmethod
-    def _deserialize_name(
-        cls,
-        version: int,
-        payload: dict,
-        messages: list[ConversationItem],
-    ) -> tuple[str | None, SessionNameSource | None]:
-        """Return validated name metadata from one supported snapshot."""
-        if version < 3:
-            first_user_message = next(
-                (
-                    message.content
-                    for message in messages
-                    if isinstance(message, Message) and message.role == "user"
-                ),
-                "",
-            )
-            name = initial_session_name(first_user_message) if first_user_message else None
-            name_source = SESSION_NAME_SOURCE_INITIAL if name is not None else None
-            return name, name_source
-        name = payload["name"]
-        name_source = payload["name_source"]
+    @staticmethod
+    def _validate_snapshot_metadata(
+        *,
+        name: object,
+        name_source: object,
+        tokens: object,
+        model: object,
+        context_window: object,
+        instruction_working_directory: object,
+        active_skills: object,
+    ) -> None:
+        """Validate scalar and instruction metadata from a current snapshot."""
         if name is not None and (not isinstance(name, str) or not normalize_session_name(name)):
             raise TypeError("Invalid serialized session name.")
         validate_session_source(name_source, allow_none=True)
-        return name, name_source
+        if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+            raise TypeError("Invalid tokens count.")
+        if model is not None and not isinstance(model, str):
+            raise TypeError("Invalid serialized model name.")
+        if context_window is not None and (
+            not isinstance(context_window, int)
+            or isinstance(context_window, bool)
+            or context_window <= 0
+        ):
+            raise TypeError("Invalid serialized context window.")
+        if instruction_working_directory is not None and not isinstance(
+            instruction_working_directory, str
+        ):
+            raise TypeError("Invalid serialized instruction working directory.")
+        if not isinstance(active_skills, list) or any(
+            not isinstance(identity, list)
+            or len(identity) != 2
+            or not all(isinstance(value, str) for value in identity)
+            for identity in active_skills
+        ):
+            raise TypeError("Invalid serialized active skills.")
+
+    @staticmethod
+    def _validate_timeline(
+        messages: list[ConversationItem],
+        compactions: list[Compaction],
+        events: list[SessionEvent],
+    ) -> None:
+        """Validate canonical checkpoint and event references."""
+        previous_boundary = -1
+        for compaction in compactions:
+            if not compaction.context or compaction.boundary > len(messages):
+                raise TypeError("Invalid serialized compaction.")
+            if compaction.boundary <= previous_boundary:
+                raise TypeError("Invalid serialized compaction order.")
+            previous_boundary = compaction.boundary
+        for event in events:
+            if isinstance(event, ConversationItemEvent) and event.item_index >= len(messages):
+                raise TypeError("Invalid serialized conversation event.")
+            if isinstance(event, CompactionEvent) and event.compaction_index >= len(compactions):
+                raise TypeError("Invalid serialized compaction event.")
+        item_event_indices = [
+            event.item_index for event in events if isinstance(event, ConversationItemEvent)
+        ]
+        compaction_event_indices = [
+            event.compaction_index for event in events if isinstance(event, CompactionEvent)
+        ]
+        required_item_indices = {
+            index for index, item in enumerate(messages) if not isinstance(item, ToolCall)
+        }
+        duplicate_items = len(item_event_indices) != len(set(item_event_indices))
+        missing_items = not required_item_indices.issubset(item_event_indices)
+        if duplicate_items or missing_items:
+            raise TypeError("Invalid serialized conversation event coverage.")
+        if sorted(compaction_event_indices) != list(range(len(compactions))):
+            raise TypeError("Serialized compaction events do not cover every checkpoint once.")
 
     @classmethod
     def deserialize(cls, value: str) -> Self:
@@ -287,7 +419,13 @@ class Session:
             )
 
         version = payload.get("version")
-        if version not in _SUPPORTED_VERSIONS:
+        if version in {1, 2, 3, 4, 5}:
+            try:
+                payload = cls._upcast_payload(payload)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("Invalid serialized session.") from error
+            version = payload["version"]
+        if version != _SCHEMA_VERSION:
             raise ValueError(f"Unsupported session version {version}.")
 
         try:
@@ -303,48 +441,23 @@ class Session:
 
             tokens = payload["tokens"]
             model = payload["model"]
-            context_window = payload["context_window"] if version >= 4 else None
-            compactions = (
-                [Compaction.model_validate(item) for item in payload["compactions"]]
-                if version >= 4
-                else []
+            context_window = payload["context_window"]
+            compactions = [Compaction.model_validate(item) for item in payload["compactions"]]
+            instruction_working_directory = payload["instruction_working_directory"]
+            active_skills = payload["active_skills"]
+            events = [_EVENT_ADAPTER.validate_python(item) for item in payload["events"]]
+            name = payload["name"]
+            name_source = payload["name_source"]
+            cls._validate_snapshot_metadata(
+                name=name,
+                name_source=name_source,
+                tokens=tokens,
+                model=model,
+                context_window=context_window,
+                instruction_working_directory=instruction_working_directory,
+                active_skills=active_skills,
             )
-            if version == 1:
-                instruction_working_directory = None
-                active_skills = []
-            else:
-                instruction_working_directory = payload["instruction_working_directory"]
-                active_skills = payload["active_skills"]
-            name, name_source = cls._deserialize_name(version, payload, messages)
-
-            if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
-                raise TypeError("Invalid tokens count.")
-            if model is not None and not isinstance(model, str):
-                raise TypeError("Invalid serialized model name.")
-            if context_window is not None and (
-                not isinstance(context_window, int)
-                or isinstance(context_window, bool)
-                or context_window <= 0
-            ):
-                raise TypeError("Invalid serialized context window.")
-            previous_boundary = -1
-            for compaction in compactions:
-                if not compaction.context or compaction.boundary > len(messages):
-                    raise TypeError("Invalid serialized compaction.")
-                if compaction.boundary <= previous_boundary:
-                    raise TypeError("Invalid serialized compaction order.")
-                previous_boundary = compaction.boundary
-            if instruction_working_directory is not None and not isinstance(
-                instruction_working_directory, str
-            ):
-                raise TypeError("Invalid serialized instruction working directory.")
-            if not isinstance(active_skills, list) or any(
-                not isinstance(identity, list)
-                or len(identity) != 2
-                or not all(isinstance(value, str) for value in identity)
-                for identity in active_skills
-            ):
-                raise TypeError("Invalid serialized active skills.")
+            cls._validate_timeline(messages, compactions, events)
 
         except (KeyError, TypeError, ValidationError) as error:
             raise ValueError("Invalid serialized session.") from error
@@ -359,7 +472,92 @@ class Session:
             context_window=context_window,
             instruction_working_directory=instruction_working_directory,
             active_skills=[tuple(identity) for identity in active_skills],
+            events=events,
         )
+
+    @staticmethod
+    def _upcast_payload(payload: dict) -> dict:
+        """Return a current in-memory representation of one legacy snapshot."""
+        value = dict(payload)
+        version = value["version"]
+        messages = value.get("messages", [])
+        compactions = value.get("compactions", []) if version >= 4 else []
+        if (
+            not isinstance(messages, list)
+            or not isinstance(compactions, list)
+            or any(not isinstance(item, dict) for item in messages)
+            or any(not isinstance(item, dict) for item in compactions)
+        ):
+            raise ValueError("Invalid serialized session.")
+        if version == 5:
+            stored_events = value.get("events")
+            if not isinstance(stored_events, list) or any(
+                not isinstance(event, dict) for event in stored_events
+            ):
+                raise ValueError("Invalid serialized session.")
+            events = []
+            for stored_event in stored_events:
+                event = dict(stored_event)
+                if event.get("type") == "run_completed":
+                    model_duration = event.pop("model_duration_seconds", 0)
+                    tool_duration = event.pop("tool_duration_seconds", 0)
+                    elapsed_duration = event.pop("duration_seconds", None)
+                    event["metrics"] = {
+                        "active_duration_seconds": model_duration + tool_duration,
+                        "elapsed_duration_seconds": elapsed_duration,
+                        "model_duration_seconds": model_duration,
+                        "tool_duration_seconds": tool_duration,
+                        "model_calls": event.pop("model_calls", []),
+                        "tools": event.pop("tools", []),
+                        "message_count": event.pop("message_count", 0),
+                        "item_count": event.pop("item_count", 0),
+                        "usage": event.pop("usage", {}),
+                        "model": event.pop("model", None),
+                        "context_tokens": event.pop("context_tokens", None),
+                        "context_window": event.pop("context_window", None),
+                    }
+                events.append(event)
+        else:
+            created_at = datetime.fromtimestamp(0, UTC)
+            events = []
+            checkpoints = {item.get("boundary"): index for index, item in enumerate(compactions)}
+            for index in range(len(messages) + 1):
+                if index in checkpoints:
+                    events.append(
+                        CompactionEvent(
+                            id=str(uuid7()),
+                            created_at=created_at,
+                            compaction_index=checkpoints[index],
+                        ).model_dump(mode="json")
+                    )
+                if index < len(messages):
+                    events.append(
+                        ConversationItemEvent(
+                            id=str(uuid7()), created_at=created_at, item_index=index
+                        ).model_dump(mode="json")
+                    )
+        first_user = next(
+            (
+                data.get("content", "")
+                for item in messages
+                if isinstance((data := item.get("data")), dict)
+                if item.get("type") == "message" and data.get("role") == "user"
+            ),
+            "",
+        )
+        value.update(
+            version=_SCHEMA_VERSION,
+            name=value.get("name", initial_session_name(first_user) if first_user else None),
+            name_source=value.get(
+                "name_source", SESSION_NAME_SOURCE_INITIAL if first_user else None
+            ),
+            compactions=compactions,
+            context_window=value.get("context_window"),
+            instruction_working_directory=value.get("instruction_working_directory"),
+            active_skills=value.get("active_skills", []),
+            events=events,
+        )
+        return value
 
 
 class SessionStore(Protocol):

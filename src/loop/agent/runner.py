@@ -1,15 +1,26 @@
 """Run one agent through bounded model and tool turns."""
 
+import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from time import sleep
+from time import perf_counter, sleep
 
 from .. import constants
 from ..backend import BackendError, BackendNotFoundError
 from ..compaction import ContextCompaction
 from ..interaction import Interaction
 from ..model_selection import ModelSelection
-from ..models import Response
+from ..models import (
+    AgentRunStopReason,
+    Message,
+    ModelCallMetrics,
+    Response,
+    ResponseMetrics,
+    RunMetrics,
+    ToolExecutionMetrics,
+    Usage,
+)
 from ..session import SessionManager
 from .agent import Agent
 from .models import AgentRunResult
@@ -127,23 +138,42 @@ class AgentRunner:
         """
         turn = 0
         response = None
+        calls = []
+        tools = []
+        started_at = datetime.now(UTC)
         while True:
             turn += 1
 
             response = self._query_with_recovery()
             if response is None:
-                return AgentRunResult(
+                return self._record_run_result(
                     final_response=None,
                     turns=turn - 1,
                     stop_reason="cancelled",
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
                 )
+            calls.append(
+                ModelCallMetrics(
+                    model=response.model,
+                    duration_seconds=response.metrics.duration_seconds,
+                    time_to_first_chunk_seconds=response.metrics.time_to_first_chunk_seconds,
+                    usage=response.usage,
+                )
+            )
             self._session_manager.add_response(response)
-            if not self.handle_tool_calls(response):
-                return AgentRunResult(
+            executions = self.handle_tool_calls(response)
+            if not executions:
+                return self._record_run_result(
                     final_response=response,
                     turns=turn,
                     stop_reason="completed",
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
                 )
+            tools.extend(executions)
 
             if self._max_turns > 0 and turn >= self._max_turns:
                 prompt = (
@@ -157,33 +187,54 @@ class AgentRunner:
         self._interaction.warning(
             f"Agent stopped after reaching the {self._max_turns}-turn safety limit."
         )
-        return AgentRunResult(
+        return self._record_run_result(
             final_response=response,
             turns=self._max_turns,
             stop_reason="max_turns",
+            started_at=started_at,
+            calls=calls,
+            tools=tools,
         )
 
-    def handle_tool_calls(self, response: Response) -> bool:
+    def handle_tool_calls(self, response: Response) -> tuple[ToolExecutionMetrics, ...]:
         """Execute and persist every tool call in a model response.
 
         Args:
             response (Response): Model response containing zero or more tool calls.
 
         Returns:
-            bool: ``True`` when at least one tool call was handled; otherwise ``False``.
+            tuple[ToolExecutionMetrics, ...]: Timing and outcome for every handled tool call.
+
+        Raises:
+            ValueError: If a requested tool call is not present in canonical session context.
         """
         if not response.tool_calls:
-            return False
+            return ()
 
         instructions = self._agent.instructions_manager
+        executions = []
         for tool_call in response.tool_calls:
+            self._session_manager.add_tool_call_event(tool_call.call_id)
             self._interaction.tool_call(tool_call.name, tool_call.arguments)
-            tool_result = self._agent.tool_registry.call(
+            tool_result, duration = self._agent.tool_registry.call_with_timing(
                 tool_call.name,
                 tool_call.arguments,
                 interaction=self._interaction,
                 instructions_manager=instructions,
                 permission_manager=self._agent.permission_manager,
+                permission_recorder=self._session_manager,
+            )
+            try:
+                payload = json.loads(tool_result)
+            except json.JSONDecodeError:
+                payload = None
+            succeeded = not isinstance(payload, dict) or "error" not in payload
+            executions.append(
+                ToolExecutionMetrics(
+                    name=tool_call.name,
+                    duration_seconds=duration,
+                    succeeded=succeeded,
+                )
             )
             self._session_manager.add_tool_call(
                 call_id=tool_call.call_id,
@@ -191,7 +242,7 @@ class AgentRunner:
                 working_directory=str(instructions.working_directory or self._working_directory()),
                 active_skills=instructions.active_skill_identities,
             )
-        return True
+        return tuple(executions)
 
     def query(self) -> Response:
         """Request one response using current session context and agent capabilities.
@@ -212,6 +263,8 @@ class AgentRunner:
         )
         self._model_selection.synchronize_session()
         self._compaction.compact_if_needed()
+        started_at = perf_counter()
+        first_chunk_at = None
         events = self._agent.backend.get_response(
             input=self._session_manager.model_context,
             instructions=instructions.instructions,
@@ -219,7 +272,70 @@ class AgentRunner:
             model=selected_model,
             tools=self._agent.tool_registry.definitions(),
         )
-        return self._interaction.response(events, debug=self._debug)
+
+        def measured_events():
+            nonlocal first_chunk_at
+            for event in events:
+                if first_chunk_at is None:
+                    first_chunk_at = perf_counter()
+                yield event
+
+        response = self._session_manager.response(
+            measured_events(), debug=self._debug, interaction=self._interaction
+        )
+        completed_at = perf_counter()
+        response.metrics = ResponseMetrics(
+            duration_seconds=completed_at - started_at,
+            time_to_first_chunk_seconds=(
+                first_chunk_at - started_at if self._stream and first_chunk_at is not None else None
+            ),
+        )
+        return response
+
+    def _record_run_result(
+        self,
+        final_response: Response,
+        turns: int,
+        stop_reason: AgentRunStopReason,
+        started_at: datetime,
+        calls: list[ModelCallMetrics],
+        tools: list[ToolExecutionMetrics],
+    ) -> AgentRunResult:
+        """Persist and return one completed run's aggregate operation statistics."""
+        usage_values = {}
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_tokens",
+            "reasoning_tokens",
+        ):
+            values = [getattr(call.usage, field) for call in calls]
+            usage_values[field] = (
+                sum(value for value in values if value is not None)
+                if values and all(value is not None for value in values)
+                else None
+            )
+        messages = self._session_manager.messages
+        calls_duration = sum(call.duration_seconds for call in calls)
+        tools_duration = sum(tool.duration_seconds for tool in tools)
+        metrics = RunMetrics(
+            active_duration_seconds=calls_duration + tools_duration,
+            model_duration_seconds=calls_duration,
+            tool_duration_seconds=tools_duration,
+            model_calls=tuple(calls),
+            tools=tuple(tools),
+            message_count=sum(isinstance(item, Message) for item in messages),
+            item_count=len(messages),
+            usage=Usage(**usage_values),
+            model=self._session_manager.model,
+            context_tokens=self._session_manager.tokens,
+            context_window=self._session_manager.context_window,
+        )
+        self._session_manager.record_run(stop_reason, started_at, metrics)
+        return AgentRunResult(
+            final_response=final_response, turns=turns, stop_reason=stop_reason, metrics=metrics
+        )
 
     def _query_with_recovery(self) -> Response | None:
         """Request one response while escalating exhausted failures to the user."""

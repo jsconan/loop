@@ -1,6 +1,7 @@
 """Register and dispatch typed functions exposed to an LLM."""
 
 from collections.abc import Callable, Iterable
+from time import perf_counter
 from typing import Any
 
 from pydantic import ValidationError
@@ -10,7 +11,13 @@ from ..commands.utils import parse_model_arguments
 from ..constants import OMIT, Omit
 from ..interaction import Interaction
 from ..models import ToolDefinition
-from ..permissions import Capability, Decision, PermissionManager, PermissionRequest
+from ..permissions import (
+    Capability,
+    Decision,
+    PermissionManager,
+    PermissionRecorder,
+    PermissionRequest,
+)
 from ..skills import InstructionsManager
 from ..utils import callable_name
 from .context import ToolContext
@@ -172,6 +179,7 @@ class ToolRegistry:
         interaction: Interaction | None = None,
         instructions_manager: InstructionsManager | None = None,
         permission_manager: PermissionManager | None = None,
+        permission_recorder: PermissionRecorder | None = None,
     ) -> str:
         """Dispatch a synchronous tool call by registered name.
 
@@ -184,6 +192,7 @@ class ToolRegistry:
                 current conversation.
             permission_manager (PermissionManager | None): Invocation policy overriding the
                 registry default.
+            permission_recorder (PermissionRecorder | None): Invocation-scoped permission sink.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -191,20 +200,66 @@ class ToolRegistry:
         Raises:
             ValueError: If the tool requires a context but none is provided.
         """
+        output, _ = self.call_with_timing(
+            name,
+            arguments,
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+            permission_manager=permission_manager,
+            permission_recorder=permission_recorder,
+        )
+        return output
+
+    def call_with_timing(
+        self,
+        name: str,
+        arguments: str,
+        *,
+        interaction: Interaction | None = None,
+        instructions_manager: InstructionsManager | None = None,
+        permission_manager: PermissionManager | None = None,
+        permission_recorder: PermissionRecorder | None = None,
+    ) -> tuple[str, float]:
+        """Dispatch a tool and measure only its function execution.
+
+        Args:
+            name (str): Registered tool name.
+            arguments (str): JSON-encoded arguments supplied by the model.
+            interaction (Interaction | None): Interaction for this invocation.
+            instructions_manager (InstructionsManager | None): Active instruction manager.
+            permission_manager (PermissionManager | None): Invocation permission policy.
+            permission_recorder (PermissionRecorder | None): Invocation-scoped permission sink.
+
+        Returns:
+            tuple[str, float]: Serialized result and tool-function duration in seconds. Validation
+                and authorization failures have a zero duration because no tool ran.
+
+        Raises:
+            ValueError: If the tool requires a context but none is provided.
+        """
         tool = self._tools.get(name)
         if tool is None:
-            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
+            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available."), 0
         validated, error = tool.validate_arguments(arguments)
         if error is not None:
-            return error
+            return error, 0
         active_permissions = permission_manager or self._permission_manager
-        denied, grants = self._authorize(tool, validated, interaction, active_permissions)
-        if denied is not None:
-            return denied
-        context = self._context_for(
-            tool, interaction, instructions_manager, active_permissions, grants
+        denied, grants = self._authorize(
+            tool, validated, interaction, active_permissions, permission_recorder
         )
-        return tool.call(validated, context)
+        if denied is not None:
+            return denied, 0
+        context = self._context_for(
+            tool,
+            interaction,
+            instructions_manager,
+            active_permissions,
+            grants,
+            permission_recorder,
+        )
+        started = perf_counter()
+        output = tool.call(validated, context)
+        return output, perf_counter() - started
 
     async def call_async(
         self,
@@ -214,6 +269,7 @@ class ToolRegistry:
         interaction: Interaction | None = None,
         instructions_manager: InstructionsManager | None = None,
         permission_manager: PermissionManager | None = None,
+        permission_recorder: PermissionRecorder | None = None,
     ) -> str:
         """Dispatch an asynchronous or synchronous tool call by registered name.
 
@@ -226,6 +282,7 @@ class ToolRegistry:
                 current conversation.
             permission_manager (PermissionManager | None): Invocation policy overriding the
                 registry default.
+            permission_recorder (PermissionRecorder | None): Invocation-scoped permission sink.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -240,11 +297,18 @@ class ToolRegistry:
         if error is not None:
             return error
         active_permissions = permission_manager or self._permission_manager
-        denied, grants = self._authorize(tool, validated, interaction, active_permissions)
+        denied, grants = self._authorize(
+            tool, validated, interaction, active_permissions, permission_recorder
+        )
         if denied is not None:
             return denied
         context = self._context_for(
-            tool, interaction, instructions_manager, active_permissions, grants
+            tool,
+            interaction,
+            instructions_manager,
+            active_permissions,
+            grants,
+            permission_recorder,
         )
         return await tool.call_async(validated, context)
 
@@ -301,26 +365,26 @@ class ToolRegistry:
         arguments: dict[str, Any],
         interaction: Interaction | None,
         permission_manager: PermissionManager,
+        permission_recorder: PermissionRecorder | None,
     ) -> tuple[str | None, frozenset[PermissionRequest]]:
         """Return a serialized denial or the grants approved for a tool call."""
         active_interaction = interaction if interaction is not None else self._interaction
-        previous = permission_manager.interaction
-        permission_manager.interaction = active_interaction
         grants = set()
-        try:
-            for request in tool.permission_requests(arguments):
-                result = permission_manager.authorize(request)
-                if result.decision is Decision.DENY:
-                    return (
-                        serialize_tool_error(
-                            "tool_call_denied",
-                            f"Tool '{tool.name}' was not executed: {result.reason}",
-                        ),
-                        frozenset(),
-                    )
-                grants.add(request)
-        finally:
-            permission_manager.interaction = previous
+        for request in tool.permission_requests(arguments):
+            result = permission_manager.authorize(
+                request,
+                interaction=active_interaction,
+                recorder=permission_recorder,
+            )
+            if result.decision is Decision.DENY:
+                return (
+                    serialize_tool_error(
+                        "tool_call_denied",
+                        f"Tool '{tool.name}' was not executed: {result.reason}",
+                    ),
+                    frozenset(),
+                )
+            grants.add(request)
         return None, frozenset(grants)
 
     def _context_for(
@@ -330,6 +394,7 @@ class ToolRegistry:
         instructions_manager: InstructionsManager | None,
         permission_manager: PermissionManager | None,
         grants: frozenset[PermissionRequest] = frozenset(),
+        permission_recorder: PermissionRecorder | None = None,
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""
         if interaction is None:
@@ -341,5 +406,6 @@ class ToolRegistry:
             tool_name=tool.name,
             instructions_manager=instructions_manager,
             permission_manager=permission_manager,
+            permission_recorder=permission_recorder,
             grants=grants,
         )

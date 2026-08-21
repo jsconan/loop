@@ -1,28 +1,53 @@
 """Tests for session coordination and persistence."""
 
 import json
-from unittest.mock import Mock
+from contextlib import nullcontext
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, call
 from uuid import uuid4
 
 import pytest
 
 from loop import (
+    AnswerCompleted,
+    AnswerDelta,
+    Capability,
+    Compaction,
     CompactionContextItem,
     CompactionResult,
     ConsoleInteraction,
     ContentArtifact,
     ContextReference,
+    Decision,
+    InstructionSnapshot,
     MemorySessionStore,
     Message,
+    PermissionRequest,
+    PermissionResult,
+    Reasoning,
+    ReasoningCompleted,
+    ReasoningDelta,
     Response,
+    ResponseCompleted,
+    RunMetrics,
     Session,
     SessionManager,
+    ToolCall,
+    ToolCallCompleted,
     ToolResult,
     Usage,
 )
 from loop.interaction import Interaction
-from loop.session import SessionStore
+from loop.session import PermissionEvent, RunCompletedEvent, SessionStore
 from loop.utils import cached_metadata, cached_path, store_content
+
+
+def response_interaction() -> MagicMock:
+    """Build an interaction mock backed by a no-op response scope."""
+    interaction = MagicMock(spec=Interaction)
+    interaction.response_context.return_value = nullcontext()
+    return interaction
 
 
 def test_manager_creates_default_services_and_an_empty_session():
@@ -49,6 +74,173 @@ def test_manager_uses_injected_services_and_session():
     assert manager.session is session
     assert manager.messages is session.messages
     assert manager.model == "model-a"
+
+
+def test_manager_response_uses_terminal_text_and_an_interaction_override():
+    """Response collection renders events and returns authoritative terminal metadata."""
+    configured = response_interaction()
+    interaction = response_interaction()
+    manager = SessionManager(interaction=configured)
+    tool_call = ToolCall(call_id="call", name="tool", arguments="{}", id="fc")
+    items = (
+        Reasoning(content="think again", id="r"),
+        Message(role="assistant", content="hello world"),
+    )
+    events = [
+        ReasoningDelta(text="incomplete "),
+        ReasoningDelta(text="thought"),
+        AnswerDelta(text="incomplete "),
+        AnswerDelta(text="answer"),
+        ToolCallCompleted(call=tool_call),
+        SimpleNamespace(ignored=True),
+        ResponseCompleted(
+            items=items,
+            usage=Usage(total_tokens=230),
+            model="served-model",
+            answer="  hello world  ",
+            reasoning="  think again  ",
+            structured_output={"message": "hello world"},
+        ),
+    ]
+
+    response = manager.response(events, debug=True, interaction=interaction)
+
+    assert response == Response(
+        answer="  hello world  ",
+        reasoning="  think again  ",
+        tool_calls=(tool_call,),
+        items=items,
+        usage=Usage(total_tokens=230),
+        model="served-model",
+        structured_output={"message": "hello world"},
+    )
+    assert interaction.reasoning_delta.call_args_list[0].kwargs == {"start": True}
+    assert interaction.reasoning_delta.call_args_list[1].kwargs == {"start": False}
+    assert interaction.answer_delta.call_args_list[0].kwargs == {"start": True}
+    assert interaction.answer_delta.call_args_list[1].kwargs == {"start": False}
+    interaction.response_context.assert_called_once_with()
+    assert interaction.debug.call_count == len(events)
+    configured.response_context.assert_not_called()
+
+
+def test_manager_response_displays_completed_text_with_its_configured_interaction():
+    """Completed response text is rendered through the manager's interaction."""
+    interaction = response_interaction()
+    manager = SessionManager(interaction=interaction)
+
+    response = manager.response(
+        [
+            ReasoningCompleted(text="think"),
+            AnswerCompleted(text="answer"),
+            ResponseCompleted(answer="answer", reasoning="think"),
+        ]
+    )
+
+    assert response == Response(answer="answer", reasoning="think")
+    interaction.reasoning.assert_called_once_with("think")
+    interaction.answer.assert_called_once_with("answer")
+    interaction.response_context.assert_called_once_with()
+
+
+def test_manager_response_defaults_missing_metadata():
+    """A completion without metadata returns default response values."""
+    interaction = response_interaction()
+    manager = SessionManager(interaction=interaction)
+
+    response = manager.response([ResponseCompleted()])
+
+    assert response == Response(answer="", reasoning="")
+
+
+def test_manager_replays_visible_session_items_in_durable_order():
+    """Replay mirrors live output, compactions, and intentionally hidden tool results."""
+    interaction = MagicMock(spec=Interaction)
+    items = (
+        Message(role="user", content="question"),
+        Reasoning(content="thought"),
+        ToolCall(call_id="known", name="search", arguments='{"query":"term"}'),
+        ToolResult(call_id="known", output="result"),
+        Message(role="assistant", content="answer"),
+    )
+    instructions = InstructionSnapshot(working_directory="/project", content=None, digest="digest")
+    compactions = (
+        Compaction(
+            id="first",
+            boundary=0,
+            created_at=datetime(2026, 8, 16, tzinfo=UTC),
+            provider="test",
+            model="model",
+            context=(CompactionContextItem(provider="test", data={}),),
+            instructions=instructions,
+        ),
+        Compaction(
+            id="second",
+            boundary=3,
+            created_at=datetime(2026, 8, 16, tzinfo=UTC),
+            provider="test",
+            model="model",
+            context=(CompactionContextItem(provider="test", data={}),),
+            instructions=instructions,
+            input_tokens_before=12_345,
+            input_tokens_after=678,
+        ),
+    )
+    manager = SessionManager(session=Session(messages=list(items), compactions=list(compactions)))
+
+    manager.replay(interaction=interaction)
+
+    assert interaction.method_calls == [
+        call.info("Compacted session context."),
+        call.user("question"),
+        call.reasoning("thought"),
+        call.tool_call("search", '{"query":"term"}'),
+        call.info("Compacted session context from 12,345 to 678 tokens."),
+        call.answer("answer"),
+    ]
+
+
+def test_manager_replays_permissions_and_run_statistics():
+    """Replay includes prompted approvals and run summaries while hiding automatic decisions."""
+    interaction = MagicMock(spec=Interaction)
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    request = PermissionRequest(tool_name="read", capability=Capability.FILESYSTEM_READ)
+    result = PermissionResult(decision=Decision.ALLOW, reason="allowed", source="user")
+    prompted = PermissionEvent(
+        id="permission",
+        created_at=now,
+        request=request,
+        result=result,
+        prompted=True,
+        prompt=None,
+    )
+    metrics = RunMetrics(
+        active_duration_seconds=1,
+        model_duration_seconds=1,
+        tool_duration_seconds=0,
+        message_count=0,
+        item_count=0,
+    )
+    manager = SessionManager(
+        interaction=interaction,
+        session=Session(
+            events=[
+                prompted,
+                prompted.model_copy(update={"id": "automatic", "prompted": False}),
+                RunCompletedEvent(
+                    id="run",
+                    created_at=now,
+                    started_at=now,
+                    stop_reason="completed",
+                    metrics=metrics,
+                ),
+            ]
+        ),
+    )
+
+    manager.replay()
+
+    interaction.permission.assert_called_once_with("Permission requested.", "allow")
+    interaction.run_metrics.assert_called_once_with(metrics)
 
 
 def test_manager_loads_a_session_identifier_during_initialization():
@@ -484,3 +676,34 @@ def test_manager_does_not_persist_rejected_items(method):
         getattr(manager, method)(value)
 
     store.save.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["run", "tool_call", "message"])
+def test_manager_rolls_back_every_mutation_when_persistence_fails(kind):
+    """Failed writes restore identical in-memory state for messages and timeline events."""
+    store = Mock(spec=SessionStore)
+    store.save.side_effect = OSError("disk full")
+    session = Session(messages=[ToolCall(call_id="call", name="demo", arguments="{}")])
+    session.events.clear()
+    manager = SessionManager(session=session, session_store=store)
+
+    with pytest.raises(OSError, match="disk full"):
+        if kind == "run":
+            manager.record_run(
+                "completed",
+                datetime(2026, 8, 20, tzinfo=UTC),
+                RunMetrics(
+                    active_duration_seconds=0,
+                    model_duration_seconds=0,
+                    tool_duration_seconds=0,
+                    message_count=0,
+                    item_count=1,
+                ),
+            )
+        elif kind == "tool_call":
+            manager.add_tool_call_event("call")
+        else:
+            manager.add_message(Message(role="assistant", content="answer"))
+
+    assert session.events == []
+    assert session.messages == [ToolCall(call_id="call", name="demo", arguments="{}")]

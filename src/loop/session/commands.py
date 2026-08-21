@@ -62,15 +62,7 @@ class SessionCommands:
             raise CommandArgumentError(str(error)) from error
         session = self._session_manager.session
         context.interaction.info(f"Restoring session history for '{session.name}'...")
-        context.interaction.history(
-            self._session_manager.messages,
-            session.compactions,
-        )
-        context.interaction.token_usage(
-            self._session_manager.model,
-            self._session_manager.tokens,
-            self._session_manager.context_window,
-        )
+        self._session_manager.replay(interaction=context.interaction)
         context.interaction.info(f"Resumed session '{session.name}'.")
 
     def sessions(self, context: CommandContext) -> None:

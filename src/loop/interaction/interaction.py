@@ -3,29 +3,12 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from prompt_toolkit.completion import Completer
 
 from .. import constants
-from ..models import (
-    AnswerCompleted,
-    AnswerDelta,
-    ConversationItem,
-    Message,
-    Reasoning,
-    ReasoningCompleted,
-    ReasoningDelta,
-    Response,
-    ResponseCompleted,
-    ResponseEvent,
-    ToolCall,
-    ToolCallCompleted,
-    Usage,
-)
-
-if TYPE_CHECKING:
-    from ..session.models import Compaction
+from ..models import RunMetrics
 
 
 class Interaction(ABC):
@@ -204,18 +187,20 @@ class Interaction(ABC):
         """
 
     @abstractmethod
-    def token_usage(
-        self,
-        model: str | None,
-        context_tokens: int | None,
-        context_window: int | None,
-    ) -> None:
-        """Display the current model and context occupancy.
+    def run_metrics(self, metrics: RunMetrics) -> None:
+        """Display one completed agent run's durable statistics.
 
         Args:
-            model (str | None): Current model identifier, when known.
-            context_tokens (int | None): Number of tokens currently in the context, when known.
-            context_window (int | None): Maximum context size in tokens, when known.
+            metrics (RunMetrics): Complete run statistics and current context occupancy.
+        """
+
+    @abstractmethod
+    def permission(self, prompt: str, decision: str) -> None:
+        """Display one originally prompted permission decision.
+
+        Args:
+            prompt (str): Exact original prompt or a replay fallback.
+            decision (str): Effective decision label.
         """
 
     @abstractmethod
@@ -233,110 +218,3 @@ class Interaction(ABC):
         Returns:
             bool: Whether the user approved the operation.
         """
-
-    def response(self, events: Iterable[ResponseEvent], *, debug: bool = False) -> Response:
-        """Display and collect normalized response events.
-
-        Args:
-            events (Iterable[ResponseEvent]): Response events to display and collect.
-            debug (bool): Whether to display every raw response event.
-
-        Returns:
-            Response: The collected answer, reasoning, tool calls, items, usage, and model.
-        """
-        reasoning = ""
-        answer = ""
-        tool_calls = []
-        items = ()
-        usage = None
-        model = None
-        structured_output = None
-        reasoning_started = False
-        answer_started = False
-
-        with self.response_context():
-            for event in events:
-                if debug:
-                    self.debug(event)
-
-                if isinstance(event, ReasoningDelta):
-                    self.reasoning_delta(event.text, start=not reasoning_started)
-                    reasoning_started = True
-                    continue
-
-                if isinstance(event, AnswerDelta):
-                    self.answer_delta(event.text, start=not answer_started)
-                    answer_started = True
-                    continue
-
-                if isinstance(event, ReasoningCompleted):
-                    reasoning = event.text
-                    self.reasoning(event.text)
-                    continue
-
-                if isinstance(event, AnswerCompleted):
-                    answer = event.text
-                    self.answer(event.text)
-                    continue
-
-                if isinstance(event, ToolCallCompleted):
-                    tool_calls.append(event.call)
-                    continue
-
-                if isinstance(event, ResponseCompleted):
-                    items = event.items
-                    usage = event.usage
-                    model = event.model
-                    answer = event.answer
-                    reasoning = event.reasoning
-                    structured_output = event.structured_output
-
-        return Response(
-            answer=answer,
-            reasoning=reasoning,
-            tool_calls=tuple(tool_calls),
-            items=items,
-            usage=usage or Usage(),
-            model=model,
-            structured_output=structured_output,
-        )
-
-    def history(
-        self,
-        items: Iterable[ConversationItem],
-        compactions: Iterable[Compaction] = (),
-    ) -> None:
-        """Display persisted conversation items as prior interaction.
-
-        Args:
-            items (Iterable[ConversationItem]): Ordered conversation items to replay.
-            compactions (Iterable[Compaction]): Ordered compaction checkpoints to replay at their
-                full-history boundaries.
-        """
-
-        def display_compaction(compaction: Compaction) -> None:
-            before = compaction.input_tokens_before
-            after = compaction.input_tokens_after
-            if before is not None and after is not None and before != after:
-                self.info(f"Compacted session context from {before:,} to {after:,} tokens.")
-            else:
-                self.info("Compacted session context.")
-
-        checkpoints = iter(compactions)
-        checkpoint = next(checkpoints, None)
-        for index, item in enumerate(items):
-            while checkpoint is not None and checkpoint.boundary == index:
-                display_compaction(checkpoint)
-                checkpoint = next(checkpoints, None)
-            if isinstance(item, Message):
-                display = self.user if item.role == "user" else self.answer
-                display(item.content)
-                continue
-            if isinstance(item, Reasoning):
-                self.reasoning(item.content)
-                continue
-            if isinstance(item, ToolCall):
-                self.tool_call(item.name, item.arguments)
-        while checkpoint is not None:
-            display_compaction(checkpoint)
-            checkpoint = next(checkpoints, None)

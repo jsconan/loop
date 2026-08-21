@@ -22,7 +22,7 @@ def test_store_round_trips_snapshots_and_updates_metadata():
     session = Session(messages=[Message(role="user", content="hello")], tokens=12)
 
     session_id = store.save(session)
-    session.messages.append(Message(role="assistant", content="answer"))
+    session.add_message(Message(role="assistant", content="answer"))
     assert store.load(session_id) != session
 
     session.model = "model-a"

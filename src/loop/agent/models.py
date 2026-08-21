@@ -1,12 +1,8 @@
 """Define results produced by an agent run."""
 
-from typing import Literal
-
 from pydantic import BaseModel
 
-from ..models import Response
-
-type AgentRunStopReason = Literal["completed", "cancelled", "max_turns"]
+from ..models import AgentRunStopReason, Response, RunMetrics
 
 
 class AgentRunResult(BaseModel):
@@ -17,8 +13,10 @@ class AgentRunResult(BaseModel):
             response completed.
         turns (int): Number of completed model turns in the run.
         stop_reason (AgentRunStopReason): Reason control returned to the caller.
+        metrics (RunMetrics | None): Persisted run statistics after completion.
     """
 
     final_response: Response | None
     turns: int
     stop_reason: AgentRunStopReason
+    metrics: RunMetrics | None = None

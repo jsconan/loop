@@ -2,15 +2,15 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Protocol, TypedDict
+from typing import Annotated, Literal, Protocol, TypedDict
 
 from pydantic import BaseModel, Field
 
 from .. import constants
-from ..models import CompactionContextItem
+from ..models import AgentRunStopReason, CompactionContextItem, RunMetrics
+from ..permissions import PermissionRequest, PermissionResult
 
 SessionNameSource = Literal["initial", "generated", "user"]
-
 SESSION_NAME_SOURCE_INITIAL: SessionNameSource = "initial"
 SESSION_NAME_SOURCE_GENERATED: SessionNameSource = "generated"
 SESSION_NAME_SOURCE_USER: SessionNameSource = "user"
@@ -71,6 +71,82 @@ class Compaction(BaseModel):
     input_tokens_after: int | None = Field(default=None, ge=0)
 
 
+class SessionEventModel(BaseModel):
+    """Provide identity and time shared by durable session events.
+
+    Args:
+        id (str): Stable event identifier.
+        created_at (datetime): UTC time at which the event occurred.
+    """
+
+    id: str
+    created_at: datetime
+
+
+class ConversationItemEvent(SessionEventModel):
+    """Place one canonical conversation item in the replay timeline.
+
+    Args:
+        type (Literal["conversation_item"]): Event discriminator.
+        item_index (int): Index into the session's canonical conversation items.
+    """
+
+    type: Literal["conversation_item"] = "conversation_item"
+    item_index: int = Field(ge=0)
+
+
+class PermissionEvent(SessionEventModel):
+    """Record one evaluated permission request and its effective result.
+
+    Args:
+        type (Literal["permission"]): Event discriminator.
+        request (PermissionRequest): Normalized requested authority.
+        result (PermissionResult): Effective authorization result.
+        prompted (bool): Whether an interactive approval prompt was displayed.
+        prompt (str | None): Exact displayed prompt, when one was shown.
+    """
+
+    type: Literal["permission"] = "permission"
+    request: PermissionRequest
+    result: PermissionResult
+    prompted: bool
+    prompt: str | None = None
+
+
+class RunCompletedEvent(SessionEventModel):
+    """Record aggregate and operation-level statistics for one agent run.
+
+    Args:
+        type (Literal["run_completed"]): Event discriminator.
+        stop_reason (AgentRunStopReason): Reason the run returned control.
+        started_at (datetime): UTC time at which execution began.
+        metrics (RunMetrics): Complete durable statistics and current context occupancy.
+    """
+
+    type: Literal["run_completed"] = "run_completed"
+    stop_reason: AgentRunStopReason
+    started_at: datetime
+    metrics: RunMetrics
+
+
+class CompactionEvent(SessionEventModel):
+    """Place one compaction checkpoint in the replay timeline.
+
+    Args:
+        type (Literal["compaction"]): Event discriminator.
+        compaction_index (int): Index into the session's canonical compactions.
+    """
+
+    type: Literal["compaction"] = "compaction"
+    compaction_index: int = Field(ge=0)
+
+
+SessionEvent = Annotated[
+    ConversationItemEvent | PermissionEvent | RunCompletedEvent | CompactionEvent,
+    Field(discriminator="type"),
+]
+
+
 class SessionNameGenerator(Protocol):
     """Generate an improved name from the first conversation exchange."""
 
@@ -124,6 +200,7 @@ class SerializedSession(TypedDict):
     context_window: int | None
     instruction_working_directory: str | None
     active_skills: list[list[str]]
+    events: list[dict]
 
 
 class StoredSession(TypedDict):

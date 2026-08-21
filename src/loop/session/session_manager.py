@@ -1,22 +1,37 @@
 """Session manager for handling user sessions."""
 
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from copy import deepcopy
+from dataclasses import fields
 from datetime import UTC, datetime
 from uuid import uuid7
 
 from .. import constants
 from ..interaction import ConsoleInteraction, Interaction
 from ..models import (
+    AgentRunStopReason,
+    AnswerCompleted,
+    AnswerDelta,
     CompactionResult,
     ContentArtifact,
     ContextReference,
     ConversationItem,
     Message,
     ModelContextItem,
+    Reasoning,
+    ReasoningCompleted,
+    ReasoningDelta,
     Response,
+    ResponseCompleted,
+    ResponseEvent,
+    RunMetrics,
+    ToolCall,
+    ToolCallCompleted,
     ToolResult,
+    Usage,
 )
+from ..permissions import PermissionRequest, PermissionResult
 from ..utils import (
     bound_tool_result,
     cached_metadata,
@@ -29,7 +44,11 @@ from .models import (
     SESSION_NAME_SOURCE_GENERATED,
     SESSION_NAME_SOURCE_INITIAL,
     Compaction,
+    CompactionEvent,
     InstructionSnapshot,
+    PermissionEvent,
+    RunCompletedEvent,
+    SessionEventModel,
     SessionNameGenerator,
 )
 from .naming import initial_session_name
@@ -107,6 +126,113 @@ class SessionManager:
             list[ConversationItem]: Items accumulated during the conversation.
         """
         return self._session.messages
+
+    def response(
+        self,
+        events: Iterable[ResponseEvent],
+        *,
+        debug: bool = False,
+        interaction: Interaction | None = None,
+    ) -> Response:
+        """Display and collect normalized response events.
+
+        Args:
+            events (Iterable[ResponseEvent]): Response events to display and collect.
+            debug (bool): Whether to display every raw response event.
+            interaction (Interaction | None): Presentation override. Defaults to the configured
+                interaction.
+
+        Returns:
+            Response: The collected answer, reasoning, tool calls, items, usage, and model.
+        """
+        output = interaction or self._interaction
+        reasoning = ""
+        answer = ""
+        tool_calls = []
+        items = ()
+        usage = None
+        model = None
+        structured_output = None
+        reasoning_started = False
+        answer_started = False
+
+        with output.response_context():
+            for event in events:
+                if debug:
+                    output.debug(event)
+
+                if isinstance(event, ReasoningDelta):
+                    output.reasoning_delta(event.text, start=not reasoning_started)
+                    reasoning_started = True
+                    continue
+                if isinstance(event, AnswerDelta):
+                    output.answer_delta(event.text, start=not answer_started)
+                    answer_started = True
+                    continue
+                if isinstance(event, ReasoningCompleted):
+                    reasoning = event.text
+                    output.reasoning(event.text)
+                    continue
+                if isinstance(event, AnswerCompleted):
+                    answer = event.text
+                    output.answer(event.text)
+                    continue
+                if isinstance(event, ToolCallCompleted):
+                    tool_calls.append(event.call)
+                    continue
+                if isinstance(event, ResponseCompleted):
+                    items = event.items
+                    usage = event.usage
+                    model = event.model
+                    answer = event.answer
+                    reasoning = event.reasoning
+                    structured_output = event.structured_output
+
+        return Response(
+            answer=answer,
+            reasoning=reasoning,
+            tool_calls=tuple(tool_calls),
+            items=items,
+            usage=usage or Usage(),
+            model=model,
+            structured_output=structured_output,
+        )
+
+    def replay(self, *, interaction: Interaction | None = None) -> None:
+        """Display the active session timeline in its original durable order.
+
+        Args:
+            interaction (Interaction | None): Presentation override. Defaults to the configured
+                interaction.
+        """
+        output = interaction or self._interaction
+        for event in self._session.events:
+            if isinstance(event, CompactionEvent):
+                compaction = self._session.compactions[event.compaction_index]
+                before = compaction.input_tokens_before
+                after = compaction.input_tokens_after
+                if before is not None and after is not None and before != after:
+                    output.info(f"Compacted session context from {before:,} to {after:,} tokens.")
+                else:
+                    output.info("Compacted session context.")
+                continue
+            if isinstance(event, PermissionEvent):
+                if event.prompted:
+                    output.permission(
+                        event.prompt or "Permission requested.", event.result.decision.value
+                    )
+                continue
+            if isinstance(event, RunCompletedEvent):
+                output.run_metrics(event.metrics)
+                continue
+            item = self._session.messages[event.item_index]
+            if isinstance(item, Message):
+                display = output.user if item.role == "user" else output.answer
+                display(item.content)
+            elif isinstance(item, Reasoning):
+                output.reasoning(item.content)
+            elif isinstance(item, ToolCall):
+                output.tool_call(item.name, item.arguments)
 
     @property
     def model_context(self) -> list[ModelContextItem]:
@@ -207,21 +333,14 @@ class SessionManager:
             input_tokens_before=self._session.tokens,
             input_tokens_after=result.context_tokens,
         )
-        previous_tokens = self._session.tokens
-        previous_directory = self._session.instruction_working_directory
-        previous_skills = list(self._session.active_skills)
-        self._session.add_compaction(compaction)
-        try:
+
+        def apply(session: Session) -> None:
+            session.add_compaction(compaction)
             if result.context_tokens is not None:
-                self._session.tokens = result.context_tokens
-            self._session.update_instruction_state(working_directory, identities)
-            self._session_store.save(self._session)
-        except Exception:
-            self._session.compactions.pop()
-            self._session.tokens = previous_tokens
-            self._session.instruction_working_directory = previous_directory
-            self._session.active_skills = previous_skills
-            raise
+                session.tokens = result.context_tokens
+            session.update_instruction_state(working_directory, identities)
+
+        self._commit(apply)
 
     def load_session(self, session: Session | str) -> None:
         """Load a session from the store.
@@ -276,8 +395,7 @@ class SessionManager:
         Raises:
             ValueError: If the name is empty after normalization.
         """
-        self._session.rename(name)
-        self._session_store.save(self._session)
+        self._commit(lambda session: session.rename(name))
 
     def generate_session_name(
         self,
@@ -308,8 +426,7 @@ class SessionManager:
             return
         name = generator.generate(user_message, assistant_message, self._session.model)
         if name:
-            self._session.rename(name, source=SESSION_NAME_SOURCE_GENERATED)
-            self._session_store.save(self._session)
+            self._commit(lambda session: session.rename(name, source=SESSION_NAME_SOURCE_GENERATED))
 
     def add_message(self, message: ConversationItem | Response) -> None:
         """Add conversation items and persist the resulting complete session.
@@ -320,8 +437,7 @@ class SessionManager:
         Raises:
             ValueError: If the value is not a supported conversation item.
         """
-        self._session.add_message(message)
-        self._session_store.save(self._session)
+        self._commit(lambda session: session.add_message(message))
 
     def add_messages(self, messages: Iterable[ConversationItem]) -> None:
         """Add messages to the conversation history.
@@ -332,8 +448,8 @@ class SessionManager:
         Raises:
             ValueError: If any value is not a supported conversation item.
         """
-        self._session.add_messages(messages)
-        self._session_store.save(self._session)
+        values = tuple(messages)
+        self._commit(lambda session: session.add_messages(values))
 
     def add_user_message(
         self,
@@ -347,9 +463,14 @@ class SessionManager:
             context (Iterable[ContextReference]): Resolved context snapshots attached to the
                 message. Defaults to no explicit context.
         """
-        if self._session.name is None:
-            self._session.rename(initial_session_name(content), source=SESSION_NAME_SOURCE_INITIAL)
-        self.add_message(Message(role="user", content=content, context=tuple(context)))
+        message = Message(role="user", content=content, context=tuple(context))
+
+        def apply(session: Session) -> None:
+            if session.name is None:
+                session.rename(initial_session_name(content), source=SESSION_NAME_SOURCE_INITIAL)
+            session.add_message(message)
+
+        self._commit(apply)
 
     def add_tool_call(
         self,
@@ -367,19 +488,34 @@ class SessionManager:
             active_skills (Iterable[tuple[str, str]]): Active skill names and canonical locations
                 after the tool call.
         """
-        self.update_instruction_state(working_directory, active_skills)
+        identities = tuple(active_skills)
         output, handle = bound_tool_result(output, f"tool result {call_id}")
         if handle is not None:
             self._interaction.info(
                 f"Tool result '{call_id}' exceeded the context limit and was cached as '{handle}'."
             )
-        self.add_message(
-            ToolResult(
-                call_id=call_id,
-                output=output,
-                artifacts=self._content_artifacts(output),
-            )
+        result = ToolResult(
+            call_id=call_id,
+            output=output,
+            artifacts=self._content_artifacts(output),
         )
+
+        def apply(session: Session) -> None:
+            session.update_instruction_state(working_directory, identities)
+            session.add_message(result)
+
+        self._commit(apply)
+
+    def add_tool_call_event(self, call_id: str) -> None:
+        """Persist one model tool call at its live presentation position.
+
+        Args:
+            call_id (str): Identifier of the canonical tool call to place.
+
+        Raises:
+            ValueError: If the call is unknown or already recorded.
+        """
+        self._commit(lambda session: session.add_tool_call_event(call_id))
 
     @staticmethod
     def _content_artifacts(output: str) -> tuple[ContentArtifact, ...]:
@@ -422,3 +558,73 @@ class SessionManager:
             response (Response): The response to add.
         """
         self.add_message(response)
+
+    def record_permission(
+        self,
+        request: PermissionRequest,
+        result: PermissionResult,
+        prompted: bool,
+        prompt: str | None,
+    ) -> None:
+        """Persist one invocation-scoped authorization decision in the session timeline.
+
+        Args:
+            request (PermissionRequest): Normalized requested authority.
+            result (PermissionResult): Effective authorization result.
+            prompted (bool): Whether an interactive prompt was displayed.
+            prompt (str | None): Exact displayed prompt, when applicable.
+        """
+        event = PermissionEvent(
+            id=str(uuid7()),
+            created_at=datetime.now(UTC),
+            request=request,
+            result=result,
+            prompted=prompted,
+            prompt=prompt,
+        )
+        self._persist_event(event)
+
+    def record_run(
+        self,
+        stop_reason: AgentRunStopReason,
+        started_at: datetime,
+        metrics: RunMetrics,
+    ) -> RunCompletedEvent:
+        """Construct and persist one completed-run event.
+
+        Args:
+            stop_reason (AgentRunStopReason): Reason the agent run returned control.
+            started_at (datetime): UTC time at which the run began.
+            metrics (RunMetrics): Completed run statistics.
+
+        Returns:
+            RunCompletedEvent: Persisted event suitable for immediate presentation.
+        """
+        event = RunCompletedEvent(
+            id=str(uuid7()),
+            created_at=datetime.now(UTC),
+            stop_reason=stop_reason,
+            started_at=started_at,
+            metrics=metrics,
+        )
+        self._persist_event(event)
+        return event
+
+    def _persist_event(self, event: SessionEventModel) -> None:
+        """Append and persist one standalone timeline event."""
+        self._commit(lambda session: session.events.append(event))
+
+    def _commit(self, mutation: Callable[[Session], None]) -> None:
+        """Apply and persist one session mutation atomically in memory."""
+        previous = deepcopy(self._session)
+        try:
+            mutation(self._session)
+            self._session_store.save(self._session)
+        except Exception:
+            for session_field in fields(Session):
+                setattr(
+                    self._session,
+                    session_field.name,
+                    deepcopy(getattr(previous, session_field.name)),
+                )
+            raise

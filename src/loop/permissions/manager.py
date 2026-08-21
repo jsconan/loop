@@ -14,6 +14,7 @@ from .models import (
     Decision,
     PermissionConfiguration,
     PermissionMode,
+    PermissionRecorder,
     PermissionRequest,
     PermissionResult,
     PermissionRule,
@@ -106,36 +107,53 @@ class PermissionManager:
         """
         self._interaction = interaction
 
-    def authorize(self, request: PermissionRequest) -> PermissionResult:
+    def authorize(
+        self,
+        request: PermissionRequest,
+        *,
+        interaction: Interaction | None = None,
+        recorder: PermissionRecorder | None = None,
+    ) -> PermissionResult:
         """Evaluate and, when required, ask the user about a permission request.
 
         Args:
             request (PermissionRequest): Normalized operation to authorize.
+            interaction (Interaction | None): Invocation-scoped interaction overriding the
+                configured default.
+            recorder (PermissionRecorder | None): Invocation-scoped permission observation sink.
 
         Returns:
             PermissionResult: Effective allow or deny result.
         """
         result = self.evaluate(request)
+        active_interaction = interaction or self._interaction
+        prompted = False
+        prompt = None
         if result.decision is Decision.ASK:
-            if self._interaction is None:
+            if active_interaction is None:
                 result = PermissionResult(
                     decision=Decision.DENY,
                     reason="Approval is required but no interactive user is available.",
                     source="headless",
                 )
-            elif self._interaction.confirm(self._prompt(request), default=False):
-                result = PermissionResult(
-                    decision=Decision.ALLOW,
-                    reason="Approved by the user for this call.",
-                    source="user",
-                )
             else:
-                result = PermissionResult(
-                    decision=Decision.DENY,
-                    reason="Rejected by the user.",
-                    source="user",
-                )
+                prompted = True
+                prompt = self._prompt(request)
+                if active_interaction.confirm(prompt, default=False):
+                    result = PermissionResult(
+                        decision=Decision.ALLOW,
+                        reason="Approved by the user for this call.",
+                        source="user",
+                    )
+                else:
+                    result = PermissionResult(
+                        decision=Decision.DENY,
+                        reason="Rejected by the user.",
+                        source="user",
+                    )
         self._audit(request, result)
+        if recorder is not None:
+            recorder.record_permission(request, result, prompted, prompt)
         return result
 
     def evaluate(self, request: PermissionRequest) -> PermissionResult:

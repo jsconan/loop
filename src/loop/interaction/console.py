@@ -1,5 +1,7 @@
 """Define user interaction abstractions and tool invocation context."""
 
+from __future__ import annotations
+
 import json
 import sys
 import termios
@@ -21,6 +23,7 @@ from rich.text import Text
 from rich.tree import Tree
 
 from .. import constants
+from ..models import RunMetrics
 from ..utils import format_tool_call_arguments
 from .interaction import Interaction
 
@@ -426,25 +429,71 @@ class ConsoleInteraction(Interaction):
             )
         )
 
-    def token_usage(
-        self,
-        model: str | None,
-        context_tokens: int | None,
-        context_window: int | None,
-    ) -> None:
-        """Write the current model and context occupancy.
+    def run_metrics(self, metrics: RunMetrics) -> None:
+        """Write one completed agent run's durable statistics.
 
         Args:
-            model (str | None): Current model identifier, when known.
-            context_tokens (int | None): Number of tokens currently in the context, when known.
-            context_window (int | None): Maximum context size in tokens, when known.
+            metrics (RunMetrics): Complete run statistics and current context occupancy.
         """
-        current_model = model or "?"
-        used = f"{context_tokens:,}" if context_tokens is not None else "?"
-        capacity = f"{context_window:,}" if context_window is not None else "?"
+        current_model = metrics.model or "?"
+        used = f"{metrics.context_tokens:,}" if metrics.context_tokens is not None else "?"
+        capacity = f"{metrics.context_window:,}" if metrics.context_window is not None else "?"
         self._console.print(
             f"Model: {current_model} · Context: {used} / {capacity} tokens",
             style="dim cyan",
+            markup=False,
+            soft_wrap=True,
+        )
+        self._console.print(
+            f"Run: {len(metrics.model_calls)} model calls · {metrics.message_count} messages · "
+            f"{metrics.item_count} items · {metrics.active_duration_seconds:.2f}s active",
+            style="dim cyan",
+            markup=False,
+            soft_wrap=True,
+        )
+        usage = metrics.usage
+        tokens = []
+        for label, value in (
+            ("input", usage.input_tokens),
+            ("output", usage.output_tokens),
+            ("cached", usage.cached_tokens),
+            ("reasoning", usage.reasoning_tokens),
+        ):
+            if value is not None:
+                tokens.append(f"{value:,} {label}")
+        if tokens:
+            self._console.print(
+                f"Tokens: {' · '.join(tokens)}",
+                style="dim cyan",
+                markup=False,
+                soft_wrap=True,
+            )
+        performance = (
+            f"Performance: {metrics.model_duration_seconds:.2f}s model · "
+            f"{metrics.tool_duration_seconds:.2f}s tools"
+        )
+        if usage.output_tokens is not None and metrics.model_duration_seconds > 0:
+            performance += (
+                f" · {usage.output_tokens / metrics.model_duration_seconds:.1f} "
+                "end-to-end output tokens/s"
+            )
+        self._console.print(
+            performance,
+            style="dim cyan",
+            markup=False,
+            soft_wrap=True,
+        )
+
+    def permission(self, prompt: str, decision: str) -> None:
+        """Write one originally prompted permission decision.
+
+        Args:
+            prompt (str): Exact original prompt or a replay fallback.
+            decision (str): Effective decision label.
+        """
+        self._console.print(
+            f"{prompt} [{decision}]",
+            style="dim yellow",
             markup=False,
             soft_wrap=True,
         )
