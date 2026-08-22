@@ -211,7 +211,8 @@ def test_resume_command_loads_a_persisted_session_id(tmp_path):
 def test_resumed_missing_model_uses_existing_query_fallback(tmp_path):
     """A resumed model is tried first and replaced through normal query recovery."""
     interaction = output_interaction()
-    interaction.prompt.side_effect = ["/resume internal-id", "hello", "replacement", False]
+    interaction.prompt.side_effect = ["/resume internal-id", "hello", False]
+    interaction.confirm.return_value = True
     store = SQLiteSessionStore(tmp_path / "sessions.db")
     store.save(Session(id="internal-id", model="missing"))
     sessions = SessionManager(interaction=interaction, session_store=store)
@@ -536,11 +537,51 @@ def test_run_stops_model_fallback_when_discovery_fails(tmp_path, models):
 
 
 def test_run_can_stop_model_selection(tmp_path):
-    """Exiting the fallback selector abandons only the failed response turn."""
+    """Declining the sole discovered model abandons only the failed response turn."""
     missing = BackendNotFoundError("missing", provider="openai", operation="create_response")
     backend = Mock(default_model="missing")
     backend.get_context_window.return_value = None
     backend.get_models.return_value = [ModelInfo(id="replacement")]
+    backend.get_response.side_effect = missing
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", False]
+    interaction.confirm.return_value = False
+
+    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+
+    assert backend.get_response.call_count == 1
+    interaction.confirm.assert_called_once_with(
+        "Only model 'replacement' is available. Use this model?", default=True
+    )
+
+
+def test_run_accepts_the_only_available_model_after_not_found(tmp_path):
+    """Approving the sole discovered model retries the response with that model."""
+    missing = BackendNotFoundError("missing", provider="openai", operation="create_response")
+    backend = Mock(default_model="missing")
+    backend.get_context_window.return_value = None
+    backend.get_models.return_value = [ModelInfo(id="replacement")]
+    backend.get_response.side_effect = [missing, [ResponseCompleted(model="replacement")]]
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", False]
+    interaction.confirm.return_value = True
+
+    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+    loop.run()
+
+    assert loop.model == "replacement"
+    assert backend.get_response.call_args_list[1].kwargs["model"] == "replacement"
+    interaction.confirm.assert_called_once_with(
+        "Only model 'replacement' is available. Use this model?", default=True
+    )
+
+
+def test_run_can_exit_multi_model_fallback_selection(tmp_path):
+    """Exiting a multi-model fallback selector abandons only the failed response turn."""
+    missing = BackendNotFoundError("missing", provider="openai", operation="create_response")
+    backend = Mock(default_model="missing")
+    backend.get_context_window.return_value = None
+    backend.get_models.return_value = [ModelInfo(id="first"), ModelInfo(id="second")]
     backend.get_response.side_effect = missing
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False, False]
@@ -548,6 +589,7 @@ def test_run_can_stop_model_selection(tmp_path):
     Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     assert backend.get_response.call_count == 1
+    interaction.confirm.assert_not_called()
 
 
 def test_loop_uses_an_injected_mention_registry(tmp_path):

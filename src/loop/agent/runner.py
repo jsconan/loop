@@ -383,6 +383,16 @@ class AgentRunner:
         if not models:
             self._interaction.warning("The backend reported no available models.")
             return False
+        if len(models) == 1:
+            selection = models[0].id
+            if not self._interaction.confirm(
+                f"Only model '{selection}' is available. Use this model?",
+                default=True,
+            ):
+                return False
+            self._model_selection.select(selection)
+            self._interaction.info(f"Using model: {selection}")
+            return True
         failing_model = self._model_selection.selected
         while True:
             selection = self._interaction.prompt(
