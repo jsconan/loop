@@ -12,6 +12,7 @@ from loop import (
     Interaction,
     Response,
     ResponseMetrics,
+    Session,
     ToolCall,
     ToolExecutionMetrics,
     Usage,
@@ -30,6 +31,7 @@ def agent_runner(*, responses, max_turns=25):
     )
     session_manager = Mock()
     session_manager.messages = []
+    session_manager.session = Session()
     session_manager.model = None
     session_manager.tokens = 0
     session_manager.context_window = None
@@ -145,6 +147,7 @@ def test_runner_continues_after_max_turns_when_user_affirms():
     agent = Agent("Assistant", backend, InstructionsManager(), Mock(), Mock())
     session_manager = Mock()
     session_manager.messages = []
+    session_manager.session = Session()
     session_manager.model = None
     session_manager.tokens = 0
     session_manager.context_window = None

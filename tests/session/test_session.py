@@ -12,6 +12,7 @@ from loop import (
     ContextReference,
     InstructionSnapshot,
     Message,
+    ModelAssignment,
     Reasoning,
     Response,
     ResponseMetadata,
@@ -120,8 +121,8 @@ def test_session_updates_instruction_state():
     assert session.active_skills == [("review", "/skills/review/SKILL.md")]
 
 
-def test_session_adds_response_items_and_updates_reported_metadata():
-    """Completed responses append their items and replace reported session metadata."""
+def test_session_adds_response_items_without_managing_model_assignment():
+    """Completed responses append history and usage without changing durable assignment state."""
     session = Session(tokens=10, model="model-a")
     answer = Message(role="assistant", content="done")
     response = Response(
@@ -136,7 +137,17 @@ def test_session_adds_response_items_and_updates_reported_metadata():
 
     assert session.messages == [function_call(), answer]
     assert session.tokens == 42
-    assert session.model == "model-b"
+    assert session.model == "model-a"
+
+
+def test_session_groups_model_metadata_as_one_assignment():
+    """The session exposes and replaces its durable model metadata as one assignment."""
+    session = Session()
+
+    assert session.assignment is None
+    session.assignment = ModelAssignment(model="model", context_window=8192)
+
+    assert session.assignment == ModelAssignment(model="model", context_window=8192)
 
 
 def test_session_places_response_tool_calls_when_they_are_executed():

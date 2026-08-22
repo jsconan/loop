@@ -162,6 +162,7 @@ class AgentRunner:
                     usage=response.usage,
                 )
             )
+            self._model_selection.record_response(response.model)
             self._session_manager.add_response(response)
             executions = self.handle_tool_calls(response)
             if not executions:
@@ -343,7 +344,7 @@ class AgentRunner:
                 return self.query()
             except BackendNotFoundError as error:
                 self._report_backend_error(error)
-                if not self._select_fallback_model():
+                if not self._model_selection.select_fallback(self._interaction):
                     return None
             except BackendError as error:
                 self._report_backend_error(error)
@@ -372,46 +373,3 @@ class AgentRunner:
         if diagnostics:
             message = f"{message} ({', '.join(diagnostics)})"
         self._interaction.error(message)
-
-    def _select_fallback_model(self) -> bool:
-        """Let the user replace a missing model selection."""
-        try:
-            models = self._model_selection.available()
-        except BackendError as error:
-            self._interaction.error(f"Could not list available models: {error}")
-            return False
-        if not models:
-            self._interaction.warning("The backend reported no available models.")
-            return False
-        if len(models) == 1:
-            selection = models[0].id
-            if not self._interaction.confirm(
-                f"Only model '{selection}' is available. Use this model?",
-                default=True,
-            ):
-                return False
-            self._model_selection.select(selection)
-            self._interaction.info(f"Using model: {selection}")
-            return True
-        failing_model = self._model_selection.selected
-        while True:
-            selection = self._interaction.prompt(
-                "Select a replacement model, or enter 'q' to stop: ",
-                choices={model.id: model.id for model in models},
-            )
-            if selection is False:
-                return False
-            if selection != failing_model:
-                break
-            self._interaction.warning(
-                f"Model '{selection}' was already unavailable; the same "
-                "failure is likely to re-occur unless the backend is updated."
-            )
-            if self._interaction.confirm(
-                "Continue with this model, or select a different one?",
-                default=True,
-            ):
-                break
-        self._model_selection.select(selection)
-        self._interaction.info(f"Using model: {selection}")
-        return True

@@ -18,8 +18,8 @@ def backend(**attributes):
     return SimpleNamespace(**(defaults | attributes))
 
 
-def test_selection_prefers_explicit_then_backend_default_models():
-    """Initialization applies explicit and backend-default precedence consistently."""
+def test_selection_prefers_explicit_then_restored_then_backend_default_models():
+    """Initialization applies explicit, restored, and backend-default precedence consistently."""
     explicit_session = SessionManager(session=Session(model="restored"))
     explicit = ModelSelection(backend(), explicit_session, selected="explicit")
     assert explicit.selected == "explicit"
@@ -34,23 +34,26 @@ def test_selection_prefers_explicit_then_backend_default_models():
     assert default_session.model == "default"
 
 
-def test_selection_requires_an_explicit_or_default_model():
-    """An unconfigured selection remains constructible but rejects effective-model access."""
+def test_selection_restores_last_used_model_without_a_backend_fallback():
+    """A durable last-used assignment remains usable when no backend default is configured."""
     session_manager = SessionManager(session=Session(model="stale", context_window=1024))
     selection = ModelSelection(backend(default_model=None), session_manager)
 
-    assert session_manager.model is None
-    assert session_manager.context_window is None
+    assert selection.effective == "stale"
+    assert selection.assignment.context_window == 8192
+    assert session_manager.model == "stale"
+    assert session_manager.context_window == 8192
 
+    empty = ModelSelection(backend(default_model=None), SessionManager())
     with pytest.raises(ValueError, match="No model was selected"):
-        _ = selection.effective
+        _ = empty.effective
     with pytest.raises(ValueError, match="No model was selected"):
-        selection.synchronize_session()
+        empty.record_assignment()
 
 
-@pytest.mark.parametrize("context_window", [None, True, False, "8192"])
+@pytest.mark.parametrize("context_window", [None, True, False, 0, -1, "8192"])
 def test_selection_normalizes_invalid_context_windows(context_window):
-    """Only integer context-window metadata is persisted in the active session."""
+    """Only positive integer context-window metadata is persisted in the active session."""
     session_manager = SessionManager()
     ModelSelection(
         backend(get_context_window=Mock(return_value=context_window)),
@@ -60,8 +63,8 @@ def test_selection_normalizes_invalid_context_windows(context_window):
     assert session_manager.context_window is None
 
 
-def test_selection_lists_selects_and_restores_models():
-    """Discovery and selection operations delegate through one synchronized state owner."""
+def test_selection_lists_selects_restores_and_records_models():
+    """Selection controls discovery, future intent, restoration, and durable use records."""
     models = [ModelInfo(id="first"), ModelInfo(id="second")]
     active_backend = backend(get_models=Mock(return_value=models))
     session_manager = SessionManager()
@@ -70,6 +73,8 @@ def test_selection_lists_selects_and_restores_models():
     assert selection.available() == models
     selection.select("second")
     assert selection.selected == "second"
+    assert session_manager.model == "second"
+    assert selection.record_response(None).model == "second"
     assert session_manager.model == "second"
 
     selection.restore(None)

@@ -57,14 +57,15 @@ def test_compaction_rejects_invalid_thresholds(threshold):
 def test_compaction_detects_known_capacity_and_new_history():
     """Automatic policy requires known capacity, sufficient usage, and uncompacted history."""
     session = Session(messages=[Message(role="user", content="hello")], tokens=79)
-    feature, manager, _, _ = compaction_feature(session=session)
+    feature, manager, backend, _ = compaction_feature(session=session)
 
     assert feature.threshold == 0.8
     assert feature.can_compact() is True
     assert feature.needed() is False
     session.tokens = 80
     assert feature.needed() is True
-    manager.context_window = None
+    manager.session.context_window = None
+    backend.get_context_window.return_value = None
     assert feature.needed() is False
 
 

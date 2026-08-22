@@ -557,6 +557,18 @@ class ModelInfo(BaseModel):
     context_window: int | None = None
 
 
+class ModelAssignment(BaseModel):
+    """Carry the resolved model used for one backend operation.
+
+    Args:
+        model (str): Exact provider model identifier selected for the operation.
+        context_window (int | None): Known positive context capacity for the model.
+    """
+
+    model: str
+    context_window: int | None = Field(default=None, gt=0)
+
+
 class ReasoningDelta(BaseModel):
     """Carry an incremental reasoning fragment.
 

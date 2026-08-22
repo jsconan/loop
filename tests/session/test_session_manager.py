@@ -23,6 +23,7 @@ from loop import (
     InstructionSnapshot,
     MemorySessionStore,
     Message,
+    ModelAssignment,
     PermissionRequest,
     PermissionResult,
     Reasoning,
@@ -550,8 +551,8 @@ def test_manager_updates_instruction_state_without_persisting_an_incomplete_quer
     store.save.assert_not_called()
 
 
-def test_manager_adds_a_response_and_persists_its_session_updates():
-    """Adding a response records its items and metadata before persistence."""
+def test_manager_adds_a_response_without_reconciling_model_assignment():
+    """Adding a response persists its items without independently managing the model."""
     store = Mock(spec=SessionStore)
     session = Session()
     manager = SessionManager(session=session, session_store=store)
@@ -561,8 +562,21 @@ def test_manager_adds_a_response_and_persists_its_session_updates():
     manager.add_response(response)
 
     assert manager.messages == [answer]
-    assert manager.model == "model-b"
+    assert manager.model is None
     store.save.assert_called_once_with(session)
+
+
+def test_manager_exposes_durable_assignment_metadata():
+    """Session usage and last-used assignment metadata remain available."""
+    session = Session(tokens=17)
+    manager = SessionManager(session=session)
+
+    manager.assignment = ModelAssignment(model="selected-model", context_window=128000)
+
+    assert manager.assignment == ModelAssignment(model="selected-model", context_window=128000)
+    assert manager.model == "selected-model"
+    assert manager.tokens == 17
+    assert manager.context_window == 128000
 
 
 def test_manager_exposes_context_metadata_and_validates_window_selection():

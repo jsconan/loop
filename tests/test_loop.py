@@ -652,7 +652,7 @@ def test_loops_share_local_conversation_context(tmp_path):
     assert first.session is second.session is session
     assert second.messages == [Message(role="user", content="hello")]
     assert second.session.tokens == 12
-    assert second.session.model == "other-model"
+    assert second.session.model == "served-model"
     response = second.agent_runner.query()
     assert response.answer == ""
     assert response.reasoning == ""
@@ -661,7 +661,7 @@ def test_loops_share_local_conversation_context(tmp_path):
         input=session.messages,
         instructions=None,
         stream=True,
-        model="other-model",
+        model="served-model",
         tools=[],
     )
 
@@ -744,6 +744,7 @@ def test_loop_delegates_a_session_identifier_to_an_injected_manager():
     manager = Mock(spec=SessionManager)
     manager.session = stored
     manager.interaction = MagicMock(spec=Interaction)
+    manager.model = None
 
     loop = Loop(backend=loop_backend(), session="session-id", session_manager=manager)
 
@@ -764,7 +765,7 @@ def test_loop_loads_a_persisted_session_identifier(tmp_path):
 
     assert loop.session.messages == stored.messages
     assert loop.session.tokens == stored.tokens
-    assert loop.session.model == "default-model"
+    assert loop.session.model == "saved-model"
 
 
 def test_loop_uses_an_injected_manager_session_without_reloading_it():
@@ -881,8 +882,8 @@ def test_loop_aligns_injected_session_capacity_with_backend(tmp_path):
 
     Loop(backend=backend, session_manager=manager, working_directory=tmp_path)
 
-    backend.get_context_window.assert_called_once_with("active-model")
-    assert session.model == "active-model"
+    backend.get_context_window.assert_called_once_with("old-model")
+    assert session.model == "old-model"
     assert session.context_window == 128000
 
 
@@ -1191,6 +1192,7 @@ def test_handle_tool_calls_delegates_session_updates():
     session_manager = Mock(spec=SessionManager)
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
+    session_manager.model = None
     loop = Loop(backend=backend, tool_registry=registry, session_manager=session_manager)
     call = function_call()
     response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
@@ -1232,6 +1234,7 @@ def test_query_delegates_instruction_state_to_the_session_manager():
     session_manager = Mock(spec=SessionManager)
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
+    session_manager.model = None
     session_manager.messages = []
     session_manager.model_context = []
     session_manager.context_window = None

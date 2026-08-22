@@ -18,6 +18,7 @@ from ..models import (
     ContextReference,
     ConversationItem,
     Message,
+    ModelAssignment,
     ModelContextItem,
     Reasoning,
     ReasoningCompleted,
@@ -233,6 +234,24 @@ class SessionManager:
                 output.reasoning(item.content)
             elif isinstance(item, ToolCall):
                 output.tool_call(item.name, item.arguments)
+
+    @property
+    def assignment(self) -> ModelAssignment | None:
+        """Return the durable model assignment for the active session.
+
+        Returns:
+            ModelAssignment | None: Session assignment, or ``None`` when unknown.
+        """
+        return self._session.assignment
+
+    @assignment.setter
+    def assignment(self, value: ModelAssignment | None) -> None:
+        """Set the durable model assignment for the active session.
+
+        Args:
+            value (ModelAssignment | None): Assignment to persist, or ``None`` to clear it.
+        """
+        self._session.assignment = value
 
     @property
     def model_context(self) -> list[ModelContextItem]:

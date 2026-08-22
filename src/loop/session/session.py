@@ -12,6 +12,7 @@ from pydantic import TypeAdapter, ValidationError
 from ..models import (
     ConversationItem,
     Message,
+    ModelAssignment,
     ModelContextItem,
     Reasoning,
     Response,
@@ -65,10 +66,10 @@ class Session:
             Defaults to an empty list.
         tokens (int): Total tokens in the context after the latest response.
             Defaults to ``0``.
-        model (str | None): Model identifier reported by the latest response,
+        model (str | None): Model identifier in the latest successfully used assignment,
             or ``None`` when unknown. Defaults to ``None``.
-        context_window (int | None): Context-window size for the latest selected model,
-            or ``None`` when unknown. Defaults to ``None``.
+        context_window (int | None): Context-window size in the latest successfully used
+            assignment, or ``None`` when unknown. Defaults to ``None``.
         instruction_working_directory (str | None): Last effective instruction directory.
             Defaults to ``None``.
         active_skills (list[tuple[str, str]]): Active skill names and canonical locations.
@@ -88,6 +89,27 @@ class Session:
     instruction_working_directory: str | None = None
     active_skills: list[tuple[str, str]] = field(default_factory=list)
     events: list[SessionEvent] = field(default_factory=list)
+
+    @property
+    def assignment(self) -> ModelAssignment | None:
+        """Return the durable model assignment for this session.
+
+        Returns:
+            ModelAssignment | None: Last resolved model and capacity, or ``None`` when unknown.
+        """
+        if self.model is None:
+            return None
+        return ModelAssignment(model=self.model, context_window=self.context_window)
+
+    @assignment.setter
+    def assignment(self, value: ModelAssignment | None) -> None:
+        """Set the durable model assignment for this session.
+
+        Args:
+            value (ModelAssignment | None): Assignment to retain, or ``None`` to clear it.
+        """
+        self.model = value.model if value is not None else None
+        self.context_window = value.context_window if value is not None else None
 
     def __post_init__(self) -> None:
         if self.events:
@@ -178,8 +200,6 @@ class Session:
                     self._add_conversation_event(len(self.messages) - 1)
             if message.usage.total_tokens is not None:
                 self.tokens = message.usage.total_tokens
-            if isinstance(message.model, str):
-                self.model = message.model
         else:
             self.add_messages((message,))
 

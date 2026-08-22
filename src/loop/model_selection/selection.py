@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..models import ModelInfo
+from ..backend import BackendError
+from ..interaction import Interaction
+from ..models import ModelAssignment, ModelInfo
 
 if TYPE_CHECKING:
     from ..backend import Backend
@@ -12,11 +14,11 @@ if TYPE_CHECKING:
 
 
 class ModelSelection:
-    """Keep backend model selection and active-session metadata consistent.
+    """Own model selection and durable last-used assignment reconciliation.
 
     Args:
         backend (Backend): Backend supplying the default model, catalog, and context metadata.
-        session_manager (SessionManager): Active session whose effective model metadata is updated.
+        session_manager (SessionManager): Active session that records successful assignments.
         selected (str | None): Explicit model selection, or ``None`` to use the backend default.
     """
 
@@ -32,11 +34,9 @@ class ModelSelection:
     ) -> None:
         self._backend = backend
         self._session_manager = session_manager
-        self._selected = selected
+        self._selected = selected if selected is not None else session_manager.model
         if self._selected is not None or backend.default_model is not None:
             self.synchronize_session()
-        else:
-            self._clear_session()
 
     @property
     def selected(self) -> str | None:
@@ -61,6 +61,36 @@ class ModelSelection:
         if not model:
             raise ValueError("No model was selected and the backend has no default model.")
         return model
+
+    @property
+    def assignment(self) -> ModelAssignment:
+        """Return the backend-resolved assignment for the next operation.
+
+        Returns:
+            ModelAssignment: Exact model and known context capacity for the operation.
+
+        Raises:
+            ValueError: If neither this selection nor the backend provides a model.
+        """
+        return self._get_assignment(self.effective)
+
+    def _get_assignment(self, model: str | None) -> ModelAssignment:
+        """Return the backend-resolved assignment for a model."""
+        return ModelAssignment(
+            model=model,
+            context_window=self._get_context_window(model),
+        )
+
+    def _get_context_window(self, model: str | None) -> int | None:
+        """Return a positive context window for a model, otherwise ``None``."""
+        context_window = self._backend.get_context_window(model)
+        if (
+            isinstance(context_window, int)
+            and not isinstance(context_window, bool)
+            and context_window > 0
+        ):
+            return context_window
+        return None
 
     def available(self) -> list[ModelInfo]:
         """Return models currently available from the backend.
@@ -92,24 +122,93 @@ class ModelSelection:
         if model is not None or self._backend.default_model is not None:
             self.synchronize_session()
         else:
-            self._clear_session()
+            self._session_manager.assignment = None
+
+    def record_response(self, model: str | None) -> ModelAssignment:
+        """Record the model actually used by a completed response.
+
+        Args:
+            model (str | None): Provider-reported model identifier, when available.
+
+        Returns:
+            ModelAssignment: Durable assignment for the completed response.
+        """
+        if model is None:
+            assignment = self.assignment
+        else:
+            self._selected = model
+            assignment = self._get_assignment(model)
+        return self.record_assignment(assignment)
+
+    def record_assignment(self, assignment: ModelAssignment | None = None) -> ModelAssignment:
+        """Persist one assignment that successfully completed an operation.
+
+        Args:
+            assignment (ModelAssignment | None): Completed assignment, or ``None`` to resolve the
+                current selection.
+
+        Returns:
+            ModelAssignment: Persisted assignment.
+
+        Raises:
+            ValueError: If no effective model is configured.
+        """
+        assignment = assignment or self.assignment
+        self._session_manager.assignment = assignment
+        return assignment
 
     def synchronize_session(self) -> None:
         """Persist the effective model and its normalized context window in the active session.
 
         Raises:
-            ValueError: If no effective model is configured.
+            ValueError: If neither the selection nor backend defines a model.
         """
-        model = self.effective
-        context_window = self._backend.get_context_window(model)
-        self._session_manager.model = model
-        self._session_manager.context_window = (
-            context_window
-            if isinstance(context_window, int) and not isinstance(context_window, bool)
-            else None
-        )
+        self._session_manager.assignment = self.assignment
 
-    def _clear_session(self) -> None:
-        """Clear effective model metadata when no model can be resolved."""
-        self._session_manager.model = None
-        self._session_manager.context_window = None
+    def select_fallback(self, interaction: Interaction) -> bool:
+        """Let the user replace a model rejected by the backend.
+
+        Args:
+            interaction (Interaction): Service used to show recovery choices and receive input.
+
+        Returns:
+            bool: ``True`` when a replacement model was selected, otherwise ``False``.
+        """
+        try:
+            models = self.available()
+        except BackendError as error:
+            interaction.error(f"Could not list available models: {error}")
+            return False
+        if not models:
+            interaction.warning("The backend reported no available models.")
+            return False
+        if len(models) == 1:
+            selection = models[0].id
+            if not interaction.confirm(
+                f"Only model '{selection}' is available. Use this model?", default=True
+            ):
+                return False
+            self.select(selection)
+            interaction.info(f"Using model: {selection}")
+            return True
+        failing_model = self.selected
+        while True:
+            selection = interaction.prompt(
+                "Select a replacement model, or enter 'q' to stop: ",
+                choices={model.id: model.id for model in models},
+            )
+            if selection is False:
+                return False
+            if selection != failing_model:
+                break
+            interaction.warning(
+                f"Model '{selection}' was already unavailable; the same "
+                "failure is likely to re-occur unless the backend is updated."
+            )
+            if interaction.confirm(
+                "Continue with this model, or select a different one?", default=True
+            ):
+                break
+        self.select(selection)
+        interaction.info(f"Using model: {selection}")
+        return True
