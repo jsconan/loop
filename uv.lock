@@ -318,6 +318,7 @@ name = "loop"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpcore" },
     { name = "httpx" },
     { name = "jsonschema" },
     { name = "openai" },
@@ -348,6 +349,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpcore", specifier = ">=1.0.9,<2" },
     { name = "httpx", specifier = ">=0.28.1,<1" },
     { name = "jsonschema", specifier = ">=4.25.1,<5" },
     { name = "openai", specifier = ">=2.46.0,<3" },
