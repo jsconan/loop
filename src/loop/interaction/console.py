@@ -99,7 +99,8 @@ class ConsoleInteraction(Interaction):
                 match_middle=True,
             )
         if message is None:
-            message = "\nYou: "
+            message = "\nYou:"
+        message = str(message).rstrip()
         if isinstance(exit_commands, str):
             exit_commands = exit_commands.strip()
             if exit_commands:
@@ -113,7 +114,7 @@ class ConsoleInteraction(Interaction):
         while True:
             try:
                 user_input = self._session.prompt(
-                    message,
+                    f"{message} " if message else "",
                     completer=completer,
                     complete_in_thread=True,
                 ).strip()

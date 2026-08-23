@@ -22,7 +22,7 @@ def test_prompt_reads_a_trimmed_message_with_a_custom_prompt():
     session = Mock()
     session.prompt.return_value = "  answer  \n"
 
-    assert ConsoleInteraction(session=session).prompt(message="Question: ") == "answer"
+    assert ConsoleInteraction(session=session).prompt(message="Question:") == "answer"
     session.prompt.assert_called_once()
     assert session.prompt.call_args.args == ("Question: ",)
 
@@ -45,7 +45,7 @@ def test_prompt_displays_choices_and_returns_a_mapped_value_for_a_number(capsys)
     session.prompt.return_value = "2"
 
     result = ConsoleInteraction(console=Console(width=80), session=session).prompt(
-        "Select: ",
+        "Select:",
         choices={"first": "First choice", "second": "Second choice"},
     )
 

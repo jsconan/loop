@@ -206,7 +206,7 @@ class ModelSelection:
         failing_model = self.selected
         while True:
             selection = interaction.prompt(
-                "Select a replacement model, or enter 'q' to stop: ",
+                "Select a replacement model, or enter 'q' to stop:",
                 choices={model.id: model.id for model in models},
             )
             if selection is False:

@@ -537,7 +537,7 @@ def test_run_selects_an_available_model_after_not_found(tmp_path):
     assert loop.session.model == "second"
     assert backend.get_response.call_args_list[1].kwargs["model"] == "second"
     assert interaction.prompt.call_args_list[1].args == (
-        "Select a replacement model, or enter 'q' to stop: ",
+        "Select a replacement model, or enter 'q' to stop:",
     )
     assert interaction.prompt.call_args_list[1].kwargs == {
         "choices": {"first": "first", "second": "second"},
