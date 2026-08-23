@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import ModelInfo, ModelSelection, Session, SessionManager
+from loop import BackendConnectionError, ModelInfo, ModelSelection, Session, SessionManager
 
 
 def backend(**attributes):
@@ -89,3 +89,39 @@ def test_selection_lists_selects_restores_and_records_models():
     assert unconfigured.selected is None
     assert unconfigured_session.model is None
     assert unconfigured_session.context_window is None
+
+
+def test_selection_reuses_a_recent_non_empty_model_catalog(monkeypatch):
+    """Available models are reused until the short catalog cache expires."""
+    models = [ModelInfo(id="first")]
+    active_backend = backend(get_models=Mock(return_value=models))
+    now = [10.0]
+    monkeypatch.setattr("loop.model_selection.selection.monotonic", lambda: now[0])
+    selection = ModelSelection(active_backend, SessionManager())
+
+    assert selection.available() == models
+    now[0] = 14.9
+    assert selection.available() == models
+    now[0] = 15.0
+    assert selection.available() == models
+    assert active_backend.get_models.call_count == 2
+
+
+def test_selection_does_not_cache_empty_or_failed_model_catalogs():
+    """Empty and failed discovery requests are retried rather than retained."""
+    active_backend = backend(
+        get_models=Mock(
+            side_effect=[
+                [],
+                BackendConnectionError("offline", provider="test", operation="list"),
+                [],
+            ]
+        )
+    )
+    selection = ModelSelection(active_backend, SessionManager())
+
+    assert selection.available() == []
+    with pytest.raises(BackendConnectionError, match="offline"):
+        selection.available()
+    assert selection.available() == []
+    assert active_backend.get_models.call_count == 3

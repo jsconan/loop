@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from time import monotonic
 from typing import TYPE_CHECKING
 
+from .. import constants
 from ..backend import BackendError
 from ..interaction import Interaction
 from ..models import ModelAssignment, ModelInfo
@@ -25,6 +27,8 @@ class ModelSelection:
     _backend: Backend
     _session_manager: SessionManager
     _selected: str | None
+    _available_models: list[ModelInfo] | None
+    _available_models_expires_at: float
 
     def __init__(
         self,
@@ -35,6 +39,8 @@ class ModelSelection:
         self._backend = backend
         self._session_manager = session_manager
         self._selected = selected if selected is not None else session_manager.model
+        self._available_models = None
+        self._available_models_expires_at = 0.0
         if self._selected is not None or backend.default_model is not None:
             self.synchronize_session()
 
@@ -96,12 +102,18 @@ class ModelSelection:
         """Return models currently available from the backend.
 
         Returns:
-            list[ModelInfo]: Available backend models.
+            list[ModelInfo]: Available backend models, reusing a recent non-empty catalog.
 
         Raises:
             BackendError: If the backend cannot list its models.
         """
-        return self._backend.get_models()
+        if self._available_models is not None and monotonic() < self._available_models_expires_at:
+            return self._available_models
+        models = self._backend.get_models()
+        if models:
+            self._available_models = models
+            self._available_models_expires_at = monotonic() + constants.MODEL_CATALOG_CACHE_SECONDS
+        return models
 
     def select(self, model: str) -> None:
         """Select a model and synchronize its active-session metadata.

@@ -111,12 +111,14 @@ def test_loop_rejects_an_invalid_compaction_threshold(tmp_path):
         )
 
 
-def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_path):
-    """Model commands update loop state and normalize model-list failures as command feedback."""
+def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_path, monkeypatch):
+    """Model commands reuse a fresh catalog and report failures once its cache expires."""
     interaction = MagicMock(spec=Interaction)
     backend = Mock(default_model="default-model")
     backend.get_context_window.return_value = 8192
     backend.get_models.return_value = [ModelInfo(id="selected-model")]
+    now = [0.0]
+    monkeypatch.setattr("loop.model_selection.selection.monotonic", lambda: now[0])
     loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
 
     loop.select_model("direct-model")
@@ -133,6 +135,7 @@ def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_p
         provider="test",
         operation="list_models",
     )
+    now[0] = 5.0
     interaction.prompt.side_effect = ["/model unavailable", False]
     loop.run()
     assert "Could not list available models: offline" in interaction.warning.call_args.args[0]

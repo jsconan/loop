@@ -70,3 +70,6 @@ COMMAND_TIMEOUT_SECONDS = 30
 
 # Error handling and recovery
 DEFAULT_MAX_RETRIES = 2
+
+# Model discovery
+MODEL_CATALOG_CACHE_SECONDS = 5.0
