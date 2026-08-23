@@ -13,6 +13,7 @@ OMIT = Omit()
 # Application home directory, used for storing session data and other application state.
 APP_DIRECTORY = Path(".loop")
 TEMPORARY_DIRECTORY_PREFIX = "loop-"
+TEMPORARY_CONTENT_DIRECTORY_PREFIX = "loop-content-"
 
 # Marker file for identifying the root of a Loop project.
 GIT_DIRECTORY = Path(".git")

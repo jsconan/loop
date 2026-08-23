@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 from .. import constants
 from .models import BoundedTextContent, CachedContentMetadata
 
-_CACHE = TemporaryDirectory(prefix="loop-content-")
+_CACHE = TemporaryDirectory(prefix=constants.TEMPORARY_CONTENT_DIRECTORY_PREFIX)
 _SOURCES: dict[str, str] = {}
 _METADATA: dict[str, CachedContentMetadata] = {}
 _LOCK = RLock()
