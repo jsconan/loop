@@ -474,8 +474,7 @@ class ConsoleInteraction(Interaction):
         )
         if usage.output_tokens is not None and metrics.model_duration_seconds > 0:
             performance += (
-                f" · {usage.output_tokens / metrics.model_duration_seconds:.1f} "
-                "output tokens/s"
+                f" · {usage.output_tokens / metrics.model_duration_seconds:.1f} output tokens/s"
             )
         self._console.print(
             performance,

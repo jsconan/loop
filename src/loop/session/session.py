@@ -236,9 +236,7 @@ class Session:
             None,
         )
         recorded = {
-            event.item_index
-            for event in self.events
-            if isinstance(event, ConversationItemEvent)
+            event.item_index for event in self.events if isinstance(event, ConversationItemEvent)
         }
         if item_index is None:
             raise ValueError(f"Unknown tool call '{call_id}'.")
