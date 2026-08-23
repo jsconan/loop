@@ -20,6 +20,9 @@ __all__ = [
     "format_tool_call_arguments",
     "is_path_ignored",
     "iter_visible_paths",
+    "kill_process_group",
+    "parse_command_line",
+    "read_bounded_stream",
     "read_bounded_text",
     "register_cached_metadata",
     "register_shutdown_signals",
@@ -44,6 +47,7 @@ from .content import (
 from .hashing import sha256_digest
 from .models import BoundedTextContent, CachedContentMetadata, IgnoreRule, IgnoreRules
 from .path import canonical_path, find_project_root, is_path_ignored, iter_visible_paths
+from .process import kill_process_group, parse_command_line, read_bounded_stream
 from .signals import ShutdownRequested, register_shutdown_signals
 from .text import (
     format_content_diff,
