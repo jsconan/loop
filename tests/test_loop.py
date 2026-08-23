@@ -741,7 +741,7 @@ def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
     assert not (tmp_path / ".loop").exists()
 
 
-def test_loop_delegates_a_session_identifier_to_an_injected_manager():
+def test_loop_delegates_a_session_identifier_to_an_injected_manager(tmp_path):
     """A persisted identifier is resolved through the injected session manager."""
     stored = Session(messages=[Message(role="user", content="saved")])
     manager = Mock(spec=SessionManager)
@@ -749,7 +749,12 @@ def test_loop_delegates_a_session_identifier_to_an_injected_manager():
     manager.interaction = MagicMock(spec=Interaction)
     manager.model = None
 
-    loop = Loop(backend=loop_backend(), session="session-id", session_manager=manager)
+    loop = Loop(
+        backend=loop_backend(),
+        session="session-id",
+        session_manager=manager,
+        working_directory=tmp_path,
+    )
 
     assert loop.session is stored
     manager.load_session.assert_called_once_with("session-id")
@@ -764,29 +769,39 @@ def test_loop_loads_a_persisted_session_identifier(tmp_path):
     session_id = store.save(stored)
 
     manager = SessionManager(session_store=store)
-    loop = Loop(backend=loop_backend(), session=session_id, session_manager=manager)
+    loop = Loop(
+        backend=loop_backend(),
+        session=session_id,
+        session_manager=manager,
+        working_directory=tmp_path,
+    )
 
     assert loop.session.messages == stored.messages
     assert loop.session.tokens == stored.tokens
     assert loop.session.model == "saved-model"
 
 
-def test_loop_uses_an_injected_manager_session_without_reloading_it():
+def test_loop_uses_an_injected_manager_session_without_reloading_it(tmp_path):
     """An injected manager keeps its active session when no replacement is requested."""
     session = Session(messages=[Message(role="user", content="saved")])
     manager = SessionManager(session=session)
 
-    loop = Loop(backend=loop_backend(), session_manager=manager)
+    loop = Loop(backend=loop_backend(), session_manager=manager, working_directory=tmp_path)
 
     assert loop.session is session
 
 
-def test_loop_prefers_an_explicit_interaction_over_the_manager_interaction():
+def test_loop_prefers_an_explicit_interaction_over_the_manager_interaction(tmp_path):
     """An explicit interaction controls loop I/O when a manager is also supplied."""
     manager = SessionManager(interaction=output_interaction())
     interaction = MagicMock(spec=Interaction)
 
-    loop = Loop(backend=loop_backend(), interaction=interaction, session_manager=manager)
+    loop = Loop(
+        backend=loop_backend(),
+        interaction=interaction,
+        session_manager=manager,
+        working_directory=tmp_path,
+    )
 
     assert loop.interaction is interaction
 
@@ -1164,13 +1179,13 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
     interaction.conversation_ended.assert_called_once_with()
 
 
-def test_run_keeps_handled_commands_out_of_model_history():
+def test_run_keeps_handled_commands_out_of_model_history(tmp_path):
     """The runner skips every command consumed by its command manager."""
     backend = Mock(default_model="model")
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.side_effect = ["/help", "/missing", False]
 
-    loop = Loop(backend=backend, interaction=interaction)
+    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
     loop.run()
 
     assert loop.messages == []
@@ -1178,13 +1193,13 @@ def test_run_keeps_handled_commands_out_of_model_history():
 
 
 @pytest.mark.parametrize("command", ["/exit", "/quit"])
-def test_run_exit_commands_end_the_conversation(command):
+def test_run_exit_commands_end_the_conversation(command, tmp_path):
     """Predefined slash exit commands terminate without a backend request."""
     backend = Mock(default_model="model")
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.return_value = command
 
-    loop = Loop(backend=backend, interaction=interaction)
+    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
     loop.run()
 
     assert loop.messages == []
@@ -1192,7 +1207,7 @@ def test_run_exit_commands_end_the_conversation(command):
     interaction.conversation_ended.assert_called_once_with()
 
 
-def test_handle_tool_calls_delegates_session_updates():
+def test_handle_tool_calls_delegates_session_updates(tmp_path):
     """Tool results and instruction state are delegated to the session manager."""
     registry = Mock()
     registry.call_with_timing.return_value = ("tool result", 0.25)
@@ -1201,9 +1216,14 @@ def test_handle_tool_calls_delegates_session_updates():
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
     session_manager.model = None
-    loop = Loop(backend=backend, tool_registry=registry, session_manager=session_manager)
-    call = function_call()
-    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    loop = Loop(
+        backend=backend,
+        tool_registry=registry,
+        session_manager=session_manager,
+        working_directory=tmp_path,
+    )
+    fn_call = function_call()
+    response = Response(answer="", reasoning="", tool_calls=(fn_call,), items=(fn_call,))
 
     assert len(loop.agent_runner.handle_tool_calls(response)) == 1
 
@@ -1214,8 +1234,8 @@ def test_handle_tool_calls_delegates_session_updates():
         active_skills=[],
     )
     registry.call_with_timing.assert_called_once_with(
-        call.name,
-        call.arguments,
+        fn_call.name,
+        fn_call.arguments,
         interaction=loop.interaction,
         instructions_manager=loop.instructions_manager,
         permission_manager=loop.permission_manager,
@@ -1224,19 +1244,21 @@ def test_handle_tool_calls_delegates_session_updates():
     assert loop.agent_runner.handle_tool_calls(Response(answer="", reasoning="")) == ()
 
 
-def test_query_selects_only_the_event_production_mode():
+def test_query_selects_only_the_event_production_mode(tmp_path):
     """Both loop modes forward identical history with only the stream flag differing."""
     backend = loop_backend(get_response=Mock(return_value=[]))
     session = Session(messages=[Message(role="user", content="hello")])
 
-    Loop(backend=backend, session=session).agent_runner.query()
-    Loop(backend=backend, session=session, stream=True).agent_runner.query()
+    Loop(backend=backend, session=session, working_directory=tmp_path).agent_runner.query()
+    Loop(
+        backend=backend, session=session, stream=True, working_directory=tmp_path
+    ).agent_runner.query()
 
     assert backend.get_response.call_args_list[0].kwargs["stream"] is False
     assert backend.get_response.call_args_list[1].kwargs["stream"] is True
 
 
-def test_query_delegates_instruction_state_to_the_session_manager():
+def test_query_delegates_instruction_state_to_the_session_manager(tmp_path):
     """Queries delegate their prepared instruction state to the session manager."""
     backend = loop_backend(get_response=Mock(return_value=[]))
     session_manager = Mock(spec=SessionManager)
@@ -1246,7 +1268,7 @@ def test_query_delegates_instruction_state_to_the_session_manager():
     session_manager.messages = []
     session_manager.model_context = []
     session_manager.context_window = None
-    loop = Loop(backend=backend, session_manager=session_manager)
+    loop = Loop(backend=backend, session_manager=session_manager, working_directory=tmp_path)
 
     loop.agent_runner.query()
 
@@ -1256,21 +1278,26 @@ def test_query_delegates_instruction_state_to_the_session_manager():
     )
 
 
-def test_query_prefers_the_explicit_model_over_response_metadata():
+def test_query_prefers_the_explicit_model_over_response_metadata(tmp_path):
     """Request selection stays independent of a model reported by an earlier response."""
     backend = loop_backend(get_response=Mock(return_value=[]))
     session = Session(model="served-model")
 
-    Loop(backend=backend, model="requested-model", session=session).agent_runner.query()
+    Loop(
+        backend=backend,
+        model="requested-model",
+        session=session,
+        working_directory=tmp_path,
+    ).agent_runner.query()
 
     assert backend.get_response.call_args.kwargs["model"] == "requested-model"
 
 
-def test_query_rejects_missing_model_selection():
+def test_query_rejects_missing_model_selection(tmp_path):
     """A query fails clearly when neither the loop nor backend selects a model."""
     backend = loop_backend(default_model=None, get_response=Mock())
 
     with pytest.raises(ValueError, match="No model was selected"):
-        Loop(backend=backend).agent_runner.query()
+        Loop(backend=backend, working_directory=tmp_path).agent_runner.query()
 
     backend.get_response.assert_not_called()
