@@ -9,7 +9,15 @@ from unittest.mock import Mock
 import pytest
 from pydantic import BaseModel
 
-from loop import Capability, ToolRegistrationError, ToolRegistry, tool
+from loop import (
+    Action,
+    Operation,
+    OperationPlan,
+    SessionTarget,
+    ToolRegistrationError,
+    ToolRegistry,
+    tool,
+)
 from loop.tooling import Tool, ToolContext
 
 tool_module = importlib.import_module("loop.tooling.tool")
@@ -46,13 +54,40 @@ def test_tool_returns_the_original_function_with_pure_defaults():
     assert declared is calculate
     assert calculate(3) == 3
     assert registered.name == "calculate"
-    assert registered.capabilities == frozenset({Capability.PURE})
+    assert registered.actions == frozenset()
+
+
+def test_plan_rejects_operations_outside_the_declared_action_bound():
+    """A planner cannot silently expand the authority declared by its tool."""
+
+    def planner(arguments):
+        return OperationPlan(
+            arguments=arguments,
+            operations=(
+                Operation(
+                    tool_id="",
+                    action=Action.SESSION_MUTATE,
+                    target=SessionTarget(identifier="state"),
+                ),
+            ),
+        )
+
+    planned = Tool(
+        function=Mock(),
+        name="calculate",
+        description="Calculate a value.",
+        arguments_model=Arguments,
+        operation_planner=planner,
+    )
+
+    with pytest.raises(ValueError, match="planned undeclared actions: session.mutate"):
+        planned.plan({"number": 3})
 
 
 def test_tool_options_preserve_an_explicitly_empty_capability_set():
     """Configured declarations retain names, descriptions, and empty capability collections."""
 
-    @tool(name="selected", description="Selected tool.", capabilities=())
+    @tool(name="selected", description="Selected tool.", actions=())
     def calculate(number: int) -> int:
         return number
 
@@ -60,7 +95,7 @@ def test_tool_options_preserve_an_explicitly_empty_capability_set():
 
     assert registered.name == "selected"
     assert registered.description == "Selected tool."
-    assert registered.capabilities == frozenset()
+    assert registered.actions == frozenset()
 
 
 def test_tools_are_immutable():

@@ -69,8 +69,8 @@ Enter a message at the `You:` prompt. To stop, enter `/exit`, `/quit`, or `q`.
 Terminal completion is available while typing. Use `/` for commands and their known values, `@`
 for visible files and directories relative to the working directory, and `$` for discovered skill
 names. Matching is case-insensitive and accepts fragments at the beginning, middle, or end. File
-completion respects `.gitignore` and `.agentignore`; `/permissions` completes operations, modes,
-decisions, registered tools, and capabilities.
+completion respects `.gitignore` and `.agentignore`; `/permissions` completes operations, scopes,
+decisions, limits, registered tools, and current rule identifiers.
 
 Command arguments use shell-like quoting and may be supplied by position, by name, or both, for
 example `/command first-value count=3 enabled=true`. Each value is decoded independently and then
@@ -212,7 +212,7 @@ A decorated function can request an explicit `ToolContext`. The registry injects
 dispatch, while the context parameter is omitted from the schema exposed to the model:
 
 ```python
-from loop import Capability, ToolContext, ToolRegistry, tool
+from loop import ToolContext, ToolRegistry, tool
 
 
 @tool
@@ -233,7 +233,6 @@ registry.register(
     describe_tool,
     name="describe_value",
     description="Describe one value.",
-    capabilities={Capability.PURE},
 )
 ```
 
@@ -248,15 +247,17 @@ registry = ToolRegistry(
             describe_tool,
             name="describe_value",
             description="Describe one value.",
-            capabilities=frozenset({Capability.PURE}),
-            permission_resolver=None,
+            actions=frozenset(),
+            operation_planner=None,
         )
     ]
 )
 ```
 
-Omitting `permission_resolver` inherits the passive declaration; explicitly passing `None` removes
-the declared resolver for that registry only.
+Omitting `operation_planner` inherits the passive declaration; explicitly passing `None` removes
+the declared planner for that registry only. Pure tools declare no actions. Authority-bearing tools
+declare an action upper bound and an operation planner that canonicalizes arguments and returns the
+complete typed effect set before any implementation code runs.
 
 The context provides invocation metadata and access to the injected user interaction service.
 For loop-managed calls it also exposes the active `SkillManager`.
@@ -344,8 +345,12 @@ it for web requests.
 ### Tool permissions
 
 Every model-originated tool call is authorized centrally after its arguments are validated and
-before its function is invoked. The default `confirm_all` mode asks about every call, including
-read-only and pure tools. A required approval is denied when no interactive user is available.
+before its function is invoked. A tool first produces one complete, canonical operation plan; the
+whole plan is then allowed, denied, or approved atomically. Pure tools require no authority. The
+default supervised policy permits reads in the workspace and Loop-owned temporary directory, asks
+for mutations and network access, and denies host-process execution at a user-configurable
+boundary. Ordinary rules cannot override boundaries. A required approval is denied when no
+interactive user is available.
 
 The local policy is stored at `.loop/permissions.yaml` under the Git project root. It is created
 when the policy is first changed. Decisions are appended to `.loop/permissions-audit.jsonl` and
@@ -355,22 +360,45 @@ prompt. Use `/permissions` to display the active policy:
 
 ```text
 /permissions
-/permissions mode read_only
-/permissions add allow read_text_file filesystem.read "/project/docs/*"
-/permissions session deny run_command process.exec
+/permissions show effective
+/permissions default set workspace filesystem.delete deny
+/permissions default set session process.execute ask
+/permissions rule add workspace allow read_text_file filesystem.read "/project/docs/*"
+/permissions rule add session deny run_command process.execute "*"
+/permissions limit set session host-process allow
+/permissions limit add workspace network-origin https://example.com
+/permissions limit add workspace read-root system-temp
+/permissions limit reset session host-process
+/permissions session reset
+/permissions explain run_command process.execute "git status"
 ```
 
-Modes are `confirm_all`, `read_only`, `workspace_write`, `locked_down`, and `unrestricted`.
-Rules select `allow`, `ask`, or `deny`, followed by a tool glob and optional capability and
-resource globs. Deny rules take precedence over ask rules, which take precedence over allow rules.
-Session rules disappear when the process exits; rules added with `add` are persisted locally.
+The versioned YAML document is the complete policy; there is no closed set of compiled permission
+postures. Each action has an independent fallback default. Rules select `allow`, `ask`, or `deny`
+and match a tool glob, action, and canonical-resource glob. Deny rules take precedence over ask
+rules, which take precedence over allow rules. Session rules disappear when the process exits.
+`/permissions show` displays the workspace policy, session overrides, effective defaults and
+limits, all active rules, and precedence. Every default, rule, and limit change takes an explicit
+`workspace` or `session` scope. `/permissions reload` validates external YAML edits before replacing
+the workspace layer while preserving session overrides; `/permissions explain` reports the
+determining source for one concrete operation.
 
-Capabilities are `pure`, `filesystem.read`, `filesystem.write`, `filesystem.delete`,
-`process.exec`, `network.read`, `network.write`, and `session.write`. The `workspace_write` mode
-automatically permits in-workspace writes but asks before deletions. Shell calls are always
-classified as `process.exec`; loop does not infer safety from a command prefix. Permission is an
-intent check rather than a sandbox, so process-level filesystem and network isolation should still
-be used for untrusted workloads.
+Actions are `filesystem.list`, `filesystem.read`, `filesystem.create`, `filesystem.replace`,
+`filesystem.delete`, `network.request`, `process.execute`, and `session.mutate`. Filesystem roots,
+control paths, network origins/private addresses, and host processes are configurable enforcement
+boundaries that rules cannot override. `workspace` and `loop-temp` roots are available by default;
+add `system-temp` only when cross-application temporary-file access is necessary. Enabling host
+processes or private-network access is explicit. Network origins use glob patterns: `*` permits
+all origins, while an empty origin list denies all network requests. Adding the first specific
+origin replaces the default `*`, making the boundary restrictive. Relative filesystem roots in
+the YAML policy are resolved from the workspace, not from the shell's launch directory. Host
+process execution requires both opening the `host-process` boundary and choosing an appropriate
+`process.execute` default or rule. The built-in executor does not supply an operating-system
+sandbox, so this boundary must remain closed for untrusted process execution. Ignore files limit
+discovery only; they are not authorization policy.
+The command tool accepts an exact argument vector and never invokes a shell, while web requests do
+not follow redirects implicitly. Policy is still distinct from operating-system containment, so an
+enforcement sandbox remains required before enabling untrusted process execution.
 
 ## Built-in tools
 
@@ -385,7 +413,7 @@ The default registry exposes these functions to the model:
 | `get_current_datetime` | Returns the current local date and time                                  |
 | `fetch_content`        | Streams authorized HTTP(S) text into a bounded resumable cache           |
 | `read_cached_content`  | Reads cached text by line or opaque cursor, optionally re-fetching a URL |
-| `run_command`          | Runs an authorized shell command with a 30-second timeout                |
+| `run_command`          | Runs an authorized argument vector with a 30-second timeout              |
 | `manage_skills`        | Manages skill activation and progressively loads bounded skill resources |
 
 Text reads report exact source and included byte sizes, returned ranges, truncation reasons, and
@@ -403,9 +431,9 @@ nested folders, using Git's pattern syntax. Agent-specific rules take precedence
 and ignored directories are not traversed. This filtering controls file discovery only; it does
 not prevent an explicitly requested file from being read or changed.
 
-These tools operate with the permissions of the process running `loop`. Reads
-are not sandboxed, and approved commands are passed to the system shell. Run the
-project only in an environment where you are comfortable granting the model that
+These tools operate with the permissions of the process running `loop`. Filesystem access is
+authorized but not OS-sandboxed; approved commands use an exact argument vector and never invoke
+a shell. Run the project only in an environment where you are comfortable granting the model that
 access.
 
 ## Development

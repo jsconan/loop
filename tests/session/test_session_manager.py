@@ -10,9 +10,10 @@ from uuid import uuid4
 import pytest
 
 from loop import (
+    Action,
     AnswerCompleted,
     AnswerDelta,
-    Capability,
+    AuthorizationResult,
     Compaction,
     CompactionContextItem,
     CompactionResult,
@@ -20,12 +21,13 @@ from loop import (
     ContentArtifact,
     ContextReference,
     Decision,
+    FileTarget,
     InstructionSnapshot,
     MemorySessionStore,
     Message,
     ModelAssignment,
-    PermissionRequest,
-    PermissionResult,
+    Operation,
+    PolicyDecision,
     Reasoning,
     ReasoningCompleted,
     ReasoningDelta,
@@ -204,15 +206,27 @@ def test_manager_replays_permissions_and_run_statistics():
     """Replay includes prompted approvals and run summaries while hiding automatic decisions."""
     interaction = MagicMock(spec=Interaction)
     now = datetime(2026, 8, 20, tzinfo=UTC)
-    request = PermissionRequest(tool_name="read", capability=Capability.FILESYSTEM_READ)
-    result = PermissionResult(decision=Decision.ALLOW, reason="allowed", source="user")
+    operation = Operation(
+        tool_id="read",
+        action=Action.FILESYSTEM_READ,
+        target=FileTarget(path="/workspace/file.txt"),
+    )
+    result = AuthorizationResult(
+        operations=(operation,),
+        policy=PolicyDecision(
+            decision=Decision.ASK,
+            reason="approval required",
+            sources=("default:filesystem.read",),
+        ),
+        decision=Decision.ALLOW,
+        prompted=True,
+        reason="allowed",
+        source="user",
+    )
     prompted = PermissionEvent(
         id="permission",
         created_at=now,
-        request=request,
         result=result,
-        prompted=True,
-        prompt=None,
     )
     metrics = RunMetrics(
         active_duration_seconds=1,
@@ -226,7 +240,12 @@ def test_manager_replays_permissions_and_run_statistics():
         session=Session(
             events=[
                 prompted,
-                prompted.model_copy(update={"id": "automatic", "prompted": False}),
+                prompted.model_copy(
+                    update={
+                        "id": "automatic",
+                        "result": result.model_copy(update={"prompted": False}),
+                    }
+                ),
                 RunCompletedEvent(
                     id="run",
                     created_at=now,

@@ -32,7 +32,7 @@ from ..models import (
     ToolResult,
     Usage,
 )
-from ..permissions import PermissionRequest, PermissionResult
+from ..permissions import AuthorizationResult
 from ..utils import (
     bound_tool_result,
     cached_metadata,
@@ -218,9 +218,10 @@ class SessionManager:
                     output.info("Compacted session context.")
                 continue
             if isinstance(event, PermissionEvent):
-                if event.prompted:
+                if event.result.prompted:
                     output.permission(
-                        event.prompt or "Permission requested.", event.result.decision.value
+                        event.result.prompt or "Permission requested.",
+                        event.result.decision.value,
                     )
                 continue
             if isinstance(event, RunCompletedEvent):
@@ -578,28 +579,16 @@ class SessionManager:
         """
         self.add_message(response)
 
-    def record_permission(
-        self,
-        request: PermissionRequest,
-        result: PermissionResult,
-        prompted: bool,
-        prompt: str | None,
-    ) -> None:
-        """Persist one invocation-scoped authorization decision in the session timeline.
+    def record_authorization(self, result: AuthorizationResult) -> None:
+        """Persist one atomic authorization decision in the session timeline.
 
         Args:
-            request (PermissionRequest): Normalized requested authority.
-            result (PermissionResult): Effective authorization result.
-            prompted (bool): Whether an interactive prompt was displayed.
-            prompt (str | None): Exact displayed prompt, when applicable.
+            result (AuthorizationResult): Policy, approval, and effective outcome.
         """
         event = PermissionEvent(
             id=str(uuid7()),
             created_at=datetime.now(UTC),
-            request=request,
             result=result,
-            prompted=prompted,
-            prompt=prompt,
         )
         self._persist_event(event)
 

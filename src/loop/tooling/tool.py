@@ -9,7 +9,7 @@ from pydantic import BaseModel, ValidationError
 
 from ..constants import OMIT, Omit
 from ..models import ToolDefinition
-from ..permissions import Capability, PermissionRequest
+from ..permissions import Action, OperationPlan, OperationPlanner
 from ..utils import callable_name
 from .context import ToolContext
 from .utils import (
@@ -23,8 +23,6 @@ from .utils import (
     takes_tool_context,
 )
 
-PermissionResolver = Callable[[dict[str, Any]], Iterable[PermissionRequest]]
-
 _TOOL_ATTR = "__loop_tool__"
 
 
@@ -36,9 +34,9 @@ class Tool:
         function (Callable[..., Any]): Python function invoked for the tool.
         name (str | None): Public name exposed to the model, or ``None`` to use the function name.
         description (str | None): Public description, or ``None`` to use the docstring summary.
-        capabilities (frozenset[Capability]): Static authority required by every call.
-        permission_resolver (PermissionResolver | None): Optional resolver producing
-            resource-specific permission requests from validated arguments.
+        actions (frozenset[Action]): Upper bound of authority-bearing effects.
+        operation_planner (OperationPlanner | None): Optional planner producing canonical
+            arguments and typed operations.
         arguments_model (type[BaseModel] | None): Pydantic model used to validate arguments after
             registration, or ``None`` for a passive declaration.
     """
@@ -46,8 +44,8 @@ class Tool:
     function: Callable[..., Any]
     name: str | None = None
     description: str | None = None
-    capabilities: frozenset[Capability] = frozenset({Capability.PURE})
-    permission_resolver: PermissionResolver | None = None
+    actions: frozenset[Action] = frozenset()
+    operation_planner: OperationPlanner | None = None
     arguments_model: type[BaseModel] | None = None
 
     def registered(
@@ -55,8 +53,8 @@ class Tool:
         *,
         name: str | None = None,
         description: str | None = None,
-        capabilities: Iterable[Capability] | None = None,
-        permission_resolver: PermissionResolver | None | Omit = OMIT,
+        actions: Iterable[Action] | None = None,
+        operation_planner: OperationPlanner | None | Omit = OMIT,
     ) -> Tool:
         """Return a registry-ready copy with resolved metadata and argument validation.
 
@@ -64,29 +62,31 @@ class Tool:
             name (str | None): Container-specific public name, or ``None`` to inherit or derive it.
             description (str | None): Container-specific description, or ``None`` to inherit or
                 derive it.
-            capabilities (Iterable[Capability] | None): Container-specific static authority, or
+            actions (Iterable[Action] | None): Container-specific action upper bound, or
                 ``None`` to inherit.
-            permission_resolver (PermissionResolver | None | Omit): Container-specific resolver.
+            operation_planner (OperationPlanner | None | Omit): Container-specific planner.
                 Omit it to inherit; pass ``None`` to remove one.
 
         Returns:
             Tool: Immutable, fully resolved tool for one registry.
         """
         resolved_name = name or self.name or callable_name(self.function)
-        return replace(
+        registered = replace(
             self,
             name=resolved_name,
             description=description or self.description or get_tool_description(self.function),
-            capabilities=(
-                frozenset(capabilities) if capabilities is not None else self.capabilities
-            ),
-            permission_resolver=(
-                self.permission_resolver
-                if isinstance(permission_resolver, Omit)
-                else permission_resolver
+            actions=frozenset(actions) if actions is not None else self.actions,
+            operation_planner=(
+                self.operation_planner if isinstance(operation_planner, Omit) else operation_planner
             ),
             arguments_model=get_tool_arguments_model(self.function, resolved_name),
         )
+        if registered.actions and registered.operation_planner is None:
+            raise ToolRegistrationError(
+                f"Tool '{resolved_name}' declares authority-bearing actions without an "
+                "operation planner."
+            )
+        return registered
 
     def definition(self) -> ToolDefinition:
         """Return the function-tool definition.
@@ -174,23 +174,36 @@ class Tool:
             )
         return validated.model_dump(), None
 
-    def permission_requests(self, arguments: dict[str, Any]) -> tuple[PermissionRequest, ...]:
-        """Return normalized permission requests for validated arguments.
+    def plan(self, arguments: dict[str, Any]) -> OperationPlan:
+        """Return canonical execution arguments and the complete operation set.
 
         Args:
             arguments (dict[str, Any]): Validated tool arguments.
 
         Returns:
-            tuple[PermissionRequest, ...]: Static or argument-specific permission requests.
+            OperationPlan: Canonical arguments and complete typed operations.
+
+        Raises:
+            ValueError: If a planner returns an undeclared action.
         """
-        if self.permission_resolver is not None:
-            return tuple(
-                request.model_copy(update={"tool_name": self._name_for_error()})
-                for request in self.permission_resolver(arguments)
+        plan = (
+            self.operation_planner(arguments)
+            if self.operation_planner is not None
+            else OperationPlan(arguments=arguments)
+        )
+        undeclared = {operation.action for operation in plan.operations} - self.actions
+        if undeclared:
+            values = ", ".join(sorted(action.value for action in undeclared))
+            raise ValueError(
+                f"Tool '{self._name_for_error()}' planned undeclared actions: {values}."
             )
-        return tuple(
-            PermissionRequest(tool_name=self._name_for_error(), capability=capability)
-            for capability in sorted(self.capabilities, key=str)
+        return plan.model_copy(
+            update={
+                "operations": tuple(
+                    operation.model_copy(update={"tool_id": self._name_for_error()})
+                    for operation in plan.operations
+                )
+            }
         )
 
     def _name_for_error(self) -> str:
@@ -226,17 +239,17 @@ class ToolRegistration:
         name (str | None): Container-specific name, or ``None`` to inherit or derive it.
         description (str | None): Container-specific description, or ``None`` to inherit or
             derive it.
-        capabilities (frozenset[Capability] | None): Container-specific capabilities, or ``None``
-            to inherit declared capabilities.
-        permission_resolver (PermissionResolver | None | Omit): Container-specific resolver.
-            Omit it to inherit a declared resolver; pass ``None`` to remove one.
+        actions (frozenset[Action] | None): Container-specific action upper bound, or ``None``
+            to inherit declared actions.
+        operation_planner (OperationPlanner | None | Omit): Container-specific planner.
+            Omit it to inherit a declared planner; pass ``None`` to remove one.
     """
 
     function: Callable[..., Any]
     name: str | None = None
     description: str | None = None
-    capabilities: frozenset[Capability] | None = None
-    permission_resolver: PermissionResolver | None | Omit = OMIT
+    actions: frozenset[Action] | None = None
+    operation_planner: OperationPlanner | None | Omit = OMIT
 
 
 @overload
@@ -250,8 +263,8 @@ def tool[ToolFunction: Callable[..., Any]](
     *,
     name: str | None = None,
     description: str | None = None,
-    capabilities: Iterable[Capability] | None = None,
-    permission_resolver: PermissionResolver | None = None,
+    actions: Iterable[Action] | None = None,
+    operation_planner: OperationPlanner | None = None,
 ) -> Callable[[ToolFunction], ToolFunction]: ...
 
 
@@ -261,8 +274,8 @@ def tool[ToolFunction: Callable[..., Any]](
     *,
     name: str | None = None,
     description: str | None = None,
-    capabilities: Iterable[Capability] | None = None,
-    permission_resolver: PermissionResolver | None = None,
+    actions: Iterable[Action] | None = None,
+    operation_planner: OperationPlanner | None = None,
 ) -> ToolFunction | Callable[[ToolFunction], ToolFunction]:
     """Declare a function as an LLM-callable tool without registering it.
 
@@ -271,10 +284,10 @@ def tool[ToolFunction: Callable[..., Any]](
         name (str | None): Public tool name. Defaults to the function name at registration.
         description (str | None): Public description. Defaults to the docstring summary at
             registration.
-        capabilities (Iterable[Capability] | None): Static authority required by every call.
-            Defaults to ``pure``.
-        permission_resolver (PermissionResolver | None): Optional resolver producing
-            resource-specific requests from validated arguments.
+        actions (Iterable[Action] | None): Upper bound of authority-bearing effects.
+            Defaults to no effects.
+        operation_planner (OperationPlanner | None): Optional planner producing canonical
+            arguments and typed operations.
 
     Returns:
         ToolFunction | Callable[[ToolFunction], ToolFunction]: The unchanged declared function,
@@ -290,8 +303,8 @@ def tool[ToolFunction: Callable[..., Any]](
                 function=target,
                 name=name,
                 description=description,
-                capabilities=frozenset({Capability.PURE} if capabilities is None else capabilities),
-                permission_resolver=permission_resolver,
+                actions=frozenset(() if actions is None else actions),
+                operation_planner=operation_planner,
             ),
         )
         return target

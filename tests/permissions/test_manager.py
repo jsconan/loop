@@ -1,339 +1,679 @@
-"""Tests for local permission evaluation, persistence, prompts, and auditing."""
+"""Tests for layered operation-policy evaluation, approval, and persistence."""
 
 import json
+import tempfile
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
 from loop import (
-    Capability,
+    Action,
+    AuthorizationResult,
     Decision,
+    FileTarget,
     Interaction,
+    NetworkTarget,
+    Operation,
     PermissionConfiguration,
     PermissionManager,
-    PermissionMode,
-    PermissionRequest,
     PermissionRule,
+    PolicyLimits,
+    PolicyScope,
+    ProcessBoundary,
+    ProcessTarget,
+    SessionTarget,
 )
 
 
-def request(
-    capability: Capability = Capability.PURE,
-    *,
-    tool: str = "demo",
-    resource: str | None = None,
-    reason: str | None = None,
-) -> PermissionRequest:
-    """Build a representative permission request."""
-    return PermissionRequest(
-        tool_name=tool, capability=capability, resource=resource, reason=reason
-    )
+def operation(action: Action, *, tool: str = "demo", target=None, reason=None) -> Operation:
+    """Build one representative typed operation."""
+    return Operation(tool_id=tool, action=action, target=target, reason=reason)
 
 
-def manager_for(mode: PermissionMode, tmp_path=None, interaction=None) -> PermissionManager:
-    """Build a manager with one explicit mode."""
-    return PermissionManager(
-        tmp_path,
-        interaction=interaction,
-        configuration=PermissionConfiguration(mode=mode),
-    )
+def file_operation(action: Action, path) -> Operation:
+    """Build one filesystem operation for a canonical path."""
+    return operation(action, target=FileTarget(path=str(path)))
 
 
-def test_default_configuration_is_local_and_fail_closed_without_a_user(tmp_path):
-    """Missing local configuration defaults to confirm-all and headless denial."""
+def test_default_policy_allows_scoped_reads_and_fails_closed_for_approval(tmp_path):
+    """The supervised default permits workspace inspection and denies headless mutations."""
     manager = PermissionManager(tmp_path)
 
-    result = manager.authorize(request())
+    read = manager.authorize((file_operation(Action.FILESYSTEM_READ, tmp_path / "file.txt"),))
+    write = manager.authorize((file_operation(Action.FILESYSTEM_CREATE, tmp_path / "new.txt"),))
 
-    assert manager.configuration.mode is PermissionMode.CONFIRM_ALL
-    assert manager.configuration_path == tmp_path / ".loop" / "permissions.yaml"
-    assert manager.interaction is None
-    assert result.decision is Decision.DENY
+    assert read.decision is Decision.ALLOW
+    assert read.policy.decision is Decision.ALLOW
+    assert write.policy.decision is Decision.ASK
+    assert write.decision is Decision.DENY
+    assert write.source == "headless"
     audit = tmp_path / ".loop" / "permissions-audit.jsonl"
-    assert json.loads(audit.read_text("utf-8"))["result"]["source"] == "headless"
+    assert json.loads(audit.read_text("utf-8").splitlines()[-1])["source"] == "headless"
 
 
-def test_authorization_uses_default_recorder_and_allows_an_override(tmp_path):
-    """Authorization uses its configured recorder unless the call supplies another one."""
+def test_authorization_approves_one_complete_operation_set_and_records_policy(tmp_path):
+    """One prompt and recorder event preserve both policy and effective outcomes."""
     interaction = Mock(spec=Interaction)
     interaction.confirm.return_value = True
     recorder = Mock()
+    manager = PermissionManager(tmp_path, interaction=interaction, recorder=recorder)
+    operations = (
+        file_operation(Action.FILESYSTEM_CREATE, tmp_path / "a.txt"),
+        file_operation(Action.FILESYSTEM_DELETE, tmp_path / "b.txt"),
+    )
+
+    result = manager.authorize(operations)
+
+    assert result.policy.decision is Decision.ASK
+    assert result.decision is Decision.ALLOW
+    assert result.prompted is True
+    assert result.prompt is not None
+    assert "filesystem.create" in result.prompt
+    assert "filesystem.delete" in result.prompt
+    interaction.confirm.assert_called_once_with(result.prompt, default=False)
+    recorder.record_authorization.assert_called_once_with(result)
+
+
+def test_authorization_rejection_and_recorder_override_are_atomic(tmp_path):
+    """A rejected batch is recorded once by an invocation-scoped recorder."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = False
+    configured = Mock()
     override = Mock()
+    manager = PermissionManager(tmp_path, interaction=interaction, recorder=configured)
+
+    result = manager.authorize(
+        (file_operation(Action.FILESYSTEM_REPLACE, tmp_path / "a.txt"),),
+        recorder=override,
+    )
+
+    assert result.decision is Decision.DENY
+    assert result.source == "user"
+    override.record_authorization.assert_called_once_with(result)
+    configured.record_authorization.assert_not_called()
+    assert manager.recorder is configured
+
+
+def test_no_authority_plan_is_allowed_without_prompting():
+    """Pure tool plans require neither policy rules nor interactive approval."""
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(interaction=interaction)
+
+    result = manager.authorize(())
+
+    assert result.decision is Decision.ALLOW
+    assert result.policy.sources == ("no_authority",)
+    interaction.confirm.assert_not_called()
+
+
+def test_interaction_property_and_non_persisted_default_changes():
+    """In-memory policy controls can be replaced without requiring a policy path."""
+    manager = PermissionManager()
+    interaction = Mock(spec=Interaction)
+
+    manager.interaction = interaction
+    manager.set_default(Action.FILESYSTEM_READ, Decision.ALLOW, scope=PolicyScope.SESSION)
+
+    assert manager.interaction is interaction
+    assert manager.effective_configuration.defaults[Action.FILESYSTEM_READ] is Decision.ALLOW
+
+
+def test_rule_composition_uses_forbid_then_approval_then_permit(tmp_path):
+    """Forbid and approval duties monotonically constrain matching permits."""
+    rules = [
+        PermissionRule(id="permit", decision=Decision.ALLOW, tool="read_*"),
+        PermissionRule(
+            id="approval",
+            decision=Decision.ASK,
+            action=Action.FILESYSTEM_READ,
+        ),
+        PermissionRule(
+            id="forbid",
+            decision=Decision.DENY,
+            resource="*/secret.*",
+        ),
+    ]
     manager = PermissionManager(
         tmp_path,
-        interaction=interaction,
-        recorder=recorder,
-        configuration=PermissionConfiguration(mode=PermissionMode.CONFIRM_ALL),
-    )
-    operation = request(Capability.NETWORK_READ, resource="https://example.com")
-
-    result = manager.authorize(operation)
-
-    recorder.record_permission.assert_called_once_with(
-        operation,
-        result,
-        True,
-        "🌐 Agent wants to use 'demo' for network.read on 'https://example.com'. Proceed?",
-    )
-    assert manager.recorder is recorder
-
-    manager.authorize(operation, recorder=override)
-
-    override.record_permission.assert_called_once()
-    assert recorder.record_permission.call_count == 1
-
-
-@pytest.mark.parametrize("approved,decision", [(True, Decision.ALLOW), (False, Decision.DENY)])
-def test_confirm_all_prompts_with_normalized_context(tmp_path, approved, decision):
-    """Interactive confirmation records either a one-call approval or rejection."""
-    interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = approved
-    manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
-    operation = request(
-        Capability.NETWORK_READ,
-        resource="https://example.com",
-        reason="Needed for documentation.",
+        configuration=PermissionConfiguration(rules=rules),
     )
 
-    result = manager.authorize(operation)
-
-    assert result.decision is decision
-    interaction.confirm.assert_called_once_with(
-        "🌐 Agent wants to use 'demo' for network.read on 'https://example.com'. "
-        "Needed for documentation. Proceed?",
-        default=False,
-    )
-
-
-@pytest.mark.parametrize(
-    ("resource", "expected"),
-    [
-        ("inside.txt", "inside.txt"),
-        ("folder/inside.txt", "folder/inside.txt"),
-        ("../outside.txt", None),
-    ],
-)
-def test_filesystem_prompt_uses_workspace_relative_paths_unless_resource_escapes(
-    tmp_path, resource, expected
-):
-    """File approval prompts abbreviate in-workspace paths but retain outside absolute paths."""
-    interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = True
-    manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
-    absolute_resource = (tmp_path / resource).resolve()
-
-    manager.authorize(request(Capability.FILESYSTEM_READ, resource=str(absolute_resource)))
-
-    displayed = expected if expected is not None else str(absolute_resource)
-    interaction.confirm.assert_called_once_with(
-        f"📖 Agent wants to use 'demo' for filesystem.read on '{displayed}'. Proceed?",
-        default=False,
-    )
-
-
-def test_filesystem_prompt_identifies_the_workspace_root_unambiguously(tmp_path):
-    """File approval prompts label the workspace root without resembling a child path."""
-    interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = True
-    manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
-
-    manager.authorize(request(Capability.FILESYSTEM_READ, resource=str(tmp_path)))
-
-    interaction.confirm.assert_called_once_with(
-        f"📖 Agent wants to use 'demo' for filesystem.read on "
-        f"'workspace root: {tmp_path}'. Proceed?",
-        default=False,
-    )
-
-
-def test_explicit_rules_match_fields_and_deny_precedes_ask_and_allow():
-    """Matching deny rules dominate weaker decisions regardless of declaration order."""
-    configuration = PermissionConfiguration(
-        mode=PermissionMode.UNRESTRICTED,
-        rules=[
-            PermissionRule(decision=Decision.ALLOW, tool="read_*"),
-            PermissionRule(
-                decision=Decision.ASK,
+    secret = manager.evaluate(
+        (
+            operation(
+                Action.FILESYSTEM_READ,
                 tool="read_file",
-                capability=Capability.FILESYSTEM_READ,
+                target=FileTarget(path=str(tmp_path / "secret.env")),
             ),
-            PermissionRule(
-                decision=Decision.DENY,
-                tool="read_file",
-                resource="*/secret.*",
-            ),
-        ],
+        )
     )
-    manager = PermissionManager(configuration=configuration)
-
-    result = manager.evaluate(
-        request(
-            Capability.FILESYSTEM_READ,
-            tool="read_file",
-            resource="/project/secret.env",
+    ordinary = manager.evaluate(
+        (
+            operation(
+                Action.FILESYSTEM_READ,
+                tool="read_file",
+                target=FileTarget(path=str(tmp_path / "ordinary.txt")),
+            ),
         )
     )
 
-    assert result.decision is Decision.DENY
-    assert manager.evaluate(request(tool="other")).decision is Decision.ALLOW
+    assert secret.decision is Decision.DENY
+    assert secret.sources == ("rule:workspace:forbid",)
+    assert ordinary.decision is Decision.ASK
+    assert ordinary.sources == ("rule:workspace:approval",)
 
 
-def test_ignored_files_are_denied_by_default_before_interactive_approval(tmp_path, monkeypatch):
-    """Ignore rules create a default filesystem denial that modes cannot prompt around."""
-    (tmp_path / ".git").mkdir()
-    (tmp_path / ".gitignore").write_text("secret.txt\n", "utf-8")
-    secret = tmp_path / "secret.txt"
-    secret.write_text("sensitive", "utf-8")
+def test_any_denied_operation_denies_a_batch_without_prompting(tmp_path):
+    """A hard denial prevents prompts for other approval-requiring operations."""
     interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = True
-    manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
 
-    result = manager.authorize(request(Capability.FILESYSTEM_READ, resource=str(secret)))
+    result = manager.authorize(
+        (
+            file_operation(Action.FILESYSTEM_CREATE, tmp_path / "new.txt"),
+            file_operation(Action.FILESYSTEM_READ, tmp_path.parent / "outside.txt"),
+        )
+    )
 
+    assert result.policy.decision is Decision.DENY
     assert result.decision is Decision.DENY
-    assert result.source == "safety:ignored_path"
     interaction.confirm.assert_not_called()
 
-    monkeypatch.setattr(
-        "loop.permissions.manager.is_path_ignored",
-        Mock(side_effect=OSError("unreadable ignore policy")),
-    )
-    assert (
-        manager.evaluate(
-            request(Capability.FILESYSTEM_READ, resource=str(tmp_path / "other.txt"))
-        ).decision
-        is Decision.DENY
+
+@pytest.mark.parametrize(
+    ("path", "action", "source"),
+    [
+        ("outside", Action.FILESYSTEM_READ, "limit:workspace:readable_roots"),
+        (".loop/policy", Action.FILESYSTEM_READ, "boundary:protected_path"),
+        (".git/config", Action.FILESYSTEM_READ, "boundary:protected_path"),
+        (".gitignore", Action.FILESYSTEM_REPLACE, "boundary:protected_path"),
+        (".agentignore", Action.FILESYSTEM_DELETE, "boundary:protected_path"),
+    ],
+)
+def test_filesystem_boundaries_cannot_be_overridden(tmp_path, path, action, source):
+    """Filesystem roots and control paths remain forbidden despite permit rules."""
+    target = tmp_path.parent / "outside" if path == "outside" else tmp_path / path
+    manager = PermissionManager(
+        tmp_path,
+        configuration=PermissionConfiguration(rules=[PermissionRule(decision=Decision.ALLOW)]),
     )
 
+    result = manager.evaluate((file_operation(action, target),))
 
-def test_explicit_allow_rule_cannot_override_an_ignored_resource(tmp_path):
-    """Hard ignored-path denial takes precedence over explicit allow rules."""
-    (tmp_path / ".git").mkdir()
-    (tmp_path / ".gitignore").write_text("secret.txt\n", "utf-8")
-    secret = tmp_path / "secret.txt"
+    assert result.decision is Decision.DENY
+    assert result.sources == (source,)
+
+
+def test_explicit_filesystem_roots_expand_the_hard_boundary(tmp_path):
+    """Configured absolute roots deliberately extend readable and writable scope."""
+    outside = tmp_path.parent / "shared"
     configuration = PermissionConfiguration(
-        rules=[
-            PermissionRule(
-                decision=Decision.ALLOW,
-                tool="read_text_file",
-                capability=Capability.FILESYSTEM_READ,
-                resource=str(secret),
-            )
-        ]
+        limits=PolicyLimits(
+            readable_roots=("workspace", str(outside)),
+            writable_roots=(str(outside),),
+        )
     )
     manager = PermissionManager(tmp_path, configuration=configuration)
 
-    result = manager.evaluate(
-        request(
-            Capability.FILESYSTEM_READ,
-            tool="read_text_file",
-            resource=str(secret),
-        )
-    )
-
-    assert result.decision is Decision.DENY
-
-
-@pytest.mark.parametrize(
-    "mode,capability,expected",
-    [
-        (PermissionMode.LOCKED_DOWN, Capability.PURE, Decision.DENY),
-        (PermissionMode.UNRESTRICTED, Capability.PROCESS_EXEC, Decision.ALLOW),
-        (PermissionMode.READ_ONLY, Capability.FILESYSTEM_READ, Decision.ALLOW),
-        (PermissionMode.READ_ONLY, Capability.FILESYSTEM_WRITE, Decision.DENY),
-        (PermissionMode.READ_ONLY, Capability.FILESYSTEM_DELETE, Decision.DENY),
-        (PermissionMode.WORKSPACE_WRITE, Capability.NETWORK_READ, Decision.ALLOW),
-        (PermissionMode.WORKSPACE_WRITE, Capability.FILESYSTEM_DELETE, Decision.ASK),
-        (PermissionMode.WORKSPACE_WRITE, Capability.PROCESS_EXEC, Decision.ASK),
-    ],
-)
-def test_modes_apply_capability_fallbacks(mode, capability, expected):
-    """Each mode applies its documented capability fallback."""
-    assert manager_for(mode).evaluate(request(capability)).decision is expected
-
-
-def test_workspace_write_allows_only_normalized_paths_below_workspace(tmp_path):
-    """Workspace write mode does not grant missing or escaping filesystem resources."""
-    manager = manager_for(PermissionMode.WORKSPACE_WRITE, tmp_path)
-
     assert (
-        manager.evaluate(
-            request(Capability.FILESYSTEM_WRITE, resource=str(tmp_path / "file.txt"))
-        ).decision
+        manager.evaluate((file_operation(Action.FILESYSTEM_READ, outside / "a.txt"),)).decision
         is Decision.ALLOW
     )
     assert (
-        manager.evaluate(
-            request(Capability.FILESYSTEM_WRITE, resource=str(tmp_path.parent / "outside.txt"))
-        ).decision
+        manager.evaluate((file_operation(Action.FILESYSTEM_CREATE, outside / "a.txt"),)).decision
         is Decision.ASK
     )
-    assert manager.evaluate(request(Capability.FILESYSTEM_WRITE)).decision is Decision.ASK
 
 
-def test_ignored_delete_paths_are_denied_before_interactive_approval(tmp_path):
-    """Ignore rules prevent deletion even when the user could otherwise approve it."""
-    (tmp_path / ".git").mkdir()
-    (tmp_path / ".gitignore").write_text("secret.txt\n", "utf-8")
-    secret = tmp_path / "secret.txt"
-    secret.write_text("sensitive", "utf-8")
+def test_loop_temp_is_allowed_by_default_and_system_temp_requires_an_explicit_root(tmp_path):
+    """Loop temporary storage is safe by default; the full OS temp directory is opt-in."""
+
+    manager = PermissionManager(tmp_path)
+    external_temp = Path(tempfile.gettempdir()) / "outside-loop-temporary-file"
+
+    assert (
+        manager.evaluate(
+            (file_operation(Action.FILESYSTEM_READ, manager.temporary_directory / "file.txt"),)
+        ).decision
+        is Decision.ALLOW
+    )
+    assert manager.evaluate((file_operation(Action.FILESYSTEM_READ, external_temp),)).sources == (
+        "limit:workspace:readable_roots",
+    )
+
+    manager.update_limit_values("readable_roots", "system-temp", add=True)
+    assert (
+        manager.evaluate((file_operation(Action.FILESYSTEM_READ, external_temp),)).decision
+        is Decision.ALLOW
+    )
+
+
+def test_workspace_root_token_requires_a_configured_workspace(tmp_path):
+    """An in-memory manager cannot resolve the special workspace root token."""
+    manager = PermissionManager()
+
+    result = manager.evaluate((file_operation(Action.FILESYSTEM_READ, tmp_path / "file.txt"),))
+
+    assert result.sources == ("limit:workspace:readable_roots",)
+
+
+def test_approval_prompt_displays_targets_outside_the_workspace(tmp_path):
+    """Approved expanded roots retain their absolute target in the prompt."""
+    outside = tmp_path.parent / "shared" / "file.txt"
     interaction = Mock(spec=Interaction)
     interaction.confirm.return_value = True
-    manager = manager_for(PermissionMode.CONFIRM_ALL, tmp_path, interaction)
+    manager = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        configuration=PermissionConfiguration(
+            limits=PolicyLimits(writable_roots=(str(outside.parent),))
+        ),
+    )
 
-    result = manager.authorize(request(Capability.FILESYSTEM_DELETE, resource=str(secret)))
+    result = manager.authorize((file_operation(Action.FILESYSTEM_CREATE, outside),))
+
+    assert str(outside) in result.prompt
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://localhost/a",
+        "http://127.0.0.1/a",
+        "http://169.254.169.254/a",
+        "http://[::1]/a",
+    ),
+)
+def test_private_network_targets_are_hard_denied(url):
+    """Local and non-global literal network targets cannot be approved."""
+    parsed_origin = url.rsplit("/", 1)[0]
+    target = NetworkTarget(url=url, origin=parsed_origin)
+
+    result = PermissionManager().evaluate((operation(Action.NETWORK_REQUEST, target=target),))
 
     assert result.decision is Decision.DENY
-    assert result.source == "safety:ignored_path"
-    interaction.confirm.assert_not_called()
+    assert result.sources == ("limit:workspace:deny_private_networks",)
 
 
-def test_persisted_and_session_rules_have_distinct_lifetimes(tmp_path):
-    """Persisted rules round-trip through YAML while session rules remain in memory."""
-    manager = PermissionManager(tmp_path)
-    persisted = PermissionRule(
-        decision=Decision.ALLOW, tool="read_*", capability=Capability.FILESYSTEM_READ
+def test_network_origin_allowlist_is_a_non_overridable_boundary():
+    """Configured origin globs reject otherwise permitted destinations."""
+    manager = PermissionManager(
+        configuration=PermissionConfiguration(
+            limits=PolicyLimits(network_origins=("https://*.example.com",))
+        )
     )
-    temporary = PermissionRule(decision=Decision.DENY, tool="danger")
+    allowed = NetworkTarget(url="https://api.example.com/a", origin="https://api.example.com")
+    denied = NetworkTarget(url="https://other.test/a", origin="https://other.test")
 
-    manager.set_mode(PermissionMode.READ_ONLY, persist=False)
+    assert (
+        manager.evaluate((operation(Action.NETWORK_REQUEST, target=allowed),)).decision
+        is Decision.ASK
+    )
+    assert manager.evaluate((operation(Action.NETWORK_REQUEST, target=denied),)).sources == (
+        "limit:workspace:network_origins",
+    )
+
+
+def test_hostname_resolution_fails_closed_for_private_and_unresolved_addresses():
+    """Network policy leaves hostname resolution to the pinned request transport."""
+    target = NetworkTarget(url="https://service.test/a", origin="https://service.test")
+    assert (
+        PermissionManager().evaluate((operation(Action.NETWORK_REQUEST, target=target),)).decision
+        is Decision.ASK
+    )
+
+
+def test_relative_roots_resolve_against_workspace_and_temp_is_manager_owned(tmp_path):
+    """Portable YAML roots and scratch directories are scoped to their manager."""
+    first = PermissionManager(
+        tmp_path,
+        configuration=PermissionConfiguration(limits=PolicyLimits(readable_roots=("shared",))),
+    )
+    second = PermissionManager(tmp_path)
+
+    assert (
+        first.evaluate((file_operation(Action.FILESYSTEM_READ, tmp_path / "shared/a"),)).decision
+        is Decision.ALLOW
+    )
+    assert first.temporary_directory != second.temporary_directory
+    assert first.temporary_directory.is_dir()
+
+
+def test_host_processes_require_an_explicit_boundary_opt_in(tmp_path):
+    """Policy rules cannot authorize host-process execution by default."""
+    target = ProcessTarget(argv=("git", "status"), cwd=str(tmp_path), boundary=ProcessBoundary.HOST)
+    denied = PermissionManager(
+        tmp_path,
+        configuration=PermissionConfiguration(rules=[PermissionRule(decision=Decision.ALLOW)]),
+    )
+    allowed = PermissionManager(
+        tmp_path,
+        configuration=PermissionConfiguration(
+            limits=PolicyLimits(allow_host_processes=True),
+            defaults={Action.PROCESS_EXECUTE: Decision.ALLOW},
+        ),
+    )
+
+    assert denied.evaluate((operation(Action.PROCESS_EXECUTE, target=target),)).sources == (
+        "limit:workspace:allow_host_processes",
+    )
+    assert (
+        allowed.evaluate((operation(Action.PROCESS_EXECUTE, target=target),)).decision
+        is Decision.ALLOW
+    )
+
+
+def test_policy_mutations_persist_defaults_and_rule_lifetimes(tmp_path):
+    """Policy changes round-trip while session rules remain process-local."""
+    manager = PermissionManager(tmp_path)
+    persisted = PermissionRule(id="persisted", decision=Decision.ALLOW, tool="read_*")
+    transient = PermissionRule(id="transient", decision=Decision.DENY, tool="danger")
+
+    manager.set_default(Action.FILESYSTEM_CREATE, Decision.DENY)
+    manager.set_default(Action.NETWORK_REQUEST, Decision.ASK)
     manager.add_rule(persisted)
-    manager.add_rule(temporary, persist=False)
+    manager.add_rule(transient, scope=PolicyScope.SESSION)
 
     loaded = PermissionManager(tmp_path)
-    assert loaded.configuration.mode is PermissionMode.READ_ONLY
+    assert loaded.configuration.defaults[Action.FILESYSTEM_CREATE] is Decision.DENY
+    assert loaded.configuration.defaults[Action.NETWORK_REQUEST] is Decision.ASK
     assert loaded.configuration.rules == [persisted]
-    assert manager.evaluate(request(tool="danger")).decision is Decision.DENY
-    assert loaded.evaluate(request(tool="danger")).decision is Decision.ALLOW
+    assert manager.remove_rule("transient", scope=PolicyScope.SESSION) is True
+    assert manager.remove_rule("missing", scope=PolicyScope.SESSION) is False
+    assert manager.remove_rule("persisted") is True
+    assert manager.remove_rule("missing") is False
 
 
-def test_describe_covers_empty_and_populated_in_memory_policies():
-    """Policy summaries expose modes, locations, and complete rule selectors."""
+def test_rule_identifiers_are_unique_across_workspace_and_session_layers(tmp_path):
+    """A rule identity always names exactly one active rule."""
+    manager = PermissionManager(tmp_path)
+    manager.add_rule(PermissionRule(id="unique", decision=Decision.ALLOW))
+
+    with pytest.raises(ValueError, match="unique"):
+        manager.add_rule(
+            PermissionRule(id="unique", decision=Decision.DENY),
+            scope=PolicyScope.SESSION,
+        )
+
+    with pytest.raises(ValueError, match="identifiers must be unique"):
+        PermissionConfiguration(
+            rules=[
+                PermissionRule(id="duplicate", decision=Decision.ALLOW),
+                PermissionRule(id="duplicate", decision=Decision.DENY),
+            ]
+        )
+
+
+def test_limit_mutations_validate_names_deduplicate_and_support_in_memory_changes(tmp_path):
+    """Limit APIs reject unknown fields and report collection changes accurately."""
+    manager = PermissionManager(tmp_path)
+
+    with pytest.raises(ValueError, match="Unknown boolean"):
+        manager.set_limit("unknown", True)
+    with pytest.raises(ValueError, match="Unknown collection"):
+        manager.update_limit_values("unknown", "value", add=True)
+
+    assert (
+        manager.update_limit_values(
+            "readable_roots", "workspace", add=True, scope=PolicyScope.SESSION
+        )
+        is False
+    )
+    assert (
+        manager.update_limit_values(
+            "readable_roots", str(tmp_path / "shared"), add=True, scope=PolicyScope.SESSION
+        )
+        is True
+    )
+    assert (
+        manager.update_limit_values(
+            "writable_roots", "relative", add=True, scope=PolicyScope.SESSION
+        )
+        is True
+    )
+    assert str(tmp_path / "relative") in manager.effective_configuration.limits.writable_roots
+    manager.set_limit("deny_private_networks", False, scope=PolicyScope.SESSION)
+    assert manager.effective_configuration.limits.deny_private_networks is False
+
+
+def test_session_overrides_never_leak_into_later_workspace_saves(tmp_path):
+    """Persisting workspace changes cannot serialize process-local policy state."""
+    manager = PermissionManager(tmp_path)
+    session_rule = PermissionRule(id="session-only", decision=Decision.DENY)
+
+    manager.set_default(Action.FILESYSTEM_DELETE, Decision.ALLOW, scope=PolicyScope.SESSION)
+    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.add_rule(session_rule, scope=PolicyScope.SESSION)
+    manager.set_default(Action.NETWORK_REQUEST, Decision.DENY)
+
+    loaded = PermissionManager(tmp_path)
+    assert loaded.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ASK
+    assert loaded.configuration.defaults[Action.NETWORK_REQUEST] is Decision.DENY
+    assert loaded.configuration.limits.allow_host_processes is False
+    assert loaded.configuration.rules == []
+    assert manager.effective_configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ALLOW
+    assert manager.effective_configuration.limits.allow_host_processes is True
+    assert manager.session_rules == (session_rule,)
+
+
+def test_session_resets_restore_workspace_inheritance_without_changing_disk(tmp_path):
+    """Per-field and whole-session resets reveal the underlying workspace policy."""
+    manager = PermissionManager(tmp_path)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.DENY)
+    manager.set_limit("allow_host_processes", True)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
+    manager.set_limit("allow_host_processes", False, scope=PolicyScope.SESSION)
+
+    assert manager.reset_default(Action.PROCESS_EXECUTE) is True
+    assert manager.reset_default(Action.PROCESS_EXECUTE) is False
+    assert manager.reset_limit("allow_host_processes") is True
+    assert manager.reset_limit("allow_host_processes") is False
+    assert manager.effective_configuration.defaults[Action.PROCESS_EXECUTE] is Decision.DENY
+    assert manager.effective_configuration.limits.allow_host_processes is True
+
+    manager.add_rule(
+        PermissionRule(id="temporary", decision=Decision.ASK),
+        scope=PolicyScope.SESSION,
+    )
+    assert manager.reset_session() is True
+    assert manager.reset_session() is False
+    assert PermissionManager(tmp_path).configuration == manager.configuration
+
+
+def test_workspace_resets_restore_application_bootstrap_values(tmp_path):
+    """Workspace resets validate names and restore built-in defaults transactionally."""
+    manager = PermissionManager(tmp_path)
+    manager.set_default(Action.FILESYSTEM_READ, Decision.DENY)
+    manager.set_limit("deny_private_networks", False)
+
+    assert manager.reset_default(Action.FILESYSTEM_READ, scope=PolicyScope.WORKSPACE) is True
+    assert manager.reset_default(Action.FILESYSTEM_READ, scope=PolicyScope.WORKSPACE) is False
+    assert manager.reset_limit("deny_private_networks", scope=PolicyScope.WORKSPACE) is True
+    assert manager.reset_limit("deny_private_networks", scope=PolicyScope.WORKSPACE) is False
+    with pytest.raises(ValueError, match="Unknown permission limit"):
+        manager.reset_limit("unknown")
+
+
+def test_policy_views_validate_names_and_render_sparse_session_overrides(tmp_path):
+    """Each policy view is selectable and sparse session sections remain explicit."""
+    manager = PermissionManager(tmp_path)
+    manager.set_limit("deny_private_networks", False, scope=PolicyScope.SESSION)
+
+    assert "Workspace policy:" in manager.describe("workspace")
+    assert "Effective policy:" in manager.describe("effective")
+    session = manager.describe("session")
+    assert "Defaults:\n    none" in session
+    assert "deny_private_networks: False" in session
+    with pytest.raises(ValueError, match="Unknown permission policy view"):
+        manager.describe("unknown")
+
+
+def test_policy_mutations_are_transactional_when_persistence_fails(tmp_path, monkeypatch):
+    """A failed atomic save leaves the active in-memory policy unchanged."""
+    manager = PermissionManager(tmp_path)
+    monkeypatch.setattr("pathlib.Path.write_text", Mock(side_effect=OSError("disk full")))
+
+    with pytest.raises(OSError, match="disk full"):
+        manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
+
+    assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ASK
+
+
+def test_explain_constructs_every_typed_target_without_prompting(tmp_path):
+    """Effective-policy explanation handles absolute paths, URLs, processes, and session state."""
+    manager = PermissionManager(
+        tmp_path,
+        configuration=PermissionConfiguration(limits=PolicyLimits(allow_host_processes=True)),
+    )
+
+    assert (
+        manager.explain("read", Action.FILESYSTEM_READ, str(tmp_path / "file.txt")).decision
+        is Decision.ALLOW
+    )
+    assert (
+        manager.explain("fetch", Action.NETWORK_REQUEST, "https://example.com:8443/file").decision
+        is Decision.ASK
+    )
+    assert (
+        manager.explain("fetch", Action.NETWORK_REQUEST, "https://example.com/file").decision
+        is Decision.ASK
+    )
+    assert manager.explain("run", Action.PROCESS_EXECUTE, "git status").decision is Decision.ASK
+    assert (
+        manager.explain("skills", Action.SESSION_MUTATE, "activate:review").decision is Decision.ASK
+    )
+    with pytest.raises(ValueError, match="absolute HTTP"):
+        manager.explain("fetch", Action.NETWORK_REQUEST, "relative")
+    with pytest.raises(ValueError, match="non-empty command"):
+        manager.explain("run", Action.PROCESS_EXECUTE, "")
+
+
+def test_remove_rule_scans_past_nonmatching_rules():
+    """Rule removal finds a requested identity beyond the first list entry."""
     manager = PermissionManager()
-    assert manager.describe() == (
-        "Permission mode: confirm_all\nConfiguration: in memory\nRules: none"
+    manager.add_rule(PermissionRule(id="first", decision=Decision.ALLOW), scope=PolicyScope.SESSION)
+    manager.add_rule(PermissionRule(id="second", decision=Decision.DENY), scope=PolicyScope.SESSION)
+
+    assert manager.remove_rule("second", scope=PolicyScope.SESSION) is True
+    result = manager.evaluate(
+        (
+            operation(
+                Action.SESSION_MUTATE,
+                target=SessionTarget(identifier="state"),
+            ),
+        )
+    )
+    assert result.sources == ("rule:session:first",)
+
+
+def test_describe_exposes_defaults_boundaries_and_rule_identity(tmp_path):
+    """Policy summaries expose every effective policy dimension."""
+    manager = PermissionManager(tmp_path)
+    manager.add_rule(
+        PermissionRule(
+            id="docs",
+            decision=Decision.ALLOW,
+            tool="read_*",
+            action=Action.FILESYSTEM_READ,
+            resource="*/docs/*",
+        ),
+        scope=PolicyScope.SESSION,
+    )
+    description = manager.describe()
+    assert "Workspace policy:" in description
+    assert "  Rules: none" in description
+    assert "Session overrides:" in description
+
+    manager.add_rule(
+        PermissionRule(id="persisted", decision=Decision.DENY),
+        scope=PolicyScope.SESSION,
+    )
+    configured = PermissionManager(
+        configuration=PermissionConfiguration(
+            rules=[PermissionRule(id="docs", decision=Decision.ALLOW)]
+        )
     )
 
-    rule = PermissionRule(
-        decision=Decision.ASK,
-        tool="write_*",
-        capability=Capability.FILESYSTEM_WRITE,
-        resource="/project/*",
-    )
-    manager = PermissionManager(configuration=PermissionConfiguration(rules=[rule]))
-    assert "ask tool=write_* capability=filesystem.write resource=/project/*" in manager.describe()
+    description = configured.describe()
+    assert "filesystem.read: allow" in description
+    assert "readable_roots: workspace" in description
+    assert "docs allow tool=*" in description
 
 
-def test_in_memory_configuration_cannot_be_saved():
+def test_in_memory_policy_cannot_be_saved():
     """Persistence without a local configuration path is rejected explicitly."""
     with pytest.raises(ValueError, match="cannot persist"):
         PermissionManager().save()
 
 
-def test_empty_yaml_loads_as_default_configuration(tmp_path):
-    """An empty local YAML file is accepted as the default configuration."""
+def test_empty_yaml_loads_as_default_policy(tmp_path):
+    """An empty policy file is accepted as the supervised default."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
     path.write_text("", "utf-8")
 
     assert PermissionManager(tmp_path).configuration == PermissionConfiguration()
+
+
+def test_reload_rejects_invalid_yaml_without_replacing_the_active_policy(tmp_path):
+    """An invalid external policy edit leaves the last valid configuration active."""
+    manager = PermissionManager(tmp_path)
+    manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.write_text("version: 2\n", "utf-8")
+
+    with pytest.raises(ValueError):
+        manager.reload()
+
+    assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+
+
+def test_diagnostic_audit_failure_does_not_change_authorization(tmp_path, monkeypatch):
+    """Unavailable diagnostic JSONL storage cannot turn a permit into a denial."""
+    manager = PermissionManager(tmp_path)
+    monkeypatch.setattr("pathlib.Path.open", Mock(side_effect=OSError("unavailable")))
+
+    result = manager.authorize((file_operation(Action.FILESYSTEM_READ, tmp_path / "file.txt"),))
+
+    assert isinstance(result, AuthorizationResult)
+    assert result.decision is Decision.ALLOW
+
+
+def test_permission_manager_configuration_path_and_recorder(tmp_path):
+    """The manager exposes its .loop policy path and a settable recorder sink."""
+    recorder = Mock()
+    workspace = PermissionManager(tmp_path)
+    workspace.recorder = recorder
+    assert workspace.recorder is recorder
+    assert workspace.configuration_path.parent.parent == tmp_path
+
+    in_memory = PermissionManager()
+    assert in_memory.configuration_path is None
+
+
+def test_approval_prompt_anchors_a_workspace_rooted_target(tmp_path):
+    """A prompt for the workspace root renders an explicit workspace anchor."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    manager.set_default(Action.FILESYSTEM_READ, Decision.ASK, scope=PolicyScope.SESSION)
+
+    result = manager.authorize((file_operation(Action.FILESYSTEM_READ, tmp_path),))
+
+    assert result.prompt is not None
+    assert "workspace root:" in result.prompt
+
+
+def test_approval_prompt_renders_session_targets_without_workspace():
+    """A manager without a workspace renders session targets without a relative path."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    manager = PermissionManager(interaction=interaction)
+
+    result = manager.authorize(
+        (operation(Action.SESSION_MUTATE, target=SessionTarget(identifier="config")),)
+    )
+
+    assert result.prompt is not None
+    assert "config" in result.prompt

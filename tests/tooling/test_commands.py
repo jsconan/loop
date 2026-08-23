@@ -49,3 +49,20 @@ def test_call_command_forwards_tokens_and_runtime_context():
     interaction.tool_result.assert_called_with("ping", "42")
     assert manager.commands[-1].completion.schema_provider is None
     assert manager.commands[-1].completion.next.schema_provider == "tool_arguments"
+
+
+def test_call_command_forwards_quoted_run_command_text_without_tool_specific_rewriting():
+    """Quoted command text and named arguments remain generic tool-call tokens."""
+    interaction = Mock(spec=Interaction)
+    registry = Mock()
+    registry.tools = []
+    registry.command.return_value = ""
+    manager = CommandManager(interaction=interaction)
+    manager.register_provider(ToolCommands(registry, InstructionsManager()))
+
+    manager.call("call", 'run_command "git status" cwd="."')
+
+    assert registry.command.call_args.args == (
+        "run_command",
+        ("git status", "cwd=."),
+    )

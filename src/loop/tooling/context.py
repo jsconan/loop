@@ -5,14 +5,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..interaction import Interaction
-from ..permissions import (
-    Capability,
-    Decision,
-    PermissionManager,
-    PermissionRequest,
-)
 
 if TYPE_CHECKING:
+    from ..permissions import Operation
     from ..skills import InstructionsManager
 
 
@@ -25,15 +20,13 @@ class ToolContext:
         tool_name (str): Public name of the tool being invoked.
         instructions_manager (InstructionsManager | None): Manager for instructions active in the
             current conversation, or ``None`` when instruction management is unavailable.
-        permission_manager (PermissionManager | None): Central manager for additional authorization.
-        grants (frozenset[PermissionRequest]): Requests authorized before tool execution.
+        operations (tuple[Operation, ...]): Authorized operations for this invocation.
     """
 
     interaction: Interaction
     tool_name: str
     instructions_manager: InstructionsManager | None = None
-    permission_manager: PermissionManager | None = None
-    grants: frozenset[PermissionRequest] = frozenset()
+    operations: tuple[Operation, ...] = ()
 
     def observe_file(self, path: Path | str) -> None:
         """Report a successfully loaded file to instruction management.
@@ -73,33 +66,3 @@ class ToolContext:
             bool: Whether the user approved the action.
         """
         return self.interaction.confirm(message, default=default)
-
-    def authorize(
-        self,
-        capability: Capability,
-        *,
-        resource: str | None = None,
-        reason: str | None = None,
-    ) -> bool:
-        """Request additional policy authorization discovered by a running tool.
-
-        Args:
-            capability (Capability): Additional authority required.
-            resource (str | None): Normalized affected resource.
-            reason (str | None): Explanation shown to the user.
-
-        Returns:
-            bool: Whether the permission policy authorized the operation.
-        """
-        request = PermissionRequest(
-            tool_name=self.tool_name,
-            capability=capability,
-            resource=resource,
-            reason=reason,
-        )
-        if request in self.grants:
-            return True
-        if self.permission_manager is None:
-            return False
-        result = self.permission_manager.authorize(request, interaction=self.interaction)
-        return result.decision is Decision.ALLOW

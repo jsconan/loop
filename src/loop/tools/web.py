@@ -1,14 +1,18 @@
 """Provide tools for accessing content on the web."""
 
+import ipaddress
 import os
+import socket
 from typing import Annotated
+from urllib.parse import urlsplit
 
+import httpcore
 import httpx
 from pydantic import Field, HttpUrl
 
 from .. import constants
-from ..permissions import Capability, PermissionRequest
-from ..tooling import tool
+from ..permissions import Action, NetworkTarget, Operation, OperationPlan
+from ..tooling import ToolContext, tool
 from ..utils import (
     BoundedTextContent,
     cached_metadata,
@@ -25,6 +29,69 @@ _DEFAULT_USER_AGENT = (
 )
 
 
+class PinnedAddressBackend:
+    """Connect HTTP clients only to the addresses resolved during authorization planning."""
+
+    _addresses: tuple[str, ...]
+    _backend: httpcore.SyncBackend
+
+    def __init__(self, addresses: tuple[str, ...]) -> None:
+        self._addresses = addresses
+        self._backend = httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options=None,
+    ):
+        """Open a TCP stream to one pinned address while preserving HTTP host identity."""
+        del host
+        if not self._addresses:
+            raise httpcore.ConnectError("No authorized network addresses are available.")
+        return self._backend.connect_tcp(
+            host=self._addresses[0],
+            port=port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    def connect_unix_socket(self, path: str, timeout: float | None = None, socket_options=None):
+        """Reject Unix-socket connections because web tools authorize only TCP targets."""
+        del path, timeout, socket_options
+        raise httpcore.ConnectError("Unix-socket connections are not authorized.")
+
+    def sleep(self, seconds: float) -> None:
+        """Delegate retry backoff to HTTP Core's synchronous backend."""
+        self._backend.sleep(seconds)
+
+
+class PinnedAddressTransport(httpx.HTTPTransport):
+    """Create a direct HTTP transport bound to an authorized address set."""
+
+    def __init__(self, addresses: tuple[str, ...]) -> None:
+        super().__init__(trust_env=False)
+        self._pool = httpcore.ConnectionPool(network_backend=PinnedAddressBackend(addresses))
+
+
+def _resolve_addresses(hostname: str) -> tuple[str, ...]:
+    """Resolve a hostname once and return the unique numeric addresses for an approved request."""
+    try:
+        resolved = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve network host '{hostname}'.") from exc
+    addresses = tuple(dict.fromkeys(item[4][0] for item in resolved))
+    if not addresses:
+        raise ValueError(f"Could not resolve network host '{hostname}'.")
+    try:
+        return tuple(str(ipaddress.ip_address(address)) for address in addresses)
+    except ValueError as exc:
+        raise ValueError(f"Could not resolve network host '{hostname}'.") from exc
+
+
 def _cached_result(
     handle: str,
     source: str,
@@ -39,41 +106,60 @@ def _cached_result(
     return result
 
 
-def _network_permission(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
-    """Describe network-read authority for one validated URL."""
-    return (
-        PermissionRequest(
-            tool_name="fetch_content",
-            capability=Capability.NETWORK_READ,
-            resource=str(arguments["url"]),
+def _network_plan(arguments: dict[str, object]) -> OperationPlan:
+    """Plan one normalized outbound HTTP request."""
+    url = str(arguments["url"])
+    parsed = urlsplit(url)
+    if parsed.hostname is None:  # pragma: no cover - HttpUrl validates host presence.
+        raise ValueError("Network request requires a hostname.")
+    origin = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port is not None:
+        origin += f":{parsed.port}"
+    normalized = dict(arguments)
+    normalized["url"] = url
+    return OperationPlan(
+        arguments=normalized,
+        operations=(
+            Operation(
+                tool_id="",
+                action=Action.NETWORK_REQUEST,
+                target=NetworkTarget(
+                    url=url,
+                    origin=origin,
+                    addresses=_resolve_addresses(parsed.hostname),
+                ),
+            ),
         ),
     )
 
 
-def _cached_content_permission(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
-    """Recover persisted authority requirements for one cached handle."""
+def _cached_content_plan(arguments: dict[str, object]) -> OperationPlan:
+    """Plan local cached access or a required source reload."""
     metadata = (
         None if cached_path(str(arguments["handle"])) else cached_metadata(str(arguments["handle"]))
     )
     source = metadata["source"] if metadata and metadata["reloadable"] else None
-    return (
-        PermissionRequest(
-            tool_name="read_cached_content",
-            capability=Capability.NETWORK_READ if source is not None else Capability.PURE,
-            resource=str(source or arguments["handle"]),
-        ),
-    )
+    if source is None:
+        return OperationPlan(arguments=arguments)
+    network = _network_plan({"url": source})
+    return OperationPlan(arguments=arguments, operations=network.operations)
 
 
-def _cache_url(url: str, handle: str | None = None) -> str:
+def _cache_url(url: str, addresses: tuple[str, ...], handle: str | None = None) -> str:
     """Stream one validated web source into the temporary content cache."""
     with httpx.stream(
         "GET",
         url,
         headers={"User-Agent": os.getenv("USER_AGENT", _DEFAULT_USER_AGENT)},
-        follow_redirects=True,
+        follow_redirects=False,
         timeout=30.0,
+        transport=PinnedAddressTransport(addresses),
     ) as response:
+        if response.is_redirect:
+            raise ValueError(
+                f"Cross-request redirects are not followed; authorize the redirected URL "
+                f"explicitly: {response.headers.get('location', 'unknown destination')}"
+            )
         response.raise_for_status()
         content_type = response.headers.get("content-type", "").lower()
         if content_type and not (
@@ -101,10 +187,11 @@ def _cache_url(url: str, handle: str | None = None) -> str:
 
 
 @tool(
-    capabilities={Capability.NETWORK_READ},
-    permission_resolver=_network_permission,
+    actions={Action.NETWORK_REQUEST},
+    operation_planner=_network_plan,
 )
 def fetch_content(
+    context: ToolContext,
     url: Annotated[
         HttpUrl,
         Field(description="HTTP(S) URL of the content to fetch."),
@@ -113,7 +200,11 @@ def fetch_content(
     """Fetch text into a bounded cache and return its first resumable portion."""
     url = str(url)
     try:
-        handle = _cache_url(url)
+        operation = context.operations[0] if context.operations else None
+        target = operation.target if operation is not None else None
+        if not isinstance(target, NetworkTarget):
+            raise TypeError("Authorized network target is missing.")
+        handle = _cache_url(url, target.addresses)
         resolved = cached_path(handle)
         if resolved is None:  # pragma: no cover - store and resolve are atomic
             raise RuntimeError("Fetched content could not be cached.")
@@ -123,8 +214,9 @@ def fetch_content(
         return f"Error fetching content: {exc}"
 
 
-@tool(permission_resolver=_cached_content_permission)
+@tool(actions={Action.NETWORK_REQUEST}, operation_planner=_cached_content_plan)
 def read_cached_content(
+    context: ToolContext,
     handle: Annotated[str, Field(description="Opaque handle returned by a bounded tool result.")],
     cursor: Annotated[
         str | None,
@@ -156,7 +248,11 @@ def read_cached_content(
             metadata = cached_metadata(handle)
             if metadata is None or not metadata["reloadable"]:
                 return "Error reading cached content: Unknown or expired content handle."
-            _cache_url(metadata["source"], handle)
+            operation = context.operations[0] if context.operations else None
+            target = operation.target if operation is not None else None
+            if not isinstance(target, NetworkTarget):
+                raise TypeError("Authorized network target is missing.")
+            _cache_url(metadata["source"], target.addresses, handle)
             resolved = cached_path(handle)
             if resolved is None:  # pragma: no cover - cache writes and lookup are atomic
                 raise RuntimeError("Reloaded content could not be cached.")

@@ -11,17 +11,12 @@ from ..commands.utils import parse_model_arguments
 from ..constants import OMIT, Omit
 from ..interaction import Interaction
 from ..models import ToolDefinition
-from ..permissions import (
-    Capability,
-    Decision,
-    PermissionManager,
-    PermissionRequest,
-)
+from ..permissions import Action, Decision, Operation, OperationPlanner, PermissionManager
 from ..skills import InstructionsManager
 from ..utils import callable_name
 from .context import ToolContext
 from .models import ToolRegistrationError
-from .tool import PermissionResolver, Tool, ToolRegistration
+from .tool import Tool, ToolRegistration
 from .utils import serialize_tool_error
 
 
@@ -36,7 +31,7 @@ class ToolRegistry:
             dispatch does not provide one, or ``None`` to require an invocation-specific
             interaction.
         permission_manager (PermissionManager | None): Central policy manager guarding every call.
-            Defaults to an in-memory, confirm-all manager.
+            Defaults to an in-memory supervised policy manager.
     """
 
     _tools: dict[str, Tool]
@@ -116,8 +111,8 @@ class ToolRegistry:
         *,
         name: str | None = None,
         description: str | None = None,
-        capabilities: Iterable[Capability] | None = None,
-        permission_resolver: PermissionResolver | None | Omit = OMIT,
+        actions: Iterable[Action] | None = None,
+        operation_planner: OperationPlanner | None | Omit = OMIT,
     ) -> None:
         """Create and register a tool from a callable or configured registration.
 
@@ -128,11 +123,10 @@ class ToolRegistry:
                 function name.
             description (str | None): Container-specific public description. Defaults to the
                 declared description or docstring summary.
-            capabilities (Iterable[Capability] | None): Container-specific static authority.
-                Defaults to declared capabilities or ``pure``.
-            permission_resolver (PermissionResolver | None | object): Container-specific resolver
-                for resource permission requests. Omit it to inherit the declared resolver; pass
-                ``None`` to remove one.
+            actions (Iterable[Action] | None): Container-specific action upper bound. Defaults to
+                declared actions or no effects.
+            operation_planner (OperationPlanner | None | object): Container-specific planner.
+                Omit it to inherit the declared planner; pass ``None`` to remove one.
 
         Raises:
             ToolRegistrationError: If the resolved name is already registered, the function has
@@ -143,11 +137,11 @@ class ToolRegistry:
             function = registration.function
             name = name or registration.name
             description = description or registration.description
-            capabilities = capabilities if capabilities is not None else registration.capabilities
-            permission_resolver = (
-                registration.permission_resolver
-                if isinstance(permission_resolver, Omit)
-                else permission_resolver
+            actions = actions if actions is not None else registration.actions
+            operation_planner = (
+                registration.operation_planner
+                if isinstance(operation_planner, Omit)
+                else operation_planner
             )
         declared_tool = Tool.get_declaration(function)
         if declared_tool is None:
@@ -158,8 +152,8 @@ class ToolRegistry:
         self._tools[tool_name] = declared_tool.registered(
             name=name,
             description=description,
-            capabilities=capabilities,
-            permission_resolver=permission_resolver,
+            actions=actions,
+            operation_planner=operation_planner,
         )
 
     def definitions(self) -> list[ToolDefinition]:
@@ -238,18 +232,21 @@ class ToolRegistry:
         if error is not None:
             return error, 0
         active_permissions = permission_manager or self._permission_manager
-        denied, grants = self._authorize(tool, validated, interaction, active_permissions)
+        try:
+            plan = tool.plan(validated)
+        except ValueError as exc:
+            return serialize_tool_error("operation_planning_failed", str(exc)), 0
+        denied = self._authorize(tool, plan.operations, interaction, active_permissions)
         if denied is not None:
             return denied, 0
         context = self._context_for(
             tool,
             interaction,
             instructions_manager,
-            active_permissions,
-            grants,
+            plan.operations,
         )
         started = perf_counter()
-        output = tool.call(validated, context)
+        output = tool.call(plan.arguments, context)
         return output, perf_counter() - started
 
     async def call_async(
@@ -320,18 +317,21 @@ class ToolRegistry:
         if error is not None:
             return error, 0
         active_permissions = permission_manager or self._permission_manager
-        denied, grants = self._authorize(tool, validated, interaction, active_permissions)
+        try:
+            plan = tool.plan(validated)
+        except ValueError as exc:
+            return serialize_tool_error("operation_planning_failed", str(exc)), 0
+        denied = self._authorize(tool, plan.operations, interaction, active_permissions)
         if denied is not None:
             return denied, 0
         context = self._context_for(
             tool,
             interaction,
             instructions_manager,
-            active_permissions,
-            grants,
+            plan.operations,
         )
         started = perf_counter()
-        output = await tool.call_async(validated, context)
+        output = await tool.call_async(plan.arguments, context)
         return output, perf_counter() - started
 
     def command(
@@ -342,7 +342,7 @@ class ToolRegistry:
         interaction: Interaction | None = None,
         instructions_manager: InstructionsManager | None = None,
     ) -> str:
-        """Dispatch a user-command tool call without permission evaluation.
+        """Dispatch a planned user-command tool call without permission evaluation.
 
         Args:
             name (str): Registered tool name.
@@ -373,44 +373,41 @@ class ToolRegistry:
                 f"Invalid arguments for tool '{name}'.",
                 details=details,
             )
+        try:
+            plan = tool.plan(validated)
+        except ValueError as exc:
+            return serialize_tool_error("operation_planning_failed", str(exc))
         context = self._context_for(
             tool,
             interaction,
             instructions_manager,
-            permission_manager=None,
+            plan.operations,
         )
-        return tool.call(validated, context)
+        return tool.call(plan.arguments, context)
 
     def _authorize(
         self,
         tool: Tool,
-        arguments: dict[str, Any],
+        operations: tuple[Operation, ...],
         interaction: Interaction | None,
         permission_manager: PermissionManager,
-    ) -> tuple[str | None, frozenset[PermissionRequest]]:
-        """Return a serialized denial or the grants approved for a tool call."""
+    ) -> str | None:
+        """Return a serialized denial or authorize the complete operation plan."""
         active_interaction = interaction if interaction is not None else self._interaction
-        grants = set()
-        for request in tool.permission_requests(arguments):
-            result = permission_manager.authorize(request, interaction=active_interaction)
-            if result.decision is Decision.DENY:
-                return (
-                    serialize_tool_error(
-                        "tool_call_denied",
-                        f"Tool '{tool.name}' was not executed: {result.reason}",
-                    ),
-                    frozenset(),
-                )
-            grants.add(request)
-        return None, frozenset(grants)
+        result = permission_manager.authorize(operations, interaction=active_interaction)
+        if result.decision is Decision.DENY:
+            return serialize_tool_error(
+                "tool_call_denied",
+                f"Tool '{tool.name}' was not executed: {result.reason}",
+            )
+        return None
 
     def _context_for(
         self,
         tool: Tool,
         interaction: Interaction | None,
         instructions_manager: InstructionsManager | None,
-        permission_manager: PermissionManager | None,
-        grants: frozenset[PermissionRequest] = frozenset(),
+        operations: tuple[Operation, ...] = (),
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""
         if interaction is None:
@@ -421,6 +418,5 @@ class ToolRegistry:
             interaction=interaction,
             tool_name=tool.name,
             instructions_manager=instructions_manager,
-            permission_manager=permission_manager,
-            grants=grants,
+            operations=operations,
         )

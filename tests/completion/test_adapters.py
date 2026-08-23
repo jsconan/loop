@@ -11,18 +11,15 @@ from loop import (
     Command,
     CommandCompletion,
     CommandCompletionAdapter,
-    CommandManager,
     CompletionAdapter,
     CompletionManager,
     CompletionMatch,
     CompletionValue,
     MarkerCompletionAdapter,
-    PermissionManager,
     ProjectPathCompletionAdapter,
     Skill,
 )
 from loop.commands.utils import get_command_arguments_model
-from loop.permissions import PermissionCommands
 
 
 def complete(completer: CompletionManager, text: str):
@@ -347,31 +344,3 @@ def test_command_adapter_rejects_invalid_markers(marker):
     """Command capabilities reject ambiguous alphanumeric activators."""
     with pytest.raises(ValueError, match="one non-alphanumeric"):
         CommandCompletionAdapter(lambda: (), marker=marker)
-
-
-def test_registered_permissions_grammar_completes_modes_decisions_tools_and_capabilities():
-    """The built-in permissions mini-language exposes every known positional domain."""
-    manager = CommandManager()
-    manager.register_provider(PermissionCommands(PermissionManager()))
-    completer = CompletionManager(
-        (
-            CommandCompletionAdapter(
-                lambda: manager.commands,
-                providers={"tools": lambda: (CompletionValue("read_text_file", "tool"),)},
-            ),
-        )
-    )
-
-    assert [item.text for item in complete(completer, "/permissions mode work")] == [
-        "workspace_write"
-    ]
-    assert [item.text for item in complete(completer, "/permissions add al")] == ["allow"]
-    assert [item.text for item in complete(completer, "/permissions add allow read")] == [
-        "read_text_file"
-    ]
-    capabilities = complete(completer, "/permissions add allow read_text_file filesystem.w")
-    assert [item.text for item in capabilities] == ["filesystem.write"]
-    assert [
-        item.text
-        for item in complete(completer, "/permissions add allow read_text_file filesystem.write ")
-    ] == ["*"]

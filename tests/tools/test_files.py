@@ -3,7 +3,7 @@
 import json
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -11,19 +11,24 @@ from loop import (
     BUILTIN_TOOLS,
     ConsoleInteraction,
     InstructionsManager,
+    PermissionManager,
     ToolRegistry,
 )
 from loop.tooling import ToolContext
 from loop.tools.files import list_folder as list_folder_tool
+from loop.tools.files import write_text_file as write_text_file_tool
 
 tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
 
 @pytest.fixture(autouse=True)
-def approve_tool_calls(monkeypatch):
+def approve_tool_calls(monkeypatch, tmp_path):
     """Approve central permission prompts unless a case overrides the decision."""
     global tool_registry  # pylint: disable=global-statement
-    tool_registry = ToolRegistry(BUILTIN_TOOLS)
+    tool_registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=PermissionManager(tmp_path),
+    )
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
 
 
@@ -154,7 +159,7 @@ def test_list_folder_rejects_ignored_folder_as_traversal_root(tmp_path):
     private_result = list_folder(str(private))
 
     assert git_result["error"] == "tool_call_denied"
-    assert private_result["error"] == "tool_call_denied"
+    assert private_result == f"Error listing folder: Path '{private}' is ignored."
 
 
 def test_list_folder_retains_tool_level_ignored_path_protection(tmp_path):
@@ -280,8 +285,8 @@ def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads
     assert read_text_file(str(tmp_path / "missing.txt")).startswith("Error reading file:")
 
 
-def test_read_text_file_denies_ignored_files_before_confirmation(tmp_path, monkeypatch):
-    """Ignored files are denied centrally without offering a confirmation override."""
+def test_read_text_file_allows_explicit_reads_of_ignored_files(tmp_path, monkeypatch):
+    """Ignore files limit discovery rather than acting as an authorization boundary."""
     (tmp_path / ".git").mkdir()
     (tmp_path / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
     secret = tmp_path / "secret.txt"
@@ -289,19 +294,19 @@ def test_read_text_file_denies_ignored_files_before_confirmation(tmp_path, monke
     confirm = MagicMock(return_value=True)
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
-    assert '"error": "tool_call_denied"' in read_text_file(secret)
-    assert confirm.call_args_list == []
+    assert json.loads(read_text_file(secret))["content"] == "sensitive"
+    confirm.assert_not_called()
 
 
-def test_read_text_file_confirms_for_visible_files_by_default(tmp_path, monkeypatch):
-    """The confirm-all mode includes ordinary visible files."""
+def test_read_text_file_allows_scoped_reads_by_default(tmp_path, monkeypatch):
+    """The supervised policy allows reads inside its filesystem boundary."""
     visible = tmp_path / "visible.txt"
     visible.write_text("hello", encoding="utf-8")
     confirm = MagicMock(return_value=True)
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
     assert json.loads(read_text_file(visible))["content"] == "hello"
-    confirm.assert_called_once()
+    confirm.assert_not_called()
 
 
 def test_read_text_file_supports_line_pages_and_line_continuations(tmp_path):
@@ -365,18 +370,10 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
 
     assert write_text_file(str(target), "saved") == f"Successfully wrote to file '{target}'."
     assert target.read_text(encoding="utf-8") == "saved"
-    assert confirm.call_args_list == [
-        call(
-            f"✏️ Agent wants to use 'write_text_file' for filesystem.write on '{target}'. "
-            "Proposed content:\n   1 | blocked Proceed?",
-            default=False,
-        ),
-        call(
-            f"✏️ Agent wants to use 'write_text_file' for filesystem.write on '{target}'. "
-            "Proposed content:\n   1 | saved Proceed?",
-            default=False,
-        ),
-    ]
+    assert confirm.call_count == 2
+    assert all("filesystem.create" in item.args[0] for item in confirm.call_args_list)
+    assert "blocked" in confirm.call_args_list[0].args[0]
+    assert "saved" in confirm.call_args_list[1].args[0]
 
 
 def test_write_text_file_truncation_notice_for_large_content(tmp_path, monkeypatch):
@@ -429,6 +426,56 @@ def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):
     assert result.startswith("Error writing to file:")
 
 
+def test_write_text_file_removes_its_temporary_file_when_commit_fails(tmp_path, monkeypatch):
+    """An atomic replacement failure does not leave staged content in the destination folder."""
+    target = tmp_path / "target.txt"
+    target.write_text("old", encoding="utf-8")
+    monkeypatch.setattr(Path, "replace", MagicMock(side_effect=OSError("commit failed")))
+
+    result = write_text_file(target, "content")
+
+    assert result == "Error writing to file: commit failed"
+    assert set(tmp_path.iterdir()) == {tmp_path / ".loop", target}
+    assert target.read_text(encoding="utf-8") == "old"
+
+
+def test_write_text_file_cancels_when_approved_target_changes(tmp_path, monkeypatch):
+    """Replacement consumes the approved digest instead of overwriting changed content."""
+    target = tmp_path / "target.txt"
+    target.write_text("approved", encoding="utf-8")
+    original = Path.read_bytes
+    calls = 0
+
+    def changing_read(path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            target.write_text("changed", encoding="utf-8")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", changing_read)
+
+    result = write_text_file(target, "replacement")
+
+    assert result.startswith("Error writing to file: The target changed after approval")
+    assert target.read_text(encoding="utf-8") == "changed"
+
+
+def test_write_executor_requires_authorized_state_and_existing_replacement(tmp_path, monkeypatch):
+    """The executor fails closed without a plan or when a replacement disappears."""
+    context = ToolContext(ConsoleInteraction(), "write_text_file")
+    target = tmp_path / "target.txt"
+    assert write_text_file_tool(context, str(target), "new").startswith(
+        "Error writing to file: Authorized file-state precondition is missing"
+    )
+
+    target.write_text("old", encoding="utf-8")
+    monkeypatch.setattr(Path, "is_file", lambda _path: False)
+    assert write_text_file(target, "new").startswith(
+        "Error writing to file: The target changed after approval"
+    )
+
+
 def test_delete_path_requires_confirmation_and_removes_files(tmp_path, monkeypatch):
     """Deleting a file requires approval and permanently removes the selected path."""
     target = tmp_path / "obsolete.txt"
@@ -441,18 +488,9 @@ def test_delete_path_requires_confirmation_and_removes_files(tmp_path, monkeypat
 
     assert delete_path(target) == f"Successfully deleted path '{target}'."
     assert not target.exists()
-    assert confirm.call_args_list == [
-        call(
-            f"🗑️ Agent wants to use 'delete_path' for filesystem.delete on '{target}'. "
-            "Permanently delete this file. Proceed?",
-            default=False,
-        ),
-        call(
-            f"🗑️ Agent wants to use 'delete_path' for filesystem.delete on '{target}'. "
-            "Permanently delete this file. Proceed?",
-            default=False,
-        ),
-    ]
+    assert confirm.call_count == 2
+    assert all("filesystem.delete" in item.args[0] for item in confirm.call_args_list)
+    assert all("Permanently delete this file." in item.args[0] for item in confirm.call_args_list)
 
 
 def test_delete_path_removes_folder_trees_without_following_symbolic_links(tmp_path, monkeypatch):
@@ -473,23 +511,20 @@ def test_delete_path_removes_folder_trees_without_following_symbolic_links(tmp_p
     assert delete_path(link) == f"Successfully deleted path '{link}'."
     assert not link.exists()
     assert target.read_text(encoding="utf-8") == "keep"
-    assert confirm.call_args_list == [
-        call(
-            f"🗑️ Agent wants to use 'delete_path' for filesystem.delete on '{folder}'. "
-            "Permanently delete this folder and all of its contents. Proceed?",
-            default=False,
-        ),
-        call(
-            f"🗑️ Agent wants to use 'delete_path' for filesystem.delete on '{link}'. "
-            "Permanently delete this symbolic link; its target will not be deleted. "
-            "Proceed?",
-            default=False,
-        ),
-    ]
+    assert (
+        "Permanently delete this folder and all of its contents."
+        in (confirm.call_args_list[0].args[0])
+    )
+    assert (
+        "Permanently delete this symbolic link; its target will not be deleted."
+        in (confirm.call_args_list[1].args[0])
+    )
 
 
-def test_delete_path_denies_ignored_paths_and_rejects_unsupported_targets(tmp_path, monkeypatch):
-    """Ignored, missing, and special paths are never deleted as ordinary file targets."""
+def test_delete_path_can_delete_ignored_paths_and_rejects_unsupported_targets(
+    tmp_path, monkeypatch
+):
+    """Explicit ignored paths can be approved; missing and special paths are rejected."""
     (tmp_path / ".git").mkdir()
     (tmp_path / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
     secret = tmp_path / "secret.txt"
@@ -497,9 +532,9 @@ def test_delete_path_denies_ignored_paths_and_rejects_unsupported_targets(tmp_pa
     confirm = MagicMock(return_value=True)
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
-    assert '"error": "tool_call_denied"' in delete_path(secret)
-    assert secret.exists()
-    confirm.assert_not_called()
+    assert delete_path(secret) == f"Successfully deleted path '{secret}'."
+    assert not secret.exists()
+    confirm.assert_called_once()
     assert delete_path(tmp_path / "missing").startswith("Error deleting path:")
 
     fifo = tmp_path / "events"

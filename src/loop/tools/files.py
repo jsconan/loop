@@ -1,20 +1,23 @@
 """Provide tools for accessing files and folders on the local disk."""
 
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import Field
 
 from .. import constants
-from ..permissions import Capability, PermissionRequest
+from ..permissions import Action, FileTarget, Operation, OperationPlan
 from ..tooling import ToolContext, tool
 from ..utils import (
+    canonical_path,
     format_content_diff,
     format_content_preview,
     is_path_ignored,
     iter_visible_paths,
     read_bounded_text,
+    sha256_digest,
 )
 from .models import FileContentResult, FolderEntry
 
@@ -33,48 +36,61 @@ def _write_preview(path: Path, content: str) -> str:
     return f"Proposed changes:\n{format_content_diff(existing, content, str(path))}"
 
 
-def _file_permission(capability: Capability):
-    """Return a resolver for one normalized filesystem resource."""
+def _file_plan(action: Action):
+    """Return a planner for one normalized filesystem operation."""
 
-    def _resolve(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
+    def _plan(arguments: dict[str, object]) -> OperationPlan:
         path = Path(str(arguments["path"]))
-        if capability is Capability.FILESYSTEM_WRITE and not path.exists():
-            parent = path.parent.resolve()
-            resource = str(parent / path.name)
+        if action is Action.FILESYSTEM_CREATE:
+            expected_exists = path.exists()
+            planned_action = (
+                Action.FILESYSTEM_REPLACE if expected_exists else Action.FILESYSTEM_CREATE
+            )
+            resource = canonical_path(path)
         else:
-            resource = str(path.resolve())
+            planned_action = action
+            resource = (
+                str(path.absolute())
+                if action is Action.FILESYSTEM_DELETE and path.is_symlink()
+                else canonical_path(path)
+            )
         reason = None
-        if capability is Capability.FILESYSTEM_WRITE:
+        if action is Action.FILESYSTEM_CREATE:
             reason = _write_preview(path, str(arguments["content"]))
-        return (
-            PermissionRequest(
-                tool_name="", capability=capability, resource=resource, reason=reason
+        elif action is Action.FILESYSTEM_DELETE:
+            kind = _deletion_kind(path)
+            reason = (
+                "Permanently delete this symbolic link; its target will not be deleted."
+                if kind == "symbolic link"
+                else "Permanently delete this folder and all of its contents."
+                if kind == "folder"
+                else f"Permanently delete this {kind}."
+                if kind is not None
+                else "Deletion supports files, symbolic links, and folders only."
+            )
+        normalized = dict(arguments)
+        normalized["path"] = resource
+        return OperationPlan(
+            arguments=normalized,
+            operations=(
+                Operation(
+                    tool_id="",
+                    action=planned_action,
+                    target=FileTarget(
+                        path=resource,
+                        expected_exists=expected_exists
+                        if action is Action.FILESYSTEM_CREATE
+                        else None,
+                        expected_digest=sha256_digest(path.read_bytes())
+                        if action is Action.FILESYSTEM_CREATE and expected_exists
+                        else None,
+                    ),
+                    reason=reason,
+                ),
             ),
         )
 
-    return _resolve
-
-
-def _delete_permission(arguments: dict[str, object]) -> tuple[PermissionRequest, ...]:
-    """Return the permanent-deletion request for the supplied path."""
-    path = Path(str(arguments["path"]))
-    kind = _deletion_kind(path)
-    if kind == "symbolic link":
-        reason = "Permanently delete this symbolic link; its target will not be deleted."
-    elif kind == "folder":
-        reason = "Permanently delete this folder and all of its contents."
-    elif kind == "file":
-        reason = "Permanently delete this file."
-    else:
-        reason = "Deletion supports files, symbolic links, and folders only."
-    return (
-        PermissionRequest(
-            tool_name="",
-            capability=Capability.FILESYSTEM_DELETE,
-            resource=str(path.absolute()),
-            reason=reason,
-        ),
-    )
+    return _plan
 
 
 def _deletion_kind(path: Path) -> Literal["file", "symbolic link", "folder"] | None:
@@ -89,8 +105,8 @@ def _deletion_kind(path: Path) -> Literal["file", "symbolic link", "folder"] | N
 
 
 @tool(
-    capabilities={Capability.FILESYSTEM_READ},
-    permission_resolver=_file_permission(Capability.FILESYSTEM_READ),
+    actions={Action.FILESYSTEM_LIST},
+    operation_planner=_file_plan(Action.FILESYSTEM_LIST),
 )
 def list_folder(
     context: ToolContext,
@@ -129,8 +145,8 @@ def list_folder(
 
 
 @tool(
-    capabilities={Capability.FILESYSTEM_READ},
-    permission_resolver=_file_permission(Capability.FILESYSTEM_READ),
+    actions={Action.FILESYSTEM_READ},
+    operation_planner=_file_plan(Action.FILESYSTEM_READ),
 )
 def read_text_file(
     context: ToolContext,
@@ -179,8 +195,8 @@ def read_text_file(
 
 
 @tool(
-    capabilities={Capability.FILESYSTEM_WRITE},
-    permission_resolver=_file_permission(Capability.FILESYSTEM_WRITE),
+    actions={Action.FILESYSTEM_CREATE, Action.FILESYSTEM_REPLACE},
+    operation_planner=_file_plan(Action.FILESYSTEM_CREATE),
 )
 def write_text_file(
     context: ToolContext,
@@ -188,19 +204,45 @@ def write_text_file(
     content: Annotated[str, Field(description="Content to write to the file.")],
 ) -> str:
     """Write content to a file on the local disk."""
+    temporary_path = None
     try:
-        with open(path, "w", encoding="utf-8") as file:
+        target = Path(path)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
             file.write(content)
-        context.observe_file(path)
-        context.invalidate_instructions(path)
+            temporary_path = Path(file.name)
+        operation = context.operations[0] if context.operations else None
+        planned = operation.target if operation is not None else None
+        if not isinstance(planned, FileTarget) or planned.expected_exists is None:
+            raise RuntimeError("Authorized file-state precondition is missing.")
+        if planned.expected_exists:
+            if not target.is_file():
+                raise RuntimeError("The target changed after approval; replacement was cancelled.")
+            if sha256_digest(target.read_bytes()) != planned.expected_digest:
+                raise RuntimeError("The target changed after approval; replacement was cancelled.")
+            temporary_path.replace(target)
+        else:
+            target.hardlink_to(temporary_path)
+            temporary_path.unlink()
+            temporary_path = None
+        context.observe_file(target)
+        context.invalidate_instructions(target)
         return f"Successfully wrote to file '{path}'."
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
         return f"Error writing to file: {exc}"
 
 
 @tool(
-    capabilities={Capability.FILESYSTEM_DELETE},
-    permission_resolver=_delete_permission,
+    actions={Action.FILESYSTEM_DELETE},
+    operation_planner=_file_plan(Action.FILESYSTEM_DELETE),
 )
 def delete_path(
     context: ToolContext,

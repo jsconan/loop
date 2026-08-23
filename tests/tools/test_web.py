@@ -1,11 +1,13 @@
 """Tests for the built-in web access tools."""
 
 import json
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
+import httpcore
 import pytest
 
-from loop import BUILTIN_TOOLS, ConsoleInteraction, ToolRegistry
+from loop import BUILTIN_TOOLS, ConsoleInteraction, ToolContext, ToolRegistry
+from loop.tools import web as web_module
 from loop.utils import cached_path as resolve_cached_path
 from loop.utils import encode_content_cursor
 
@@ -13,10 +15,14 @@ tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
 
 @pytest.fixture(autouse=True)
-def fresh_tool_registry():
-    """Provide an isolated built-in registry for each web-tool case."""
+def fresh_tool_registry(monkeypatch):
+    """Provide isolated tools and deterministic public DNS for each web-tool case."""
     global tool_registry  # pylint: disable=global-statement
     tool_registry = ToolRegistry(BUILTIN_TOOLS)
+    monkeypatch.setattr(
+        "loop.tools.web.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(None, None, None, None, ("93.184.216.34", 0))],
+    )
 
 
 def stream_response(content, *, content_type="text/plain"):
@@ -24,6 +30,7 @@ def stream_response(content, *, content_type="text/plain"):
     response = MagicMock()
     response.__enter__.return_value = response
     response.__exit__.return_value = False
+    response.is_redirect = False
     response.headers = {"content-type": content_type}
     response.iter_bytes.return_value = iter([content])
     return response
@@ -62,31 +69,19 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
     result = json.loads(fetch_content("https://example.com/file.txt"))
     assert result["content"] == "<html>fetched content</html>"
     assert result["truncated"] is False
-    stream.assert_called_once_with(
-        "GET",
-        "https://example.com/file.txt",
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; "
-                "rv:153.0) Gecko/20100101 Firefox/153.0"
-            ),
-        },
-        follow_redirects=True,
-        timeout=30.0,
-    )
+    assert stream.call_args.args == ("GET", "https://example.com/file.txt")
+    assert stream.call_args.kwargs["headers"] == {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+        ),
+    }
+    assert stream.call_args.kwargs["follow_redirects"] is False
+    assert stream.call_args.kwargs["timeout"] == 30.0
+    assert type(stream.call_args.kwargs["transport"]).__name__ == "PinnedAddressTransport"
     response.raise_for_status.assert_called_once_with()
-    assert confirm.call_args_list == [
-        call(
-            "🌐 Agent wants to use 'fetch_content' for network.read on "
-            "'https://example.com/file.txt'. Proceed?",
-            default=False,
-        ),
-        call(
-            "🌐 Agent wants to use 'fetch_content' for network.read on "
-            "'https://example.com/file.txt'. Proceed?",
-            default=False,
-        ),
-    ]
+    assert confirm.call_count == 2
+    assert all("network.request" in item.args[0] for item in confirm.call_args_list)
+    assert all("https://example.com/file.txt" in item.args[0] for item in confirm.call_args_list)
 
 
 def test_fetch_content_uses_configured_user_agent(monkeypatch):
@@ -111,6 +106,136 @@ def test_fetch_content_reports_failures(monkeypatch):
 
     assert fetch_content("https://example.com/file.txt") == (
         "Error fetching content: network unavailable"
+    )
+
+
+def test_fetch_content_rejects_redirects_for_separate_authorization(monkeypatch):
+    """A redirect cannot silently expand approval to a different network target."""
+    response = stream_response(b"")
+    response.is_redirect = True
+    response.headers["location"] = "https://other.example/target"
+    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
+
+    result = fetch_content("https://example.com/redirect")
+
+    assert "redirected URL explicitly" in result
+    assert "https://other.example/target" in result
+
+
+def test_fetch_content_plans_origins_with_explicit_ports(monkeypatch):
+    """Network plans retain a non-default port in the approval target."""
+    response = stream_response(b"content")
+    confirm = MagicMock(return_value=True)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
+
+    assert json.loads(fetch_content("https://example.com:8443/file"))["content"] == "content"
+    assert "https://example.com:8443/file" in confirm.call_args.args[0]
+
+
+def test_fetch_content_denies_private_addresses_resolved_during_planning(monkeypatch):
+    """A hostname resolving to a private address is denied before the request starts."""
+    stream = MagicMock()
+    monkeypatch.setattr(
+        "loop.tools.web.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(None, None, None, None, ("127.0.0.1", 0))],
+    )
+    monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
+
+    result = fetch_content("https://service.test/private")
+
+    assert '"tool_call_denied"' in result
+    stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "resolver",
+    [
+        lambda *_args, **_kwargs: [],
+        lambda *_args, **_kwargs: [(None, None, None, None, ("not-an-address", 0))],
+    ],
+)
+def test_fetch_content_fails_closed_when_resolution_returns_no_usable_addresses(
+    monkeypatch, resolver
+):
+    """Resolution errors stop planning before approval or a request can begin."""
+    confirm = MagicMock(return_value=True)
+    stream = MagicMock()
+    monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", resolver)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
+
+    result = fetch_content("https://service.test/content")
+
+    assert '"operation_planning_failed"' in result
+    confirm.assert_not_called()
+    stream.assert_not_called()
+
+
+def test_fetch_content_fails_closed_when_resolution_raises(monkeypatch):
+    """A DNS failure stops planning before approval or a request can begin."""
+
+    def unresolved(*_args, **_kwargs):
+        """Simulate a resolver unable to locate the requested hostname."""
+        raise __import__("socket").gaierror
+
+    monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", unresolved)
+
+    assert '"operation_planning_failed"' in fetch_content("https://service.test/content")
+
+
+def test_pinned_address_backend_connects_only_to_its_authorised_address():
+    """The connection backend substitutes the planned address while retaining the request port."""
+    backend = web_module.PinnedAddressBackend(("93.184.216.34",))
+    backend._backend = MagicMock()  # pylint: disable=protected-access
+    stream = object()
+    backend._backend.connect_tcp.return_value = stream  # pylint: disable=protected-access
+
+    assert backend.connect_tcp("example.com", 443, timeout=2) is stream
+    backend._backend.connect_tcp.assert_called_once_with(  # pylint: disable=protected-access
+        host="93.184.216.34",
+        port=443,
+        timeout=2,
+        local_address=None,
+        socket_options=None,
+    )
+
+
+def test_pinned_address_backend_rejects_missing_or_non_tcp_connections():
+    """The connection backend refuses unplanned addresses and Unix sockets."""
+    backend = web_module.PinnedAddressBackend(())
+
+    with pytest.raises(httpcore.ConnectError, match="No authorized"):
+        backend.connect_tcp("example.com", 443)
+    with pytest.raises(httpcore.ConnectError, match="Unix-socket"):
+        backend.connect_unix_socket("/tmp/socket")
+
+
+def test_pinned_address_backend_delegates_retry_sleep():
+    """The connection backend preserves HTTP Core retry timing behavior."""
+    backend = web_module.PinnedAddressBackend(("93.184.216.34",))
+    backend._backend = MagicMock()  # pylint: disable=protected-access
+
+    backend.sleep(0.1)
+
+    backend._backend.sleep.assert_called_once_with(0.1)  # pylint: disable=protected-access
+
+
+def test_web_tools_fail_closed_without_an_authorized_network_operation(monkeypatch):
+    """Direct execution cannot fetch or reload content without a planned network target."""
+    context = ToolContext(ConsoleInteraction(), "fetch_content")
+    monkeypatch.setattr("loop.tools.web.cached_path", lambda _handle: None)
+    monkeypatch.setattr(
+        "loop.tools.web.cached_metadata",
+        lambda _handle: {"source": "https://example.com", "reloadable": True},
+    )
+
+    assert "Authorized network target is missing" in web_module.fetch_content(
+        context, "https://example.com"
+    )
+    assert "Authorized network target is missing" in web_module.read_cached_content(
+        context, "handle"
     )
 
 
@@ -207,7 +332,7 @@ def test_read_cached_content_reloads_an_expired_web_artifact_with_authorization(
     assert result["content"] == "reloaded"
     assert result["source"] == "https://example.com/source.txt"
     assert result["handle"] == fetched["handle"]
-    assert "network.read" in confirm.call_args.args[0]
+    assert "network.request" in confirm.call_args.args[0]
     assert "https://example.com/source.txt" in confirm.call_args.args[0]
     assert stream.call_count == 2
 

@@ -4,13 +4,6 @@ from unittest.mock import Mock
 
 from loop import InstructionsManager, ToolContext
 from loop.interaction import Interaction
-from loop.permissions import (
-    Capability,
-    PermissionConfiguration,
-    PermissionManager,
-    PermissionMode,
-    PermissionRequest,
-)
 
 
 def test_confirm_delegates_to_the_interaction():
@@ -21,30 +14,6 @@ def test_confirm_delegates_to_the_interaction():
 
     assert context.confirm("Continue?", default=True) is True
     interaction.confirm.assert_called_once_with("Continue?", default=True)
-
-
-def test_authorize_reuses_dispatch_grants_and_fails_closed_without_policy():
-    """Additional authorization reuses exact grants and denies unavailable policy services."""
-    interaction = Mock(spec=Interaction)
-    grant = PermissionRequest(
-        tool_name="demo", capability=Capability.FILESYSTEM_READ, resource="/project/file"
-    )
-    context = ToolContext(interaction, "demo", grants=frozenset({grant}))
-
-    assert context.authorize(Capability.FILESYSTEM_READ, resource="/project/file") is True
-    assert context.authorize(Capability.FILESYSTEM_WRITE, resource="/project/file") is False
-
-
-def test_authorize_delegates_additional_requests_to_the_permission_manager():
-    """A tool can request stricter authority discovered during execution."""
-    interaction = Mock(spec=Interaction)
-    manager = PermissionManager(
-        interaction=interaction,
-        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED),
-    )
-    context = ToolContext(interaction, "demo", permission_manager=manager)
-
-    assert context.authorize(Capability.NETWORK_WRITE, reason="Publish result.") is True
 
 
 def test_instruction_observations_delegate_only_when_a_manager_is_available(tmp_path):

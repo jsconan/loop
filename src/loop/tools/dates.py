@@ -2,11 +2,10 @@
 
 from datetime import datetime
 
-from ..permissions import Capability
 from ..tooling import tool
 
 
-@tool(capabilities={Capability.PURE})
+@tool
 def get_current_datetime() -> str:
     """Return the current local date and time."""
     return datetime.now().astimezone().strftime("%A, %B %d, %Y - %H:%M:%S")

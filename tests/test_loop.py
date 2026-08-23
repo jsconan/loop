@@ -175,7 +175,7 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
 
     assert values("/he") == ["/help"]
     assert values("$rev") == ["$review"]
-    assert values("/permissions add allow ins") == ["inspect"]
+    assert values("/permissions rule add session allow ins") == ["inspect"]
     resume = list(completer.get_completions(Document("/resume "), Mock()))
     assert [item.text for item in resume] == ["newer-session", "older-session"]
     assert [item.display_text for item in resume] == ["Zebra session", "Alpha session"]

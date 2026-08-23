@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from .. import constants
 from ..models import AgentRunStopReason, CompactionContextItem, RunMetrics
-from ..permissions import PermissionRequest, PermissionResult
+from ..permissions import AuthorizationResult
 
 SessionNameSource = Literal["initial", "generated", "user"]
 SESSION_NAME_SOURCE_INITIAL: SessionNameSource = "initial"
@@ -96,21 +96,15 @@ class ConversationItemEvent(SessionEventModel):
 
 
 class PermissionEvent(SessionEventModel):
-    """Record one evaluated permission request and its effective result.
+    """Record one atomic operation authorization.
 
     Args:
         type (Literal["permission"]): Event discriminator.
-        request (PermissionRequest): Normalized requested authority.
-        result (PermissionResult): Effective authorization result.
-        prompted (bool): Whether an interactive approval prompt was displayed.
-        prompt (str | None): Exact displayed prompt, when one was shown.
+        result (AuthorizationResult): Policy, approval, and effective outcome.
     """
 
     type: Literal["permission"] = "permission"
-    request: PermissionRequest
-    result: PermissionResult
-    prompted: bool
-    prompt: str | None = None
+    result: AuthorizationResult
 
 
 class RunCompletedEvent(SessionEventModel):

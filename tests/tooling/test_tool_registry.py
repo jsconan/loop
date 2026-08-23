@@ -8,13 +8,37 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import Capability, PermissionConfiguration, PermissionManager, PermissionMode
+from loop import (
+    Action,
+    NetworkTarget,
+    Operation,
+    OperationPlan,
+    PermissionManager,
+    SessionTarget,
+)
 from loop.interaction import Interaction
 from loop.skills import InstructionsManager
 from loop.tooling import ToolContext, ToolRegistration, ToolRegistrationError, ToolRegistry
 from loop.tooling import tool as declare_tool
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
+
+
+def planner_for(action: Action):
+    """Return a concrete operation planner for an authority-bearing test tool."""
+
+    def plan(arguments):
+        target = (
+            NetworkTarget(url="https://example.com", origin="https://example.com")
+            if action is Action.NETWORK_REQUEST
+            else SessionTarget(identifier="test-state")
+        )
+        return OperationPlan(
+            arguments=arguments,
+            operations=(Operation(tool_id="", action=action, target=target),),
+        )
+
+    return plan
 
 
 def register(registry: ToolRegistry):
@@ -42,10 +66,7 @@ def test_constructor_registers_in_order_and_exposes_sorted_snapshots():
         """Return the alpha result."""
         return "alpha"
 
-    permissions = PermissionManager(
-        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
-    )
-    registry = ToolRegistry([zebra, alpha], permission_manager=permissions)
+    registry = ToolRegistry([zebra, alpha])
     tools = registry.tools
     names = registry.names
 
@@ -72,7 +93,7 @@ def test_register_resolves_a_tool_from_declared_metadata():
     assert registered.name == "calculate"
     assert registered.description == "Calculate a number."
     assert registered.arguments_model is not None
-    assert registered.capabilities == frozenset({Capability.PURE})
+    assert registered.actions == frozenset()
 
 
 def test_register_accepts_explicit_metadata_and_rejects_duplicate_names():
@@ -95,10 +116,7 @@ def test_register_accepts_undeclared_functions_with_derived_defaults():
         """Return an ordinary value."""
         return value
 
-    permissions = PermissionManager(
-        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
-    )
-    registry = ToolRegistry([ordinary], permission_manager=permissions)
+    registry = ToolRegistry([ordinary])
 
     assert registry.names == ["ordinary"]
     assert registry.call("ordinary", '{"value": 3}') == "3"
@@ -107,18 +125,18 @@ def test_register_accepts_undeclared_functions_with_derived_defaults():
 def test_register_overrides_metadata_for_only_one_container():
     """Registration options customize one registry without changing a reusable declaration."""
 
-    @declare_tool(name="declared", description="Declared", capabilities={Capability.PURE})
+    @declare_tool(name="declared", description="Declared")
     def calculate(number: int) -> int:
         return number
 
-    resolver = Mock(return_value=())
+    planner = Mock(side_effect=lambda arguments: OperationPlan(arguments=arguments))
     customized = ToolRegistry()
     customized.register(
         calculate,
         name="customized",
         description="Customized",
-        capabilities={Capability.NETWORK_READ},
-        permission_resolver=resolver,
+        actions={Action.NETWORK_REQUEST},
+        operation_planner=planner,
     )
     standard = ToolRegistry([calculate])
 
@@ -127,37 +145,48 @@ def test_register_overrides_metadata_for_only_one_container():
     assert (
         custom_tool.name,
         custom_tool.description,
-        custom_tool.capabilities,
-        custom_tool.permission_resolver,
+        custom_tool.actions,
+        custom_tool.operation_planner,
     ) == (
         "customized",
         "Customized",
-        frozenset({Capability.NETWORK_READ}),
-        resolver,
+        frozenset({Action.NETWORK_REQUEST}),
+        planner,
     )
     assert (
         standard_tool.name,
         standard_tool.description,
-        standard_tool.capabilities,
-        standard_tool.permission_resolver,
-    ) == ("declared", "Declared", frozenset({Capability.PURE}), None)
+        standard_tool.actions,
+        standard_tool.operation_planner,
+    ) == ("declared", "Declared", frozenset(), None)
 
 
-def test_register_can_remove_a_declared_permission_resolver():
-    """An explicit null resolver removes inherited resource-specific policy in one registry."""
-    resolver = Mock(return_value=())
+def test_register_rejects_authority_bearing_tools_without_a_planner():
+    """Every authority-bearing registration must identify concrete targets before execution."""
 
-    @declare_tool(permission_resolver=resolver)
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    with pytest.raises(ToolRegistrationError, match="without an operation planner"):
+        ToolRegistry().register(calculate, actions={Action.SESSION_MUTATE})
+
+
+def test_register_can_remove_a_declared_operation_planner():
+    """An explicit null planner removes inherited operation planning in one registry."""
+    planner = Mock(side_effect=lambda arguments: OperationPlan(arguments=arguments))
+
+    @declare_tool(operation_planner=planner)
     def calculate(number: int) -> int:
         """Calculate a number."""
         return number
 
     inherited = ToolRegistry([calculate])
     overridden = ToolRegistry()
-    overridden.register(calculate, permission_resolver=None)
+    overridden.register(calculate, operation_planner=None)
 
-    assert inherited.tools[0].permission_resolver is resolver
-    assert overridden.tools[0].permission_resolver is None
+    assert inherited.tools[0].operation_planner is planner
+    assert overridden.tools[0].operation_planner is None
 
 
 def test_register_accepts_container_specific_registration_records():
@@ -172,14 +201,14 @@ def test_register_accepts_container_specific_registration_records():
             calculate,
             name="local_calculate",
             description="Calculate locally.",
-            capabilities=frozenset(),
+            actions=frozenset(),
         )
     )
 
     registered = registry.tools[0]
     assert registered.name == "local_calculate"
     assert registered.description == "Calculate locally."
-    assert registered.capabilities == frozenset()
+    assert registered.actions == frozenset()
 
 
 def test_independent_registries_allow_the_same_name_and_isolate_runtime_state():
@@ -231,10 +260,7 @@ def test_register_accepts_callable_objects():
         def __call__(self, number: int) -> int:
             return number * 2
 
-    permissions = PermissionManager(
-        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
-    )
-    registry = ToolRegistry([Multiplier()], permission_manager=permissions)
+    registry = ToolRegistry([Multiplier()])
 
     assert registry.names == ["Multiplier"]
     assert registry.call("Multiplier", '{"number": 3}') == "6"
@@ -246,10 +272,7 @@ def test_register_accepts_partials_with_explicit_local_metadata():
     def add(first: int, second: int) -> int:
         return first + second
 
-    permissions = PermissionManager(
-        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
-    )
-    registry = ToolRegistry(permission_manager=permissions)
+    registry = ToolRegistry()
     registry.register(partial(add, 2), name="add_two", description="Add two to a number.")
 
     assert registry.call("add_two", '{"second": 3}') == "5"
@@ -264,10 +287,7 @@ def test_register_dispatches_async_callable_objects_only_through_async_calls():
         async def __call__(self, number: int) -> int:
             return number * 2
 
-    permissions = PermissionManager(
-        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
-    )
-    registry = ToolRegistry([AsyncMultiplier()], permission_manager=permissions)
+    registry = ToolRegistry([AsyncMultiplier()])
 
     assert "async_tool_in_sync_loop" in registry.call("AsyncMultiplier", '{"number": 3}')
     assert asyncio.run(registry.call_async("AsyncMultiplier", '{"number": 3}')) == "6"
@@ -301,9 +321,7 @@ def test_interaction_property_can_be_replaced_and_cleared():
     registry.interaction = None
     assert registry.interaction is None
 
-    replacement = PermissionManager(
-        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
-    )
+    replacement = PermissionManager()
     registry.permission_manager = replacement
     assert registry.permission_manager is replacement
 
@@ -345,10 +363,7 @@ def test_call_routes_arguments_and_runtime_context():
 def test_call_uses_default_or_no_context():
     """Synchronous routing uses the default interaction and omits context when none exists."""
     interaction = Mock(spec=Interaction)
-    permissions = PermissionManager(
-        configuration=PermissionConfiguration(mode=PermissionMode.UNRESTRICTED)
-    )
-    registry = ToolRegistry(interaction=interaction, permission_manager=permissions)
+    registry = ToolRegistry(interaction=interaction)
     seen = []
 
     @declare_tool
@@ -373,7 +388,16 @@ def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
     recorder = Mock()
     permissions = PermissionManager(interaction=interaction, recorder=recorder)
     registry = ToolRegistry(interaction=interaction, permission_manager=permissions)
-    register(registry)
+
+    @declare_tool(
+        actions={Action.SESSION_MUTATE},
+        operation_planner=planner_for(Action.SESSION_MUTATE),
+    )
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    registry.register(calculate)
     clock = Mock(side_effect=[10.0, 12.0])
     monkeypatch.setattr(tool_registry_module, "perf_counter", clock)
 
@@ -382,7 +406,7 @@ def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
     assert output == "3"
     assert duration == 2
     interaction.confirm.assert_called_once()
-    recorder.record_permission.assert_called_once()
+    recorder.record_authorization.assert_called_once()
 
 
 def test_call_command_parses_model_parameters_before_shared_dispatch():
@@ -397,8 +421,8 @@ def test_call_command_parses_model_parameters_before_shared_dispatch():
 
     @declare_tool
     def has_no_policy(context: ToolContext) -> bool:
-        """Report whether command dispatch omitted the permission policy."""
-        return context.permission_manager is None
+        """Report successful user-command context construction."""
+        return context.tool_name == "has_no_policy"
 
     registry.register(describe)
     registry.register(has_no_policy)
@@ -412,14 +436,25 @@ def test_call_command_parses_model_parameters_before_shared_dispatch():
 
 
 def test_call_command_reports_unknown_tools_and_invalid_parameters():
-    """Command routing serializes lookup, binding, and model validation failures."""
+    """Command routing serializes lookup, binding, validation, and planning failures."""
     registry = ToolRegistry()
     register(registry)
+
+    def invalid_planner(_arguments):
+        """Reject planning to verify the user-command error boundary."""
+        raise ValueError("invalid operation plan")
+
+    @declare_tool(actions={Action.SESSION_MUTATE}, operation_planner=invalid_planner)
+    def invalid_plan() -> None:
+        """Expose an intentionally invalid operation planner."""
+
+    registry.register(invalid_plan)
 
     assert "unknown_tool" in registry.command("missing", ())
     assert "invalid_arguments" in registry.command("calculate", ("unknown=1",))
     assert "argument_binding" in registry.command("calculate", ("unknown=1",))
     assert "invalid_arguments" in registry.command("calculate", ("not-an-integer",))
+    assert "operation_planning_failed" in registry.command("invalid_plan", ())
 
 
 def test_call_async_reports_unknown_tools(monkeypatch):
@@ -454,13 +489,46 @@ def test_call_async_returns_validation_and_permission_denials_before_invocation(
     interaction = Mock(spec=Interaction)
     interaction.confirm.return_value = False
     registry = ToolRegistry(interaction=interaction)
-    register(registry)
+
+    @declare_tool(
+        actions={Action.SESSION_MUTATE},
+        operation_planner=planner_for(Action.SESSION_MUTATE),
+    )
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    registry.register(calculate)
 
     invalid = asyncio.run(registry.call_async("calculate", "bad"))
     denied = asyncio.run(registry.call_async("calculate", '{"number": 1}'))
 
     assert "invalid_arguments" in invalid
     assert "tool_call_denied" in denied
+
+
+def test_sync_and_async_dispatch_report_operation_planning_failures():
+    """A failed canonical operation plan prevents both dispatch paths from invoking a tool."""
+    calls = []
+
+    def calculate() -> str:
+        """Return an unreachable result."""
+        calls.append(True)
+        return "unreachable"
+
+    def fail_plan(_arguments):
+        raise ValueError("cannot canonicalize target")
+
+    registry = ToolRegistry()
+    registry.register(calculate, operation_planner=fail_plan)
+
+    sync_result, sync_duration = registry.call_with_timing("calculate", "{}")
+    async_result, async_duration = asyncio.run(registry.call_with_timing_async("calculate", "{}"))
+
+    assert "operation_planning_failed" in sync_result
+    assert "operation_planning_failed" in async_result
+    assert sync_duration == async_duration == 0
+    assert calls == []
 
 
 def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
@@ -471,7 +539,10 @@ def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
     permissions = PermissionManager(interaction=interaction, recorder=recorder)
     registry = ToolRegistry(interaction=interaction, permission_manager=permissions)
 
-    @declare_tool(capabilities={Capability.NETWORK_READ})
+    @declare_tool(
+        actions={Action.NETWORK_REQUEST},
+        operation_planner=planner_for(Action.NETWORK_REQUEST),
+    )
     async def calculate(number: int) -> int:
         """Calculate a number asynchronously."""
         return number
@@ -480,14 +551,12 @@ def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
     clock = Mock(side_effect=[10.0, 12.0])
     monkeypatch.setattr(tool_registry_module, "perf_counter", clock)
 
-    output, duration = asyncio.run(
-        registry.call_with_timing_async("calculate", '{"number": 3}')
-    )
+    output, duration = asyncio.run(registry.call_with_timing_async("calculate", '{"number": 3}'))
 
     assert output == "3"
     assert duration == 2
     interaction.confirm.assert_called_once()
-    recorder.record_permission.assert_called_once()
+    recorder.record_authorization.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -498,14 +567,21 @@ def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
         ("calculate", '{"number": 1}', "tool_call_denied"),
     ],
 )
-def test_call_with_timing_async_returns_zero_before_invocation(
-    name, arguments, error, monkeypatch
-):
+def test_call_with_timing_async_returns_zero_before_invocation(name, arguments, error, monkeypatch):
     """Async timing remains zero when lookup, validation, or authorization stops dispatch."""
     interaction = Mock(spec=Interaction)
     interaction.confirm.return_value = False
     registry = ToolRegistry(interaction=interaction)
-    register(registry)
+
+    @declare_tool(
+        actions={Action.SESSION_MUTATE},
+        operation_planner=planner_for(Action.SESSION_MUTATE),
+    )
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    registry.register(calculate)
     clock = Mock()
     monkeypatch.setattr(tool_registry_module, "perf_counter", clock)
 
