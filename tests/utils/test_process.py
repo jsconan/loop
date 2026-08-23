@@ -13,7 +13,7 @@ from loop.utils.process import kill_process_group, parse_command_line, read_boun
         ("git status", ("git", "status")),
         ("printf '%s' 'a|b'", ("printf", "%s", "a|b")),
         (r"printf '%s' a\|b", ("printf", "%s", "a|b")),
-        ('printf "%s" "a\\\"b"', ("printf", "%s", 'a"b')),
+        ('printf "%s" "a\\"b"', ("printf", "%s", 'a"b')),
         ("command ''", ("command", "")),
     ],
 )

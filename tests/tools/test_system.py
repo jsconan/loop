@@ -151,7 +151,7 @@ def test_run_command_rejects_empty_malformed_or_shell_syntax(command):
         ("printf '%s' 'a|b'", ["printf", "%s", "a|b"]),
         (r"printf '%s' a\|b", ["printf", "%s", "a|b"]),
         ('printf "%s" "price: $5"', ["printf", "%s", "price: $5"]),
-        ('printf "%s" "a\\\"b"', ["printf", "%s", 'a"b']),
+        ('printf "%s" "a\\"b"', ["printf", "%s", 'a"b']),
     ],
 )
 def test_run_command_preserves_quoted_or_escaped_shell_characters_as_argument_data(
