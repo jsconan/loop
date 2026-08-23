@@ -103,6 +103,21 @@ def test_permissions_reload_and_limit_removal_report_outcomes(tmp_path):
     assert "was not found" in interaction.warning.call_args.args[0]
 
 
+def test_permissions_reload_reports_invalid_policy_without_replacing_active_policy(tmp_path):
+    """Reload shows recovery diagnostics while preserving the last valid workspace policy."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path)
+    permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
+    (tmp_path / ".loop" / "permissions.yaml").write_text("version: 2\n", "utf-8")
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "reload")
+
+    assert permissions.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+    interaction.error.assert_called_once()
+    assert "remain unchanged" in interaction.warning.call_args.args[0]
+
+
 def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
     """Session boundaries affect effective output without changing workspace YAML."""
     interaction = Mock(spec=Interaction)
@@ -166,7 +181,11 @@ def test_permissions_preset_commands_preview_and_confirm_scoped_policy_replaceme
 
 def test_permissions_preset_list_reports_an_empty_catalog(monkeypatch, tmp_path):
     """The preset list command explains when no selectable artifacts are available."""
-    monkeypatch.setattr(PermissionPreset, "builtin_presets", classmethod(lambda cls: ()))
+    monkeypatch.setattr(
+        PermissionPreset,
+        "load_builtin_presets",
+        classmethod(lambda cls: ((), ())),
+    )
     interaction = Mock(spec=Interaction)
     manager = command_manager(PermissionManager(tmp_path), interaction)
 

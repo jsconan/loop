@@ -99,10 +99,18 @@ class PermissionCommands:
             context.interaction.info(manager.describe(arguments[1]))
             return
         if arguments == ("reload",):
-            manager.reload()
-            context.interaction.info(
-                "Reloaded the workspace policy; session overrides remain active."
-            )
+            if manager.reload():
+                context.interaction.info(
+                    "Reloaded the workspace policy; session overrides remain active."
+                )
+            else:
+                failure = manager.load_failure
+                context.interaction.error(
+                    f"Could not reload workspace policy at {failure.path}: {failure.message}"
+                )
+                context.interaction.warning(
+                    "The active permission policy and session overrides remain unchanged."
+                )
             return
         if arguments == ("help",):
             context.interaction.info(self._help())

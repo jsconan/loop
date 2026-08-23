@@ -780,17 +780,50 @@ def test_empty_yaml_loads_as_default_policy(tmp_path):
     assert PermissionManager(tmp_path).configuration == PermissionConfiguration()
 
 
-def test_reload_rejects_invalid_yaml_without_replacing_the_active_policy(tmp_path):
-    """An invalid external policy edit leaves the last valid configuration active."""
+def test_reload_retains_active_policy_and_exposes_a_failure_for_invalid_yaml(tmp_path):
+    """An invalid external policy edit retains active policy and exposes recovery diagnostics."""
     manager = PermissionManager(tmp_path)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
     path = tmp_path / ".loop" / "permissions.yaml"
     path.write_text("version: 2\n", "utf-8")
 
-    with pytest.raises(ValueError):
-        manager.reload()
+    assert manager.reload() is False
 
     assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+    assert manager.load_failure is not None
+    assert manager.load_failure.path == str(path)
+
+
+def test_invalid_policy_load_uses_supervised_fallback_and_reset_archives_file(tmp_path):
+    """A corrupt policy activates safe defaults until an explicit reset archives it."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text("version: 2\n", "utf-8")
+
+    manager = PermissionManager(tmp_path)
+
+    assert manager.load_failure is not None
+    assert manager.configuration == PermissionConfiguration()
+    backup = manager.reset_configuration()
+
+    assert backup is not None
+    assert backup.read_text("utf-8") == "version: 2\n"
+    assert PermissionManager(tmp_path).configuration == PermissionConfiguration()
+    assert manager.load_failure is None
+
+
+def test_reset_configuration_creates_defaults_when_no_policy_file_exists(tmp_path):
+    """An explicit reset creates the default policy even before a policy file exists."""
+    manager = PermissionManager(tmp_path)
+
+    assert manager.reset_configuration() is None
+    assert (tmp_path / ".loop" / "permissions.yaml").exists()
+
+
+def test_in_memory_policy_cannot_be_reset():
+    """Reset requires a local policy path to preserve its archival contract."""
+    with pytest.raises(ValueError, match="cannot reset"):
+        PermissionManager().reset_configuration()
 
 
 def test_diagnostic_audit_failure_does_not_change_authorization(tmp_path, monkeypatch):

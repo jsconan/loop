@@ -112,8 +112,58 @@ def test_builtin_permission_presets_are_sorted_and_have_stable_hashes():
     assert presets[0].content_hash == presets[0].model_copy(deep=True).content_hash
 
 
-def test_builtin_permission_presets_reject_duplicate_packaged_ids(monkeypatch, tmp_path):
-    """The packaged catalog rejects two artifacts claiming the same identifier."""
+def test_builtin_preset_loading_excludes_invalid_artifacts_and_reports_them(monkeypatch):
+    """Malformed packaged presets do not prevent valid catalog artifacts from loading."""
+
+    class Resource:
+        """Provide a single invalid preset artifact."""
+
+        name = "invalid.yaml"
+
+        @staticmethod
+        def read_text(_encoding):
+            """Return an invalid preset payload."""
+            return "version: 2\n"
+
+        def __str__(self):
+            """Render a stable artifact path."""
+            return "presets/invalid.yaml"
+
+    class IgnoredResource:
+        """Provide an unrelated package resource."""
+
+        name = "README.md"
+
+    class ResourcePackage:
+        """Provide package-style access to the invalid preset artifact."""
+
+        @staticmethod
+        def joinpath(_name):
+            """Return the preset directory."""
+            return ResourcePackage()
+
+        @staticmethod
+        def iterdir():
+            """Return the available preset artifact."""
+            return (Resource(), IgnoredResource())
+
+        def __str__(self):
+            """Render a stable display path."""
+            return "presets"
+
+    monkeypatch.setattr("loop.permissions.models.files", lambda package: ResourcePackage())
+
+    presets, failures = PermissionPreset.load_builtin_presets()
+
+    assert not presets
+    assert failures[0].source == "preset"
+    assert failures[0].path == "presets/invalid.yaml"
+
+
+def test_builtin_permission_presets_reject_duplicates_but_retains_one_for_recovery(
+    monkeypatch, tmp_path
+):
+    """Strict loading rejects duplicate IDs while recovery retains one usable preset."""
     defaults = "\n".join(f"  {action.value}: deny" for action in Action)
     payload = (
         "version: 1\nkind: loop.permission-preset\nmetadata:\n"
@@ -135,3 +185,8 @@ def test_builtin_permission_presets_reject_duplicate_packaged_ids(monkeypatch, t
     monkeypatch.setattr("loop.permissions.models.files", lambda package: ResourcePackage())
     with pytest.raises(ValueError, match="Built-in permission preset identifiers"):
         PermissionPreset.builtin_presets()
+
+    presets, failures = PermissionPreset.load_builtin_presets()
+
+    assert [preset.metadata.id for preset in presets] == ["duplicate"]
+    assert failures[0].message == "Built-in permission preset identifiers must be unique."

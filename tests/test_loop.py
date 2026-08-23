@@ -28,10 +28,12 @@ from loop import (
     ModelInfo,
     PermissionConfiguration,
     PermissionManager,
+    PermissionPreset,
     Response,
     ResponseCompleted,
     Session,
     SessionManager,
+    ShutdownRequested,
     Skill,
     SkillManager,
     SQLiteSessionStore,
@@ -43,6 +45,7 @@ from loop import (
     manage_skills,
     tool,
 )
+from loop.permissions import PermissionLoadFailure
 
 
 def function_call() -> ToolCall:
@@ -99,6 +102,81 @@ def test_loop_exposes_its_configured_state(tmp_path):
 
     loop.debug = False
     assert loop.debug is False
+
+
+@pytest.mark.parametrize("choice", ["continue", None])
+def test_loop_continues_with_supervised_defaults_after_permission_load_failure(tmp_path, choice):
+    """Invalid policies are reported and retained for correction while Loop uses safe defaults."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text("version: 2\n", "utf-8")
+    permissions = PermissionManager(tmp_path)
+    interaction = output_interaction()
+    interaction.prompt.return_value = choice
+
+    Loop(
+        backend=loop_backend(),
+        interaction=interaction,
+        permission_manager=permissions,
+        working_directory=tmp_path,
+    )
+
+    interaction.error.assert_called_once()
+    interaction.warning.assert_called_once()
+    assert permissions.load_failure is not None
+
+
+def test_loop_resets_invalid_permission_policy_only_after_user_selection(tmp_path):
+    """The reset choice delegates archival and default activation to PermissionManager."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text("version: 2\n", "utf-8")
+    permissions = PermissionManager(tmp_path)
+    interaction = output_interaction()
+    interaction.prompt.return_value = "reset"
+
+    Loop(
+        backend=loop_backend(),
+        interaction=interaction,
+        permission_manager=permissions,
+        working_directory=tmp_path,
+    )
+
+    assert permissions.load_failure is None
+    assert path.exists()
+    assert list(path.parent.glob("permissions.yaml.*.bak"))
+
+
+@pytest.mark.parametrize("choice", ["exit", False])
+def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
+    """The recovery prompt can stop startup without changing the invalid policy file."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text("version: 2\n", "utf-8")
+    interaction = output_interaction()
+    interaction.prompt.return_value = choice
+
+    with pytest.raises(ShutdownRequested):
+        Loop(backend=loop_backend(), interaction=interaction, working_directory=tmp_path)
+
+    assert path.read_text("utf-8") == "version: 2\n"
+
+
+def test_loop_reports_presets_excluded_by_permission_manager(tmp_path, monkeypatch):
+    """Malformed shipped presets are reported without preventing Loop construction."""
+    failure = PermissionLoadFailure(
+        source="preset", path="presets/broken.yaml", message="invalid schema"
+    )
+    monkeypatch.setattr(
+        PermissionPreset,
+        "load_builtin_presets",
+        classmethod(lambda cls: ((), (failure,))),
+    )
+    interaction = output_interaction()
+
+    Loop(backend=loop_backend(), interaction=interaction, working_directory=tmp_path)
+
+    assert "Excluded invalid permission preset" in interaction.warning.call_args.args[0]
 
 
 def test_loop_rejects_an_invalid_compaction_threshold(tmp_path):

@@ -285,6 +285,22 @@ class PresetMetadata(BaseModel):
     description: str
 
 
+class PermissionLoadFailure(BaseModel):
+    """Describe a permission artifact that could not be activated safely.
+
+    Args:
+        source (Literal["configuration", "preset"]): Type of artifact that failed to load.
+        path (str): Filesystem or package path of the failed artifact.
+        message (str): Safe, actionable summary of the loading failure.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    source: Literal["configuration", "preset"]
+    path: str
+    message: str
+
+
 class PresetRule(BaseModel):
     """Describe one rule before a preset installs it into a policy scope.
 
@@ -369,18 +385,52 @@ class PermissionPreset(BaseModel):
 
         Raises:
             ValueError: If packaged artifacts duplicate an identifier.
-            yaml.YAMLError: If a packaged artifact contains invalid YAML.
         """
-        directory = files("loop.permissions").joinpath("presets")
-        presets = tuple(
-            cls.model_validate(yaml.safe_load(entry.read_text("utf-8")))
-            for entry in sorted(directory.iterdir(), key=lambda item: item.name)
-            if entry.name.endswith((".yaml", ".yml"))
-        )
-        identifiers = [preset.metadata.id for preset in presets]
-        if len(identifiers) != len(set(identifiers)):
-            raise ValueError("Built-in permission preset identifiers must be unique.")
+        presets, failures = cls.load_builtin_presets()
+        if failures:
+            raise ValueError(f"Could not load built-in permission preset: {failures[0].message}")
         return tuple(sorted(presets, key=lambda preset: preset.metadata.id))
+
+    @classmethod
+    def load_builtin_presets(
+        cls,
+    ) -> tuple[tuple[PermissionPreset, ...], tuple[PermissionLoadFailure, ...]]:
+        """Load every usable shipped preset and retain diagnostics for unusable artifacts.
+
+        Returns:
+            tuple[tuple[PermissionPreset, ...], tuple[PermissionLoadFailure, ...]]: Valid presets
+                sorted by stable identifier and failures for artifacts excluded from the catalog.
+        """
+        presets = []
+        failures = []
+        directory = files("loop.permissions").joinpath("presets")
+        for entry in sorted(directory.iterdir(), key=lambda item: item.name):
+            if not entry.name.endswith((".yaml", ".yml")):
+                continue
+            try:
+                presets.append(cls.model_validate(yaml.safe_load(entry.read_text("utf-8"))))
+            except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+                failures.append(
+                    PermissionLoadFailure(source="preset", path=str(entry), message=str(exc))
+                )
+        unique_presets = []
+        identifiers = set()
+        for preset in presets:
+            if preset.metadata.id in identifiers:
+                failures.append(
+                    PermissionLoadFailure(
+                        source="preset",
+                        path=str(directory),
+                        message="Built-in permission preset identifiers must be unique.",
+                    )
+                )
+                continue
+            identifiers.add(preset.metadata.id)
+            unique_presets.append(preset)
+        return (
+            tuple(sorted(unique_presets, key=lambda preset: preset.metadata.id)),
+            tuple(failures),
+        )
 
 
 class PresetReplacementPreview(BaseModel):

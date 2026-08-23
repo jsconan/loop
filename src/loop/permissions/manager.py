@@ -8,6 +8,7 @@ import json
 import shlex
 import tempfile
 from collections.abc import Iterable
+from datetime import datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,6 +26,7 @@ from .models import (
     NetworkTarget,
     Operation,
     PermissionConfiguration,
+    PermissionLoadFailure,
     PermissionPreset,
     PermissionRecorder,
     PermissionRule,
@@ -70,11 +72,6 @@ class PermissionManager:
         configuration (PermissionConfiguration | None): Explicit policy instead of the local file.
         presets (Iterable[PermissionPreset] | None): Additional selectable presets alongside
             the built-in catalog. Duplicate identifiers are rejected.
-
-    Raises:
-        OSError: If an existing configuration cannot be read.
-        ValueError: If an existing configuration is invalid.
-        yaml.YAMLError: If an existing configuration contains invalid YAML.
     """
 
     _working_directory: Path | None
@@ -82,6 +79,8 @@ class PermissionManager:
     _interaction: Interaction | None
     _recorder: PermissionRecorder | None
     _configuration: PermissionConfiguration
+    _load_failure: PermissionLoadFailure | None
+    _preset_load_failures: tuple[PermissionLoadFailure, ...]
     _session_overrides: SessionPolicyOverrides
     _temporary_directory: tempfile.TemporaryDirectory[str]
     _temporary_path: Path
@@ -113,9 +112,12 @@ class PermissionManager:
         )
         self._interaction = interaction
         self._recorder = recorder
+        self._load_failure = None
+        self._preset_load_failures = ()
         self._configuration = configuration or self._load()
         self._session_overrides = SessionPolicyOverrides()
-        catalog = (*PermissionPreset.builtin_presets(), *(presets or ()))
+        builtin_presets, self._preset_load_failures = PermissionPreset.load_builtin_presets()
+        catalog = (*builtin_presets, *(presets or ()))
         identifiers = [preset.metadata.id for preset in catalog]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Permission preset identifiers must be unique.")
@@ -129,6 +131,24 @@ class PermissionManager:
             PermissionConfiguration: Workspace defaults, limits, and rules.
         """
         return self._configuration.model_copy(deep=True)
+
+    @property
+    def load_failure(self) -> PermissionLoadFailure | None:
+        """Return the unresolved workspace policy loading failure, when any.
+
+        Returns:
+            PermissionLoadFailure | None: Failure that activated the supervised fallback, or None.
+        """
+        return self._load_failure
+
+    @property
+    def preset_load_failures(self) -> tuple[PermissionLoadFailure, ...]:
+        """Return diagnostics for shipped presets excluded from the selectable catalog.
+
+        Returns:
+            tuple[PermissionLoadFailure, ...]: Immutable failures for malformed preset artifacts.
+        """
+        return self._preset_load_failures
 
     @property
     def effective_configuration(self) -> PermissionConfiguration:
@@ -626,9 +646,42 @@ class PermissionManager:
         self._session_overrides = SessionPolicyOverrides()
         return changed
 
-    def reload(self) -> None:
-        """Reload and validate the active YAML policy atomically."""
-        self._configuration = self._load()
+    def reload(self) -> bool:
+        """Reload the workspace policy without replacing a valid active policy on failure.
+
+        Returns:
+            bool: Whether the workspace policy loaded successfully.
+        """
+        configuration = self._load(fallback_to_defaults=False)
+        if configuration is None:
+            return False
+        self._configuration = configuration
+        return True
+
+    def reset_configuration(self) -> Path | None:
+        """Archive an invalid workspace policy and replace it with supervised defaults.
+
+        Returns:
+            Path | None: Backup path for the invalid policy, or None when no local file existed.
+
+        Raises:
+            ValueError: If this manager has no configuration path.
+            OSError: If the invalid policy cannot be archived or defaults cannot be persisted.
+        """
+        if self._configuration_path is None:
+            raise ValueError("An in-memory PermissionManager cannot reset configuration.")
+        backup_path = None
+        if self._configuration_path.exists():
+            timestamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%f%z")
+            backup_path = self._configuration_path.with_name(
+                f"{self._configuration_path.name}.{timestamp}.bak"
+            )
+            self._configuration_path.replace(backup_path)
+        configuration = PermissionConfiguration()
+        self._persist(configuration)
+        self._configuration = configuration
+        self._load_failure = None
+        return backup_path
 
     def explain(self, tool: str, action: Action, resource: str) -> PolicyDecision:
         """Evaluate one concrete operation without prompting or recording.
@@ -867,11 +920,19 @@ class PermissionManager:
             f"resource={rule.resource or '*'}{description}{source}"
         )
 
-    def _load(self) -> PermissionConfiguration:
+    def _load(self, *, fallback_to_defaults: bool = True) -> PermissionConfiguration | None:
         if self._configuration_path is None or not self._configuration_path.exists():
             return PermissionConfiguration()
-        payload = yaml.safe_load(self._configuration_path.read_text("utf-8"))
-        return PermissionConfiguration.model_validate(payload or {})
+        try:
+            payload = yaml.safe_load(self._configuration_path.read_text("utf-8"))
+            configuration = PermissionConfiguration.model_validate(payload or {})
+        except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+            self._load_failure = PermissionLoadFailure(
+                source="configuration", path=str(self._configuration_path), message=str(exc)
+            )
+            return PermissionConfiguration() if fallback_to_defaults else None
+        self._load_failure = None
+        return configuration
 
     def _evaluate_operation(self, operation: Operation) -> PolicyDecision:
         boundary = self._boundary_decision(operation)
