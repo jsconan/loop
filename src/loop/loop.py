@@ -24,7 +24,7 @@ from .session import (
     SessionManager,
     SessionNameGenerator,
 )
-from .skills import InstructionsManager, SkillCommands
+from .skills import InstructionsManager, RuntimeEnvironment, SkillCommands
 from .tooling import ToolCommands, ToolRegistry
 from .utils import find_project_root
 
@@ -132,6 +132,10 @@ class Loop:
         self._working_directory = Path(
             working_directory or restored_directory or Path.cwd()
         ).resolve()
+        self._permission_manager = permission_manager or PermissionManager(
+            find_project_root(self._working_directory) or self._working_directory,
+            interaction=self._interaction,
+        )
         self._instructions_manager = instructions_manager or InstructionsManager.discover(
             self._working_directory,
             agents_filenames=agents_filenames,
@@ -140,6 +144,12 @@ class Loop:
             self._instructions_manager.reactivate_skills(
                 self._session_manager.session.active_skills
             )
+        self._instructions_manager.set_runtime_environment(
+            RuntimeEnvironment(
+                working_directory=self._working_directory,
+                temporary_directory=self._permission_manager.temporary_directory,
+            )
+        )
         self._stream = stream
         self._debug = debug
         self._model_selection = ModelSelection(
@@ -157,10 +167,6 @@ class Loop:
             threshold=compaction_threshold,
         )
         self._prompt_on_recoverable_error = prompt_on_recoverable_error
-        self._permission_manager = permission_manager or PermissionManager(
-            find_project_root(self._working_directory) or self._working_directory,
-            interaction=self._interaction,
-        )
         self._permission_manager.recorder = self._session_manager
         self._tool_registry = tool_registry or ToolRegistry()
         self._agent = Agent(

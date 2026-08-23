@@ -391,7 +391,8 @@ add `system-temp` only when cross-application temporary-file access is necessary
 processes or private-network access is explicit. Network origins use glob patterns: `*` permits
 all origins, while an empty origin list denies all network requests. Adding the first specific
 origin replaces the default `*`, making the boundary restrictive. Relative filesystem roots in
-the YAML policy are resolved from the workspace, not from the shell's launch directory. Host
+the YAML policy are resolved from the workspace, not from the shell's launch directory. Each Loop
+instance owns a private `loop-temp` directory and announces its exact path to the model. Host
 process execution requires both opening the `host-process` boundary and choosing an appropriate
 `process.execute` default or rule. The built-in executor does not supply an operating-system
 sandbox, so this boundary must remain closed for untrusted process execution. Ignore files limit

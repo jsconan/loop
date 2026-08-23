@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from loop import InstructionsManager, Skill, SkillManager
+from loop import InstructionsManager, RuntimeEnvironment, Skill, SkillManager
 
 
 def write_skill(directory: Path, name: str, body: str = "Follow the workflow.") -> Skill:
@@ -23,7 +23,10 @@ def test_manager_combines_project_catalog_and_active_skills_in_stable_order(tmp_
     """Dynamic instructions preserve the static prefix and discovery-order skill bodies."""
     first = write_skill(tmp_path / "first", "first", "First instructions.")
     second = write_skill(tmp_path / "second", "second", "Second instructions.")
-    manager = InstructionsManager("Project rules.", SkillManager([first, second]))
+    manager = InstructionsManager(
+        project_instructions="Project rules.",
+        skill_manager=SkillManager([first, second]),
+    )
     initial = manager.instructions
 
     second_result = manager.activate_skill("second")
@@ -48,6 +51,42 @@ def test_manager_combines_project_catalog_and_active_skills_in_stable_order(tmp_
         "active_skill",
     ]
     assert len(context["digest"]) == 64
+
+
+def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
+    """Runtime context participates in composition, generation, and the hard budget."""
+    manager = InstructionsManager(max_bytes=512)
+    environment = RuntimeEnvironment(tmp_path, tmp_path / "temporary")
+    manager.set_runtime_environment(environment)
+    generation = manager.generation
+
+    manager.set_runtime_environment(environment)
+
+    assert manager.instructions is not None
+    assert str(tmp_path) in manager.instructions
+    assert manager.generation == generation
+    with pytest.raises(ValueError, match="Runtime environment exceeds"):
+        manager.set_runtime_environment(RuntimeEnvironment(tmp_path, tmp_path / ("x" * 600)))
+
+
+def test_runtime_environment_tracks_the_observed_instruction_directory(tmp_path):
+    """Runtime workspace guidance stays aligned with the active instruction scope."""
+    initial = tmp_path / "initial"
+    observed = tmp_path / "observed"
+    initial.mkdir()
+    observed.mkdir()
+    manager = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(initial, tmp_path / "temporary"),
+        max_bytes=4096,
+    )
+
+    manager.observe_path(observed, directory=True)
+    manager.prepare()
+
+    assert manager.instructions is not None
+    assert f"working_directory: {observed.resolve()}" in manager.instructions
+    sections = manager.list_skills()["instruction_context"]["sections"]
+    assert [section["kind"] for section in sections] == ["runtime_environment"]
 
 
 def test_manager_discovers_project_instructions_and_skills(tmp_path):
@@ -352,7 +391,7 @@ def test_manager_rejects_invalid_and_oversized_initial_limits():
             InstructionsManager(max_bytes=limit)
 
     with pytest.raises(ValueError, match="Initial instructions exceed"):
-        InstructionsManager("too large", max_bytes=2)
+        InstructionsManager(project_instructions="too large", max_bytes=2)
 
 
 def test_activation_is_idempotent_and_unknown_skills_remain_errors(tmp_path):

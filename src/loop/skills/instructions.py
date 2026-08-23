@@ -1,6 +1,7 @@
 """Compose the developer instructions used for backend requests."""
 
 from collections.abc import Iterable
+from dataclasses import replace
 from html import escape
 from pathlib import Path
 from threading import RLock
@@ -16,6 +17,7 @@ from .models import (
     InstructionSourceSummary,
     LoadedAgentInstructions,
     ManagedSkillListResult,
+    RuntimeEnvironment,
     SkillActivationResponse,
     SkillActivationResult,
     SkillDeactivationAllResult,
@@ -38,6 +40,8 @@ class InstructionsManager:
     Args:
         project_instructions (str | None): Project instructions loaded from applicable AGENTS.md
             files, or ``None`` when none apply.
+        runtime_environment (RuntimeEnvironment | None): Application-owned runtime paths and
+            capability guidance, or ``None`` when none apply.
         skill_manager (SkillManager | None): Skill manager supplying the catalog and lazily loaded
             skill bodies. Defaults to an empty manager.
         max_bytes (int): Maximum encoded size of the complete instruction document.
@@ -52,6 +56,7 @@ class InstructionsManager:
     """
 
     _project_instructions: str | None
+    _runtime_environment: RuntimeEnvironment | None
     _skill_manager: SkillManager
     _max_bytes: int
     _working_directory: Path | None
@@ -68,9 +73,10 @@ class InstructionsManager:
 
     def __init__(
         self,
-        project_instructions: str | None = None,
-        skill_manager: SkillManager | None = None,
         *,
+        project_instructions: str | None = None,
+        runtime_environment: RuntimeEnvironment | None = None,
+        skill_manager: SkillManager | None = None,
         max_bytes: int = constants.MAX_INSTRUCTIONS_BYTES,
         working_directory: Path | str | None = None,
         agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
@@ -78,6 +84,7 @@ class InstructionsManager:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise ValueError("Instruction limit must be a positive integer.")
         self._project_instructions = project_instructions
+        self._runtime_environment = runtime_environment
         self._skill_manager = skill_manager or SkillManager()
         self._max_bytes = max_bytes
         self._working_directory = (
@@ -126,8 +133,8 @@ class InstructionsManager:
         directory = Path(working_directory).resolve()
         loaded = load_agents_instructions(directory, agents_filenames)
         manager = cls(
-            loaded.content,
-            skill_manager or SkillManager.discover(directory),
+            project_instructions=loaded.content,
+            skill_manager=skill_manager or SkillManager.discover(directory),
             max_bytes=max_bytes,
             working_directory=directory,
             agents_filenames=agents_filenames,
@@ -191,6 +198,24 @@ class InstructionsManager:
             int: Maximum encoded instruction size in bytes.
         """
         return self._max_bytes
+
+    def set_runtime_environment(self, environment: RuntimeEnvironment | None) -> None:
+        """Replace application-owned runtime context atomically.
+
+        Args:
+            environment (RuntimeEnvironment | None): Runtime paths and capabilities to announce,
+                or ``None``.
+
+        Raises:
+            ValueError: If the resulting instruction document exceeds the configured limit.
+        """
+        candidate = self._compose(self._project_instructions, self._skill_manager, environment)
+        if self._encoded_size(candidate) > self._max_bytes:
+            raise ValueError("Runtime environment exceeds the configured instruction limit.")
+        if self._runtime_environment != environment:
+            self._runtime_environment = environment
+            self._instructions = candidate
+            self._generation += 1
 
     def list_skills(self) -> ManagedSkillListResult:
         """Return available skills and activation diagnostics.
@@ -273,6 +298,10 @@ class InstructionsManager:
         with self._lock:
             if self._working_directory != target:
                 self._working_directory = target
+                if self._runtime_environment is not None:
+                    self._runtime_environment = replace(
+                        self._runtime_environment, working_directory=target
+                    )
                 self._dirty = True
 
     def invalidate(self, path: Path | str | None = None) -> None:
@@ -438,14 +467,16 @@ class InstructionsManager:
         diagnostics = self._load_diagnostics(loaded)
 
         for skill in skill_manager.activated_skills:
-            instructions = self._compose(project_instructions, skill_manager)
+            instructions = self._compose(
+                project_instructions, skill_manager, self._runtime_environment
+            )
             if self._encoded_size(instructions) > self._max_bytes:
                 skill_manager.deactivate(skill.name)
                 diagnostics.append(
                     f"Deactivated '{skill.name}' during refresh: instruction budget exceeded."
                 )
 
-        instructions = self._compose(project_instructions, skill_manager)
+        instructions = self._compose(project_instructions, skill_manager, self._runtime_environment)
         if self._encoded_size(instructions) > self._max_bytes:
             raise ValueError("Refreshed base instructions exceed the configured instruction limit.")
 
@@ -472,7 +503,7 @@ class InstructionsManager:
         previous_instructions: str | None,
     ) -> bool:
         """Install refreshed project content while preserving an injected skill manager."""
-        instructions = self._compose(loaded.content, self._skill_manager)
+        instructions = self._compose(loaded.content, self._skill_manager, self._runtime_environment)
         if self._encoded_size(instructions) > self._max_bytes:
             raise ValueError("Refreshed base instructions exceed the configured instruction limit.")
         changed = previous_target != str(working_directory) or previous_instructions != instructions
@@ -489,7 +520,9 @@ class InstructionsManager:
 
     def _build_instructions(self) -> str | None:
         """Render the current instruction sources."""
-        return self._compose(self._project_instructions, self._skill_manager)
+        return self._compose(
+            self._project_instructions, self._skill_manager, self._runtime_environment
+        )
 
     def _commit_activation(self, result: SkillActivationResult) -> SkillActivationResponse:
         """Commit an activated skill to the aggregate instruction snapshot or roll it back."""
@@ -518,6 +551,14 @@ class InstructionsManager:
         ]
         if self._project_instructions and not sections:
             sections.append(InstructionSection("agents", self._project_instructions, "injected"))
+        if self._runtime_environment is not None:
+            sections.append(
+                InstructionSection(
+                    "runtime_environment",
+                    self._runtime_environment.render(),
+                    "runtime",
+                )
+            )
         catalog = self._skill_manager.catalog()
         if catalog:
             sections.append(InstructionSection("skill_catalog", catalog, "skill_discovery"))
@@ -528,7 +569,12 @@ class InstructionsManager:
         return tuple(sections)
 
     @classmethod
-    def _compose(cls, project_instructions: str | None, skill_manager: SkillManager) -> str | None:
+    def _compose(
+        cls,
+        project_instructions: str | None,
+        skill_manager: SkillManager,
+        runtime_environment: RuntimeEnvironment | None = None,
+    ) -> str | None:
         """Render an instruction document from candidate sources."""
         entries = []
         for skill, instructions in skill_manager.activated_instructions:
@@ -536,7 +582,12 @@ class InstructionsManager:
         active = (
             "<active_skills>\n" + "\n".join(entries) + "\n</active_skills>" if entries else None
         )
-        return build_instructions(project_instructions, skill_manager.catalog(), active)
+        return build_instructions(
+            project_instructions,
+            runtime_environment.render() if runtime_environment is not None else None,
+            skill_manager.catalog(),
+            active,
+        )
 
     def _discovery_signature(self, working_directory: Path | None) -> tuple:
         """Return cheap metadata identifying discoverable instruction sources."""

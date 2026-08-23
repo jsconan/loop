@@ -41,6 +41,33 @@ class InstructionSection:
 
 
 @dataclass(frozen=True)
+class RuntimeEnvironment:
+    """Describe runtime paths available to the model.
+
+    Args:
+        working_directory (Path): Directory used as the current workspace.
+        temporary_directory (Path): Explicitly permitted ephemeral directory for scratch files.
+    """
+
+    working_directory: Path
+    temporary_directory: Path
+
+    def render(self) -> str:
+        """Render the model-facing runtime environment section.
+
+        Returns:
+            str: XML-like runtime environment guidance with the current paths.
+        """
+        return (
+            "<runtime_environment>\n"
+            f"working_directory: {self.working_directory}\n"
+            f"temporary_directory: {self.temporary_directory}\n"
+            "Use temporary_directory only for scratch files; its contents are ephemeral.\n"
+            "</runtime_environment>"
+        )
+
+
+@dataclass(frozen=True)
 class Skill:
     """Describe an Agent Skill without eagerly loading its instructions.
 

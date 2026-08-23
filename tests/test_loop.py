@@ -89,7 +89,8 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.stream is False
     assert loop.interaction is interaction
     assert loop.working_directory == tmp_path.resolve()
-    assert loop.instructions is None
+    assert loop.instructions is not None
+    assert str(loop.permission_manager.temporary_directory) in loop.instructions
     assert loop.instructions_manager is not None
     assert loop.permission_manager.configuration_path == tmp_path / ".loop" / "permissions.yaml"
     assert loop.tool_registry.names == []
@@ -143,7 +144,8 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
     interaction.prompt.return_value = False
     skill = Skill("review", "Review code.", tmp_path / "skills" / "review" / "SKILL.md")
     instructions = InstructionsManager(
-        skill_manager=SkillManager([skill]), working_directory=tmp_path
+        skill_manager=SkillManager([skill]),
+        working_directory=tmp_path,
     )
     store = SQLiteSessionStore(tmp_path / "sessions.db")
     store.save(Session(id="older-session", name="Alpha session", name_source="user"))
@@ -623,7 +625,8 @@ def test_loop_passes_custom_instruction_fallbacks_to_discovery(tmp_path):
         agents_filenames=("AGENTS.md", "CUSTOM.md"),
     )
 
-    assert loop.instructions == "custom instructions"
+    assert loop.instructions is not None
+    assert loop.instructions.startswith("custom instructions\n")
 
 
 def test_loop_uses_an_injected_permission_manager(tmp_path):
@@ -659,7 +662,7 @@ def test_loops_share_local_conversation_context(tmp_path):
     assert response.metrics.duration_seconds >= 0
     second_backend.get_response.assert_called_once_with(
         input=session.messages,
-        instructions=None,
+        instructions=second.instructions,
         stream=True,
         model="served-model",
         tools=[],
@@ -794,7 +797,8 @@ def test_loop_loads_project_instructions_for_its_normalized_working_directory(tm
 
     loop = Loop(backend=loop_backend(), working_directory=str(tmp_path))
 
-    assert loop.instructions == "project rules"
+    assert loop.instructions is not None
+    assert loop.instructions.startswith("project rules\n")
 
 
 def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
@@ -817,7 +821,9 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     loop.agent_runner.query()
 
     assert loop.working_directory == second.resolve()
-    assert backend.get_response.call_args.kwargs["instructions"] == "Second rules."
+    instructions = backend.get_response.call_args.kwargs["instructions"]
+    assert instructions.startswith("Second rules.\n")
+    assert f"working_directory: {second.resolve()}" in instructions
 
 
 def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
@@ -926,7 +932,9 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
     assert session.compactions[0].instructions.working_directory == str(tmp_path)
     assert session.tokens == 20
     assert session.context_window == 100
-    backend.compact.assert_called_once_with(messages, instructions=None, model="default-model")
+    backend.compact.assert_called_once_with(
+        messages, instructions=loop.instructions, model="default-model"
+    )
     assert backend.get_response.call_args.kwargs["input"] == [compacted]
     assert [call.args[0] for call in interaction.info.call_args_list] == [
         "Compacting session context...",
