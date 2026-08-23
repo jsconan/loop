@@ -30,6 +30,7 @@ class ModelCommands:
             tuple[CommandRegistration, ...]: Model discovery and selection commands.
         """
         return (
+            CommandRegistration(self.backend, name="backend"),
             CommandRegistration(self.models, name="models"),
             CommandRegistration(
                 self.model,
@@ -37,6 +38,25 @@ class ModelCommands:
                 completion=CommandCompletion(provider="models"),
             ),
         )
+
+    def backend(self, context: CommandContext) -> None:
+        """Check backend reachability and the effective model's availability."""
+        try:
+            models = self._available()
+        except CommandArgumentError as error:
+            context.interaction.error(f"Backend is unavailable: {error}")
+            return
+        try:
+            model = self._model_selection.effective
+        except ValueError:
+            context.interaction.warning("Backend is available, but no model is selected.")
+            self._model_selection.select_fallback(context.interaction)
+            return
+        if model in {available_model.id for available_model in models}:
+            context.interaction.info(f"Backend is available. Model '{model}' is available.")
+            return
+        context.interaction.warning(f"Backend is available, but model '{model}' is not available.")
+        self._model_selection.select_fallback(context.interaction)
 
     def models(self, context: CommandContext) -> None:
         """List all models available from the backend."""
