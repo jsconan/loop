@@ -80,3 +80,14 @@ def test_is_path_ignored_does_not_load_rules_below_an_ignored_parent(tmp_path):
     secret.touch()
 
     assert is_path_ignored(secret, root=tmp_path)
+
+
+def test_is_path_ignored_always_excludes_the_application_directory(tmp_path):
+    """The application directory is ignored by name, unlike ordinary directories."""
+    app_directory = tmp_path / ".loop"
+    app_directory.mkdir()
+    ordinary = tmp_path / "data"
+    ordinary.mkdir()
+
+    assert is_path_ignored(app_directory)
+    assert not is_path_ignored(ordinary)

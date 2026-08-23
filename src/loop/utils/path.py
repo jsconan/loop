@@ -82,7 +82,10 @@ def _ignore_decision(path: Path, is_directory: bool, rules: list[IgnoreRule]) ->
 
 def _is_ignored(path: Path, is_directory: bool, rules: IgnoreRules) -> bool:
     """Evaluate a path against already-loaded Git and agent ignore rules."""
-    if is_directory and path.name == constants.GIT_DIRECTORY.name:
+    if is_directory and path.name in {
+        constants.GIT_DIRECTORY.name,
+        constants.APP_DIRECTORY.name,
+    }:
         return True
 
     agent_decision = _ignore_decision(path, is_directory, rules[constants.AGENT_IGNORE_FILENAME])
