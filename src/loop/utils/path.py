@@ -9,6 +9,21 @@ from .. import constants
 from .models import IgnoreRule, IgnoreRules
 
 
+def canonical_path(path: Path | str) -> str:
+    """Return an absolute normalized path without requiring it to exist.
+
+    Args:
+        path (Path | str): Filesystem path to normalize.
+
+    Returns:
+        str: Absolute canonical representation.
+    """
+    candidate = Path(path)
+    if candidate.exists() or candidate.is_symlink():
+        return str(candidate.resolve())
+    return str(candidate.parent.resolve() / candidate.name)
+
+
 def find_project_root(working_directory: Path | str) -> Path | None:
     """Return the closest Git project root containing the working directory.
 

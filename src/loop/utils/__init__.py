@@ -11,6 +11,7 @@ __all__ = [
     "cached_path",
     "callable_hints",
     "callable_name",
+    "canonical_path",
     "decode_content_cursor",
     "encode_content_cursor",
     "find_project_root",
@@ -42,7 +43,7 @@ from .content import (
 )
 from .hashing import sha256_digest
 from .models import BoundedTextContent, CachedContentMetadata, IgnoreRule, IgnoreRules
-from .path import find_project_root, is_path_ignored, iter_visible_paths
+from .path import canonical_path, find_project_root, is_path_ignored, iter_visible_paths
 from .signals import ShutdownRequested, register_shutdown_signals
 from .text import (
     format_content_diff,

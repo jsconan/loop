@@ -1,6 +1,15 @@
 """Tests for path discovery helpers."""
 
-from loop.utils import find_project_root, is_path_ignored
+from loop.utils import canonical_path, find_project_root, is_path_ignored
+
+
+def test_canonical_path_handles_existing_and_missing_targets(tmp_path):
+    """Canonical paths resolve existing targets and missing target parents."""
+    existing = tmp_path / "existing.txt"
+    existing.write_text("content", "utf-8")
+
+    assert canonical_path(existing) == str(existing)
+    assert canonical_path(tmp_path / "missing.txt") == str(tmp_path / "missing.txt")
 
 
 def test_find_project_root_returns_none_outside_a_git_project(tmp_path):
