@@ -13,6 +13,7 @@ from loop import (
     ProcessTarget,
     SessionTarget,
 )
+from loop.permissions import PermissionPreset
 
 
 def test_actions_map_to_distinct_prompt_icons():
@@ -75,3 +76,62 @@ def test_policy_configuration_has_a_versioned_complete_default():
     assert configuration.version == 1
     assert set(configuration.defaults) == set(Action)
     assert configuration.defaults[Action.FILESYSTEM_READ] is Decision.ALLOW
+
+
+def test_permission_presets_reject_duplicate_rule_identifiers():
+    """A preset rule set cannot contain ambiguous rule identifiers."""
+    with pytest.raises(ValueError, match="rule identifiers must be unique"):
+        PermissionPreset.model_validate(
+            {
+                "metadata": {
+                    "id": "duplicate-rules",
+                    "revision": "1",
+                    "title": "Duplicate rules",
+                    "description": "Invalid preset.",
+                },
+                "defaults": {action.value: Decision.DENY.value for action in Action},
+                "rules": [
+                    {"id": "same", "decision": "allow"},
+                    {"id": "same", "decision": "deny"},
+                ],
+            }
+        )
+
+
+def test_builtin_permission_presets_are_sorted_and_have_stable_hashes():
+    """Packaged presets load in catalog order and expose deterministic content hashes."""
+    presets = PermissionPreset.builtin_presets()
+
+    assert [preset.metadata.id for preset in presets] == [
+        "locked",
+        "observe",
+        "supervised",
+        "workspace",
+    ]
+    assert all(preset.content_hash.startswith("sha256:") for preset in presets)
+    assert presets[0].content_hash == presets[0].model_copy(deep=True).content_hash
+
+
+def test_builtin_permission_presets_reject_duplicate_packaged_ids(monkeypatch, tmp_path):
+    """The packaged catalog rejects two artifacts claiming the same identifier."""
+    defaults = "\n".join(f"  {action.value}: deny" for action in Action)
+    payload = (
+        "version: 1\nkind: loop.permission-preset\nmetadata:\n"
+        "  id: duplicate\n  revision: '1'\n  title: Duplicate\n"
+        "  description: Invalid\ndefaults:\n"
+        f"{defaults}\nrules: []\n"
+    )
+    (tmp_path / "one.yaml").write_text(payload)
+    (tmp_path / "two.yaml").write_text(payload)
+
+    class ResourcePackage:
+        """Expose the temporary preset directory as an importlib resource."""
+
+        def joinpath(self, name):
+            """Return the requested temporary resource directory."""
+            assert name == "presets"
+            return tmp_path
+
+    monkeypatch.setattr("loop.permissions.models.files", lambda package: ResourcePackage())
+    with pytest.raises(ValueError, match="Built-in permission preset identifiers"):
+        PermissionPreset.builtin_presets()

@@ -7,6 +7,7 @@ import ipaddress
 import json
 import shlex
 import tempfile
+from collections.abc import Iterable
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,7 +16,7 @@ from urllib.parse import urlsplit
 import yaml
 
 from .. import constants
-from ..utils import canonical_path
+from ..utils import canonical_path, sha256_digest
 from .models import (
     Action,
     AuthorizationResult,
@@ -24,12 +25,15 @@ from .models import (
     NetworkTarget,
     Operation,
     PermissionConfiguration,
+    PermissionPreset,
     PermissionRecorder,
     PermissionRule,
     PolicyDecision,
     PolicyLimitOverrides,
     PolicyLimits,
     PolicyScope,
+    PresetReplacementPreview,
+    PresetSource,
     ProcessBoundary,
     ProcessTarget,
     SessionPolicyOverrides,
@@ -64,6 +68,8 @@ class PermissionManager:
         interaction (Interaction | None): User interaction used for approval prompts.
         recorder (PermissionRecorder | None): Default sink for authorization observations.
         configuration (PermissionConfiguration | None): Explicit policy instead of the local file.
+        presets (Iterable[PermissionPreset] | None): Additional selectable presets alongside
+            the built-in catalog. Duplicate identifiers are rejected.
 
     Raises:
         OSError: If an existing configuration cannot be read.
@@ -79,6 +85,7 @@ class PermissionManager:
     _session_overrides: SessionPolicyOverrides
     _temporary_directory: tempfile.TemporaryDirectory[str]
     _temporary_path: Path
+    _presets: dict[str, PermissionPreset]
 
     def __init__(
         self,
@@ -88,6 +95,7 @@ class PermissionManager:
         interaction: Interaction | None = None,
         recorder: PermissionRecorder | None = None,
         configuration: PermissionConfiguration | None = None,
+        presets: Iterable[PermissionPreset] | None = None,
     ) -> None:
         self._working_directory = (
             Path(working_directory).resolve() if working_directory is not None else None
@@ -107,6 +115,11 @@ class PermissionManager:
         self._recorder = recorder
         self._configuration = configuration or self._load()
         self._session_overrides = SessionPolicyOverrides()
+        catalog = (*PermissionPreset.builtin_presets(), *(presets or ()))
+        identifiers = [preset.metadata.id for preset in catalog]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Permission preset identifiers must be unique.")
+        self._presets = {preset.metadata.id: preset for preset in catalog}
 
     @property
     def configuration(self) -> PermissionConfiguration:
@@ -401,6 +414,93 @@ class PermissionManager:
         """
         return tuple(rule.model_copy(deep=True) for rule in self._session_overrides.rules)
 
+    @property
+    def presets(self) -> tuple[PermissionPreset, ...]:
+        """Return selectable permission presets ordered by stable identifier.
+
+        Returns:
+            tuple[PermissionPreset, ...]: Deep-copied preset catalog entries.
+        """
+        return tuple(
+            self._presets[identifier].model_copy(deep=True) for identifier in sorted(self._presets)
+        )
+
+    def preset(self, preset_id: str) -> PermissionPreset:
+        """Return one named permission preset artifact.
+
+        Args:
+            preset_id (str): Stable preset catalog identifier.
+
+        Returns:
+            PermissionPreset: Deep copy of the selected artifact.
+
+        Raises:
+            ValueError: If no configured preset uses this identifier.
+        """
+        try:
+            return self._presets[preset_id].model_copy(deep=True)
+        except KeyError as exc:
+            raise ValueError(f"Unknown permission preset '{preset_id}'.") from exc
+
+    def preview_preset_replacement(
+        self,
+        preset_id: str,
+        *,
+        scope: PolicyScope,
+    ) -> PresetReplacementPreview:
+        """Describe replacement of one scoped defaults-and-rules layer without mutating it.
+
+        Limits and the non-selected policy layer are deliberately absent from this operation. The
+        returned preview carries a revision that rejects stale replacements.
+
+        Args:
+            preset_id (str): Stable identifier of the selected preset.
+            scope (PolicyScope): Workspace persistence or process-local replacement target.
+
+        Returns:
+            PresetReplacementPreview: Exact default and rule replacement plus a scope revision.
+        """
+        preset = self.preset(preset_id)
+        return PresetReplacementPreview(
+            preset=preset,
+            scope=scope,
+            removed_defaults=self._defaults_for_scope(scope),
+            installed_defaults=dict(preset.defaults),
+            removed_rules=self._rules_for_scope(scope),
+            installed_rules=self._rules_from_preset(preset, scope),
+            scope_revision=self._scope_revision(scope),
+        )
+
+    def replace_preset(self, preview: PresetReplacementPreview) -> None:
+        """Atomically replace the defaults and rules described by a current preview.
+
+        Args:
+            preview (PresetReplacementPreview): Previously reviewed scoped replacement.
+
+        Raises:
+            ValueError: If the preview is stale or installs an identifier active in another layer.
+        """
+        if preview.scope_revision != self._scope_revision(preview.scope):
+            raise ValueError("Permission preset preview is stale; generate a new preview.")
+        replacement = list(preview.installed_rules)
+        other_scope = (
+            PolicyScope.SESSION if preview.scope is PolicyScope.WORKSPACE else PolicyScope.WORKSPACE
+        )
+        other_identifiers = {rule.id for rule in self._rules_for_scope(other_scope)}
+        collision = next((rule.id for rule in replacement if rule.id in other_identifiers), None)
+        if collision is not None:
+            raise ValueError(
+                f"Permission rule '{collision}' already exists in {other_scope.value}."
+            )
+        if preview.scope is PolicyScope.WORKSPACE:
+            updated = self._configuration.model_copy(
+                update={"defaults": preview.installed_defaults, "rules": replacement}, deep=True
+            )
+            self._replace_configuration(updated)
+        else:
+            self._session_overrides.defaults = dict(preview.installed_defaults)
+            self._session_overrides.rules = replacement
+
     def set_limit(
         self,
         name: str,
@@ -592,6 +692,59 @@ class PermissionManager:
         self._persist(configuration)
         self._configuration = configuration
 
+    def _rules_for_scope(self, scope: PolicyScope) -> tuple[PermissionRule, ...]:
+        """Return deep-copied rules from one exact policy layer."""
+        rules = (
+            self._configuration.rules
+            if scope is PolicyScope.WORKSPACE
+            else self._session_overrides.rules
+        )
+        return tuple(rule.model_copy(deep=True) for rule in rules)
+
+    def _defaults_for_scope(self, scope: PolicyScope) -> dict[Action, Decision]:
+        """Return a deep-copied default map from one exact policy layer."""
+        defaults = (
+            self._configuration.defaults
+            if scope is PolicyScope.WORKSPACE
+            else self._session_overrides.defaults
+        )
+        return dict(defaults)
+
+    @staticmethod
+    def _rules_from_preset(
+        preset: PermissionPreset,
+        scope: PolicyScope,
+    ) -> tuple[PermissionRule, ...]:
+        """Materialize one artifact into collision-resistant, provenance-bearing policy rules."""
+        metadata = preset.metadata
+        return tuple(
+            PermissionRule(
+                id=(f"preset:{scope.value}:{metadata.id}:{metadata.revision}:{rule.id}"),
+                decision=rule.decision,
+                description=rule.description,
+                tool=rule.tool,
+                action=rule.action,
+                resource=rule.resource,
+                source=PresetSource(
+                    preset_id=metadata.id,
+                    revision=metadata.revision,
+                    content_hash=preset.content_hash,
+                    rule_id=rule.id,
+                ),
+            )
+            for rule in preset.rules
+        )
+
+    def _scope_revision(self, scope: PolicyScope) -> str:
+        """Return a semantic revision of the exact layer a replacement would overwrite."""
+        payload = (
+            self._configuration.model_dump(mode="json")
+            if scope is PolicyScope.WORKSPACE
+            else self._session_overrides.model_dump(mode="json")
+        )
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return f"sha256:{sha256_digest(encoded)}"
+
     def describe(self, view: str = "all") -> str:
         """Return a user-facing summary of selected policy layers.
 
@@ -702,10 +855,16 @@ class PermissionManager:
     @staticmethod
     def _describe_rule(rule: PermissionRule) -> str:
         description = f" — {rule.description}" if rule.description else ""
+        source = (
+            f" [preset={rule.source.preset_id}@{rule.source.revision} "
+            f"hash={rule.source.content_hash}]"
+            if rule.source is not None
+            else ""
+        )
         return (
             f"{rule.id} {rule.decision.value} tool={rule.tool} "
             f"action={rule.action.value if rule.action else '*'} "
-            f"resource={rule.resource or '*'}{description}"
+            f"resource={rule.resource or '*'}{description}{source}"
         )
 
     def _load(self) -> PermissionConfiguration:
@@ -872,7 +1031,9 @@ class PermissionManager:
             addresses = addresses or (str(ipaddress.ip_address(hostname)),)
         except ValueError:
             return False
-        return not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses)
+        return not addresses or any(
+            not ipaddress.ip_address(address).is_global for address in addresses
+        )
 
     def _prompt(self, operations: tuple[Operation, ...]) -> str:
         lines = ["Agent requests approval for the following operations:"]

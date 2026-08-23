@@ -13,6 +13,7 @@ from loop import (
     Decision,
     Interaction,
     PermissionManager,
+    PermissionPreset,
     PermissionRule,
     PolicyScope,
 )
@@ -124,9 +125,93 @@ def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
     manager.call("permissions", "session reset")
     manager.call("permissions", "session reset")
     assert "already empty" in interaction.warning.call_args.args[0]
-    assert permissions.session_overrides.defaults == {}
-    assert permissions.session_rules == ()
+    assert not permissions.session_overrides.defaults
+    assert not permissions.session_rules
     assert permissions.effective_configuration == permissions.configuration
+
+
+def test_permissions_preset_commands_preview_and_confirm_scoped_policy_replacement(tmp_path):
+    """Preset commands replace confirmed selected-scope defaults and rules only."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path)
+    permissions.add_rule(PermissionRule(id="workspace-rule", decision=Decision.DENY))
+    permissions.add_rule(
+        PermissionRule(id="session-rule", decision=Decision.DENY),
+        scope=PolicyScope.SESSION,
+    )
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "preset list")
+    assert "workspace@1" in interaction.info.call_args.args[0]
+    manager.call("permissions", "preset show workspace")
+    assert "Permission preset: workspace@1" in interaction.info.call_args.args[0]
+    assert "filesystem.create: allow" in interaction.info.call_args.args[0]
+    manager.call("permissions", "preset diff workspace workspace")
+    assert "Unchanged: enforcement limits" in interaction.info.call_args.args[0]
+
+    interaction.confirm.return_value = False
+    manager.call("permissions", "preset replace workspace workspace")
+    assert [rule.id for rule in permissions.persistent_rules] == ["workspace-rule"]
+    assert "not approved" in interaction.warning.call_args.args[0]
+
+    interaction.confirm.return_value = True
+    manager.call("permissions", "preset replace workspace workspace")
+    assert permissions.persistent_rules == ()
+    assert permissions.configuration.defaults[Action.FILESYSTEM_CREATE] is Decision.ALLOW
+    assert [rule.id for rule in permissions.session_rules] == ["session-rule"]
+    prompt = interaction.confirm.call_args.args[0]
+    assert "defaults and rules" in prompt
+    assert "Non-overridable boundaries" in prompt
+
+
+def test_permissions_preset_list_reports_an_empty_catalog(monkeypatch, tmp_path):
+    """The preset list command explains when no selectable artifacts are available."""
+    monkeypatch.setattr(PermissionPreset, "builtin_presets", classmethod(lambda cls: ()))
+    interaction = Mock(spec=Interaction)
+    manager = command_manager(PermissionManager(tmp_path), interaction)
+
+    manager.call("permissions", "preset list")
+
+    interaction.info.assert_called_once_with("Permission presets: none")
+
+
+def test_permissions_preset_diff_describes_empty_replacements_and_replace_reports_success(tmp_path):
+    """Preset diff labels empty layers and confirmed replacement reports completion."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path)
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "preset diff session locked")
+    diff = interaction.info.call_args.args[0]
+    assert "Replaced defaults:" in diff
+    assert "Removed rules: none" in diff
+    assert "Installed rules: none" in diff
+
+    interaction.confirm.return_value = True
+    manager.call("permissions", "preset replace session locked")
+    assert "Replaced session defaults and rules" in interaction.info.call_args.args[0]
+
+
+def test_permissions_preset_diff_renders_installed_rules(tmp_path):
+    """Preset diffs include the rendered rule list when an artifact installs rules."""
+    preset = PermissionPreset.model_validate(
+        {
+            "metadata": {
+                "id": "rules",
+                "revision": "1",
+                "title": "Rules",
+                "description": "Rule-bearing preset.",
+            },
+            "defaults": {action.value: "deny" for action in Action},
+            "rules": [{"id": "allow-read", "decision": "allow"}],
+        }
+    )
+    interaction = Mock(spec=Interaction)
+    manager = command_manager(PermissionManager(tmp_path, presets=(preset,)), interaction)
+
+    manager.call("permissions", "preset diff workspace rules")
+
+    assert "preset:workspace:rules:1:allow-read allow" in interaction.info.call_args.args[0]
 
 
 def test_permissions_command_rejects_every_malformed_branch(tmp_path):
@@ -150,6 +235,9 @@ def test_permissions_command_rejects_every_malformed_branch(tmp_path):
         "limit set workspace read-root allow",
         "limit reset workspace invalid",
         "limit set invalid host-process allow",
+        "preset unknown",
+        "preset show missing extra",
+        "preset diff invalid workspace",
     )
     for arguments in invalid:
         manager.call("permissions", arguments)
@@ -193,6 +281,7 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
         "default",
         "rule",
         "limit",
+        "preset",
         "session",
         "help",
     }
@@ -218,6 +307,10 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
     limits = complete(completer, "/permissions limit set session host-process ")
     assert [item.text for item in limits] == ["allow", "deny"]
     assert all(item.display_meta_text for item in limits)
+    presets = complete(completer, "/permissions preset ")
+    assert {item.text for item in presets} == {"list", "show", "diff", "replace"}
+    presets = complete(completer, "/permissions preset replace session w")
+    assert [item.text for item in presets] == ["workspace"]
     roots = complete(completer, "/permissions limit remove workspace read-root ")
     assert [item.text for item in roots] == ["loop-temp", "workspace"]
     root_tokens = complete(completer, "/permissions limit add workspace read-root ")

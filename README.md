@@ -371,6 +371,9 @@ prompt. Use `/permissions` to display the active policy:
 /permissions limit reset session host-process
 /permissions session reset
 /permissions explain run_command process.execute "git status"
+/permissions preset list
+/permissions preset diff workspace observe
+/permissions preset replace session workspace
 ```
 
 The versioned YAML document is the complete policy; there is no closed set of compiled permission
@@ -382,6 +385,15 @@ limits, all active rules, and precedence. Every default, rule, and limit change 
 `workspace` or `session` scope. `/permissions reload` validates external YAML edits before replacing
 the workspace layer while preserving session overrides; `/permissions explain` reports the
 determining source for one concrete operation.
+
+Permission presets are versioned YAML artifacts rather than compiled Python modes. The built-in
+`observe`, `supervised`, `workspace`, and `locked` presets define a complete fallback decision for
+every action and may include rules. Use `/permissions preset list` and `show` to inspect them,
+`diff` to preview one replacement, and `replace` to replace only the selected scope's defaults and
+rules after confirmation. Presets never change filesystem, network, or process enforcement limits,
+nor the other policy layer. The replacement prompt lists the replaced and installed defaults and
+rules, and warns that the change may relax or tighten policy. Installed rules retain the preset
+identifier, revision, and content hash for policy diagnostics.
 
 Actions are `filesystem.list`, `filesystem.read`, `filesystem.create`, `filesystem.replace`,
 `filesystem.delete`, `network.request`, `process.execute`, and `session.mutate`. Filesystem roots,

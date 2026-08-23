@@ -1,0 +1,17 @@
+version: 1
+kind: loop.permission-preset
+metadata:
+  id: workspace
+  revision: "1"
+  title: Workspace
+  description: Allow scoped local reads, creates, and replacements; require approval for deletion, network, execution, and session changes.
+defaults:
+  filesystem.list: allow
+  filesystem.read: allow
+  filesystem.create: allow
+  filesystem.replace: allow
+  filesystem.delete: ask
+  network.request: ask
+  process.execute: ask
+  session.mutate: ask
+rules: []

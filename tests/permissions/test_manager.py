@@ -17,6 +17,7 @@ from loop import (
     Operation,
     PermissionConfiguration,
     PermissionManager,
+    PermissionPreset,
     PermissionRule,
     PolicyLimits,
     PolicyScope,
@@ -383,6 +384,169 @@ def test_policy_mutations_persist_defaults_and_rule_lifetimes(tmp_path):
     assert manager.remove_rule("missing", scope=PolicyScope.SESSION) is False
     assert manager.remove_rule("persisted") is True
     assert manager.remove_rule("missing") is False
+
+
+def test_preset_replacement_changes_the_selected_defaults_and_rule_layer(tmp_path):
+    """A preset replaces selected-scope defaults and rules while preserving limits and overlays."""
+    manager = PermissionManager(tmp_path)
+    manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
+    manager.set_limit("allow_host_processes", True)
+    manager.add_rule(PermissionRule(id="old-workspace", decision=Decision.DENY))
+    manager.add_rule(
+        PermissionRule(
+            id="session-guard",
+            decision=Decision.DENY,
+            action=Action.PROCESS_EXECUTE,
+        ),
+        scope=PolicyScope.SESSION,
+    )
+
+    preview = manager.preview_preset_replacement(
+        "workspace",
+        scope=PolicyScope.WORKSPACE,
+    )
+    manager.replace_preset(preview)
+
+    assert [rule.id for rule in preview.removed_rules] == ["old-workspace"]
+    assert preview.removed_defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+    assert not manager.persistent_rules
+    assert manager.configuration.defaults[Action.FILESYSTEM_CREATE] is Decision.ALLOW
+    assert manager.configuration.defaults[Action.FILESYSTEM_REPLACE] is Decision.ALLOW
+    assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ASK
+    assert manager.configuration.limits.allow_host_processes is True
+    assert [rule.id for rule in manager.session_rules] == ["session-guard"]
+    assert (
+        manager.explain("write_text_file", Action.FILESYSTEM_CREATE, str(tmp_path / "new")).decision
+        is Decision.ALLOW
+    )
+    assert not PermissionManager(tmp_path).session_rules
+
+
+def test_preset_replacement_rejects_a_stale_preview_and_supports_session_scope(tmp_path):
+    """Previews cannot overwrite later scoped changes and session profiles never persist."""
+    manager = PermissionManager(tmp_path)
+    preview = manager.preview_preset_replacement("locked", scope=PolicyScope.SESSION)
+    manager.set_default(Action.FILESYSTEM_CREATE, Decision.DENY, scope=PolicyScope.SESSION)
+
+    with pytest.raises(ValueError, match="stale"):
+        manager.replace_preset(preview)
+
+    replacement = manager.preview_preset_replacement("locked", scope=PolicyScope.SESSION)
+    manager.replace_preset(replacement)
+
+    assert set(manager.session_overrides.defaults.values()) == {Decision.DENY}
+    assert manager.configuration.defaults[Action.FILESYSTEM_READ] is Decision.ALLOW
+    assert not manager.session_rules
+    assert not PermissionManager(tmp_path).persistent_rules
+
+
+def test_preset_catalog_rejects_duplicate_custom_identifiers(tmp_path):
+    """A caller cannot shadow a built-in preset with the same catalog identifier."""
+    preset = PermissionPreset.model_validate(
+        {
+            "metadata": {
+                "id": "observe",
+                "revision": "custom",
+                "title": "Duplicate",
+                "description": "Duplicate identifier.",
+            },
+            "defaults": {action.value: "deny" for action in Action},
+            "rules": [],
+        }
+    )
+
+    with pytest.raises(ValueError, match="identifiers must be unique"):
+        PermissionManager(tmp_path, presets=(preset,))
+
+
+def test_preset_catalog_returns_copies_and_rejects_unknown_ids(tmp_path):
+    """Preset lookup exposes isolated artifacts and reports missing catalog entries."""
+    manager = PermissionManager(tmp_path)
+    presets = manager.presets
+
+    assert [preset.metadata.id for preset in presets] == sorted(
+        preset.metadata.id for preset in presets
+    )
+    assert presets[0] is not manager.presets[0]
+    assert manager.preset("workspace") == next(
+        preset for preset in presets if preset.metadata.id == "workspace"
+    )
+    with pytest.raises(ValueError, match="Unknown permission preset 'missing'"):
+        manager.preset("missing")
+
+
+def test_preset_replacement_rejects_rule_id_collisions_with_other_scope(tmp_path):
+    """A replacement cannot activate a preset rule already used by the other scope."""
+    preset = PermissionPreset.model_validate(
+        {
+            "metadata": {
+                "id": "collision",
+                "revision": "1",
+                "title": "Collision",
+                "description": "Collision test.",
+            },
+            "defaults": {action.value: "deny" for action in Action},
+            "rules": [{"id": "shared", "decision": "allow"}],
+        }
+    )
+    manager = PermissionManager(tmp_path, presets=(preset,))
+    manager.add_rule(
+        PermissionRule(id="preset:workspace:collision:1:shared", decision=Decision.DENY),
+        scope=PolicyScope.SESSION,
+    )
+
+    with pytest.raises(ValueError, match="already exists in session"):
+        manager.replace_preset(
+            manager.preview_preset_replacement("collision", scope=PolicyScope.WORKSPACE)
+        )
+
+
+def test_preset_requires_a_default_for_every_authority_action():
+    """A preset cannot leave an action to the policy it is replacing."""
+    with pytest.raises(ValueError, match="every known action"):
+        PermissionPreset.model_validate(
+            {
+                "metadata": {
+                    "id": "incomplete",
+                    "revision": "1",
+                    "title": "Incomplete",
+                    "description": "Missing fallback decisions.",
+                },
+                "defaults": {Action.FILESYSTEM_READ.value: Decision.ALLOW.value},
+                "rules": [],
+            }
+        )
+
+
+def test_preset_rules_retain_the_selected_artifact_provenance(tmp_path):
+    """Rules supplied by a complete preset retain its immutable diagnostic identity."""
+    preset = PermissionPreset.model_validate(
+        {
+            "metadata": {
+                "id": "custom",
+                "revision": "1",
+                "title": "Custom",
+                "description": "Custom rule-bearing preset.",
+            },
+            "defaults": {action.value: "deny" for action in Action},
+            "rules": [
+                {
+                    "id": "allow-read",
+                    "decision": "allow",
+                    "action": "filesystem.read",
+                }
+            ],
+        }
+    )
+    manager = PermissionManager(tmp_path, presets=(preset,))
+
+    manager.replace_preset(
+        manager.preview_preset_replacement("custom", scope=PolicyScope.WORKSPACE)
+    )
+
+    installed = manager.persistent_rules[0]
+    assert installed.source and installed.source.preset_id == "custom"
+    assert "preset=custom@1" in manager.describe("workspace")
 
 
 def test_rule_identifiers_are_unique_across_workspace_and_session_layers(tmp_path):

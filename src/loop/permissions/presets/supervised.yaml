@@ -1,0 +1,17 @@
+version: 1
+kind: loop.permission-preset
+metadata:
+  id: supervised
+  revision: "1"
+  title: Supervised
+  description: Allow scoped local filesystem reads and require approval for mutations, network, execution, and session changes.
+defaults:
+  filesystem.list: allow
+  filesystem.read: allow
+  filesystem.create: ask
+  filesystem.replace: ask
+  filesystem.delete: ask
+  network.request: ask
+  process.execute: ask
+  session.mutate: ask
+rules: []

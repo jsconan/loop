@@ -1,0 +1,17 @@
+version: 1
+kind: loop.permission-preset
+metadata:
+  id: locked
+  revision: "1"
+  title: Locked
+  description: Deny every authority-requiring operation.
+defaults:
+  filesystem.list: deny
+  filesystem.read: deny
+  filesystem.create: deny
+  filesystem.replace: deny
+  filesystem.delete: deny
+  network.request: deny
+  process.execute: deny
+  session.mutate: deny
+rules: []

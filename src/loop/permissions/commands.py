@@ -5,7 +5,14 @@ from typing import Annotated
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration, CommandRemainder
 from ..completion import CommandCompletion, CompletionValue
 from .manager import PermissionManager
-from .models import Action, Decision, PermissionRule, PolicyScope
+from .models import (
+    Action,
+    Decision,
+    PermissionPreset,
+    PermissionRule,
+    PolicyScope,
+    PresetReplacementPreview,
+)
 
 _ACTION_DESCRIPTIONS = {
     Action.FILESYSTEM_LIST: "List entries under a filesystem path.",
@@ -124,7 +131,53 @@ class PermissionCommands:
         if arguments[:1] == ("limit",):
             self._change_limit(context, arguments[1:])
             return
+        if arguments[:1] == ("preset",):
+            self._change_preset(context, arguments[1:])
+            return
         raise ValueError("Invalid permission command arguments.")
+
+    def _change_preset(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
+        """List, inspect, preview, or explicitly replace one scoped policy preset."""
+        manager = self._permission_manager
+        if arguments == ("list",):
+            presets = manager.presets
+            if not presets:
+                context.interaction.info("Permission presets: none")
+                return
+            context.interaction.info(
+                "Permission presets:\n"
+                + "\n".join(
+                    f"  {preset.metadata.id}@{preset.metadata.revision} — "
+                    f"{preset.metadata.title}: {preset.metadata.description}"
+                    for preset in presets
+                )
+            )
+            return
+        if len(arguments) == 2 and arguments[0] == "show":
+            preset = manager.preset(arguments[1])
+            context.interaction.info(self._describe_preset(preset))
+            return
+        if len(arguments) == 3 and arguments[0] in {"diff", "replace"}:
+            operation, raw_scope, preset_id = arguments
+            preview = manager.preview_preset_replacement(
+                preset_id,
+                scope=PolicyScope(raw_scope),
+            )
+            if operation == "diff":
+                context.interaction.info(self._describe_replacement(preview))
+                return
+            prompt = self._replacement_prompt(preview)
+            if not context.interaction.confirm(prompt, default=False):
+                context.interaction.warning("Permission preset replacement was not approved.")
+                return
+            manager.replace_preset(preview)
+            metadata = preview.preset.metadata
+            context.interaction.info(
+                f"Replaced {preview.scope.value} defaults and rules with "
+                f"{metadata.id}@{metadata.revision}; enforcement limits were unchanged."
+            )
+            return
+        raise ValueError("Invalid permission preset arguments.")
 
     def _change_default(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
         manager = self._permission_manager
@@ -266,6 +319,29 @@ class PermissionCommands:
         )
         default = self._default_completion(actions, decisions, scopes)
         limit = self._limit_completion(scopes)
+        presets = CommandCompletion(provider=self._preset_values)
+        preset = CommandCompletion(
+            values=(
+                CompletionValue("list", "List complete policy presets."),
+                CompletionValue("show", "Show one preset without changing policy."),
+                CompletionValue("diff", "Preview scoped defaults and rule replacement."),
+                CompletionValue(
+                    "replace",
+                    "Replace only selected scoped rules after explicit confirmation.",
+                ),
+            ),
+            children={
+                "show": presets,
+                "diff": CommandCompletion(
+                    values=scopes,
+                    children={scope.value: presets for scope in PolicyScope},
+                ),
+                "replace": CommandCompletion(
+                    values=scopes,
+                    children={scope.value: presets for scope in PolicyScope},
+                ),
+            },
+        )
         explain_resources = {
             action.value: CommandCompletion(values=(self._example_resource(action),))
             for action in Action
@@ -283,6 +359,9 @@ class PermissionCommands:
                 CompletionValue("default", "Manage scoped fallback decisions by action."),
                 CompletionValue("rule", "Manage workspace and session rules."),
                 CompletionValue("limit", "Manage scoped roots, network, and process limits."),
+                CompletionValue(
+                    "preset", "Inspect or explicitly replace scoped policy defaults and rules."
+                ),
                 CompletionValue("help", "Explain policy concepts and common commands."),
             ),
             children={
@@ -299,6 +378,7 @@ class PermissionCommands:
                 "default": default,
                 "rule": rule,
                 "limit": limit,
+                "preset": preset,
             },
         )
 
@@ -417,6 +497,16 @@ class PermissionCommands:
     def _session_rule_values(self) -> tuple[CompletionValue, ...]:
         return tuple(self._rule_value(rule) for rule in self._permission_manager.session_rules)
 
+    def _preset_values(self) -> tuple[CompletionValue, ...]:
+        """Return completion values for the immutable preset catalog."""
+        return tuple(
+            CompletionValue(
+                preset.metadata.id,
+                f"{preset.metadata.title} (revision {preset.metadata.revision})",
+            )
+            for preset in self._permission_manager.presets
+        )
+
     def _limit_values(self, scope: PolicyScope, name: str) -> tuple[CompletionValue, ...]:
         configuration = (
             self._permission_manager.configuration
@@ -473,10 +563,83 @@ class PermissionCommands:
         )
 
     @staticmethod
+    def _describe_preset(preset: PermissionPreset) -> str:
+        """Render one complete policy preset without implying it is active."""
+        metadata = preset.metadata
+        lines = [
+            f"Permission preset: {metadata.id}@{metadata.revision}",
+            f"Title: {metadata.title}",
+            f"Description: {metadata.description}",
+            "Defaults:",
+            *(f"  {action.value}: {preset.defaults[action].value}" for action in Action),
+            "Rules:",
+        ]
+        lines.extend(
+            f"  {rule.id} {rule.decision.value} tool={rule.tool} "
+            f"action={rule.action.value if rule.action else '*'} "
+            f"resource={rule.resource or '*'}"
+            for rule in preset.rules
+        )
+        return "\n".join(lines)
+
+    @classmethod
+    def _describe_replacement(cls, preview: PresetReplacementPreview) -> str:
+        """Render a non-mutating scoped replacement preview."""
+        metadata = preview.preset.metadata
+        lines = [
+            (
+                f"Replace {preview.scope.value} defaults and {len(preview.removed_rules)} rule(s) "
+                f"with {metadata.id}@{metadata.revision}."
+            ),
+            "Replaced defaults:",
+            *(
+                f"  {action.value}: {decision.value}"
+                for action, decision in preview.removed_defaults.items()
+            ),
+            "Installed defaults:",
+            *(
+                f"  {action.value}: {decision.value}"
+                for action, decision in preview.installed_defaults.items()
+            ),
+            "Removed rules:",
+            *(f"  {cls._render_rule(rule)}" for rule in preview.removed_rules),
+            "Installed rules:",
+            *(f"  {cls._render_rule(rule)}" for rule in preview.installed_rules),
+            "Unchanged: enforcement limits and every non-selected policy layer.",
+        ]
+        if not preview.removed_defaults:
+            lines[2:3] = ["Replaced defaults: none"]
+        if not preview.removed_rules:
+            lines[2:3] = ["Removed rules: none"]
+        if not preview.installed_rules:
+            index = lines.index("Installed rules:")
+            lines[index : index + 1] = ["Installed rules: none"]
+        return "\n".join(lines)
+
+    @classmethod
+    def _replacement_prompt(cls, preview: PresetReplacementPreview) -> str:
+        """Return the confirmation text for a destructive scoped preset replacement."""
+        return (
+            f"{cls._describe_replacement(preview)}\n\n"
+            "This can relax or tighten the selected scope's defaults and rules. "
+            "Non-overridable boundaries still apply. "
+            "Proceed?"
+        )
+
+    @staticmethod
+    def _render_rule(rule: PermissionRule) -> str:
+        """Return a concise human-readable representation of one installed rule."""
+        return (
+            f"{rule.id} {rule.decision.value} tool={rule.tool} "
+            f"action={rule.action.value if rule.action else '*'} resource={rule.resource or '*'}"
+        )
+
+    @staticmethod
     def _usage() -> str:
         return (
             "Usage: /permissions [show [effective|workspace|session] | "
             "help | reload | session reset | "
+            "preset <list|show|diff|replace> ... | "
             "explain <tool> <action> <resource> | default set <workspace|session> <action> "
             "<decision> | default reset <workspace|session> <action> | rule add "
             "<workspace|session> <decision> <tool> <action|*> <resource|*> [description] | "
@@ -498,6 +661,9 @@ class PermissionCommands:
             "  /permissions limit add workspace read-root system-temp\n"
             "  /permissions limit set session host-process allow\n"
             "  /permissions default set session process.execute ask\n\n"
+            "Presets replace only the explicitly selected workspace or session defaults and rules. "
+            "They never replace enforcement limits or the other policy layer; replace prompts for "
+            "confirmation and diff previews the exact policy change.\n\n"
             "Host-process permission runs commands with this application's host access; Loop does "
             "not currently provide an OS sandbox executor."
         )

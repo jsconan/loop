@@ -1,11 +1,16 @@
 """Define typed operations, policies, authorization decisions, and recording protocols."""
 
+import json
 from collections.abc import Callable
 from enum import StrEnum
+from importlib.resources import files
 from typing import Annotated, Any, Literal, Protocol
 from uuid import uuid4
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+
+from ..utils import sha256_digest
 
 
 class Action(StrEnum):
@@ -217,6 +222,24 @@ class OperationPlan(BaseModel):
     operations: tuple[Operation, ...] = ()
 
 
+class PresetSource(BaseModel):
+    """Identify the immutable preset snapshot that installed a policy rule.
+
+    Args:
+        preset_id (str): Stable identifier of the originating preset.
+        revision (str): Preset revision selected by the user.
+        content_hash (str): SHA-256 digest of the selected preset content.
+        rule_id (str): Identifier of the rule within the originating preset.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    preset_id: str
+    revision: str
+    content_hash: str
+    rule_id: str
+
+
 OperationPlanner = Callable[[dict[str, Any]], OperationPlan]
 
 
@@ -230,6 +253,7 @@ class PermissionRule(BaseModel):
         tool (str): Tool-identity glob, defaulting to every tool.
         action (Action | None): Required action, or every action when omitted.
         resource (str | None): Canonical resource glob, or every target when omitted.
+        source (PresetSource | None): Preset snapshot that installed this rule, when any.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -240,6 +264,147 @@ class PermissionRule(BaseModel):
     tool: str = "*"
     action: Action | None = None
     resource: str | None = None
+    source: PresetSource | None = None
+
+
+class PresetMetadata(BaseModel):
+    """Describe a versioned, user-selectable permission preset.
+
+    Args:
+        id (str): Stable catalog identifier.
+        revision (str): Immutable revision selected during installation.
+        title (str): Short user-facing name.
+        description (str): Explanation of the rule set's intended effect.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    revision: str
+    title: str
+    description: str
+
+
+class PresetRule(BaseModel):
+    """Describe one rule before a preset installs it into a policy scope.
+
+    Args:
+        id (str): Identifier unique within the containing rule set.
+        decision (Decision): Policy effect contributed by this rule.
+        description (str | None): Human-readable rationale for the rule.
+        tool (str): Tool-identity glob, defaulting to every tool.
+        action (Action | None): Required action, or every action when omitted.
+        resource (str | None): Canonical resource glob, or every target when omitted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    decision: Decision
+    description: str | None = None
+    tool: str = "*"
+    action: Action | None = None
+    resource: str | None = None
+
+
+class PermissionPreset(BaseModel):
+    """Contain a versioned complete policy-default and rule artifact.
+
+    A preset replaces defaults and rules in one explicit policy scope. It intentionally excludes
+    enforcement limits, which remain the user-controlled boundaries for every preset.
+
+    Args:
+        version (Literal[1]): Preset schema version.
+        kind (Literal["loop.permission-preset"]): Artifact type discriminator.
+        metadata (PresetMetadata): Identity and explanation shown before replacement.
+        defaults (dict[Action, Decision]): Complete fallback decision for every known action.
+        rules (tuple[PresetRule, ...]): Complete rule replacement payload.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    kind: Literal["loop.permission-preset"] = "loop.permission-preset"
+    metadata: PresetMetadata
+    defaults: dict[Action, Decision]
+    rules: tuple[PresetRule, ...]
+
+    @model_validator(mode="after")
+    def validate_contents(self) -> PermissionPreset:
+        """Require a complete default map and unique rule identifiers.
+
+        Returns:
+            PermissionPreset: This validated preset.
+
+        Raises:
+            ValueError: If defaults omit or add an action, or multiple rules use the same
+                identifier.
+        """
+        if set(self.defaults) != set(Action):
+            raise ValueError(
+                "Permission preset defaults must contain every known action exactly once."
+            )
+        identifiers = [rule.id for rule in self.rules]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Permission preset rule identifiers must be unique.")
+        return self
+
+    @property
+    def content_hash(self) -> str:
+        """Return a stable digest for this preset snapshot.
+
+        Returns:
+            str: ``sha256:``-prefixed digest of the schema-normalized artifact.
+        """
+        payload = self.model_dump(mode="json")
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return f"sha256:{sha256_digest(encoded)}"
+
+    @classmethod
+    def builtin_presets(cls) -> tuple[PermissionPreset, ...]:
+        """Return all validated presets shipped with Loop.
+
+        Returns:
+            tuple[PermissionPreset, ...]: Catalog entries sorted by stable identifier.
+
+        Raises:
+            ValueError: If packaged artifacts duplicate an identifier.
+            yaml.YAMLError: If a packaged artifact contains invalid YAML.
+        """
+        directory = files("loop.permissions").joinpath("presets")
+        presets = tuple(
+            cls.model_validate(yaml.safe_load(entry.read_text("utf-8")))
+            for entry in sorted(directory.iterdir(), key=lambda item: item.name)
+            if entry.name.endswith((".yaml", ".yml"))
+        )
+        identifiers = [preset.metadata.id for preset in presets]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Built-in permission preset identifiers must be unique.")
+        return tuple(sorted(presets, key=lambda preset: preset.metadata.id))
+
+
+class PresetReplacementPreview(BaseModel):
+    """Describe one explicit scoped preset replacement before activation.
+
+    Args:
+        preset (PermissionPreset): Selected immutable preset snapshot.
+        scope (PolicyScope): Defaults and rule layer that would be replaced.
+        removed_defaults (dict[Action, Decision]): Existing defaults in the selected layer.
+        installed_defaults (dict[Action, Decision]): Complete defaults installed in that layer.
+        removed_rules (tuple[PermissionRule, ...]): Existing rules removed from that layer.
+        installed_rules (tuple[PermissionRule, ...]): Rules installed into that layer.
+        scope_revision (str): Revision required to reject stale replacement previews.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    preset: PermissionPreset
+    scope: PolicyScope
+    removed_defaults: dict[Action, Decision]
+    installed_defaults: dict[Action, Decision]
+    removed_rules: tuple[PermissionRule, ...]
+    installed_rules: tuple[PermissionRule, ...]
+    scope_revision: str
 
 
 class PolicyLimits(BaseModel):
