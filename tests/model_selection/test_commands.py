@@ -19,7 +19,10 @@ def test_model_commands_list_show_and_select_available_models():
     interaction = Mock(spec=Interaction)
     selection = Mock(spec=ModelSelection)
     selection.selected = None
-    selection.available.return_value = [ModelInfo(id="model-a"), ModelInfo(id="model-b")]
+    selection.available.return_value = [
+        ModelInfo(id="model-a", context_window="10"),
+        ModelInfo(id="model-b", context_window="20"),
+    ]
     manager = CommandManager(interaction=interaction)
     manager.register_provider(ModelCommands(selection))
 
@@ -28,7 +31,10 @@ def test_model_commands_list_show_and_select_available_models():
     manager.call("model", "model-b")
 
     interaction.table.assert_called_once_with(
-        [ModelInfo(id="model-a"), ModelInfo(id="model-b")],
+        [
+            SimpleNamespace(id="model-a", context_window="10 tokens"),
+            SimpleNamespace(id="model-b", context_window="20 tokens"),
+        ],
         title="Available models:",
         columns=("id", "context_window"),
     )

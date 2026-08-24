@@ -230,7 +230,8 @@ class Loop:
                             for index, session in enumerate(self._session_manager.store.list())
                         ),
                         "models": lambda: (
-                            CompletionValue(model.id) for model in self._model_selection.available()
+                            CompletionValue(model.id, f"{model.context_window:,} tokens")
+                            for model in self._model_selection.available()
                         ),
                     },
                     schema_providers={

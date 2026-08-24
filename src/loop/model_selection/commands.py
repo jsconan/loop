@@ -1,5 +1,6 @@
 """Expose active model selection through user commands."""
 
+from types import SimpleNamespace
 from typing import Annotated
 
 from pydantic import Field
@@ -65,7 +66,10 @@ class ModelCommands:
             context.interaction.info("No models available.")
             return
         context.interaction.table(
-            models,
+            [
+                SimpleNamespace(id=model.id, context_window=f"{model.context_window:,} tokens")
+                for model in models
+            ],
             title="Available models:",
             columns=("id", "context_window"),
         )
