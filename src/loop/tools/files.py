@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from pydantic import Field
 
 from .. import constants
+from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, FileTarget, Operation, OperationPlan
 from ..tooling import ToolContext, tool
 from ..utils import (
@@ -107,6 +108,7 @@ def _deletion_kind(path: Path) -> Literal["file", "symbolic link", "folder"] | N
 @tool(
     actions={Action.FILESYSTEM_LIST},
     operation_planner=_file_plan(Action.FILESYSTEM_LIST),
+    result_presentation=ToolResultPresentationSpec(kind=ToolResultPresentation.TREE),
 )
 def list_folder(
     context: ToolContext,
@@ -147,6 +149,7 @@ def list_folder(
 @tool(
     actions={Action.FILESYSTEM_READ},
     operation_planner=_file_plan(Action.FILESYSTEM_READ),
+    result_presentation=ToolResultPresentationSpec(kind=ToolResultPresentation.TEXT),
 )
 def read_text_file(
     context: ToolContext,

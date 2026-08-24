@@ -1,10 +1,12 @@
 """Expose progressively loaded Agent Skills to the model."""
 
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
 from .. import constants
+from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, Operation, OperationPlan, SessionTarget
 from ..skills.models import (
     PublicSkillOperationResult,
@@ -73,7 +75,36 @@ def _skill_plan(arguments: dict[str, Any]) -> OperationPlan:
     return OperationPlan(arguments=arguments, operations=operations)
 
 
-@tool(actions={Action.SESSION_MUTATE}, operation_planner=_skill_plan)
+def _skill_result_presentation(
+    arguments: Mapping[str, Any],
+    result: Any,
+) -> ToolResultPresentationSpec:
+    """Select the presentation matching one completed skill action."""
+    if isinstance(result, dict) and "error" in result:
+        return ToolResultPresentationSpec()
+    action = arguments["action"]
+    if action == "list":
+        return ToolResultPresentationSpec(
+            kind=ToolResultPresentation.TABLE,
+            value_path=("skills",),
+            columns=("name", "description", "activated"),
+        )
+    if action == "list_resources":
+        return ToolResultPresentationSpec(
+            kind=ToolResultPresentation.TABLE,
+            value_path=("resources",),
+            columns=("path", "size_bytes"),
+        )
+    if action == "read_resource":
+        return ToolResultPresentationSpec(kind=ToolResultPresentation.TEXT)
+    return ToolResultPresentationSpec(kind=ToolResultPresentation.JSON)
+
+
+@tool(
+    actions={Action.SESSION_MUTATE},
+    operation_planner=_skill_plan,
+    result_presentation=_skill_result_presentation,
+)
 def manage_skills(
     context: ToolContext,
     action: Annotated[

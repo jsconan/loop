@@ -23,7 +23,12 @@ from rich.text import Text
 from rich.tree import Tree
 
 from .. import constants
-from ..models import RunMetrics
+from ..models import (
+    RAW_TOOL_RESULT_PRESENTATION,
+    RunMetrics,
+    ToolResultPresentation,
+    ToolResultPresentationSpec,
+)
 from ..utils import choice_items, format_tool_call_arguments
 from .interaction import Interaction
 
@@ -351,12 +356,17 @@ class ConsoleInteraction(Interaction):
             markup=False,
         )
 
-    def tool_result(self, name: str, result: str) -> None:
+    def tool_result(
+        self,
+        result: str,
+        presentation: ToolResultPresentationSpec = RAW_TOOL_RESULT_PRESENTATION,
+    ) -> None:
         """Write a serialized tool result in a user-readable form.
 
         Args:
-            name (str): Name of the tool that produced the result.
             result (str): Serialized result returned by the tool.
+            presentation (ToolResultPresentationSpec): Semantic presentation requested by the
+                tool execution. Defaults to generic raw presentation.
         """
         try:
             value = json.loads(result)
@@ -364,27 +374,45 @@ class ConsoleInteraction(Interaction):
             self.info(result)
             return
 
-        if isinstance(value, str):
-            self.info(value)
-            return
         if isinstance(value, dict) and "error" in value and "message" in value:
             self.error(str(value["message"]))
             details = {key: item for key, item in value.items() if key not in {"error", "message"}}
             if details:
                 self._console.print(JSON.from_data(details))
             return
-        if name == "list_folder" and self._is_folder_result(value):
-            self._display_folder_result(value)
+        selected = self._value_at(value, presentation.value_path)
+        if presentation.title:
+            self.info(presentation.title)
+        if presentation.kind is ToolResultPresentation.TREE and self._is_folder_result(selected):
+            self._display_folder_result(selected)
             return
-        if name == "read_text_file" and self._is_content_result(value, cached=False):
-            self._display_content_result(value, identifier=value["path"])
+        if presentation.kind is ToolResultPresentation.TEXT and self._is_content_result(selected):
+            identifier = selected.get("path", selected.get("source"))
+            self._display_content_result(selected, identifier=identifier)
             return
-        if name in {"fetch_content", "read_cached_content"} and self._is_content_result(
-            value, cached=True
-        ):
-            self._display_content_result(value, identifier=value["source"])
+        if presentation.kind is ToolResultPresentation.TABLE and self._is_table_result(selected):
+            self._display_table_result(selected, presentation.columns)
             return
-        self._console.print(JSON.from_data(value))
+        if presentation.kind is ToolResultPresentation.LIST and self._is_list_result(selected):
+            self._console.print("\n".join(str(item) for item in selected))
+            return
+        if presentation.kind is ToolResultPresentation.JSON:
+            self._console.print(JSON.from_data(selected))
+            return
+        if isinstance(value, str):
+            self.info(value)
+        else:
+            self._console.print(JSON.from_data(value))
+
+    @staticmethod
+    def _value_at(value: Any, path: tuple[str, ...]) -> Any:
+        """Return the nested mapping value at a presentation path, or the root on mismatch."""
+        selected = value
+        for key in path:
+            if not isinstance(selected, dict) or key not in selected:
+                return value
+            selected = selected[key]
+        return selected
 
     @staticmethod
     def _is_folder_result(value: Any) -> bool:
@@ -397,13 +425,37 @@ class ConsoleInteraction(Interaction):
         )
 
     @staticmethod
-    def _is_content_result(value: Any, *, cached: bool) -> bool:
+    def _is_content_result(value: Any) -> bool:
         """Return whether a value is a local or cached bounded-content envelope."""
         if not isinstance(value, dict):
             return False
         required = {"content", "size_bytes", "start_byte", "end_byte", "truncated"}
-        identity = {"handle", "source"} if cached else {"path"}
-        return required | identity <= value.keys() and isinstance(value["content"], str)
+        has_identity = isinstance(value.get("path", value.get("source")), str)
+        return required <= value.keys() and has_identity and isinstance(value["content"], str)
+
+    @staticmethod
+    def _is_table_result(value: Any) -> bool:
+        """Return whether a value is a list of string-keyed records."""
+        return isinstance(value, list) and all(
+            isinstance(item, dict) and all(isinstance(key, str) for key in item) for item in value
+        )
+
+    @staticmethod
+    def _is_list_result(value: Any) -> bool:
+        """Return whether a value is a list of scalar labels."""
+        return isinstance(value, list) and all(
+            item is None or isinstance(item, (bool, int, float, str)) for item in value
+        )
+
+    def _display_table_result(self, items: list[dict[str, Any]], columns: tuple[str, ...]) -> None:
+        """Write mapping records using explicitly declared columns."""
+        if not columns:
+            self._console.print(JSON.from_data(items))
+            return
+        table = Table(*columns)
+        for item in items:
+            table.add_row(*(str(item.get(column, "")) for column in columns))
+        self._console.print(table)
 
     def _display_folder_result(self, entries: list[dict[str, Any]]) -> None:
         """Write typed folder entries as a hierarchical tree."""

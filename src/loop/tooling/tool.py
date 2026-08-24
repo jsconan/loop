@@ -8,7 +8,13 @@ from typing import Any, overload
 from pydantic import BaseModel, ValidationError
 
 from ..constants import OMIT, Omit
-from ..models import ToolDefinition
+from ..models import (
+    RAW_TOOL_RESULT_PRESENTATION,
+    ToolDefinition,
+    ToolExecutionResult,
+    ToolResultPresentationDeclaration,
+    ToolResultPresentationSpec,
+)
 from ..permissions import Action, OperationPlan, OperationPlanner
 from ..utils import callable_name
 from .context import ToolContext
@@ -39,6 +45,8 @@ class Tool:
             arguments and typed operations.
         arguments_model (type[BaseModel] | None): Pydantic model used to validate arguments after
             registration, or ``None`` for a passive declaration.
+        result_presentation (ToolResultPresentationDeclaration): Fixed presentation or selector
+            applied to each successful raw result.
     """
 
     function: Callable[..., Any]
@@ -47,6 +55,7 @@ class Tool:
     actions: frozenset[Action] = frozenset()
     operation_planner: OperationPlanner | None = None
     arguments_model: type[BaseModel] | None = None
+    result_presentation: ToolResultPresentationDeclaration = RAW_TOOL_RESULT_PRESENTATION
 
     def registered(
         self,
@@ -55,6 +64,7 @@ class Tool:
         description: str | None = None,
         actions: Iterable[Action] | None = None,
         operation_planner: OperationPlanner | None | Omit = OMIT,
+        result_presentation: ToolResultPresentationDeclaration | Omit = OMIT,
     ) -> Tool:
         """Return a registry-ready copy with resolved metadata and argument validation.
 
@@ -66,6 +76,8 @@ class Tool:
                 ``None`` to inherit.
             operation_planner (OperationPlanner | None | Omit): Container-specific planner.
                 Omit it to inherit; pass ``None`` to remove one.
+            result_presentation (ToolResultPresentationDeclaration | Omit): Container-specific
+                presentation declaration. Omit it to inherit.
 
         Returns:
             Tool: Immutable, fully resolved tool for one registry.
@@ -78,6 +90,11 @@ class Tool:
             actions=frozenset(actions) if actions is not None else self.actions,
             operation_planner=(
                 self.operation_planner if isinstance(operation_planner, Omit) else operation_planner
+            ),
+            result_presentation=(
+                self.result_presentation
+                if isinstance(result_presentation, Omit)
+                else result_presentation
             ),
             arguments_model=get_tool_arguments_model(self.function, resolved_name),
         )
@@ -115,16 +132,39 @@ class Tool:
         Returns:
             str: Serialized tool result or model-readable error.
         """
+        return self.execute(arguments, context).output
+
+    def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolContext | None = None,
+    ) -> ToolExecutionResult:
+        """Invoke a synchronous tool and retain its user-presentation metadata.
+
+        Args:
+            arguments (dict[str, Any]): Validated canonical keyword arguments.
+            context (ToolContext | None): Runtime tool context.
+
+        Returns:
+            ToolExecutionResult: Serialized output and selected presentation.
+        """
         if is_async_callable(self.function):
-            return serialize_tool_error(
-                "async_tool_in_sync_loop",
-                f"Tool '{self._name_for_error()}' must be called through call_async().",
+            return ToolExecutionResult(
+                serialize_tool_error(
+                    "async_tool_in_sync_loop",
+                    f"Tool '{self._name_for_error()}' must be called through call_async().",
+                )
             )
         try:
-            return serialize_tool_result(self._call_function(arguments, context))
+            result = self._call_function(arguments, context)
+            return ToolExecutionResult(
+                serialize_tool_result(result), self._presentation_for(arguments, result)
+            )
         except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-            return serialize_tool_error(
-                "execution_failed", f"Tool '{self._name_for_error()}' failed: {exc}"
+            return ToolExecutionResult(
+                serialize_tool_error(
+                    "execution_failed", f"Tool '{self._name_for_error()}' failed: {exc}"
+                )
             )
 
     async def call_async(
@@ -139,14 +179,34 @@ class Tool:
         Returns:
             str: Serialized tool result or model-readable error.
         """
+        return (await self.execute_async(arguments, context)).output
+
+    async def execute_async(
+        self,
+        arguments: dict[str, Any],
+        context: ToolContext | None = None,
+    ) -> ToolExecutionResult:
+        """Invoke any tool asynchronously and retain its user-presentation metadata.
+
+        Args:
+            arguments (dict[str, Any]): Validated canonical keyword arguments.
+            context (ToolContext | None): Runtime tool context.
+
+        Returns:
+            ToolExecutionResult: Serialized output and selected presentation.
+        """
         try:
             result = self._call_function(arguments, context)
             if inspect.isawaitable(result):
                 result = await result
-            return serialize_tool_result(result)
+            return ToolExecutionResult(
+                serialize_tool_result(result), self._presentation_for(arguments, result)
+            )
         except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-            return serialize_tool_error(
-                "execution_failed", f"Tool '{self._name_for_error()}' failed: {exc}"
+            return ToolExecutionResult(
+                serialize_tool_error(
+                    "execution_failed", f"Tool '{self._name_for_error()}' failed: {exc}"
+                )
             )
 
     def validate_arguments(self, arguments: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -210,6 +270,25 @@ class Tool:
         """Return the resolved name or a stable fallback for diagnostics."""
         return self.name or callable_name(self.function)
 
+    def _presentation_for(
+        self,
+        arguments: dict[str, Any],
+        result: Any,
+    ) -> ToolResultPresentationSpec:
+        """Return a fixed or dynamically selected presentation, falling back safely."""
+        declaration = self.result_presentation
+        if isinstance(declaration, ToolResultPresentationSpec):
+            return declaration
+        try:
+            presentation = declaration(arguments, result)
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-except
+            return RAW_TOOL_RESULT_PRESENTATION
+        return (
+            presentation
+            if isinstance(presentation, ToolResultPresentationSpec)
+            else RAW_TOOL_RESULT_PRESENTATION
+        )
+
     def _call_function(self, arguments: dict[str, Any], context: ToolContext | None) -> Any:
         """Call the function with an explicit context when it requests one."""
         if takes_tool_context(self.function):
@@ -243,6 +322,8 @@ class ToolRegistration:
             to inherit declared actions.
         operation_planner (OperationPlanner | None | Omit): Container-specific planner.
             Omit it to inherit a declared planner; pass ``None`` to remove one.
+        result_presentation (ToolResultPresentationDeclaration | Omit): Container-specific
+            presentation declaration, or omit it to inherit.
     """
 
     function: Callable[..., Any]
@@ -250,6 +331,7 @@ class ToolRegistration:
     description: str | None = None
     actions: frozenset[Action] | None = None
     operation_planner: OperationPlanner | None | Omit = OMIT
+    result_presentation: ToolResultPresentationDeclaration | Omit = OMIT
 
 
 @overload
@@ -265,6 +347,7 @@ def tool[ToolFunction: Callable[..., Any]](
     description: str | None = None,
     actions: Iterable[Action] | None = None,
     operation_planner: OperationPlanner | None = None,
+    result_presentation: ToolResultPresentationDeclaration = RAW_TOOL_RESULT_PRESENTATION,
 ) -> Callable[[ToolFunction], ToolFunction]: ...
 
 
@@ -276,6 +359,7 @@ def tool[ToolFunction: Callable[..., Any]](
     description: str | None = None,
     actions: Iterable[Action] | None = None,
     operation_planner: OperationPlanner | None = None,
+    result_presentation: ToolResultPresentationDeclaration = RAW_TOOL_RESULT_PRESENTATION,
 ) -> ToolFunction | Callable[[ToolFunction], ToolFunction]:
     """Declare a function as an LLM-callable tool without registering it.
 
@@ -288,6 +372,8 @@ def tool[ToolFunction: Callable[..., Any]](
             Defaults to no effects.
         operation_planner (OperationPlanner | None): Optional planner producing canonical
             arguments and typed operations.
+        result_presentation (ToolResultPresentationDeclaration): Fixed presentation or selector
+            applied to each successful raw result.
 
     Returns:
         ToolFunction | Callable[[ToolFunction], ToolFunction]: The unchanged declared function,
@@ -305,6 +391,7 @@ def tool[ToolFunction: Callable[..., Any]](
                 description=description,
                 actions=frozenset(() if actions is None else actions),
                 operation_planner=operation_planner,
+                result_presentation=result_presentation,
             ),
         )
         return target

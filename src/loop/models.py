@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Literal, TypeAlias
 
 from jsonschema import FormatChecker, SchemaError
@@ -671,3 +672,49 @@ class Response(BaseModel):
     model: str | None = None
     structured_output: Any | None = Field(default=None, exclude_if=lambda value: value is None)
     metrics: ResponseMetrics = Field(default_factory=ResponseMetrics)
+
+
+class ToolResultPresentation(StrEnum):
+    """Identify a semantic presentation supported by user interactions."""
+
+    RAW = "raw"
+    JSON = "json"
+    TABLE = "table"
+    LIST = "list"
+    TREE = "tree"
+    TEXT = "text"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultPresentationSpec:
+    """Describe how an interaction should present one structured tool result.
+
+    Args:
+        kind (ToolResultPresentation): Semantic renderer to use.
+        value_path (tuple[str, ...]): Nested mapping keys leading to the value to render.
+        columns (tuple[str, ...]): Ordered record fields used by table rendering.
+        title (str | None): Optional heading displayed before the rendered value.
+    """
+
+    kind: ToolResultPresentation = ToolResultPresentation.RAW
+    value_path: tuple[str, ...] = ()
+    columns: tuple[str, ...] = ()
+    title: str | None = None
+
+
+RAW_TOOL_RESULT_PRESENTATION = ToolResultPresentationSpec()
+type ToolResultPresentationSelector = Callable[[Mapping[str, Any], Any], ToolResultPresentationSpec]
+type ToolResultPresentationDeclaration = ToolResultPresentationSpec | ToolResultPresentationSelector
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionResult:
+    """Carry model-facing output and independent user-presentation metadata.
+
+    Args:
+        output (str): Serialized output supplied to the model and session.
+        presentation (ToolResultPresentationSpec): User-facing presentation specification.
+    """
+
+    output: str
+    presentation: ToolResultPresentationSpec = RAW_TOOL_RESULT_PRESENTATION

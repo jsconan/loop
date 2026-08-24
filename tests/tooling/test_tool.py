@@ -16,6 +16,8 @@ from loop import (
     SessionTarget,
     ToolRegistrationError,
     ToolRegistry,
+    ToolResultPresentation,
+    ToolResultPresentationSpec,
     tool,
 )
 from loop.tooling import Tool, ToolContext
@@ -104,6 +106,40 @@ def test_tools_are_immutable():
 
     with pytest.raises(FrozenInstanceError):
         declaration.name = "changed"
+
+
+def test_execution_selects_presentation_from_arguments_and_raw_result():
+    """Dynamic presentation selectors receive canonical arguments and unserialized results."""
+    selected = ToolResultPresentationSpec(kind=ToolResultPresentation.LIST)
+    selector = Mock(return_value=selected)
+
+    @tool(result_presentation=selector)
+    def calculate(number: int) -> dict:
+        """Calculate a structured value."""
+        return {"values": [number]}
+
+    registered = ToolRegistry([calculate]).tools[0]
+
+    execution = registered.execute({"number": 3})
+
+    assert json.loads(execution.output) == {"values": [3]}
+    assert execution.presentation is selected
+    selector.assert_called_once_with({"number": 3}, {"values": [3]})
+
+
+@pytest.mark.parametrize("selector", [Mock(side_effect=RuntimeError), Mock(return_value=None)])
+def test_execution_falls_back_when_dynamic_presentation_selection_fails(selector):
+    """Presentation metadata failures cannot turn successful tool calls into tool errors."""
+
+    @tool(result_presentation=selector)
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number * 2
+
+    execution = ToolRegistry([calculate]).tools[0].execute({"number": 3})
+
+    assert execution.output == "6"
+    assert execution.presentation.kind is ToolResultPresentation.RAW
 
 
 def test_passive_tools_require_registration_for_model_operations():

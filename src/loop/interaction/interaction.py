@@ -8,7 +8,7 @@ from typing import Any
 from prompt_toolkit.completion import Completer
 
 from .. import constants
-from ..models import RunMetrics
+from ..models import RAW_TOOL_RESULT_PRESENTATION, RunMetrics, ToolResultPresentationSpec
 
 
 class Interaction(ABC):
@@ -199,12 +199,17 @@ class Interaction(ABC):
         """
 
     @abstractmethod
-    def tool_result(self, name: str, result: str) -> None:
+    def tool_result(
+        self,
+        result: str,
+        presentation: ToolResultPresentationSpec = RAW_TOOL_RESULT_PRESENTATION,
+    ) -> None:
         """Display a serialized tool result for a user.
 
         Args:
-            name (str): Name of the tool that produced the result.
             result (str): Serialized result returned by the tool.
+            presentation (ToolResultPresentationSpec): Semantic presentation requested by the
+                tool execution. Defaults to generic raw presentation.
         """
 
     @abstractmethod

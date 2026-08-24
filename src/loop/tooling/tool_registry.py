@@ -10,7 +10,11 @@ from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
 from ..constants import OMIT, Omit
 from ..interaction import Interaction
-from ..models import ToolDefinition
+from ..models import (
+    ToolDefinition,
+    ToolExecutionResult,
+    ToolResultPresentationDeclaration,
+)
 from ..permissions import Action, Decision, Operation, OperationPlanner, PermissionManager
 from ..skills import InstructionsManager
 from ..utils import callable_name
@@ -113,6 +117,7 @@ class ToolRegistry:
         description: str | None = None,
         actions: Iterable[Action] | None = None,
         operation_planner: OperationPlanner | None | Omit = OMIT,
+        result_presentation: ToolResultPresentationDeclaration | Omit = OMIT,
     ) -> None:
         """Create and register a tool from a callable or configured registration.
 
@@ -125,8 +130,10 @@ class ToolRegistry:
                 declared description or docstring summary.
             actions (Iterable[Action] | None): Container-specific action upper bound. Defaults to
                 declared actions or no effects.
-            operation_planner (OperationPlanner | None | object): Container-specific planner.
+            operation_planner (OperationPlanner | None | Omit): Container-specific planner.
                 Omit it to inherit the declared planner; pass ``None`` to remove one.
+            result_presentation (ToolResultPresentationDeclaration | Omit): Container-specific
+                presentation declaration. Omit it to inherit.
 
         Raises:
             ToolRegistrationError: If the resolved name is already registered, the function has
@@ -143,6 +150,11 @@ class ToolRegistry:
                 if isinstance(operation_planner, Omit)
                 else operation_planner
             )
+            result_presentation = (
+                registration.result_presentation
+                if isinstance(result_presentation, Omit)
+                else result_presentation
+            )
         declared_tool = Tool.get_declaration(function)
         if declared_tool is None:
             declared_tool = Tool(function=function)
@@ -154,6 +166,7 @@ class ToolRegistry:
             description=description,
             actions=actions,
             operation_planner=operation_planner,
+            result_presentation=result_presentation,
         )
 
     def definitions(self) -> list[ToolDefinition]:
@@ -341,7 +354,7 @@ class ToolRegistry:
         *,
         interaction: Interaction | None = None,
         instructions_manager: InstructionsManager | None = None,
-    ) -> str:
+    ) -> ToolExecutionResult:
         """Dispatch a planned user-command tool call without permission evaluation.
 
         Args:
@@ -352,14 +365,16 @@ class ToolRegistry:
             instructions_manager (InstructionsManager | None): Instruction manager active for the
                 current conversation.
         Returns:
-            str: The serialized tool result or a model-readable error.
+            ToolExecutionResult: Serialized result and its user-presentation metadata.
 
         Raises:
             ValueError: If the tool requires a context but none is provided.
         """
         tool = self._tools.get(name)
         if tool is None:
-            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
+            return ToolExecutionResult(
+                serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
+            )
         try:
             validated = parse_model_arguments(tool.arguments_model, arguments).model_dump()
         except (CommandArgumentError, ValidationError) as exc:
@@ -368,22 +383,24 @@ class ToolRegistry:
                 if isinstance(exc, ValidationError)
                 else [{"type": "argument_binding", "msg": str(exc)}]
             )
-            return serialize_tool_error(
-                "invalid_arguments",
-                f"Invalid arguments for tool '{name}'.",
-                details=details,
+            return ToolExecutionResult(
+                serialize_tool_error(
+                    "invalid_arguments",
+                    f"Invalid arguments for tool '{name}'.",
+                    details=details,
+                )
             )
         try:
             plan = tool.plan(validated)
         except ValueError as exc:
-            return serialize_tool_error("operation_planning_failed", str(exc))
+            return ToolExecutionResult(serialize_tool_error("operation_planning_failed", str(exc)))
         context = self._context_for(
             tool,
             interaction,
             instructions_manager,
             plan.operations,
         )
-        return tool.call(plan.arguments, context)
+        return tool.execute(plan.arguments, context)
 
     def _authorize(
         self,

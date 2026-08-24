@@ -11,6 +11,7 @@ import httpx
 from pydantic import Field, HttpUrl
 
 from .. import constants
+from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, NetworkTarget, Operation, OperationPlan
 from ..tooling import ToolContext, tool
 from ..utils import (
@@ -189,6 +190,7 @@ def _cache_url(url: str, addresses: tuple[str, ...], handle: str | None = None) 
 @tool(
     actions={Action.NETWORK_REQUEST},
     operation_planner=_network_plan,
+    result_presentation=ToolResultPresentationSpec(kind=ToolResultPresentation.TEXT),
 )
 def fetch_content(
     context: ToolContext,
@@ -214,7 +216,11 @@ def fetch_content(
         return f"Error fetching content: {exc}"
 
 
-@tool(actions={Action.NETWORK_REQUEST}, operation_planner=_cached_content_plan)
+@tool(
+    actions={Action.NETWORK_REQUEST},
+    operation_planner=_cached_content_plan,
+    result_presentation=ToolResultPresentationSpec(kind=ToolResultPresentation.TEXT),
+)
 def read_cached_content(
     context: ToolContext,
     handle: Annotated[str, Field(description="Opaque handle returned by a bounded tool result.")],

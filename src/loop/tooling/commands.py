@@ -105,4 +105,4 @@ class ToolCommands:
             interaction=context.interaction,
             instructions_manager=self._instructions_manager,
         )
-        context.interaction.tool_result(name, result)
+        context.interaction.tool_result(result.output, result.presentation)

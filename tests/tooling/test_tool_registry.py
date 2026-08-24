@@ -15,6 +15,8 @@ from loop import (
     OperationPlan,
     PermissionManager,
     SessionTarget,
+    ToolResultPresentation,
+    ToolResultPresentationSpec,
 )
 from loop.interaction import Interaction
 from loop.skills import InstructionsManager
@@ -427,12 +429,27 @@ def test_call_command_parses_model_parameters_before_shared_dispatch():
     registry.register(describe)
     registry.register(has_no_policy)
 
-    assert json.loads(registry.command("describe", ("3", "label=two words"))) == {
+    assert json.loads(registry.command("describe", ("3", "label=two words")).output) == {
         "count": 3,
         "label": "two words",
     }
-    assert registry.command("has_no_policy", ()) == "true"
+    assert registry.command("has_no_policy", ()).output == "true"
     permissions.authorize.assert_not_called()
+
+
+def test_call_command_retains_dynamic_result_presentation():
+    """Command dispatch returns the presentation selected for canonical arguments and output."""
+    presentation = ToolResultPresentationSpec(kind=ToolResultPresentation.TABLE)
+
+    @declare_tool(result_presentation=lambda arguments, result: presentation)
+    def describe(count: int) -> dict:
+        """Describe parsed values."""
+        return {"count": count}
+
+    execution = ToolRegistry([describe]).command("describe", ("3",))
+
+    assert json.loads(execution.output) == {"count": 3}
+    assert execution.presentation is presentation
 
 
 def test_call_command_reports_unknown_tools_and_invalid_parameters():
@@ -450,11 +467,11 @@ def test_call_command_reports_unknown_tools_and_invalid_parameters():
 
     registry.register(invalid_plan)
 
-    assert "unknown_tool" in registry.command("missing", ())
-    assert "invalid_arguments" in registry.command("calculate", ("unknown=1",))
-    assert "argument_binding" in registry.command("calculate", ("unknown=1",))
-    assert "invalid_arguments" in registry.command("calculate", ("not-an-integer",))
-    assert "operation_planning_failed" in registry.command("invalid_plan", ())
+    assert "unknown_tool" in registry.command("missing", ()).output
+    assert "invalid_arguments" in registry.command("calculate", ("unknown=1",)).output
+    assert "argument_binding" in registry.command("calculate", ("unknown=1",)).output
+    assert "invalid_arguments" in registry.command("calculate", ("not-an-integer",)).output
+    assert "operation_planning_failed" in registry.command("invalid_plan", ()).output
 
 
 def test_call_async_reports_unknown_tools(monkeypatch):

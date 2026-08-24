@@ -2,7 +2,7 @@
 
 from unittest.mock import Mock
 
-from loop import CommandManager, InstructionsManager, Interaction, Tool
+from loop import CommandManager, InstructionsManager, Interaction, Tool, ToolExecutionResult
 from loop.tooling import ToolCommands
 
 
@@ -36,7 +36,7 @@ def test_call_command_forwards_tokens_and_runtime_context():
         arguments_model=arguments_model,
     )
     registry.tools = [tool]
-    registry.command.return_value = "42"
+    registry.command.return_value = ToolExecutionResult("42")
     instructions = InstructionsManager()
     manager = CommandManager(interaction=interaction)
     provider = ToolCommands(registry, instructions)
@@ -54,7 +54,7 @@ def test_call_command_forwards_tokens_and_runtime_context():
         "instructions_manager": instructions,
     }
     assert registry.command.call_args_list[1].args == ("ping", ())
-    interaction.tool_result.assert_called_with("ping", "42")
+    interaction.tool_result.assert_called_with("42", ToolExecutionResult("42").presentation)
     assert manager.commands[-1].completion.schema_provider is None
     assert manager.commands[-1].completion.next.schema_provider == "tool_arguments"
     values, schemas = provider.get_completion_providers()
@@ -70,7 +70,7 @@ def test_call_command_forwards_quoted_run_command_text_without_tool_specific_rew
     interaction = Mock(spec=Interaction)
     registry = Mock()
     registry.tools = []
-    registry.command.return_value = ""
+    registry.command.return_value = ToolExecutionResult("")
     manager = CommandManager(interaction=interaction)
     manager.register_provider(ToolCommands(registry, InstructionsManager()))
 
