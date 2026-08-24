@@ -1,10 +1,45 @@
 """Provide general text formatting utilities."""
 
 import json
+from collections.abc import Iterable, Mapping
 from difflib import unified_diff
 from typing import Any
 
 from .. import constants
+
+
+def choice_items(
+    values: Iterable[str] | Mapping[object, str],
+) -> tuple[tuple[object, str], ...]:
+    """Normalize selectable values and enforce unambiguous input.
+
+    Args:
+        values (Iterable[str] | Mapping[object, str]): Values to normalize. Mapping keys become
+            returned values while mapping values become displayed labels.
+
+    Returns:
+        tuple[tuple[object, str], ...]: Ordered pairs of returned values and displayed labels.
+
+    Raises:
+        ValueError: If no values are supplied, a label is empty, labels are duplicated ignoring
+            case, or a label conflicts with its one-based selection number.
+    """
+    items = (
+        tuple(values.items())
+        if isinstance(values, Mapping)
+        else tuple((value, value) for value in values)
+    )
+    if not items:
+        raise ValueError("choices cannot be empty.")
+    labels = tuple(label for _, label in items)
+    if any(not label for label in labels):
+        raise ValueError("choice labels cannot be empty.")
+    if len({label.casefold() for label in labels}) != len(labels):
+        raise ValueError("choice labels must be unique ignoring case.")
+    numbers = {str(index) for index in range(1, len(items) + 1)}
+    if any(label in numbers for label in labels):
+        raise ValueError("choice labels cannot conflict with selection numbers.")
+    return items
 
 
 def format_tool_call_arguments(

@@ -7,10 +7,35 @@ from loop.constants import (
     CONTENT_PREVIEW_MAX_LINES,
 )
 from loop.utils.text import (
+    choice_items,
     format_content_diff,
     format_content_preview,
     format_tool_call_arguments,
 )
+
+
+def test_choice_items_normalizes_iterables_and_mappings():
+    """Selectable values preserve their order and separate returned keys from displayed labels."""
+    assert choice_items(["first", "second"]) == (("first", "first"), ("second", "second"))
+    assert choice_items({"first-id": "First", "second-id": "Second"}) == (
+        ("first-id", "First"),
+        ("second-id", "Second"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ([], "choices cannot be empty."),
+        ([""], "choice labels cannot be empty."),
+        (["same", "SAME"], "choice labels must be unique ignoring case."),
+        (["1"], "choice labels cannot conflict with selection numbers."),
+    ],
+)
+def test_choice_items_rejects_ambiguous_labels(values, message):
+    """Selectable values reject catalog shapes that cannot be selected unambiguously."""
+    with pytest.raises(ValueError, match=message):
+        choice_items(values)
 
 
 def test_format_tool_call_arguments_formats_object_fields_as_parameters():

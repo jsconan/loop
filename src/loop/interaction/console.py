@@ -24,7 +24,7 @@ from rich.tree import Tree
 
 from .. import constants
 from ..models import RunMetrics
-from ..utils import format_tool_call_arguments
+from ..utils import choice_items, format_tool_call_arguments
 from .interaction import Interaction
 
 
@@ -87,13 +87,13 @@ class ConsoleInteraction(Interaction):
         Raises:
             ValueError: If ``choices`` are invalid or used with a custom ``completer``.
         """
-        choice_items = self._choice_items(choices) if choices is not None else None
-        if choice_items is not None:
+        normalized_choices = choice_items(choices) if choices is not None else None
+        if normalized_choices is not None:
             if completer is not None:
                 raise ValueError("choices cannot be combined with a custom completer.")
-            self.columns(dict(choice_items), numbered=True)
+            self.columns(dict(normalized_choices), numbered=True)
             completer = WordCompleter(
-                [label for _, label in choice_items],
+                [label for _, label in normalized_choices],
                 ignore_case=True,
                 sentence=True,
                 match_middle=True,
@@ -125,39 +125,17 @@ class ConsoleInteraction(Interaction):
                 continue
             if user_input.casefold() in exit_commands:
                 return False
-            if choice_items is not None:
+            if normalized_choices is not None:
                 if user_input.isdecimal():
                     index = int(user_input) - 1
-                    if 0 <= index < len(choice_items):
-                        return choice_items[index][0]
-                for value, label in choice_items:
+                    if 0 <= index < len(normalized_choices):
+                        return normalized_choices[index][0]
+                for value, label in normalized_choices:
                     if user_input.casefold() == label.casefold():
                         return value
                 self.warning("Select one of the listed choices by number or value.")
                 continue
             return user_input
-
-    @staticmethod
-    def _choice_items(
-        values: Iterable[str] | Mapping[object, str],
-    ) -> tuple[tuple[object, str], ...]:
-        """Normalize selectable values and enforce unambiguous input."""
-        items = (
-            tuple(values.items())
-            if isinstance(values, Mapping)
-            else tuple((value, value) for value in values)
-        )
-        if not items:
-            raise ValueError("choices cannot be empty.")
-        labels = tuple(label for _, label in items)
-        if any(not label for label in labels):
-            raise ValueError("choice labels cannot be empty.")
-        if len({label.casefold() for label in labels}) != len(labels):
-            raise ValueError("choice labels must be unique ignoring case.")
-        numbers = {str(index) for index in range(1, len(items) + 1)}
-        if any(label in numbers for label in labels):
-            raise ValueError("choice labels cannot conflict with selection numbers.")
-        return items
 
     def columns(
         self,
@@ -177,7 +155,7 @@ class ConsoleInteraction(Interaction):
             ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
                 label conflicts with a displayed number.
         """
-        items = self._choice_items(values)
+        items = choice_items(values)
         renderables = [
             Text(f"{index}. {label}" if numbered else label)
             for index, (_, label) in enumerate(items, start=1)
