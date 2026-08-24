@@ -78,7 +78,8 @@ class ConsoleInteraction(Interaction):
                 prompt. Defaults to ``"q"``.
             choices (Iterable[str] | Mapping[object, str] | None): Optional selectable values.
                 Mapping keys are returned while their values are displayed and accepted as input.
-                Defaults to ``None``.
+                One choice is confirmed directly, two through nine are shown as a numbered list,
+                and larger catalogs are arranged in columns. Defaults to ``None``.
 
         Returns:
             object | False: The selected value or entered message, or ``False`` when the user
@@ -91,7 +92,14 @@ class ConsoleInteraction(Interaction):
         if normalized_choices is not None:
             if completer is not None:
                 raise ValueError("choices cannot be combined with a custom completer.")
-            self.columns(dict(normalized_choices), numbered=True)
+            if len(normalized_choices) == 1:
+                value, label = normalized_choices[0]
+                self.info(f"\nOnly one choice available: {label}")
+                return value if self.confirm(f"Use '{label}'?", default=False) else False
+            if len(normalized_choices) < constants.COLUMNS_THRESHOLD:
+                self.list(dict(normalized_choices), numbered=True)
+            else:
+                self.columns(dict(normalized_choices), numbered=True)
             completer = WordCompleter(
                 [label for _, label in normalized_choices],
                 ignore_case=True,
@@ -136,33 +144,6 @@ class ConsoleInteraction(Interaction):
                 self.warning("Select one of the listed choices by number or value.")
                 continue
             return user_input
-
-    def columns(
-        self,
-        values: Iterable[str] | Mapping[object, str],
-        *,
-        numbered: bool = False,
-    ) -> None:
-        """Write values in terminal-width-aware columns.
-
-        Args:
-            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
-                displayed while their keys remain available to callers that also retain the
-                mapping.
-            numbered (bool): Whether to prefix displayed values with one-based numbers.
-
-        Raises:
-            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
-                label conflicts with a displayed number.
-        """
-        items = choice_items(values)
-        renderables = [
-            Text(f"{index}. {label}" if numbered else label)
-            for index, (_, label) in enumerate(items, start=1)
-        ]
-        self._console.print(
-            Columns(renderables, padding=(0, 2), equal=True, expand=True, column_first=True)
-        )
 
     def user(self, message: str) -> None:
         """Write a completed user message to the terminal.
@@ -303,6 +284,59 @@ class ConsoleInteraction(Interaction):
                 values[0].plain = f"{prefix}{values[0].plain}"
             table.add_row(*values)
         self._console.print(Constrain(table, max_width))
+
+    def list(
+        self,
+        values: Iterable[str] | Mapping[object, str],
+        *,
+        numbered: bool = False,
+    ) -> None:
+        """Write values as a vertical list.
+
+        Args:
+            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+                displayed while their keys remain available to callers that also retain the
+                mapping.
+            numbered (bool): Whether to prefix displayed values with one-based numbers.
+
+        Raises:
+            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
+                label conflicts with a displayed number.
+        """
+        items = choice_items(values)
+        self._console.print(
+            "\n".join(
+                f"{index}. {label}" if numbered else label
+                for index, (_, label) in enumerate(items, start=1)
+            )
+        )
+
+    def columns(
+        self,
+        values: Iterable[str] | Mapping[object, str],
+        *,
+        numbered: bool = False,
+    ) -> None:
+        """Write values in terminal-width-aware columns.
+
+        Args:
+            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+                displayed while their keys remain available to callers that also retain the
+                mapping.
+            numbered (bool): Whether to prefix displayed values with one-based numbers.
+
+        Raises:
+            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
+                label conflicts with a displayed number.
+        """
+        items = choice_items(values)
+        renderables = [
+            Text(f"{index}. {label}" if numbered else label)
+            for index, (_, label) in enumerate(items, start=1)
+        ]
+        self._console.print(
+            Columns(renderables, padding=(0, 2), equal=True, expand=True, column_first=True)
+        )
 
     def tool_call(self, name: str, arguments: str) -> None:
         """Write a model-requested tool call to the terminal.

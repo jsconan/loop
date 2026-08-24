@@ -194,19 +194,10 @@ class ModelSelection:
         if not models:
             interaction.warning("The backend reported no available models.")
             return False
-        if len(models) == 1:
-            selection = models[0].id
-            if not interaction.confirm(
-                f"Only model '{selection}' is available. Use this model?", default=True
-            ):
-                return False
-            self.select(selection)
-            interaction.info(f"Using model: {selection}")
-            return True
         failing_model = self.selected
         while True:
             selection = interaction.prompt(
-                "Select a replacement model, or enter 'q' to stop:",
+                "Select a replacement model:",
                 choices={model.id: model.id for model in models},
             )
             if selection is False:

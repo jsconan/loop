@@ -12,7 +12,7 @@ from prompt_toolkit.document import Document
 from rich.console import Console
 from rich.prompt import Confirm
 
-from loop import ModelCallMetrics, RunMetrics
+from loop import ModelCallMetrics, RunMetrics, constants
 from loop.interaction import ConsoleInteraction
 from loop.models import Usage
 
@@ -39,8 +39,8 @@ def test_prompt_forwards_an_explicit_completer_to_the_prompt_session():
     assert session.prompt.call_args.kwargs["complete_in_thread"] is True
 
 
-def test_prompt_displays_choices_and_returns_a_mapped_value_for_a_number(capsys):
-    """Numbered choice input returns the key associated with its displayed label."""
+def test_prompt_displays_a_short_choice_list_and_returns_a_mapped_value_for_a_number(capsys):
+    """Short catalogs render vertically and return the key associated with a selected number."""
     session = Mock()
     session.prompt.return_value = "2"
 
@@ -51,9 +51,44 @@ def test_prompt_displays_choices_and_returns_a_mapped_value_for_a_number(capsys)
 
     assert result == "second"
     output = capsys.readouterr().out
-    assert "1. First choice" in output
-    assert "2. Second choice" in output
+    assert output.splitlines() == ["1. First choice", "2. Second choice"]
     assert "complete_while_typing" not in session.prompt.call_args.kwargs
+
+
+def test_prompt_displays_large_choice_catalogs_in_columns(capsys):
+    """Catalogs larger than nine choices retain the terminal-width-aware column layout."""
+    session = Mock()
+    session.prompt.return_value = "10"
+    choices = [f"Choice {index}" for index in range(1, constants.COLUMNS_THRESHOLD + 2)]
+
+    assert ConsoleInteraction(console=Console(width=80), session=session).prompt(
+        choices=choices
+    ) == ("Choice 10")
+
+    output = capsys.readouterr().out
+    assert "1. Choice 1" in output
+    assert len(output.splitlines()) < len(choices)
+
+
+def test_prompt_confirms_a_single_choice_without_opening_an_input_session(monkeypatch):
+    """A singleton catalog uses confirmation and returns its mapped value when approved."""
+    session = Mock()
+    confirm = Mock(return_value=True)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    assert (
+        ConsoleInteraction(session=session).prompt(choices={"model-id": "Model label"})
+        == "model-id"
+    )
+    confirm.assert_called_once_with("Use 'Model label'?", default=False)
+    session.prompt.assert_not_called()
+
+
+def test_prompt_returns_false_when_its_single_choice_is_declined(monkeypatch):
+    """Declining a singleton catalog has the same outcome as leaving a choice prompt."""
+    monkeypatch.setattr(ConsoleInteraction, "confirm", Mock(return_value=False))
+
+    assert ConsoleInteraction().prompt(choices=["Only choice"]) is False
 
 
 def test_prompt_returns_a_choice_value_entered_without_its_number():
@@ -89,7 +124,7 @@ def test_prompt_reprompts_until_a_choice_is_selected(capsys):
     session = Mock()
     session.prompt.side_effect = ["0", "unknown", "first"]
 
-    assert ConsoleInteraction(session=session).prompt(choices=["first"]) == "first"
+    assert ConsoleInteraction(session=session).prompt(choices=["first", "second"]) == "first"
     assert capsys.readouterr().out.endswith(
         "Warning: Select one of the listed choices by number or value.\n"
     )
@@ -127,6 +162,15 @@ def test_columns_displays_unumbered_mapping_labels_without_exposing_keys(capsys)
     assert "First" in output
     assert "Second" in output
     assert "internal-one" not in output
+
+
+def test_list_displays_numbered_mapping_labels_without_exposing_keys(capsys):
+    """List display keeps mapping keys separate from their numbered user-facing labels."""
+    ConsoleInteraction(console=Console(width=80)).list(
+        {"internal-one": "First", "internal-two": "Second"}, numbered=True
+    )
+
+    assert capsys.readouterr().out.splitlines() == ["1. First", "2. Second"]
 
 
 def test_prompt_reprompts_for_blank_input(capsys):

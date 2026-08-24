@@ -91,9 +91,9 @@ def test_backend_command_offers_existing_fallback_for_a_missing_model():
 
 
 def test_backend_command_offers_a_model_when_none_is_configured():
-    """Backend checks offer the existing selection flow when no effective model exists."""
+    """Backend checks delegate a singleton model catalog to the shared choice prompt."""
     interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = False
+    interaction.prompt.return_value = False
     selection = ModelSelection(
         SimpleNamespace(
             default_model=None,
@@ -108,8 +108,8 @@ def test_backend_command_offers_a_model_when_none_is_configured():
     manager.call("backend")
 
     interaction.warning.assert_called_once_with("Backend is available, but no model is selected.")
-    interaction.confirm.assert_called_once_with(
-        "Only model 'replacement' is available. Use this model?", default=True
+    interaction.prompt.assert_called_once_with(
+        "Select a replacement model:", choices={"replacement": "replacement"}
     )
 
 

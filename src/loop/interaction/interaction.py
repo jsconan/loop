@@ -40,31 +40,12 @@ class Interaction(ABC):
                 prompt. Defaults to ``None``.
             choices (Iterable[str] | Mapping[object, str] | None): Optional selectable values.
                 Mapping keys are returned while their values are displayed and accepted as input.
-                Defaults to ``None``.
+                Implementations may adapt their presentation to the catalog size. Defaults to
+                ``None``.
 
         Returns:
             object | False: The selected value or stripped text entered by the user, or ``False``
             when the user requests to exit.
-        """
-
-    @abstractmethod
-    def columns(
-        self,
-        values: Iterable[str] | Mapping[object, str],
-        *,
-        numbered: bool = False,
-    ) -> None:
-        """Display values in terminal-width-aware columns.
-
-        Args:
-            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
-                displayed while their keys remain available to callers that also retain the
-                mapping.
-            numbered (bool): Whether to prefix displayed values with one-based numbers.
-
-        Raises:
-            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
-                label conflicts with a displayed number.
         """
 
     @abstractmethod
@@ -166,6 +147,46 @@ class Interaction(ABC):
 
         Raises:
             ValueError: If ``max_width`` is not positive or ``max_rows`` is negative.
+        """
+
+    @abstractmethod
+    def columns(
+        self,
+        values: Iterable[str] | Mapping[object, str],
+        *,
+        numbered: bool = False,
+    ) -> None:
+        """Display values in terminal-width-aware columns.
+
+        Args:
+            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+                displayed while their keys remain available to callers that also retain the
+                mapping.
+            numbered (bool): Whether to prefix displayed values with one-based numbers.
+
+        Raises:
+            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
+                label conflicts with a displayed number.
+        """
+
+    @abstractmethod
+    def list(
+        self,
+        values: Iterable[str] | Mapping[object, str],
+        *,
+        numbered: bool = False,
+    ) -> None:
+        """Write values as a vertical list.
+
+        Args:
+            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+                displayed while their keys remain available to callers that also retain the
+                mapping.
+            numbered (bool): Whether to prefix displayed values with one-based numbers.
+
+        Raises:
+            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
+                label conflicts with a displayed number.
         """
 
     @abstractmethod

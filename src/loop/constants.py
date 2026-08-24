@@ -64,6 +64,7 @@ TOOL_CALL_VALUE_MAX_CHARS = 20
 
 # UI constants
 TABULAR_MAX_WIDTH = 120
+COLUMNS_THRESHOLD = 9
 
 # Command execution timeout in seconds
 COMMAND_TIMEOUT_SECONDS = 30
