@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager
-from typing import Any
+from typing import Any, Literal
 
 from prompt_toolkit.completion import Completer
 
@@ -125,7 +125,7 @@ class Interaction(ABC):
     @abstractmethod
     def table(
         self,
-        items: list[object],
+        items: Iterable[object | Mapping[str, Any]],
         *,
         title: str | None = None,
         prefix: str = "  ",
@@ -133,10 +133,11 @@ class Interaction(ABC):
         max_width: int | None = constants.TABULAR_MAX_WIDTH,
         max_rows: int | None = None,
     ) -> None:
-        """Display object attributes as a table.
+        """Display mapping fields or object attributes as a table.
 
         Args:
-            items (list[object]): Objects whose attributes provide the row values.
+            items (Iterable[object | Mapping[str, Any]]): Rows whose mappings or attributes
+                provide the displayed values.
             title (str | None): Optional title to display above the table.
             prefix (str): Text to prepend to the first value in each row.
             columns (Iterable[str]): Attribute names to display as columns.
@@ -152,41 +153,68 @@ class Interaction(ABC):
     @abstractmethod
     def columns(
         self,
-        values: Iterable[str] | Mapping[object, str],
+        values: Iterable[object] | Mapping[object, str],
         *,
-        numbered: bool = False,
+        marker: Literal["plain", "numbered", "bullet"] = "plain",
     ) -> None:
         """Display values in terminal-width-aware columns.
 
         Args:
-            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+            values (Iterable[object] | Mapping[object, str]): Values to display. Mapping values are
                 displayed while their keys remain available to callers that also retain the
                 mapping.
-            numbered (bool): Whether to prefix displayed values with one-based numbers.
-
-        Raises:
-            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
-                label conflicts with a displayed number.
+            marker (Literal["plain", "numbered", "bullet"]): Prefix style for each displayed
+                value. Defaults to ``"plain"``.
         """
 
     @abstractmethod
     def list(
         self,
-        values: Iterable[str] | Mapping[object, str],
+        values: Iterable[object] | Mapping[object, str],
         *,
-        numbered: bool = False,
+        marker: Literal["plain", "numbered", "bullet"] = "plain",
     ) -> None:
-        """Write values as a vertical list.
+        """Display values as a vertical list.
 
         Args:
-            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+            values (Iterable[object] | Mapping[object, str]): Values to display. Mapping values are
                 displayed while their keys remain available to callers that also retain the
                 mapping.
-            numbered (bool): Whether to prefix displayed values with one-based numbers.
+            marker (Literal["plain", "numbered", "bullet"]): Prefix style for each displayed
+                value. Defaults to ``"plain"``.
+        """
 
-        Raises:
-            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
-                label conflicts with a displayed number.
+    @abstractmethod
+    def json(self, value: Any) -> None:
+        """Display a structured value as formatted JSON.
+
+        Args:
+            value (Any): JSON-compatible value to display.
+        """
+
+    @abstractmethod
+    def tree(self, entries: Iterable[Mapping[str, str]]) -> None:
+        """Display typed path entries as a hierarchical tree.
+
+        Args:
+            entries (Iterable[Mapping[str, str]]): Entries containing ``path`` and ``type``
+                fields, where type is ``"file"`` or ``"folder"``.
+        """
+
+    @abstractmethod
+    def content(
+        self,
+        text: str,
+        *,
+        identifier: str,
+        start_line: int | None = None,
+    ) -> None:
+        """Display syntax-highlighted textual content.
+
+        Args:
+            text (str): Textual content to display.
+            identifier (str): Source name used to select a syntax lexer.
+            start_line (int | None): First source line number, or ``None`` to omit line numbers.
         """
 
     @abstractmethod

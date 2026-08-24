@@ -173,10 +173,29 @@ def test_columns_displays_unumbered_mapping_labels_without_exposing_keys(capsys)
 def test_list_displays_numbered_mapping_labels_without_exposing_keys(capsys):
     """List display keeps mapping keys separate from their numbered user-facing labels."""
     ConsoleInteraction(console=Console(width=80)).list(
-        {"internal-one": "First", "internal-two": "Second"}, numbered=True
+        {"internal-one": "First", "internal-two": "Second"}, marker="numbered"
     )
 
     assert capsys.readouterr().out.splitlines() == ["1. First", "2. Second"]
+
+
+def test_list_displays_arbitrary_values_with_bullet_markers(capsys):
+    """Bullet lists accept tool-shaped scalar values without choice validation."""
+    ConsoleInteraction().list(["first", 2, True, None, "first"], marker="bullet")
+
+    assert capsys.readouterr().out.splitlines() == [
+        "• first",
+        "• 2",
+        "• True",
+        "• None",
+        "• first",
+    ]
+
+
+def test_list_rejects_an_unknown_marker():
+    """List rendering rejects marker styles outside its public contract."""
+    with pytest.raises(ValueError, match="marker must be plain, numbered, or bullet"):
+        ConsoleInteraction().list(["first"], marker="unknown")  # type: ignore[arg-type]
 
 
 def test_prompt_reprompts_for_blank_input(capsys):
@@ -332,6 +351,19 @@ def test_table_handles_missing_attributes_empty_columns_and_row_limits(capsys):
     assert "first" in output
     assert "second" not in output
     assert "hidden" not in output
+
+
+def test_table_displays_mapping_rows_with_the_standard_table_style(capsys):
+    """Tables use the same headed layout for mapping rows as tool results."""
+    ConsoleInteraction(console=Console(width=200)).table(
+        [{"name": "alpha", "enabled": True}], columns=("name", "enabled")
+    )
+
+    output = capsys.readouterr().out
+    assert "name" in output
+    assert "enabled" in output
+    assert "alpha" in output
+    assert "True" in output
 
 
 def test_table_constrains_output_width_and_can_use_the_console_width(capsys):
@@ -553,14 +585,42 @@ def test_tool_result_renders_nested_tables_with_declared_columns_and_title(capsy
     assert "True" in output
 
 
-def test_tool_result_renders_scalar_lists(capsys):
-    """List presentations display scalar values one per line."""
+def test_tool_result_renders_scalar_lists_as_bullet_lists(capsys):
+    """List presentations delegate scalar values to the shared bullet-list renderer."""
     ConsoleInteraction().tool_result(
         '["first",2,true,null]',
         ToolResultPresentationSpec(kind=ToolResultPresentation.LIST),
     )
 
-    assert capsys.readouterr().out == "first\n2\nTrue\nNone\n"
+    assert capsys.readouterr().out == "• first\n• 2\n• True\n• None\n"
+
+
+def test_json_writes_a_structured_value(capsys):
+    """The public JSON renderer formats arbitrary JSON-compatible data."""
+    ConsoleInteraction().json({"ready": True})
+
+    assert '"ready": true' in capsys.readouterr().out
+
+
+def test_tree_writes_typed_path_entries(capsys):
+    """The public tree renderer presents nested typed paths hierarchically."""
+    ConsoleInteraction().tree(
+        [
+            {"path": "src/main.py", "type": "file"},
+            {"path": "src/tools", "type": "folder"},
+        ]
+    )
+
+    assert capsys.readouterr().out == ".\n└── src\n    ├── main.py\n    └── tools\n"
+
+
+def test_content_writes_only_highlighted_text_without_metadata(capsys):
+    """The public content renderer omits source metadata and line numbers by default."""
+    ConsoleInteraction().content("ready = True", identifier="example.py")
+
+    output = capsys.readouterr().out
+    assert "ready = True" in output
+    assert "bytes" not in output
 
 
 def test_tool_result_pretty_prints_explicit_nested_json(capsys):

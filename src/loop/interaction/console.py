@@ -7,8 +7,9 @@ import sys
 import termios
 from collections.abc import Generator, Iterable, Mapping
 from contextlib import contextmanager
+from itertools import islice
 from pprint import pformat
-from typing import Any
+from typing import Any, Literal
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, WordCompleter
@@ -102,9 +103,9 @@ class ConsoleInteraction(Interaction):
                 self.info(f"\nOnly one choice available: {label}")
                 return value if self.confirm(f"Use '{label}'?", default=False) else False
             if len(normalized_choices) < constants.COLUMNS_THRESHOLD:
-                self.list(dict(normalized_choices), numbered=True)
+                self.list(dict(normalized_choices), marker="numbered")
             else:
-                self.columns(dict(normalized_choices), numbered=True)
+                self.columns(dict(normalized_choices), marker="numbered")
             completer = WordCompleter(
                 [label for _, label in normalized_choices],
                 ignore_case=True,
@@ -248,7 +249,7 @@ class ConsoleInteraction(Interaction):
 
     def table(
         self,
-        items: list[object],
+        items: Iterable[object | Mapping[str, Any]],
         *,
         title: str | None = None,
         prefix: str = "  ",
@@ -256,10 +257,11 @@ class ConsoleInteraction(Interaction):
         max_width: int | None = constants.TABULAR_MAX_WIDTH,
         max_rows: int | None = None,
     ) -> None:
-        """Write object attributes as a table.
+        """Write mapping fields or object attributes as a table.
 
         Args:
-            items (list[object]): Objects whose attributes provide the row values.
+            items (Iterable[object | Mapping[str, Any]]): Rows whose mappings or attributes
+                provide the displayed values.
             title (str | None): Optional title to write above the table.
             prefix (str): Text to prepend to the first value in each row.
             columns (Iterable[str]): Attribute names to display as columns.
@@ -279,12 +281,12 @@ class ConsoleInteraction(Interaction):
         if title:
             self.info(title)
         column_names = tuple(columns)
-        table = Table.grid(padding=(0, 2))
-        for _ in column_names:
-            table.add_column(overflow="ellipsis")
-        visible_items = items if max_rows is None else items[:max_rows]
+        table = Table(*column_names)
+        for column in table.columns:
+            column.overflow = "ellipsis"
+        visible_items = items if max_rows is None else islice(items, max_rows)
         for item in visible_items:
-            values = [Text(str(getattr(item, column, ""))) for column in column_names]
+            values = [Text(str(self._value_for(item, column))) for column in column_names]
             if values:
                 values[0].plain = f"{prefix}{values[0].plain}"
             table.add_row(*values)
@@ -292,55 +294,92 @@ class ConsoleInteraction(Interaction):
 
     def list(
         self,
-        values: Iterable[str] | Mapping[object, str],
+        values: Iterable[object] | Mapping[object, str],
         *,
-        numbered: bool = False,
+        marker: Literal["plain", "numbered", "bullet"] = "plain",
     ) -> None:
         """Write values as a vertical list.
 
         Args:
-            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+            values (Iterable[object] | Mapping[object, str]): Values to display. Mapping values are
                 displayed while their keys remain available to callers that also retain the
                 mapping.
-            numbered (bool): Whether to prefix displayed values with one-based numbers.
-
-        Raises:
-            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
-                label conflicts with a displayed number.
+            marker (Literal["plain", "numbered", "bullet"]): Prefix style for each displayed
+                value. Defaults to ``"plain"``.
         """
-        items = choice_items(values)
-        self._console.print(
-            "\n".join(
-                f"{index}. {label}" if numbered else label
-                for index, (_, label) in enumerate(items, start=1)
-            )
-        )
+        self._console.print("\n".join(self._marked_values(values, marker)))
 
     def columns(
         self,
-        values: Iterable[str] | Mapping[object, str],
+        values: Iterable[object] | Mapping[object, str],
         *,
-        numbered: bool = False,
+        marker: Literal["plain", "numbered", "bullet"] = "plain",
     ) -> None:
         """Write values in terminal-width-aware columns.
 
         Args:
-            values (Iterable[str] | Mapping[object, str]): Values to display. Mapping values are
+            values (Iterable[object] | Mapping[object, str]): Values to display. Mapping values are
                 displayed while their keys remain available to callers that also retain the
                 mapping.
-            numbered (bool): Whether to prefix displayed values with one-based numbers.
-
-        Raises:
-            ValueError: If no values are supplied, a label is empty, labels are duplicated, or a
-                label conflicts with a displayed number.
+            marker (Literal["plain", "numbered", "bullet"]): Prefix style for each displayed
+                value. Defaults to ``"plain"``.
         """
-        items = choice_items(values)
-        renderables = [
-            Text(f"{index}. {label}" if numbered else label)
-            for index, (_, label) in enumerate(items, start=1)
-        ]
+        renderables = [Text(value) for value in self._marked_values(values, marker)]
         self._console.print(
             Columns(renderables, padding=(0, 2), equal=True, expand=True, column_first=True)
+        )
+
+    def json(self, value: Any) -> None:
+        """Write a structured value as formatted JSON.
+
+        Args:
+            value (Any): JSON-compatible value to write.
+        """
+        self._console.print(JSON.from_data(value))
+
+    def tree(self, entries: Iterable[Mapping[str, str]]) -> None:
+        """Write typed path entries as a hierarchical tree.
+
+        Args:
+            entries (Iterable[Mapping[str, str]]): Entries containing ``path`` and ``type``
+                fields, where type is ``"file"`` or ``"folder"``.
+        """
+        root = Tree(Text("."), guide_style="dim")
+        folders = {(): root}
+        entry_types = {tuple(entry["path"].split("/")): entry["type"] for entry in entries}
+        paths = set(entry_types)
+        paths.update(path[:index] for path in entry_types for index in range(1, len(path)))
+
+        for path in sorted(paths, key=lambda item: (len(item), item)):
+            parent = folders[path[:-1]]
+            is_folder = entry_types.get(path, "folder") == "folder"
+            node = parent.add(Text(path[-1], style="bold blue" if is_folder else None))
+            if is_folder:
+                folders[path] = node
+        self._console.print(root)
+
+    def content(
+        self,
+        text: str,
+        *,
+        identifier: str,
+        start_line: int | None = None,
+    ) -> None:
+        """Write syntax-highlighted textual content.
+
+        Args:
+            text (str): Textual content to write.
+            identifier (str): Source name used to select a syntax lexer.
+            start_line (int | None): First source line number, or ``None`` to omit line numbers.
+        """
+        self._console.print(
+            Syntax(
+                text,
+                Syntax.guess_lexer(identifier, text),
+                line_numbers=start_line is not None,
+                start_line=start_line or 1,
+                word_wrap=True,
+            )
         )
 
     def tool_call(self, name: str, arguments: str) -> None:
@@ -378,31 +417,34 @@ class ConsoleInteraction(Interaction):
             self.error(str(value["message"]))
             details = {key: item for key, item in value.items() if key not in {"error", "message"}}
             if details:
-                self._console.print(JSON.from_data(details))
+                self.json(details)
             return
         selected = self._value_at(value, presentation.value_path)
         if presentation.title:
             self.info(presentation.title)
         if presentation.kind is ToolResultPresentation.TREE and self._is_folder_result(selected):
-            self._display_folder_result(selected)
+            self.tree(selected)
             return
         if presentation.kind is ToolResultPresentation.TEXT and self._is_content_result(selected):
             identifier = selected.get("path", selected.get("source"))
-            self._display_content_result(selected, identifier=identifier)
+            self._display_content_metadata(selected, identifier=identifier)
             return
         if presentation.kind is ToolResultPresentation.TABLE and self._is_table_result(selected):
-            self._display_table_result(selected, presentation.columns)
+            if presentation.columns:
+                self.table(selected, columns=presentation.columns)
+                return
+            self.json(selected)
             return
         if presentation.kind is ToolResultPresentation.LIST and self._is_list_result(selected):
-            self._console.print("\n".join(str(item) for item in selected))
+            self.list(selected, marker="bullet")
             return
         if presentation.kind is ToolResultPresentation.JSON:
-            self._console.print(JSON.from_data(selected))
+            self.json(selected)
             return
         if isinstance(value, str):
             self.info(value)
         else:
-            self._console.print(JSON.from_data(value))
+            self.json(value)
 
     @staticmethod
     def _value_at(value: Any, path: tuple[str, ...]) -> Any:
@@ -447,34 +489,8 @@ class ConsoleInteraction(Interaction):
             item is None or isinstance(item, (bool, int, float, str)) for item in value
         )
 
-    def _display_table_result(self, items: list[dict[str, Any]], columns: tuple[str, ...]) -> None:
-        """Write mapping records using explicitly declared columns."""
-        if not columns:
-            self._console.print(JSON.from_data(items))
-            return
-        table = Table(*columns)
-        for item in items:
-            table.add_row(*(str(item.get(column, "")) for column in columns))
-        self._console.print(table)
-
-    def _display_folder_result(self, entries: list[dict[str, Any]]) -> None:
-        """Write typed folder entries as a hierarchical tree."""
-        root = Tree(Text("."), guide_style="dim")
-        folders = {(): root}
-        entry_types = {tuple(entry["path"].split("/")): entry["type"] for entry in entries}
-        paths = set(entry_types)
-        paths.update(path[:index] for path in entry_types for index in range(1, len(path)))
-
-        for path in sorted(paths, key=lambda item: (len(item), item)):
-            parent = folders[path[:-1]]
-            is_folder = entry_types.get(path, "folder") == "folder"
-            node = parent.add(Text(path[-1], style="bold blue" if is_folder else None))
-            if is_folder:
-                folders[path] = node
-        self._console.print(root)
-
-    def _display_content_result(self, value: dict[str, Any], *, identifier: str) -> None:
-        """Write bounded textual content with its source and range metadata."""
+    def _display_content_metadata(self, value: dict[str, Any], *, identifier: str) -> None:
+        """Write bounded-content metadata before its separately rendered body."""
         range_text = f"bytes {value['start_byte']}–{value['end_byte']} of {value['size_bytes']}"
         metadata = Text(identifier, style="bold cyan")
         metadata.append(f" · {range_text}", style="dim")
@@ -484,15 +500,27 @@ class ConsoleInteraction(Interaction):
         if "handle" in value:
             metadata.append(f" · handle {value['handle']}", style="dim")
         self._console.print(metadata)
-        self._console.print(
-            Syntax(
-                value["content"],
-                Syntax.guess_lexer(identifier, value["content"]),
-                line_numbers="start_line" in value,
-                start_line=value.get("start_line", 1),
-                word_wrap=True,
-            )
-        )
+        self.content(value["content"], identifier=identifier, start_line=value.get("start_line"))
+
+    @staticmethod
+    def _value_for(item: object | Mapping[str, Any], column: str) -> Any:
+        """Return one table cell value from a mapping row or an object row."""
+        return item.get(column, "") if isinstance(item, Mapping) else getattr(item, column, "")
+
+    @staticmethod
+    def _marked_values(
+        values: Iterable[object] | Mapping[object, str],
+        marker: Literal["plain", "numbered", "bullet"],
+    ) -> list[str]:
+        """Return display values with a requested list marker."""
+        if marker not in {"plain", "numbered", "bullet"}:
+            raise ValueError("marker must be plain, numbered, or bullet.")
+        labels = values.values() if isinstance(values, Mapping) else values
+        prefix = "• " if marker == "bullet" else ""
+        return [
+            f"{index}. {label}" if marker == "numbered" else f"{prefix}{label}"
+            for index, label in enumerate(labels, start=1)
+        ]
 
     def run_metrics(self, metrics: RunMetrics) -> None:
         """Write one completed agent run's durable statistics.
