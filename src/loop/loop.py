@@ -10,7 +10,6 @@ from .compaction import CompactionCommands, ContextCompaction
 from .completion import (
     CommandCompletionAdapter,
     CompletionManager,
-    CompletionValue,
 )
 from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
@@ -190,16 +189,17 @@ class Loop:
             max_turns=max_agent_turns,
             prompt_on_recoverable_error=prompt_on_recoverable_error,
         )
-        self._command_manager = CommandManager(interaction=self._interaction)
-        self._command_manager.register_providers(
-            (
-                SessionCommands(self._session_manager),
-                PermissionCommands(self._permission_manager),
-                SkillCommands(self._instructions_manager),
-                ToolCommands(self._tool_registry, self._instructions_manager),
-                ModelCommands(self._model_selection),
-                CompactionCommands(self._compaction),
-            )
+        providers = (
+            SessionCommands(self._session_manager),
+            PermissionCommands(self._permission_manager),
+            SkillCommands(self._instructions_manager),
+            ToolCommands(self._tool_registry, self._instructions_manager),
+            ModelCommands(self._model_selection),
+            CompactionCommands(self._compaction),
+        )
+        self._command_manager = CommandManager(
+            providers=providers,
+            interaction=self._interaction,
         )
         self._mention_manager = mention_manager or MentionManager(
             (
@@ -211,39 +211,7 @@ class Loop:
             (
                 CommandCompletionAdapter(
                     lambda: self._command_manager.commands,
-                    providers={
-                        "tools": lambda: (
-                            CompletionValue(tool.name, tool.description)
-                            for tool in self._tool_registry.tools
-                        ),
-                        "skills": lambda: (
-                            CompletionValue(skill.name, skill.description)
-                            for skill in self._instructions_manager.skill_manager.skills
-                        ),
-                        "sessions": lambda: (
-                            CompletionValue(
-                                session.id,
-                                str(session.updated_at),
-                                display=session.name,
-                                sort_order=index,
-                            )
-                            for index, session in enumerate(self._session_manager.store.list())
-                        ),
-                        "models": lambda: (
-                            CompletionValue(model.id, f"{model.context_window:,} tokens")
-                            for model in self._model_selection.available()
-                        ),
-                    },
-                    schema_providers={
-                        "tool_arguments": lambda tokens: next(
-                            (
-                                tool.arguments_model
-                                for tool in self._tool_registry.tools
-                                if tokens and tool.name == tokens[0]
-                            ),
-                            None,
-                        )
-                    },
+                    providers=providers,
                 ),
                 *self._mention_manager.completion_adapters,
             )

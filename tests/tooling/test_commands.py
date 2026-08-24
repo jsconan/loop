@@ -28,11 +28,19 @@ def test_call_command_forwards_tokens_and_runtime_context():
     """Tool invocation forwards parsed remainder tokens and active instruction state."""
     interaction = Mock(spec=Interaction)
     registry = Mock()
-    registry.tools = []
+    arguments_model = Mock()
+    tool = Tool(
+        lambda: None,
+        name="ping",
+        description="Ping a service",
+        arguments_model=arguments_model,
+    )
+    registry.tools = [tool]
     registry.command.return_value = "42"
     instructions = InstructionsManager()
     manager = CommandManager(interaction=interaction)
-    manager.register_provider(ToolCommands(registry, instructions))
+    provider = ToolCommands(registry, instructions)
+    manager.register_provider(provider)
 
     manager.call("call", 'calculate number=21 label="two words"')
     manager.call("call", "ping")
@@ -49,6 +57,12 @@ def test_call_command_forwards_tokens_and_runtime_context():
     interaction.tool_result.assert_called_with("ping", "42")
     assert manager.commands[-1].completion.schema_provider is None
     assert manager.commands[-1].completion.next.schema_provider == "tool_arguments"
+    values, schemas = provider.get_completion_providers()
+    assert [(value.value, value.description) for value in values.provider()] == [
+        ("ping", "Ping a service")
+    ]
+    assert schemas.provider(()) is None
+    assert schemas.provider(("ping",)) is arguments_model
 
 
 def test_call_command_forwards_quoted_run_command_text_without_tool_specific_rewriting():

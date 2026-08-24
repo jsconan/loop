@@ -14,8 +14,9 @@ def test_skill_commands_list_and_activate_skills_idempotently(tmp_path):
         skill_manager=SkillManager([Skill("review", "Review.", location)])
     )
     interaction = Mock(spec=Interaction)
+    provider = SkillCommands(instructions)
     manager = CommandManager(interaction=interaction)
-    manager.register_provider(SkillCommands(instructions))
+    manager.register_provider(provider)
 
     manager.call("skills")
     manager.call("use", "review")
@@ -28,6 +29,10 @@ def test_skill_commands_list_and_activate_skills_idempotently(tmp_path):
     assert "Check carefully." in instructions.instructions
     assert interaction.info.call_args_list[-2].args[0] == "Loaded skill 'review'."
     assert interaction.info.call_args_list[-1].args[0] == "Skill 'review' is already loaded."
+    completion = provider.get_completion_providers()[0]
+    assert [(value.value, value.description) for value in completion.provider()] == [
+        ("review", "Review.")
+    ]
 
 
 def test_skill_commands_report_empty_unknown_and_loading_failures():

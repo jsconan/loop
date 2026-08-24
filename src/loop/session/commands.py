@@ -5,7 +5,7 @@ from typing import Annotated
 from pydantic import Field
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
-from ..completion import CommandCompletion
+from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
 from .session_manager import SessionManager
 
 
@@ -34,6 +34,26 @@ class SessionCommands:
                 name="resume",
                 completion=CommandCompletion(provider="sessions"),
             ),
+        )
+
+    def get_completion_providers(self) -> tuple[CompletionProviderRegistration, ...]:
+        """Return dynamic session completion sources.
+
+        Returns:
+            tuple[CompletionProviderRegistration, ...]: Named session completion source.
+        """
+        return (CompletionProviderRegistration("sessions", self._session_values),)
+
+    def _session_values(self) -> tuple[CompletionValue, ...]:
+        """Return persisted sessions in store order."""
+        return tuple(
+            CompletionValue(
+                session.id,
+                str(session.updated_at),
+                display=session.name,
+                sort_order=index,
+            )
+            for index, session in enumerate(self._session_manager.store.list())
         )
 
     def new(self, context: CommandContext) -> None:

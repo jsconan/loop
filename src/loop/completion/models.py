@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Protocol, Self
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -31,6 +31,48 @@ class CompletionValue:
 
 type CompletionProvider = Callable[[], Iterable[CompletionValue]]
 type SchemaCompletionProvider = Callable[[tuple[str, ...]], type[BaseModel] | None]
+
+
+@dataclass(frozen=True)
+class CompletionProviderRegistration:
+    """Associate a dynamic value provider with its grammar-facing name.
+
+    Args:
+        name (str): Name referenced by command completion grammars.
+        provider (CompletionProvider): Lazy source of completion candidates.
+    """
+
+    name: str
+    provider: CompletionProvider
+
+
+@dataclass(frozen=True)
+class SchemaCompletionProviderRegistration:
+    """Associate a dynamic schema provider with its grammar-facing name.
+
+    Args:
+        name (str): Name referenced by command completion grammars.
+        provider (SchemaCompletionProvider): Lazy source of argument models.
+    """
+
+    name: str
+    provider: SchemaCompletionProvider
+
+
+type CompletionProviderRegistrationLike = (
+    CompletionProviderRegistration | SchemaCompletionProviderRegistration
+)
+
+
+class CompletionProvidersProvider(Protocol):
+    """Provide named completion sources for one application capability."""
+
+    def get_completion_providers(self) -> Iterable[CompletionProviderRegistrationLike]:
+        """Return named completion sources contributed by this provider.
+
+        Returns:
+            Iterable[CompletionProviderRegistrationLike]: Named value and schema providers.
+        """
 
 
 @dataclass(frozen=True)

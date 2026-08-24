@@ -93,8 +93,7 @@ def test_manager_registers_structural_command_providers():
             return (CommandRegistration(supplied, name=self.name),)
 
     provider: CommandsProvider = Provider("first")
-    manager = CommandManager()
-    manager.register_provider(provider)
+    manager = CommandManager(providers=(provider,))
     manager.register_providers((Provider("second"),))
 
     assert [command.name for command in manager.commands] == [

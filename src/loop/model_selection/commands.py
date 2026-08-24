@@ -7,7 +7,7 @@ from pydantic import Field
 
 from ..backend import BackendError
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
-from ..completion import CommandCompletion
+from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
 from ..models import ModelInfo
 from .selection import ModelSelection
 
@@ -40,6 +40,21 @@ class ModelCommands:
             ),
         )
 
+    def get_completion_providers(self) -> tuple[CompletionProviderRegistration, ...]:
+        """Return dynamic model completion sources.
+
+        Returns:
+            tuple[CompletionProviderRegistration, ...]: Named model completion source.
+        """
+        return (CompletionProviderRegistration("models", self._model_values),)
+
+    def _model_values(self) -> tuple[CompletionValue, ...]:
+        """Return models currently available from the backend."""
+        return tuple(
+            CompletionValue(model.id, f"{model.context_window:,} tokens")
+            for model in self._available()
+        )
+
     def backend(self, context: CommandContext) -> None:
         """Check backend reachability and the effective model's availability."""
         try:
@@ -61,15 +76,12 @@ class ModelCommands:
 
     def models(self, context: CommandContext) -> None:
         """List all models available from the backend."""
-        models = self._available()
-        if not models:
+        values = self._model_values()
+        if not values:
             context.interaction.info("No models available.")
             return
         context.interaction.table(
-            [
-                SimpleNamespace(id=model.id, context_window=f"{model.context_window:,} tokens")
-                for model in models
-            ],
+            [SimpleNamespace(id=value.value, context_window=value.description) for value in values],
             title="Available models:",
             columns=("id", "context_window"),
         )

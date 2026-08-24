@@ -5,7 +5,12 @@ from typing import Annotated
 from pydantic import Field
 
 from ..commands import CommandContext, CommandRegistration, CommandRemainder
-from ..completion import CommandCompletion
+from ..completion import (
+    CommandCompletion,
+    CompletionProviderRegistration,
+    CompletionValue,
+    SchemaCompletionProviderRegistration,
+)
 from ..skills import InstructionsManager
 from .tool_registry import ToolRegistry
 
@@ -42,6 +47,37 @@ class ToolCommands:
                     next=CommandCompletion(schema_provider="tool_arguments"),
                 ),
             ),
+        )
+
+    def get_completion_providers(
+        self,
+    ) -> tuple[CompletionProviderRegistration | SchemaCompletionProviderRegistration, ...]:
+        """Return dynamic tool value and argument-schema completion sources.
+
+        Returns:
+            tuple[CompletionProviderRegistration | SchemaCompletionProviderRegistration, ...]:
+                Named tool completion sources.
+        """
+        return (
+            CompletionProviderRegistration("tools", self._tool_values),
+            SchemaCompletionProviderRegistration("tool_arguments", self._tool_arguments),
+        )
+
+    def _tool_values(self) -> tuple[CompletionValue, ...]:
+        """Return currently registered tools."""
+        return tuple(
+            CompletionValue(tool.name, tool.description) for tool in self._tool_registry.tools
+        )
+
+    def _tool_arguments(self, tokens: tuple[str, ...]):
+        """Return the argument model for the selected tool, if any."""
+        return next(
+            (
+                tool.arguments_model
+                for tool in self._tool_registry.tools
+                if tokens and tool.name == tokens[0]
+            ),
+            None,
         )
 
     def tools(self, context: CommandContext) -> None:

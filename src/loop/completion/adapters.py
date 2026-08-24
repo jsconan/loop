@@ -5,7 +5,7 @@ from __future__ import annotations
 import shlex
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from enum import Enum
 from pathlib import Path
 from types import NoneType, UnionType
@@ -18,8 +18,10 @@ from .models import (
     CommandCompletion,
     CompletionMatch,
     CompletionProvider,
+    CompletionProviderRegistration,
     CompletionValue,
     SchemaCompletionProvider,
+    SchemaCompletionProviderRegistration,
     SchemaCompletionState,
 )
 
@@ -79,7 +81,7 @@ class MarkerCompletionAdapter(CompletionAdapter):
         provider (CompletionProvider): Lazy source of completion candidates.
 
     Raises:
-        ValueError: If ``marker`` is not one non-alphanumeric, non-whitespace character.
+        ValueError: If ``marker`` is invalid or a named completion source is invalid or duplicated.
     """
 
     _marker: str
@@ -272,10 +274,8 @@ class CommandCompletionAdapter(CompletionAdapter):
     Args:
         commands (Callable[[], Iterable[Command]]): Lazy source of registered commands.
         marker (str): Symbol introducing command names. Defaults to ``/``.
-        providers (Mapping[str, CompletionProvider] | None): Dynamic providers referenced by name
-            from command completion grammars.
-        schema_providers (Mapping[str, SchemaCompletionProvider] | None): Dynamic model providers
-            referenced by name from command completion grammars.
+        providers (Iterable[object] | None): Capability providers inspected for an optional
+            ``get_completion_providers()`` method during construction.
 
     Raises:
         ValueError: If ``marker`` is not one non-alphanumeric, non-whitespace character.
@@ -283,22 +283,68 @@ class CommandCompletionAdapter(CompletionAdapter):
 
     _commands: Callable[[], Iterable[Command]]
     _marker: str
-    _providers: Mapping[str, CompletionProvider]
-    _schema_providers: Mapping[str, SchemaCompletionProvider]
+    _providers: dict[str, CompletionProvider]
+    _schema_providers: dict[str, SchemaCompletionProvider]
 
     def __init__(
         self,
         commands: Callable[[], Iterable[Command]],
         marker: str = "/",
-        providers: Mapping[str, CompletionProvider] | None = None,
-        schema_providers: Mapping[str, SchemaCompletionProvider] | None = None,
+        providers: Iterable[object] | None = None,
     ) -> None:
         if len(marker) != 1 or marker.isalnum() or marker.isspace():
             raise ValueError("A completion marker must be one non-alphanumeric character.")
         self._commands = commands
         self._marker = marker
-        self._providers = providers or {}
-        self._schema_providers = schema_providers or {}
+        self._providers = {}
+        self._schema_providers = {}
+        self.register_providers(providers or ())
+
+    def register(
+        self,
+        registration: CompletionProviderRegistration | SchemaCompletionProviderRegistration,
+    ) -> None:
+        """Register one named value or schema completion source.
+
+        Args:
+            registration (CompletionProviderRegistration | SchemaCompletionProviderRegistration):
+                Named completion source to register.
+
+        Raises:
+            ValueError: If the provider name is empty or already registered for its source kind.
+        """
+        if not registration.name:
+            raise ValueError("A completion provider name must not be empty.")
+        registry = (
+            self._providers
+            if isinstance(registration, CompletionProviderRegistration)
+            else self._schema_providers
+        )
+        if registration.name in registry:
+            raise ValueError(f"Completion provider '{registration.name}' is already registered.")
+        registry[registration.name] = registration.provider
+
+    def register_provider(self, provider: object) -> None:
+        """Register named completion sources exposed by one provider, if any.
+
+        Args:
+            provider (object): Capability provider optionally implementing
+                ``get_completion_providers()``.
+        """
+        get_completion_providers = getattr(provider, "get_completion_providers", None)
+        if get_completion_providers is None:
+            return
+        for registration in get_completion_providers():
+            self.register(registration)
+
+    def register_providers(self, providers: Iterable[object]) -> None:
+        """Register completion sources exposed by multiple providers in order.
+
+        Args:
+            providers (Iterable[object]): Capability providers to inspect and register.
+        """
+        for provider in providers:
+            self.register_provider(provider)
 
     @property
     def front_markers(self) -> tuple[str, ...]:

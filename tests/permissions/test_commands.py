@@ -9,6 +9,7 @@ from loop import (
     CommandCompletionAdapter,
     CommandManager,
     CompletionManager,
+    CompletionProviderRegistration,
     CompletionValue,
     Decision,
     Interaction,
@@ -283,11 +284,17 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
     )
     manager = CommandManager()
     manager.register_provider(PermissionCommands(permissions))
+    tool_completions = Mock()
+    tool_completions.get_completion_providers.return_value = (
+        CompletionProviderRegistration(
+            "tools", lambda: (CompletionValue("read_text_file", "tool"),)
+        ),
+    )
     completer = CompletionManager(
         (
             CommandCompletionAdapter(
                 lambda: manager.commands,
-                providers={"tools": lambda: (CompletionValue("read_text_file", "tool"),)},
+                providers=(tool_completions,),
             ),
         )
     )

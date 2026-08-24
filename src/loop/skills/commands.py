@@ -5,7 +5,7 @@ from typing import Annotated
 from pydantic import Field
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
-from ..completion import CommandCompletion
+from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
 from .instructions import InstructionsManager
 
 
@@ -32,6 +32,21 @@ class SkillCommands:
                 name="use",
                 completion=CommandCompletion(provider="skills"),
             ),
+        )
+
+    def get_completion_providers(self) -> tuple[CompletionProviderRegistration, ...]:
+        """Return dynamic skill completion sources.
+
+        Returns:
+            tuple[CompletionProviderRegistration, ...]: Named skill completion source.
+        """
+        return (CompletionProviderRegistration("skills", self._skill_values),)
+
+    def _skill_values(self) -> tuple[CompletionValue, ...]:
+        """Return currently discovered skills."""
+        return tuple(
+            CompletionValue(skill.name, skill.description)
+            for skill in self._instructions_manager.skill_manager.skills
         )
 
     def skills(self, context: CommandContext) -> None:

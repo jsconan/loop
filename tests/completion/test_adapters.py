@@ -14,9 +14,11 @@ from loop import (
     CompletionAdapter,
     CompletionManager,
     CompletionMatch,
+    CompletionProviderRegistration,
     CompletionValue,
     MarkerCompletionAdapter,
     ProjectPathCompletionAdapter,
+    SchemaCompletionProviderRegistration,
     Skill,
 )
 from loop.commands.utils import get_command_arguments_model
@@ -42,12 +44,28 @@ def command_completer(
     *commands: Command, providers=None, schema_providers=None
 ) -> CompletionManager:
     """Build a manager containing one command completion adapter."""
+
+    class Provider:
+        """Expose test-local named completion sources."""
+
+        def get_completion_providers(self):
+            """Return configured value and schema sources."""
+            return (
+                *(
+                    CompletionProviderRegistration(name, provider)
+                    for name, provider in (providers or {}).items()
+                ),
+                *(
+                    SchemaCompletionProviderRegistration(name, provider)
+                    for name, provider in (schema_providers or {}).items()
+                ),
+            )
+
     return CompletionManager(
         (
             CommandCompletionAdapter(
                 lambda: commands,
-                providers=providers,
-                schema_providers=schema_providers,
+                providers=(Provider(),),
             ),
         )
     )
@@ -208,6 +226,34 @@ def test_nested_command_completion_switches_to_a_selected_dynamic_schema():
         providers={"tools": lambda: (CompletionValue("selected"),)},
     )
     assert complete(direct, "/invoke selected ")
+
+
+def test_command_adapter_validates_named_provider_registrations():
+    """Providers are duck typed while named sources reject invalid registrations."""
+
+    class Provider:
+        """Expose supplied completion registrations."""
+
+        def __init__(self, *registrations) -> None:
+            self.registrations = registrations
+
+        def get_completion_providers(self):
+            """Return supplied completion registrations."""
+            return self.registrations
+
+    adapter = CommandCompletionAdapter(lambda: (), providers=(object(),))
+    with pytest.raises(ValueError, match="must not be empty"):
+        adapter.register(CompletionProviderRegistration("", lambda: ()))
+
+    registration = CompletionProviderRegistration("values", lambda: ())
+    adapter.register_provider(Provider(registration))
+    with pytest.raises(ValueError, match="already registered"):
+        adapter.register_providers((Provider(registration),))
+
+    schema = SchemaCompletionProviderRegistration("values", lambda _tokens: None)
+    adapter.register(schema)
+    with pytest.raises(ValueError, match="already registered"):
+        adapter.register(schema)
 
 
 def test_invalid_command_paths_quotes_and_provider_failures_return_no_values():

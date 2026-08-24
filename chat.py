@@ -9,7 +9,6 @@ from loop import (
     CommandCompletionAdapter,
     CommandManager,
     CompletionManager,
-    CompletionValue,
     ConsoleInteraction,
     MemorySessionStore,
     MentionManager,
@@ -37,25 +36,15 @@ def main() -> None:
             interaction=interaction,
             session_store=MemorySessionStore(),
         )
-        command_manager = CommandManager(interaction=interaction)
-        command_manager.register_provider(SessionCommands(session_manager))
+        providers = (SessionCommands(session_manager),)
+        command_manager = CommandManager(providers=providers, interaction=interaction)
 
         mention_manager = MentionManager((ProjectPathMentionHandler(Path.cwd),))
         completion_manager = CompletionManager(
             (
                 CommandCompletionAdapter(
                     lambda: command_manager.commands,
-                    providers={
-                        "sessions": lambda: (
-                            CompletionValue(
-                                session.id,
-                                str(session.updated_at),
-                                display=session.name,
-                                sort_order=index,
-                            )
-                            for index, session in enumerate(session_manager.store.list())
-                        ),
-                    },
+                    providers=providers,
                 ),
                 *mention_manager.completion_adapters,
             )

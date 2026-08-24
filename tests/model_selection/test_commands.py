@@ -23,8 +23,9 @@ def test_model_commands_list_show_and_select_available_models():
         ModelInfo(id="model-a", context_window="10"),
         ModelInfo(id="model-b", context_window="20"),
     ]
+    provider = ModelCommands(selection)
     manager = CommandManager(interaction=interaction)
-    manager.register_provider(ModelCommands(selection))
+    manager.register_provider(provider)
 
     manager.call("models")
     manager.call("model")
@@ -41,6 +42,11 @@ def test_model_commands_list_show_and_select_available_models():
     assert interaction.info.call_args_list[0].args[0] == "Using the backend default model."
     selection.select.assert_called_once_with("model-b")
     assert manager.commands[-1].completion.provider == "models"
+    completion = provider.get_completion_providers()[0]
+    assert [(value.value, value.description) for value in completion.provider()] == [
+        ("model-a", "10 tokens"),
+        ("model-b", "20 tokens"),
+    ]
 
 
 def test_backend_command_reports_a_healthy_effective_model():

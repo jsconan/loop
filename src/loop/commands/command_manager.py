@@ -22,13 +22,14 @@ class CommandManager:
 
     Args:
         commands (Iterable[CommandRegistration | Callable[..., None]] | None): Commands
-            registered after the built-in commands in iteration order, or ``None`` to register
-            only built-ins.
+            registered after provider commands in iteration order, or ``None``.
         interaction (Interaction | None): Default interaction used during dispatch, or ``None``
             when callers will provide one for each invocation.
         exit_command_names (tuple[str, ...] | None): Names that request conversation termination.
             Defaults to ``("exit", "quit")``. Pass ``None`` to expose no exit command. The help
             command is always registered.
+        providers (Iterable[CommandsProvider] | None): Capability providers registered after
+            built-ins and before individual commands, or ``None``.
 
     Raises:
         ValueError: If a command name is invalid or registered more than once.
@@ -44,6 +45,7 @@ class CommandManager:
         commands: Iterable[CommandRegistration | Callable[..., None]] | None = None,
         interaction: Interaction | None = None,
         exit_command_names: tuple[str, ...] | None = ("exit", "quit"),
+        providers: Iterable[CommandsProvider] | None = None,
     ) -> None:
         self._commands = {}
         self._exit_requested = False
@@ -63,8 +65,8 @@ class CommandManager:
                     description="End the conversation.",
                 )
             )
-        for command in commands or ():
-            self.register(command)
+        self.register_providers(providers or ())
+        self.register_all(commands or ())
 
     @property
     def interaction(self) -> Interaction | None:
