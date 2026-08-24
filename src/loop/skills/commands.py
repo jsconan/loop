@@ -7,6 +7,7 @@ from pydantic import Field
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
 from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
 from .instructions import InstructionsManager
+from .models import SkillOperationError
 
 
 class SkillCommands:
@@ -67,8 +68,8 @@ class SkillCommands:
             result = self._instructions_manager.activate_skill(name)
         except (OSError, UnicodeError, ValueError) as exc:
             raise CommandArgumentError(f"Could not load skill '{name}': {exc}") from exc
-        if "error" in result:
-            raise CommandArgumentError(result["message"])
+        if isinstance(result, SkillOperationError):
+            raise CommandArgumentError(result.detail)
         if result["instructions_updated"]:
             context.interaction.info(f"Loaded skill '{name}'.")
         else:

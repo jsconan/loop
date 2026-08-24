@@ -135,7 +135,7 @@ def test_deactivate_reports_unknown_names_and_deactivate_all_clears_every_skill(
 
     manager.activate("unique")
 
-    assert manager.deactivate("missing")["error"] == "unknown_skill"
+    assert manager.deactivate("missing").code == "skill.unknown"
     assert manager.deactivate("unique")["status"] == "deactivated"
     assert manager.deactivate("unique")["status"] == "deactivated"
 
@@ -220,8 +220,8 @@ def test_resources_are_listed_and_loaded_only_for_active_skills(tmp_path):
     (reference.parent / "outside.txt").symlink_to(outside)
     manager = SkillManager.discover(tmp_path, [tmp_path / "skills"])
 
-    assert manager.list_resources("missing")["error"] == "unknown_skill"
-    assert manager.list_resources("resourceful")["error"] == "skill_not_active"
+    assert manager.list_resources("missing").code == "skill.unknown"
+    assert manager.list_resources("resourceful").code == "skill.not_active"
     manager.activate("resourceful")
 
     listed = manager.list_resources("resourceful")
@@ -249,9 +249,9 @@ def test_resource_loading_rejects_escapes_and_bounds_oversized_content(tmp_path)
     manager = SkillManager.discover(tmp_path, [tmp_path / "skills"])
     manager.activate("safe")
 
-    assert manager.read_resource("missing", "assets/a")["error"] == "unknown_skill"
-    assert manager.read_resource("safe", "../SKILL.md")["error"] == "invalid_skill_resource"
-    assert manager.read_resource("safe", "assets/missing")["error"] == "invalid_skill_resource"
+    assert manager.read_resource("missing", "assets/a").code == "skill.unknown"
+    assert manager.read_resource("safe", "../SKILL.md").code == "skill.invalid_resource"
+    assert manager.read_resource("safe", "assets/missing").code == "skill.invalid_resource"
     oversized = manager.read_resource("safe", "assets/large.bin")
     assert oversized["size_bytes"] == 64 * 1024 + 1
     assert oversized["included_bytes"] == 16 * 1024
@@ -365,7 +365,7 @@ def test_explicit_directory_order_resolves_duplicate_names_and_reports_shadowing
 
     assert len(listing["skills"]) == 1
     assert not listing["skills"][0]["activated"]
-    assert manager.activate("missing")["error"] == "unknown_skill"
+    assert manager.activate("missing").code == "skill.unknown"
     result = manager.activate("same")
     assert "instructions" not in result
     assert manager.activated_instructions == ((manager.skills[0], "First instructions."),)

@@ -11,6 +11,7 @@ from loop import (
     CompletionManager,
     ContextReference,
     InstructionsManager,
+    Problem,
     ProjectPathMentionHandler,
     Skill,
     SkillManager,
@@ -194,7 +195,11 @@ def test_skill_handler_exposes_live_candidates_and_rolls_back_failed_activation(
     instructions.active_skill_identities = []
     instructions.activate_skill.side_effect = [
         {"name": "first", "status": "activated", "instructions_updated": True},
-        {"error": "instruction_budget_exceeded", "message": "Too much skill context."},
+        Problem(
+            code="skill.instruction_budget_exceeded",
+            title="Instruction budget exceeded",
+            detail="Too much skill context.",
+        ),
     ]
     handler = SkillMentionHandler(instructions)
 

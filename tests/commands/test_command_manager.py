@@ -247,11 +247,13 @@ def test_handle_user_command_reports_invalid_and_unknown_commands():
     manager.register(pair)
 
     assert manager.handle_user_command("/pair invalid") is True
-    assert interaction.warning.call_args.args[0].startswith("Invalid arguments for command '/pair'")
+    assert interaction.report.call_args.args[0].detail.startswith(
+        "Invalid arguments for command '/pair'"
+    )
     assert manager.handle_user_command("/pair unknown=1") is True
-    assert "Unknown parameter 'unknown'" in interaction.warning.call_args.args[0]
+    assert "Unknown parameter 'unknown'" in interaction.report.call_args.args[0].detail
     assert manager.handle_user_command("/missing argument") is True
-    interaction.warning.assert_called_with(
+    assert interaction.report.call_args.args[0].detail == (
         "Unknown command '/missing'. Type /help for available commands."
     )
 

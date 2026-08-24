@@ -819,7 +819,7 @@ def test_auto_policy_reports_and_uses_defaults_or_last_known_good(tmp_path, capl
 
     assert manager.reload() is PermissionLoadResult.RETAINED
     assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
-    interaction.error.assert_called_once()
+    interaction.report.assert_called_once()
     interaction.warning.assert_called_once()
 
 
@@ -838,7 +838,7 @@ def test_interactive_policy_retries_a_repaired_file(tmp_path):
     manager = PermissionManager(tmp_path, interaction=interaction)
 
     assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
-    interaction.error.assert_called_once()
+    interaction.report.assert_called_once()
 
 
 @pytest.mark.parametrize(

@@ -11,6 +11,12 @@ from loop import BUILTIN_TOOLS, InstructionsManager, Interaction, Skill, SkillMa
 tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
 
+def decoded(output: str):
+    """Return the result or problem body from a tool result envelope."""
+    payload = json.loads(output)
+    return payload["result"] if payload["ok"] else payload["problem"]
+
+
 @pytest.fixture(autouse=True)
 def fresh_tool_registry():
     """Provide an isolated built-in registry for each skill-tool case."""
@@ -33,7 +39,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
     instructions_manager = InstructionsManager(skill_manager=manager)
     interaction = Mock(spec=Interaction)
 
-    listed = json.loads(
+    listed = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"list","name":null}',
@@ -41,7 +47,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
             instructions_manager=instructions_manager,
         )
     )
-    activated = json.loads(
+    activated = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"activate","name":"example"}',
@@ -49,7 +55,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
             instructions_manager=instructions_manager,
         )
     )
-    resources = json.loads(
+    resources = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"list_resources","name":"example","path":null}',
@@ -57,7 +63,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
             instructions_manager=instructions_manager,
         )
     )
-    resource = json.loads(
+    resource = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"read_resource","name":"example","path":"references/guide.md"}',
@@ -65,7 +71,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
             instructions_manager=instructions_manager,
         )
     )
-    deactivated = json.loads(
+    deactivated = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"deactivate","name":"example"}',
@@ -74,7 +80,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
         )
     )
     instructions_manager.activate_skill("example")
-    deactivated_all = json.loads(
+    deactivated_all = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"deactivate_all","name":null}',
@@ -128,14 +134,14 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
 def test_manage_skills_validates_mutations_and_runtime_manager():
     """Mutations need a name while every action needs an active instruction manager."""
     interaction = Mock(spec=Interaction)
-    unavailable = json.loads(
+    unavailable = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"list","name":null}',
             interaction=interaction,
         )
     )
-    missing_name = json.loads(
+    missing_name = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"activate","name":null}',
@@ -143,7 +149,7 @@ def test_manage_skills_validates_mutations_and_runtime_manager():
             instructions_manager=InstructionsManager(),
         )
     )
-    missing_deactivation_name = json.loads(
+    missing_deactivation_name = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"deactivate","name":null}',
@@ -151,7 +157,7 @@ def test_manage_skills_validates_mutations_and_runtime_manager():
             instructions_manager=InstructionsManager(),
         )
     )
-    missing_resource_path = json.loads(
+    missing_resource_path = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"read_resource","name":"example","path":null}',
@@ -162,13 +168,11 @@ def test_manage_skills_validates_mutations_and_runtime_manager():
         )
     )
 
-    assert unavailable["error"] == "skills_unavailable"
-    assert missing_name["error"] == "missing_skill_name"
-    assert missing_deactivation_name == {
-        "error": "missing_skill_name",
-        "message": "The deactivate action requires a skill name.",
-    }
-    assert missing_resource_path["error"] == "missing_resource_path"
+    assert unavailable["code"] == "skill.manager_unavailable"
+    assert missing_name["code"] == "skill.name_required"
+    assert missing_deactivation_name["code"] == "skill.name_required"
+    assert missing_deactivation_name["detail"] == "The deactivate action requires a skill name."
+    assert missing_resource_path["code"] == "skill.resource_path_required"
 
 
 def test_manage_skills_sanitizes_activation_failures(tmp_path):
@@ -178,7 +182,7 @@ def test_manage_skills_sanitizes_activation_failures(tmp_path):
         skill_manager=SkillManager([Skill("broken", "Broken skill.", location)])
     )
 
-    result = json.loads(
+    result = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"activate","name":"broken"}',
@@ -187,10 +191,8 @@ def test_manage_skills_sanitizes_activation_failures(tmp_path):
         )
     )
 
-    assert result == {
-        "error": "skill_operation_failed",
-        "message": "The activate action failed for skill 'broken'.",
-    }
+    assert result["code"] == "skill.operation_failed"
+    assert result["detail"] == "The activate action failed for skill 'broken'."
     assert str(location) not in json.dumps(result)
 
 
@@ -211,7 +213,7 @@ def test_manage_skills_returns_only_public_error_details(tmp_path):
     manager.activate_skill("large")
     interaction = Mock(spec=Interaction)
 
-    unknown = json.loads(
+    unknown = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"activate","name":"missing"}',
@@ -219,7 +221,7 @@ def test_manage_skills_returns_only_public_error_details(tmp_path):
             instructions_manager=manager,
         )
     )
-    oversized = json.loads(
+    oversized = decoded(
         tool_registry.call(
             "manage_skills",
             '{"action":"read_resource","name":"large","path":"assets/large.bin"}',
@@ -228,10 +230,8 @@ def test_manage_skills_returns_only_public_error_details(tmp_path):
         )
     )
 
-    assert unknown == {
-        "error": "unknown_skill",
-        "message": "Skill 'missing' is not available.",
-    }
+    assert unknown["code"] == "skill.unknown"
+    assert unknown["detail"] == "Skill 'missing' is not available."
     assert oversized["size_bytes"] == 64 * 1024 + 1
     assert oversized["included_bytes"] == 16 * 1024
     assert oversized["next_start_byte"] == 16 * 1024

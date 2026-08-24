@@ -51,4 +51,4 @@ def test_resume_reports_unknown_session_ids():
 
     manager.call("resume", "missing-id")
 
-    assert "Session 'missing-id' was not found" in interaction.warning.call_args.args[0]
+    assert "Session 'missing-id' was not found" in interaction.report.call_args.args[0].detail

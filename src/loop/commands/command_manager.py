@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from pydantic import ValidationError
 
 from ..completion import CommandCompletion
+from ..errors import Problem
 from .command import Command, CommandRegistration, CommandsProvider
 from .context import CommandContext
 from .models import CommandArgumentError
@@ -232,8 +233,14 @@ class CommandManager:
         if command is None:
             if active_interaction is None:
                 raise ValueError("Command dispatch requires an Interaction.")
-            active_interaction.warning(
-                f"Unknown command '/{name}'. Type /help for available commands."
+            active_interaction.report(
+                Problem(
+                    code="command.unknown",
+                    title="Unknown command",
+                    detail=f"Unknown command '/{name}'. Type /help for available commands.",
+                    severity="warning",
+                    operation=name,
+                )
             )
             return
 
@@ -250,7 +257,16 @@ class CommandManager:
         except (CommandArgumentError, ValidationError) as exc:
             if active_interaction is None:
                 raise
-            active_interaction.warning(f"Invalid arguments for command '/{name}': {exc}")
+            active_interaction.report(
+                Problem.from_exception(
+                    exc,
+                    code="command.invalid_arguments",
+                    title="Invalid command arguments",
+                    detail=f"Invalid arguments for command '/{name}': {exc}",
+                    severity="warning",
+                    operation=name,
+                )
+            )
 
     def request_exit(self) -> None:
         """Request termination of the active conversation loop."""

@@ -45,11 +45,11 @@ def test_skill_commands_report_empty_unknown_and_loading_failures():
     manager.call("skills")
     manager.call("use", "missing")
     assert interaction.info.call_args.args[0] == "No skills discovered."
-    assert "Skill 'missing' is not available" in interaction.warning.call_args.args[0]
+    assert "Skill 'missing' is not available" in interaction.report.call_args.args[0].detail
 
     broken = Mock(spec=InstructionsManager)
     broken.activate_skill.side_effect = ValueError("malformed instructions")
     failing = CommandManager(interaction=interaction)
     failing.register_provider(SkillCommands(broken))
     failing.call("use", "broken")
-    assert "Could not load skill 'broken'" in interaction.warning.call_args.args[0]
+    assert "Could not load skill 'broken'" in interaction.report.call_args.args[0].detail

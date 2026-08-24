@@ -12,8 +12,10 @@ from ..completion import (
     MarkerCompletionAdapter,
     ProjectPathCompletionAdapter,
 )
+from ..errors import Problem
 from ..models import ContextReference
 from ..skills import InstructionsManager
+from ..skills.models import SkillOperationError
 from ..utils import encode_content_cursor, is_path_ignored, iter_visible_paths, store_content
 
 
@@ -321,8 +323,10 @@ class SkillMentionHandler(MentionHandler):
         try:
             for name in dict.fromkeys(values):
                 result = self._instructions_manager.activate_skill(name)
-                if "error" in result:
-                    raise ValueError(result["message"])
+                if isinstance(result, (Problem, SkillOperationError)):
+                    raise ValueError(  # noqa: TRY004 - mention resolution exposes ValueError.
+                        result.detail
+                    )
                 if name not in previously_active:
                     activated.append(name)
         except OSError, UnicodeError, ValueError:

@@ -1,6 +1,7 @@
 """Run one agent through bounded model and tool turns."""
 
 import json
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from time import perf_counter, sleep
 from .. import constants
 from ..backend import BackendError, BackendNotFoundError
 from ..compaction import ContextCompaction
+from ..errors import log_problem
 from ..interaction import Interaction
 from ..model_selection import ModelSelection
 from ..models import (
@@ -24,6 +26,8 @@ from ..models import (
 from ..session import SessionManager
 from .agent import Agent
 from .models import AgentRunResult
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class AgentRunner:
@@ -228,7 +232,7 @@ class AgentRunner:
                 payload = json.loads(tool_result)
             except json.JSONDecodeError:
                 payload = None
-            succeeded = not isinstance(payload, dict) or "error" not in payload
+            succeeded = isinstance(payload, dict) and payload.get("ok") is True
             executions.append(
                 ToolExecutionMetrics(
                     name=tool_call.name,
@@ -364,12 +368,6 @@ class AgentRunner:
 
     def _report_backend_error(self, error: BackendError) -> None:
         """Display a normalized backend failure and useful diagnostic identifiers."""
-        message = str(error)
-        diagnostics = []
-        if error.status_code is not None:
-            diagnostics.append(f"HTTP {error.status_code}")
-        if error.request_id:
-            diagnostics.append(f"request {error.request_id}")
-        if diagnostics:
-            message = f"{message} ({', '.join(diagnostics)})"
-        self._interaction.error(message)
+        problem = error.to_problem()
+        log_problem(_LOGGER, problem, error)
+        self._interaction.report(problem)

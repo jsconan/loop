@@ -1,6 +1,7 @@
 """Provide tools for accessing content on the web."""
 
 import ipaddress
+import logging
 import os
 import socket
 from typing import Annotated
@@ -11,6 +12,7 @@ import httpx
 from pydantic import Field, HttpUrl
 
 from .. import constants
+from ..errors import Problem, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, NetworkTarget, Operation, OperationPlan
 from ..tooling import ToolContext, tool
@@ -24,6 +26,8 @@ from ..utils import (
     store_text_stream,
 )
 from .models import CachedContentResult
+
+_LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
@@ -198,7 +202,7 @@ def fetch_content(
         HttpUrl,
         Field(description="HTTP(S) URL of the content to fetch."),
     ],
-) -> CachedContentResult | str:
+) -> CachedContentResult | Problem:
     """Fetch text into a bounded cache and return its first resumable portion."""
     url = str(url)
     try:
@@ -213,7 +217,14 @@ def fetch_content(
         path, source = resolved
         return _cached_result(handle, source, read_bounded_text(path))
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-        return f"Error fetching content: {exc}"
+        problem = Problem.from_exception(
+            exc,
+            code="network.fetch_failed",
+            title="Could not fetch content",
+            operation="fetch_content",
+        )
+        log_problem(_LOGGER, problem, exc)
+        return problem
 
 
 @tool(
@@ -246,14 +257,19 @@ def read_cached_content(
             le=constants.MAX_TOOL_CONTENT_BYTES,
         ),
     ] = constants.MAX_TOOL_CONTENT_BYTES,
-) -> CachedContentResult | str:
+) -> CachedContentResult | Problem:
     """Read a bounded, resumable portion of cached textual content."""
     try:
         resolved = cached_path(handle)
         if resolved is None:
             metadata = cached_metadata(handle)
             if metadata is None or not metadata["reloadable"]:
-                return "Error reading cached content: Unknown or expired content handle."
+                return Problem(
+                    code="content.handle_expired",
+                    title="Cached content unavailable",
+                    detail="Unknown or expired content handle.",
+                    operation="read_cached_content",
+                )
             operation = context.operations[0] if context.operations else None
             target = operation.target if operation is not None else None
             if not isinstance(target, NetworkTarget):
@@ -280,4 +296,11 @@ def read_cached_content(
             ),
         )
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-        return f"Error reading cached content: {exc}"
+        problem = Problem.from_exception(
+            exc,
+            code="content.read_failed",
+            title="Could not read cached content",
+            operation="read_cached_content",
+        )
+        log_problem(_LOGGER, problem, exc)
+        return problem

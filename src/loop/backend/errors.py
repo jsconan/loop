@@ -2,6 +2,8 @@
 
 from typing import Any, ClassVar
 
+from ..errors import Problem
+
 
 class BackendError(Exception):
     """Describe a failure reported through a conversation backend.
@@ -50,6 +52,28 @@ class BackendError(Exception):
         self.retry_after = retry_after
         self.response_started = response_started
         self.details = details
+
+    def to_problem(self) -> Problem:
+        """Return the safe application problem for this backend failure.
+
+        Returns:
+            Problem: Provider-neutral problem with available request diagnostics.
+        """
+        metadata = {}
+        if self.status_code is not None:
+            metadata["status_code"] = self.status_code
+        if self.request_id:
+            metadata["request_id"] = self.request_id
+        if self.code:
+            metadata["provider_code"] = self.code
+        return Problem.from_exception(
+            self,
+            code="backend.request_failed",
+            title="Backend request failed",
+            retryable=self.recoverable,
+            operation=self.operation,
+            metadata=metadata,
+        )
 
 
 class BackendConnectionError(BackendError):

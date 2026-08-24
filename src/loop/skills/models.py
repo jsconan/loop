@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
+from ..errors import Problem
 from ..utils.hashing import sha256_digest
 
 
@@ -136,14 +137,8 @@ class SkillListResult(TypedDict):
     diagnostics: list[str]
 
 
-class SkillOperationError(TypedDict):
-    """Describe a failed skill operation."""
-
-    error: str
-    message: str
-    size_bytes: NotRequired[int]
-    max_bytes: NotRequired[int]
-    required_bytes: NotRequired[int]
+class SkillOperationError(Problem):
+    """Describe an error that occurred during a skill operation."""
 
 
 class SkillActivationResult(SkillSummary):

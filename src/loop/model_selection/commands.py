@@ -8,6 +8,7 @@ from pydantic import Field
 from ..backend import BackendError
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
 from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
+from ..errors import Problem
 from ..models import ModelInfo
 from .selection import ModelSelection
 
@@ -60,7 +61,14 @@ class ModelCommands:
         try:
             models = self._available()
         except CommandArgumentError as error:
-            context.interaction.error(f"Backend is unavailable: {error}")
+            context.interaction.report(
+                Problem.from_exception(
+                    error,
+                    code="backend.unavailable",
+                    title="Backend unavailable",
+                    operation="list_models",
+                )
+            )
             return
         try:
             model = self._model_selection.effective

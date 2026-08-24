@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, create_model
 
+from ..errors import Problem
 from ..utils import callable_hints, callable_name
 from .context import ToolContext
 from .models import ToolRegistrationError
@@ -145,36 +146,31 @@ def get_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def serialize_tool_result(result: Any) -> str:
-    """Convert a tool result to the string required by ``function_call_output``.
+    """Wrap a successful tool value in the application result envelope.
 
     Args:
         result (Any): Tool result to serialize.
 
     Returns:
-        str: The original string, serialized Pydantic model, or JSON-encoded value.
+        str: JSON-encoded successful result envelope.
 
     Raises:
         TypeError: If ``result`` contains a value that JSON cannot serialize.
     """
-    if isinstance(result, str):
-        return result
+    if isinstance(result, Problem):
+        return serialize_tool_problem(result)
     if isinstance(result, BaseModel):
-        return result.model_dump_json()
-    return json.dumps(result)
+        result = result.model_dump(mode="json")
+    return json.dumps({"ok": True, "result": result})
 
 
-def serialize_tool_error(kind: str, message: str, **details: Any) -> str:
-    """Return a stable, model-readable error result.
+def serialize_tool_problem(problem: Problem) -> str:
+    """Wrap a problem in the application result envelope.
 
     Args:
-        kind (str): Machine-readable error category.
-        message (str): Human-readable error description.
-        **details (Any): Additional fields to include in the error object.
+        problem (Problem): Structured tool failure to serialize.
 
     Returns:
-        str: A JSON-encoded error object.
-
-    Raises:
-        TypeError: If a detail value cannot be JSON serialized.
+        str: JSON-encoded failed result envelope.
     """
-    return json.dumps({"error": kind, "message": message, **details})
+    return json.dumps({"ok": False, "problem": problem.model_dump(mode="json")})

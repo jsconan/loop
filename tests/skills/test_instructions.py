@@ -271,7 +271,7 @@ def test_reactivation_preserves_idempotence_and_aggregate_budget(tmp_path):
 
     rejected = manager.reactivate_skills(identity)
 
-    assert rejected[0]["error"] == "instruction_budget_exceeded"
+    assert rejected[0].code == "skill.instruction_budget_exceeded"
     assert manager.active_skill_identities == []
 
     roomy = InstructionsManager(skill_manager=SkillManager([skill]))
@@ -290,8 +290,8 @@ def test_reactivation_preserves_idempotence_and_aggregate_budget(tmp_path):
     repeated_rejection = constrained.reactivate_skills(identity)
     direct_rejection = constrained.activate_skill("large")
 
-    assert repeated_rejection[0]["error"] == "instruction_budget_exceeded"
-    assert direct_rejection["error"] == "instruction_budget_exceeded"
+    assert repeated_rejection[0].code == "skill.instruction_budget_exceeded"
+    assert direct_rejection.code == "skill.instruction_budget_exceeded"
     assert externally_activated.is_active("large") is True
 
 
@@ -407,7 +407,7 @@ def test_activation_is_idempotent_and_unknown_skills_remain_errors(tmp_path):
     assert first["instructions_updated"] is True
     assert second["instructions_updated"] is False
     assert manager.instructions == instructions
-    assert missing["error"] == "unknown_skill"
+    assert missing.code == "skill.unknown"
     assert str(tmp_path) not in instructions
     assert '<skill name="example">' in instructions
     assert " root=" not in instructions
@@ -422,8 +422,8 @@ def test_activation_rolls_back_when_complete_instructions_exceed_budget(tmp_path
 
     result = manager.activate_skill("large")
 
-    assert result["error"] == "instruction_budget_exceeded"
-    assert result["required_bytes"] > result["max_bytes"]
+    assert result.code == "skill.instruction_budget_exceeded"
+    assert result.metadata["required_bytes"] > result.metadata["max_bytes"]
     assert manager.instructions == baseline
     assert skill_manager.activated == 0
 
@@ -445,7 +445,7 @@ def test_deactivation_is_idempotent_and_unknown_skills_remain_errors(tmp_path):
     assert isinstance(instructions, str)
     assert "Follow the workflow." not in instructions
     assert manager.instructions == instructions
-    assert missing["error"] == "unknown_skill"
+    assert missing.code == "skill.unknown"
 
     empty = manager.deactivate_all_skills()
     assert empty["deactivated"] == 0

@@ -38,20 +38,29 @@ def stream_response(content, *, content_type="text/plain"):
 
 def fetch_content(url):
     """Dispatch the context-aware content-fetching tool."""
-    return tool_registry.call(
+    output = tool_registry.call(
         "fetch_content",
         json.dumps({"url": url}),
         interaction=ConsoleInteraction(),
     )
+    payload = json.loads(output)
+    return json.dumps(payload["result"]) if payload["ok"] else output
 
 
 def read_cached_content(handle, **ranges):
     """Dispatch a cached-content continuation read."""
-    return tool_registry.call(
+    output = tool_registry.call(
         "read_cached_content",
         json.dumps({"handle": handle, **ranges}),
         interaction=ConsoleInteraction(),
     )
+    payload = json.loads(output)
+    return json.dumps(payload["result"]) if payload["ok"] else output
+
+
+def problem(output: str):
+    """Return the problem from a failed tool result envelope."""
+    return json.loads(output)["problem"]
 
 
 def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
@@ -63,7 +72,7 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
-    assert '"error": "tool_call_denied"' in fetch_content("https://example.com/file.txt")
+    assert problem(fetch_content("https://example.com/file.txt"))["code"] == "tool.denied"
     stream.assert_not_called()
 
     result = json.loads(fetch_content("https://example.com/file.txt"))
@@ -104,8 +113,8 @@ def test_fetch_content_reports_failures(monkeypatch):
         MagicMock(side_effect=OSError("network unavailable")),
     )
 
-    assert fetch_content("https://example.com/file.txt") == (
-        "Error fetching content: network unavailable"
+    assert problem(fetch_content("https://example.com/file.txt"))["detail"] == (
+        "network unavailable"
     )
 
 
@@ -145,7 +154,7 @@ def test_fetch_content_denies_private_addresses_resolved_during_planning(monkeyp
 
     result = fetch_content("https://service.test/private")
 
-    assert '"tool_call_denied"' in result
+    assert problem(result)["code"] == "tool.denied"
     stream.assert_not_called()
 
 
@@ -168,7 +177,7 @@ def test_fetch_content_fails_closed_when_resolution_returns_no_usable_addresses(
 
     result = fetch_content("https://service.test/content")
 
-    assert '"operation_planning_failed"' in result
+    assert problem(result)["code"] == "tool.planning_failed"
     confirm.assert_not_called()
     stream.assert_not_called()
 
@@ -182,7 +191,9 @@ def test_fetch_content_fails_closed_when_resolution_raises(monkeypatch):
 
     monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", unresolved)
 
-    assert '"operation_planning_failed"' in fetch_content("https://service.test/content")
+    assert problem(fetch_content("https://service.test/content"))["code"] == (
+        "tool.planning_failed"
+    )
 
 
 def test_pinned_address_backend_connects_only_to_its_authorised_address():
@@ -231,11 +242,13 @@ def test_web_tools_fail_closed_without_an_authorized_network_operation(monkeypat
         lambda _handle: {"source": "https://example.com", "reloadable": True},
     )
 
-    assert "Authorized network target is missing" in web_module.fetch_content(
-        context, "https://example.com"
+    assert (
+        "Authorized network target is missing"
+        in web_module.fetch_content(context, "https://example.com").detail
     )
-    assert "Authorized network target is missing" in web_module.read_cached_content(
-        context, "handle"
+    assert (
+        "Authorized network target is missing"
+        in web_module.read_cached_content(context, "handle").detail
     )
 
 
@@ -245,8 +258,8 @@ def test_fetch_content_rejects_binary_content(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
-    assert fetch_content("https://example.com/file.bin") == (
-        "Error fetching content: Content at 'https://example.com/file.bin' appears to be binary."
+    assert problem(fetch_content("https://example.com/file.bin"))["detail"] == (
+        "Content at 'https://example.com/file.bin' appears to be binary."
     )
     response.raise_for_status.assert_called_once_with()
 

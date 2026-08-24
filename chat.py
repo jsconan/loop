@@ -1,5 +1,6 @@
 """Minimal chat loop: prompt -> query -> output."""
 
+import logging
 import os
 from pathlib import Path
 
@@ -13,12 +14,16 @@ from loop import (
     MemorySessionStore,
     MentionManager,
     OpenAIBackend,
+    Problem,
     ProjectPathMentionHandler,
     SessionManager,
     ShutdownRequested,
+    log_problem,
     register_shutdown_signals,
 )
 from loop.session import SessionCommands
+
+_LOGGER = logging.getLogger(__name__)
 
 _BASE_URL = "http://localhost:8000/v1"
 _DEFAULT_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
@@ -72,7 +77,14 @@ def main() -> None:
             try:
                 context = mention_manager.resolve(prompt)
             except (OSError, UnicodeError, ValueError) as error:
-                interaction.error(str(error))
+                interaction.report(
+                    Problem.from_exception(
+                        error,
+                        code="mention.resolution_failed",
+                        title="Could not resolve mention",
+                        operation="resolve_mention",
+                    )
+                )
                 continue
             session_manager.add_user_message(prompt, context=context)
 
@@ -84,8 +96,16 @@ def main() -> None:
 
     except EOFError, KeyboardInterrupt, ShutdownRequested:
         interaction.conversation_ended()
-    except Exception as e:  # noqa: BLE001  # pylint: disable=broad-except
-        interaction.error(f"An unexpected error occurred: {e}")
+    except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
+        problem = Problem(
+            code="internal.unexpected",
+            title="Unexpected application error",
+            detail="Chat encountered an unexpected error and must stop.",
+            severity="fatal",
+            operation="chat",
+        )
+        log_problem(_LOGGER, problem, error)
+        interaction.report(problem)
 
 
 if __name__ == "__main__":

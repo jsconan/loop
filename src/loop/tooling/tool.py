@@ -1,6 +1,7 @@
 """Declare, validate, and invoke typed functions exposed to an LLM."""
 
 import inspect
+import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Any, overload
@@ -8,6 +9,7 @@ from typing import Any, overload
 from pydantic import BaseModel, ValidationError
 
 from ..constants import OMIT, Omit
+from ..errors import Problem, log_problem
 from ..models import (
     RAW_TOOL_RESULT_PRESENTATION,
     ToolDefinition,
@@ -24,12 +26,13 @@ from .utils import (
     get_tool_description,
     get_tool_schema,
     is_async_callable,
-    serialize_tool_error,
+    serialize_tool_problem,
     serialize_tool_result,
     takes_tool_context,
 )
 
 _TOOL_ATTR = "__loop_tool__"
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -150,9 +153,13 @@ class Tool:
         """
         if is_async_callable(self.function):
             return ToolExecutionResult(
-                serialize_tool_error(
-                    "async_tool_in_sync_loop",
-                    f"Tool '{self._name_for_error()}' must be called through call_async().",
+                serialize_tool_problem(
+                    Problem(
+                        code="tool.async_required",
+                        title="Asynchronous tool invocation required",
+                        detail=f"Tool '{self._name_for_error()}' must be called asynchronously.",
+                        operation=self._name_for_error(),
+                    )
                 )
             )
         try:
@@ -161,11 +168,15 @@ class Tool:
                 serialize_tool_result(result), self._presentation_for(arguments, result)
             )
         except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-            return ToolExecutionResult(
-                serialize_tool_error(
-                    "execution_failed", f"Tool '{self._name_for_error()}' failed: {exc}"
-                )
+            problem = Problem.from_exception(
+                exc,
+                code="tool.execution_failed",
+                title="Tool execution failed",
+                detail=f"Tool '{self._name_for_error()}' failed.",
+                operation=self._name_for_error(),
             )
+            log_problem(_LOGGER, problem, exc)
+            return ToolExecutionResult(serialize_tool_problem(problem))
 
     async def call_async(
         self, arguments: dict[str, Any], context: ToolContext | None = None
@@ -203,11 +214,15 @@ class Tool:
                 serialize_tool_result(result), self._presentation_for(arguments, result)
             )
         except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-            return ToolExecutionResult(
-                serialize_tool_error(
-                    "execution_failed", f"Tool '{self._name_for_error()}' failed: {exc}"
-                )
+            problem = Problem.from_exception(
+                exc,
+                code="tool.execution_failed",
+                title="Tool execution failed",
+                detail=f"Tool '{self._name_for_error()}' failed.",
+                operation=self._name_for_error(),
             )
+            log_problem(_LOGGER, problem, exc)
+            return ToolExecutionResult(serialize_tool_problem(problem))
 
     def validate_arguments(self, arguments: str) -> tuple[dict[str, Any] | None, str | None]:
         """Return validated keyword arguments or a model-readable error.
@@ -227,10 +242,15 @@ class Tool:
         try:
             validated = self.arguments_model.model_validate_json(arguments or "{}")
         except ValidationError as exc:
-            return None, serialize_tool_error(
-                "invalid_arguments",
-                f"Invalid arguments for tool '{self._name_for_error()}'.",
-                details=exc.errors(include_url=False),
+            return None, serialize_tool_problem(
+                Problem(
+                    code="tool.invalid_arguments",
+                    title="Invalid tool arguments",
+                    detail=f"Invalid arguments for tool '{self._name_for_error()}'.",
+                    severity="warning",
+                    operation=self._name_for_error(),
+                    metadata={"fields": exc.errors(include_url=False)},
+                )
             )
         return validated.model_dump(), None
 

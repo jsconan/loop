@@ -14,6 +14,7 @@ from rich.prompt import Confirm
 
 from loop import (
     ModelCallMetrics,
+    Problem,
     RunMetrics,
     ToolResultPresentation,
     ToolResultPresentationSpec,
@@ -307,6 +308,25 @@ def test_classified_messages_have_console_presentations(capsys, method, message,
     assert capsys.readouterr().out == expected
 
 
+def test_report_renders_a_problem_with_its_reference_and_retry_guidance(capsys):
+    """Problem reports consistently present safe detail and an occurrence reference."""
+    ConsoleInteraction().report(
+        Problem(
+            code="example.failed",
+            title="Example failed",
+            detail="Try again later.",
+            retryable=True,
+            instance="err_test",
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "Example failed" in output
+    assert "Try again later." in output
+    assert "Reference: err_test" in output
+    assert "can be retried" in output
+
+
 def test_info_supports_a_blank_separator(capsys):
     """Neutral information can emit a blank line between streamed sections."""
     ConsoleInteraction().info()
@@ -407,16 +427,21 @@ def test_tool_call_truncates_each_long_argument_value_in_the_middle(capsys):
     assert capsys.readouterr().out == '\n[TOOL CALL]: write(content="0123456789…hijklmnop")\n'
 
 
+def tool_output(value):
+    """Serialize a successful application tool result envelope."""
+    return json.dumps({"ok": True, "result": value})
+
+
 @pytest.mark.parametrize(
     ("result", "expected"),
     [
         ("plain text", "plain text\n"),
-        ('"Unicode: \\u2603"', "Unicode: ☃\n"),
+        ("Unicode: ☃", "Unicode: ☃\n"),
     ],
 )
 def test_tool_result_displays_text_without_transport_quoting(capsys, result, expected):
     """Tool results preserve plain text and unwrap JSON-encoded strings."""
-    ConsoleInteraction().tool_result(result)
+    ConsoleInteraction().tool_result(tool_output(result))
 
     assert capsys.readouterr().out == expected
 
@@ -432,32 +457,43 @@ def test_tool_result_displays_text_without_transport_quoting(capsys, result, exp
 )
 def test_tool_result_pretty_prints_structured_json(capsys, result, expected_parts):
     """Structured and primitive JSON results receive readable JSON presentation."""
-    ConsoleInteraction().tool_result(result, ToolResultPresentationSpec())
+    ConsoleInteraction().tool_result(tool_output(json.loads(result)), ToolResultPresentationSpec())
 
     output = capsys.readouterr().out
     assert all(part in output for part in expected_parts)
 
 
-def test_tool_result_classifies_error_envelopes_and_displays_details(capsys):
-    """Serialized tool errors emphasize their message and retain diagnostic details."""
-    result = '{"error":"invalid_arguments","message":"Invalid input.","details":[{"field":"x"}]}'
+def test_tool_result_renders_problem_envelopes_without_raw_metadata(capsys):
+    """Serialized tool problems use one panel and hide machine-oriented metadata."""
+    result = json.dumps(
+        {
+            "ok": False,
+            "problem": {
+                "code": "tool.invalid_arguments",
+                "title": "Invalid input",
+                "detail": "The supplied value is invalid.",
+                "severity": "error",
+                "retryable": False,
+                "operation": "example",
+                "instance": "err_test",
+                "metadata": {"fields": [{"field": "x"}]},
+            },
+        }
+    )
 
     ConsoleInteraction().tool_result(result, ToolResultPresentationSpec())
 
     output = capsys.readouterr().out
-    assert output.startswith("Error: Invalid input.\n")
-    assert '"details": [' in output
-    assert '"field": "x"' in output
-    assert "invalid_arguments" not in output
+    assert "Invalid input" in output
+    assert "The supplied value is invalid." in output
+    assert "Reference: err_test" in output
+    assert '"fields"' not in output
 
 
-def test_tool_result_classifies_error_envelopes_without_details(capsys):
-    """Minimal serialized tool errors display only their human-readable message."""
-    ConsoleInteraction().tool_result(
-        '{"error":"unknown_tool","message":"Unavailable."}', ToolResultPresentationSpec()
-    )
-
-    assert capsys.readouterr().out == "Error: Unavailable.\n"
+def test_tool_result_rejects_values_without_an_envelope():
+    """Raw values cannot bypass the application tool result contract."""
+    with pytest.raises(TypeError, match="result envelope"):
+        ConsoleInteraction().tool_result('{"message":"Unavailable."}')
 
 
 def test_tool_result_displays_local_file_content_with_source_and_line_numbers(capsys):
@@ -479,7 +515,7 @@ def test_tool_result_displays_local_file_content_with_source_and_line_numbers(ca
     )
 
     ConsoleInteraction().tool_result(
-        result,
+        tool_output(json.loads(result)),
         ToolResultPresentationSpec(kind=ToolResultPresentation.TEXT),
     )
 
@@ -505,7 +541,7 @@ def test_tool_result_displays_cached_content_with_source_and_handle(capsys):
     )
 
     ConsoleInteraction().tool_result(
-        result,
+        tool_output(json.loads(result)),
         ToolResultPresentationSpec(kind=ToolResultPresentation.TEXT),
     )
 
@@ -525,7 +561,7 @@ def test_tool_result_displays_folder_entries_as_a_hierarchical_tree(capsys):
     )
 
     ConsoleInteraction().tool_result(
-        result,
+        tool_output(json.loads(result)),
         ToolResultPresentationSpec(kind=ToolResultPresentation.TREE),
     )
 
@@ -538,7 +574,7 @@ def test_tool_result_displays_folder_entries_as_a_hierarchical_tree(capsys):
 def test_tool_result_displays_an_empty_folder_as_a_tree(capsys):
     """An empty list from list_folder remains identifiable as an empty folder tree."""
     ConsoleInteraction().tool_result(
-        "[]", ToolResultPresentationSpec(kind=ToolResultPresentation.TREE)
+        tool_output([]), ToolResultPresentationSpec(kind=ToolResultPresentation.TREE)
     )
 
     assert capsys.readouterr().out == ".\n"
@@ -561,7 +597,9 @@ def test_tool_result_displays_an_empty_folder_as_a_tree(capsys):
 )
 def test_tool_result_falls_back_for_malformed_well_known_formats(capsys, presentation, result):
     """Malformed recognized-tool results retain the generic JSON presentation."""
-    ConsoleInteraction().tool_result(result, ToolResultPresentationSpec(kind=presentation))
+    ConsoleInteraction().tool_result(
+        tool_output(json.loads(result)), ToolResultPresentationSpec(kind=presentation)
+    )
 
     assert capsys.readouterr().out.strip()
 
@@ -569,7 +607,7 @@ def test_tool_result_falls_back_for_malformed_well_known_formats(capsys, present
 def test_tool_result_renders_nested_tables_with_declared_columns_and_title(capsys):
     """Table presentations select nested rows and use declared headings."""
     ConsoleInteraction().tool_result(
-        '{"skills":[{"name":"coding","activated":true}]}',
+        tool_output({"skills": [{"name": "coding", "activated": True}]}),
         ToolResultPresentationSpec(
             kind=ToolResultPresentation.TABLE,
             value_path=("skills",),
@@ -588,7 +626,7 @@ def test_tool_result_renders_nested_tables_with_declared_columns_and_title(capsy
 def test_tool_result_renders_scalar_lists_as_bullet_lists(capsys):
     """List presentations delegate scalar values to the shared bullet-list renderer."""
     ConsoleInteraction().tool_result(
-        '["first",2,true,null]',
+        tool_output(["first", 2, True, None]),
         ToolResultPresentationSpec(kind=ToolResultPresentation.LIST),
     )
 
@@ -626,7 +664,7 @@ def test_content_writes_only_highlighted_text_without_metadata(capsys):
 def test_tool_result_pretty_prints_explicit_nested_json(capsys):
     """JSON presentations can select and render a nested value."""
     ConsoleInteraction().tool_result(
-        '{"result":{"ready":true}}',
+        tool_output({"result": {"ready": True}}),
         ToolResultPresentationSpec(
             kind=ToolResultPresentation.JSON,
             value_path=("result",),
@@ -642,7 +680,7 @@ def test_tool_result_pretty_prints_explicit_nested_json(capsys):
 def test_tool_result_falls_back_to_the_root_for_an_invalid_value_path(capsys, result):
     """Missing or non-mapping presentation paths preserve the complete result."""
     ConsoleInteraction().tool_result(
-        result,
+        tool_output(json.loads(result)),
         ToolResultPresentationSpec(
             kind=ToolResultPresentation.JSON,
             value_path=("missing",),
@@ -655,7 +693,7 @@ def test_tool_result_falls_back_to_the_root_for_an_invalid_value_path(capsys, re
 def test_tool_result_table_without_columns_falls_back_to_json(capsys):
     """A table lacking column declarations remains visible as structured JSON."""
     ConsoleInteraction().tool_result(
-        '[{"name":"loop"}]',
+        tool_output([{"name": "loop"}]),
         ToolResultPresentationSpec(kind=ToolResultPresentation.TABLE),
     )
 

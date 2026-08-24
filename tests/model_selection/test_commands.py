@@ -78,10 +78,9 @@ def test_backend_command_reports_a_catalog_failure_as_an_unavailable_backend():
 
     manager.call("backend")
 
-    interaction.error.assert_called_once_with(
-        "Backend is unavailable: Could not list available models: offline"
-    )
-    interaction.warning.assert_not_called()
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "backend.unavailable"
+    assert problem.detail == "Could not list available models: offline"
     selection.select_fallback.assert_not_called()
 
 
@@ -150,7 +149,7 @@ def test_model_commands_report_empty_invalid_and_failed_catalogs():
     manager.call("models")
     manager.call("model", "missing")
     interaction.info.assert_called_once_with("No models available.")
-    assert "Model 'missing' is not available" in interaction.warning.call_args.args[0]
+    assert "Model 'missing' is not available" in interaction.report.call_args.args[0].detail
 
     selection.available.side_effect = BackendConnectionError(
         "offline",
@@ -158,4 +157,4 @@ def test_model_commands_report_empty_invalid_and_failed_catalogs():
         operation="list_models",
     )
     manager.call("models")
-    assert "Could not list available models: offline" in interaction.warning.call_args.args[0]
+    assert "Could not list available models: offline" in interaction.report.call_args.args[0].detail

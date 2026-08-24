@@ -1,5 +1,6 @@
 """Provide tools for accessing files and folders on the local disk."""
 
+import logging
 import shutil
 import tempfile
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Annotated, Literal
 from pydantic import Field
 
 from .. import constants
+from ..errors import Problem, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, FileTarget, Operation, OperationPlan
 from ..tooling import ToolContext, tool
@@ -21,6 +23,8 @@ from ..utils import (
     sha256_digest,
 )
 from .models import FileContentResult, FolderEntry
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _write_preview(path: Path, content: str) -> str:
@@ -121,12 +125,17 @@ def list_folder(
         bool,
         Field(description="Whether to include entries in nested folders."),
     ] = False,
-) -> list[FolderEntry] | str:
+) -> list[FolderEntry] | Problem:
     """List selected, non-ignored entries in a folder on the local disk."""
     try:
         folder = Path(path).resolve()
         if is_path_ignored(folder):
-            return f"Error listing folder: Path '{path}' is ignored."
+            return Problem(
+                code="filesystem.path_ignored",
+                title="Folder cannot be listed",
+                detail=f"Path '{path}' is ignored.",
+                operation="list_folder",
+            )
         entries = iter_visible_paths(folder, recursive)
         result = sorted(
             (
@@ -143,7 +152,14 @@ def list_folder(
         context.observe_directory(folder)
         return result
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-        return f"Error listing folder: {exc}"
+        problem = Problem.from_exception(
+            exc,
+            code="filesystem.list_failed",
+            title="Could not list folder",
+            operation="list_folder",
+        )
+        log_problem(_LOGGER, problem, exc)
+        return problem
 
 
 @tool(
@@ -172,7 +188,7 @@ def read_text_file(
             le=constants.MAX_TOOL_CONTENT_BYTES,
         ),
     ] = constants.MAX_TOOL_CONTENT_BYTES,
-) -> FileContentResult | str:
+) -> FileContentResult | str | Problem:
     """Read a bounded, resumable portion of a UTF-8 text file."""
     try:
         file_path = Path(path)
@@ -193,8 +209,20 @@ def read_text_file(
         return result
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         if str(exc) == "Content appears to be binary.":
-            return f"Error reading file: File '{path}' appears to be binary."
-        return f"Error reading file: {exc}"
+            return Problem(
+                code="filesystem.binary_file",
+                title="Could not read text file",
+                detail=f"File '{path}' appears to be binary.",
+                operation="read_text_file",
+            )
+        problem = Problem.from_exception(
+            exc,
+            code="filesystem.read_failed",
+            title="Could not read file",
+            operation="read_text_file",
+        )
+        log_problem(_LOGGER, problem, exc)
+        return problem
 
 
 @tool(
@@ -205,7 +233,7 @@ def write_text_file(
     context: ToolContext,
     path: Annotated[str, Field(description="Path to the text file to write.")],
     content: Annotated[str, Field(description="Content to write to the file.")],
-) -> str:
+) -> str | Problem:
     """Write content to a file on the local disk."""
     temporary_path = None
     try:
@@ -240,7 +268,14 @@ def write_text_file(
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
-        return f"Error writing to file: {exc}"
+        problem = Problem.from_exception(
+            exc,
+            code="filesystem.write_failed",
+            title="Could not write file",
+            operation="write_text_file",
+        )
+        log_problem(_LOGGER, problem, exc)
+        return problem
 
 
 @tool(
@@ -253,7 +288,7 @@ def delete_path(
         str,
         Field(description="Path to the file, symbolic link, or folder to permanently delete."),
     ],
-) -> str:
+) -> str | Problem:
     """Permanently delete a file, symbolic link, or folder tree from the local disk."""
     try:
         target = Path(path)
@@ -263,10 +298,27 @@ def delete_path(
         elif kind in {"file", "symbolic link"}:
             target.unlink()
         elif target.exists():
-            return f"Error deleting path: Path '{path}' is not a file, symbolic link, or folder."
+            return Problem(
+                code="filesystem.unsupported_path",
+                title="Could not delete path",
+                detail=f"Path '{path}' is not a file, symbolic link, or folder.",
+                operation="delete_path",
+            )
         else:
-            return f"Error deleting path: Path '{path}' does not exist."
+            return Problem(
+                code="filesystem.path_missing",
+                title="Could not delete path",
+                detail=f"Path '{path}' does not exist.",
+                operation="delete_path",
+            )
         context.invalidate_instructions(target)
         return f"Successfully deleted path '{path}'."
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-        return f"Error deleting path: {exc}"
+        problem = Problem.from_exception(
+            exc,
+            code="filesystem.delete_failed",
+            title="Could not delete path",
+            operation="delete_path",
+        )
+        log_problem(_LOGGER, problem, exc)
+        return problem

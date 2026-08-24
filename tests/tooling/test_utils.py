@@ -6,13 +6,14 @@ from typing import Annotated
 import pytest
 from pydantic import BaseModel, Field
 
+from loop import Problem
 from loop.tooling import (
     ToolContext,
     ToolRegistrationError,
     get_tool_arguments_model,
     get_tool_description,
     get_tool_schema,
-    serialize_tool_error,
+    serialize_tool_problem,
     serialize_tool_result,
     takes_tool_context,
 )
@@ -165,9 +166,15 @@ def test_serialize_tool_result_supports_strings_models_and_json_values():
     class Result(BaseModel):
         value: int
 
-    assert serialize_tool_result("plain") == "plain"
-    assert json.loads(serialize_tool_result(Result(value=4))) == {"value": 4}
-    assert json.loads(serialize_tool_result({"ready": True})) == {"ready": True}
+    assert json.loads(serialize_tool_result("plain")) == {"ok": True, "result": "plain"}
+    assert json.loads(serialize_tool_result(Result(value=4))) == {
+        "ok": True,
+        "result": {"value": 4},
+    }
+    assert json.loads(serialize_tool_result({"ready": True})) == {
+        "ok": True,
+        "result": {"ready": True},
+    }
 
 
 def test_serialize_tool_result_rejects_non_json_values():
@@ -176,18 +183,24 @@ def test_serialize_tool_result_rejects_non_json_values():
         serialize_tool_result(object())
 
 
-def test_serialize_tool_error_includes_kind_message_and_details():
-    """Structured errors contain stable required fields and arbitrary serializable details."""
-    assert json.loads(
-        serialize_tool_error("invalid_arguments", "Invalid payload.", details=[{"field": "value"}])
-    ) == {
-        "error": "invalid_arguments",
-        "message": "Invalid payload.",
-        "details": [{"field": "value"}],
+def test_serialize_tool_problem_includes_the_complete_problem():
+    """Failed result envelopes retain the complete structured problem contract."""
+    problem = Problem(
+        code="tool.invalid_arguments",
+        title="Invalid arguments",
+        detail="Invalid payload.",
+        instance="err_test",
+        metadata={"fields": [{"field": "value"}]},
+    )
+
+    assert json.loads(serialize_tool_problem(problem)) == {
+        "ok": False,
+        "problem": problem.model_dump(mode="json"),
     }
 
 
-def test_serialize_tool_error_rejects_non_json_details():
-    """Unsupported detail values preserve the JSON encoder's explicit failure."""
-    with pytest.raises(TypeError):
-        serialize_tool_error("failure", "Failed.", detail=object())
+def test_serialize_tool_result_treats_problems_as_failures():
+    """Returning a problem from a tool selects the failed result envelope."""
+    problem = Problem(code="tool.failed", title="Failed", detail="No result.")
+
+    assert json.loads(serialize_tool_result(problem))["problem"]["code"] == "tool.failed"

@@ -93,6 +93,8 @@ __all__ = [
     "PresetReplacementPreview",
     "PresetRule",
     "PresetSource",
+    "Problem",
+    "ProblemException",
     "ProcessBoundary",
     "ProcessTarget",
     "ProjectPathCompletionAdapter",
@@ -159,6 +161,7 @@ __all__ = [
     "is_path_ignored",
     "iter_visible_paths",
     "list_folder",
+    "log_problem",
     "manage_skills",
     "normalize_session_name",
     "read_cached_content",
@@ -215,6 +218,7 @@ from .completion import (
     SchemaCompletionState,
 )
 from .constants import OMIT, Omit
+from .errors import Problem, ProblemException, log_problem
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop
 from .mentions import (

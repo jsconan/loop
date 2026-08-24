@@ -116,7 +116,7 @@ def test_permissions_reload_reports_invalid_policy_without_replacing_active_poli
     manager.call("permissions", "reload")
 
     assert permissions.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
-    interaction.error.assert_called_once()
+    interaction.report.assert_called_once()
     assert "Keeping" in interaction.warning.call_args.args[0]
     assert "Retained" in interaction.info.call_args.args[0]
 
@@ -267,7 +267,7 @@ def test_permissions_command_rejects_every_malformed_branch(tmp_path):
     )
     for arguments in invalid:
         manager.call("permissions", arguments)
-        assert "Usage: /permissions" in interaction.warning.call_args.args[0]
+        assert "Usage: /permissions" in interaction.report.call_args.args[0].detail
 
 
 def complete(completer: CompletionManager, text: str):

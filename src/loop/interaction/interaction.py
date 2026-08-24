@@ -8,6 +8,7 @@ from typing import Any, Literal
 from prompt_toolkit.completion import Completer
 
 from .. import constants
+from ..errors import Problem
 from ..models import RAW_TOOL_RESULT_PRESENTATION, RunMetrics, ToolResultPresentationSpec
 
 
@@ -88,6 +89,14 @@ class Interaction(ABC):
         Args:
             delta (str): Incremental answer text to display.
             start (bool): Whether this is the first answer delta in the response.
+        """
+
+    @abstractmethod
+    def report(self, problem: Problem) -> None:
+        """Display a structured application problem.
+
+        Args:
+            problem (Problem): Safe problem to present consistently.
         """
 
     @abstractmethod

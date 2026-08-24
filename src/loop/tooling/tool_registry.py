@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
 from ..constants import OMIT, Omit
+from ..errors import Problem
 from ..interaction import Interaction
 from ..models import (
     ToolDefinition,
@@ -21,7 +22,7 @@ from ..utils import callable_name
 from .context import ToolContext
 from .models import ToolRegistrationError
 from .tool import Tool, ToolRegistration
-from .utils import serialize_tool_error
+from .utils import serialize_tool_problem
 
 
 class ToolRegistry:
@@ -240,7 +241,9 @@ class ToolRegistry:
         """
         tool = self._tools.get(name)
         if tool is None:
-            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available."), 0
+            return self._problem(
+                "tool.unknown", "Tool unavailable", f"Tool '{name}' is not available.", name
+            ), 0
         validated, error = tool.validate_arguments(arguments)
         if error is not None:
             return error, 0
@@ -248,7 +251,7 @@ class ToolRegistry:
         try:
             plan = tool.plan(validated)
         except ValueError as exc:
-            return serialize_tool_error("operation_planning_failed", str(exc)), 0
+            return self._problem("tool.planning_failed", "Tool planning failed", str(exc), name), 0
         denied = self._authorize(tool, plan.operations, interaction, active_permissions)
         if denied is not None:
             return denied, 0
@@ -325,7 +328,9 @@ class ToolRegistry:
         """
         tool = self._tools.get(name)
         if tool is None:
-            return serialize_tool_error("unknown_tool", f"Tool '{name}' is not available."), 0
+            return self._problem(
+                "tool.unknown", "Tool unavailable", f"Tool '{name}' is not available.", name
+            ), 0
         validated, error = tool.validate_arguments(arguments)
         if error is not None:
             return error, 0
@@ -333,7 +338,7 @@ class ToolRegistry:
         try:
             plan = tool.plan(validated)
         except ValueError as exc:
-            return serialize_tool_error("operation_planning_failed", str(exc)), 0
+            return self._problem("tool.planning_failed", "Tool planning failed", str(exc), name), 0
         denied = self._authorize(tool, plan.operations, interaction, active_permissions)
         if denied is not None:
             return denied, 0
@@ -373,7 +378,9 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return ToolExecutionResult(
-                serialize_tool_error("unknown_tool", f"Tool '{name}' is not available.")
+                self._problem(
+                    "tool.unknown", "Tool unavailable", f"Tool '{name}' is not available.", name
+                )
             )
         try:
             validated = parse_model_arguments(tool.arguments_model, arguments).model_dump()
@@ -384,16 +391,23 @@ class ToolRegistry:
                 else [{"type": "argument_binding", "msg": str(exc)}]
             )
             return ToolExecutionResult(
-                serialize_tool_error(
-                    "invalid_arguments",
-                    f"Invalid arguments for tool '{name}'.",
-                    details=details,
+                serialize_tool_problem(
+                    Problem(
+                        code="tool.invalid_arguments",
+                        title="Invalid tool arguments",
+                        detail=f"Invalid arguments for tool '{name}'.",
+                        severity="warning",
+                        operation=name,
+                        metadata={"fields": details},
+                    )
                 )
             )
         try:
             plan = tool.plan(validated)
         except ValueError as exc:
-            return ToolExecutionResult(serialize_tool_error("operation_planning_failed", str(exc)))
+            return ToolExecutionResult(
+                self._problem("tool.planning_failed", "Tool planning failed", str(exc), name)
+            )
         context = self._context_for(
             tool,
             interaction,
@@ -413,11 +427,23 @@ class ToolRegistry:
         active_interaction = interaction if interaction is not None else self._interaction
         result = permission_manager.authorize(operations, interaction=active_interaction)
         if result.decision is Decision.DENY:
-            return serialize_tool_error(
-                "tool_call_denied",
-                f"Tool '{tool.name}' was not executed: {result.reason}",
+            return serialize_tool_problem(
+                Problem(
+                    code="tool.denied",
+                    title="Tool call denied",
+                    detail=f"Tool '{tool.name}' was not executed: {result.reason}",
+                    severity="warning",
+                    operation=tool.name,
+                )
             )
         return None
+
+    @staticmethod
+    def _problem(code: str, title: str, detail: str, operation: str) -> str:
+        """Serialize one tool problem with its operation context."""
+        return serialize_tool_problem(
+            Problem(code=code, title=title, detail=detail, operation=operation)
+        )
 
     def _context_for(
         self,

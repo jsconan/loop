@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from .. import constants
 from ..backend import BackendError
+from ..errors import Problem
 from ..interaction import Interaction
 from ..models import ModelAssignment, ModelInfo
 
@@ -189,7 +190,14 @@ class ModelSelection:
         try:
             models = self.available()
         except BackendError as error:
-            interaction.error(f"Could not list available models: {error}")
+            interaction.report(
+                Problem.from_exception(
+                    error,
+                    code="backend.model_listing_failed",
+                    title="Could not list available models",
+                    operation="list_models",
+                )
+            )
             return False
         if not models:
             interaction.warning("The backend reported no available models.")

@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 import yaml
 
 from .. import constants
+from ..errors import Problem
 from ..utils import ShutdownRequested, canonical_path, sha256_digest
 from .models import (
     Action,
@@ -968,7 +969,15 @@ class PermissionManager:
         retain_on_failure: bool,
     ) -> PermissionLoadResult:
         """Report one failure and return the user's selected recovery outcome."""
-        self._interaction.error(str(error))
+        self._interaction.report(
+            Problem.from_exception(
+                error,
+                code="permission.configuration_invalid",
+                title="Invalid permission policy",
+                operation="load_permission_policy",
+                metadata={"path": error.path},
+            )
+        )
         continue_description = (
             "Keep the current permission policy"
             if retain_on_failure
@@ -1005,7 +1014,15 @@ class PermissionManager:
     def _report_configuration_error(self, error: PermissionConfigurationError) -> None:
         """Report an automatically recovered configuration failure."""
         if self._interaction is not None:
-            self._interaction.error(str(error))
+            self._interaction.report(
+                Problem.from_exception(
+                    error,
+                    code="permission.configuration_invalid",
+                    title="Invalid permission policy",
+                    operation="load_permission_policy",
+                    metadata={"path": error.path},
+                )
+            )
             self._interaction.warning("Recovered according to the automatic permission policy.")
         else:
             _LOGGER.warning("%s; recovered according to the automatic permission policy", error)

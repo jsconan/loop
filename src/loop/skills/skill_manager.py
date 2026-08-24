@@ -263,8 +263,10 @@ class SkillManager:
         skill = self._skills_by_name.get(name)
         if skill is None:
             return SkillOperationError(
-                error="unknown_skill",
-                message=f"Skill '{name}' is not available.",
+                code="skill.unknown",
+                title="Skill unavailable",
+                detail=f"Skill '{name}' is not available.",
+                operation="activate_skill",
             )
         instructions_updated = skill.location not in self._activated
         if instructions_updated:
@@ -293,8 +295,10 @@ class SkillManager:
         skill = self._skills_by_name.get(name)
         if skill is None:
             return SkillOperationError(
-                error="unknown_skill",
-                message=f"Skill '{name}' is not available.",
+                code="skill.unknown",
+                title="Skill unavailable",
+                detail=f"Skill '{name}' is not available.",
+                operation="deactivate_skill",
             )
         instructions_updated = skill.location in self._activated
         self._activated.pop(skill.location, None)
@@ -380,13 +384,17 @@ class SkillManager:
         skill = self._skills_by_name.get(name)
         if skill is None:
             return SkillOperationError(
-                error="unknown_skill",
-                message=f"Skill '{name}' is not available.",
+                code="skill.unknown",
+                title="Skill unavailable",
+                detail=f"Skill '{name}' is not available.",
+                operation="list_skill_resources",
             )
         if skill.location not in self._activated:
             return SkillOperationError(
-                error="skill_not_active",
-                message=f"Skill '{name}' must be activated before loading its resources.",
+                code="skill.not_active",
+                title="Skill is not active",
+                detail=f"Skill '{name}' must be activated before loading its resources.",
+                operation="list_skill_resources",
             )
         root = skill.location.parent.resolve()
         resources = []
@@ -431,7 +439,7 @@ class SkillManager:
             SkillResourceContentResponse: Text or base64 resource content, or a structured error.
         """
         listed = self.list_resources(name)
-        if "error" in listed:
+        if isinstance(listed, SkillOperationError):
             return listed
         root = Path(listed["skill_root"])
         candidate = (root / resource_path).resolve()
@@ -441,8 +449,10 @@ class SkillManager:
         )
         if not allowed or not candidate.is_file():
             return SkillOperationError(
-                error="invalid_skill_resource",
-                message="Resource must be a file beneath references, scripts, or assets.",
+                code="skill.invalid_resource",
+                title="Invalid skill resource",
+                detail="Resource must be a file beneath references, scripts, or assets.",
+                operation="read_skill_resource",
             )
         try:
             bounded = read_bounded_text(

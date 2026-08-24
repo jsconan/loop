@@ -11,6 +11,7 @@ from .completion import (
     CommandCompletionAdapter,
     CompletionManager,
 )
+from .errors import Problem
 from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
 from .model_selection import ModelCommands, ModelSelection
@@ -392,7 +393,14 @@ class Loop:
             try:
                 context = self._mention_manager.resolve(user_input)
             except (OSError, UnicodeError, ValueError) as error:
-                self._interaction.error(str(error))
+                self._interaction.report(
+                    Problem.from_exception(
+                        error,
+                        code="mention.resolution_failed",
+                        title="Could not resolve mention",
+                        operation="resolve_mention",
+                    )
+                )
                 continue
             self._session_manager.add_user_message(user_input, context=context)
 

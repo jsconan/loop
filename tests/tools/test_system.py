@@ -39,11 +39,18 @@ def fresh_tool_registry():
 
 def run_command(command):
     """Dispatch the context-aware command tool."""
-    return tool_registry.call(
+    output = tool_registry.call(
         "run_command",
         json.dumps({"command": command}),
         interaction=ConsoleInteraction(),
     )
+    payload = json.loads(output)
+    return payload["result"] if payload["ok"] else output
+
+
+def problem(output: str):
+    """Return the problem from a failed tool result envelope."""
+    return json.loads(output)["problem"]
 
 
 class ImmediateThread:
@@ -93,7 +100,7 @@ def test_run_command_requires_an_affirmative_confirmation(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", popen)
 
-    assert '"error": "tool_call_denied"' in run_command("echo hello")
+    assert problem(run_command("echo hello"))["code"] == "tool.denied"
     confirm.assert_called_once()
     assert "process.execute" in confirm.call_args.args[0]
     assert "echo hello" in confirm.call_args.args[0]
@@ -142,7 +149,7 @@ def test_run_command_rejects_empty_malformed_or_shell_syntax(command):
         interaction=ConsoleInteraction(),
     )
 
-    assert '"error": "operation_planning_failed"' in result
+    assert problem(result)["code"] == "tool.planning_failed"
 
 
 @pytest.mark.parametrize(
@@ -171,7 +178,8 @@ def test_run_command_fails_closed_without_an_authorized_process_target():
     """Direct execution cannot parse or execute an unplanned command."""
     result = run_command_tool(ToolContext(ConsoleInteraction(), "run_command"), "echo hello")
 
-    assert result == "Error running command: Authorized process target is missing."
+    assert result.code == "process.execution_failed"
+    assert result.detail == "Authorized process target is missing."
 
 
 def test_successful_run_command_invalidates_instruction_scope(monkeypatch, tmp_path, confirmed):
@@ -187,7 +195,7 @@ def test_successful_run_command_invalidates_instruction_scope(monkeypatch, tmp_p
         instructions_manager=manager,
     )
 
-    assert result == "ok"
+    assert json.loads(result) == {"ok": True, "result": "ok"}
     manager.invalidate.assert_called_once_with(None)
 
 
@@ -198,9 +206,13 @@ def test_run_command_reports_exit_code_stdout_and_stderr(monkeypatch, confirmed)
     )
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
 
-    assert run_command("missing") == (
-        "Command failed with code 127. Output: some output Error: command not found"
-    )
+    failure = problem(run_command("missing"))
+    assert failure["code"] == "process.nonzero_exit"
+    assert failure["metadata"] == {
+        "exit_code": 127,
+        "stdout": "some output",
+        "stderr": "command not found",
+    }
 
 
 def test_run_command_caps_each_output_stream_while_draining_it(monkeypatch, confirmed):
@@ -214,10 +226,10 @@ def test_run_command_caps_each_output_stream_while_draining_it(monkeypatch, conf
 
     result = run_command("verbose-command")
 
-    prefix = "Command failed with code 2. Output: "
-    separator = " Error: "
-    assert result.startswith(prefix + "x" * MAX_OUTPUT_CHARS + separator)
-    assert result.endswith("y" * MAX_OUTPUT_CHARS)
+    failure = problem(result)
+    assert failure["code"] == "process.nonzero_exit"
+    assert failure["metadata"]["stdout"] == "x" * MAX_OUTPUT_CHARS
+    assert failure["metadata"]["stderr"] == "y" * MAX_OUTPUT_CHARS
     assert process.stdout.read.call_count == 3
     assert process.stderr.read.call_count == 3
 
@@ -232,7 +244,7 @@ def test_run_command_kills_a_posix_process_group_after_timeout(monkeypatch, conf
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", killpg)
 
-    assert run_command("sleep 60") == "Command timed out after 30 seconds."
+    assert problem(run_command("sleep 60"))["code"] == "process.timeout"
     assert process.wait.call_args_list == [call(timeout=30), call()]
     killpg.assert_called_once_with(123, 9)
 
@@ -245,7 +257,7 @@ def test_run_command_ignores_a_process_that_disappears_during_posix_cleanup(monk
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock(side_effect=ProcessLookupError))
 
-    assert run_command("sleep 60") == "Command timed out after 30 seconds."
+    assert problem(run_command("sleep 60"))["code"] == "process.timeout"
 
 
 def test_run_command_kills_only_the_process_on_non_posix_systems(monkeypatch, confirmed):
@@ -256,7 +268,7 @@ def test_run_command_kills_only_the_process_on_non_posix_systems(monkeypatch, co
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.name", "nt")
 
-    assert run_command("sleep 60") == "Command timed out after 30 seconds."
+    assert problem(run_command("sleep 60"))["code"] == "process.timeout"
     process.kill.assert_called_once_with()
 
 
@@ -269,7 +281,7 @@ def test_run_command_cleans_up_when_wait_raises(monkeypatch, confirmed):
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", killpg)
 
-    assert run_command("broken") == "Error running command: wait failed"
+    assert problem(run_command("broken"))["detail"] == "wait failed"
     killpg.assert_called_once_with(process.pid, 9)
     assert all(reader.joined for reader in ImmediateThread.instances)
 
@@ -295,7 +307,7 @@ def test_run_command_cleans_up_readers_that_started_before_start_failure(monkeyp
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock())
 
-    assert run_command("broken") == "Error running command: thread failed"
+    assert problem(run_command("broken"))["detail"] == "thread failed"
     assert FailingSecondThread.instances[0].joined
     assert not FailingSecondThread.instances[1].joined
 
@@ -306,4 +318,4 @@ def test_run_command_reports_process_creation_errors(monkeypatch, confirmed):
         "loop.tools.system.subprocess.Popen", MagicMock(side_effect=PermissionError("denied"))
     )
 
-    assert run_command("restricted") == "Error running command: denied"
+    assert problem(run_command("restricted"))["detail"] == "denied"

@@ -357,7 +357,7 @@ class InstructionsManager:
         with self._lock:
             self.prepare()
             result = self._skill_manager.activate(name)
-            if "error" in result:
+            if isinstance(result, SkillOperationError):
                 return result
             return self._commit_activation(result)
 
@@ -373,7 +373,7 @@ class InstructionsManager:
         with self._lock:
             self.prepare()
             result = self._skill_manager.deactivate(name)
-            if "error" not in result and result["instructions_updated"]:
+            if not isinstance(result, SkillOperationError) and result["instructions_updated"]:
                 self._instructions = self._build_instructions()
                 self._generation += 1
             return result
@@ -532,10 +532,11 @@ class InstructionsManager:
             if result["instructions_updated"]:
                 self._skill_manager.deactivate(result["name"])
             return SkillOperationError(
-                error="instruction_budget_exceeded",
-                message=f"Activating skill '{result['name']}' exceeds the instruction budget.",
-                max_bytes=self._max_bytes,
-                required_bytes=size,
+                code="skill.instruction_budget_exceeded",
+                title="Instruction budget exceeded",
+                detail=f"Activating skill '{result['name']}' exceeds the instruction budget.",
+                operation="activate_skill",
+                metadata={"max_bytes": self._max_bytes, "required_bytes": size},
             )
         if result["instructions_updated"]:
             self._instructions = instructions

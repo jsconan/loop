@@ -17,6 +17,7 @@ from rich.columns import Columns
 from rich.console import Console
 from rich.constrain import Constrain
 from rich.json import JSON
+from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.syntax import Syntax
 from rich.table import Table
@@ -24,6 +25,7 @@ from rich.text import Text
 from rich.tree import Tree
 
 from .. import constants
+from ..errors import Problem
 from ..models import (
     RAW_TOOL_RESULT_PRESENTATION,
     RunMetrics,
@@ -213,6 +215,19 @@ class ConsoleInteraction(Interaction):
         self._console.print(
             delta, end="", style="bold", markup=False, highlight=False, soft_wrap=True
         )
+
+    def report(self, problem: Problem) -> None:
+        """Write a structured problem to the terminal.
+
+        Args:
+            problem (Problem): Safe problem to render with a stable reference.
+        """
+        color = "yellow" if problem.severity == "warning" else "red"
+        content = Text(problem.detail)
+        content.append(f"\n\nReference: {problem.instance}", style="dim")
+        if problem.retryable:
+            content.append("\nThis operation can be retried.", style="dim")
+        self._console.print(Panel(content, title=problem.title, border_style=color))
 
     def error(self, message: str) -> None:
         """Write an error to the terminal.
@@ -407,18 +422,13 @@ class ConsoleInteraction(Interaction):
             presentation (ToolResultPresentationSpec): Semantic presentation requested by the
                 tool execution. Defaults to generic raw presentation.
         """
-        try:
-            value = json.loads(result)
-        except json.JSONDecodeError:
-            self.info(result)
+        value = json.loads(result)
+        if not isinstance(value, dict) or not isinstance(value.get("ok"), bool):
+            raise TypeError("Tool result must use the application result envelope.")
+        if not value["ok"]:
+            self.report(Problem.model_validate(value.get("problem")))
             return
-
-        if isinstance(value, dict) and "error" in value and "message" in value:
-            self.error(str(value["message"]))
-            details = {key: item for key, item in value.items() if key not in {"error", "message"}}
-            if details:
-                self.json(details)
-            return
+        value = value.get("result")
         selected = self._value_at(value, presentation.value_path)
         if presentation.title:
             self.info(presentation.title)

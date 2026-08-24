@@ -26,6 +26,13 @@ from loop.tooling import tool as declare_tool
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
 
 
+def result_value(output: str):
+    """Return the successful value from a tool result envelope."""
+    payload = json.loads(output)
+    assert payload["ok"] is True
+    return payload["result"]
+
+
 def planner_for(action: Action):
     """Return a concrete operation planner for an authority-bearing test tool."""
 
@@ -81,7 +88,7 @@ def test_constructor_registers_in_order_and_exposes_sorted_snapshots():
     tools.clear()
     names.clear()
     assert registry.names == ["alpha", "zebra"]
-    assert registry.call("zebra", "{}") == "zebra"
+    assert result_value(registry.call("zebra", "{}")) == "zebra"
 
 
 def test_register_resolves_a_tool_from_declared_metadata():
@@ -121,7 +128,7 @@ def test_register_accepts_undeclared_functions_with_derived_defaults():
     registry = ToolRegistry([ordinary])
 
     assert registry.names == ["ordinary"]
-    assert registry.call("ordinary", '{"value": 3}') == "3"
+    assert result_value(registry.call("ordinary", '{"value": 3}')) == 3
 
 
 def test_register_overrides_metadata_for_only_one_container():
@@ -265,7 +272,7 @@ def test_register_accepts_callable_objects():
     registry = ToolRegistry([Multiplier()])
 
     assert registry.names == ["Multiplier"]
-    assert registry.call("Multiplier", '{"number": 3}') == "6"
+    assert result_value(registry.call("Multiplier", '{"number": 3}')) == 6
 
 
 def test_register_accepts_partials_with_explicit_local_metadata():
@@ -277,7 +284,7 @@ def test_register_accepts_partials_with_explicit_local_metadata():
     registry = ToolRegistry()
     registry.register(partial(add, 2), name="add_two", description="Add two to a number.")
 
-    assert registry.call("add_two", '{"second": 3}') == "5"
+    assert result_value(registry.call("add_two", '{"second": 3}')) == 5
 
 
 def test_register_dispatches_async_callable_objects_only_through_async_calls():
@@ -291,8 +298,8 @@ def test_register_dispatches_async_callable_objects_only_through_async_calls():
 
     registry = ToolRegistry([AsyncMultiplier()])
 
-    assert "async_tool_in_sync_loop" in registry.call("AsyncMultiplier", '{"number": 3}')
-    assert asyncio.run(registry.call_async("AsyncMultiplier", '{"number": 3}')) == "6"
+    assert "tool.async_required" in registry.call("AsyncMultiplier", '{"number": 3}')
+    assert result_value(asyncio.run(registry.call_async("AsyncMultiplier", '{"number": 3}'))) == 6
 
 
 def test_definitions_preserve_registration_order():
@@ -328,13 +335,11 @@ def test_interaction_property_can_be_replaced_and_cleared():
     assert registry.permission_manager is replacement
 
 
-def test_call_reports_unknown_tools(monkeypatch):
+def test_call_reports_unknown_tools():
     """Synchronous routing serializes an unknown-tool error at the registry boundary."""
-    serialize = Mock(return_value="unknown")
-    monkeypatch.setattr(tool_registry_module, "serialize_tool_error", serialize)
-
-    assert ToolRegistry().call("missing", "{}") == "unknown"
-    serialize.assert_called_once_with("unknown_tool", "Tool 'missing' is not available.")
+    problem = json.loads(ToolRegistry().call("missing", "{}"))["problem"]
+    assert problem["code"] == "tool.unknown"
+    assert problem["detail"] == "Tool 'missing' is not available."
 
 
 def test_call_routes_arguments_and_runtime_context():
@@ -353,7 +358,9 @@ def test_call_routes_arguments_and_runtime_context():
     manager = Mock(spec=InstructionsManager)
 
     assert (
-        registry.call("calculate", "{}", interaction=runtime, instructions_manager=manager)
+        result_value(
+            registry.call("calculate", "{}", interaction=runtime, instructions_manager=manager)
+        )
         == "calculate"
     )
     context = contexts[0]
@@ -405,7 +412,7 @@ def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
 
     output, duration = registry.call_with_timing("calculate", '{"number": 3}')
 
-    assert output == "3"
+    assert result_value(output) == 3
     assert duration == 2
     interaction.confirm.assert_called_once()
     recorder.record_authorization.assert_called_once()
@@ -429,11 +436,11 @@ def test_call_command_parses_model_parameters_before_shared_dispatch():
     registry.register(describe)
     registry.register(has_no_policy)
 
-    assert json.loads(registry.command("describe", ("3", "label=two words")).output) == {
+    assert result_value(registry.command("describe", ("3", "label=two words")).output) == {
         "count": 3,
         "label": "two words",
     }
-    assert registry.command("has_no_policy", ()).output == "true"
+    assert result_value(registry.command("has_no_policy", ()).output) is True
     permissions.authorize.assert_not_called()
 
 
@@ -448,7 +455,7 @@ def test_call_command_retains_dynamic_result_presentation():
 
     execution = ToolRegistry([describe]).command("describe", ("3",))
 
-    assert json.loads(execution.output) == {"count": 3}
+    assert result_value(execution.output) == {"count": 3}
     assert execution.presentation is presentation
 
 
@@ -467,18 +474,17 @@ def test_call_command_reports_unknown_tools_and_invalid_parameters():
 
     registry.register(invalid_plan)
 
-    assert "unknown_tool" in registry.command("missing", ()).output
-    assert "invalid_arguments" in registry.command("calculate", ("unknown=1",)).output
+    assert "tool.unknown" in registry.command("missing", ()).output
+    assert "tool.invalid_arguments" in registry.command("calculate", ("unknown=1",)).output
     assert "argument_binding" in registry.command("calculate", ("unknown=1",)).output
-    assert "invalid_arguments" in registry.command("calculate", ("not-an-integer",)).output
-    assert "operation_planning_failed" in registry.command("invalid_plan", ()).output
+    assert "tool.invalid_arguments" in registry.command("calculate", ("not-an-integer",)).output
+    assert "tool.planning_failed" in registry.command("invalid_plan", ()).output
 
 
-def test_call_async_reports_unknown_tools(monkeypatch):
+def test_call_async_reports_unknown_tools():
     """Asynchronous routing serializes an unknown-tool error at the registry boundary."""
-    monkeypatch.setattr(tool_registry_module, "serialize_tool_error", Mock(return_value="unknown"))
-
-    assert asyncio.run(ToolRegistry().call_async("missing", "{}")) == "unknown"
+    problem = json.loads(asyncio.run(ToolRegistry().call_async("missing", "{}")))["problem"]
+    assert problem["code"] == "tool.unknown"
 
 
 def test_call_async_routes_arguments_and_context():
@@ -497,7 +503,7 @@ def test_call_async_routes_arguments_and_context():
 
     result = asyncio.run(registry.call_async("calculate", "{}", interaction=interaction))
 
-    assert result == "calculate"
+    assert result_value(result) == "calculate"
     assert contexts[0].interaction is interaction
 
 
@@ -520,8 +526,8 @@ def test_call_async_returns_validation_and_permission_denials_before_invocation(
     invalid = asyncio.run(registry.call_async("calculate", "bad"))
     denied = asyncio.run(registry.call_async("calculate", '{"number": 1}'))
 
-    assert "invalid_arguments" in invalid
-    assert "tool_call_denied" in denied
+    assert "tool.invalid_arguments" in invalid
+    assert "tool.denied" in denied
 
 
 def test_sync_and_async_dispatch_report_operation_planning_failures():
@@ -542,8 +548,8 @@ def test_sync_and_async_dispatch_report_operation_planning_failures():
     sync_result, sync_duration = registry.call_with_timing("calculate", "{}")
     async_result, async_duration = asyncio.run(registry.call_with_timing_async("calculate", "{}"))
 
-    assert "operation_planning_failed" in sync_result
-    assert "operation_planning_failed" in async_result
+    assert "tool.planning_failed" in sync_result
+    assert "tool.planning_failed" in async_result
     assert sync_duration == async_duration == 0
     assert calls == []
 
@@ -570,7 +576,7 @@ def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
 
     output, duration = asyncio.run(registry.call_with_timing_async("calculate", '{"number": 3}'))
 
-    assert output == "3"
+    assert result_value(output) == 3
     assert duration == 2
     interaction.confirm.assert_called_once()
     recorder.record_authorization.assert_called_once()
@@ -579,9 +585,9 @@ def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
 @pytest.mark.parametrize(
     ("name", "arguments", "error"),
     [
-        ("missing", "{}", "unknown_tool"),
-        ("calculate", "bad", "invalid_arguments"),
-        ("calculate", '{"number": 1}', "tool_call_denied"),
+        ("missing", "{}", "tool.unknown"),
+        ("calculate", "bad", "tool.invalid_arguments"),
+        ("calculate", '{"number": 1}', "tool.denied"),
     ],
 )
 def test_call_with_timing_async_returns_zero_before_invocation(name, arguments, error, monkeypatch):

@@ -21,6 +21,20 @@ from loop.tools.files import write_text_file as write_text_file_tool
 tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
 
+def dispatched_value(output: str):
+    """Return a successful value while preserving failed envelopes for assertions."""
+    payload = json.loads(output)
+    if not payload["ok"]:
+        return output
+    result = payload["result"]
+    return result if isinstance(result, str) else json.dumps(result)
+
+
+def problem(output: str):
+    """Return the problem from a failed tool result envelope."""
+    return json.loads(output)["problem"]
+
+
 @pytest.fixture(autouse=True)
 def approve_tool_calls(monkeypatch, tmp_path):
     """Approve central permission prompts unless a case overrides the decision."""
@@ -34,28 +48,34 @@ def approve_tool_calls(monkeypatch, tmp_path):
 
 def write_text_file(path, content):
     """Dispatch the context-aware file-writing tool."""
-    return tool_registry.call(
-        "write_text_file",
-        json.dumps({"path": str(path), "content": content}),
-        interaction=ConsoleInteraction(),
+    return dispatched_value(
+        tool_registry.call(
+            "write_text_file",
+            json.dumps({"path": str(path), "content": content}),
+            interaction=ConsoleInteraction(),
+        )
     )
 
 
 def delete_path(path):
     """Dispatch the context-aware file-deletion tool."""
-    return tool_registry.call(
-        "delete_path",
-        json.dumps({"path": str(path)}),
-        interaction=ConsoleInteraction(),
+    return dispatched_value(
+        tool_registry.call(
+            "delete_path",
+            json.dumps({"path": str(path)}),
+            interaction=ConsoleInteraction(),
+        )
     )
 
 
 def read_text_file(path, **ranges):
     """Dispatch the context-aware file-reading tool."""
-    return tool_registry.call(
-        "read_text_file",
-        json.dumps({"path": str(path), **ranges}),
-        interaction=ConsoleInteraction(),
+    return dispatched_value(
+        tool_registry.call(
+            "read_text_file",
+            json.dumps({"path": str(path), **ranges}),
+            interaction=ConsoleInteraction(),
+        )
     )
 
 
@@ -66,10 +86,8 @@ def list_folder(path, entry_type="all", recursive=False):
         json.dumps({"path": str(path), "entry_type": entry_type, "recursive": recursive}),
         interaction=ConsoleInteraction(),
     )
-    try:
-        return json.loads(result)
-    except json.JSONDecodeError:
-        return result
+    payload = json.loads(result)
+    return payload["result"] if payload["ok"] else result
 
 
 def test_list_folder_filters_and_sorts_immediate_entries(tmp_path):
@@ -158,8 +176,8 @@ def test_list_folder_rejects_ignored_folder_as_traversal_root(tmp_path):
     git_result = list_folder(str(tmp_path / ".git"))
     private_result = list_folder(str(private))
 
-    assert git_result["error"] == "tool_call_denied"
-    assert private_result == f"Error listing folder: Path '{private}' is ignored."
+    assert problem(git_result)["code"] == "tool.denied"
+    assert problem(private_result)["code"] == "filesystem.path_ignored"
 
 
 def test_list_folder_retains_tool_level_ignored_path_protection(tmp_path):
@@ -170,9 +188,9 @@ def test_list_folder_retains_tool_level_ignored_path_protection(tmp_path):
     private.mkdir()
     context = ToolContext(ConsoleInteraction(), "list_folder")
 
-    assert list_folder_tool(context, str(private)) == (
-        f"Error listing folder: Path '{private}' is ignored."
-    )
+    result = list_folder_tool(context, str(private))
+    assert result.code == "filesystem.path_ignored"
+    assert str(private) in result.detail
 
 
 def test_list_folder_applies_ancestor_and_nested_ignore_files(tmp_path):
@@ -203,7 +221,7 @@ def test_list_folder_applies_ancestor_and_nested_ignore_files(tmp_path):
 
 def test_list_folder_reports_failures(tmp_path):
     """Listing reports an invalid folder as a readable tool result."""
-    assert list_folder(str(tmp_path / "missing")).startswith("Error listing folder:")
+    assert problem(list_folder(str(tmp_path / "missing")))["code"] == "filesystem.list_failed"
 
 
 def test_file_navigation_reports_successful_instruction_context_changes(tmp_path):
@@ -279,10 +297,10 @@ def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads
         "end_line": 1,
     }
     assert read_text_file(str(empty)) == f"File '{empty}' is empty."
-    assert read_text_file(str(binary)) == (
-        f"Error reading file: File '{binary}' appears to be binary."
+    assert problem(read_text_file(str(binary)))["code"] == "filesystem.binary_file"
+    assert (
+        problem(read_text_file(str(tmp_path / "missing.txt")))["code"] == "filesystem.read_failed"
     )
-    assert read_text_file(str(tmp_path / "missing.txt")).startswith("Error reading file:")
 
 
 def test_read_text_file_allows_explicit_reads_of_ignored_files(tmp_path, monkeypatch):
@@ -355,7 +373,7 @@ def test_read_text_file_rejects_byte_selection_and_reports_oversized_lines(tmp_p
     assert oversized["content"] == ""
     assert oversized["truncation_reason"] == "line_too_long"
     assert "next_start_line" not in oversized
-    assert invalid["error"] == "invalid_arguments"
+    assert invalid["problem"]["code"] == "tool.invalid_arguments"
     assert "start_byte" not in definition.parameters["properties"]
 
 
@@ -365,7 +383,7 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
     confirm = MagicMock(side_effect=[False, True])
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
-    assert '"error": "tool_call_denied"' in write_text_file(str(target), "blocked")
+    assert problem(write_text_file(str(target), "blocked"))["code"] == "tool.denied"
     assert not target.exists()
 
     assert write_text_file(str(target), "saved") == f"Successfully wrote to file '{target}'."
@@ -423,7 +441,7 @@ def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):
     """An invalid destination becomes a readable tool result."""
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     result = write_text_file(str(tmp_path / "missing" / "file.txt"), "content")
-    assert result.startswith("Error writing to file:")
+    assert problem(result)["code"] == "filesystem.write_failed"
 
 
 def test_write_text_file_removes_its_temporary_file_when_commit_fails(tmp_path, monkeypatch):
@@ -434,7 +452,7 @@ def test_write_text_file_removes_its_temporary_file_when_commit_fails(tmp_path, 
 
     result = write_text_file(target, "content")
 
-    assert result == "Error writing to file: commit failed"
+    assert problem(result)["detail"] == "commit failed"
     assert set(tmp_path.iterdir()) == {tmp_path / ".loop", target}
     assert target.read_text(encoding="utf-8") == "old"
 
@@ -457,7 +475,7 @@ def test_write_text_file_cancels_when_approved_target_changes(tmp_path, monkeypa
 
     result = write_text_file(target, "replacement")
 
-    assert result.startswith("Error writing to file: The target changed after approval")
+    assert problem(result)["detail"].startswith("The target changed after approval")
     assert target.read_text(encoding="utf-8") == "changed"
 
 
@@ -465,14 +483,14 @@ def test_write_executor_requires_authorized_state_and_existing_replacement(tmp_p
     """The executor fails closed without a plan or when a replacement disappears."""
     context = ToolContext(ConsoleInteraction(), "write_text_file")
     target = tmp_path / "target.txt"
-    assert write_text_file_tool(context, str(target), "new").startswith(
-        "Error writing to file: Authorized file-state precondition is missing"
+    assert write_text_file_tool(context, str(target), "new").detail.startswith(
+        "Authorized file-state precondition is missing"
     )
 
     target.write_text("old", encoding="utf-8")
     monkeypatch.setattr(Path, "is_file", lambda _path: False)
-    assert write_text_file(target, "new").startswith(
-        "Error writing to file: The target changed after approval"
+    assert problem(write_text_file(target, "new"))["detail"].startswith(
+        "The target changed after approval"
     )
 
 
@@ -483,7 +501,7 @@ def test_delete_path_requires_confirmation_and_removes_files(tmp_path, monkeypat
     confirm = MagicMock(side_effect=[False, True])
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
-    assert '"error": "tool_call_denied"' in delete_path(target)
+    assert problem(delete_path(target))["code"] == "tool.denied"
     assert target.exists()
 
     assert delete_path(target) == f"Successfully deleted path '{target}'."
@@ -535,13 +553,11 @@ def test_delete_path_can_delete_ignored_paths_and_rejects_unsupported_targets(
     assert delete_path(secret) == f"Successfully deleted path '{secret}'."
     assert not secret.exists()
     confirm.assert_called_once()
-    assert delete_path(tmp_path / "missing").startswith("Error deleting path:")
+    assert problem(delete_path(tmp_path / "missing"))["code"] == "filesystem.path_missing"
 
     fifo = tmp_path / "events"
     os.mkfifo(fifo)
-    assert delete_path(fifo) == (
-        f"Error deleting path: Path '{fifo}' is not a file, symbolic link, or folder."
-    )
+    assert problem(delete_path(fifo))["code"] == "filesystem.unsupported_path"
     assert fifo.exists()
 
 
@@ -552,5 +568,5 @@ def test_delete_path_reports_removal_failures(tmp_path, monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr(Path, "unlink", MagicMock(side_effect=OSError("access denied")))
 
-    assert delete_path(target) == "Error deleting path: access denied"
+    assert problem(delete_path(target))["detail"] == "access denied"
     assert target.exists()

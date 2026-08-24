@@ -11,7 +11,7 @@ __all__ = [
     "get_tool_description",
     "get_tool_schema",
     "is_async_callable",
-    "serialize_tool_error",
+    "serialize_tool_problem",
     "serialize_tool_result",
     "takes_tool_context",
     "tool",
@@ -27,7 +27,7 @@ from .utils import (
     get_tool_description,
     get_tool_schema,
     is_async_callable,
-    serialize_tool_error,
+    serialize_tool_problem,
     serialize_tool_result,
     takes_tool_context,
 )

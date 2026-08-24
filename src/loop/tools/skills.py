@@ -46,8 +46,8 @@ def _filter_fields(result: dict[str, Any], fields: tuple[str, ...]) -> dict[str,
 
 def _public_result(action: str, result: SkillOperationResult) -> PublicSkillOperationResult:
     """Return only fields required by the model-facing skill protocol."""
-    if "error" in result:
-        return _filter_fields(result, ("error", "message"))
+    if isinstance(result, SkillOperationError):
+        return result
     if action == "list":
         return {
             "skills": [
@@ -80,7 +80,7 @@ def _skill_result_presentation(
     result: Any,
 ) -> ToolResultPresentationSpec:
     """Select the presentation matching one completed skill action."""
-    if isinstance(result, dict) and "error" in result:
+    if isinstance(result, SkillOperationError):
         return ToolResultPresentationSpec()
     action = arguments["action"]
     if action == "list":
@@ -156,13 +156,18 @@ def manage_skills(
     manager = context.instructions_manager
     if manager is None:
         return SkillOperationError(
-            error="skills_unavailable",
-            message="No InstructionsManager is active.",
+            code="skill.manager_unavailable",
+            title="Skills unavailable",
+            detail="No InstructionsManager is active.",
+            operation=action,
         )
     if action not in ("list", "deactivate_all") and not name:
         return SkillOperationError(
-            error="missing_skill_name",
-            message=f"The {action} action requires a skill name.",
+            code="skill.name_required",
+            title="Skill name required",
+            detail=f"The {action} action requires a skill name.",
+            severity="warning",
+            operation=action,
         )
     try:
         if action == "list":
@@ -176,8 +181,11 @@ def manage_skills(
         elif action == "read_resource":
             if not path:
                 return SkillOperationError(
-                    error="missing_resource_path",
-                    message="The read_resource action requires a relative path.",
+                    code="skill.resource_path_required",
+                    title="Skill resource path required",
+                    detail="The read_resource action requires a relative path.",
+                    severity="warning",
+                    operation=action,
                 )
             result = manager.read_skill_resource(
                 name,
@@ -189,10 +197,13 @@ def manage_skills(
             )
         else:
             result = manager.deactivate_skill(name)
-    except OSError, UnicodeError, ValueError:
+    except (OSError, UnicodeError, ValueError) as error:
         target = f" for skill '{name}'" if name else ""
-        return SkillOperationError(
-            error="skill_operation_failed",
-            message=f"The {action} action failed{target}.",
+        return SkillOperationError.from_exception(
+            error,
+            code="skill.operation_failed",
+            title="Skill operation failed",
+            detail=f"The {action} action failed{target}.",
+            operation=action,
         )
     return _public_result(action, result)

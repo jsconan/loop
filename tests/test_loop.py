@@ -119,7 +119,7 @@ def test_loop_continues_with_supervised_defaults_after_permission_load_failure(t
         working_directory=tmp_path,
     )
 
-    interaction.error.assert_called_once()
+    interaction.report.assert_called_once()
     interaction.warning.assert_called_once()
     assert loop.permission_manager.configuration == PermissionConfiguration()
 
@@ -212,7 +212,7 @@ def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_p
     now[0] = 5.0
     interaction.prompt.side_effect = ["/model unavailable", False]
     loop.run()
-    assert "Could not list available models: offline" in interaction.warning.call_args.args[0]
+    assert "Could not list available models: offline" in interaction.report.call_args.args[0].detail
 
 
 def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
@@ -333,7 +333,7 @@ def test_resume_command_reports_an_unknown_session_id(tmp_path):
 
     loop.run()
 
-    assert "Session 'missing-id' was not found" in interaction.warning.call_args.args[0]
+    assert "Session 'missing-id' was not found" in interaction.report.call_args.args[0].detail
 
 
 def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(tmp_path):
@@ -396,7 +396,9 @@ def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
 
     assert loop.messages == []
     backend.get_response.assert_not_called()
-    interaction.error.assert_called_once_with("Content appears to be binary.")
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "mention.resolution_failed"
+    assert problem.detail == "Content appears to be binary."
 
 
 def test_run_retries_an_exhausted_recoverable_failure(tmp_path):
@@ -419,9 +421,9 @@ def test_run_retries_an_exhausted_recoverable_failure(tmp_path):
         Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     assert backend.get_response.call_count == 2
-    interaction.error.assert_called_once_with(
-        "temporarily unavailable (HTTP 503, request request-1)"
-    )
+    problem = interaction.report.call_args.args[0]
+    assert problem.detail == "temporarily unavailable"
+    assert problem.metadata == {"status_code": 503, "request_id": "request-1"}
     interaction.confirm.assert_called_once_with(
         "Retry the complete response after at least 2.5 seconds?", default=False
     )
@@ -508,7 +510,9 @@ def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):
 
     Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
-    interaction.error.assert_called_once_with("invalid key (HTTP 401)")
+    problem = interaction.report.call_args.args[0]
+    assert problem.detail == "invalid key"
+    assert problem.metadata == {"status_code": 401}
     interaction.confirm.assert_not_called()
 
 
@@ -607,7 +611,10 @@ def test_run_stops_model_fallback_when_discovery_fails(tmp_path, models):
     Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     if isinstance(models, Exception):
-        interaction.error.assert_any_call("Could not list available models: offline")
+        assert any(
+            problem.detail == "offline"
+            for problem in (call.args[0] for call in interaction.report.call_args_list)
+        )
     else:
         interaction.warning.assert_called_once_with("The backend reported no available models.")
 
@@ -1174,7 +1181,7 @@ def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_p
     loop.agent_runner.query()
 
     assert isinstance(result, ToolResult)
-    assert json.loads(result.output)["instructions_updated"] is True
+    assert json.loads(result.output)["result"]["instructions_updated"] is True
     updated_instructions = backend.get_response.call_args.kwargs["instructions"]
     assert "Follow review instructions." not in updated_instructions
 
@@ -1222,7 +1229,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
     assert second_input[:3] == [
         Message(role="user", content="hello"),
         call,
-        ToolResult(call_id="call", output="done"),
+        ToolResult(call_id="call", output='{"ok": true, "result": "done"}'),
     ]
     assert second_input[-1] == Message(role="assistant", content="done")
     interaction.answer_delta.assert_called_once_with("done", start=True)
