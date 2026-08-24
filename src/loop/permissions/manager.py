@@ -5,6 +5,7 @@
 
 import ipaddress
 import json
+import logging
 import shlex
 import tempfile
 from collections.abc import Iterable
@@ -17,7 +18,7 @@ from urllib.parse import urlsplit
 import yaml
 
 from .. import constants
-from ..utils import canonical_path, sha256_digest
+from ..utils import ShutdownRequested, canonical_path, sha256_digest
 from .models import (
     Action,
     AuthorizationResult,
@@ -26,8 +27,11 @@ from .models import (
     NetworkTarget,
     Operation,
     PermissionConfiguration,
-    PermissionLoadFailure,
+    PermissionConfigurationError,
+    PermissionLoadPolicy,
+    PermissionLoadResult,
     PermissionPreset,
+    PermissionPresetError,
     PermissionRecorder,
     PermissionRule,
     PolicyDecision,
@@ -58,6 +62,7 @@ _LIMIT_NAMES = (
     "deny_private_networks",
     "allow_host_processes",
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class PermissionManager:
@@ -72,6 +77,15 @@ class PermissionManager:
         configuration (PermissionConfiguration | None): Explicit policy instead of the local file.
         presets (Iterable[PermissionPreset] | None): Additional selectable presets alongside
             the built-in catalog. Duplicate identifiers are rejected.
+        load_policy (PermissionLoadPolicy | None): Artifact failure behavior. Defaults to
+            interactive recovery when an interaction is available and strict errors otherwise.
+
+    Raises:
+        PermissionConfigurationError: If a policy is invalid in strict mode.
+        PermissionPresetError: If built-in presets are invalid in strict mode.
+        ShutdownRequested: If the user exits interactive configuration recovery.
+        ValueError: If interactive recovery is selected without an interaction or preset
+            identifiers are duplicated.
     """
 
     _working_directory: Path | None
@@ -79,8 +93,7 @@ class PermissionManager:
     _interaction: Interaction | None
     _recorder: PermissionRecorder | None
     _configuration: PermissionConfiguration
-    _load_failure: PermissionLoadFailure | None
-    _preset_load_failures: tuple[PermissionLoadFailure, ...]
+    _load_policy: PermissionLoadPolicy
     _session_overrides: SessionPolicyOverrides
     _temporary_directory: tempfile.TemporaryDirectory[str]
     _temporary_path: Path
@@ -95,6 +108,7 @@ class PermissionManager:
         recorder: PermissionRecorder | None = None,
         configuration: PermissionConfiguration | None = None,
         presets: Iterable[PermissionPreset] | None = None,
+        load_policy: PermissionLoadPolicy | None = None,
     ) -> None:
         self._working_directory = (
             Path(working_directory).resolve() if working_directory is not None else None
@@ -112,11 +126,18 @@ class PermissionManager:
         )
         self._interaction = interaction
         self._recorder = recorder
-        self._load_failure = None
-        self._preset_load_failures = ()
-        self._configuration = configuration or self._load()
+        self._load_policy = load_policy or (
+            PermissionLoadPolicy.INTERACTIVE
+            if interaction is not None
+            else PermissionLoadPolicy.ERROR
+        )
+        if self._load_policy is PermissionLoadPolicy.INTERACTIVE and interaction is None:
+            raise ValueError("Interactive permission loading requires an Interaction.")
+        self._configuration = configuration or PermissionConfiguration()
+        if configuration is None:
+            self._load_configuration()
         self._session_overrides = SessionPolicyOverrides()
-        builtin_presets, self._preset_load_failures = PermissionPreset.load_builtin_presets()
+        builtin_presets = self._load_presets()
         catalog = (*builtin_presets, *(presets or ()))
         identifiers = [preset.metadata.id for preset in catalog]
         if len(identifiers) != len(set(identifiers)):
@@ -131,24 +152,6 @@ class PermissionManager:
             PermissionConfiguration: Workspace defaults, limits, and rules.
         """
         return self._configuration.model_copy(deep=True)
-
-    @property
-    def load_failure(self) -> PermissionLoadFailure | None:
-        """Return the unresolved workspace policy loading failure, when any.
-
-        Returns:
-            PermissionLoadFailure | None: Failure that activated the supervised fallback, or None.
-        """
-        return self._load_failure
-
-    @property
-    def preset_load_failures(self) -> tuple[PermissionLoadFailure, ...]:
-        """Return diagnostics for shipped presets excluded from the selectable catalog.
-
-        Returns:
-            tuple[PermissionLoadFailure, ...]: Immutable failures for malformed preset artifacts.
-        """
-        return self._preset_load_failures
 
     @property
     def effective_configuration(self) -> PermissionConfiguration:
@@ -646,17 +649,17 @@ class PermissionManager:
         self._session_overrides = SessionPolicyOverrides()
         return changed
 
-    def reload(self) -> bool:
-        """Reload the workspace policy without replacing a valid active policy on failure.
+    def reload(self) -> PermissionLoadResult:
+        """Reload the workspace policy according to the configured failure policy.
 
         Returns:
-            bool: Whether the workspace policy loaded successfully.
+            PermissionLoadResult: Whether new policy loaded or the active policy was retained.
+
+        Raises:
+            PermissionConfigurationError: If loading fails in strict mode.
+            ShutdownRequested: If the user exits interactive recovery.
         """
-        configuration = self._load(fallback_to_defaults=False)
-        if configuration is None:
-            return False
-        self._configuration = configuration
-        return True
+        return self._load_configuration(retain_on_failure=True)
 
     def reset_configuration(self) -> Path | None:
         """Archive an invalid workspace policy and replace it with supervised defaults.
@@ -680,7 +683,6 @@ class PermissionManager:
         configuration = PermissionConfiguration()
         self._persist(configuration)
         self._configuration = configuration
-        self._load_failure = None
         return backup_path
 
     def explain(self, tool: str, action: Action, resource: str) -> PolicyDecision:
@@ -920,19 +922,109 @@ class PermissionManager:
             f"resource={rule.resource or '*'}{description}{source}"
         )
 
-    def _load(self, *, fallback_to_defaults: bool = True) -> PermissionConfiguration | None:
+    def _read_configuration(self) -> PermissionConfiguration:
+        """Read and validate the configured policy without changing active state."""
         if self._configuration_path is None or not self._configuration_path.exists():
             return PermissionConfiguration()
         try:
             payload = yaml.safe_load(self._configuration_path.read_text("utf-8"))
-            configuration = PermissionConfiguration.model_validate(payload or {})
+            return PermissionConfiguration.model_validate(payload or {})
         except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
-            self._load_failure = PermissionLoadFailure(
-                source="configuration", path=str(self._configuration_path), message=str(exc)
+            raise PermissionConfigurationError(self._configuration_path, str(exc)) from exc
+
+    def _load_configuration(
+        self,
+        *,
+        retain_on_failure: bool = False,
+    ) -> PermissionLoadResult:
+        """Load configuration and completely handle the selected failure policy."""
+        while True:
+            try:
+                configuration = self._read_configuration()
+            except PermissionConfigurationError as exc:
+                if self._load_policy is PermissionLoadPolicy.ERROR:
+                    raise
+                if self._load_policy is PermissionLoadPolicy.AUTO:
+                    self._report_configuration_error(exc)
+                    if retain_on_failure:
+                        return PermissionLoadResult.RETAINED
+                    self._configuration = PermissionConfiguration()
+                    return PermissionLoadResult.DEFAULTED
+                if self._interaction is None:
+                    raise
+                choice = self._recover_configuration_interactively(
+                    exc, retain_on_failure=retain_on_failure
+                )
+                if choice is PermissionLoadResult.LOADED:
+                    continue
+                return choice
+            self._configuration = configuration
+            return PermissionLoadResult.LOADED
+
+    def _recover_configuration_interactively(
+        self,
+        error: PermissionConfigurationError,
+        *,
+        retain_on_failure: bool,
+    ) -> PermissionLoadResult:
+        """Report one failure and return the user's selected recovery outcome."""
+        self._interaction.error(str(error))
+        continue_description = (
+            "Keep the current permission policy"
+            if retain_on_failure
+            else "Use supervised defaults for this session"
+        )
+        choice = self._interaction.prompt(
+            "Permission policy recovery:",
+            exit_commands=(),
+            choices={
+                "retry": "Retry after fixing the permission file",
+                "continue": continue_description,
+                "reset": "Archive the invalid file and reset to supervised defaults",
+                "exit": "Exit Loop",
+            },
+        )
+        if choice == "retry":
+            return PermissionLoadResult.LOADED
+        if choice == "reset":
+            backup_path = self.reset_configuration()
+            self._interaction.info(
+                "Reset permission policy to supervised defaults; "
+                f"archived invalid file at {backup_path}."
             )
-            return PermissionConfiguration() if fallback_to_defaults else None
-        self._load_failure = None
-        return configuration
+            return PermissionLoadResult.DEFAULTED
+        if choice == "exit" or choice is False:
+            raise ShutdownRequested()
+        if retain_on_failure:
+            self._interaction.warning("Keeping the current permission policy.")
+            return PermissionLoadResult.RETAINED
+        self._configuration = PermissionConfiguration()
+        self._interaction.warning("Using supervised permission defaults for this session.")
+        return PermissionLoadResult.DEFAULTED
+
+    def _report_configuration_error(self, error: PermissionConfigurationError) -> None:
+        """Report an automatically recovered configuration failure."""
+        if self._interaction is not None:
+            self._interaction.error(str(error))
+            self._interaction.warning("Recovered according to the automatic permission policy.")
+        else:
+            _LOGGER.warning("%s; recovered according to the automatic permission policy", error)
+
+    def _load_presets(self) -> tuple[PermissionPreset, ...]:
+        """Load presets and completely handle invalid catalog artifacts."""
+        presets, failures = PermissionPreset.load_builtin_presets()
+        if not failures:
+            return presets
+        error = PermissionPresetError(failures)
+        if self._load_policy is PermissionLoadPolicy.ERROR:
+            raise error
+        for failure in failures:
+            message = f"Excluded invalid permission preset at {failure.path}: {failure.message}"
+            if self._interaction is not None:
+                self._interaction.warning(message)
+            else:
+                _LOGGER.warning("%s", message)
+        return presets
 
     def _evaluate_operation(self, operation: Operation) -> PolicyDecision:
         boundary = self._boundary_decision(operation)

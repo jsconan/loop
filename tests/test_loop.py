@@ -106,24 +106,22 @@ def test_loop_exposes_its_configured_state(tmp_path):
 
 @pytest.mark.parametrize("choice", ["continue", None])
 def test_loop_continues_with_supervised_defaults_after_permission_load_failure(tmp_path, choice):
-    """Invalid policies are reported and retained for correction while Loop uses safe defaults."""
+    """The manager completes interactive fallback during Loop construction."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
     path.write_text("version: 2\n", "utf-8")
-    permissions = PermissionManager(tmp_path)
     interaction = output_interaction()
     interaction.prompt.return_value = choice
 
-    Loop(
+    loop = Loop(
         backend=loop_backend(),
         interaction=interaction,
-        permission_manager=permissions,
         working_directory=tmp_path,
     )
 
     interaction.error.assert_called_once()
     interaction.warning.assert_called_once()
-    assert permissions.load_failure is not None
+    assert loop.permission_manager.configuration == PermissionConfiguration()
 
 
 def test_loop_resets_invalid_permission_policy_only_after_user_selection(tmp_path):
@@ -131,18 +129,16 @@ def test_loop_resets_invalid_permission_policy_only_after_user_selection(tmp_pat
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
     path.write_text("version: 2\n", "utf-8")
-    permissions = PermissionManager(tmp_path)
     interaction = output_interaction()
     interaction.prompt.return_value = "reset"
 
-    Loop(
+    loop = Loop(
         backend=loop_backend(),
         interaction=interaction,
-        permission_manager=permissions,
         working_directory=tmp_path,
     )
 
-    assert permissions.load_failure is None
+    assert loop.permission_manager.configuration == PermissionConfiguration()
     assert path.exists()
     assert list(path.parent.glob("permissions.yaml.*.bak"))
 

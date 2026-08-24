@@ -16,8 +16,12 @@ from loop import (
     NetworkTarget,
     Operation,
     PermissionConfiguration,
+    PermissionConfigurationError,
+    PermissionLoadPolicy,
+    PermissionLoadResult,
     PermissionManager,
     PermissionPreset,
+    PermissionPresetError,
     PermissionRule,
     PolicyLimits,
     PolicyScope,
@@ -25,6 +29,7 @@ from loop import (
     ProcessTarget,
     SessionTarget,
 )
+from loop.permissions import PermissionLoadFailure
 
 
 def operation(action: Action, *, tool: str = "demo", target=None, reason=None) -> Operation:
@@ -780,36 +785,119 @@ def test_empty_yaml_loads_as_default_policy(tmp_path):
     assert PermissionManager(tmp_path).configuration == PermissionConfiguration()
 
 
-def test_reload_retains_active_policy_and_exposes_a_failure_for_invalid_yaml(tmp_path):
-    """An invalid external policy edit retains active policy and exposes recovery diagnostics."""
+def test_error_policy_raises_configuration_errors_and_preserves_active_policy(tmp_path):
+    """Strict startup and reload expose typed errors without replacing valid active policy."""
     manager = PermissionManager(tmp_path)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
     path = tmp_path / ".loop" / "permissions.yaml"
     path.write_text("version: 2\n", "utf-8")
 
-    assert manager.reload() is False
+    with pytest.raises(PermissionConfigurationError) as raised:
+        manager.reload()
 
     assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
-    assert manager.load_failure is not None
-    assert manager.load_failure.path == str(path)
+    assert raised.value.path == str(path)
+    assert raised.value.__cause__ is not None
+    with pytest.raises(PermissionConfigurationError):
+        PermissionManager(tmp_path)
 
 
-def test_invalid_policy_load_uses_supervised_fallback_and_reset_archives_file(tmp_path):
-    """A corrupt policy activates safe defaults until an explicit reset archives it."""
+def test_auto_policy_reports_and_uses_defaults_or_last_known_good(tmp_path, caplog):
+    """Automatic recovery reports startup defaults and retains valid policy on reload."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
     path.write_text("version: 2\n", "utf-8")
 
-    manager = PermissionManager(tmp_path)
+    manager = PermissionManager(tmp_path, load_policy=PermissionLoadPolicy.AUTO)
 
-    assert manager.load_failure is not None
     assert manager.configuration == PermissionConfiguration()
-    backup = manager.reset_configuration()
+    assert "automatic permission policy" in caplog.text
+    manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
+    path.write_text("version: 2\n", "utf-8")
+    interaction = Mock(spec=Interaction)
+    manager.interaction = interaction
 
-    assert backup is not None
-    assert backup.read_text("utf-8") == "version: 2\n"
-    assert PermissionManager(tmp_path).configuration == PermissionConfiguration()
-    assert manager.load_failure is None
+    assert manager.reload() is PermissionLoadResult.RETAINED
+    assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+    interaction.error.assert_called_once()
+    interaction.warning.assert_called_once()
+
+
+def test_interactive_policy_retries_a_repaired_file(tmp_path):
+    """Interactive recovery rereads a file repaired while the recovery prompt is active."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text("version: 2\n", "utf-8")
+    interaction = Mock(spec=Interaction)
+
+    def repair(*_args, **_kwargs):
+        path.write_text("version: 1\ndefaults:\n  filesystem.delete: deny\n", "utf-8")
+        return "retry"
+
+    interaction.prompt.side_effect = repair
+    manager = PermissionManager(tmp_path, interaction=interaction)
+
+    assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+    interaction.error.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("choice", "expected"),
+    [("continue", PermissionLoadResult.RETAINED), (None, PermissionLoadResult.RETAINED)],
+)
+def test_interactive_reload_can_retain_the_active_policy(tmp_path, choice, expected):
+    """Interactive reload retains last-known-good state when the user continues."""
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
+    manager.configuration_path.write_text("version: 2\n", "utf-8")
+    interaction.prompt.return_value = choice
+
+    assert manager.reload() is expected
+    assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+    interaction.warning.assert_called_once_with("Keeping the current permission policy.")
+
+
+def test_interactive_loading_requires_an_interaction(tmp_path):
+    """Interactive loading cannot silently start or recover without an interaction."""
+    with pytest.raises(ValueError, match="requires an Interaction"):
+        PermissionManager(load_policy=PermissionLoadPolicy.INTERACTIVE)
+
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    manager.interaction = None
+    manager.configuration_path.parent.mkdir(exist_ok=True)
+    manager.configuration_path.write_text("version: 2\n", "utf-8")
+    with pytest.raises(PermissionConfigurationError):
+        manager.reload()
+
+
+def test_preset_failures_raise_strictly_and_report_during_headless_auto_recovery(
+    monkeypatch, caplog
+):
+    """Preset failures follow the same strict or reported recovery policy as configuration."""
+    failure = PermissionLoadFailure(
+        source="preset", path="presets/broken.yaml", message="invalid schema"
+    )
+    monkeypatch.setattr(
+        PermissionPreset,
+        "load_builtin_presets",
+        classmethod(lambda cls: ((), (failure,))),
+    )
+
+    with pytest.raises(PermissionPresetError) as raised:
+        PermissionManager()
+    assert raised.value.failures == (failure,)
+
+    manager = PermissionManager(load_policy=PermissionLoadPolicy.AUTO)
+    assert not manager.presets
+    assert "Excluded invalid permission preset" in caplog.text
+
+
+def test_preset_error_requires_a_failure():
+    """The aggregate preset error rejects an empty diagnostic collection."""
+    with pytest.raises(ValueError, match="at least one failure"):
+        PermissionPresetError(())
 
 
 def test_reset_configuration_creates_defaults_when_no_policy_file_exists(tmp_path):

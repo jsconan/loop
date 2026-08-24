@@ -107,7 +107,8 @@ def test_permissions_reload_and_limit_removal_report_outcomes(tmp_path):
 def test_permissions_reload_reports_invalid_policy_without_replacing_active_policy(tmp_path):
     """Reload shows recovery diagnostics while preserving the last valid workspace policy."""
     interaction = Mock(spec=Interaction)
-    permissions = PermissionManager(tmp_path)
+    interaction.prompt.return_value = "continue"
+    permissions = PermissionManager(tmp_path, interaction=interaction)
     permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
     (tmp_path / ".loop" / "permissions.yaml").write_text("version: 2\n", "utf-8")
     manager = command_manager(permissions, interaction)
@@ -116,7 +117,12 @@ def test_permissions_reload_reports_invalid_policy_without_replacing_active_poli
 
     assert permissions.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
     interaction.error.assert_called_once()
-    assert "remain unchanged" in interaction.warning.call_args.args[0]
+    assert "Keeping" in interaction.warning.call_args.args[0]
+    assert "Retained" in interaction.info.call_args.args[0]
+
+    interaction.prompt.return_value = "reset"
+    manager.call("permissions", "reload")
+    assert "supervised defaults" in interaction.info.call_args.args[0]
 
 
 def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):

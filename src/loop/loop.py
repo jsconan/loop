@@ -25,7 +25,7 @@ from .session import (
 )
 from .skills import InstructionsManager, RuntimeEnvironment, SkillCommands
 from .tooling import ToolCommands, ToolRegistry
-from .utils import ShutdownRequested, find_project_root
+from .utils import find_project_root
 
 
 class Loop:
@@ -135,8 +135,6 @@ class Loop:
             find_project_root(self._working_directory) or self._working_directory,
             interaction=self._interaction,
         )
-        self._recover_permission_configuration()
-        self._report_preset_load_failures()
         self._instructions_manager = instructions_manager or InstructionsManager.discover(
             self._working_directory,
             agents_filenames=agents_filenames,
@@ -169,7 +167,10 @@ class Loop:
         )
         self._prompt_on_recoverable_error = prompt_on_recoverable_error
         self._permission_manager.recorder = self._session_manager
-        self._tool_registry = tool_registry or ToolRegistry()
+        self._tool_registry = tool_registry or ToolRegistry(
+            interaction=self._interaction,
+            permission_manager=self._permission_manager,
+        )
         self._agent = Agent(
             agent_name,
             self._backend,
@@ -216,44 +217,6 @@ class Loop:
                 *self._mention_manager.completion_adapters,
             )
         )
-
-    def _recover_permission_configuration(self) -> None:
-        """Present manager-owned recovery choices for an invalid workspace policy."""
-        failure = self._permission_manager.load_failure
-        if failure is None:
-            return
-        self._interaction.error(
-            f"Could not load permission policy at {failure.path}: {failure.message}"
-        )
-        choice = self._interaction.prompt(
-            "Permission policy recovery:",
-            exit_commands=(),
-            choices={
-                "continue": "Continue with supervised defaults for this session",
-                "reset": "Archive the invalid file and reset to supervised defaults",
-                "exit": "Exit Loop",
-            },
-        )
-        if choice == "reset":
-            backup_path = self._permission_manager.reset_configuration()
-            self._interaction.info(
-                "Reset permission policy to supervised defaults; "
-                f"archived invalid file at {backup_path}."
-            )
-            return
-        if choice == "exit" or choice is False:
-            raise ShutdownRequested()
-        self._interaction.warning(
-            "Using supervised permission defaults for this session; "
-            "correct the file and run /permissions reload."
-        )
-
-    def _report_preset_load_failures(self) -> None:
-        """Report shipped presets excluded by the permission manager during catalog loading."""
-        for failure in self._permission_manager.preset_load_failures:
-            self._interaction.warning(
-                f"Excluded invalid permission preset at {failure.path}: {failure.message}"
-            )
 
     @property
     def permission_manager(self) -> PermissionManager:

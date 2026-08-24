@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 from enum import StrEnum
 from importlib.resources import files
+from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
 from uuid import uuid4
 
@@ -299,6 +300,61 @@ class PermissionLoadFailure(BaseModel):
     source: Literal["configuration", "preset"]
     path: str
     message: str
+
+
+class PermissionLoadPolicy(StrEnum):
+    """Control recovery from invalid permission configuration and preset artifacts."""
+
+    INTERACTIVE = "interactive"
+    AUTO = "auto"
+    ERROR = "error"
+
+
+class PermissionLoadResult(StrEnum):
+    """Describe the configuration selected by a completed load operation."""
+
+    LOADED = "loaded"
+    DEFAULTED = "defaulted"
+    RETAINED = "retained"
+
+
+class PermissionArtifactError(Exception):
+    """Report permission artifacts that could not be activated safely."""
+
+
+class PermissionConfigurationError(PermissionArtifactError):
+    """Report an invalid workspace permission configuration.
+
+    Args:
+        path (Path | str): Path of the configuration that could not be loaded.
+        message (str): Safe description of the loading failure.
+    """
+
+    path: str
+    message: str
+
+    def __init__(self, path: Path | str, message: str) -> None:
+        self.path = str(path)
+        self.message = message
+        super().__init__(f"Could not load permission policy at {self.path}: {message}")
+
+
+class PermissionPresetError(PermissionArtifactError):
+    """Report one or more invalid built-in permission presets.
+
+    Args:
+        failures (tuple[PermissionLoadFailure, ...]): Invalid preset diagnostics.
+    """
+
+    failures: tuple[PermissionLoadFailure, ...]
+
+    def __init__(self, failures: tuple[PermissionLoadFailure, ...]) -> None:
+        if not failures:
+            raise ValueError("PermissionPresetError requires at least one failure.")
+        self.failures = failures
+        super().__init__(
+            f"Could not load {len(failures)} built-in permission preset(s): {failures[0].message}"
+        )
 
 
 class PresetRule(BaseModel):

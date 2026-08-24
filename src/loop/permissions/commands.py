@@ -8,6 +8,7 @@ from .manager import PermissionManager
 from .models import (
     Action,
     Decision,
+    PermissionLoadResult,
     PermissionPreset,
     PermissionRule,
     PolicyScope,
@@ -47,6 +48,17 @@ _BOOLEAN_LIMIT_POLARITY = {
     "host-process": "allow",
 }
 _LIMIT_FIELDS = {**_COLLECTION_LIMITS, **_BOOLEAN_LIMITS}
+_DISPATCH_MESSAGES = {
+    PermissionLoadResult.LOADED: (
+        "Reloaded the workspace policy; session overrides remain active."
+    ),
+    PermissionLoadResult.DEFAULTED: (
+        "Reset the workspace policy to supervised defaults; session overrides remain active."
+    ),
+    PermissionLoadResult.RETAINED: (
+        "Retained the workspace policy; session overrides remain active."
+    ),
+}
 
 
 def _enum_values(enum_type: type, descriptions: dict) -> tuple[CompletionValue, ...]:
@@ -99,18 +111,8 @@ class PermissionCommands:
             context.interaction.info(manager.describe(arguments[1]))
             return
         if arguments == ("reload",):
-            if manager.reload():
-                context.interaction.info(
-                    "Reloaded the workspace policy; session overrides remain active."
-                )
-            else:
-                failure = manager.load_failure
-                context.interaction.error(
-                    f"Could not reload workspace policy at {failure.path}: {failure.message}"
-                )
-                context.interaction.warning(
-                    "The active permission policy and session overrides remain unchanged."
-                )
+            result = manager.reload()
+            context.interaction.info(_DISPATCH_MESSAGES[result])
             return
         if arguments == ("help",):
             context.interaction.info(self._help())
