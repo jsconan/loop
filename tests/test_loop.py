@@ -212,7 +212,7 @@ def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_p
     now[0] = 5.0
     interaction.prompt.side_effect = ["/model unavailable", False]
     loop.run()
-    assert "Could not list available models: offline" in interaction.report.call_args.args[0].detail
+    assert interaction.report.call_args.args[0].detail == "The backend is not reachable."
 
 
 def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
@@ -612,7 +612,7 @@ def test_run_stops_model_fallback_when_discovery_fails(tmp_path, models):
 
     if isinstance(models, Exception):
         assert any(
-            problem.detail == "offline"
+            problem.detail == "The backend is not reachable."
             for problem in (call.args[0] for call in interaction.report.call_args_list)
         )
     else:

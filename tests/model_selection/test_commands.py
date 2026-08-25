@@ -64,8 +64,8 @@ def test_backend_command_reports_a_healthy_effective_model():
     selection.select_fallback.assert_not_called()
 
 
-def test_backend_command_reports_a_catalog_failure_as_an_unavailable_backend():
-    """Backend checks present catalog failures as unavailable backend status."""
+def test_backend_command_gently_reports_an_unreachable_backend():
+    """Backend checks present failed probes as diagnostic warnings rather than errors."""
     interaction = Mock(spec=Interaction)
     selection = Mock(spec=ModelSelection)
     selection.available.side_effect = BackendConnectionError(
@@ -78,9 +78,8 @@ def test_backend_command_reports_a_catalog_failure_as_an_unavailable_backend():
 
     manager.call("backend")
 
-    problem = interaction.report.call_args.args[0]
-    assert problem.code == "backend.unavailable"
-    assert problem.detail == "Could not list available models: offline"
+    interaction.warning.assert_called_once_with("The backend is not reachable.")
+    interaction.report.assert_not_called()
     selection.select_fallback.assert_not_called()
 
 
@@ -157,4 +156,6 @@ def test_model_commands_report_empty_invalid_and_failed_catalogs():
         operation="list_models",
     )
     manager.call("models")
-    assert "Could not list available models: offline" in interaction.report.call_args.args[0].detail
+    assert interaction.report.call_args.args[0].detail == "The backend is not reachable."
+    manager.call("model", "missing")
+    assert interaction.report.call_args.args[0].detail == "The backend is not reachable."

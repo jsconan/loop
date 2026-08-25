@@ -195,6 +195,8 @@ class ModelSelection:
                     error,
                     code="backend.model_listing_failed",
                     title="Could not list available models",
+                    detail="The backend is not reachable.",
+                    retryable=error.recoverable,
                     operation="list_models",
                 )
             )

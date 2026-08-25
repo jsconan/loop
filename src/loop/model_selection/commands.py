@@ -60,15 +60,8 @@ class ModelCommands:
         """Check backend reachability and the effective model's availability."""
         try:
             models = self._available()
-        except CommandArgumentError as error:
-            context.interaction.report(
-                Problem.from_exception(
-                    error,
-                    code="backend.unavailable",
-                    title="Backend unavailable",
-                    operation="list_models",
-                )
-            )
+        except BackendError:
+            context.interaction.warning("The backend is not reachable.")
             return
         try:
             model = self._model_selection.effective
@@ -84,7 +77,11 @@ class ModelCommands:
 
     def models(self, context: CommandContext) -> None:
         """List all models available from the backend."""
-        values = self._model_values()
+        try:
+            values = self._model_values()
+        except BackendError as error:
+            self._report_unavailable(context, error)
+            return
         if not values:
             context.interaction.info("No models available.")
             return
@@ -109,14 +106,30 @@ class ModelCommands:
                 f"Selected model: {selected}" if selected else "Using the backend default model."
             )
             return
-        if name not in {model.id for model in self._available()}:
+        try:
+            available = self._available()
+        except BackendError as error:
+            self._report_unavailable(context, error)
+            return
+        if name not in {model.id for model in available}:
             raise CommandArgumentError(f"Model '{name}' is not available.")
         self._model_selection.select(name)
         context.interaction.info(f"Using model: {name}")
 
     def _available(self) -> list[ModelInfo]:
-        """Return available models with backend failures normalized for command dispatch."""
-        try:
-            return self._model_selection.available()
-        except BackendError as error:
-            raise CommandArgumentError(f"Could not list available models: {error}") from error
+        """Return models currently available from the backend."""
+        return self._model_selection.available()
+
+    @staticmethod
+    def _report_unavailable(context: CommandContext, error: BackendError) -> None:
+        """Report a model-catalog failure without exposing provider error text."""
+        context.interaction.report(
+            Problem.from_exception(
+                error,
+                code="backend.unavailable",
+                title="Backend unavailable",
+                detail="The backend is not reachable.",
+                retryable=error.recoverable,
+                operation="list_models",
+            )
+        )
