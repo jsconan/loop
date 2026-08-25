@@ -1232,7 +1232,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
         ToolResult(call_id="call", output='{"ok": true, "result": "done"}'),
     ]
     assert second_input[-1] == Message(role="assistant", content="done")
-    interaction.answer_delta.assert_called_once_with("done", start=True)
+    interaction.answer_delta.assert_called_once_with("done")
     assert interaction.response_context.call_count == 2
     interaction.run_metrics.assert_called_once()
     metrics = interaction.run_metrics.call_args.args[0]

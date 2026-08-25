@@ -163,11 +163,11 @@ class SessionManager:
                     output.debug(event)
 
                 if isinstance(event, ReasoningDelta):
-                    output.reasoning_delta(event.text, start=not reasoning_started)
+                    output.reasoning_delta(event.text)
                     reasoning_started = True
                     continue
                 if isinstance(event, AnswerDelta):
-                    output.answer_delta(event.text, start=not answer_started)
+                    output.answer_delta(event.text)
                     answer_started = True
                     continue
                 if isinstance(event, ReasoningCompleted):

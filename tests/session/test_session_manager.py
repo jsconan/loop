@@ -119,10 +119,14 @@ def test_manager_response_uses_terminal_text_and_an_interaction_override():
         model="served-model",
         structured_output={"message": "hello world"},
     )
-    assert interaction.reasoning_delta.call_args_list[0].kwargs == {"start": True}
-    assert interaction.reasoning_delta.call_args_list[1].kwargs == {"start": False}
-    assert interaction.answer_delta.call_args_list[0].kwargs == {"start": True}
-    assert interaction.answer_delta.call_args_list[1].kwargs == {"start": False}
+    assert [call.args for call in interaction.reasoning_delta.call_args_list] == [
+        ("incomplete ",),
+        ("thought",),
+    ]
+    assert [call.args for call in interaction.answer_delta.call_args_list] == [
+        ("incomplete ",),
+        ("answer",),
+    ]
     interaction.reasoning.assert_not_called()
     interaction.answer.assert_not_called()
     interaction.response_context.assert_called_once_with()

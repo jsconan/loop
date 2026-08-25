@@ -10,6 +10,7 @@ import pytest
 from prompt_toolkit.completion import CompleteEvent, DummyCompleter
 from prompt_toolkit.document import Document
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.prompt import Confirm
 
 from loop import (
@@ -22,6 +23,11 @@ from loop import (
 )
 from loop.interaction import ConsoleInteraction
 from loop.models import Usage
+
+
+def trimmed_rendered_lines(output: str) -> list[str]:
+    """Return terminal lines without renderer-added right padding."""
+    return [line.rstrip() for line in output.splitlines()]
 
 
 def test_prompt_reads_a_trimmed_message_with_a_custom_prompt():
@@ -260,37 +266,167 @@ def test_user_message_has_a_console_presentation(capsys):
 @pytest.mark.parametrize(
     ("method", "expected"),
     [
-        ("reasoning", "\nThinking...\n\ncomplete\n"),
-        ("answer", "\nAnswer:complete\n"),
+        ("reasoning", ["", "Thinking...", "", "complete"]),
+        ("answer", ["", "Answer:", "complete"]),
     ],
 )
 def test_model_output_has_a_console_presentation(capsys, method, expected):
-    """The console owns presentation of complete model output."""
-    getattr(ConsoleInteraction(), method)("complete")
+    """The console renders completed model output beneath its section heading."""
+    getattr(ConsoleInteraction(), method)("**complete**")
 
-    assert capsys.readouterr().out == expected
+    output = capsys.readouterr().out
+    assert trimmed_rendered_lines(output) == expected
+    assert "**" not in output
+
+
+def test_answer_renders_common_llm_markdown_constructs(capsys):
+    """Answers render headings, lists, links, tables, and fenced code as terminal content."""
+    ConsoleInteraction(console=Console(width=100)).answer(
+        "# Heading\n\n- item\n\n[link](https://example.com)\n\n"
+        "| Name | Value |\n| --- | --- |\n| alpha | one |\n\n"
+        "```python\nprint('ok')\n```"
+    )
+
+    output = capsys.readouterr().out
+    for content in ("Heading", "item", "link", "alpha", "one", "print", "ok"):
+        assert content in output
+    for markdown_marker in ("# Heading", "- item", "```", "| --- |"):
+        assert markdown_marker not in output
 
 
 @pytest.mark.parametrize(
     ("method", "expected"),
     [
         ("reasoning_delta", "\nThinking...\n\npartial"),
-        ("answer_delta", "\nAnswer:partial"),
+        ("answer_delta", "\nAnswer:\npartial"),
     ],
 )
 def test_model_output_formats_stream_starts(capsys, method, expected):
-    """The console owns presentation of model-output stream boundaries."""
-    getattr(ConsoleInteraction(), method)("partial", start=True)
+    """A model-output stream renders its final Markdown beneath one heading."""
+    interaction = ConsoleInteraction()
+    with interaction.response_context():
+        getattr(interaction, method)("**par")
+        getattr(interaction, method)("tial**")
 
-    assert capsys.readouterr().out == expected
+    output = capsys.readouterr().out
+    assert trimmed_rendered_lines(output) == trimmed_rendered_lines(expected)
+    assert "**" not in output
 
 
 @pytest.mark.parametrize("method", ["reasoning_delta", "answer_delta"])
 def test_model_output_continues_streams_without_repeating_headings(capsys, method):
-    """Continued deltas are appended without another heading."""
-    getattr(ConsoleInteraction(), method)("partial")
+    """Continued deltas append to the active Markdown document without another heading."""
+    interaction = ConsoleInteraction()
+    with interaction.response_context():
+        getattr(interaction, method)("first ")
+        getattr(interaction, method)("second")
 
-    assert capsys.readouterr().out == "partial"
+    output = capsys.readouterr().out
+    assert "first second" in output
+    heading = "Thinking..." if method == "reasoning_delta" else "Answer:"
+    assert output.count(heading) == 1
+
+
+def test_streaming_switches_from_reasoning_to_answer_markdown(capsys):
+    """Changing model-output sections commits reasoning before starting the answer."""
+    interaction = ConsoleInteraction()
+
+    with interaction.response_context():
+        interaction.reasoning_delta("*thought*")
+        interaction.answer_delta("`result`")
+
+    output = capsys.readouterr().out
+    assert output.index("thought") < output.index("Answer:") < output.index("result")
+    assert "*thought*" not in output
+    assert "`result`" not in output
+
+
+def test_streaming_appends_stable_blocks_without_rewriting_pending_output():
+    """Streaming prints each stable block once and buffers only the final block."""
+    console = Mock()
+    interaction = ConsoleInteraction(console=console)
+
+    with interaction.response_context():
+        interaction.answer_delta("First paragraph.\n\n# Sec")
+        assert len(console.print.call_args_list) == 1
+        interaction.answer_delta("ond\n")
+        assert len(console.print.call_args_list) == 2
+
+    rendered = [call.args[0] for call in console.print.call_args_list if call.args]
+    assert [item.markup for item in rendered if isinstance(item, Markdown)] == [
+        "First paragraph.\n\n",
+        "# Second\n",
+    ]
+
+
+def test_streaming_waits_for_setext_heading_lookahead():
+    """A line remains pending until its following line rules out Setext reinterpretation."""
+    console = Mock()
+    interaction = ConsoleInteraction(console=console)
+
+    with interaction.response_context():
+        interaction.answer_delta("Heading\n")
+        assert len(console.print.call_args_list) == 1
+        interaction.answer_delta("---\nFollowing\n")
+        assert console.print.call_args_list[1].args[0].markup == "Heading\n---\n"
+
+
+def test_empty_stream_delta_writes_only_its_section_heading(capsys):
+    """An empty streamed event creates its section without fabricating Markdown output."""
+    interaction = ConsoleInteraction()
+
+    with interaction.response_context():
+        interaction.answer_delta("")
+
+    assert trimmed_rendered_lines(capsys.readouterr().out) == ["", "Answer:"]
+
+
+def test_streaming_keeps_fenced_code_together_until_a_following_block():
+    """Fenced code is committed as one block only after its structural successor arrives."""
+    console = Mock()
+    interaction = ConsoleInteraction(console=console)
+
+    with interaction.response_context():
+        interaction.answer_delta("```python\nprint('ok')\n")
+        assert len(console.print.call_args_list) == 1
+        interaction.answer_delta("```\nAfter\n")
+        assert console.print.call_args_list[1].args[0].markup == (
+            "```python\nprint('ok')\n```\n"
+        )
+
+
+def test_streaming_flushes_an_unclosed_fence_at_end_of_response():
+    """End-of-response finalizes an unclosed fenced block without losing its source."""
+    console = Mock()
+    interaction = ConsoleInteraction(console=console)
+
+    with interaction.response_context():
+        interaction.answer_delta("```python\nprint('ok')")
+
+    assert console.print.call_args_list[1].args[0].markup == "```python\nprint('ok')"
+
+
+@pytest.mark.parametrize(
+    "first_block",
+    [
+        "| Name | Value |\n| --- | --- |\n| alpha | one |\n\n",
+        "- first\n  - nested\n- second\n\n",
+    ],
+)
+def test_streaming_commits_complete_markdown_containers(first_block):
+    """Tables and nested lists remain intact when their following block establishes a boundary."""
+    console = Mock()
+    interaction = ConsoleInteraction(console=console)
+
+    with interaction.response_context():
+        interaction.answer_delta(f"{first_block}After\n")
+
+    markdown = [
+        call.args[0].markup
+        for call in console.print.call_args_list
+        if call.args and isinstance(call.args[0], Markdown)
+    ]
+    assert markdown == [first_block, "After\n"]
 
 
 @pytest.mark.parametrize(
@@ -765,7 +901,7 @@ def test_debug_formats_raw_values(capsys):
 
 
 def test_output_styles_prioritize_answers_over_diagnostics():
-    """Answers are emphasized while reasoning, tool calls, and debug output are dimmed."""
+    """Model Markdown preserves answer hierarchy while diagnostics remain dimmed."""
     console = Mock()
     interaction = ConsoleInteraction(console=console)
 
@@ -774,19 +910,32 @@ def test_output_styles_prioritize_answers_over_diagnostics():
     interaction.tool_call("search", "{}")
     interaction.debug({"detail": True})
 
-    styles = [call.kwargs.get("style") for call in console.print.call_args_list]
-    assert styles[:2] == ["bold bright_green", "bold"]
-    assert styles[2:] == ["dim cyan", "dim", "dim magenta", "dim blue", "dim"]
+    calls = console.print.call_args_list
+    assert calls[0].kwargs.get("style") == "bold bright_green"
+    assert isinstance(calls[1].args[0], Markdown)
+    assert calls[2].kwargs.get("style") == "dim cyan"
+    assert isinstance(calls[3].args[0], Markdown)
+    assert [item.kwargs.get("style") for item in calls[4:]] == [
+        "dim magenta",
+        "dim blue",
+        "dim",
+    ]
 
 
 def test_response_scope_terminates_streamed_output(capsys):
     """A response scope terminates streamed output before subsequent presentation."""
     interaction = ConsoleInteraction()
     with interaction.response_context():
-        interaction.answer_delta("partial", start=True)
+        interaction.answer_delta("partial")
     interaction.conversation_ended()
 
-    assert capsys.readouterr().out == "\nAnswer:partial\n\nConversation ended.\n"
+    assert trimmed_rendered_lines(capsys.readouterr().out) == [
+        "",
+        "Answer:",
+        "partial",
+        "",
+        "Conversation ended.",
+    ]
 
 
 def test_response_scope_does_not_extend_complete_output(capsys):
@@ -795,7 +944,7 @@ def test_response_scope_does_not_extend_complete_output(capsys):
     with interaction.response_context():
         interaction.answer("complete")
 
-    assert capsys.readouterr().out == "\nAnswer:complete\n"
+    assert trimmed_rendered_lines(capsys.readouterr().out) == ["", "Answer:", "complete"]
 
 
 def test_response_scope_terminates_streamed_output_after_an_error(capsys):
@@ -803,10 +952,10 @@ def test_response_scope_terminates_streamed_output_after_an_error(capsys):
     interaction = ConsoleInteraction()
 
     with pytest.raises(RuntimeError, match="failed"), interaction.response_context():
-        interaction.answer_delta("partial", start=True)
+        interaction.answer_delta("partial")
         raise RuntimeError("failed")
 
-    assert capsys.readouterr().out == "\nAnswer:partial\n"
+    assert trimmed_rendered_lines(capsys.readouterr().out) == ["", "Answer:", "partial"]
 
 
 @pytest.mark.parametrize(("default", "expected"), [(False, True), (True, False)])

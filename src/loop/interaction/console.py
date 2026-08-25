@@ -11,12 +11,14 @@ from itertools import islice
 from pprint import pformat
 from typing import Any, Literal
 
+from markdown_it import MarkdownIt
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, WordCompleter
 from rich.columns import Columns
 from rich.console import Console
 from rich.constrain import Constrain
 from rich.json import JSON
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.syntax import Syntax
@@ -36,6 +38,52 @@ from ..utils import choice_items, format_tool_call_arguments
 from .interaction import Interaction
 
 
+class MarkdownStream:
+    """Append structurally complete Markdown blocks to a console.
+
+    Earlier reference-style links are not held for definitions in later blocks. Supporting that
+    uncommon CommonMark feature would require buffering the entire response and defeat streaming.
+    """
+
+    _parser = MarkdownIt().enable("strikethrough").enable("table")
+
+    def __init__(self, console: Console, *, style: str) -> None:
+        self._console = console
+        self._style = style
+        self._pending = ""
+
+    def write(self, delta: str) -> None:
+        """Buffer a delta and print any structurally stable prefix."""
+        self._pending += delta
+        if not self._pending.endswith(("\n", "\r")):
+            return
+        boundary = self._stable_boundary()
+        if boundary is None:
+            return
+        stable = self._pending[:boundary]
+        self._pending = self._pending[boundary:]
+        self._console.print(Markdown(stable, style=self._style))
+
+    def finish(self) -> None:
+        """Print the final buffered block, treating end-of-stream as its boundary."""
+        if self._pending:
+            self._console.print(Markdown(self._pending, style=self._style))
+        self._pending = ""
+
+    def _stable_boundary(self) -> int | None:
+        """Return the source offset before the final top-level Markdown block."""
+        block_starts = [
+            token.map[0]
+            for token in self._parser.parse(self._pending)
+            if token.level == 0 and token.map is not None
+        ]
+        if len(block_starts) < 2:
+            return None
+        final_start = block_starts[-1]
+        lines = self._pending.splitlines(keepends=True)
+        return sum(len(line) for line in lines[:final_start])
+
+
 class ConsoleInteraction(Interaction):
     """Interact with a user through a rich, editable process terminal.
 
@@ -45,6 +93,9 @@ class ConsoleInteraction(Interaction):
             to a new session.
     """
 
+    _stream_kind: Literal["reasoning", "answer"] | None
+    _stream: MarkdownStream | None
+
     def __init__(
         self,
         console: Console | None = None,
@@ -52,7 +103,8 @@ class ConsoleInteraction(Interaction):
     ) -> None:
         self._console = console or Console()
         self._session = session or PromptSession()
-        self._streamed_output = False
+        self._stream_kind = None
+        self._stream = None
 
     @contextmanager
     def response_context(self) -> Generator[None]:
@@ -61,13 +113,37 @@ class ConsoleInteraction(Interaction):
         Yields:
             None: Control while the response is being presented.
         """
-        self._streamed_output = False
         try:
             yield
         finally:
-            if self._streamed_output:
-                self.info()
-            self._streamed_output = False
+            self._finish_markdown_stream()
+
+    def _finish_markdown_stream(self) -> None:
+        """Commit and clear the active model-output stream."""
+        if self._stream is not None:
+            self._stream.finish()
+        self._stream_kind = None
+        self._stream = None
+
+    def _write_markdown_delta(
+        self,
+        delta: str,
+        *,
+        kind: Literal["reasoning", "answer"],
+    ) -> None:
+        """Append stable Markdown blocks without rewriting terminal history."""
+        if self._stream is None or self._stream_kind != kind:
+            self._finish_markdown_stream()
+            if kind == "reasoning":
+                self._reasoning_heading()
+            else:
+                self._answer_heading()
+            self._stream_kind = kind
+            self._stream = MarkdownStream(
+                self._console,
+                style="dim" if kind == "reasoning" else "none",
+            )
+        self._stream.write(delta)
 
     def prompt(
         self,
@@ -167,54 +243,44 @@ class ConsoleInteraction(Interaction):
         self._console.print("\nThinking...\n", style="dim cyan", markup=False)
 
     def reasoning(self, message: str) -> None:
-        """Write model reasoning to the terminal.
+        """Render completed model reasoning as Markdown in the terminal.
 
         Args:
             message (str): Complete reasoning text to write.
         """
+        self._finish_markdown_stream()
         self._reasoning_heading()
-        self._console.print(message, style="dim", markup=False, highlight=False)
+        self._console.print(Markdown(message, style="dim"))
 
-    def reasoning_delta(self, delta: str, *, start: bool = False) -> None:
-        """Write a streamed model reasoning delta to the terminal.
+    def reasoning_delta(self, delta: str) -> None:
+        """Buffer streamed reasoning and append complete Markdown blocks.
 
         Args:
             delta (str): Incremental reasoning text to write.
-            start (bool): Whether to write the reasoning heading before the delta.
         """
-        if start:
-            self._reasoning_heading()
-        self._streamed_output = True
-        self._console.print(
-            delta, end="", style="dim", markup=False, highlight=False, soft_wrap=True
-        )
+        self._write_markdown_delta(delta, kind="reasoning")
 
     def _answer_heading(self) -> None:
         """Write an answer heading to the terminal."""
-        self._console.print("\nAnswer:", end="", style="bold bright_green", markup=False)
+        self._console.print("\nAnswer:", style="bold bright_green", markup=False)
 
     def answer(self, message: str) -> None:
-        """Write a model answer to the terminal.
+        """Render a completed model answer as Markdown in the terminal.
 
         Args:
             message (str): Complete answer text to write.
         """
+        self._finish_markdown_stream()
         self._answer_heading()
-        self._console.print(message, style="bold", markup=False, highlight=False)
+        self._console.print(Markdown(message))
 
-    def answer_delta(self, delta: str, *, start: bool = False) -> None:
-        """Write a streamed model answer delta to the terminal.
+    def answer_delta(self, delta: str) -> None:
+        """Buffer streamed answers and append complete Markdown blocks.
 
         Args:
             delta (str): Incremental answer text to write.
-            start (bool): Whether to write the answer heading before the delta.
         """
-        if start:
-            self._answer_heading()
-        self._streamed_output = True
-        self._console.print(
-            delta, end="", style="bold", markup=False, highlight=False, soft_wrap=True
-        )
+        self._write_markdown_delta(delta, kind="answer")
 
     def report(self, problem: Problem) -> None:
         """Write a structured problem to the terminal.

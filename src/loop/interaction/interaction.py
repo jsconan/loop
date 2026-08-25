@@ -66,12 +66,11 @@ class Interaction(ABC):
         """
 
     @abstractmethod
-    def reasoning_delta(self, delta: str, *, start: bool = False) -> None:
+    def reasoning_delta(self, delta: str) -> None:
         """Display a streamed model reasoning delta.
 
         Args:
             delta (str): Incremental reasoning text to display.
-            start (bool): Whether this is the first reasoning delta in the response.
         """
 
     @abstractmethod
@@ -83,12 +82,11 @@ class Interaction(ABC):
         """
 
     @abstractmethod
-    def answer_delta(self, delta: str, *, start: bool = False) -> None:
+    def answer_delta(self, delta: str) -> None:
         """Display a streamed model answer delta.
 
         Args:
             delta (str): Incremental answer text to display.
-            start (bool): Whether this is the first answer delta in the response.
         """
 
     @abstractmethod
