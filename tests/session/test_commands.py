@@ -44,11 +44,24 @@ def test_session_commands_list_resume_rename_and_reset_sessions():
 
 
 def test_resume_reports_unknown_session_ids():
-    """Resume translates missing persisted IDs into command argument warnings."""
+    """Resume requires an ID and translates unknown persisted IDs into argument warnings."""
     interaction = Mock(spec=Interaction)
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(SessionManager()))
 
+    manager.call("resume")
+    assert "Field required" in interaction.report.call_args.args[0].detail
     manager.call("resume", "missing-id")
 
     assert "Session 'missing-id' was not found" in interaction.report.call_args.args[0].detail
+
+
+def test_rename_reports_invalid_session_names():
+    """Rename translates invalid domain values into standard command argument feedback."""
+    interaction = Mock(spec=Interaction)
+    manager = CommandManager(interaction=interaction)
+    manager.register_provider(SessionCommands(SessionManager()))
+
+    manager.call("rename", "''")
+
+    assert "Session name cannot be empty" in interaction.report.call_args.args[0].detail

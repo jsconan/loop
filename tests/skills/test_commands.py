@@ -36,13 +36,15 @@ def test_skill_commands_list_and_activate_skills_idempotently(tmp_path):
 
 
 def test_skill_commands_report_empty_unknown_and_loading_failures():
-    """Skill commands report empty catalogs and normalize activation failures."""
+    """Skill commands require a selection, report empty catalogs, and normalize failures."""
     interaction = Mock(spec=Interaction)
     instructions = InstructionsManager()
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SkillCommands(instructions))
 
     manager.call("skills")
+    manager.call("use")
+    assert "Field required" in interaction.report.call_args.args[0].detail
     manager.call("use", "missing")
     assert interaction.info.call_args.args[0] == "No skills discovered."
     assert "Skill 'missing' is not available" in interaction.report.call_args.args[0].detail

@@ -67,7 +67,10 @@ class SessionCommands:
         name: Annotated[str, Field(description="New human-readable session name.")],
     ) -> None:
         """Rename the active session."""
-        self._session_manager.rename_session(name)
+        try:
+            self._session_manager.rename_session(name)
+        except ValueError as error:
+            raise CommandArgumentError(str(error)) from error
         context.interaction.info(f"Renamed session to '{self._session_manager.session.name}'.")
 
     def resume(

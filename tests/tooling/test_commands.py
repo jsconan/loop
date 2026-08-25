@@ -7,7 +7,7 @@ from loop.tooling import ToolCommands
 
 
 def test_tools_command_displays_registered_tools_and_reports_empty_catalogs():
-    """Tool discovery renders populated registries and explains empty ones."""
+    """Tool discovery renders catalogs while invocation still requires a tool name."""
     interaction = Mock(spec=Interaction)
     registry = Mock()
     registry.tools = [
@@ -22,6 +22,8 @@ def test_tools_command_displays_registered_tools_and_reports_empty_catalogs():
     registry.tools = []
     manager.call("tools")
     assert interaction.info.call_args.args[0] == "No tools registered."
+    manager.call("call")
+    assert "Field required" in interaction.report.call_args.args[0].detail
 
 
 def test_call_command_forwards_tokens_and_runtime_context():
