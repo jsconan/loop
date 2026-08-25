@@ -398,7 +398,8 @@ rules, which take precedence over allow rules. Session rules disappear when the 
 limits, all active rules, and precedence. Every default, rule, and limit change takes an explicit
 `workspace` or `session` scope. `/permissions reload` validates external YAML edits before replacing
 the workspace layer while preserving session overrides; `/permissions explain` reports the
-determining source for one concrete operation.
+determining source for one concrete operation. Creating a rule with a wildcard tool, action, or
+resource requires explicit confirmation because it may affect more operations than intended.
 
 Permission presets are versioned YAML artifacts rather than compiled Python modes. The built-in
 `observe`, `supervised`, `workspace`, and `locked` presets define a complete fallback decision for
@@ -407,7 +408,10 @@ every action and may include rules. Use `/permissions preset list` and `show` to
 rules after confirmation. Presets never change filesystem, network, or process enforcement limits,
 nor the other policy layer. The replacement prompt lists the replaced and installed defaults and
 rules, and warns that the change may relax or tighten policy. Installed rules retain the preset
-identifier, revision, and content hash for policy diagnostics.
+identifier, revision, and content hash for policy diagnostics. The shorter `/permissions preset`
+form also lists presets, while `/permissions rule` lists both rule scopes; use `rule list workspace`
+or `rule list session` to filter the output. Likewise, `/permissions limit` lists workspace values
+and session overrides; `limit list workspace` and `limit list session` select one layer.
 
 Actions are `filesystem.list`, `filesystem.read`, `filesystem.create`, `filesystem.replace`,
 `filesystem.delete`, `network.request`, `process.execute`, and `session.mutate`. Filesystem roots,

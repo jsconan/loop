@@ -149,7 +149,7 @@ class PermissionCommands:
     def _change_preset(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
         """List, inspect, preview, or explicitly replace one scoped policy preset."""
         manager = self._permission_manager
-        if arguments == ("list",):
+        if not arguments or arguments == ("list",):
             presets = manager.presets
             if not presets:
                 context.interaction.info("Permission presets: none")
@@ -212,8 +212,18 @@ class PermissionCommands:
 
     def _change_rule(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
         manager = self._permission_manager
-        if len(arguments) in {6, 7} and arguments[0] == "add":
-            _, raw_scope, raw_decision, tool, raw_action, resource, *description = arguments
+        if not arguments or arguments == ("list",):
+            self._list_rules(context)
+            return
+        if len(arguments) == 2 and arguments[0] == "list":
+            self._list_rules(context, PolicyScope(arguments[1]))
+            return
+        if 3 <= len(arguments) <= 7 and arguments[0] == "add":
+            _, raw_scope, raw_decision, *matchers = arguments
+            tool = matchers[0] if matchers else "*"
+            raw_action = matchers[1] if len(matchers) >= 2 else "*"
+            resource = matchers[2] if len(matchers) >= 3 else "*"
+            description = matchers[3:]
             scope = PolicyScope(raw_scope)
             rule = PermissionRule(
                 decision=Decision(raw_decision),
@@ -222,6 +232,12 @@ class PermissionCommands:
                 resource=None if resource == "*" else resource,
                 description=description[0] if description else None,
             )
+            if self._is_broad_rule(rule) and not context.interaction.confirm(
+                self._broad_rule_prompt(rule, scope),
+                default=False,
+            ):
+                context.interaction.warning("Permission rule creation was not approved.")
+                return
             manager.add_rule(rule, scope=scope)
             context.interaction.info(f"Added {scope.value} {rule.decision.value} rule {rule.id}.")
             return
@@ -237,8 +253,53 @@ class PermissionCommands:
             return
         raise ValueError("Invalid permission rule arguments.")
 
+    @staticmethod
+    def _is_broad_rule(rule: PermissionRule) -> bool:
+        """Return whether any rule matcher selects every possible value."""
+        return rule.tool == "*" or rule.action is None or rule.resource is None
+
+    @staticmethod
+    def _broad_rule_prompt(rule: PermissionRule, scope: PolicyScope) -> str:
+        """Describe a broad rule and its wildcard dimensions for confirmation."""
+        wildcards = []
+        if rule.tool == "*":
+            wildcards.append("tool")
+        if rule.action is None:
+            wildcards.append("action")
+        if rule.resource is None:
+            wildcards.append("resource")
+        return (
+            f"This {scope.value} {rule.decision.value} rule matches every "
+            f"{', '.join(wildcards)}. Broad rules can affect more operations than intended. "
+            "Create it?"
+        )
+
+    def _list_rules(
+        self,
+        context: CommandContext,
+        scope: PolicyScope | None = None,
+    ) -> None:
+        """List permission rules in the selected scope or both scopes."""
+        sections = []
+        scopes = (scope,) if scope is not None else tuple(PolicyScope)
+        for selected_scope in scopes:
+            rules = (
+                self._permission_manager.persistent_rules
+                if selected_scope is PolicyScope.WORKSPACE
+                else self._permission_manager.session_rules
+            )
+            rendered = "\n".join(f"  {self._render_rule(rule)}" for rule in rules) or "  none"
+            sections.append(f"{selected_scope.value.title()} permission rules:\n{rendered}")
+        context.interaction.info("\n".join(sections))
+
     def _change_limit(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
         manager = self._permission_manager
+        if not arguments or arguments == ("list",):
+            self._list_limits(context)
+            return
+        if len(arguments) == 2 and arguments[0] == "list":
+            self._list_limits(context, PolicyScope(arguments[1]))
+            return
         if len(arguments) == 4 and arguments[0] in {"add", "remove"}:
             operation, raw_scope, label, value = arguments
             if label not in _COLLECTION_LIMITS:
@@ -277,6 +338,35 @@ class PermissionCommands:
             return
         raise ValueError("Invalid permission limit arguments.")
 
+    def _list_limits(
+        self,
+        context: CommandContext,
+        scope: PolicyScope | None = None,
+    ) -> None:
+        """List permission limits in the selected scope or both scopes."""
+        sections = []
+        scopes = (scope,) if scope is not None else tuple(PolicyScope)
+        for selected_scope in scopes:
+            limits = (
+                self._permission_manager.configuration.limits
+                if selected_scope is PolicyScope.WORKSPACE
+                else self._permission_manager.session_overrides.limits
+            )
+            lines = []
+            for label, field in _LIMIT_FIELDS.items():
+                value = getattr(limits, field)
+                if selected_scope is PolicyScope.SESSION and value is None:
+                    rendered = "inherited"
+                elif isinstance(value, tuple):
+                    rendered = ", ".join(value) or "none"
+                else:
+                    rendered = str(value).lower()
+                lines.append(f"  {label}: {rendered}")
+            sections.append(
+                f"{selected_scope.value.title()} permission limits:\n" + "\n".join(lines)
+            )
+        context.interaction.info("\n".join(sections))
+
     @staticmethod
     def _report_reset(context: CommandContext, label: str, changed: bool) -> None:
         """Report whether one scoped reset changed policy state."""
@@ -309,10 +399,12 @@ class PermissionCommands:
         )
         rule = CommandCompletion(
             values=(
+                CompletionValue("list", "List rules in both scopes or one selected scope."),
                 CompletionValue("add", "Create a workspace or session policy rule."),
                 CompletionValue("remove", "Remove an existing scoped rule by identifier."),
             ),
             children={
+                "list": CommandCompletion(values=scopes),
                 "add": scoped_decision,
                 "remove": CommandCompletion(
                     values=scopes,
@@ -488,12 +580,14 @@ class PermissionCommands:
         )
         return CommandCompletion(
             values=(
+                CompletionValue("list", "List limits in both scopes or one selected scope."),
                 CompletionValue("set", "Set a scoped boolean limit."),
                 CompletionValue("add", "Add a root or origin to a scoped limit."),
                 CompletionValue("remove", "Remove a root or origin from a scoped limit."),
                 CompletionValue("reset", "Restore a bootstrap or inherited limit."),
             ),
             children={
+                "list": CommandCompletion(values=scopes),
                 "set": scoped_boolean,
                 "add": scoped_collection("add"),
                 "remove": scoped_collection("remove"),
@@ -652,9 +746,10 @@ class PermissionCommands:
             "preset <list|show|diff|replace> ... | "
             "explain <tool> <action> <resource> | default set <workspace|session> <action> "
             "<decision> | default reset <workspace|session> <action> | rule add "
-            "<workspace|session> <decision> <tool> <action|*> <resource|*> [description] | "
-            "rule remove <workspace|session> <rule-id> | limit "
-            "<set|add|remove|reset> <workspace|session> <name> [value]]"
+            "<workspace|session> <decision> [tool|*] [action|*] [resource|*] [description] | "
+            "rule [list [workspace|session]] | rule remove <workspace|session> <rule-id> | "
+            "limit [list [workspace|session]] | limit <set|add|remove|reset> "
+            "<workspace|session> <name> [value]]"
         )
 
     @staticmethod

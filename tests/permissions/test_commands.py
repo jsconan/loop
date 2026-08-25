@@ -44,7 +44,7 @@ def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes
         "rule add workspace allow read_text_file filesystem.read '/project/*' 'Read docs'",
     )
     persistent_id = permissions.persistent_rules[0].id
-    manager.call("permissions", "rule add session deny run_command process.execute '*'")
+    manager.call("permissions", "rule add session deny run_command process.execute")
     session_id = permissions.session_rules[0].id
 
     loaded = PermissionManager(tmp_path)
@@ -53,11 +53,96 @@ def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes
     assert loaded.configuration.limits.deny_private_networks is False
     assert loaded.configuration.limits.network_origins == ("https://example.com",)
     assert loaded.configuration.rules[0].description == "Read docs"
+    assert permissions.session_rules[0].resource is None
 
     manager.call("permissions", f"rule remove workspace {persistent_id}")
     manager.call("permissions", f"rule remove session {session_id}")
     assert not permissions.persistent_rules
     assert not permissions.session_rules
+
+
+def test_permissions_rule_add_defaults_omitted_matchers_to_wildcards(tmp_path):
+    """Omitted trailing tool, action, and resource matchers each mean wildcard."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = True
+    permissions = PermissionManager(tmp_path)
+    manager = command_manager(permissions, interaction)
+
+    variants = (
+        ("rule add session allow", "*", None, None),
+        ("rule add session allow run_command", "run_command", None, None),
+        (
+            "rule add session allow run_command process.execute",
+            "run_command",
+            Action.PROCESS_EXECUTE,
+            None,
+        ),
+        (
+            "rule add session allow run_command process.execute 'git *'",
+            "run_command",
+            Action.PROCESS_EXECUTE,
+            "git *",
+        ),
+    )
+    for command, tool, action, resource in variants:
+        manager.call("permissions", command)
+        rule = permissions.session_rules[-1]
+        assert (rule.tool, rule.action, rule.resource) == (tool, action, resource)
+
+    interaction.report.assert_not_called()
+
+
+def test_permissions_rule_add_confirms_broad_matchers_before_mutation(tmp_path):
+    """Broad rules require explicit approval and declined creation leaves policy unchanged."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path)
+    manager = command_manager(permissions, interaction)
+
+    interaction.confirm.return_value = False
+    manager.call("permissions", "rule add session allow run_command process.execute")
+
+    assert not permissions.session_rules
+    prompt = interaction.confirm.call_args.args[0]
+    assert "session allow rule" in prompt
+    assert "every resource" in prompt
+    assert interaction.confirm.call_args.kwargs == {"default": False}
+    interaction.warning.assert_called_once_with("Permission rule creation was not approved.")
+
+    interaction.confirm.return_value = True
+    manager.call("permissions", "rule add session allow run_command process.execute")
+
+    assert len(permissions.session_rules) == 1
+    assert permissions.session_rules[0].resource is None
+
+    interaction.confirm.return_value = False
+    manager.call("permissions", "rule add session deny * process.execute git")
+    prompt = interaction.confirm.call_args.args[0]
+    assert "every tool" in prompt
+    assert "resource" not in prompt
+    assert len(permissions.session_rules) == 1
+
+
+def test_permissions_rule_without_mutation_lists_scoped_rules(tmp_path):
+    """Bare and explicitly scoped rule inspection list rules without changing policy."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path)
+    permissions.add_rule(PermissionRule(id="workspace-rule", decision=Decision.ASK))
+    permissions.add_rule(
+        PermissionRule(id="session-rule", decision=Decision.ALLOW, tool="run_command"),
+        scope=PolicyScope.SESSION,
+    )
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "rule")
+    listed = interaction.info.call_args.args[0]
+    assert "Workspace permission rules:\n  workspace-rule" in listed
+    assert "Session permission rules:\n  session-rule" in listed
+
+    manager.call("permissions", "rule list session")
+    scoped = interaction.info.call_args.args[0]
+    assert "Session permission rules:\n  session-rule" in scoped
+    assert "Workspace permission rules:" not in scoped
+    interaction.report.assert_not_called()
 
 
 def test_permissions_show_and_explain_report_the_complete_effective_policy(tmp_path):
@@ -152,6 +237,27 @@ def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
     assert permissions.effective_configuration == permissions.configuration
 
 
+def test_permissions_limit_without_mutation_lists_scoped_values(tmp_path):
+    """Bare and explicitly scoped limit inspection distinguish values from inheritance."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "limit")
+    listed = interaction.info.call_args.args[0]
+    assert "Workspace permission limits:" in listed
+    assert "Session permission limits:" in listed
+    assert "  host-process: true" in listed
+    assert "  private-network: inherited" in listed
+
+    manager.call("permissions", "limit list workspace")
+    scoped = interaction.info.call_args.args[0]
+    assert "Workspace permission limits:" in scoped
+    assert "Session permission limits:" not in scoped
+    interaction.report.assert_not_called()
+
+
 def test_permissions_preset_commands_preview_and_confirm_scoped_policy_replacement(tmp_path):
     """Preset commands replace confirmed selected-scope defaults and rules only."""
     interaction = Mock(spec=Interaction)
@@ -196,7 +302,7 @@ def test_permissions_preset_list_reports_an_empty_catalog(monkeypatch, tmp_path)
     interaction = Mock(spec=Interaction)
     manager = command_manager(PermissionManager(tmp_path), interaction)
 
-    manager.call("permissions", "preset list")
+    manager.call("permissions", "preset")
 
     interaction.info.assert_called_once_with("Permission presets: none")
 
