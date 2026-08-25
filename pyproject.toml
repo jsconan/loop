@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "loop"
-version = "0.1.0"
+version = "0.0.1"
 description = "An experimental agentic loop for OpenAI-compatible Responses API servers"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -20,6 +20,14 @@ dependencies = [
     "pyyaml>=6.0.3,<7",
     "rich>=14.1.0,<15",
 ]
+classifiers = [
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/jsconan/loop"
+"Bug Tracker" = "https://github.com/jsconan/loop/issues"
 
 [project.scripts]
 loop = "loop.main:main"
