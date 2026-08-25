@@ -94,6 +94,8 @@ def test_manager_response_uses_terminal_text_and_an_interaction_override():
         ReasoningDelta(text="thought"),
         AnswerDelta(text="incomplete "),
         AnswerDelta(text="answer"),
+        ReasoningCompleted(text="incomplete thought"),
+        AnswerCompleted(text="incomplete answer"),
         ToolCallCompleted(call=tool_call),
         SimpleNamespace(ignored=True),
         ResponseCompleted(
@@ -121,6 +123,8 @@ def test_manager_response_uses_terminal_text_and_an_interaction_override():
     assert interaction.reasoning_delta.call_args_list[1].kwargs == {"start": False}
     assert interaction.answer_delta.call_args_list[0].kwargs == {"start": True}
     assert interaction.answer_delta.call_args_list[1].kwargs == {"start": False}
+    interaction.reasoning.assert_not_called()
+    interaction.answer.assert_not_called()
     interaction.response_context.assert_called_once_with()
     assert interaction.debug.call_count == len(events)
     configured.response_context.assert_not_called()

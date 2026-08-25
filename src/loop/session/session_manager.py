@@ -172,11 +172,13 @@ class SessionManager:
                     continue
                 if isinstance(event, ReasoningCompleted):
                     reasoning = event.text
-                    output.reasoning(event.text)
+                    if not reasoning_started:
+                        output.reasoning(event.text)
                     continue
                 if isinstance(event, AnswerCompleted):
                     answer = event.text
-                    output.answer(event.text)
+                    if not answer_started:
+                        output.answer(event.text)
                     continue
                 if isinstance(event, ToolCallCompleted):
                     tool_calls.append(event.call)
