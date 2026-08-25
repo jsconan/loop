@@ -24,7 +24,7 @@ The project defaults to a local server at `http://localhost:8000/v1` running
 
 ## Requirements
 
-- Python 3.14 or later
+- Python 3.12 or later
 - An OpenAI-compatible server that implements the Responses API
 - [`uv`](https://docs.astral.sh/uv/) (recommended), or another Python package manager
 
