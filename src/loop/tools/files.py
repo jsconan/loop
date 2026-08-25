@@ -2,14 +2,13 @@
 
 import logging
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import Field
 
 from .. import constants
-from ..errors import Problem, log_problem
+from ..errors import Problem, ProblemException, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, FileTarget, Operation, OperationPlan
 from ..tooling import ToolContext, tool
@@ -21,6 +20,7 @@ from ..utils import (
     iter_visible_paths,
     read_bounded_text,
     sha256_digest,
+    write_text_atomically,
 )
 from .models import FileContentResult, FolderEntry
 
@@ -96,6 +96,99 @@ def _file_plan(action: Action):
         )
 
     return _plan
+
+
+def _edit_problem(code: str, detail: str) -> ProblemException:
+    """Return a structured planning failure for an invalid text edit."""
+    return ProblemException(
+        Problem(
+            code=code,
+            title="Could not edit file",
+            detail=detail,
+            severity="warning",
+            operation="edit_text_file",
+        )
+    )
+
+
+def _edited_content(
+    content: str,
+    old_content: str,
+    new_content: str,
+    replace_all: bool,
+) -> tuple[str, int]:
+    """Return content with one validated exact replacement applied."""
+    if not old_content:
+        raise _edit_problem(
+            "filesystem.empty_match",
+            "old_content cannot be empty. Include exact existing content that anchors the edit.",
+        )
+    occurrences = content.count(old_content)
+    if not occurrences:
+        raise _edit_problem(
+            "filesystem.content_not_found",
+            "old_content was not found. Read the relevant file range again and retry with exact "
+            "content.",
+        )
+    if occurrences > 1 and not replace_all:
+        raise _edit_problem(
+            "filesystem.content_ambiguous",
+            f"Found {occurrences} matches for old_content. Include more surrounding content or "
+            "set replace_all to true.",
+        )
+    if old_content == new_content:
+        raise _edit_problem(
+            "filesystem.no_content_change",
+            "old_content and new_content are identical; no edit was requested.",
+        )
+    replacements = occurrences if replace_all else 1
+    return content.replace(old_content, new_content, replacements), replacements
+
+
+def _edit_plan(arguments: dict[str, object]) -> OperationPlan:
+    """Plan one exact UTF-8 text replacement and its approved resulting content."""
+    path = Path(str(arguments["path"]))
+    resource = canonical_path(path)
+    try:
+        if not path.is_file():
+            raise _edit_problem(
+                "filesystem.path_not_file",
+                f"Path '{path}' is not an existing regular file.",
+            )
+        original_bytes = path.read_bytes()
+        try:
+            original = original_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _edit_problem(
+                "filesystem.binary_file",
+                f"File '{path}' is not valid UTF-8 text and cannot be edited with this tool.",
+            ) from exc
+        updated, _ = _edited_content(
+            original,
+            str(arguments["old_content"]),
+            str(arguments["new_content"]),
+            bool(arguments["replace_all"]),
+        )
+    except OSError as exc:
+        raise _edit_problem("filesystem.edit_failed", str(exc)) from exc
+
+    normalized = dict(arguments)
+    normalized["path"] = resource
+    return OperationPlan(
+        arguments=normalized,
+        operations=(
+            Operation(
+                tool_id="",
+                action=Action.FILESYSTEM_REPLACE,
+                target=FileTarget(
+                    path=resource,
+                    expected_exists=True,
+                    expected_digest=sha256_digest(original_bytes),
+                ),
+                reason=f"Proposed changes:\n{format_content_diff(original, updated, resource)}",
+            ),
+        ),
+    )
 
 
 def _deletion_kind(path: Path) -> Literal["file", "symbolic link", "folder"] | None:
@@ -235,44 +328,79 @@ def write_text_file(
     content: Annotated[str, Field(description="Content to write to the file.")],
 ) -> str | Problem:
     """Write content to a file on the local disk."""
-    temporary_path = None
     try:
         target = Path(path)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=target.parent,
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as file:
-            file.write(content)
-            temporary_path = Path(file.name)
         operation = context.operations[0] if context.operations else None
         planned = operation.target if operation is not None else None
         if not isinstance(planned, FileTarget) or planned.expected_exists is None:
             raise RuntimeError("Authorized file-state precondition is missing.")
-        if planned.expected_exists:
-            if not target.is_file():
-                raise RuntimeError("The target changed after approval; replacement was cancelled.")
-            if sha256_digest(target.read_bytes()) != planned.expected_digest:
-                raise RuntimeError("The target changed after approval; replacement was cancelled.")
-            temporary_path.replace(target)
-        else:
-            target.hardlink_to(temporary_path)
-            temporary_path.unlink()
-            temporary_path = None
+        write_text_atomically(
+            target,
+            content,
+            expected_digest=planned.expected_digest if planned.expected_exists else None,
+        )
         context.observe_file(target)
         context.invalidate_instructions(target)
         return f"Successfully wrote to file '{path}'."
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
         problem = Problem.from_exception(
             exc,
             code="filesystem.write_failed",
             title="Could not write file",
             operation="write_text_file",
+        )
+        log_problem(_LOGGER, problem, exc)
+        return problem
+
+
+@tool(
+    actions={Action.FILESYSTEM_REPLACE},
+    operation_planner=_edit_plan,
+)
+def edit_text_file(
+    context: ToolContext,
+    path: Annotated[str, Field(description="Path to the existing UTF-8 text file to edit.")],
+    old_content: Annotated[
+        str,
+        Field(
+            description="Exact, non-empty existing content that uniquely anchors the edit."
+        ),
+    ],
+    new_content: Annotated[
+        str,
+        Field(description="Replacement content; use an empty string to delete the matched text."),
+    ],
+    replace_all: Annotated[
+        bool,
+        Field(description="Whether to replace every exact match instead of requiring one match."),
+    ] = False,
+) -> str | Problem:
+    """Replace exact content in an existing UTF-8 text file."""
+    try:
+        target = Path(path)
+        operation = context.operations[0] if context.operations else None
+        planned = operation.target if operation is not None else None
+        if not isinstance(planned, FileTarget) or not planned.expected_exists:
+            raise RuntimeError("Authorized file-state precondition is missing.")
+        if planned.expected_digest is None:
+            raise RuntimeError("Approved edit content is missing.")
+        current_bytes = target.read_bytes()
+        if sha256_digest(current_bytes) != planned.expected_digest:
+            raise RuntimeError("The target changed after approval; replacement was cancelled.")
+        updated, replacement_count = _edited_content(
+            current_bytes.decode("utf-8"), old_content, new_content, replace_all
+        )
+        write_text_atomically(target, updated, expected_digest=planned.expected_digest)
+        context.observe_file(target)
+        context.invalidate_instructions(target)
+        noun = "replacement" if replacement_count == 1 else "replacements"
+        return f"Successfully edited file '{path}' ({replacement_count} {noun})."
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
+        problem = Problem.from_exception(
+            exc,
+            code="filesystem.edit_failed",
+            title="Could not edit file",
+            operation="edit_text_file",
         )
         log_problem(_LOGGER, problem, exc)
         return problem

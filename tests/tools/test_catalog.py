@@ -23,6 +23,7 @@ def test_builtin_manifest_has_every_tool_in_deterministic_order():
         "list_folder",
         "read_text_file",
         "write_text_file",
+        "edit_text_file",
         "delete_path",
         "manage_skills",
         "run_command",

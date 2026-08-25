@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
 from ..constants import OMIT, Omit
-from ..errors import Problem
+from ..errors import Problem, ProblemException
 from ..interaction import Interaction
 from ..models import (
     ToolDefinition,
@@ -250,6 +250,8 @@ class ToolRegistry:
         active_permissions = permission_manager or self._permission_manager
         try:
             plan = tool.plan(validated)
+        except ProblemException as exc:
+            return serialize_tool_problem(exc.problem), 0
         except ValueError as exc:
             return self._problem("tool.planning_failed", "Tool planning failed", str(exc), name), 0
         denied = self._authorize(tool, plan.operations, interaction, active_permissions)
@@ -337,6 +339,8 @@ class ToolRegistry:
         active_permissions = permission_manager or self._permission_manager
         try:
             plan = tool.plan(validated)
+        except ProblemException as exc:
+            return serialize_tool_problem(exc.problem), 0
         except ValueError as exc:
             return self._problem("tool.planning_failed", "Tool planning failed", str(exc), name), 0
         denied = self._authorize(tool, plan.operations, interaction, active_permissions)
@@ -404,6 +408,8 @@ class ToolRegistry:
             )
         try:
             plan = tool.plan(validated)
+        except ProblemException as exc:
+            return ToolExecutionResult(serialize_tool_problem(exc.problem))
         except ValueError as exc:
             return ToolExecutionResult(
                 self._problem("tool.planning_failed", "Tool planning failed", str(exc), name)

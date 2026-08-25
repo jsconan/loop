@@ -440,6 +440,7 @@ The default registry exposes these functions to the model:
 | `list_folder`          | Lists typed file/folder entries, optionally including nested entries     |
 | `read_text_file`       | Reads bounded UTF-8 text by line range                                   |
 | `write_text_file`      | Writes a UTF-8 text file after centralized authorization                 |
+| `edit_text_file`       | Replaces exact UTF-8 text with ambiguity and change safeguards           |
 | `delete_path`          | Permanently deletes an authorized file, symbolic link, or folder tree    |
 | `get_current_datetime` | Returns the current local date and time                                  |
 | `fetch_content`        | Streams authorized HTTP(S) text into a bounded resumable cache           |

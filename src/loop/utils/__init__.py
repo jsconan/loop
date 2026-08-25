@@ -30,6 +30,7 @@ __all__ = [
     "sha256_digest",
     "store_content",
     "store_text_stream",
+    "write_text_atomically",
 ]
 
 
@@ -45,6 +46,7 @@ from .content import (
     store_content,
     store_text_stream,
 )
+from .files import write_text_atomically
 from .hashing import sha256_digest
 from .models import BoundedTextContent, CachedContentMetadata, IgnoreRule, IgnoreRules
 from .path import canonical_path, find_project_root, is_path_ignored, iter_visible_paths

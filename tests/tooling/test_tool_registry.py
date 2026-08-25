@@ -14,6 +14,8 @@ from loop import (
     Operation,
     OperationPlan,
     PermissionManager,
+    Problem,
+    ProblemException,
     SessionTarget,
     ToolResultPresentation,
     ToolResultPresentationSpec,
@@ -552,6 +554,31 @@ def test_sync_and_async_dispatch_report_operation_planning_failures():
     assert "tool.planning_failed" in async_result
     assert sync_duration == async_duration == 0
     assert calls == []
+
+
+def test_all_dispatch_paths_preserve_structured_operation_planning_problems():
+    """Structured planning failures retain their problem contract across every dispatcher."""
+    planning_problem = Problem(
+        code="test.specific",
+        title="Specific planning failure",
+        detail="Use different input.",
+        operation="calculate",
+    )
+
+    def fail_plan(_arguments):
+        raise ProblemException(planning_problem)
+
+    @declare_tool(actions={Action.SESSION_MUTATE}, operation_planner=fail_plan)
+    def calculate() -> None:
+        """Expose a structured planning failure."""
+
+    registry = ToolRegistry([calculate])
+
+    sync = json.loads(registry.call("calculate", "{}"))["problem"]
+    asynchronous = json.loads(asyncio.run(registry.call_async("calculate", "{}")))["problem"]
+    command = json.loads(registry.command("calculate", ()).output)["problem"]
+
+    assert sync["code"] == asynchronous["code"] == command["code"] == "test.specific"
 
 
 def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):

@@ -9,12 +9,16 @@ import pytest
 
 from loop import (
     BUILTIN_TOOLS,
+    Action,
     ConsoleInteraction,
+    FileTarget,
     InstructionsManager,
+    Operation,
     PermissionManager,
     ToolRegistry,
 )
 from loop.tooling import ToolContext
+from loop.tools.files import edit_text_file as edit_text_file_tool
 from loop.tools.files import list_folder as list_folder_tool
 from loop.tools.files import write_text_file as write_text_file_tool
 
@@ -52,6 +56,24 @@ def write_text_file(path, content):
         tool_registry.call(
             "write_text_file",
             json.dumps({"path": str(path), "content": content}),
+            interaction=ConsoleInteraction(),
+        )
+    )
+
+
+def edit_text_file(path, old_content, new_content, replace_all=False):
+    """Dispatch the context-aware exact text-editing tool."""
+    return dispatched_value(
+        tool_registry.call(
+            "edit_text_file",
+            json.dumps(
+                {
+                    "path": str(path),
+                    "old_content": old_content,
+                    "new_content": new_content,
+                    "replace_all": replace_all,
+                }
+            ),
             interaction=ConsoleInteraction(),
         )
     )
@@ -253,6 +275,21 @@ def test_file_navigation_reports_successful_instruction_context_changes(tmp_path
     tool_registry.call(
         "read_text_file",
         json.dumps({"path": str(target)}),
+        interaction=interaction,
+        instructions_manager=manager,
+    )
+    assert manager.working_directory == nested.resolve()
+
+    tool_registry.call(
+        "edit_text_file",
+        json.dumps(
+            {
+                "path": str(target),
+                "old_content": "content",
+                "new_content": "edited",
+                "replace_all": False,
+            }
+        ),
         interaction=interaction,
         instructions_manager=manager,
     )
@@ -492,6 +529,167 @@ def test_write_executor_requires_authorized_state_and_existing_replacement(tmp_p
     assert problem(write_text_file(target, "new"))["detail"].startswith(
         "The target changed after approval"
     )
+
+
+def test_edit_text_file_replaces_inserts_deletes_and_replaces_all(tmp_path):
+    """Exact edits support unique replacement, anchored insertion, deletion, and explicit all."""
+    target = tmp_path / "target.txt"
+    target.write_text("first\nanchor\nremove\nrepeat repeat\n", encoding="utf-8")
+
+    assert "(1 replacement)" in edit_text_file(target, "first", "changed")
+    assert "(1 replacement)" in edit_text_file(
+        target, "anchor\n", "inserted\nanchor\n"
+    )
+    assert "(1 replacement)" in edit_text_file(target, "remove\n", "")
+    assert "(2 replacements)" in edit_text_file(target, "repeat", "done", True)
+
+    assert target.read_text(encoding="utf-8") == (
+        "changed\ninserted\nanchor\ndone done\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("old_content", "new_content", "code"),
+    [
+        ("", "new", "filesystem.empty_match"),
+        ("missing", "new", "filesystem.content_not_found"),
+        ("same", "same", "filesystem.no_content_change"),
+        ("repeat", "new", "filesystem.content_ambiguous"),
+    ],
+)
+def test_edit_text_file_rejects_invalid_or_ambiguous_replacements(
+    tmp_path, monkeypatch, old_content, new_content, code
+):
+    """Invalid exact edits fail with actionable codes before requesting approval."""
+    target = tmp_path / "target.txt"
+    target.write_text("same repeat repeat", encoding="utf-8")
+    confirm = MagicMock(return_value=True)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    result = edit_text_file(target, old_content, new_content)
+
+    assert problem(result)["code"] == code
+    confirm.assert_not_called()
+    assert target.read_text(encoding="utf-8") == "same repeat repeat"
+
+
+def test_edit_text_file_rejects_missing_directory_and_non_utf8_targets(tmp_path):
+    """Exact editing reports unsupported target and encoding states without mutation."""
+    binary = tmp_path / "binary.dat"
+    binary.write_bytes(b"\xff")
+
+    assert problem(edit_text_file(tmp_path / "missing", "a", "b"))["code"] == (
+        "filesystem.path_not_file"
+    )
+    assert problem(edit_text_file(tmp_path, "a", "b"))["code"] == (
+        "filesystem.path_not_file"
+    )
+    assert problem(edit_text_file(binary, "a", "b"))["code"] == "filesystem.binary_file"
+
+
+def test_edit_text_file_reports_a_planning_read_failure(tmp_path, monkeypatch):
+    """An operating-system failure while preparing an edit remains a structured file problem."""
+    target = tmp_path / "target.txt"
+    target.write_text("old", encoding="utf-8")
+    monkeypatch.setattr(Path, "read_bytes", MagicMock(side_effect=OSError("read failed")))
+
+    result = edit_text_file(target, "old", "new")
+
+    assert problem(result)["code"] == "filesystem.edit_failed"
+    assert problem(result)["detail"] == "read failed"
+
+
+def test_edit_text_file_requires_approval_and_previews_the_resulting_diff(tmp_path, monkeypatch):
+    """Exact editing shows its unified diff and leaves denied content unchanged."""
+    target = tmp_path / "target.txt"
+    target.write_text("before\nunchanged\n", encoding="utf-8")
+    confirm = MagicMock(side_effect=[False, True])
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+
+    assert problem(edit_text_file(target, "before", "after"))["code"] == "tool.denied"
+    assert target.read_text(encoding="utf-8") == "before\nunchanged\n"
+    assert "(1 replacement)" in edit_text_file(target, "before", "after")
+
+    prompt = confirm.call_args.args[0]
+    assert "filesystem.replace" in prompt
+    assert "Proposed changes:" in prompt
+    assert "-before" in prompt
+    assert "+after" in prompt
+
+
+def test_edit_text_file_cancels_when_the_approved_target_changes(tmp_path, monkeypatch):
+    """Exact editing consumes the approved digest instead of overwriting later content."""
+    target = tmp_path / "target.txt"
+    target.write_text("approved", encoding="utf-8")
+    original = Path.read_bytes
+    calls = 0
+
+    def changing_read(path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            target.write_text("changed", encoding="utf-8")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", changing_read)
+
+    result = edit_text_file(target, "approved", "replacement")
+
+    assert problem(result)["detail"].startswith("The target changed after approval")
+    assert target.read_text(encoding="utf-8") == "changed"
+
+
+def test_edit_text_file_reports_commit_failures_and_cleans_up_staging(tmp_path, monkeypatch):
+    """Exact editing preserves original content and reports a failed atomic commit."""
+    target = tmp_path / "target.txt"
+    target.write_text("old", encoding="utf-8")
+    monkeypatch.setattr(Path, "replace", MagicMock(side_effect=OSError("commit failed")))
+
+    result = edit_text_file(target, "old", "new")
+
+    assert problem(result)["detail"] == "commit failed"
+    assert target.read_text(encoding="utf-8") == "old"
+    assert set(tmp_path.iterdir()) == {tmp_path / ".loop", target}
+
+
+def test_edit_executor_requires_an_authorized_digest(tmp_path):
+    """Direct exact-edit execution fails closed without an approved operation state."""
+    target = tmp_path / "target.txt"
+    target.write_text("old", encoding="utf-8")
+    context = ToolContext(ConsoleInteraction(), "edit_text_file")
+
+    result = edit_text_file_tool(context, str(target), "old", "new")
+
+    assert result.code == "filesystem.edit_failed"
+    assert result.detail.startswith("Authorized file-state precondition is missing")
+
+    incomplete = ToolContext(
+        ConsoleInteraction(),
+        "edit_text_file",
+        operations=(
+            Operation(
+                tool_id="edit_text_file",
+                action=Action.FILESYSTEM_REPLACE,
+                target=FileTarget(path=str(target), expected_exists=True),
+            ),
+        ),
+    )
+    result = edit_text_file_tool(incomplete, str(target), "old", "new")
+    assert result.detail == "Approved edit content is missing."
+
+
+def test_edit_text_file_schema_exposes_only_the_model_facing_arguments():
+    """The exact editor schema documents its compact public contract without internal state."""
+    definition = next(
+        definition for definition in tool_registry.definitions() if definition.name == "edit_text_file"
+    )
+
+    assert list(definition.parameters["properties"]) == [
+        "path",
+        "old_content",
+        "new_content",
+        "replace_all",
+    ]
 
 
 def test_delete_path_requires_confirmation_and_removes_files(tmp_path, monkeypatch):
