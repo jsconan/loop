@@ -202,7 +202,7 @@ class ProjectPathMentionHandler(MentionHandler):
                         f"Mentioned path '{value}' exceeds the "
                         f"{constants.MAX_FETCH_BYTES}-byte snapshot limit."
                     )
-            except OSError, UnicodeError, ValueError:
+            except (OSError, UnicodeError, ValueError):
                 if ignore_invalid:
                     continue
                 raise
@@ -329,7 +329,7 @@ class SkillMentionHandler(MentionHandler):
                     )
                 if name not in previously_active:
                     activated.append(name)
-        except OSError, UnicodeError, ValueError:
+        except (OSError, UnicodeError, ValueError):
             for name in reversed(activated):
                 self._instructions_manager.deactivate_skill(name)
             raise

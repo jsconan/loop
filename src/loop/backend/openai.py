@@ -237,16 +237,16 @@ class OpenAIBackend(Backend):
         """Return a provider retry delay from millisecond, second, or HTTP-date headers."""
         try:
             return max(0.0, float(headers["retry-after-ms"]) / 1000)
-        except KeyError, TypeError, ValueError:
+        except (KeyError, TypeError, ValueError):
             pass
         value = headers.get("retry-after")
         try:
             return max(0.0, float(value))
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             pass
         try:
             retry_at = parsedate_to_datetime(value)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return None
         if retry_at.tzinfo is None:
             retry_at = retry_at.replace(tzinfo=UTC)
@@ -620,7 +620,7 @@ class OpenAIBackend(Backend):
             )
             response.raise_for_status()
             return int(response.json()["count"])
-        except httpx.HTTPError, KeyError, TypeError, ValueError:
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
             return None
 
     async def count_tokens_async(self, prompt: str, model: str | None = None) -> int | None:
@@ -655,7 +655,7 @@ class OpenAIBackend(Backend):
                 )
             response.raise_for_status()
             return int(response.json()["count"])
-        except httpx.HTTPError, KeyError, TypeError, ValueError:
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
             return None
 
     @staticmethod
@@ -673,7 +673,7 @@ class OpenAIBackend(Backend):
         context_window = (model.model_extra or {}).get("max_model_len")
         try:
             context_window = int(context_window) if context_window is not None else None
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             context_window = None
         return ModelInfo(id=model.id, context_window=context_window)
 

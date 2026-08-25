@@ -1,5 +1,7 @@
 """Tests for the built-in system tools."""
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess

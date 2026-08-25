@@ -1,5 +1,7 @@
 """Declare, validate, and invoke typed functions exposed to an LLM."""
 
+from __future__ import annotations
+
 import inspect
 import logging
 from collections.abc import Callable, Iterable

@@ -134,7 +134,7 @@ class ConsoleInteraction(Interaction):
                     completer=completer,
                     complete_in_thread=True,
                 ).strip()
-            except KeyboardInterrupt, EOFError:
+            except (KeyboardInterrupt, EOFError):
                 return False
             if not user_input:
                 self.warning("Please enter a message!")
@@ -624,5 +624,5 @@ class ConsoleInteraction(Interaction):
             return
         try:
             termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-        except AttributeError, OSError, ValueError:
+        except (AttributeError, OSError, ValueError):
             pass

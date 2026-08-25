@@ -159,7 +159,7 @@ def store_text_stream(
                 decoder.decode(chunk)
                 artifact.write(chunk)
             decoder.decode(b"", final=True)
-    except UnicodeDecodeError, ValueError:
+    except (UnicodeDecodeError, ValueError):
         path.unlink(missing_ok=True)
         raise
     with _LOCK:

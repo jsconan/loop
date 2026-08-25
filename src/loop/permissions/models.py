@@ -1,5 +1,7 @@
 """Define typed operations, policies, authorization decisions, and recording protocols."""
 
+from __future__ import annotations
+
 import json
 from collections.abc import Callable
 from enum import StrEnum

@@ -33,7 +33,7 @@ def _write_preview(path: Path, content: str) -> str:
         return f"Proposed content:\n{format_content_preview(content)}"
     try:
         existing = path.read_text(encoding="utf-8")
-    except OSError, UnicodeDecodeError:
+    except (OSError, UnicodeDecodeError):
         return (
             "Existing content could not be previewed; proposed content:\n"
             f"{format_content_preview(content)}"

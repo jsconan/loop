@@ -62,7 +62,7 @@ def main() -> None:
             stream=True,
         )
         loop.run()
-    except EOFError, KeyboardInterrupt, ShutdownRequested:
+    except (EOFError, KeyboardInterrupt, ShutdownRequested):
         interaction.info("\nStopping loop. Goodbye!")
     except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
         problem = Problem(

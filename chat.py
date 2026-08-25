@@ -94,7 +94,7 @@ def main() -> None:
 
         interaction.conversation_ended()
 
-    except EOFError, KeyboardInterrupt, ShutdownRequested:
+    except (EOFError, KeyboardInterrupt, ShutdownRequested):
         interaction.conversation_ended()
     except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
         problem = Problem(

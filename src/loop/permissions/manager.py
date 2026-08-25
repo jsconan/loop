@@ -3,6 +3,8 @@
 # Pylint cannot infer mutable attributes declared by Pydantic models.
 # pylint: disable=no-member
 
+from __future__ import annotations
+
 import ipaddress
 import json
 import logging
