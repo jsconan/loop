@@ -14,15 +14,18 @@ from ..permissions import Action, FileTarget, Operation, OperationPlan
 from ..tooling import ToolContext, tool
 from ..utils import (
     canonical_path,
+    filter_paths_by_globs,
     format_content_diff,
     format_content_preview,
+    is_binary_file,
     is_path_ignored,
     iter_visible_paths,
     read_bounded_text,
+    search_text_paths,
     sha256_digest,
     write_text_atomically,
 )
-from .models import FileContentResult, FolderEntry
+from .models import FileContentResult, FolderEntry, TextSearchResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -313,6 +316,109 @@ def read_text_file(
             code="filesystem.read_failed",
             title="Could not read file",
             operation="read_text_file",
+        )
+        log_problem(_LOGGER, problem, exc)
+        return problem
+
+
+@tool(
+    actions={Action.FILESYSTEM_READ},
+    operation_planner=_file_plan(Action.FILESYSTEM_READ),
+)
+def search_text(
+    context: ToolContext,
+    path: Annotated[str, Field(description="Path to a text file or folder to search.")],
+    query: Annotated[
+        str,
+        Field(description="Non-empty literal text or regular expression to find.", min_length=1),
+    ],
+    regex: Annotated[
+        bool,
+        Field(description="Whether query is a regular expression instead of literal text."),
+    ] = False,
+    case: Annotated[
+        Literal["smart", "sensitive", "insensitive"],
+        Field(
+            description="Case strategy; smart treats queries containing uppercase as sensitive."
+        ),
+    ] = "smart",
+    include: Annotated[
+        list[str] | None,
+        Field(description="Optional inclusive Git-style file globs.", max_length=20),
+    ] = None,
+    context_lines: Annotated[
+        int,
+        Field(description="Neighboring lines to return around every match.", ge=0, le=10),
+    ] = 0,
+    max_results: Annotated[
+        int,
+        Field(description="Maximum matching lines to return.", ge=1, le=1000),
+    ] = 100,
+    max_bytes: Annotated[
+        int,
+        Field(
+            description="Maximum approximate result bytes retained, capped by the application.",
+            ge=1,
+            le=constants.MAX_TOOL_CONTENT_BYTES,
+        ),
+    ] = constants.MAX_TOOL_CONTENT_BYTES,
+) -> TextSearchResult | Problem:
+    """Search bounded text matches in a file or folder on the local disk."""
+    try:
+        target = Path(path).resolve()
+        if is_path_ignored(target):
+            return Problem(
+                code="filesystem.path_ignored",
+                title="Path cannot be searched",
+                detail=f"Path '{path}' is ignored.",
+                operation="search_text",
+            )
+        if target.is_file():
+            root = target.parent
+            candidates = [] if is_binary_file(target) else [target]
+        elif target.is_dir():
+            root = target
+            candidates = [
+                entry
+                for entry in iter_visible_paths(target, True)
+                if entry.is_file() and not entry.is_symlink() and not is_binary_file(entry)
+            ]
+        else:
+            return Problem(
+                code="filesystem.path_not_searchable",
+                title="Path cannot be searched",
+                detail=f"Path '{path}' is not an existing file or folder.",
+                operation="search_text",
+            )
+        candidates = list(filter_paths_by_globs(candidates, root, include))
+        matches, truncated = search_text_paths(
+            candidates,
+            query,
+            root=root,
+            regex=regex,
+            case=case,
+            context_lines=context_lines,
+            max_results=max_results,
+            max_bytes=max_bytes,
+        )
+        if target.is_dir():
+            context.observe_directory(target)
+        else:
+            context.observe_file(target)
+        for match_path in {match["path"] for match in matches}:
+            context.observe_file(root / match_path)
+        return TextSearchResult(matches=matches, truncated=truncated)
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
+        detail = str(exc)
+        code = "filesystem.invalid_search_pattern" if regex and "regex parse error" in detail else (
+            "filesystem.search_unavailable" if isinstance(exc, FileNotFoundError) else
+            "filesystem.search_failed"
+        )
+        problem = Problem.from_exception(
+            exc,
+            code=code,
+            title="Could not search text",
+            operation="search_text",
         )
         log_problem(_LOGGER, problem, exc)
         return problem

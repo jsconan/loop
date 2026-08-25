@@ -439,6 +439,7 @@ The default registry exposes these functions to the model:
 | ---------------------- | ------------------------------------------------------------------------ |
 | `list_folder`          | Lists typed file/folder entries, optionally including nested entries     |
 | `read_text_file`       | Reads bounded UTF-8 text by line range                                   |
+| `search_text`          | Searches files or folders with bounded, structured ripgrep matches       |
 | `write_text_file`      | Writes a UTF-8 text file after centralized authorization                 |
 | `edit_text_file`       | Replaces exact UTF-8 text with ambiguity and change safeguards           |
 | `delete_path`          | Permanently deletes an authorized file, symbolic link, or folder tree    |
@@ -462,6 +463,13 @@ external source.
 nested folders, using Git's pattern syntax. Agent-specific rules take precedence over Git rules,
 and ignored directories are not traversed. This filtering controls file discovery only; it does
 not prevent an explicitly requested file from being read or changed.
+
+`search_text` performs literal smart-case matching by default, with optional regular expressions,
+case control, inclusive Git-style globs, neighboring lines, and a global result limit. Folder
+searches reuse Loop's ignore traversal before passing explicit visible files to ripgrep, skip
+binary files and symbolic links, and return paths relative to the requested folder.
+Loop does not bundle ripgrep: `rg` must be installed separately and available on `PATH`. When it
+is unavailable, searches return a structured `filesystem.search_unavailable` problem.
 
 These tools operate with the permissions of the process running `loop`. Filesystem access is
 authorized but not OS-sandboxed; approved commands use an exact argument vector and never invoke

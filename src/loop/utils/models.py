@@ -30,3 +30,20 @@ class CachedContentMetadata(TypedDict):
 
     source: str
     reloadable: bool
+
+
+class TextSearchContext(TypedDict):
+    """Describe one neighboring source line around a text match."""
+
+    line: int
+    text: str
+
+
+class TextSearchMatch(TypedDict):
+    """Describe one matching source line returned by text search."""
+
+    path: str
+    line: int
+    column: int
+    text: str
+    context: NotRequired[list[TextSearchContext]]

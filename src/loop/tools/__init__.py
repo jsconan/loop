@@ -12,6 +12,7 @@ __all__ = [
     "read_cached_content",
     "read_text_file",
     "run_command",
+    "search_text",
     "write_text_file",
 ]
 
@@ -28,5 +29,6 @@ from .catalog import (
     read_cached_content,
     read_text_file,
     run_command,
+    search_text,
     write_text_file,
 )

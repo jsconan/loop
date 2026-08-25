@@ -101,6 +101,17 @@ def read_text_file(path, **ranges):
     )
 
 
+def search_text(path, query, **options):
+    """Dispatch the context-aware text-searching tool."""
+    return dispatched_value(
+        tool_registry.call(
+            "search_text",
+            json.dumps({"path": str(path), "query": query, **options}),
+            interaction=ConsoleInteraction(),
+        )
+    )
+
+
 def list_folder(path, entry_type="all", recursive=False):
     """Dispatch the context-aware folder-listing tool."""
     result = tool_registry.call(
@@ -246,7 +257,7 @@ def test_list_folder_reports_failures(tmp_path):
     assert problem(list_folder(str(tmp_path / "missing")))["code"] == "filesystem.list_failed"
 
 
-def test_file_navigation_reports_successful_instruction_context_changes(tmp_path):
+def test_file_navigation_reports_successful_instruction_context_changes(tmp_path, monkeypatch):
     """Registered folder and file tools report only successful navigation to their manager."""
     nested = tmp_path / "nested"
     nested.mkdir()
@@ -275,6 +286,23 @@ def test_file_navigation_reports_successful_instruction_context_changes(tmp_path
     tool_registry.call(
         "read_text_file",
         json.dumps({"path": str(target)}),
+        interaction=interaction,
+        instructions_manager=manager,
+    )
+    assert manager.working_directory == nested.resolve()
+
+    monkeypatch.setattr(
+        "loop.tools.files.search_text_paths",
+        MagicMock(
+            return_value=(
+                [{"path": "file.txt", "line": 1, "column": 1, "text": "content"}],
+                False,
+            )
+        ),
+    )
+    tool_registry.call(
+        "search_text",
+        json.dumps({"path": str(nested), "query": "content"}),
         interaction=interaction,
         instructions_manager=manager,
     )
@@ -412,6 +440,127 @@ def test_read_text_file_rejects_byte_selection_and_reports_oversized_lines(tmp_p
     assert "next_start_line" not in oversized
     assert invalid["problem"]["code"] == "tool.invalid_arguments"
     assert "start_byte" not in definition.parameters["properties"]
+
+
+def test_search_text_finds_literal_unicode_with_smart_case_and_context(tmp_path, monkeypatch):
+    """Text search returns deterministic lines, columns, Unicode, and neighboring context."""
+    source = tmp_path / "source file.txt"
+    source.write_text("before\nNeedle € here\nafter\nneedle lower\n", encoding="utf-8")
+    matches = [
+        {
+            "path": "source file.txt",
+            "line": 2,
+            "column": 1,
+            "text": "Needle € here",
+            "context": [
+                {"line": 1, "text": "before"},
+                {"line": 3, "text": "after"},
+            ],
+        }
+    ]
+    engine = MagicMock(return_value=(matches, False))
+    monkeypatch.setattr("loop.tools.files.search_text_paths", engine)
+
+    result = json.loads(search_text(tmp_path, "Needle", context_lines=1))
+
+    assert result == {"matches": matches, "truncated": False}
+    assert engine.call_args.kwargs["case"] == "smart"
+    assert engine.call_args.kwargs["context_lines"] == 1
+
+
+def test_search_text_supports_regex_case_globs_files_and_result_limits(tmp_path, monkeypatch):
+    """Regex, explicit case, inclusive globs, file roots, and global limits compose safely."""
+    selected = tmp_path / "selected.py"
+    selected.write_text("TOKEN 1\ntoken 2\ntoken 3\n", encoding="utf-8")
+    (tmp_path / "excluded.txt").write_text("token 4\n", encoding="utf-8")
+    engine = MagicMock(
+        side_effect=[
+            (
+                [
+                    {"path": "selected.py", "line": 1, "column": 1, "text": "TOKEN 1"},
+                    {"path": "selected.py", "line": 2, "column": 1, "text": "token 2"},
+                ],
+                True,
+            ),
+            (
+                [
+                    {"path": "selected.py", "line": 2, "column": 1, "text": "token 2"},
+                    {"path": "selected.py", "line": 3, "column": 1, "text": "token 3"},
+                ],
+                False,
+            ),
+        ]
+    )
+    monkeypatch.setattr("loop.tools.files.search_text_paths", engine)
+
+    result = json.loads(
+        search_text(
+            tmp_path,
+            r"token \d",
+            regex=True,
+            case="insensitive",
+            include=["*.py"],
+            max_results=2,
+        )
+    )
+    direct = json.loads(search_text(selected, "token", case="sensitive"))
+
+    assert [match["line"] for match in result["matches"]] == [1, 2]
+    assert result["truncated"] is True
+    assert [match["line"] for match in direct["matches"]] == [2, 3]
+    assert list(engine.call_args_list[0].args[0]) == [selected]
+    assert engine.call_args_list[0].kwargs["regex"] is True
+    assert engine.call_args_list[0].kwargs["case"] == "insensitive"
+    assert engine.call_args_list[0].kwargs["max_results"] == 2
+    assert engine.call_args_list[1].kwargs["case"] == "sensitive"
+
+
+def test_search_text_skips_binary_and_ignored_content(tmp_path, monkeypatch):
+    """Folder search preserves ignore, binary, and symlink traversal protections."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    (tmp_path / "visible.txt").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "ignored.txt").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "binary.dat").write_bytes(b"needle\0binary")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_text("needle\n", encoding="utf-8")
+    (tmp_path / "linked.txt").symlink_to(outside)
+    engine = MagicMock(
+        return_value=(
+            [{"path": "visible.txt", "line": 1, "column": 1, "text": "needle"}],
+            False,
+        )
+    )
+    monkeypatch.setattr("loop.tools.files.search_text_paths", engine)
+
+    result = json.loads(search_text(tmp_path, "needle"))
+    ignored = search_text(tmp_path / "ignored.txt", "needle")
+
+    assert [match["path"] for match in result["matches"]] == ["visible.txt"]
+    assert problem(ignored)["code"] == "filesystem.path_ignored"
+    searched = set(engine.call_args.args[0])
+    assert tmp_path / "visible.txt" in searched
+    assert tmp_path / "ignored.txt" not in searched
+    assert tmp_path / "binary.dat" not in searched
+    assert tmp_path / "linked.txt" not in searched
+
+
+def test_search_text_reports_empty_missing_invalid_and_unavailable_searches(tmp_path, monkeypatch):
+    """Empty selections and distinct root, regex, and engine failures remain actionable."""
+    (tmp_path / "empty.txt").touch()
+    engine = MagicMock(return_value=([], False))
+    monkeypatch.setattr("loop.tools.files.search_text_paths", engine)
+    assert json.loads(search_text(tmp_path, "absent")) == {"matches": [], "truncated": False}
+    assert problem(search_text(tmp_path / "missing", "text"))["code"] == (
+        "filesystem.path_not_searchable"
+    )
+    engine.side_effect = RuntimeError("regex parse error")
+    assert problem(search_text(tmp_path, "(", regex=True))["code"] == (
+        "filesystem.invalid_search_pattern"
+    )
+
+    engine.side_effect = FileNotFoundError("rg missing")
+    assert problem(search_text(tmp_path, "text"))["code"] == "filesystem.search_unavailable"
 
 
 def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, monkeypatch):

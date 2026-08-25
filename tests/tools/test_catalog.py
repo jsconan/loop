@@ -22,6 +22,7 @@ def test_builtin_manifest_has_every_tool_in_deterministic_order():
         "get_current_datetime",
         "list_folder",
         "read_text_file",
+        "search_text",
         "write_text_file",
         "edit_text_file",
         "delete_path",

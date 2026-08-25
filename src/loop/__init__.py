@@ -169,6 +169,7 @@ __all__ = [
     "read_text_file",
     "register_shutdown_signals",
     "run_command",
+    "search_text",
     "tool",
     "validate_session_source",
     "write_text_file",
@@ -350,6 +351,7 @@ from .tools import (
     read_cached_content,
     read_text_file,
     run_command,
+    search_text,
     write_text_file,
 )
 from .utils import (

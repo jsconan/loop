@@ -1,6 +1,6 @@
 """Provide repository-aware path discovery and traversal utilities."""
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
 from pathspec import GitIgnoreSpec
@@ -162,3 +162,26 @@ def iter_visible_paths(folder: Path | str, recursive: bool = False) -> Iterator[
     """
     folder = Path(folder).resolve()
     yield from _iter_visible_paths(folder, recursive, _initial_ignore_rules(folder))
+
+
+def filter_paths_by_globs(
+    paths: Iterable[Path], root: Path | str, patterns: Sequence[str] | None
+) -> Iterator[Path]:
+    """Yield paths whose root-relative names match any supplied Git-style glob.
+
+    Args:
+        paths (Iterable[Path]): Candidate paths to filter.
+        root (Path | str): Root used to derive portable relative names.
+        patterns (Sequence[str] | None): Inclusive Git-style globs, or ``None`` to include all.
+
+    Yields:
+        Path: Candidate paths selected by at least one pattern, or every path without patterns.
+    """
+    if not patterns:
+        yield from paths
+        return
+    spec = GitIgnoreSpec.from_lines(patterns)
+    root = Path(root).resolve()
+    for path in paths:
+        if spec.match_file(path.resolve().relative_to(root).as_posix()):
+            yield path

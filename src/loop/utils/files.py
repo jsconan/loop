@@ -6,6 +6,20 @@ from pathlib import Path
 from .hashing import sha256_digest
 
 
+def is_binary_file(path: Path, probe_bytes: int = 8192) -> bool:
+    """Return whether a file begins with a binary NUL-byte marker.
+
+    Args:
+        path (Path): File to inspect.
+        probe_bytes (int): Maximum leading bytes inspected. Defaults to 8192.
+
+    Returns:
+        bool: Whether the inspected prefix contains a NUL byte.
+    """
+    with path.open("rb") as stream:
+        return b"\0" in stream.read(probe_bytes)
+
+
 def write_text_atomically(
     path: Path,
     content: str,

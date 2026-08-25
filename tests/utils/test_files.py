@@ -5,8 +5,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from loop.utils.files import write_text_atomically
+from loop.utils.files import is_binary_file, write_text_atomically
 from loop.utils.hashing import sha256_digest
+
+
+def test_is_binary_file_detects_nul_bytes_within_its_bounded_probe(tmp_path):
+    """Binary detection distinguishes NUL-marked prefixes from ordinary UTF-8 text."""
+    binary = tmp_path / "binary.dat"
+    binary.write_bytes(b"text\0binary")
+    text = tmp_path / "text.txt"
+    text.write_text("ordinary text", encoding="utf-8")
+
+    assert is_binary_file(binary) is True
+    assert is_binary_file(text, probe_bytes=4) is False
 
 
 def test_write_text_atomically_creates_and_replaces_expected_files(tmp_path):

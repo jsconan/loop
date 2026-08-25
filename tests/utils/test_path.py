@@ -1,6 +1,6 @@
 """Tests for path discovery helpers."""
 
-from loop.utils import canonical_path, find_project_root, is_path_ignored
+from loop.utils import canonical_path, filter_paths_by_globs, find_project_root, is_path_ignored
 
 
 def test_canonical_path_handles_existing_and_missing_targets(tmp_path):
@@ -10,6 +10,22 @@ def test_canonical_path_handles_existing_and_missing_targets(tmp_path):
 
     assert canonical_path(existing) == str(existing)
     assert canonical_path(tmp_path / "missing.txt") == str(tmp_path / "missing.txt")
+
+
+def test_filter_paths_by_globs_selects_git_style_relative_patterns(tmp_path):
+    """Inclusive path filtering supports recursive Git-style globs and an unfiltered mode."""
+    nested = tmp_path / "tests" / "unit.py"
+    nested.parent.mkdir()
+    nested.touch()
+    root_file = tmp_path / "main.py"
+    root_file.touch()
+    text = tmp_path / "notes.txt"
+    text.touch()
+    paths = [nested, root_file, text]
+
+    assert list(filter_paths_by_globs(paths, tmp_path, ["*.py"])) == [nested, root_file]
+    assert list(filter_paths_by_globs(paths, tmp_path, ["tests/**"])) == [nested]
+    assert list(filter_paths_by_globs(paths, tmp_path, None)) == paths
 
 
 def test_find_project_root_returns_none_outside_a_git_project(tmp_path):
