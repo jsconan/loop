@@ -324,6 +324,32 @@ def test_permissions_preset_diff_describes_empty_replacements_and_replace_report
     assert "Replaced session defaults and rules" in interaction.info.call_args.args[0]
 
 
+def test_permissions_unsupervised_preset_warns_and_requires_confirmation(tmp_path):
+    """Unsupervised activation warns and a declined confirmation preserves the policy."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = False
+    permissions = PermissionManager(tmp_path)
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "preset replace workspace unsupervised")
+
+    expected_warning = (
+        "Unsupervised mode allows every authority-requiring operation without approval. "
+        "Enforcement limits remain active."
+    )
+    assert interaction.warning.call_args_list[0].args == (expected_warning,)
+    interaction.confirm.assert_called_once()
+    assert interaction.confirm.call_args.kwargs == {"default": False}
+    assert permissions.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ASK
+
+    interaction.confirm.return_value = True
+    manager.call("permissions", "preset replace workspace unsupervised")
+
+    assert all(
+        decision is Decision.ALLOW for decision in permissions.configuration.defaults.values()
+    )
+
+
 def test_permissions_preset_diff_renders_installed_rules(tmp_path):
     """Preset diffs include the rendered rule list when an artifact installs rules."""
     preset = PermissionPreset.model_validate(

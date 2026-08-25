@@ -106,10 +106,14 @@ def test_builtin_permission_presets_are_sorted_and_have_stable_hashes():
         "locked",
         "observe",
         "supervised",
+        "unsupervised",
         "workspace",
     ]
     assert all(preset.content_hash.startswith("sha256:") for preset in presets)
     assert presets[0].content_hash == presets[0].model_copy(deep=True).content_hash
+    assert next(
+        preset for preset in presets if preset.metadata.id == "unsupervised"
+    ).confirmation_warning
 
 
 def test_builtin_preset_loading_excludes_invalid_artifacts_and_reports_them(monkeypatch):

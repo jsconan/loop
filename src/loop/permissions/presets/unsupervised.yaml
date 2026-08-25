@@ -1,0 +1,18 @@
+version: 1
+kind: loop.permission-preset
+metadata:
+  id: unsupervised
+  revision: "1"
+  title: Unsupervised
+  description: Allow every authority-requiring operation without approval, subject to enforcement limits.
+confirmation_warning: Unsupervised mode allows every authority-requiring operation without approval. Enforcement limits remain active.
+defaults:
+  filesystem.list: allow
+  filesystem.read: allow
+  filesystem.create: allow
+  filesystem.replace: allow
+  filesystem.delete: allow
+  network.request: allow
+  process.execute: allow
+  session.mutate: allow
+rules: []

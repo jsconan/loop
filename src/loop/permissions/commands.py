@@ -176,6 +176,8 @@ class PermissionCommands:
             if operation == "diff":
                 context.interaction.info(self._describe_replacement(preview))
                 return
+            if preview.preset.confirmation_warning:
+                context.interaction.warning(preview.preset.confirmation_warning)
             prompt = self._replacement_prompt(preview)
             if not context.interaction.confirm(prompt, default=False):
                 context.interaction.warning("Permission preset replacement was not approved.")

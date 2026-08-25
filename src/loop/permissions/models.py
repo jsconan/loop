@@ -391,6 +391,8 @@ class PermissionPreset(BaseModel):
         version (Literal[1]): Preset schema version.
         kind (Literal["loop.permission-preset"]): Artifact type discriminator.
         metadata (PresetMetadata): Identity and explanation shown before replacement.
+        confirmation_warning (str | None): Warning shown before the required confirmation, or
+            ``None`` when the standard replacement prompt is sufficient.
         defaults (dict[Action, Decision]): Complete fallback decision for every known action.
         rules (tuple[PresetRule, ...]): Complete rule replacement payload.
     """
@@ -400,6 +402,7 @@ class PermissionPreset(BaseModel):
     version: Literal[1] = 1
     kind: Literal["loop.permission-preset"] = "loop.permission-preset"
     metadata: PresetMetadata
+    confirmation_warning: str | None = None
     defaults: dict[Action, Decision]
     rules: tuple[PresetRule, ...]
 
