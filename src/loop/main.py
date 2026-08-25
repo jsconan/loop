@@ -1,4 +1,4 @@
-"""Main entry point for the loop package."""
+"""Run the interactive loop command-line application."""
 
 import logging
 import os

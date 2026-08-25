@@ -1,12 +1,12 @@
 """Tests for the command-line entry point."""
 
+import runpy
 from pathlib import Path
 from unittest.mock import Mock, call
 
 import pytest
 
-import main
-from loop import SessionManager, ShutdownRequested
+from loop import SessionManager, ShutdownRequested, main
 
 
 @pytest.fixture(autouse=True)
@@ -131,3 +131,38 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
     )
     interaction.info.assert_called_once_with("Hello from loop!")
     loop.run.assert_called_once_with()
+
+
+def test_main_reports_unexpected_failures(monkeypatch):
+    """Unexpected startup or runtime failures are converted into fatal problems."""
+    interaction = Mock()
+    error = RuntimeError("backend failed")
+    monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
+    monkeypatch.setattr(main, "register_shutdown_signals", Mock())
+    monkeypatch.setattr(main, "OpenAIBackend", Mock(side_effect=error))
+    logger = Mock()
+    monkeypatch.setattr(main, "_LOGGER", logger)
+
+    main.main()
+
+    logger.log.assert_called_once()
+    assert logger.log.call_args.args[0] == 50
+    assert logger.log.call_args.kwargs["exc_info"][1] is error
+    interaction.report.assert_called_once()
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "internal.unexpected"
+    assert problem.severity == "fatal"
+
+
+def test_main_module_runs_entry_point(monkeypatch):
+    """Executing the source module as a script invokes its entry point."""
+    monkeypatch.setattr("loop.ConsoleInteraction", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.OpenAIBackend", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.Loop", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.SessionManager", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.SQLiteSessionStore", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.create_default_tool_registry", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.find_project_root", Mock(return_value=Path.cwd()))
+    monkeypatch.setattr("loop.register_shutdown_signals", Mock())
+
+    runpy.run_path(str(Path(main.__file__)), run_name="__main__")

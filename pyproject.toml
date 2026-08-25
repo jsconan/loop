@@ -21,6 +21,9 @@ dependencies = [
     "rich>=14.1.0,<15",
 ]
 
+[project.scripts]
+loop = "loop.main:main"
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.3.0,<5",
