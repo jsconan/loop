@@ -38,6 +38,14 @@ cd loop
 uv sync
 ```
 
+To install the latest version directly as a `uv` tool instead, run:
+
+```bash
+uv tool install git+https://github.com/jsconan/loop.git
+```
+
+The installation provides the `loop` command.
+
 Before running the examples, start your Responses API server. By default, `loop`
 expects it at:
 
@@ -58,10 +66,16 @@ needed; the OpenAI backend supplies a placeholder key.
 
 ### Interactive conversation
 
-Run the chat loop, which enables streaming in `main.py`:
+Run the chat loop, which enables streaming:
 
 ```bash
-uv run python main.py
+uv run loop
+```
+
+When installed as a `uv` tool, run it from any directory with:
+
+```bash
+loop
 ```
 
 Enter a message at the `You:` prompt. To stop, enter `/exit`, `/quit`, or `q`.
@@ -321,7 +335,7 @@ OpenAI-compatible servers do not implement `input_file`. Override either default
 `file_input_mode="text"` or `file_input_mode="native"`. Both modes retain the reference metadata
 manifest.
 
-The executable in `main.py` resolves environment variables and applies these application defaults:
+The `loop` command resolves environment variables and applies these application defaults:
 
 | Setting           | Environment variable | Built-in default               |
 | ----------------- | -------------------- | ------------------------------ |
