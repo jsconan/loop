@@ -33,6 +33,11 @@ classifiers = [
 [project.scripts]
 loop = "loop.main:main"
 
+[project.optional-dependencies]
+tools = [
+    "ripgrep>=15.1.0",
+]
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.3.0,<5",

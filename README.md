@@ -38,6 +38,13 @@ cd loop
 uv sync
 ```
 
+To install the optional tools dependency, which provides ripgrep for the
+`search_text` tool, include the `tools` extra:
+
+```bash
+uv sync --extra tools
+```
+
 To install the latest version directly as a `uv` tool instead, run:
 
 ```bash
