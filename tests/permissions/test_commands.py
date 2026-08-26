@@ -38,7 +38,7 @@ def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes
     manager.call("permissions", "limit set workspace host-process allow")
     manager.call("permissions", "limit set workspace private-network allow")
     manager.call("permissions", "limit add workspace write-root shared")
-    manager.call("permissions", "limit add workspace network-origin https://example.com")
+    manager.call("permissions", "limit add workspace network-origin https://my-host.local")
     manager.call(
         "permissions",
         "rule add workspace allow read_text_file filesystem.read '/project/*' 'Read docs'",
@@ -51,7 +51,7 @@ def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes
     assert loaded.configuration.defaults[Action.NETWORK_REQUEST] is Decision.DENY
     assert loaded.configuration.limits.allow_host_processes is True
     assert loaded.configuration.limits.deny_private_networks is False
-    assert loaded.configuration.limits.network_origins == ("https://example.com",)
+    assert loaded.configuration.limits.network_origins == ("https://my-host.local",)
     assert loaded.configuration.rules[0].description == "Read docs"
     assert permissions.session_rules[0].resource is None
 
@@ -217,12 +217,12 @@ def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "limit set session host-process allow")
-    manager.call("permissions", "limit add session network-origin https://example.com")
+    manager.call("permissions", "limit add session network-origin https://my-host.local")
     manager.call("permissions", "default set session process.execute allow")
     manager.call("permissions", "show session")
     shown = interaction.info.call_args.args[0]
     assert "allow_host_processes: True" in shown
-    assert "network_origins: https://example.com" in shown
+    assert "network_origins: https://my-host.local" in shown
     assert PermissionManager(tmp_path).configuration.limits == permissions.configuration.limits
 
     manager.call("permissions", "limit reset session host-process")

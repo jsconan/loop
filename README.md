@@ -347,7 +347,7 @@ Pass configuration directly to `OpenAIBackend` when using a different server or 
 from loop import OpenAIBackend
 
 backend = OpenAIBackend(
-    base_url="https://example.com/v1",
+    base_url="https://my-host.local/v1",
     api_key="your-api-key",
     default_model="your-model-id",
     max_retries=2,
@@ -407,7 +407,7 @@ prompt. Use `/permissions` to display the active policy:
 /permissions rule add workspace allow read_text_file filesystem.read "/project/docs/*"
 /permissions rule add session deny run_command process.execute "*"
 /permissions limit set session host-process allow
-/permissions limit add workspace network-origin https://example.com
+/permissions limit add workspace network-origin https://my-host.local
 /permissions limit add workspace read-root system-temp
 /permissions limit reset session host-process
 /permissions session reset

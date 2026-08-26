@@ -398,7 +398,7 @@ def test_session_serializes_and_deserializes_all_conversation_items():
                 artifacts=(
                     ContentArtifact(
                         handle="0123456789abcdef0123456789abcdef",
-                        source="https://example.com/source.txt",
+                        source="https://my-host.local/source.txt",
                         reloadable=True,
                     ),
                 ),

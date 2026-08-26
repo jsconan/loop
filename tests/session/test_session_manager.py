@@ -566,7 +566,7 @@ def test_manager_restores_artifact_metadata_from_a_loaded_session():
     handle = uuid4().hex
     artifact = ContentArtifact(
         handle=handle,
-        source="https://example.com/source.txt",
+        source="https://my-host.local/source.txt",
         reloadable=True,
     )
     session = Session(messages=[ToolResult(call_id="call", output="result", artifacts=(artifact,))])
@@ -574,7 +574,7 @@ def test_manager_restores_artifact_metadata_from_a_loaded_session():
     SessionManager(session=session)
 
     assert cached_metadata(handle) == {
-        "source": "https://example.com/source.txt",
+        "source": "https://my-host.local/source.txt",
         "reloadable": True,
     }
 

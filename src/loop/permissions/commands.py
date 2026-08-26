@@ -634,7 +634,7 @@ class PermissionCommands:
     def _limit_example(label: str) -> CompletionValue:
         if label in {"read-root", "write-root"}:
             return CompletionValue("workspace", "Use the workspace root.")
-        return CompletionValue("https://example.com", "Example exact HTTP origin.")
+        return CompletionValue("https://my-host.local", "Example exact HTTP origin.")
 
     @staticmethod
     def _root_values() -> tuple[CompletionValue, ...]:
@@ -654,7 +654,7 @@ class PermissionCommands:
         if action.value.startswith("filesystem."):
             return CompletionValue("workspace", "Example workspace-relative path.")
         if action is Action.NETWORK_REQUEST:
-            return CompletionValue("https://example.com", "Example HTTP request URL.")
+            return CompletionValue("https://my-host.local", "Example HTTP request URL.")
         if action is Action.PROCESS_EXECUTE:
             return CompletionValue("git", "Example shell-free process command line.")
         return CompletionValue("state", "Example session-state identifier.")

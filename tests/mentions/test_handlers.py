@@ -169,7 +169,7 @@ def test_project_paths_gracefully_resolve_valid_markdown_link_destinations(tmp_p
     handler = ProjectPathMentionHandler(lambda: tmp_path)
 
     context = handler.resolve_optional(
-        ("https://example.com", "missing.md", "binary.bin", "guide.md")
+        ("https://my-host.local", "missing.md", "binary.bin", "guide.md")
     )
 
     assert context == (

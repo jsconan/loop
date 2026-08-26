@@ -41,13 +41,13 @@ def test_instruction_observations_delegate_only_when_a_manager_is_available(tmp_
 def test_additional_authorization_delegates_or_fails_closed():
     """Runtime-discovered arguments use the registry callback and fail closed without one."""
     interaction = Mock(spec=Interaction)
-    plan = OperationPlan(arguments={"url": "https://example.com"})
+    plan = OperationPlan(arguments={"url": "https://my-host.local"})
     authorizer = Mock(return_value=plan)
     context = ToolContext(interaction, "fetch", additional_authorizer=authorizer)
 
-    assert context.authorize_additional({"url": "https://example.com"}) is plan
-    authorizer.assert_called_once_with({"url": "https://example.com"})
+    assert context.authorize_additional({"url": "https://my-host.local"}) is plan
+    authorizer.assert_called_once_with({"url": "https://my-host.local"})
 
     with pytest.raises(ProblemException) as denied:
-        ToolContext(interaction, "fetch").authorize_additional({"url": "https://example.com"})
+        ToolContext(interaction, "fetch").authorize_additional({"url": "https://my-host.local"})
     assert denied.value.problem.code == "tool.authorization_unavailable"

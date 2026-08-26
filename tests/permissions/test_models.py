@@ -37,7 +37,7 @@ def test_operations_expose_stable_resource_representations():
         Operation(
             tool_id="web",
             action=Action.NETWORK_REQUEST,
-            target=NetworkTarget(url="https://example.com/a", origin="https://example.com"),
+            target=NetworkTarget(url="https://my-host.local/a", origin="https://my-host.local"),
         ),
         Operation(
             tool_id="exec",
@@ -53,7 +53,7 @@ def test_operations_expose_stable_resource_representations():
 
     assert tuple(operation.resource for operation in operations) == (
         "/x",
-        "https://example.com/a",
+        "https://my-host.local/a",
         "git status",
         "activate:demo",
     )

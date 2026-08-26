@@ -282,7 +282,7 @@ def test_model_output_has_a_console_presentation(capsys, method, expected):
 def test_answer_renders_common_llm_markdown_constructs(capsys):
     """Answers render headings, lists, links, tables, and fenced code as terminal content."""
     ConsoleInteraction(console=Console(width=100), markdown=True).answer(
-        "# Heading\n\n- item\n\n[link](https://example.com)\n\n"
+        "# Heading\n\n- item\n\n[link](https://my-host.local)\n\n"
         "| Name | Value |\n| --- | --- |\n| alpha | one |\n\n"
         "```python\nprint('ok')\n```"
     )
@@ -692,7 +692,7 @@ def test_tool_result_displays_cached_content_with_source_and_handle(capsys):
     result = json.dumps(
         {
             "handle": "content-123",
-            "source": "https://example.com/article.txt",
+            "source": "https://my-host.local/article.txt",
             "content": "article body",
             "size_bytes": 12,
             "start_byte": 0,
@@ -708,7 +708,7 @@ def test_tool_result_displays_cached_content_with_source_and_handle(capsys):
     )
 
     output = capsys.readouterr().out
-    assert "https://example.com/article.txt · bytes 0–12 of 12 · handle content-123" in output
+    assert "https://my-host.local/article.txt · bytes 0–12 of 12 · handle content-123" in output
     assert "article body" in output
 
 
@@ -753,7 +753,7 @@ def test_tool_result_displays_an_empty_folder_as_a_tree(capsys):
         ),
         (
             ToolResultPresentation.TEXT,
-            '{"source":"https://example.com","content":"incomplete"}',
+            '{"source":"https://my-host.local","content":"incomplete"}',
         ),
     ],
 )

@@ -47,7 +47,7 @@ def planner_for(action: Action):
 
     def plan(arguments):
         target = (
-            NetworkTarget(url="https://example.com", origin="https://example.com")
+            NetworkTarget(url="https://my-host.local", origin="https://my-host.local")
             if action is Action.NETWORK_REQUEST
             else SessionTarget(identifier="test-state")
         )

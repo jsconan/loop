@@ -92,13 +92,13 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
-    assert problem(fetch_content("https://example.com/file.txt"))["code"] == "tool.denied"
+    assert problem(fetch_content("https://my-host.local/file.txt"))["code"] == "tool.denied"
     stream.assert_not_called()
 
-    result = json.loads(fetch_content("https://example.com/file.txt"))
+    result = json.loads(fetch_content("https://my-host.local/file.txt"))
     assert result["content"] == "<html>fetched content</html>"
     assert result["truncated"] is False
-    assert stream.call_args.args == ("GET", "https://example.com/file.txt")
+    assert stream.call_args.args == ("GET", "https://my-host.local/file.txt")
     assert stream.call_args.kwargs["headers"] == {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
@@ -110,7 +110,7 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
     response.raise_for_status.assert_called_once_with()
     assert confirm.call_count == 2
     assert all("network.request" in item.args[0] for item in confirm.call_args_list)
-    assert all("https://example.com/file.txt" in item.args[0] for item in confirm.call_args_list)
+    assert all("https://my-host.local/file.txt" in item.args[0] for item in confirm.call_args_list)
 
 
 def test_fetch_content_uses_configured_user_agent(monkeypatch):
@@ -121,7 +121,7 @@ def test_fetch_content_uses_configured_user_agent(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
-    assert json.loads(fetch_content("https://example.com"))["content"] == "fetched content"
+    assert json.loads(fetch_content("https://my-host.local"))["content"] == "fetched content"
     assert stream.call_args.kwargs["headers"] == {"User-Agent": "LoopBot/1.0"}
 
 
@@ -133,7 +133,7 @@ def test_fetch_content_reports_failures(monkeypatch):
         MagicMock(side_effect=OSError("network unavailable")),
     )
 
-    assert problem(fetch_content("https://example.com/file.txt"))["detail"] == (
+    assert problem(fetch_content("https://my-host.local/file.txt"))["detail"] == (
         "network unavailable"
     )
 
@@ -147,19 +147,19 @@ def test_fetch_content_authorizes_and_pins_each_redirect_target(monkeypatch):
 
     def resolve(hostname, *_args, **_kwargs):
         """Resolve each approved host to a distinct public address."""
-        address = "93.184.216.34" if hostname == "example.com" else "93.184.216.35"
+        address = "93.184.216.34" if hostname == "my-host.local" else "93.184.216.35"
         return [(None, None, None, None, (address, 0))]
 
     monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", resolve)
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
-    result = json.loads(fetch_content("https://example.com/redirect"))
+    result = json.loads(fetch_content("https://my-host.local/redirect"))
 
     assert result["content"] == "moved content"
-    assert result["source"] == "https://example.com/redirect"
+    assert result["source"] == "https://my-host.local/redirect"
     assert [call.args[1] for call in stream.call_args_list] == [
-        "https://example.com/redirect",
+        "https://my-host.local/redirect",
         "https://other.example/target",
     ]
     assert [
@@ -167,7 +167,7 @@ def test_fetch_content_authorizes_and_pins_each_redirect_target(monkeypatch):
         for call in stream.call_args_list
     ] == [("93.184.216.34",), ("93.184.216.35",)]
     assert confirm.call_count == 2
-    assert "https://example.com/redirect" in confirm.call_args_list[0].args[0]
+    assert "https://my-host.local/redirect" in confirm.call_args_list[0].args[0]
     assert "https://other.example/target" in confirm.call_args_list[1].args[0]
     redirected.__exit__.assert_called_once_with(None, None, None)
     redirected.iter_bytes.assert_not_called()
@@ -182,7 +182,7 @@ def test_fetch_content_stops_when_redirect_authorization_is_denied(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
-    result = problem(fetch_content("https://example.com/redirect"))
+    result = problem(fetch_content("https://my-host.local/redirect"))
 
     assert result["code"] == "tool.denied"
     assert result["title"] == "Additional operation denied"
@@ -197,14 +197,14 @@ def test_fetch_content_denies_redirects_to_private_addresses(monkeypatch):
 
     def resolve(hostname, *_args, **_kwargs):
         """Resolve the entry host publicly and the redirect host privately."""
-        address = "93.184.216.34" if hostname == "example.com" else "127.0.0.1"
+        address = "93.184.216.34" if hostname == "my-host.local" else "127.0.0.1"
         return [(None, None, None, None, (address, 0))]
 
     monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", resolve)
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
-    result = problem(fetch_content("https://example.com/redirect"))
+    result = problem(fetch_content("https://my-host.local/redirect"))
 
     assert result["code"] == "tool.denied"
     assert stream.call_count == 1
@@ -213,14 +213,14 @@ def test_fetch_content_denies_redirects_to_private_addresses(monkeypatch):
 
 def test_fetch_content_rejects_redirect_loops_and_excessive_chains(monkeypatch):
     """Redirect loops and chains beyond the fixed hop ceiling stop without another request."""
-    loop = redirect_response("https://example.com/start#section")
-    redirects = [redirect_response(f"https://example.com/hop-{index}") for index in range(1, 7)]
+    loop = redirect_response("https://my-host.local/start#section")
+    redirects = [redirect_response(f"https://my-host.local/hop-{index}") for index in range(1, 7)]
     stream = MagicMock(side_effect=[loop, *redirects])
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
-    assert "redirect loop" in fetch_content("https://example.com/start")
-    assert "redirect limit" in fetch_content("https://example.com/chain")
+    assert "redirect loop" in fetch_content("https://my-host.local/start")
+    assert "redirect limit" in fetch_content("https://my-host.local/chain")
     assert stream.call_count == 7
 
 
@@ -228,8 +228,8 @@ def test_fetch_content_requires_an_authorized_network_target_for_each_redirect(m
     """A malformed runtime authorization plan cannot reach a redirected destination."""
     response = redirect_response("https://other.example/target")
     target = NetworkTarget(
-        url="https://example.com/start",
-        origin="https://example.com",
+        url="https://my-host.local/start",
+        origin="https://my-host.local",
         addresses=("93.184.216.34",),
     )
     context = ToolContext(
@@ -242,7 +242,7 @@ def test_fetch_content_requires_an_authorized_network_target_for_each_redirect(m
     )
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
-    result = web_module.fetch_content(context, "https://example.com/start")
+    result = web_module.fetch_content(context, "https://my-host.local/start")
 
     assert "Authorized redirect network target is missing" in result.detail
 
@@ -254,7 +254,7 @@ def test_fetch_content_rejects_unsupported_redirect_schemes(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
-    result = problem(fetch_content("https://example.com/start"))
+    result = problem(fetch_content("https://my-host.local/start"))
 
     assert result["code"] == "network.fetch_failed"
     assert stream.call_count == 1
@@ -268,7 +268,7 @@ def test_fetch_content_commands_fail_closed_when_a_redirect_needs_authorization(
 
     output = tool_registry.command(
         "fetch_content",
-        ("https://example.com/start",),
+        ("https://my-host.local/start",),
         interaction=ConsoleInteraction(),
     ).output
 
@@ -283,8 +283,8 @@ def test_fetch_content_plans_origins_with_explicit_ports(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
-    assert json.loads(fetch_content("https://example.com:8443/file"))["content"] == "content"
-    assert "https://example.com:8443/file" in confirm.call_args.args[0]
+    assert json.loads(fetch_content("https://my-host.local:8443/file"))["content"] == "content"
+    assert "https://my-host.local:8443/file" in confirm.call_args.args[0]
 
 
 def test_fetch_content_denies_private_addresses_resolved_during_planning(monkeypatch):
@@ -347,7 +347,7 @@ def test_pinned_address_backend_connects_only_to_its_authorised_address():
     stream = object()
     backend._backend.connect_tcp.return_value = stream  # pylint: disable=protected-access
 
-    assert backend.connect_tcp("example.com", 443, timeout=2) is stream
+    assert backend.connect_tcp("my-host.local", 443, timeout=2) is stream
     backend._backend.connect_tcp.assert_called_once_with(  # pylint: disable=protected-access
         host="93.184.216.34",
         port=443,
@@ -362,7 +362,7 @@ def test_pinned_address_backend_rejects_missing_or_non_tcp_connections():
     backend = web_module.PinnedAddressBackend(())
 
     with pytest.raises(httpcore.ConnectError, match="No authorized"):
-        backend.connect_tcp("example.com", 443)
+        backend.connect_tcp("my-host.local", 443)
     with pytest.raises(httpcore.ConnectError, match="Unix-socket"):
         backend.connect_unix_socket("/tmp/socket")
 
@@ -383,12 +383,12 @@ def test_web_tools_fail_closed_without_an_authorized_network_operation(monkeypat
     monkeypatch.setattr("loop.tools.web.cached_path", lambda _handle: None)
     monkeypatch.setattr(
         "loop.tools.web.cached_metadata",
-        lambda _handle: {"source": "https://example.com", "reloadable": True},
+        lambda _handle: {"source": "https://my-host.local", "reloadable": True},
     )
 
     assert (
         "Authorized network target is missing"
-        in web_module.fetch_content(context, "https://example.com").detail
+        in web_module.fetch_content(context, "https://my-host.local").detail
     )
     assert (
         "Authorized network target is missing"
@@ -402,8 +402,8 @@ def test_fetch_content_rejects_binary_content(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
-    assert problem(fetch_content("https://example.com/file.bin"))["detail"] == (
-        "Content at 'https://example.com/file.bin' appears to be binary."
+    assert problem(fetch_content("https://my-host.local/file.bin"))["detail"] == (
+        "Content at 'https://my-host.local/file.bin' appears to be binary."
     )
     response.raise_for_status.assert_called_once_with()
 
@@ -415,7 +415,7 @@ def test_fetch_content_is_bounded_and_cached_for_continuation(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
-    first = json.loads(fetch_content("https://example.com/large.txt"))
+    first = json.loads(fetch_content("https://my-host.local/large.txt"))
     second = json.loads(
         read_cached_content(
             first["handle"],
@@ -426,7 +426,7 @@ def test_fetch_content_is_bounded_and_cached_for_continuation(monkeypatch):
     assert first["included_bytes"] <= 16 * 1024
     assert first["truncated"] is True
     assert second["start_byte"] == first["end_byte"]
-    assert second["source"] == "https://example.com/large.txt"
+    assert second["source"] == "https://my-host.local/large.txt"
     assert "next_start_byte" not in first
     assert (
         "start_byte"
@@ -446,8 +446,8 @@ def test_fetch_content_rejects_unsupported_or_excessive_responses(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
-    assert "not a supported text response" in fetch_content("https://example.com/image.png")
-    assert "download limit" in fetch_content("https://example.com/large.txt")
+    assert "not a supported text response" in fetch_content("https://my-host.local/image.png")
+    assert "download limit" in fetch_content("https://my-host.local/large.txt")
 
 
 def test_fetch_content_rejects_invalid_utf8(monkeypatch):
@@ -456,7 +456,7 @@ def test_fetch_content_rejects_invalid_utf8(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
-    assert "utf-8" in fetch_content("https://example.com/invalid.txt")
+    assert "utf-8" in fetch_content("https://my-host.local/invalid.txt")
 
 
 def test_read_cached_content_reports_unknown_handles(monkeypatch):
@@ -473,7 +473,7 @@ def test_read_cached_content_reloads_an_expired_web_artifact_with_authorization(
     confirm = MagicMock(return_value=True)
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
-    fetched = json.loads(fetch_content("https://example.com/source.txt"))
+    fetched = json.loads(fetch_content("https://my-host.local/source.txt"))
     lookups = 0
 
     def expired_then_repopulated(handle):
@@ -487,10 +487,10 @@ def test_read_cached_content_reloads_an_expired_web_artifact_with_authorization(
     result = json.loads(read_cached_content(fetched["handle"]))
 
     assert result["content"] == "reloaded"
-    assert result["source"] == "https://example.com/source.txt"
+    assert result["source"] == "https://my-host.local/source.txt"
     assert result["handle"] == fetched["handle"]
     assert "network.request" in confirm.call_args.args[0]
-    assert "https://example.com/source.txt" in confirm.call_args.args[0]
+    assert "https://my-host.local/source.txt" in confirm.call_args.args[0]
     assert stream.call_count == 2
 
 
@@ -502,7 +502,7 @@ def test_read_cached_content_reports_a_denied_redirect_during_reload(monkeypatch
     monkeypatch.setattr("loop.tools.web.cached_path", lambda _handle: None)
     monkeypatch.setattr(
         "loop.tools.web.cached_metadata",
-        lambda _handle: {"source": "https://example.com/source.txt", "reloadable": True},
+        lambda _handle: {"source": "https://my-host.local/source.txt", "reloadable": True},
     )
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=redirected))
 
@@ -517,7 +517,7 @@ def test_read_cached_content_reports_invalid_cursors_and_selectors(monkeypatch):
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
     response = stream_response(b"cached")
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
-    fetched = json.loads(fetch_content("https://example.com/content.txt"))
+    fetched = json.loads(fetch_content("https://my-host.local/content.txt"))
 
     malformed = read_cached_content(fetched["handle"], cursor="invalid")
     conflicting = read_cached_content(

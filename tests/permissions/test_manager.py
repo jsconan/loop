@@ -306,10 +306,10 @@ def test_network_origin_allowlist_is_a_non_overridable_boundary():
     """Configured origin globs reject otherwise permitted destinations."""
     manager = PermissionManager(
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(network_origins=("https://*.example.com",))
+            limits=PolicyLimits(network_origins=("https://*.my-host.local",))
         )
     )
-    allowed = NetworkTarget(url="https://api.example.com/a", origin="https://api.example.com")
+    allowed = NetworkTarget(url="https://api.my-host.local/a", origin="https://api.my-host.local")
     denied = NetworkTarget(url="https://other.test/a", origin="https://other.test")
 
     assert (
@@ -701,11 +701,11 @@ def test_explain_constructs_every_typed_target_without_prompting(tmp_path):
         is Decision.ALLOW
     )
     assert (
-        manager.explain("fetch", Action.NETWORK_REQUEST, "https://example.com:8443/file").decision
+        manager.explain("fetch", Action.NETWORK_REQUEST, "https://my-host.local:8443/file").decision
         is Decision.ASK
     )
     assert (
-        manager.explain("fetch", Action.NETWORK_REQUEST, "https://example.com/file").decision
+        manager.explain("fetch", Action.NETWORK_REQUEST, "https://my-host.local/file").decision
         is Decision.ASK
     )
     assert manager.explain("run", Action.PROCESS_EXECUTE, "git status").decision is Decision.ASK
