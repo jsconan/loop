@@ -252,7 +252,7 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
     def values(text):
         return [item.text for item in completer.get_completions(Document(text), Mock())]
 
-    assert values("/he") == ["/help"]
+    assert values("/he") == ["/help", "/check"]
     assert values("$rev") == ["$review"]
     assert values("/permissions rule add session allow ins") == ["inspect"]
     resume = list(completer.get_completions(Document("/resume "), Mock()))

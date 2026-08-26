@@ -32,7 +32,7 @@ class ModelCommands:
             tuple[CommandRegistration, ...]: Model discovery and selection commands.
         """
         return (
-            CommandRegistration(self.backend, name="backend"),
+            CommandRegistration(self.check, name="check"),
             CommandRegistration(self.models, name="models"),
             CommandRegistration(
                 self.model,
@@ -56,7 +56,7 @@ class ModelCommands:
             for model in self._available()
         )
 
-    def backend(self, context: CommandContext) -> None:
+    def check(self, context: CommandContext) -> None:
         """Check backend reachability and the effective model's availability."""
         try:
             models = self._available()

@@ -50,8 +50,8 @@ def test_model_commands_list_show_and_select_available_models():
     ]
 
 
-def test_backend_command_reports_a_healthy_effective_model():
-    """Backend checks confirm that the active model remains available."""
+def test_check_command_reports_a_healthy_effective_model():
+    """The check command confirms that the active model remains available."""
     interaction = Mock(spec=Interaction)
     selection = Mock(spec=ModelSelection)
     selection.effective = "model-a"
@@ -59,14 +59,14 @@ def test_backend_command_reports_a_healthy_effective_model():
     manager = CommandManager(interaction=interaction)
     manager.register_provider(ModelCommands(selection))
 
-    manager.call("backend")
+    manager.call("check")
 
     interaction.info.assert_called_once_with("Backend is available. Model 'model-a' is available.")
     selection.select_fallback.assert_not_called()
 
 
-def test_backend_command_gently_reports_an_unreachable_backend():
-    """Backend checks present failed probes as diagnostic warnings rather than errors."""
+def test_check_command_gently_reports_an_unreachable_backend():
+    """The check command presents failed probes as diagnostic warnings rather than errors."""
     interaction = Mock(spec=Interaction)
     selection = Mock(spec=ModelSelection)
     selection.available.side_effect = BackendConnectionError(
@@ -77,15 +77,15 @@ def test_backend_command_gently_reports_an_unreachable_backend():
     manager = CommandManager(interaction=interaction)
     manager.register_provider(ModelCommands(selection))
 
-    manager.call("backend")
+    manager.call("check")
 
     interaction.warning.assert_called_once_with("The backend is not reachable.")
     interaction.report.assert_not_called()
     selection.select_fallback.assert_not_called()
 
 
-def test_backend_command_offers_existing_fallback_for_a_missing_model():
-    """Backend checks delegate absent model recovery to the established fallback flow."""
+def test_check_command_offers_existing_fallback_for_a_missing_model():
+    """The check command delegates absent model recovery to the established fallback flow."""
     interaction = Mock(spec=Interaction)
     selection = Mock(spec=ModelSelection)
     selection.available.return_value = [ModelInfo(id="replacement")]
@@ -93,7 +93,7 @@ def test_backend_command_offers_existing_fallback_for_a_missing_model():
     manager = CommandManager(interaction=interaction)
     manager.register_provider(ModelCommands(selection))
 
-    manager.call("backend")
+    manager.call("check")
 
     assert interaction.warning.call_args.args[0] == (
         "Backend is available, but model 'missing' is not available."
@@ -101,8 +101,8 @@ def test_backend_command_offers_existing_fallback_for_a_missing_model():
     selection.select_fallback.assert_called_once_with(interaction)
 
 
-def test_backend_command_offers_a_model_when_none_is_configured():
-    """Backend checks delegate a singleton model catalog to the shared choice prompt."""
+def test_check_command_offers_a_model_when_none_is_configured():
+    """The check command delegates a singleton model catalog to the shared choice prompt."""
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = False
     selection = ModelSelection(
@@ -116,7 +116,7 @@ def test_backend_command_offers_a_model_when_none_is_configured():
     manager = CommandManager(interaction=interaction)
     manager.register_provider(ModelCommands(selection))
 
-    manager.call("backend")
+    manager.call("check")
 
     interaction.warning.assert_called_once_with("Backend is available, but no model is selected.")
     interaction.prompt.assert_called_once_with(

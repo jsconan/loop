@@ -136,7 +136,8 @@ Use `/sessions` to show names, stable IDs, update times, and message counts in a
 stable ID internal. `/new` starts a fresh unpersisted session, and `/rename` assigns a name that
 automatic generation will not overwrite. Use `/use` to load a skill for subsequent model requests,
 `/tools` to list available tools, `/skills` to inspect active and discoverable skills, and
-`/call` to invoke a tool directly by name. The usual `/help`, `/exit`, and `/quit` commands remain
+`/call` to invoke a tool directly by name, and `/check` to verify backend and model availability.
+The usual `/help`, `/exit`, and `/quit` commands remain
 available.
 
 Library callers can supply a `Session` or a persisted session identifier directly:
