@@ -91,20 +91,27 @@ class ConsoleInteraction(Interaction):
         console (Console | None): Rich console used for terminal output. Defaults to a new console.
         session (PromptSession[str] | None): Prompt session used for editable user input. Defaults
             to a new session.
+        markdown (bool): Whether to render model output as Markdown.
+            Defaults to ``RENDER_MARKDOWN``.
     """
 
     _stream_kind: Literal["reasoning", "answer"] | None
     _stream: MarkdownStream | None
+    _plain_stream_has_output: bool
 
     def __init__(
         self,
+        *,
         console: Console | None = None,
         session: PromptSession[str] | None = None,
+        markdown: bool = constants.RENDER_MARKDOWN,
     ) -> None:
         self._console = console or Console()
         self._session = session or PromptSession()
+        self._markdown = markdown
         self._stream_kind = None
         self._stream = None
+        self._plain_stream_has_output = False
 
     @contextmanager
     def response_context(self) -> Generator[None]:
@@ -122,8 +129,11 @@ class ConsoleInteraction(Interaction):
         """Commit and clear the active model-output stream."""
         if self._stream is not None:
             self._stream.finish()
+        elif self._plain_stream_has_output:
+            self._console.print()
         self._stream_kind = None
         self._stream = None
+        self._plain_stream_has_output = False
 
     def _write_markdown_delta(
         self,
@@ -144,6 +154,23 @@ class ConsoleInteraction(Interaction):
                 style="dim" if kind == "reasoning" else "none",
             )
         self._stream.write(delta)
+
+    def _write_plain_delta(self, delta: str, *, kind: Literal["reasoning", "answer"]) -> None:
+        """Write a streamed model delta immediately without Markdown parsing."""
+        if self._stream_kind != kind:
+            self._finish_markdown_stream()
+            if kind == "reasoning":
+                self._reasoning_heading()
+            else:
+                self._answer_heading()
+            self._stream_kind = kind
+        self._console.print(
+            delta,
+            end="",
+            style="dim" if kind == "reasoning" else None,
+            markup=False,
+        )
+        self._plain_stream_has_output |= bool(delta)
 
     def prompt(
         self,
@@ -250,7 +277,10 @@ class ConsoleInteraction(Interaction):
         """
         self._finish_markdown_stream()
         self._reasoning_heading()
-        self._console.print(Markdown(message, style="dim"))
+        self._console.print(
+            Markdown(message, style="dim") if self._markdown else message,
+            markup=False,
+        )
 
     def reasoning_delta(self, delta: str) -> None:
         """Buffer streamed reasoning and append complete Markdown blocks.
@@ -258,7 +288,10 @@ class ConsoleInteraction(Interaction):
         Args:
             delta (str): Incremental reasoning text to write.
         """
-        self._write_markdown_delta(delta, kind="reasoning")
+        if self._markdown:
+            self._write_markdown_delta(delta, kind="reasoning")
+        else:
+            self._write_plain_delta(delta, kind="reasoning")
 
     def _answer_heading(self) -> None:
         """Write an answer heading to the terminal."""
@@ -272,7 +305,7 @@ class ConsoleInteraction(Interaction):
         """
         self._finish_markdown_stream()
         self._answer_heading()
-        self._console.print(Markdown(message))
+        self._console.print(Markdown(message) if self._markdown else message, markup=False)
 
     def answer_delta(self, delta: str) -> None:
         """Buffer streamed answers and append complete Markdown blocks.
@@ -280,7 +313,10 @@ class ConsoleInteraction(Interaction):
         Args:
             delta (str): Incremental answer text to write.
         """
-        self._write_markdown_delta(delta, kind="answer")
+        if self._markdown:
+            self._write_markdown_delta(delta, kind="answer")
+        else:
+            self._write_plain_delta(delta, kind="answer")
 
     def report(self, problem: Problem) -> None:
         """Write a structured problem to the terminal.

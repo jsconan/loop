@@ -272,7 +272,7 @@ def test_user_message_has_a_console_presentation(capsys):
 )
 def test_model_output_has_a_console_presentation(capsys, method, expected):
     """The console renders completed model output beneath its section heading."""
-    getattr(ConsoleInteraction(), method)("**complete**")
+    getattr(ConsoleInteraction(markdown=True), method)("**complete**")
 
     output = capsys.readouterr().out
     assert trimmed_rendered_lines(output) == expected
@@ -281,7 +281,7 @@ def test_model_output_has_a_console_presentation(capsys, method, expected):
 
 def test_answer_renders_common_llm_markdown_constructs(capsys):
     """Answers render headings, lists, links, tables, and fenced code as terminal content."""
-    ConsoleInteraction(console=Console(width=100)).answer(
+    ConsoleInteraction(console=Console(width=100), markdown=True).answer(
         "# Heading\n\n- item\n\n[link](https://example.com)\n\n"
         "| Name | Value |\n| --- | --- |\n| alpha | one |\n\n"
         "```python\nprint('ok')\n```"
@@ -303,7 +303,7 @@ def test_answer_renders_common_llm_markdown_constructs(capsys):
 )
 def test_model_output_formats_stream_starts(capsys, method, expected):
     """A model-output stream renders its final Markdown beneath one heading."""
-    interaction = ConsoleInteraction()
+    interaction = ConsoleInteraction(markdown=True)
     with interaction.response_context():
         getattr(interaction, method)("**par")
         getattr(interaction, method)("tial**")
@@ -313,10 +313,38 @@ def test_model_output_formats_stream_starts(capsys, method, expected):
     assert "**" not in output
 
 
+def test_model_output_streams_plain_text_immediately_by_default():
+    """The default response presentation does not buffer deltas for Markdown parsing."""
+    console = Mock()
+    interaction = ConsoleInteraction(console=console, markdown=False)
+
+    with interaction.response_context():
+        interaction.answer_delta("first")
+        assert console.print.call_args_list[-1].kwargs["end"] == ""
+        interaction.answer_delta(" second")
+
+    assert [call.args[0] for call in console.print.call_args_list if call.args][-2:] == [
+        "first",
+        " second",
+    ]
+
+
+def test_reasoning_streams_plain_text_when_markdown_is_disabled():
+    """Disabled Markdown rendering writes reasoning deltas immediately with dim styling."""
+    console = Mock()
+    interaction = ConsoleInteraction(console=console, markdown=False)
+
+    with interaction.response_context():
+        interaction.reasoning_delta("thought")
+
+    delta_call = next(call for call in console.print.call_args_list if call.args == ("thought",))
+    assert delta_call.kwargs == {"end": "", "style": "dim", "markup": False}
+
+
 @pytest.mark.parametrize("method", ["reasoning_delta", "answer_delta"])
 def test_model_output_continues_streams_without_repeating_headings(capsys, method):
     """Continued deltas append to the active Markdown document without another heading."""
-    interaction = ConsoleInteraction()
+    interaction = ConsoleInteraction(markdown=True)
     with interaction.response_context():
         getattr(interaction, method)("first ")
         getattr(interaction, method)("second")
@@ -329,7 +357,7 @@ def test_model_output_continues_streams_without_repeating_headings(capsys, metho
 
 def test_streaming_switches_from_reasoning_to_answer_markdown(capsys):
     """Changing model-output sections commits reasoning before starting the answer."""
-    interaction = ConsoleInteraction()
+    interaction = ConsoleInteraction(markdown=True)
 
     with interaction.response_context():
         interaction.reasoning_delta("*thought*")
@@ -344,7 +372,7 @@ def test_streaming_switches_from_reasoning_to_answer_markdown(capsys):
 def test_streaming_appends_stable_blocks_without_rewriting_pending_output():
     """Streaming prints each stable block once and buffers only the final block."""
     console = Mock()
-    interaction = ConsoleInteraction(console=console)
+    interaction = ConsoleInteraction(console=console, markdown=True)
 
     with interaction.response_context():
         interaction.answer_delta("First paragraph.\n\n# Sec")
@@ -362,7 +390,7 @@ def test_streaming_appends_stable_blocks_without_rewriting_pending_output():
 def test_streaming_waits_for_setext_heading_lookahead():
     """A line remains pending until its following line rules out Setext reinterpretation."""
     console = Mock()
-    interaction = ConsoleInteraction(console=console)
+    interaction = ConsoleInteraction(console=console, markdown=True)
 
     with interaction.response_context():
         interaction.answer_delta("Heading\n")
@@ -384,7 +412,7 @@ def test_empty_stream_delta_writes_only_its_section_heading(capsys):
 def test_streaming_keeps_fenced_code_together_until_a_following_block():
     """Fenced code is committed as one block only after its structural successor arrives."""
     console = Mock()
-    interaction = ConsoleInteraction(console=console)
+    interaction = ConsoleInteraction(console=console, markdown=True)
 
     with interaction.response_context():
         interaction.answer_delta("```python\nprint('ok')\n")
@@ -396,7 +424,7 @@ def test_streaming_keeps_fenced_code_together_until_a_following_block():
 def test_streaming_flushes_an_unclosed_fence_at_end_of_response():
     """End-of-response finalizes an unclosed fenced block without losing its source."""
     console = Mock()
-    interaction = ConsoleInteraction(console=console)
+    interaction = ConsoleInteraction(console=console, markdown=True)
 
     with interaction.response_context():
         interaction.answer_delta("```python\nprint('ok')")
@@ -414,7 +442,7 @@ def test_streaming_flushes_an_unclosed_fence_at_end_of_response():
 def test_streaming_commits_complete_markdown_containers(first_block):
     """Tables and nested lists remain intact when their following block establishes a boundary."""
     console = Mock()
-    interaction = ConsoleInteraction(console=console)
+    interaction = ConsoleInteraction(console=console, markdown=True)
 
     with interaction.response_context():
         interaction.answer_delta(f"{first_block}After\n")
@@ -901,7 +929,7 @@ def test_debug_formats_raw_values(capsys):
 def test_output_styles_prioritize_answers_over_diagnostics():
     """Model Markdown preserves answer hierarchy while diagnostics remain dimmed."""
     console = Mock()
-    interaction = ConsoleInteraction(console=console)
+    interaction = ConsoleInteraction(console=console, markdown=True)
 
     interaction.answer("result")
     interaction.reasoning("thought")
