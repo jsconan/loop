@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from . import constants
-from .agent import Agent, AgentRunner
+from .agent import Agent, AgentRunner, AgentRunResult
 from .backend import Backend
 from .commands import CommandManager
 from .compaction import CompactionCommands, ContextCompaction
@@ -381,6 +381,7 @@ class Loop:
 
     def run(self):
         """Run the conversation until the user requests to exit."""
+        recovery_pending = self._recover_session()
         while not self._command_manager.exit_requested:
             user_input = self._interaction.prompt(completer=self._completion_manager)
             if user_input is False:
@@ -389,6 +390,12 @@ class Loop:
             if self._command_manager.handle_user_command(user_input):
                 if self.session is not session:
                     self._model_selection.restore(self.session.model)
+                    recovery_pending = self._recover_session()
+                continue
+            if recovery_pending:
+                self._interaction.warning(
+                    "Recover the interrupted run or start a new session before sending a message."
+                )
                 continue
             try:
                 context = self._mention_manager.resolve(user_input)
@@ -405,18 +412,30 @@ class Loop:
             self._session_manager.add_user_message(user_input, context=context)
 
             result = self._agent_runner.run()
-            if result.metrics is None:
-                raise TypeError("Agent run did not produce completion metrics.")
-            self._interaction.run_metrics(result.metrics)
-            if result.stop_reason != "completed":
-                continue
-
-            if self._session_manager.session.has_initial_name():
-                try:
-                    self._interaction.info("Generating a session name...")
-                    self._session_manager.generate_session_name(self._session_name_generator)
-                    self._interaction.info(f"Session name: {self._session_manager.session.name}")
-                except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-                    self._interaction.warning(f"Could not generate the session name: {error}")
+            self._complete_agent_run(result)
 
         self._interaction.conversation_ended()
+
+    def _complete_agent_run(self, result: AgentRunResult) -> None:
+        """Present metrics and finalize naming for one completed or recovered run."""
+        if result.metrics is None:
+            raise TypeError("Agent run did not produce completion metrics.")
+        self._interaction.run_metrics(result.metrics)
+        if result.stop_reason != "completed":
+            return
+
+        if self._session_manager.session.has_initial_name():
+            try:
+                self._interaction.info("Generating a session name...")
+                self._session_manager.generate_session_name(self._session_name_generator)
+                self._interaction.info(f"Session name: {self._session_manager.session.name}")
+            except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                self._interaction.warning(f"Could not generate the session name: {error}")
+
+    def _recover_session(self) -> bool:
+        """Recover a previously interrupted run, if any."""
+        recovery = self._agent_runner.recover_session()
+        recovery_pending = recovery.pending
+        if recovery.result is not None:
+            self._complete_agent_run(recovery.result)
+        return recovery_pending

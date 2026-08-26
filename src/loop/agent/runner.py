@@ -10,7 +10,7 @@ from time import perf_counter, sleep
 from .. import constants
 from ..backend import BackendError, BackendNotFoundError
 from ..compaction import ContextCompaction
-from ..errors import log_problem
+from ..errors import Problem, log_problem
 from ..interaction import Interaction
 from ..model_selection import ModelSelection
 from ..models import (
@@ -20,12 +20,14 @@ from ..models import (
     Response,
     ResponseMetrics,
     RunMetrics,
+    ToolCall,
     ToolExecutionMetrics,
     Usage,
 )
-from ..session import SessionManager
+from ..session import SessionManager, SessionRecoveryState
+from ..tooling.utils import serialize_tool_problem
 from .agent import Agent
-from .models import AgentRunResult
+from .models import AgentRecoveryStatus, AgentRunResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -140,10 +142,61 @@ class AgentRunner:
         Returns:
             AgentRunResult: Final response, completed turn count, and termination reason.
         """
+        return self._run_from_boundary()
+
+    def recover_session(self) -> AgentRecoveryStatus:
+        """Execute an approved recovery plan for the active session.
+
+        Returns:
+            AgentRecoveryStatus: Recovered run result and whether unresolved recovery remains.
+        """
+        state = self._session_manager.recovery_state
+        if state is None:
+            return AgentRecoveryStatus(pending=False)
+        if not self._interaction.confirm(
+            "This session stopped during an agent run. Recover and continue it?",
+            default=False,
+        ):
+            return AgentRecoveryStatus(pending=True)
+        return AgentRecoveryStatus(pending=False, result=self._recover(state))
+
+    def _recover(self, state: SessionRecoveryState) -> AgentRunResult:
+        """Continue one approved recovery plan from its durable execution boundary."""
+        if state.action == "finalize_run":
+            return self._record_run_result(
+                final_response=None,
+                turns=0,
+                stop_reason="completed",
+                started_at=datetime.now(UTC),
+                calls=[],
+                tools=[],
+            )
+
+        executions = []
+        for pending in state.pending_calls:
+            if pending.status == "result_available":
+                continue
+            if pending.status == "outcome_unknown" and not self._interaction.confirm(
+                f"Tool '{pending.call.name}' may already have run. Retry it?",
+                default=False,
+            ):
+                self._persist_interrupted_tool_result(pending.call)
+                continue
+            executions.extend(
+                self._execute_tool_calls((pending.call,), present=pending.status == "not_started")
+            )
+        return self._run_from_boundary(tools=executions)
+
+    def _run_from_boundary(
+        self,
+        *,
+        tools: list[ToolExecutionMetrics] | None = None,
+    ) -> AgentRunResult:
+        """Run model turns from a fresh or recovered durable boundary."""
         turn = 0
         response = None
         calls = []
-        tools = []
+        tools = list(tools or ())
         started_at = datetime.now(UTC)
         while True:
             turn += 1
@@ -216,10 +269,21 @@ class AgentRunner:
         if not response.tool_calls:
             return ()
 
+        return self._execute_tool_calls(response.tool_calls, present=True)
+
+    def _execute_tool_calls(
+        self,
+        tool_calls: tuple[ToolCall, ...],
+        *,
+        present: bool,
+    ) -> tuple[ToolExecutionMetrics, ...]:
+        """Execute and persist canonical tool requests from one durable boundary."""
+
         instructions = self._agent.instructions_manager
         executions = []
-        for tool_call in response.tool_calls:
-            self._session_manager.add_tool_call_event(tool_call.call_id)
+        for tool_call in tool_calls:
+            if present:
+                self._session_manager.add_tool_call_event(tool_call.call_id)
             self._interaction.tool_call(tool_call.name, tool_call.arguments)
             tool_result, duration = self._agent.tool_registry.call_with_timing(
                 tool_call.name,
@@ -227,6 +291,10 @@ class AgentRunner:
                 interaction=self._interaction,
                 instructions_manager=instructions,
                 permission_manager=self._agent.permission_manager,
+                call_id=tool_call.call_id,
+                execution_started=lambda call_id=tool_call.call_id: (
+                    self._session_manager.record_tool_execution_started(call_id)
+                ),
             )
             try:
                 payload = json.loads(tool_result)
@@ -245,8 +313,34 @@ class AgentRunner:
                 output=tool_result,
                 working_directory=str(instructions.working_directory or self._working_directory()),
                 active_skills=instructions.active_skill_identities,
+                succeeded=succeeded,
+                duration_seconds=duration,
             )
         return tuple(executions)
+
+    def _persist_interrupted_tool_result(self, call: ToolCall) -> None:
+        """Resolve one uncertain invocation without risking a duplicate side effect."""
+        instructions = self._agent.instructions_manager
+        output = serialize_tool_problem(
+            Problem(
+                code="tool.execution_interrupted",
+                title="Tool execution interrupted",
+                detail=(
+                    f"Tool '{call.name}' was interrupted and its external outcome is unknown. "
+                    "Do not assume the operation failed."
+                ),
+                severity="warning",
+                operation=call.name,
+            )
+        )
+        self._session_manager.add_tool_call(
+            call_id=call.call_id,
+            output=output,
+            working_directory=str(instructions.working_directory or self._working_directory()),
+            active_skills=instructions.active_skill_identities,
+            succeeded=False,
+            duration_seconds=0,
+        )
 
     def query(self) -> Response:
         """Request one response using current session context and agent capabilities.

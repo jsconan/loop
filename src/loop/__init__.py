@@ -6,6 +6,7 @@ __all__ = [
     "Action",
     "Agent",
     "AgentInstructionsSource",
+    "AgentRecoveryStatus",
     "AgentRunResult",
     "AgentRunStopReason",
     "AgentRunner",
@@ -75,6 +76,7 @@ __all__ = [
     "OpenAIBackend",
     "Operation",
     "OperationPlan",
+    "PendingToolCall",
     "PermissionArtifactError",
     "PermissionConfiguration",
     "PermissionConfigurationError",
@@ -123,6 +125,7 @@ __all__ = [
     "SessionNameSource",
     "SessionNotFoundError",
     "SessionPolicyOverrides",
+    "SessionRecoveryState",
     "SessionStore",
     "SessionTarget",
     "ShutdownRequested",
@@ -137,8 +140,10 @@ __all__ = [
     "ToolCallCompleted",
     "ToolContext",
     "ToolDefinition",
+    "ToolExecutionCompletedEvent",
     "ToolExecutionMetrics",
     "ToolExecutionResult",
+    "ToolExecutionStartedEvent",
     "ToolPreflight",
     "ToolPreflightResult",
     "ToolRegistration",
@@ -179,7 +184,7 @@ __all__ = [
 ]
 
 
-from .agent import Agent, AgentRunner, AgentRunResult, AgentRunStopReason
+from .agent import Agent, AgentRecoveryStatus, AgentRunner, AgentRunResult, AgentRunStopReason
 from .backend import (
     Backend,
     BackendAuthenticationError,
@@ -306,6 +311,7 @@ from .session import (
     ConversationItemEvent,
     InstructionSnapshot,
     MemorySessionStore,
+    PendingToolCall,
     PermissionEvent,
     RunCompletedEvent,
     SerializedMessage,
@@ -317,9 +323,12 @@ from .session import (
     SessionNameGenerator,
     SessionNameSource,
     SessionNotFoundError,
+    SessionRecoveryState,
     SessionStore,
     SQLiteSessionStore,
     StoredSession,
+    ToolExecutionCompletedEvent,
+    ToolExecutionStartedEvent,
     UnsupportedConversationItemError,
     initial_session_name,
     normalize_session_name,

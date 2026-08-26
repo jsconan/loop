@@ -51,6 +51,9 @@ from .models import (
     RunCompletedEvent,
     SessionEventModel,
     SessionNameGenerator,
+    SessionRecoveryState,
+    ToolExecutionCompletedEvent,
+    ToolExecutionStartedEvent,
 )
 from .naming import initial_session_name
 from .session import Session, SessionStore
@@ -229,6 +232,8 @@ class SessionManager:
             if isinstance(event, RunCompletedEvent):
                 output.run_metrics(event.metrics)
                 continue
+            if isinstance(event, (ToolExecutionStartedEvent, ToolExecutionCompletedEvent)):
+                continue
             item = self._session.messages[event.item_index]
             if isinstance(item, Message):
                 display = output.user if item.role == "user" else output.answer
@@ -265,6 +270,16 @@ class SessionManager:
                 history when the session has not been compacted.
         """
         return self._session.model_context()
+
+    @property
+    def recovery_state(self) -> SessionRecoveryState | None:
+        """Return the active session's required recovery boundary.
+
+        Returns:
+            SessionRecoveryState | None: Pending recovery state, or ``None`` when the latest run
+                ended cleanly.
+        """
+        return self._session.recovery_state()
 
     @property
     def model(self) -> str | None:
@@ -500,6 +515,9 @@ class SessionManager:
         output: str,
         working_directory: str,
         active_skills: Iterable[tuple[str, str]],
+        *,
+        succeeded: bool = False,
+        duration_seconds: float = 0,
     ) -> None:
         """Add a tool result and its instruction state to the session.
 
@@ -509,6 +527,8 @@ class SessionManager:
             working_directory (str): Effective instruction directory after the tool call.
             active_skills (Iterable[tuple[str, str]]): Active skill names and canonical locations
                 after the tool call.
+            succeeded (bool): Whether the serialized tool result reports success.
+            duration_seconds (float): Tool-function execution duration in seconds.
         """
         identities = tuple(active_skills)
         output, handle = bound_tool_result(output, f"tool result {call_id}")
@@ -525,6 +545,18 @@ class SessionManager:
         def apply(session: Session) -> None:
             session.update_instruction_state(working_directory, identities)
             session.add_message(result)
+            if any(
+                isinstance(item, ToolCall) and item.call_id == call_id for item in session.messages
+            ):
+                session.events.append(
+                    ToolExecutionCompletedEvent(
+                        id=str(uuid7()),
+                        created_at=datetime.now(UTC),
+                        call_id=call_id,
+                        succeeded=succeeded,
+                        duration_seconds=duration_seconds,
+                    )
+                )
 
         self._commit(apply)
 
@@ -538,6 +570,26 @@ class SessionManager:
             ValueError: If the call is unknown or already recorded.
         """
         self._commit(lambda session: session.add_tool_call_event(call_id))
+
+    def record_tool_execution_started(self, call_id: str) -> None:
+        """Persist that one tool invocation is about to cross the execution boundary.
+
+        Args:
+            call_id (str): Identifier of the model tool request being executed.
+
+        Raises:
+            ValueError: If the call is not present in canonical session history.
+        """
+        if not any(
+            isinstance(item, ToolCall) and item.call_id == call_id
+            for item in self._session.messages
+        ):
+            raise ValueError(f"Unknown tool call '{call_id}'.")
+        self._persist_event(
+            ToolExecutionStartedEvent(
+                id=str(uuid7()), created_at=datetime.now(UTC), call_id=call_id
+            )
+        )
 
     @staticmethod
     def _content_artifacts(output: str) -> tuple[ContentArtifact, ...]:

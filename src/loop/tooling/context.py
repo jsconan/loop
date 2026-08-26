@@ -23,12 +23,15 @@ class ToolContext:
         instructions_manager (InstructionsManager | None): Manager for instructions active in the
             current conversation, or ``None`` when instruction management is unavailable.
         operations (tuple[Operation, ...]): Authorized operations for this invocation.
+        call_id (str | None): Stable model call identifier suitable as an idempotency key, or
+            ``None`` for direct user-command invocations.
     """
 
     interaction: Interaction
     tool_name: str
     instructions_manager: InstructionsManager | None = None
     operations: tuple[Operation, ...] = ()
+    call_id: str | None = None
 
     def observe_file(self, path: Path | str) -> None:
         """Report a successfully loaded file to instruction management.

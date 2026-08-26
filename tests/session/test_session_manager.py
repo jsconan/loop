@@ -42,7 +42,13 @@ from loop import (
     Usage,
 )
 from loop.interaction import Interaction
-from loop.session import PermissionEvent, RunCompletedEvent, SessionStore
+from loop.session import (
+    PermissionEvent,
+    RunCompletedEvent,
+    SessionStore,
+    ToolExecutionCompletedEvent,
+    ToolExecutionStartedEvent,
+)
 from loop.utils import cached_metadata, cached_path, store_content
 
 
@@ -196,7 +202,22 @@ def test_manager_replays_visible_session_items_in_durable_order():
             input_tokens_after=678,
         ),
     )
-    manager = SessionManager(session=Session(messages=list(items), compactions=list(compactions)))
+    session = Session(messages=list(items), compactions=list(compactions))
+    session.events.extend(
+        [
+            ToolExecutionStartedEvent(
+                id="start", created_at=datetime(2026, 8, 16, tzinfo=UTC), call_id="known"
+            ),
+            ToolExecutionCompletedEvent(
+                id="end",
+                created_at=datetime(2026, 8, 16, tzinfo=UTC),
+                call_id="known",
+                succeeded=True,
+                duration_seconds=0.1,
+            ),
+        ]
+    )
+    manager = SessionManager(session=session)
 
     manager.replay(interaction=interaction)
 
@@ -314,6 +335,16 @@ def test_manager_rejects_an_invalid_session_type():
 
     with pytest.raises(ValueError, match="Invalid session type"):
         manager.load_session(object())
+
+
+def test_manager_exposes_durable_recovery_classification():
+    """The manager exposes session-owned recovery state without applying execution policy."""
+    session = Session(messages=[Message(role="user", content="unfinished")])
+    manager = SessionManager(session=session)
+
+    assert manager.recovery_state.action == "query_model"
+    manager.new_session()
+    assert manager.recovery_state is None
 
 
 def test_manager_adds_and_persists_one_conversation_item():
@@ -463,16 +494,45 @@ def test_manager_new_session_forwards_none_model():
 def test_manager_adds_a_tool_result_with_its_instruction_state():
     """Tool results and their effective instruction state are persisted together."""
     store = Mock(spec=SessionStore)
-    session = Session()
+    call = ToolCall(call_id="call-id", name="demo", arguments="{}")
+    session = Session(messages=[call])
     manager = SessionManager(session=session, session_store=store)
     active_skills = iter([("review", "/skills/review/SKILL.md")])
 
-    manager.add_tool_call("call-id", "result", "/project", active_skills)
+    manager.add_tool_call(
+        "call-id",
+        "result",
+        "/project",
+        active_skills,
+        succeeded=True,
+        duration_seconds=0.25,
+    )
 
-    assert manager.messages == [ToolResult(call_id="call-id", output="result")]
+    assert manager.messages == [call, ToolResult(call_id="call-id", output="result")]
     assert session.instruction_working_directory == "/project"
     assert session.active_skills == [("review", "/skills/review/SKILL.md")]
+    completed = session.events[-1]
+    assert isinstance(completed, ToolExecutionCompletedEvent)
+    assert completed.call_id == "call-id"
+    assert completed.succeeded is True
+    assert completed.duration_seconds == 0.25
     store.save.assert_called_once_with(session)
+
+
+def test_manager_records_tool_execution_start_only_for_known_calls():
+    """Execution-start checkpoints are durable and reject unknown model requests."""
+    store = Mock(spec=SessionStore)
+    call = ToolCall(call_id="call", name="demo", arguments="{}")
+    session = Session(messages=[call])
+    manager = SessionManager(session=session, session_store=store)
+
+    manager.record_tool_execution_started("call")
+
+    assert isinstance(session.events[-1], ToolExecutionStartedEvent)
+    assert session.events[-1].call_id == "call"
+    store.save.assert_called_once_with(session)
+    with pytest.raises(ValueError, match="Unknown tool call"):
+        manager.record_tool_execution_started("missing")
 
 
 def test_manager_caches_oversized_tool_results_before_persistence():

@@ -20,3 +20,15 @@ class AgentRunResult(BaseModel):
     turns: int
     stop_reason: AgentRunStopReason
     metrics: RunMetrics | None = None
+
+
+class AgentRecoveryStatus(BaseModel):
+    """Report whether session recovery completed or still blocks new input.
+
+    Args:
+        pending (bool): Whether the active session still requires recovery.
+        result (AgentRunResult | None): Completed recovered run, or ``None`` when no recovery ran.
+    """
+
+    pending: bool
+    result: AgentRunResult | None = None

@@ -530,10 +530,18 @@ def test_call_routes_arguments_and_runtime_context():
     registry.register(calculate)
     runtime = Mock(spec=Interaction)
     manager = Mock(spec=InstructionsManager)
+    execution_started = Mock()
 
     assert (
         result_value(
-            registry.call("calculate", "{}", interaction=runtime, instructions_manager=manager)
+            registry.call(
+                "calculate",
+                "{}",
+                interaction=runtime,
+                instructions_manager=manager,
+                call_id="call-123",
+                execution_started=execution_started,
+            )
         )
         == "calculate"
     )
@@ -541,6 +549,8 @@ def test_call_routes_arguments_and_runtime_context():
     assert context.interaction is runtime
     assert context.tool_name == "calculate"
     assert context.instructions_manager is manager
+    assert context.call_id == "call-123"
+    execution_started.assert_called_once_with()
 
 
 def test_call_uses_default_or_no_context():
@@ -674,11 +684,22 @@ def test_call_async_routes_arguments_and_context():
 
     registry.register(calculate)
     interaction = Mock(spec=Interaction)
+    execution_started = Mock()
 
-    result = asyncio.run(registry.call_async("calculate", "{}", interaction=interaction))
+    result = asyncio.run(
+        registry.call_async(
+            "calculate",
+            "{}",
+            interaction=interaction,
+            call_id="async-call",
+            execution_started=execution_started,
+        )
+    )
 
     assert result_value(result) == "calculate"
     assert contexts[0].interaction is interaction
+    assert contexts[0].call_id == "async-call"
+    execution_started.assert_called_once_with()
 
 
 def test_call_async_returns_validation_and_permission_denials_before_invocation():

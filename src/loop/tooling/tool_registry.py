@@ -266,6 +266,8 @@ class ToolRegistry:
         interaction: Interaction | None = None,
         instructions_manager: InstructionsManager | None = None,
         permission_manager: PermissionManager | None = None,
+        call_id: str | None = None,
+        execution_started: Callable[[], None] | None = None,
     ) -> str:
         """Dispatch a synchronous tool call by registered name.
 
@@ -278,6 +280,9 @@ class ToolRegistry:
                 current conversation.
             permission_manager (PermissionManager | None): Invocation policy overriding the
                 registry default.
+            call_id (str | None): Stable model request identifier exposed to context-aware tools.
+            execution_started (Callable[[], None] | None): Callback invoked immediately before
+                the validated and authorized tool function runs.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -291,6 +296,8 @@ class ToolRegistry:
             interaction=interaction,
             instructions_manager=instructions_manager,
             permission_manager=permission_manager,
+            call_id=call_id,
+            execution_started=execution_started,
         )
         return output
 
@@ -302,6 +309,8 @@ class ToolRegistry:
         interaction: Interaction | None = None,
         instructions_manager: InstructionsManager | None = None,
         permission_manager: PermissionManager | None = None,
+        call_id: str | None = None,
+        execution_started: Callable[[], None] | None = None,
     ) -> tuple[str, float]:
         """Dispatch a tool and measure only its function execution.
 
@@ -311,6 +320,9 @@ class ToolRegistry:
             interaction (Interaction | None): Interaction for this invocation.
             instructions_manager (InstructionsManager | None): Active instruction manager.
             permission_manager (PermissionManager | None): Invocation permission policy.
+            call_id (str | None): Stable model request identifier exposed to context-aware tools.
+            execution_started (Callable[[], None] | None): Callback invoked immediately before
+                the validated and authorized tool function runs.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds. Validation
@@ -342,7 +354,10 @@ class ToolRegistry:
             interaction,
             instructions_manager,
             plan.operations,
+            call_id,
         )
+        if execution_started is not None:
+            execution_started()
         started = perf_counter()
         output = tool.call(plan.arguments, context)
         return output, perf_counter() - started
@@ -355,6 +370,8 @@ class ToolRegistry:
         interaction: Interaction | None = None,
         instructions_manager: InstructionsManager | None = None,
         permission_manager: PermissionManager | None = None,
+        call_id: str | None = None,
+        execution_started: Callable[[], None] | None = None,
     ) -> str:
         """Dispatch an asynchronous or synchronous tool call by registered name.
 
@@ -367,6 +384,9 @@ class ToolRegistry:
                 current conversation.
             permission_manager (PermissionManager | None): Invocation policy overriding the
                 registry default.
+            call_id (str | None): Stable model request identifier exposed to context-aware tools.
+            execution_started (Callable[[], None] | None): Callback invoked immediately before
+                the validated and authorized tool function runs.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -380,6 +400,8 @@ class ToolRegistry:
             interaction=interaction,
             instructions_manager=instructions_manager,
             permission_manager=permission_manager,
+            call_id=call_id,
+            execution_started=execution_started,
         )
         return output
 
@@ -391,6 +413,8 @@ class ToolRegistry:
         interaction: Interaction | None = None,
         instructions_manager: InstructionsManager | None = None,
         permission_manager: PermissionManager | None = None,
+        call_id: str | None = None,
+        execution_started: Callable[[], None] | None = None,
     ) -> tuple[str, float]:
         """Dispatch a tool asynchronously and measure only its function execution.
 
@@ -400,6 +424,9 @@ class ToolRegistry:
             interaction (Interaction | None): Interaction for this invocation.
             instructions_manager (InstructionsManager | None): Active instruction manager.
             permission_manager (PermissionManager | None): Invocation permission policy.
+            call_id (str | None): Stable model request identifier exposed to context-aware tools.
+            execution_started (Callable[[], None] | None): Callback invoked immediately before
+                the validated and authorized tool function runs.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds. Validation
@@ -431,7 +458,10 @@ class ToolRegistry:
             interaction,
             instructions_manager,
             plan.operations,
+            call_id,
         )
+        if execution_started is not None:
+            execution_started()
         started = perf_counter()
         output = await tool.call_async(plan.arguments, context)
         return output, perf_counter() - started
@@ -537,6 +567,7 @@ class ToolRegistry:
         interaction: Interaction | None,
         instructions_manager: InstructionsManager | None,
         operations: tuple[Operation, ...] = (),
+        call_id: str | None = None,
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""
         if interaction is None:
@@ -546,6 +577,7 @@ class ToolRegistry:
         return ToolContext(
             interaction=interaction,
             tool_name=tool.name,
+            call_id=call_id,
             instructions_manager=instructions_manager,
             operations=operations,
         )

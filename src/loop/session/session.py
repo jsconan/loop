@@ -25,15 +25,20 @@ from .models import (
     Compaction,
     CompactionEvent,
     ConversationItemEvent,
+    PendingToolCall,
+    RunCompletedEvent,
     SerializedMessage,
     SerializedSession,
     SessionEvent,
     SessionInfo,
     SessionNameSource,
+    SessionRecoveryState,
+    ToolExecutionCompletedEvent,
+    ToolExecutionStartedEvent,
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -290,6 +295,59 @@ class Session:
         checkpoint = self.compactions[-1]
         return [*checkpoint.context, *self.messages[checkpoint.boundary :]]
 
+    def recovery_state(self) -> SessionRecoveryState | None:
+        """Return the safest continuation for an interrupted agent run.
+
+        Returns:
+            SessionRecoveryState | None: Required continuation derived from durable history, or
+                ``None`` when the latest run ended cleanly.
+        """
+        completed_items = 0
+        for event in self.events:
+            if isinstance(event, RunCompletedEvent):
+                completed_items = event.metrics.item_count
+        if completed_items >= len(self.messages):
+            return None
+
+        suffix = self.messages[completed_items:]
+        calls = [item for item in suffix if isinstance(item, ToolCall)]
+        results = {item.call_id for item in suffix if isinstance(item, ToolResult)}
+        if not calls:
+            if any(isinstance(item, Message) and item.role == "assistant" for item in suffix):
+                return SessionRecoveryState(action="finalize_run")
+            return SessionRecoveryState(action="query_model")
+
+        presented_indices = {
+            event.item_index for event in self.events if isinstance(event, ConversationItemEvent)
+        }
+        started = {
+            event.call_id for event in self.events if isinstance(event, ToolExecutionStartedEvent)
+        }
+        pending = []
+        for offset, item in enumerate(suffix):
+            if not isinstance(item, ToolCall):
+                continue
+            call = item
+            index = completed_items + offset
+            if call.call_id in results:
+                status = "result_available"
+            elif call.call_id in started or index in presented_indices:
+                status = "outcome_unknown"
+            else:
+                status = "not_started"
+            pending.append(PendingToolCall(call=call, status=status))
+
+        statuses = {item.status for item in pending}
+        if "outcome_unknown" in statuses:
+            action = "resolve_uncertain_tools"
+        elif "not_started" in statuses:
+            action = "execute_tools"
+        elif isinstance(suffix[-1], (Message, Reasoning)):
+            action = "finalize_run"
+        else:
+            action = "query_model"
+        return SessionRecoveryState(action=action, pending_calls=tuple(pending))
+
     @staticmethod
     def _get_message(message: ConversationItem) -> ConversationItem:
         """Return a validated conversation item for storage."""
@@ -395,6 +453,12 @@ class Session:
                 raise TypeError("Invalid serialized conversation event.")
             if isinstance(event, CompactionEvent) and event.compaction_index >= len(compactions):
                 raise TypeError("Invalid serialized compaction event.")
+            if isinstance(
+                event, (ToolExecutionStartedEvent, ToolExecutionCompletedEvent)
+            ) and not any(
+                isinstance(item, ToolCall) and item.call_id == event.call_id for item in messages
+            ):
+                raise TypeError("Invalid serialized tool execution event.")
         item_event_indices = [
             event.item_index for event in events if isinstance(event, ConversationItemEvent)
         ]
@@ -437,7 +501,7 @@ class Session:
             )
 
         version = payload.get("version")
-        if version in {1, 2, 3, 4, 5}:
+        if version in {1, 2, 3, 4, 5, 6}:
             try:
                 payload = cls._upcast_payload(payload)
             except (KeyError, TypeError, ValueError) as error:
@@ -507,7 +571,7 @@ class Session:
             or any(not isinstance(item, dict) for item in compactions)
         ):
             raise ValueError("Invalid serialized session.")
-        if version == 5:
+        if version in {5, 6}:
             stored_events = value.get("events")
             if not isinstance(stored_events, list) or any(
                 not isinstance(event, dict) for event in stored_events
@@ -516,7 +580,7 @@ class Session:
             events = []
             for stored_event in stored_events:
                 event = dict(stored_event)
-                if event.get("type") == "run_completed":
+                if version == 5 and event.get("type") == "run_completed":
                     model_duration = event.pop("model_duration_seconds", 0)
                     tool_duration = event.pop("tool_duration_seconds", 0)
                     elapsed_duration = event.pop("duration_seconds", None)

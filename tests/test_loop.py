@@ -3,7 +3,7 @@
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, call, patch
+from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 import pytest
 from prompt_toolkit.document import Document
@@ -285,6 +285,90 @@ def test_resume_command_loads_a_persisted_session_id(tmp_path):
     assert sessions.session.id == "internal-id"
     assert loop.model == "session-model"
     assert interaction.prompt.call_args_list[0].args == ()
+
+
+def test_resume_command_offers_and_completes_an_interrupted_agent_run(tmp_path):
+    """Resuming unfinished history continues it before accepting another user turn."""
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["/resume internal-id", False]
+    interaction.confirm.return_value = True
+    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    interrupted = Session(id="internal-id", name="Interrupted", name_source="user")
+    interrupted.add_message(Message(role="user", content="question"))
+    store.save(interrupted)
+    sessions = SessionManager(interaction=interaction, session_store=store)
+    backend = loop_backend(
+        get_response=Mock(
+            return_value=[ResponseCompleted(items=(Message(role="assistant", content="answer"),))]
+        )
+    )
+
+    loop = Loop(
+        backend=backend,
+        interaction=interaction,
+        session_manager=sessions,
+        working_directory=tmp_path,
+    )
+    loop.run()
+
+    assert backend.get_response.call_count == 1
+    assert loop.messages == [
+        Message(role="user", content="question"),
+        Message(role="assistant", content="answer"),
+    ]
+
+
+def test_run_declining_recovery_blocks_new_input_without_mutating_history(tmp_path):
+    """An unresolved run remains intact and prevents an incompatible new user turn."""
+    session = Session(messages=[Message(role="user", content="unfinished")])
+    interaction = output_interaction()
+    interaction.confirm.return_value = False
+    interaction.prompt.side_effect = ["new question", False]
+    backend = loop_backend(get_response=Mock())
+    loop = Loop(
+        backend=backend,
+        interaction=interaction,
+        session=session,
+        working_directory=tmp_path,
+    )
+
+    loop.run()
+
+    assert loop.messages == [Message(role="user", content="unfinished")]
+    backend.get_response.assert_not_called()
+    interaction.warning.assert_called_once_with(
+        "Recover the interrupted run or start a new session before sending a message."
+    )
+
+
+def test_run_completes_approved_startup_recovery_before_prompting(tmp_path):
+    """An approved startup recovery is presented before ordinary conversation input."""
+    session = Session(
+        name="Interrupted",
+        name_source="user",
+        messages=[Message(role="user", content="unfinished")],
+    )
+    interaction = output_interaction()
+    interaction.confirm.return_value = True
+    interaction.prompt.return_value = False
+    backend = loop_backend(
+        get_response=Mock(
+            return_value=[
+                ResponseCompleted(items=(Message(role="assistant", content="recovered"),))
+            ]
+        )
+    )
+    loop = Loop(
+        backend=backend,
+        interaction=interaction,
+        session=session,
+        working_directory=tmp_path,
+    )
+
+    loop.run()
+
+    assert loop.messages[-1] == Message(role="assistant", content="recovered")
+    interaction.run_metrics.assert_called_once()
 
 
 def test_resumed_missing_model_uses_existing_query_fallback(tmp_path):
@@ -1244,7 +1328,9 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
         "conversation_item",
         "conversation_item",
         "permission",
+        "tool_execution_started",
         "conversation_item",
+        "tool_execution_completed",
         "conversation_item",
         "run_completed",
     ]
@@ -1310,6 +1396,8 @@ def test_handle_tool_calls_delegates_session_updates(tmp_path):
         output="tool result",
         working_directory=str(loop.working_directory),
         active_skills=[],
+        succeeded=False,
+        duration_seconds=0.25,
     )
     registry.call_with_timing.assert_called_once_with(
         fn_call.name,
@@ -1317,6 +1405,8 @@ def test_handle_tool_calls_delegates_session_updates(tmp_path):
         interaction=loop.interaction,
         instructions_manager=loop.instructions_manager,
         permission_manager=loop.permission_manager,
+        call_id="call_123",
+        execution_started=ANY,
     )
     assert loop.permission_manager.recorder is session_manager
     assert loop.agent_runner.handle_tool_calls(Response(answer="", reasoning="")) == ()

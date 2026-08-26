@@ -1,7 +1,7 @@
 """Tests for bounded single-agent execution."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
 
@@ -10,9 +10,11 @@ from loop import (
     AgentRunner,
     InstructionsManager,
     Interaction,
+    PendingToolCall,
     Response,
     ResponseMetrics,
     Session,
+    SessionRecoveryState,
     ToolCall,
     ToolExecutionMetrics,
     Usage,
@@ -64,6 +66,132 @@ def test_runner_returns_the_first_final_response():
     sessions.add_response.assert_called_once_with(response)
     sessions.record_run.assert_called_once()
     assert result.metrics is sessions.record_run.call_args.args[2]
+
+
+def test_runner_recovers_a_model_boundary_without_adding_user_input():
+    """Recovery requeries existing context and completes the interrupted run."""
+    response = Response(answer="done", reasoning="")
+    runner, sessions, interaction = agent_runner(responses=[response])
+
+    sessions.recovery_state = SessionRecoveryState(action="query_model")
+    interaction.confirm.return_value = True
+
+    recovery = runner.recover_session()
+
+    assert recovery.result.final_response is response
+    assert recovery.pending is False
+    sessions.add_response.assert_called_once_with(response)
+
+
+def test_runner_recovers_unstarted_tools_before_requerying():
+    """Definitely unstarted calls execute once with their stable call identifier."""
+    final = Response(answer="done", reasoning="")
+    runner, sessions, interaction = agent_runner(responses=[final])
+    call = ToolCall(call_id="call", name="echo", arguments="{}")
+    runner.agent.tool_registry.call_with_timing.return_value = (
+        '{"ok": true, "result": "done"}',
+        0.5,
+    )
+
+    sessions.recovery_state = SessionRecoveryState(
+        action="execute_tools",
+        pending_calls=(PendingToolCall(call=call, status="not_started"),),
+    )
+    interaction.confirm.return_value = True
+
+    runner.recover_session()
+
+    sessions.add_tool_call_event.assert_called_once_with("call")
+    runner.agent.tool_registry.call_with_timing.assert_called_once_with(
+        "echo",
+        "{}",
+        interaction=interaction,
+        instructions_manager=runner.agent.instructions_manager,
+        permission_manager=runner.agent.permission_manager,
+        call_id="call",
+        execution_started=ANY,
+    )
+    runner.agent.tool_registry.call_with_timing.call_args.kwargs["execution_started"]()
+    sessions.record_tool_execution_started.assert_called_once_with("call")
+    assert sessions.add_tool_call.call_args.kwargs["succeeded"] is True
+
+
+def test_runner_skips_completed_calls_in_a_partially_recovered_batch():
+    """Mixed recovery executes only calls whose durable results are still absent."""
+    final = Response(answer="done", reasoning="")
+    runner, sessions, interaction = agent_runner(responses=[final])
+    runner.agent.tool_registry.call_with_timing.return_value = ('{"ok": true}', 0.1)
+    completed = ToolCall(call_id="completed", name="read", arguments="{}")
+    pending = ToolCall(call_id="pending", name="write", arguments="{}")
+
+    sessions.recovery_state = SessionRecoveryState(
+        action="execute_tools",
+        pending_calls=(
+            PendingToolCall(call=completed, status="result_available"),
+            PendingToolCall(call=pending, status="not_started"),
+        ),
+    )
+    interaction.confirm.return_value = True
+
+    runner.recover_session()
+
+    callback = runner.agent.tool_registry.call_with_timing.call_args.kwargs["execution_started"]
+    callback()
+    sessions.record_tool_execution_started.assert_called_once_with("pending")
+
+
+def test_runner_resolves_uncertain_tools_without_retry_by_default():
+    """An uncertain side effect becomes an explicit model-visible error unless retry is approved."""
+    final = Response(answer="reconciled", reasoning="")
+    runner, sessions, interaction = agent_runner(responses=[final])
+    interaction.confirm.side_effect = [True, False]
+    call = ToolCall(call_id="call", name="mutate", arguments="{}")
+
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=call, status="outcome_unknown"),),
+    )
+    runner.recover_session()
+
+    runner.agent.tool_registry.call_with_timing.assert_not_called()
+    assert "outcome is unknown" in sessions.add_tool_call.call_args.kwargs["output"]
+    assert interaction.confirm.call_args_list[-1].args == (
+        "Tool 'mutate' may already have run. Retry it?",
+    )
+
+
+def test_runner_retries_an_uncertain_tool_only_after_explicit_approval():
+    """Explicit approval retries an uncertain call without duplicating its presentation event."""
+    final = Response(answer="done", reasoning="")
+    runner, sessions, interaction = agent_runner(responses=[final])
+    interaction.confirm.side_effect = [True, True]
+    runner.agent.tool_registry.call_with_timing.return_value = ('{"ok": false}', 0.1)
+    call = ToolCall(call_id="call", name="mutate", arguments="{}")
+
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=call, status="outcome_unknown"),),
+    )
+    runner.recover_session()
+
+    sessions.add_tool_call_event.assert_not_called()
+    callback = runner.agent.tool_registry.call_with_timing.call_args.kwargs["execution_started"]
+    callback()
+    sessions.record_tool_execution_started.assert_called_once_with("call")
+
+
+def test_runner_finalizes_a_completed_response_without_another_model_call():
+    """A persisted final assistant response only receives missing run bookkeeping."""
+    runner, sessions, interaction = agent_runner(responses=[])
+
+    sessions.recovery_state = SessionRecoveryState(action="finalize_run")
+    interaction.confirm.return_value = True
+
+    recovery = runner.recover_session()
+
+    runner.query.assert_not_called()
+    assert recovery.result.stop_reason == "completed"
+    sessions.record_run.assert_called_once()
 
 
 def test_runner_cancels_when_response_recovery_is_exhausted():

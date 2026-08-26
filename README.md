@@ -122,7 +122,8 @@ descriptive name without adding the title request to conversation history. A fai
 leaves the provisional name intact.
 
 Each session also owns an ordered event timeline for faithful replay. It records conversation-item
-placement, compactions, permission decisions, and completed-run statistics. Run statistics include
+placement, tool-execution boundaries, compactions, permission decisions, and completed-run
+statistics. Run statistics include
 per-model token usage and latency, tool-function durations and outcomes, active checkpoint time,
 message and item counts, model identity, and context occupancy. Human permission and recovery
 waits are excluded from active time. `/resume` renders this timeline, including the
@@ -130,6 +131,12 @@ metrics originally shown after each run and any permission prompts originally pr
 user. Historical permission decisions are informational and are never reapplied as grants.
 Legacy session schemas are upcast in memory when read; loading or listing sessions never rewrites
 their stored payloads. A modified session is written using the current schema on its next save.
+
+When startup or `/resume` finds history written after the last completed run, the loop offers to
+recover it before accepting another user message. Recovery resumes at the durable boundary: it
+requeries after stored tool results, executes calls that definitely never started, and never
+silently retries a call whose external outcome is unknown. For an uncertain call, declining the
+explicit retry records a model-visible interrupted result so the model can reconcile safely.
 
 Use `/sessions` to show names, stable IDs, update times, and message counts in a table. Use
 `/resume` with name-based completion to select a session; a captured name-to-ID resolver keeps its
@@ -240,11 +247,15 @@ from loop import ToolContext, ToolRegistry, tool
 @tool
 def describe_tool(context: ToolContext, value: str) -> str:
     """Return a value labeled with its registered tool name."""
-    return f"{context.tool_name}: {value}"
+    return f"{context.tool_name} ({context.call_id}): {value}"
 
 
 registry = ToolRegistry([describe_tool])
 ```
+
+For model-originated calls, `context.call_id` is the stable provider call identifier and can be
+used as an idempotency key by tools that perform external mutations. It is `None` for direct
+user-command invocations.
 
 Tools may declare a `preflight` check that returns a `ToolPreflightResult`. Ready tools are
 registered normally. Degraded tools are registered after a warning, while broken tools are logged,

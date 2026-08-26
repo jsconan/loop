@@ -7,7 +7,7 @@ from typing import Annotated, Literal, Protocol, TypedDict
 from pydantic import BaseModel, Field
 
 from .. import constants
-from ..models import AgentRunStopReason, CompactionContextItem, RunMetrics
+from ..models import AgentRunStopReason, CompactionContextItem, RunMetrics, ToolCall
 from ..permissions import AuthorizationResult
 
 SessionNameSource = Literal["initial", "generated", "user"]
@@ -123,6 +123,34 @@ class RunCompletedEvent(SessionEventModel):
     metrics: RunMetrics
 
 
+class ToolExecutionStartedEvent(SessionEventModel):
+    """Record that one local tool invocation crossed its execution boundary.
+
+    Args:
+        type (Literal["tool_execution_started"]): Event discriminator.
+        call_id (str): Identifier of the model tool call being executed.
+    """
+
+    type: Literal["tool_execution_started"] = "tool_execution_started"
+    call_id: str
+
+
+class ToolExecutionCompletedEvent(SessionEventModel):
+    """Record one durably resolved local tool request.
+
+    Args:
+        type (Literal["tool_execution_completed"]): Event discriminator.
+        call_id (str): Identifier of the resolved model tool call.
+        succeeded (bool): Whether the serialized result reports success.
+        duration_seconds (float): Tool-function execution duration in seconds.
+    """
+
+    type: Literal["tool_execution_completed"] = "tool_execution_completed"
+    call_id: str
+    succeeded: bool
+    duration_seconds: float = Field(ge=0)
+
+
 class CompactionEvent(SessionEventModel):
     """Place one compaction checkpoint in the replay timeline.
 
@@ -136,9 +164,47 @@ class CompactionEvent(SessionEventModel):
 
 
 SessionEvent = Annotated[
-    ConversationItemEvent | PermissionEvent | RunCompletedEvent | CompactionEvent,
+    ConversationItemEvent
+    | PermissionEvent
+    | RunCompletedEvent
+    | ToolExecutionStartedEvent
+    | ToolExecutionCompletedEvent
+    | CompactionEvent,
     Field(discriminator="type"),
 ]
+
+
+ToolRecoveryStatus = Literal["not_started", "outcome_unknown", "result_available"]
+SessionRecoveryAction = Literal[
+    "query_model", "execute_tools", "resolve_uncertain_tools", "finalize_run"
+]
+
+
+@dataclass(frozen=True)
+class PendingToolCall:
+    """Describe the durable recovery status of one model tool request.
+
+    Args:
+        call (ToolCall): Canonical model tool request.
+        status (ToolRecoveryStatus): Safest conclusion supported by durable history.
+    """
+
+    call: ToolCall
+    status: ToolRecoveryStatus
+
+
+@dataclass(frozen=True)
+class SessionRecoveryState:
+    """Describe how an interrupted session can safely continue.
+
+    Args:
+        action (SessionRecoveryAction): Next durable agent-loop boundary to enter.
+        pending_calls (tuple[PendingToolCall, ...]): Tool requests belonging to the unfinished
+            exchange, in model order.
+    """
+
+    action: SessionRecoveryAction
+    pending_calls: tuple[PendingToolCall, ...] = ()
 
 
 class SessionNameGenerator(Protocol):

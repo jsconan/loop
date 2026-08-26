@@ -20,6 +20,8 @@ from loop import (
     Session,
     SessionInfo,
     ToolCall,
+    ToolExecutionCompletedEvent,
+    ToolExecutionStartedEvent,
     ToolResult,
     UnsupportedConversationItemError,
     Usage,
@@ -177,6 +179,170 @@ def test_session_places_response_tool_calls_when_they_are_executed():
         session.add_tool_call_event("missing")
 
 
+@pytest.mark.parametrize(
+    ("messages", "events", "action", "statuses"),
+    [
+        ([Message(role="user", content="question")], [], "query_model", []),
+        (
+            [
+                Message(role="user", content="question"),
+                ToolCall(call_id="call", name="demo", arguments="{}"),
+            ],
+            [],
+            "execute_tools",
+            ["not_started"],
+        ),
+        (
+            [
+                Message(role="user", content="question"),
+                ToolCall(call_id="call", name="demo", arguments="{}"),
+            ],
+            [
+                ToolExecutionStartedEvent(
+                    id="started", created_at=datetime(2026, 8, 26, tzinfo=UTC), call_id="call"
+                )
+            ],
+            "resolve_uncertain_tools",
+            ["outcome_unknown"],
+        ),
+        (
+            [
+                Message(role="user", content="question"),
+                ToolCall(call_id="call", name="demo", arguments="{}"),
+                ToolResult(call_id="call", output="done"),
+            ],
+            [],
+            "query_model",
+            ["result_available"],
+        ),
+        (
+            [
+                Message(role="user", content="question"),
+                Message(role="assistant", content="answer"),
+            ],
+            [],
+            "finalize_run",
+            [],
+        ),
+    ],
+)
+def test_session_classifies_every_interrupted_agent_boundary(messages, events, action, statuses):
+    """Recovery derives the safest continuation from canonical items and lifecycle events."""
+    calls = tuple(item for item in messages if isinstance(item, ToolCall))
+    if calls:
+        session = Session()
+        for item in messages:
+            if isinstance(item, Message):
+                session.add_message(item)
+        session.add_message(Response(answer="", reasoning="", tool_calls=calls, items=calls))
+        for item in messages:
+            if isinstance(item, ToolResult):
+                session.add_message(item)
+        session.events.extend(events)
+    else:
+        session = Session(messages=messages, events=events)
+
+    state = session.recovery_state()
+
+    assert state is not None
+    assert state.action == action
+    assert [pending.status for pending in state.pending_calls] == statuses
+
+
+def test_session_treats_presented_legacy_calls_as_uncertain_and_completed_runs_as_clean():
+    """Legacy execution markers remain conservative while terminal runs need no recovery."""
+    call = ToolCall(call_id="call", name="demo", arguments="{}")
+    session = Session(messages=[Message(role="user", content="question"), call])
+
+    assert session.recovery_state().pending_calls[0].status == "outcome_unknown"
+
+    session.events.append(
+        RunCompletedEvent(
+            id="run",
+            created_at=datetime(2026, 8, 26, tzinfo=UTC),
+            stop_reason="cancelled",
+            started_at=datetime(2026, 8, 26, tzinfo=UTC),
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=2,
+            ),
+        )
+    )
+
+    assert session.recovery_state() is None
+
+
+def test_session_finalizes_a_response_that_followed_durable_tool_results():
+    """A final assistant item after consumed tool results needs only run bookkeeping."""
+    call = ToolCall(call_id="call", name="demo", arguments="{}")
+    session = Session()
+    session.add_message(Message(role="user", content="question"))
+    session.add_message(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    session.add_message(ToolResult(call_id="call", output="done"))
+    session.add_message(Message(role="assistant", content="answer"))
+
+    assert session.recovery_state().action == "finalize_run"
+
+
+def test_session_recovery_uses_complete_history_after_a_compaction():
+    """Compaction does not hide an unfinished tool request from recovery classification."""
+    call = ToolCall(call_id="call", name="demo", arguments="{}")
+    session = Session()
+    session.add_message(Message(role="user", content="question"))
+    session.add_compaction(
+        Compaction(
+            id="checkpoint",
+            boundary=1,
+            created_at=datetime(2026, 8, 26, tzinfo=UTC),
+            provider="test",
+            model="model",
+            context=(CompactionContextItem(provider="test", data={}),),
+            instructions=InstructionSnapshot(
+                working_directory="/project", content=None, digest="digest"
+            ),
+        )
+    )
+    session.add_message(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+
+    state = session.recovery_state()
+
+    assert state.action == "execute_tools"
+    assert state.pending_calls[0].call == call
+
+
+def test_session_round_trips_and_validates_tool_execution_lifecycle_events():
+    """Tool lifecycle checkpoints survive persistence and must reference known calls."""
+    call = ToolCall(call_id="call", name="demo", arguments="{}")
+    session = Session(messages=[call, ToolResult(call_id="call", output="done")])
+    session.events.extend(
+        [
+            ToolExecutionStartedEvent(
+                id="start", created_at=datetime(2026, 8, 26, tzinfo=UTC), call_id="call"
+            ),
+            ToolExecutionCompletedEvent(
+                id="end",
+                created_at=datetime(2026, 8, 26, tzinfo=UTC),
+                call_id="call",
+                succeeded=True,
+                duration_seconds=0.5,
+            ),
+        ]
+    )
+
+    assert Session.deserialize(session.serialize()) == session
+
+    payload = json.loads(session.serialize())
+    lifecycle = next(
+        event for event in payload["events"] if event["type"] == "tool_execution_started"
+    )
+    lifecycle["call_id"] = "missing"
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        Session.deserialize(json.dumps(payload))
+
+
 def test_session_preserves_metadata_omitted_from_a_response():
     """Completed responses retain existing metadata when replacements are unavailable."""
     session = Session(tokens=10, model="model-a")
@@ -254,6 +420,15 @@ def test_session_round_trips_instruction_context_and_events():
     )
 
     assert Session.deserialize(session.serialize()) == session
+
+
+def test_session_upcasts_version_six_events_without_rewriting_them():
+    """The immediately previous schema retains its typed timeline during in-memory migration."""
+    session = Session(messages=[Message(role="user", content="question")])
+    payload = json.loads(session.serialize())
+    payload["version"] = 6
+
+    assert Session.deserialize(json.dumps(payload)) == session
 
 
 def test_session_upcasts_version_five_run_metrics_without_rewriting_history():
@@ -455,7 +630,7 @@ def test_session_serialization_identifies_unsupported_item_types():
     [
         ("not-json", "Invalid serialized session"),
         ("[]", "Invalid serialized session"),
-        ('{"version":7,"messages":[],"tokens":0,"model":null}', "Unsupported session version 7"),
+        ('{"version":8,"messages":[],"tokens":0,"model":null}', "Unsupported session version 8"),
         ('{"messages":[],"tokens":0,"model":null}', "Unsupported session version None"),
         ('{"version":5,"messages":[]}', "Invalid serialized session"),
     ],
