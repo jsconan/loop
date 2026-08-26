@@ -18,6 +18,7 @@ from loop import (
     ToolRegistry,
 )
 from loop.tooling import ToolContext
+from loop.tools import files as files_module
 from loop.tools.files import edit_text_file as edit_text_file_tool
 from loop.tools.files import list_folder as list_folder_tool
 from loop.tools.files import write_text_file as write_text_file_tool
@@ -43,6 +44,7 @@ def problem(output: str):
 def approve_tool_calls(monkeypatch, tmp_path):
     """Approve central permission prompts unless a case overrides the decision."""
     global tool_registry  # pylint: disable=global-statement
+    monkeypatch.setattr(files_module, "ripgrep_path", MagicMock(return_value="rg"))
     tool_registry = ToolRegistry(
         BUILTIN_TOOLS,
         permission_manager=PermissionManager(tmp_path),

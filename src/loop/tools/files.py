@@ -11,7 +11,7 @@ from .. import constants
 from ..errors import Problem, ProblemException, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, FileTarget, Operation, OperationPlan
-from ..tooling import ToolContext, tool
+from ..tooling import TOOL_READY, ToolContext, ToolPreflightResult, ToolStatus, tool
 from ..utils import (
     canonical_path,
     filter_paths_by_globs,
@@ -21,6 +21,7 @@ from ..utils import (
     is_path_ignored,
     iter_visible_paths,
     read_bounded_text,
+    ripgrep_path,
     search_text_paths,
     sha256_digest,
     write_text_atomically,
@@ -28,6 +29,15 @@ from ..utils import (
 from .models import FileContentResult, FolderEntry, TextSearchResult
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _check_text_search() -> ToolPreflightResult:
+    """Return whether the external text-search capability is available."""
+    try:
+        ripgrep_path()
+    except FileNotFoundError as exc:
+        return ToolPreflightResult(status=ToolStatus.BROKEN, detail=str(exc))
+    return TOOL_READY
 
 
 def _write_preview(path: Path, content: str) -> str:
@@ -324,6 +334,7 @@ def read_text_file(
 @tool(
     actions={Action.FILESYSTEM_READ},
     operation_planner=_file_plan(Action.FILESYSTEM_READ),
+    preflight=_check_text_search,
 )
 def search_text(
     context: ToolContext,
@@ -338,9 +349,7 @@ def search_text(
     ] = False,
     case: Annotated[
         Literal["smart", "sensitive", "insensitive"],
-        Field(
-            description="Case strategy; smart treats queries containing uppercase as sensitive."
-        ),
+        Field(description="Case strategy; smart treats queries containing uppercase as sensitive."),
     ] = "smart",
     include: Annotated[
         list[str] | None,
@@ -410,9 +419,14 @@ def search_text(
         return TextSearchResult(matches=matches, truncated=truncated)
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         detail = str(exc)
-        code = "filesystem.invalid_search_pattern" if regex and "regex parse error" in detail else (
-            "filesystem.search_unavailable" if isinstance(exc, FileNotFoundError) else
-            "filesystem.search_failed"
+        code = (
+            "filesystem.invalid_search_pattern"
+            if regex and "regex parse error" in detail
+            else (
+                "filesystem.search_unavailable"
+                if isinstance(exc, FileNotFoundError)
+                else "filesystem.search_failed"
+            )
         )
         problem = Problem.from_exception(
             exc,
@@ -468,9 +482,7 @@ def edit_text_file(
     path: Annotated[str, Field(description="Path to the existing UTF-8 text file to edit.")],
     old_content: Annotated[
         str,
-        Field(
-            description="Exact, non-empty existing content that uniquely anchors the edit."
-        ),
+        Field(description="Exact, non-empty existing content that uniquely anchors the edit."),
     ],
     new_content: Annotated[
         str,

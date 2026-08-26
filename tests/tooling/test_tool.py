@@ -20,7 +20,7 @@ from loop import (
     ToolResultPresentationSpec,
     tool,
 )
-from loop.tooling import Tool, ToolContext
+from loop.tooling import Tool, ToolContext, ToolPreflightResult, ToolStatus
 
 tool_module = importlib.import_module("loop.tooling.tool")
 
@@ -98,6 +98,22 @@ def test_tool_options_preserve_an_explicitly_empty_capability_set():
     assert registered.name == "selected"
     assert registered.description == "Selected tool."
     assert registered.actions == frozenset()
+
+
+def test_tool_options_preserve_preflight_and_requiredness_metadata():
+    """Declarations carry readiness behavior into each registered tool."""
+    preflight = Mock(return_value=ToolPreflightResult(ToolStatus.READY))
+
+    @tool(preflight=preflight, required=True)
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    registered = ToolRegistry([calculate]).tools[0]
+
+    assert registered.preflight is preflight
+    assert registered.required is True
+    preflight.assert_called_once_with()
 
 
 def test_tools_are_immutable():

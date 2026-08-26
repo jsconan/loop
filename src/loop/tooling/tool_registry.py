@@ -1,5 +1,6 @@
 """Register and dispatch typed functions exposed to an LLM."""
 
+import logging
 from collections.abc import Callable, Iterable
 from time import perf_counter
 from typing import Any
@@ -9,7 +10,7 @@ from pydantic import ValidationError
 from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
 from ..constants import OMIT, Omit
-from ..errors import Problem, ProblemException
+from ..errors import Problem, ProblemException, log_problem
 from ..interaction import Interaction
 from ..models import (
     ToolDefinition,
@@ -20,9 +21,11 @@ from ..permissions import Action, Decision, Operation, OperationPlanner, Permiss
 from ..skills import InstructionsManager
 from ..utils import callable_name
 from .context import ToolContext
-from .models import ToolRegistrationError
+from .models import ToolPreflight, ToolRegistrationError, ToolStatus
 from .tool import Tool, ToolRegistration
 from .utils import serialize_tool_problem
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ToolRegistry:
@@ -42,6 +45,7 @@ class ToolRegistry:
     _tools: dict[str, Tool]
     _interaction: Interaction | None
     _permission_manager: PermissionManager
+    _registration_problems: list[Problem]
 
     def __init__(
         self,
@@ -50,6 +54,7 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
     ) -> None:
         self._tools = {}
+        self._registration_problems = []
         self._interaction = interaction
         self._permission_manager = permission_manager or PermissionManager(interaction=interaction)
         for tool in tools or ():
@@ -110,6 +115,15 @@ class ToolRegistry:
         """
         return sorted(self._tools.keys(), key=str.casefold)
 
+    @property
+    def registration_problems(self) -> tuple[Problem, ...]:
+        """Return immutable diagnostics from skipped tool registrations.
+
+        Returns:
+            tuple[Problem, ...]: Problems encountered by preflight checks in registration order.
+        """
+        return tuple(self._registration_problems)
+
     def register(
         self,
         function: Callable[..., Any] | ToolRegistration,
@@ -119,7 +133,9 @@ class ToolRegistry:
         actions: Iterable[Action] | None = None,
         operation_planner: OperationPlanner | None | Omit = OMIT,
         result_presentation: ToolResultPresentationDeclaration | Omit = OMIT,
-    ) -> None:
+        preflight: ToolPreflight | None | Omit = OMIT,
+        required: bool | Omit = OMIT,
+    ) -> bool:
         """Create and register a tool from a callable or configured registration.
 
         Args:
@@ -135,10 +151,18 @@ class ToolRegistry:
                 Omit it to inherit the declared planner; pass ``None`` to remove one.
             result_presentation (ToolResultPresentationDeclaration | Omit): Container-specific
                 presentation declaration. Omit it to inherit.
+            preflight (ToolPreflight | None | Omit): Container-specific readiness check. Omit it
+                to inherit; pass ``None`` to remove one.
+            required (bool | Omit): Whether a broken tool requires an explicit choice to continue.
+                Omit it to inherit.
+
+        Returns:
+            bool: Whether the tool was registered.
 
         Raises:
             ToolRegistrationError: If the resolved name is already registered, the function has
-                no description, or its parameters cannot be represented by an arguments model.
+                no description, its parameters cannot be represented by an arguments model, or a
+                required broken tool halts registration.
         """
         if isinstance(function, ToolRegistration):
             registration = function
@@ -156,19 +180,75 @@ class ToolRegistry:
                 if isinstance(result_presentation, Omit)
                 else result_presentation
             )
+            preflight = registration.preflight if isinstance(preflight, Omit) else preflight
+            required = registration.required if isinstance(required, Omit) else required
         declared_tool = Tool.get_declaration(function)
         if declared_tool is None:
             declared_tool = Tool(function=function)
         tool_name = name or declared_tool.name or callable_name(function)
         if tool_name in self._tools:
             raise ToolRegistrationError(f"Tool '{tool_name}' is already registered.")
-        self._tools[tool_name] = declared_tool.registered(
+        registered = declared_tool.registered(
             name=name,
             description=description,
             actions=actions,
             operation_planner=operation_planner,
             result_presentation=result_presentation,
+            preflight=preflight,
+            required=required,
         )
+        if registered.preflight is not None:
+            preflight_error = None
+            try:
+                readiness = registered.preflight()
+            except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
+                preflight_error = exc
+                readiness_status = ToolStatus.BROKEN
+                problem = Problem.from_exception(
+                    exc,
+                    code="tool.preflight_error",
+                    title="Tool readiness check failed",
+                    detail=f"Could not determine whether tool '{tool_name}' is available.",
+                    operation=tool_name,
+                )
+            else:
+                readiness_status = readiness.status
+                problem = (
+                    None
+                    if readiness_status is ToolStatus.READY
+                    else Problem(
+                        code=f"tool.preflight_{readiness_status.value}",
+                        title=f"Tool {readiness_status.value}",
+                        detail=readiness.detail
+                        or f"Tool '{tool_name}' is {readiness_status.value}.",
+                        severity="warning" if readiness_status is ToolStatus.DEGRADED else "error",
+                        operation=tool_name,
+                    )
+                )
+            if problem is not None:
+                log_problem(_LOGGER, problem, preflight_error)
+                self._registration_problems.append(problem)
+                if self._interaction is not None:
+                    self._interaction.warning(problem.detail)
+                if readiness_status is ToolStatus.DEGRADED:
+                    self._tools[tool_name] = registered
+                    return True
+                if registered.required and (
+                    self._interaction is None
+                    or self._interaction.prompt(
+                        f"Required tool '{tool_name}' is unavailable:",
+                        exit_commands=(),
+                        choices={
+                            "halt": "Halt startup",
+                            "continue": "Continue without this tool",
+                        },
+                    )
+                    != "continue"
+                ):
+                    raise ToolRegistrationError(problem.detail)
+                return False
+        self._tools[tool_name] = registered
+        return True
 
     def definitions(self) -> list[ToolDefinition]:
         """Return definitions for all registered tools.

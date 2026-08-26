@@ -22,6 +22,7 @@ from ..models import (
 from ..permissions import Action, OperationPlan, OperationPlanner
 from ..utils import callable_name
 from .context import ToolContext
+from .models import ToolPreflight
 from .utils import (
     ToolRegistrationError,
     get_tool_arguments_model,
@@ -52,6 +53,9 @@ class Tool:
             registration, or ``None`` for a passive declaration.
         result_presentation (ToolResultPresentationDeclaration): Fixed presentation or selector
             applied to each successful raw result.
+        preflight (ToolPreflight | None): Optional readiness check run before registration.
+        required (bool): Whether a user must explicitly choose to continue when the tool is
+            broken. Without an interaction, a broken required tool raises ``ToolRegistrationError``.
     """
 
     function: Callable[..., Any]
@@ -61,6 +65,8 @@ class Tool:
     operation_planner: OperationPlanner | None = None
     arguments_model: type[BaseModel] | None = None
     result_presentation: ToolResultPresentationDeclaration = RAW_TOOL_RESULT_PRESENTATION
+    preflight: ToolPreflight | None = None
+    required: bool = False
 
     def registered(
         self,
@@ -70,6 +76,8 @@ class Tool:
         actions: Iterable[Action] | None = None,
         operation_planner: OperationPlanner | None | Omit = OMIT,
         result_presentation: ToolResultPresentationDeclaration | Omit = OMIT,
+        preflight: ToolPreflight | None | Omit = OMIT,
+        required: bool | Omit = OMIT,
     ) -> Tool:
         """Return a registry-ready copy with resolved metadata and argument validation.
 
@@ -83,6 +91,10 @@ class Tool:
                 Omit it to inherit; pass ``None`` to remove one.
             result_presentation (ToolResultPresentationDeclaration | Omit): Container-specific
                 presentation declaration. Omit it to inherit.
+            preflight (ToolPreflight | None | Omit): Container-specific readiness check. Omit it
+                to inherit; pass ``None`` to remove one.
+            required (bool | Omit): Whether the tool must be available for the container to be
+                considered ready. Omit it to inherit; pass ``None`` to remove one.
 
         Returns:
             Tool: Immutable, fully resolved tool for one registry.
@@ -101,6 +113,8 @@ class Tool:
                 if isinstance(result_presentation, Omit)
                 else result_presentation
             ),
+            preflight=self.preflight if isinstance(preflight, Omit) else preflight,
+            required=self.required if isinstance(required, Omit) else required,
             arguments_model=get_tool_arguments_model(self.function, resolved_name),
         )
         if registered.actions and registered.operation_planner is None:
@@ -346,6 +360,10 @@ class ToolRegistration:
             Omit it to inherit a declared planner; pass ``None`` to remove one.
         result_presentation (ToolResultPresentationDeclaration | Omit): Container-specific
             presentation declaration, or omit it to inherit.
+        preflight (ToolPreflight | None | Omit): Container-specific readiness check, or omit it
+            to inherit.
+        required (bool | Omit): Whether the tool must be available for the container to be
+            considered ready. Omit it to inherit; pass ``None`` to remove one.
     """
 
     function: Callable[..., Any]
@@ -354,6 +372,8 @@ class ToolRegistration:
     actions: frozenset[Action] | None = None
     operation_planner: OperationPlanner | None | Omit = OMIT
     result_presentation: ToolResultPresentationDeclaration | Omit = OMIT
+    preflight: ToolPreflight | None | Omit = OMIT
+    required: bool | Omit = OMIT
 
 
 @overload
@@ -370,6 +390,8 @@ def tool[ToolFunction: Callable[..., Any]](
     actions: Iterable[Action] | None = None,
     operation_planner: OperationPlanner | None = None,
     result_presentation: ToolResultPresentationDeclaration = RAW_TOOL_RESULT_PRESENTATION,
+    preflight: ToolPreflight | None = None,
+    required: bool = False,
 ) -> Callable[[ToolFunction], ToolFunction]: ...
 
 
@@ -382,6 +404,8 @@ def tool[ToolFunction: Callable[..., Any]](
     actions: Iterable[Action] | None = None,
     operation_planner: OperationPlanner | None = None,
     result_presentation: ToolResultPresentationDeclaration = RAW_TOOL_RESULT_PRESENTATION,
+    preflight: ToolPreflight | None = None,
+    required: bool = False,
 ) -> ToolFunction | Callable[[ToolFunction], ToolFunction]:
     """Declare a function as an LLM-callable tool without registering it.
 
@@ -396,6 +420,9 @@ def tool[ToolFunction: Callable[..., Any]](
             arguments and typed operations.
         result_presentation (ToolResultPresentationDeclaration): Fixed presentation or selector
             applied to each successful raw result.
+        preflight (ToolPreflight | None): Optional readiness check run before registration.
+        required (bool): Whether a user must explicitly choose to continue when the tool is
+            broken. Without an interaction, a broken required tool raises ``ToolRegistrationError``.
 
     Returns:
         ToolFunction | Callable[[ToolFunction], ToolFunction]: The unchanged declared function,
@@ -414,6 +441,8 @@ def tool[ToolFunction: Callable[..., Any]](
                 actions=frozenset(() if actions is None else actions),
                 operation_planner=operation_planner,
                 result_presentation=result_presentation,
+                preflight=preflight,
+                required=required,
             ),
         )
         return target

@@ -238,6 +238,12 @@ def describe_tool(context: ToolContext, value: str) -> str:
 registry = ToolRegistry([describe_tool])
 ```
 
+Tools may declare a `preflight` check that returns a `ToolPreflightResult`. Ready tools are
+registered normally. Degraded tools are registered after a warning, while broken tools are logged,
+shown as a warning when an interaction is available, and omitted from the registry. Marking a tool
+`required=True` asks an interactive user whether to halt or continue without a broken tool;
+headless registration halts because continuing cannot be authorized.
+
 Registries can also create tools from undecorated callables and override metadata locally without
 changing the callable or another registry:
 

@@ -139,6 +139,8 @@ __all__ = [
     "ToolDefinition",
     "ToolExecutionMetrics",
     "ToolExecutionResult",
+    "ToolPreflight",
+    "ToolPreflightResult",
     "ToolRegistration",
     "ToolRegistrationError",
     "ToolRegistry",
@@ -147,6 +149,7 @@ __all__ = [
     "ToolResultPresentationDeclaration",
     "ToolResultPresentationSelector",
     "ToolResultPresentationSpec",
+    "ToolStatus",
     "UnsupportedConversationItemError",
     "Usage",
     "command",
@@ -334,9 +337,12 @@ from .skills import (
 from .tooling import (
     Tool,
     ToolContext,
+    ToolPreflight,
+    ToolPreflightResult,
     ToolRegistration,
     ToolRegistrationError,
     ToolRegistry,
+    ToolStatus,
     tool,
 )
 from .tools import (

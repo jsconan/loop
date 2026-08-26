@@ -56,7 +56,7 @@ def main() -> None:
         loop = Loop(
             backend,
             interaction=interaction,
-            tool_registry=create_default_tool_registry(),
+            tool_registry=create_default_tool_registry(interaction=interaction),
             working_directory=working_directory,
             session_manager=session_manager,
             stream=True,

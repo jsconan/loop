@@ -22,7 +22,14 @@ from loop import (
 )
 from loop.interaction import Interaction
 from loop.skills import InstructionsManager
-from loop.tooling import ToolContext, ToolRegistration, ToolRegistrationError, ToolRegistry
+from loop.tooling import (
+    ToolContext,
+    ToolPreflightResult,
+    ToolRegistration,
+    ToolRegistrationError,
+    ToolRegistry,
+    ToolStatus,
+)
 from loop.tooling import tool as declare_tool
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
@@ -91,6 +98,21 @@ def test_constructor_registers_in_order_and_exposes_sorted_snapshots():
     names.clear()
     assert registry.names == ["alpha", "zebra"]
     assert result_value(registry.call("zebra", "{}")) == "zebra"
+
+
+def test_registration_problems_returns_an_immutable_snapshot():
+    """Registration diagnostics are exposed as a tuple independent of internal storage."""
+    @declare_tool(preflight=lambda: ToolPreflightResult(ToolStatus.BROKEN, "Unavailable"))
+    def unavailable() -> None:
+        """Attempt unavailable work."""
+
+    registry = ToolRegistry([unavailable])
+
+    problems = registry.registration_problems
+
+    assert isinstance(problems, tuple)
+    assert len(problems) == 1
+    assert problems[0].detail == "Unavailable"
 
 
 def test_register_resolves_a_tool_from_declared_metadata():
@@ -220,6 +242,159 @@ def test_register_accepts_container_specific_registration_records():
     assert registered.name == "local_calculate"
     assert registered.description == "Calculate locally."
     assert registered.actions == frozenset()
+
+
+def test_register_admits_ready_tools_and_returns_registration_status():
+    """A successful preflight runs once and admits the tool to every public catalog view."""
+    preflight = Mock(return_value=ToolPreflightResult(ToolStatus.READY))
+
+    @declare_tool(preflight=preflight)
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    registry = ToolRegistry()
+
+    assert registry.register(calculate) is True
+    assert registry.names == ["calculate"]
+    assert [tool.name for tool in registry.tools] == ["calculate"]
+    assert [definition.name for definition in registry.definitions()] == ["calculate"]
+    preflight.assert_called_once_with()
+
+
+def test_register_skips_unavailable_optional_tools_and_reports_the_problem():
+    """Optional readiness failures stay out of the catalog and notify the active user."""
+    interaction = Mock(spec=Interaction)
+    registry = ToolRegistry(interaction=interaction)
+
+    @declare_tool(
+        preflight=lambda: ToolPreflightResult(ToolStatus.BROKEN, "Install the dependency.")
+    )
+    def unavailable() -> None:
+        """Attempt unavailable work."""
+
+    def available() -> None:
+        """Perform available work."""
+
+    assert registry.register(unavailable) is False
+    assert registry.register(available) is True
+
+    assert registry.names == ["available"]
+    interaction.warning.assert_called_once_with("Install the dependency.")
+
+
+def test_register_logs_headless_broken_tools_with_a_default_detail(caplog):
+    """Headless registries log broken optional tools with an actionable default detail."""
+
+    @declare_tool(preflight=lambda: ToolPreflightResult(ToolStatus.BROKEN))
+    def unavailable() -> None:
+        """Attempt unavailable work."""
+
+    registry = ToolRegistry([unavailable])
+
+    assert registry.names == []
+    assert "Tool 'unavailable' is broken." in caplog.text
+
+
+def test_register_converts_unexpected_preflight_errors_and_logs_them(monkeypatch):
+    """Unexpected readiness errors become safe optional diagnostics with private logging."""
+    error = RuntimeError("private failure")
+    logger = Mock()
+    monkeypatch.setattr(tool_registry_module, "_LOGGER", logger)
+
+    @declare_tool(preflight=Mock(side_effect=error))
+    def unavailable() -> None:
+        """Attempt unavailable work."""
+
+    ToolRegistry([unavailable])
+
+    assert logger.log.call_args.kwargs["exc_info"][1] is error
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_register_halts_when_the_user_rejects_a_broken_required_tool(raises):
+    """Broken required tools warn the user and halt when the user chooses to halt."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "halt"
+    preflight = (
+        Mock(side_effect=RuntimeError("broken check"))
+        if raises
+        else Mock(
+            return_value=ToolPreflightResult(
+                ToolStatus.BROKEN, "Required capability is missing."
+            )
+        )
+    )
+
+    @declare_tool(preflight=preflight, required=True)
+    def required() -> None:
+        """Perform required work."""
+
+    registry = ToolRegistry(interaction=interaction)
+
+    with pytest.raises(ToolRegistrationError):
+        registry.register(required)
+
+    assert registry.names == []
+    interaction.warning.assert_called_once()
+    interaction.prompt.assert_called_once()
+
+
+def test_register_continues_without_a_broken_required_tool_when_selected():
+    """The explicit continue choice skips a broken required tool without halting."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "continue"
+
+    @declare_tool(
+        preflight=lambda: ToolPreflightResult(ToolStatus.BROKEN, "Dependency missing."),
+        required=True,
+    )
+    def required() -> None:
+        """Perform required work."""
+
+    registry = ToolRegistry(interaction=interaction)
+
+    assert registry.register(required) is False
+    assert registry.names == []
+
+
+def test_register_admits_degraded_tools_after_warning():
+    """Degraded tools remain available after their warning is logged and displayed."""
+    interaction = Mock(spec=Interaction)
+
+    @declare_tool(
+        preflight=lambda: ToolPreflightResult(ToolStatus.DEGRADED, "Limited capability.")
+    )
+    def degraded() -> None:
+        """Perform limited work."""
+
+    registry = ToolRegistry(interaction=interaction)
+
+    assert registry.register(degraded) is True
+    assert registry.names == ["degraded"]
+    interaction.warning.assert_called_once_with("Limited capability.")
+
+
+def test_registration_overrides_can_replace_and_remove_declared_readiness():
+    """Container registrations can replace checks and requiredness or remove a declared check."""
+    declared_check = Mock(return_value=ToolPreflightResult(ToolStatus.BROKEN, "not used"))
+    replacement = Mock(return_value=ToolPreflightResult(ToolStatus.READY))
+
+    @declare_tool(preflight=declared_check, required=True)
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    replaced = ToolRegistry()
+    assert (
+        replaced.register(ToolRegistration(calculate, preflight=replacement, required=False))
+        is True
+    )
+    removed = ToolRegistry()
+    assert removed.register(calculate, preflight=None, required=False) is True
+
+    declared_check.assert_not_called()
+    replacement.assert_called_once_with()
 
 
 def test_independent_registries_allow_the_same_name_and_isolate_runtime_state():

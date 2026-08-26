@@ -51,7 +51,7 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     main.main()
 
     register_shutdown_signals.assert_called_once_with()
-    registry_factory.assert_called_once_with()
+    registry_factory.assert_called_once_with(interaction=interaction)
     backend_factory.assert_called_once_with(
         base_url="http://localhost:8000/v1",
         default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
@@ -108,7 +108,7 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
 
     main.main()
 
-    registry_factory.assert_called_once_with()
+    registry_factory.assert_called_once_with(interaction=interaction)
     backend_factory.assert_called_once_with(
         base_url="https://example.test/v1",
         default_model="configured-model",
