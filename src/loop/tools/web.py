@@ -9,10 +9,10 @@ from urllib.parse import urlsplit
 
 import httpcore
 import httpx
-from pydantic import Field, HttpUrl
+from pydantic import Field, HttpUrl, TypeAdapter
 
 from .. import constants
-from ..errors import Problem, log_problem
+from ..errors import Problem, ProblemException, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, NetworkTarget, Operation, OperationPlan
 from ..tooling import ToolContext, tool
@@ -29,9 +29,7 @@ from .models import CachedContentResult
 
 _LOGGER = logging.getLogger(__name__)
 
-_DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
-)
+_HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
 
 
 class PinnedAddressBackend:
@@ -113,7 +111,7 @@ def _cached_result(
 
 def _network_plan(arguments: dict[str, object]) -> OperationPlan:
     """Plan one normalized outbound HTTP request."""
-    url = str(arguments["url"])
+    url = str(_HTTP_URL_ADAPTER.validate_python(arguments["url"]))
     parsed = urlsplit(url)
     if parsed.hostname is None:  # pragma: no cover - HttpUrl validates host presence.
         raise ValueError("Network request requires a hostname.")
@@ -139,7 +137,9 @@ def _network_plan(arguments: dict[str, object]) -> OperationPlan:
 
 
 def _cached_content_plan(arguments: dict[str, object]) -> OperationPlan:
-    """Plan local cached access or a required source reload."""
+    """Plan local cached access, a source reload, or one redirected reload hop."""
+    if "url" in arguments:
+        return _network_plan(arguments)
     metadata = (
         None if cached_path(str(arguments["handle"])) else cached_metadata(str(arguments["handle"]))
     )
@@ -150,45 +150,77 @@ def _cached_content_plan(arguments: dict[str, object]) -> OperationPlan:
     return OperationPlan(arguments=arguments, operations=network.operations)
 
 
-def _cache_url(url: str, addresses: tuple[str, ...], handle: str | None = None) -> str:
-    """Stream one validated web source into the temporary content cache."""
-    with httpx.stream(
-        "GET",
-        url,
-        headers={"User-Agent": os.getenv("USER_AGENT", _DEFAULT_USER_AGENT)},
-        follow_redirects=False,
-        timeout=30.0,
-        transport=PinnedAddressTransport(addresses),
-    ) as response:
-        if response.is_redirect:
-            raise ValueError(
-                f"Cross-request redirects are not followed; authorize the redirected URL "
-                f"explicitly: {response.headers.get('location', 'unknown destination')}"
-            )
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "").lower()
-        if content_type and not (
-            content_type.startswith("text/")
-            or "json" in content_type
-            or "xml" in content_type
-            or "javascript" in content_type
-        ):
-            raise ValueError(f"Content at '{url}' is not a supported text response.")
-        try:
-            handle, _ = store_text_stream(
-                response.iter_bytes(),
-                url,
-                constants.MAX_FETCH_BYTES,
-                handle=handle,
-                reloadable=True,
-            )
-        except ValueError as exc:
-            if str(exc) == "Content appears to be binary.":
-                raise ValueError(f"Content at '{url}' appears to be binary.") from exc
-            if "download limit" in str(exc):
-                raise ValueError(str(exc).replace("Content", f"Content at '{url}'", 1)) from exc
-            raise
-    return handle
+def _cache_url(
+    context: ToolContext,
+    url: str,
+    addresses: tuple[str, ...],
+    handle: str | None = None,
+) -> str:
+    """Stream one validated web source through separately authorized redirect hops."""
+    source = url
+    current_url = url
+    current_addresses = addresses
+    visited = {str(httpx.URL(url).copy_with(fragment=None))}
+    redirects = 0
+    while True:
+        with httpx.stream(
+            "GET",
+            current_url,
+            headers={"User-Agent": os.getenv("USER_AGENT", constants.DEFAULT_USER_AGENT)},
+            follow_redirects=False,
+            timeout=30.0,
+            transport=PinnedAddressTransport(current_addresses),
+        ) as response:
+            next_request = response.next_request
+            if next_request is not None:
+                if redirects >= constants.MAX_REDIRECTS:
+                    raise ValueError(f"Content at '{source}' exceeded the redirect limit.")
+                redirected_url = str(next_request.url)
+            else:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").lower()
+                if content_type and not (
+                    content_type.startswith("text/")
+                    or "json" in content_type
+                    or "xml" in content_type
+                    or "javascript" in content_type
+                ):
+                    raise ValueError(
+                        f"Content at '{current_url}' is not a supported text response."
+                    )
+                try:
+                    handle, _ = store_text_stream(
+                        response.iter_bytes(),
+                        source,
+                        constants.MAX_FETCH_BYTES,
+                        handle=handle,
+                        reloadable=True,
+                    )
+                except ValueError as exc:
+                    if str(exc) == "Content appears to be binary.":
+                        raise ValueError(
+                            f"Content at '{current_url}' appears to be binary."
+                        ) from exc
+                    if "download limit" in str(exc):
+                        raise ValueError(
+                            str(exc).replace("Content", f"Content at '{current_url}'", 1)
+                        ) from exc
+                    raise
+                return handle
+
+        redirected_url = str(_HTTP_URL_ADAPTER.validate_python(redirected_url))
+        redirect_identity = str(httpx.URL(redirected_url).copy_with(fragment=None))
+        if redirect_identity in visited:
+            raise ValueError(f"Content at '{source}' entered a redirect loop.")
+        plan = context.authorize_additional({"url": redirected_url})
+        operation = plan.operations[0] if len(plan.operations) == 1 else None
+        target = operation.target if operation is not None else None
+        if not isinstance(target, NetworkTarget):
+            raise TypeError("Authorized redirect network target is missing.")
+        visited.add(redirect_identity)
+        redirects += 1
+        current_url = str(plan.arguments["url"])
+        current_addresses = target.addresses
 
 
 @tool(
@@ -210,12 +242,14 @@ def fetch_content(
         target = operation.target if operation is not None else None
         if not isinstance(target, NetworkTarget):
             raise TypeError("Authorized network target is missing.")
-        handle = _cache_url(url, target.addresses)
+        handle = _cache_url(context, url, target.addresses)
         resolved = cached_path(handle)
         if resolved is None:  # pragma: no cover - store and resolve are atomic
             raise RuntimeError("Fetched content could not be cached.")
         path, source = resolved
         return _cached_result(handle, source, read_bounded_text(path))
+    except ProblemException as exc:
+        return exc.problem
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         problem = Problem.from_exception(
             exc,
@@ -274,7 +308,7 @@ def read_cached_content(
             target = operation.target if operation is not None else None
             if not isinstance(target, NetworkTarget):
                 raise TypeError("Authorized network target is missing.")
-            _cache_url(metadata["source"], target.addresses, handle)
+            _cache_url(context, metadata["source"], target.addresses, handle)
             resolved = cached_path(handle)
             if resolved is None:  # pragma: no cover - cache writes and lookup are atomic
                 raise RuntimeError("Reloaded content could not be cached.")
@@ -295,6 +329,8 @@ def read_cached_content(
                 max_bytes=max_bytes,
             ),
         )
+    except ProblemException as exc:
+        return exc.problem
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         problem = Problem.from_exception(
             exc,

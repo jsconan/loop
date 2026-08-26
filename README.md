@@ -384,12 +384,14 @@ it for web requests.
 ### Tool permissions
 
 Every model-originated tool call is authorized centrally after its arguments are validated and
-before its function is invoked. A tool first produces one complete, canonical operation plan; the
-whole plan is then allowed, denied, or approved atomically. Pure tools require no authority. The
-default supervised policy permits reads in the workspace and Loop-owned temporary directory, asks
-for mutations and network access, and denies host-process execution at a user-configurable
-boundary. Ordinary rules cannot override boundaries. A required approval is denied when no
-interactive user is available.
+before its function is invoked. A tool first produces one complete, canonical operation plan for
+all effects knowable before execution; the whole plan is then allowed, denied, or approved
+atomically. An effect discovered only while the tool runs must pass another registry-owned planning
+and authorization checkpoint before it occurs. Pure tools require no authority. The default
+supervised policy permits reads in the workspace and Loop-owned temporary directory, asks for
+mutations and network access, and denies host-process execution at a user-configurable boundary.
+Ordinary rules cannot override boundaries. A required approval is denied when no interactive user
+is available.
 
 The local policy is stored at `.loop/permissions.yaml` under the Git project root. It is created
 when the policy is first changed. Decisions are appended to `.loop/permissions-audit.jsonl` and

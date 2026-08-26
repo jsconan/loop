@@ -17,7 +17,14 @@ from ..models import (
     ToolExecutionResult,
     ToolResultPresentationDeclaration,
 )
-from ..permissions import Action, Decision, Operation, OperationPlanner, PermissionManager
+from ..permissions import (
+    Action,
+    Decision,
+    Operation,
+    OperationPlan,
+    OperationPlanner,
+    PermissionManager,
+)
 from ..skills import InstructionsManager
 from ..utils import callable_name
 from .context import ToolContext
@@ -355,6 +362,7 @@ class ToolRegistry:
             instructions_manager,
             plan.operations,
             call_id,
+            active_permissions,
         )
         if execution_started is not None:
             execution_started()
@@ -459,6 +467,7 @@ class ToolRegistry:
             instructions_manager,
             plan.operations,
             call_id,
+            active_permissions,
         )
         if execution_started is not None:
             execution_started()
@@ -568,16 +577,39 @@ class ToolRegistry:
         instructions_manager: InstructionsManager | None,
         operations: tuple[Operation, ...] = (),
         call_id: str | None = None,
+        permission_manager: PermissionManager | None = None,
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""
         if interaction is None:
             interaction = self._interaction
         if interaction is None:
             return None
+
+        def authorize_additional(arguments: dict[str, object]) -> OperationPlan:
+            """Plan and authorize one runtime-discovered operation set."""
+            if permission_manager is None:  # pragma: no cover - callback is omitted below.
+                raise RuntimeError("Additional authorization is unavailable.")
+            plan = tool.plan(arguments)
+            result = permission_manager.authorize(plan.operations, interaction=interaction)
+            if result.decision is Decision.DENY:
+                raise ProblemException(
+                    Problem(
+                        code="tool.denied",
+                        title="Additional operation denied",
+                        detail=f"Tool '{tool.name}' stopped: {result.reason}",
+                        severity="warning",
+                        operation=tool.name,
+                    )
+                )
+            return plan
+
         return ToolContext(
             interaction=interaction,
             tool_name=tool.name,
             call_id=call_id,
             instructions_manager=instructions_manager,
             operations=operations,
+            additional_authorizer=(
+                authorize_additional if permission_manager is not None else None
+            ),
         )

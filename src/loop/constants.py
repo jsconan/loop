@@ -9,7 +9,6 @@ class Omit:
 
 OMIT = Omit()
 
-
 # Application home directory, used for storing session data and other application state.
 APP_DIRECTORY = Path(".loop")
 TEMPORARY_DIRECTORY_PREFIX = "loop-"
@@ -36,6 +35,12 @@ MAX_STRUCTURED_OUTPUT_DIAGNOSTIC_CHARS = 2_000
 # Permissions-related constants
 PERMISSIONS_FILENAME = "permissions.yaml"
 PERMISSIONS_AUDIT_FILENAME = "permissions-audit.jsonl"
+
+# HTTP request constants
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+)
+MAX_REDIRECTS = 5
 
 # Ignore files
 AGENT_IGNORE_FILENAME = ".agentignore"

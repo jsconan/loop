@@ -4,9 +4,19 @@ import json
 from unittest.mock import MagicMock
 
 import httpcore
+import httpx
 import pytest
 
-from loop import BUILTIN_TOOLS, ConsoleInteraction, ToolContext, ToolRegistry
+from loop import (
+    BUILTIN_TOOLS,
+    Action,
+    ConsoleInteraction,
+    NetworkTarget,
+    Operation,
+    OperationPlan,
+    ToolContext,
+    ToolRegistry,
+)
 from loop.tools import web as web_module
 from loop.utils import cached_path as resolve_cached_path
 from loop.utils import encode_content_cursor
@@ -31,8 +41,18 @@ def stream_response(content, *, content_type="text/plain"):
     response.__enter__.return_value = response
     response.__exit__.return_value = False
     response.is_redirect = False
+    response.next_request = None
     response.headers = {"content-type": content_type}
     response.iter_bytes.return_value = iter([content])
+    return response
+
+
+def redirect_response(url):
+    """Return a redirect response whose next request is already resolved by HTTPX."""
+    response = stream_response(b"")
+    response.is_redirect = True
+    response.next_request = httpx.Request("GET", url)
+    response.headers["location"] = url
     return response
 
 
@@ -118,18 +138,142 @@ def test_fetch_content_reports_failures(monkeypatch):
     )
 
 
-def test_fetch_content_rejects_redirects_for_separate_authorization(monkeypatch):
-    """A redirect cannot silently expand approval to a different network target."""
-    response = stream_response(b"")
-    response.is_redirect = True
-    response.headers["location"] = "https://other.example/target"
+def test_fetch_content_authorizes_and_pins_each_redirect_target(monkeypatch):
+    """Each redirect is separately planned, approved, and connected through new pinned DNS."""
+    redirected = redirect_response("https://other.example/target")
+    content = stream_response(b"moved content")
+    stream = MagicMock(side_effect=[redirected, content])
+    confirm = MagicMock(return_value=True)
+
+    def resolve(hostname, *_args, **_kwargs):
+        """Resolve each approved host to a distinct public address."""
+        address = "93.184.216.34" if hostname == "example.com" else "93.184.216.35"
+        return [(None, None, None, None, (address, 0))]
+
+    monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", resolve)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
+
+    result = json.loads(fetch_content("https://example.com/redirect"))
+
+    assert result["content"] == "moved content"
+    assert result["source"] == "https://example.com/redirect"
+    assert [call.args[1] for call in stream.call_args_list] == [
+        "https://example.com/redirect",
+        "https://other.example/target",
+    ]
+    assert [
+        call.kwargs["transport"]._pool._network_backend._addresses  # pylint: disable=protected-access
+        for call in stream.call_args_list
+    ] == [("93.184.216.34",), ("93.184.216.35",)]
+    assert confirm.call_count == 2
+    assert "https://example.com/redirect" in confirm.call_args_list[0].args[0]
+    assert "https://other.example/target" in confirm.call_args_list[1].args[0]
+    redirected.__exit__.assert_called_once_with(None, None, None)
+    redirected.iter_bytes.assert_not_called()
+    assert stream.call_args_list[1].kwargs["headers"] == stream.call_args_list[0].kwargs["headers"]
+
+
+def test_fetch_content_stops_when_redirect_authorization_is_denied(monkeypatch):
+    """A denied redirected URL is reported without connecting to the new destination."""
+    redirected = redirect_response("https://other.example/target")
+    stream = MagicMock(return_value=redirected)
+    confirm = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
+
+    result = problem(fetch_content("https://example.com/redirect"))
+
+    assert result["code"] == "tool.denied"
+    assert result["title"] == "Additional operation denied"
+    assert stream.call_count == 1
+
+
+def test_fetch_content_denies_redirects_to_private_addresses(monkeypatch):
+    """A redirect cannot use a public entry URL to reach a private network address."""
+    redirected = redirect_response("http://localhost/private")
+    stream = MagicMock(return_value=redirected)
+    confirm = MagicMock(return_value=True)
+
+    def resolve(hostname, *_args, **_kwargs):
+        """Resolve the entry host publicly and the redirect host privately."""
+        address = "93.184.216.34" if hostname == "example.com" else "127.0.0.1"
+        return [(None, None, None, None, (address, 0))]
+
+    monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", resolve)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
+
+    result = problem(fetch_content("https://example.com/redirect"))
+
+    assert result["code"] == "tool.denied"
+    assert stream.call_count == 1
+    assert confirm.call_count == 1
+
+
+def test_fetch_content_rejects_redirect_loops_and_excessive_chains(monkeypatch):
+    """Redirect loops and chains beyond the fixed hop ceiling stop without another request."""
+    loop = redirect_response("https://example.com/start#section")
+    redirects = [redirect_response(f"https://example.com/hop-{index}") for index in range(1, 7)]
+    stream = MagicMock(side_effect=[loop, *redirects])
     monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
+
+    assert "redirect loop" in fetch_content("https://example.com/start")
+    assert "redirect limit" in fetch_content("https://example.com/chain")
+    assert stream.call_count == 7
+
+
+def test_fetch_content_requires_an_authorized_network_target_for_each_redirect(monkeypatch):
+    """A malformed runtime authorization plan cannot reach a redirected destination."""
+    response = redirect_response("https://other.example/target")
+    target = NetworkTarget(
+        url="https://example.com/start",
+        origin="https://example.com",
+        addresses=("93.184.216.34",),
+    )
+    context = ToolContext(
+        ConsoleInteraction(),
+        "fetch_content",
+        operations=(
+            Operation(tool_id="fetch_content", action=Action.NETWORK_REQUEST, target=target),
+        ),
+        additional_authorizer=lambda arguments: OperationPlan(arguments=arguments),
+    )
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
-    result = fetch_content("https://example.com/redirect")
+    result = web_module.fetch_content(context, "https://example.com/start")
 
-    assert "redirected URL explicitly" in result
-    assert "https://other.example/target" in result
+    assert "Authorized redirect network target is missing" in result.detail
+
+
+def test_fetch_content_rejects_unsupported_redirect_schemes(monkeypatch):
+    """A redirect to a non-HTTP scheme fails validation before another connection."""
+    response = redirect_response("file:///etc/passwd")
+    stream = MagicMock(return_value=response)
+    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
+
+    result = problem(fetch_content("https://example.com/start"))
+
+    assert result["code"] == "network.fetch_failed"
+    assert stream.call_count == 1
+
+
+def test_fetch_content_commands_fail_closed_when_a_redirect_needs_authorization(monkeypatch):
+    """Direct command execution retains redirect rejection without a permission checkpoint."""
+    response = redirect_response("https://other.example/target")
+    stream = MagicMock(return_value=response)
+    monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
+
+    output = tool_registry.command(
+        "fetch_content",
+        ("https://example.com/start",),
+        interaction=ConsoleInteraction(),
+    ).output
+
+    assert problem(output)["code"] == "tool.authorization_unavailable"
+    assert stream.call_count == 1
 
 
 def test_fetch_content_plans_origins_with_explicit_ports(monkeypatch):
@@ -348,6 +492,24 @@ def test_read_cached_content_reloads_an_expired_web_artifact_with_authorization(
     assert "network.request" in confirm.call_args.args[0]
     assert "https://example.com/source.txt" in confirm.call_args.args[0]
     assert stream.call_count == 2
+
+
+def test_read_cached_content_reports_a_denied_redirect_during_reload(monkeypatch):
+    """An expired artifact reload stops when its persisted source redirects without approval."""
+    redirected = redirect_response("https://other.example/target")
+    confirm = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr("loop.tools.web.cached_path", lambda _handle: None)
+    monkeypatch.setattr(
+        "loop.tools.web.cached_metadata",
+        lambda _handle: {"source": "https://example.com/source.txt", "reloadable": True},
+    )
+    monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=redirected))
+
+    result = problem(read_cached_content("expired"))
+
+    assert result["code"] == "tool.denied"
+    assert result["title"] == "Additional operation denied"
 
 
 def test_read_cached_content_reports_invalid_cursors_and_selectors(monkeypatch):
