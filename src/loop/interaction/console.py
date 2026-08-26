@@ -309,7 +309,7 @@ class ConsoleInteraction(Interaction):
         Args:
             message (str): Warning text to write.
         """
-        self._console.print(f"Warning: {message}", style="bold yellow", markup=False)
+        self._console.print(f"Warning: {message}", style="bold orange1", markup=False)
 
     def debug(self, value: Any) -> None:
         """Write diagnostic output to the terminal.
