@@ -212,7 +212,7 @@ def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_p
     now[0] = 5.0
     interaction.prompt.side_effect = ["/model unavailable", False]
     loop.run()
-    assert interaction.report.call_args.args[0].detail == "The backend is not reachable."
+    interaction.warning.assert_called_with("The backend is not reachable.")
 
 
 def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
@@ -586,7 +586,7 @@ def test_run_accepts_same_failed_model_on_confirm(tmp_path):
 
     assert loop.model == "missing"
     assert loop.session.model == "missing"
-    interaction.warning.assert_called_once_with(
+    interaction.warning.assert_any_call(
         "Model 'missing' was already unavailable; the same failure is "
         "likely to re-occur unless the backend is updated."
     )
@@ -616,7 +616,7 @@ def test_run_stops_model_fallback_when_discovery_fails(tmp_path, models):
             for problem in (call.args[0] for call in interaction.report.call_args_list)
         )
     else:
-        interaction.warning.assert_called_once_with("The backend reported no available models.")
+        interaction.warning.assert_any_call("The backend reported no available models.")
 
 
 def test_run_can_stop_model_selection(tmp_path):

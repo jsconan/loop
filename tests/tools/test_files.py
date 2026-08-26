@@ -688,15 +688,11 @@ def test_edit_text_file_replaces_inserts_deletes_and_replaces_all(tmp_path):
     target.write_text("first\nanchor\nremove\nrepeat repeat\n", encoding="utf-8")
 
     assert "(1 replacement)" in edit_text_file(target, "first", "changed")
-    assert "(1 replacement)" in edit_text_file(
-        target, "anchor\n", "inserted\nanchor\n"
-    )
+    assert "(1 replacement)" in edit_text_file(target, "anchor\n", "inserted\nanchor\n")
     assert "(1 replacement)" in edit_text_file(target, "remove\n", "")
     assert "(2 replacements)" in edit_text_file(target, "repeat", "done", True)
 
-    assert target.read_text(encoding="utf-8") == (
-        "changed\ninserted\nanchor\ndone done\n"
-    )
+    assert target.read_text(encoding="utf-8") == ("changed\ninserted\nanchor\ndone done\n")
 
 
 @pytest.mark.parametrize(
@@ -732,9 +728,7 @@ def test_edit_text_file_rejects_missing_directory_and_non_utf8_targets(tmp_path)
     assert problem(edit_text_file(tmp_path / "missing", "a", "b"))["code"] == (
         "filesystem.path_not_file"
     )
-    assert problem(edit_text_file(tmp_path, "a", "b"))["code"] == (
-        "filesystem.path_not_file"
-    )
+    assert problem(edit_text_file(tmp_path, "a", "b"))["code"] == ("filesystem.path_not_file")
     assert problem(edit_text_file(binary, "a", "b"))["code"] == "filesystem.binary_file"
 
 
@@ -832,7 +826,9 @@ def test_edit_executor_requires_an_authorized_digest(tmp_path):
 def test_edit_text_file_schema_exposes_only_the_model_facing_arguments():
     """The exact editor schema documents its compact public contract without internal state."""
     definition = next(
-        definition for definition in tool_registry.definitions() if definition.name == "edit_text_file"
+        definition
+        for definition in tool_registry.definitions()
+        if definition.name == "edit_text_file"
     )
 
     assert list(definition.parameters["properties"]) == [

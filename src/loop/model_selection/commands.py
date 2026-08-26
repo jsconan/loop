@@ -6,7 +6,7 @@ from typing import Annotated
 from pydantic import Field
 
 from ..backend import BackendError
-from ..commands import CommandArgumentError, CommandContext, CommandRegistration
+from ..commands import CommandContext, CommandRegistration
 from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
 from ..errors import Problem
 from ..models import ModelInfo
@@ -112,7 +112,8 @@ class ModelCommands:
             self._report_unavailable(context, error)
             return
         if name not in {model.id for model in available}:
-            raise CommandArgumentError(f"Model '{name}' is not available.")
+            context.interaction.warning(f"Model '{name}' is not available.")
+            return
         self._model_selection.select(name)
         context.interaction.info(f"Using model: {name}")
 
@@ -123,13 +124,16 @@ class ModelCommands:
     @staticmethod
     def _report_unavailable(context: CommandContext, error: BackendError) -> None:
         """Report a model-catalog failure without exposing provider error text."""
-        context.interaction.report(
-            Problem.from_exception(
-                error,
-                code="backend.unavailable",
-                title="Backend unavailable",
-                detail="The backend is not reachable.",
-                retryable=error.recoverable,
-                operation="list_models",
-            )
+        problem = Problem.from_exception(
+            error,
+            code="backend.unavailable",
+            title="Backend unavailable",
+            detail="The backend is not reachable.",
+            severity="warning" if error.recoverable else "error",
+            retryable=error.recoverable,
+            operation="list_models",
         )
+        if error.recoverable:
+            context.interaction.warning(problem.detail)
+        else:
+            context.interaction.report(problem)

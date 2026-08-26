@@ -346,8 +346,8 @@ class AgentRunner:
         while True:
             try:
                 return self.query()
-            except BackendNotFoundError as error:
-                self._report_backend_error(error)
+            except BackendNotFoundError:
+                self._interaction.warning("The selected model is not available.")
                 if not self._model_selection.select_fallback(self._interaction):
                     return None
             except BackendError as error:

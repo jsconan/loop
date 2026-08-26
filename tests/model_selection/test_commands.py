@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from loop import (
+    BackendAuthenticationError,
     BackendConnectionError,
     CommandManager,
     Interaction,
@@ -148,7 +149,8 @@ def test_model_commands_report_empty_invalid_and_failed_catalogs():
     manager.call("models")
     manager.call("model", "missing")
     interaction.info.assert_called_once_with("No models available.")
-    assert "Model 'missing' is not available" in interaction.report.call_args.args[0].detail
+    interaction.warning.assert_called_once_with("Model 'missing' is not available.")
+    interaction.report.assert_not_called()
 
     selection.available.side_effect = BackendConnectionError(
         "offline",
@@ -156,6 +158,26 @@ def test_model_commands_report_empty_invalid_and_failed_catalogs():
         operation="list_models",
     )
     manager.call("models")
-    assert interaction.report.call_args.args[0].detail == "The backend is not reachable."
-    manager.call("model", "missing")
-    assert interaction.report.call_args.args[0].detail == "The backend is not reachable."
+    interaction.report.assert_not_called()
+    assert interaction.warning.call_count == 2
+    interaction.warning.assert_called_with("The backend is not reachable.")
+
+
+def test_model_commands_report_nonrecoverable_catalog_failures_as_errors():
+    """Model commands preserve true backend failures as structured error reports."""
+    interaction = Mock(spec=Interaction)
+    selection = Mock(spec=ModelSelection)
+    selection.available.side_effect = BackendAuthenticationError(
+        "invalid credentials",
+        provider="test",
+        operation="list_models",
+    )
+    manager = CommandManager(interaction=interaction)
+    manager.register_provider(ModelCommands(selection))
+
+    manager.call("models")
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.detail == "The backend is not reachable."
+    assert problem.severity == "error"
+    interaction.warning.assert_not_called()

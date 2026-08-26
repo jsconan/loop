@@ -11,11 +11,7 @@ from loop.utils.search import ripgrep_path, search_text_paths
 
 def _message(kind, path, line, text, submatches=None, *, encoded=False):
     """Return one ripgrep JSON protocol line for a test process."""
-    value = (
-        {"bytes": base64.b64encode(text.encode()).decode()}
-        if encoded
-        else {"text": text}
-    )
+    value = {"bytes": base64.b64encode(text.encode()).decode()} if encoded else {"text": text}
     return json.dumps(
         {
             "type": kind,

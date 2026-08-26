@@ -55,9 +55,7 @@ def test_write_text_atomically_treats_a_symbolic_link_as_an_existing_creation_ta
     assert target.is_symlink()
 
 
-def test_write_text_atomically_cleans_up_staged_content_after_commit_failure(
-    tmp_path, monkeypatch
-):
+def test_write_text_atomically_cleans_up_staged_content_after_commit_failure(tmp_path, monkeypatch):
     """A failed atomic commit leaves the destination intact and removes its staging file."""
     target = tmp_path / "target.txt"
     target.write_text("old", encoding="utf-8")

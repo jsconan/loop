@@ -390,9 +390,7 @@ def test_streaming_keeps_fenced_code_together_until_a_following_block():
         interaction.answer_delta("```python\nprint('ok')\n")
         assert len(console.print.call_args_list) == 1
         interaction.answer_delta("```\nAfter\n")
-        assert console.print.call_args_list[1].args[0].markup == (
-            "```python\nprint('ok')\n```\n"
-        )
+        assert console.print.call_args_list[1].args[0].markup == ("```python\nprint('ok')\n```\n")
 
 
 def test_streaming_flushes_an_unclosed_fence_at_end_of_response():

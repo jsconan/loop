@@ -102,6 +102,7 @@ def test_constructor_registers_in_order_and_exposes_sorted_snapshots():
 
 def test_registration_problems_returns_an_immutable_snapshot():
     """Registration diagnostics are exposed as a tuple independent of internal storage."""
+
     @declare_tool(preflight=lambda: ToolPreflightResult(ToolStatus.BROKEN, "Unavailable"))
     def unavailable() -> None:
         """Attempt unavailable work."""
@@ -320,9 +321,7 @@ def test_register_halts_when_the_user_rejects_a_broken_required_tool(raises):
         Mock(side_effect=RuntimeError("broken check"))
         if raises
         else Mock(
-            return_value=ToolPreflightResult(
-                ToolStatus.BROKEN, "Required capability is missing."
-            )
+            return_value=ToolPreflightResult(ToolStatus.BROKEN, "Required capability is missing.")
         )
     )
 
@@ -362,9 +361,7 @@ def test_register_admits_degraded_tools_after_warning():
     """Degraded tools remain available after their warning is logged and displayed."""
     interaction = Mock(spec=Interaction)
 
-    @declare_tool(
-        preflight=lambda: ToolPreflightResult(ToolStatus.DEGRADED, "Limited capability.")
-    )
+    @declare_tool(preflight=lambda: ToolPreflightResult(ToolStatus.DEGRADED, "Limited capability."))
     def degraded() -> None:
         """Perform limited work."""
 
