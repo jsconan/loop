@@ -12,6 +12,7 @@ __all__ = [
     "AgentRunner",
     "AnswerCompleted",
     "AnswerDelta",
+    "ApprovalChoice",
     "AuthorizationResult",
     "Backend",
     "BackendAuthenticationError",
@@ -276,6 +277,7 @@ from .models import (
 )
 from .permissions import (
     Action,
+    ApprovalChoice,
     AuthorizationResult,
     Decision,
     FileTarget,

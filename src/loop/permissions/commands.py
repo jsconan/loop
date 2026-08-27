@@ -735,9 +735,11 @@ class PermissionCommands:
     @staticmethod
     def _render_rule(rule: PermissionRule) -> str:
         """Return a concise human-readable representation of one installed rule."""
+        resource = rule.target.model_dump_json() if rule.target is not None else rule.resource
+        tool_match = " tool_match=exact" if rule.tool_exact else ""
         return (
-            f"{rule.id} {rule.decision.value} tool={rule.tool} "
-            f"action={rule.action.value if rule.action else '*'} resource={rule.resource or '*'}"
+            f"{rule.id} {rule.decision.value} tool={rule.tool}{tool_match} "
+            f"action={rule.action.value if rule.action else '*'} resource={resource or '*'}"
         )
 
     @staticmethod

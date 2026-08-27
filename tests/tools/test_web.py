@@ -14,6 +14,7 @@ from loop import (
     NetworkTarget,
     Operation,
     OperationPlan,
+    PermissionManager,
     ToolContext,
     ToolRegistry,
 )
@@ -89,7 +90,7 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
     confirm = MagicMock(side_effect=[False, True])
     response = stream_response(b"<html>fetched content</html>", content_type="text/html")
     stream = MagicMock(return_value=response)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     assert problem(fetch_content("https://my-host.local/file.txt"))["code"] == "tool.denied"
@@ -118,7 +119,7 @@ def test_fetch_content_uses_configured_user_agent(monkeypatch):
     response = stream_response(b"fetched content")
     stream = MagicMock(return_value=response)
     monkeypatch.setenv("USER_AGENT", "LoopBot/1.0")
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     assert json.loads(fetch_content("https://my-host.local"))["content"] == "fetched content"
@@ -127,7 +128,7 @@ def test_fetch_content_uses_configured_user_agent(monkeypatch):
 
 def test_fetch_content_reports_failures(monkeypatch):
     """Fetch failures become readable tool results."""
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr(
         "loop.tools.web.httpx.stream",
         MagicMock(side_effect=OSError("network unavailable")),
@@ -151,7 +152,7 @@ def test_fetch_content_authorizes_and_pins_each_redirect_target(monkeypatch):
         return [(None, None, None, None, (address, 0))]
 
     monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", resolve)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     result = json.loads(fetch_content("https://my-host.local/redirect"))
@@ -179,7 +180,7 @@ def test_fetch_content_stops_when_redirect_authorization_is_denied(monkeypatch):
     redirected = redirect_response("https://other.example/target")
     stream = MagicMock(return_value=redirected)
     confirm = MagicMock(side_effect=[True, False])
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     result = problem(fetch_content("https://my-host.local/redirect"))
@@ -201,7 +202,7 @@ def test_fetch_content_denies_redirects_to_private_addresses(monkeypatch):
         return [(None, None, None, None, (address, 0))]
 
     monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", resolve)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     result = problem(fetch_content("https://my-host.local/redirect"))
@@ -216,7 +217,7 @@ def test_fetch_content_rejects_redirect_loops_and_excessive_chains(monkeypatch):
     loop = redirect_response("https://my-host.local/start#section")
     redirects = [redirect_response(f"https://my-host.local/hop-{index}") for index in range(1, 7)]
     stream = MagicMock(side_effect=[loop, *redirects])
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     assert "redirect loop" in fetch_content("https://my-host.local/start")
@@ -251,7 +252,7 @@ def test_fetch_content_rejects_unsupported_redirect_schemes(monkeypatch):
     """A redirect to a non-HTTP scheme fails validation before another connection."""
     response = redirect_response("file:///etc/passwd")
     stream = MagicMock(return_value=response)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     result = problem(fetch_content("https://my-host.local/start"))
@@ -280,7 +281,7 @@ def test_fetch_content_plans_origins_with_explicit_ports(monkeypatch):
     """Network plans retain a non-default port in the approval target."""
     response = stream_response(b"content")
     confirm = MagicMock(return_value=True)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
     assert json.loads(fetch_content("https://my-host.local:8443/file"))["content"] == "content"
@@ -316,7 +317,7 @@ def test_fetch_content_fails_closed_when_resolution_returns_no_usable_addresses(
     confirm = MagicMock(return_value=True)
     stream = MagicMock()
     monkeypatch.setattr("loop.tools.web.socket.getaddrinfo", resolver)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     result = fetch_content("https://service.test/content")
@@ -399,7 +400,7 @@ def test_web_tools_fail_closed_without_an_authorized_network_operation(monkeypat
 def test_fetch_content_rejects_binary_content(monkeypatch):
     """Binary response content is not returned to the agent."""
     response = stream_response(b"binary\0content")
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
     assert problem(fetch_content("https://my-host.local/file.bin"))["detail"] == (
@@ -412,7 +413,7 @@ def test_fetch_content_is_bounded_and_cached_for_continuation(monkeypatch):
     """Large web text returns one bounded part and an opaque resumable handle."""
     content = ("line\n" * 5_000).encode()
     response = stream_response(content)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
     first = json.loads(fetch_content("https://my-host.local/large.txt"))
@@ -443,7 +444,7 @@ def test_fetch_content_rejects_unsupported_or_excessive_responses(monkeypatch):
     binary = stream_response(b"image", content_type="image/png")
     excessive = stream_response(b"x" * (10 * 1024 * 1024 + 1))
     stream = MagicMock(side_effect=[binary, excessive])
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     assert "not a supported text response" in fetch_content("https://my-host.local/image.png")
@@ -453,7 +454,7 @@ def test_fetch_content_rejects_unsupported_or_excessive_responses(monkeypatch):
 def test_fetch_content_rejects_invalid_utf8(monkeypatch):
     """Streaming rejects text responses that are not valid UTF-8."""
     response = stream_response(b"\xff")
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
 
     assert "utf-8" in fetch_content("https://my-host.local/invalid.txt")
@@ -461,7 +462,7 @@ def test_fetch_content_rejects_invalid_utf8(monkeypatch):
 
 def test_read_cached_content_reports_unknown_handles(monkeypatch):
     """Cached reads report expired or unknown artifact handles."""
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     assert "Unknown or expired" in read_cached_content("missing")
 
 
@@ -471,7 +472,7 @@ def test_read_cached_content_reloads_an_expired_web_artifact_with_authorization(
     reloaded = stream_response(b"reloaded")
     stream = MagicMock(side_effect=[initial, reloaded])
     confirm = MagicMock(return_value=True)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
     fetched = json.loads(fetch_content("https://my-host.local/source.txt"))
     lookups = 0
@@ -498,7 +499,7 @@ def test_read_cached_content_reports_a_denied_redirect_during_reload(monkeypatch
     """An expired artifact reload stops when its persisted source redirects without approval."""
     redirected = redirect_response("https://other.example/target")
     confirm = MagicMock(side_effect=[True, False])
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.cached_path", lambda _handle: None)
     monkeypatch.setattr(
         "loop.tools.web.cached_metadata",
@@ -514,7 +515,7 @@ def test_read_cached_content_reports_a_denied_redirect_during_reload(monkeypatch
 
 def test_read_cached_content_reports_invalid_cursors_and_selectors(monkeypatch):
     """Cached reads reject malformed cursors and conflicting selectors."""
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     response = stream_response(b"cached")
     monkeypatch.setattr("loop.tools.web.httpx.stream", MagicMock(return_value=response))
     fetched = json.loads(fetch_content("https://my-host.local/content.txt"))
@@ -536,7 +537,7 @@ def test_fetch_content_rejects_non_http_urls(monkeypatch):
     """Non-HTTP URL schemes are rejected before confirmation or network access."""
     confirm = MagicMock(return_value=True)
     stream = MagicMock()
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     result = fetch_content("file:///etc/passwd")
@@ -550,7 +551,7 @@ def test_fetch_content_rejects_malformed_urls(monkeypatch):
     """Malformed HTTP URLs are rejected before confirmation or network access."""
     confirm = MagicMock(return_value=True)
     stream = MagicMock()
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     result = fetch_content("https://")

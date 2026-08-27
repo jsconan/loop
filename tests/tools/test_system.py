@@ -80,7 +80,7 @@ class ImmediateThread:
 def confirmed(monkeypatch):
     """Confirm command execution and make stream readers synchronous."""
     ImmediateThread.instances = []
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.system.threading.Thread", ImmediateThread)
 
 
@@ -99,7 +99,7 @@ def test_run_command_requires_an_affirmative_confirmation(monkeypatch):
     """A rejected confirmation cancels command execution."""
     popen = MagicMock()
     confirm = MagicMock(return_value=False)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", popen)
 
     assert problem(run_command("echo hello"))["code"] == "tool.denied"

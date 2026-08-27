@@ -49,7 +49,7 @@ def approve_tool_calls(monkeypatch, tmp_path):
         BUILTIN_TOOLS,
         permission_manager=PermissionManager(tmp_path),
     )
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
 
 
 def write_text_file(path, content):
@@ -377,7 +377,7 @@ def test_read_text_file_allows_explicit_reads_of_ignored_files(tmp_path, monkeyp
     secret = tmp_path / "secret.txt"
     secret.write_text("sensitive", encoding="utf-8")
     confirm = MagicMock(return_value=True)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     assert json.loads(read_text_file(secret))["content"] == "sensitive"
     confirm.assert_not_called()
@@ -388,7 +388,7 @@ def test_read_text_file_allows_scoped_reads_by_default(tmp_path, monkeypatch):
     visible = tmp_path / "visible.txt"
     visible.write_text("hello", encoding="utf-8")
     confirm = MagicMock(return_value=True)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     assert json.loads(read_text_file(visible))["content"] == "hello"
     confirm.assert_not_called()
@@ -569,7 +569,7 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
     """Writing only happens after an affirmative confirmation."""
     target = tmp_path / "written.txt"
     confirm = MagicMock(side_effect=[False, True])
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     assert problem(write_text_file(str(target), "blocked"))["code"] == "tool.denied"
     assert not target.exists()
@@ -585,7 +585,7 @@ def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, mon
 def test_write_text_file_truncation_notice_for_large_content(tmp_path, monkeypatch):
     """Writing content exceeding the character limit appends a truncation notice."""
     target = tmp_path / "big.txt"
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
 
     long_content = "x" * 2001
     assert write_text_file(str(target), long_content) == f"Successfully wrote to file '{target}'."
@@ -597,7 +597,7 @@ def test_write_text_file_includes_a_diff_in_the_confirmation_prompt(tmp_path, mo
     target = tmp_path / "written.txt"
     target.write_text("before\nunchanged", encoding="utf-8")
     confirm = MagicMock(return_value=True)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     assert write_text_file(str(target), "after\nunchanged") == (
         f"Successfully wrote to file '{target}'."
@@ -617,7 +617,7 @@ def test_write_text_file_falls_back_to_content_preview_for_binary_destination(
     target = tmp_path / "written.txt"
     target.write_bytes(b"\xff")
     confirm = MagicMock(return_value=True)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     assert write_text_file(str(target), "replacement") == f"Successfully wrote to file '{target}'."
     prompt = confirm.call_args.args[0]
@@ -627,7 +627,7 @@ def test_write_text_file_falls_back_to_content_preview_for_binary_destination(
 
 def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):
     """An invalid destination becomes a readable tool result."""
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     result = write_text_file(str(tmp_path / "missing" / "file.txt"), "content")
     assert problem(result)["code"] == "filesystem.write_failed"
 
@@ -711,7 +711,7 @@ def test_edit_text_file_rejects_invalid_or_ambiguous_replacements(
     target = tmp_path / "target.txt"
     target.write_text("same repeat repeat", encoding="utf-8")
     confirm = MagicMock(return_value=True)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     result = edit_text_file(target, old_content, new_content)
 
@@ -749,7 +749,7 @@ def test_edit_text_file_requires_approval_and_previews_the_resulting_diff(tmp_pa
     target = tmp_path / "target.txt"
     target.write_text("before\nunchanged\n", encoding="utf-8")
     confirm = MagicMock(side_effect=[False, True])
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     assert problem(edit_text_file(target, "before", "after"))["code"] == "tool.denied"
     assert target.read_text(encoding="utf-8") == "before\nunchanged\n"
@@ -844,7 +844,7 @@ def test_delete_path_requires_confirmation_and_removes_files(tmp_path, monkeypat
     target = tmp_path / "obsolete.txt"
     target.write_text("obsolete", encoding="utf-8")
     confirm = MagicMock(side_effect=[False, True])
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     assert problem(delete_path(target))["code"] == "tool.denied"
     assert target.exists()
@@ -867,7 +867,7 @@ def test_delete_path_removes_folder_trees_without_following_symbolic_links(tmp_p
     link = tmp_path / "target-link"
     link.symlink_to(target)
     confirm = MagicMock(return_value=True)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     assert delete_path(folder) == f"Successfully deleted path '{folder}'."
     assert not folder.exists()
@@ -893,7 +893,7 @@ def test_delete_path_can_delete_ignored_paths_and_rejects_unsupported_targets(
     secret = tmp_path / "secret.txt"
     secret.write_text("sensitive", encoding="utf-8")
     confirm = MagicMock(return_value=True)
-    monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
+    monkeypatch.setattr(PermissionManager, "request_permission", confirm)
 
     assert delete_path(secret) == f"Successfully deleted path '{secret}'."
     assert not secret.exists()
@@ -910,7 +910,7 @@ def test_delete_path_reports_removal_failures(tmp_path, monkeypatch):
     """Filesystem removal failures are returned without reporting a successful deletion."""
     target = tmp_path / "protected.txt"
     target.write_text("keep", encoding="utf-8")
-    monkeypatch.setattr(ConsoleInteraction, "confirm", MagicMock(return_value=True))
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr(Path, "unlink", MagicMock(side_effect=OSError("access denied")))
 
     assert problem(delete_path(target))["detail"] == "access denied"

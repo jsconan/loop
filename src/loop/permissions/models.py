@@ -65,6 +65,15 @@ class PolicyScope(StrEnum):
     SESSION = "session"
 
 
+class ApprovalChoice(StrEnum):
+    """Identify one interactive permission response and its lifetime."""
+
+    DENY = "deny"
+    ONCE = "once"
+    SESSION = "session"
+    WORKSPACE = "workspace"
+
+
 class ProcessBoundary(StrEnum):
     """Identify the execution boundary supplied by a process executor."""
 
@@ -254,8 +263,11 @@ class PermissionRule(BaseModel):
         id (str): Stable identifier used for diagnostics and removal.
         description (str | None): Human-readable policy rationale.
         tool (str): Tool-identity glob, defaulting to every tool.
+        tool_exact (bool): Whether ``tool`` is matched literally instead of as a glob.
         action (Action | None): Required action, or every action when omitted.
         resource (str | None): Canonical resource glob, or every target when omitted.
+        target (OperationTarget | None): Exact typed target, or glob matching through ``resource``
+            when omitted.
         source (PresetSource | None): Preset snapshot that installed this rule, when any.
     """
 
@@ -265,9 +277,25 @@ class PermissionRule(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     description: str | None = None
     tool: str = "*"
+    tool_exact: bool = False
     action: Action | None = None
     resource: str | None = None
+    target: OperationTarget | None = None
     source: PresetSource | None = None
+
+    @model_validator(mode="after")
+    def validate_matcher(self) -> PermissionRule:
+        """Require glob and exact target matchers to be mutually exclusive.
+
+        Returns:
+            PermissionRule: This validated permission rule.
+
+        Raises:
+            ValueError: If both a resource glob and exact typed target are configured.
+        """
+        if self.resource is not None and self.target is not None:
+            raise ValueError("Permission rules cannot combine resource and target matchers.")
+        return self
 
 
 class PresetMetadata(BaseModel):
@@ -650,6 +678,8 @@ class AuthorizationResult(BaseModel):
         prompt (str | None): Exact displayed prompt, when applicable.
         reason (str): Explanation of the effective result.
         source (str): Effective decision source.
+        approval_choice (ApprovalChoice | None): Interactive response, when prompted.
+        installed_rule_ids (tuple[str, ...]): Remembered rule identifiers installed by approval.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -661,6 +691,8 @@ class AuthorizationResult(BaseModel):
     prompt: str | None = None
     reason: str
     source: str
+    approval_choice: ApprovalChoice | None = None
+    installed_rule_ids: tuple[str, ...] = ()
 
 
 class PermissionRecorder(Protocol):

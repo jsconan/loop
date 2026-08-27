@@ -6,7 +6,15 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import BUILTIN_TOOLS, InstructionsManager, Interaction, Skill, SkillManager, ToolRegistry
+from loop import (
+    BUILTIN_TOOLS,
+    ApprovalChoice,
+    InstructionsManager,
+    Interaction,
+    Skill,
+    SkillManager,
+    ToolRegistry,
+)
 
 tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
@@ -15,6 +23,13 @@ def decoded(output: str):
     """Return the result or problem body from a tool result envelope."""
     payload = json.loads(output)
     return payload["result"] if payload["ok"] else payload["problem"]
+
+
+def approving_interaction() -> Mock:
+    """Return an interaction that approves one requested mutation."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    return interaction
 
 
 @pytest.fixture(autouse=True)
@@ -37,7 +52,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
     reference.write_text("Guide content.", encoding="utf-8")
     manager = SkillManager([Skill("example", "Example workflow.", location)])
     instructions_manager = InstructionsManager(skill_manager=manager)
-    interaction = Mock(spec=Interaction)
+    interaction = approving_interaction()
 
     listed = decoded(
         tool_registry.call(
@@ -133,7 +148,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
 
 def test_manage_skills_validates_mutations_and_runtime_manager():
     """Mutations need a name while every action needs an active instruction manager."""
-    interaction = Mock(spec=Interaction)
+    interaction = approving_interaction()
     unavailable = decoded(
         tool_registry.call(
             "manage_skills",
@@ -186,7 +201,7 @@ def test_manage_skills_sanitizes_activation_failures(tmp_path):
         tool_registry.call(
             "manage_skills",
             '{"action":"activate","name":"broken"}',
-            interaction=Mock(spec=Interaction),
+            interaction=approving_interaction(),
             instructions_manager=manager,
         )
     )
@@ -211,7 +226,7 @@ def test_manage_skills_returns_only_public_error_details(tmp_path):
         skill_manager=SkillManager([Skill("large", "Large resource.", location)])
     )
     manager.activate_skill("large")
-    interaction = Mock(spec=Interaction)
+    interaction = approving_interaction()
 
     unknown = decoded(
         tool_registry.call(

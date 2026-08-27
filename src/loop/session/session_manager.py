@@ -224,9 +224,12 @@ class SessionManager:
                 continue
             if isinstance(event, PermissionEvent):
                 if event.result.prompted:
+                    decision = event.result.decision.value
+                    if event.result.approval_choice is not None:
+                        decision += f" ({event.result.approval_choice.value})"
                     output.permission(
                         event.result.prompt or "Permission requested.",
-                        event.result.decision.value,
+                        decision,
                     )
                 continue
             if isinstance(event, RunCompletedEvent):

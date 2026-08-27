@@ -24,11 +24,13 @@ from ..errors import Problem
 from ..utils import ShutdownRequested, canonical_path, sha256_digest
 from .models import (
     Action,
+    ApprovalChoice,
     AuthorizationResult,
     Decision,
     FileTarget,
     NetworkTarget,
     Operation,
+    OperationTarget,
     PermissionConfiguration,
     PermissionConfigurationError,
     PermissionLoadPolicy,
@@ -267,6 +269,8 @@ class PermissionManager:
         decision = policy.decision
         reason = policy.reason
         source = "policy"
+        approval_choice = None
+        installed_rule_ids = ()
         if policy.decision is Decision.ASK:
             if active_interaction is None:
                 decision = Decision.DENY
@@ -275,13 +279,37 @@ class PermissionManager:
             else:
                 prompted = True
                 prompt = self._prompt(operations)
-                if active_interaction.confirm(prompt, default=False):
+                selected = self.request_permission(
+                    prompt,
+                    interaction=active_interaction,
+                )
+                approval_choice = (
+                    selected
+                    if isinstance(selected, ApprovalChoice)
+                    else ApprovalChoice.ONCE
+                    if selected is True
+                    else ApprovalChoice.DENY
+                )
+                if approval_choice is ApprovalChoice.WORKSPACE and self._configuration_path is None:
+                    approval_choice = ApprovalChoice.DENY
+                    decision = Decision.DENY
+                    reason = "Workspace approval is unavailable without a workspace policy path."
+                if approval_choice is not ApprovalChoice.DENY:
                     decision = Decision.ALLOW
-                    reason = "Approved by the user for this call."
-                else:
+                    reason = f"Approved by the user with {approval_choice.value} scope."
+                    if approval_choice in {ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE}:
+                        scope = PolicyScope(approval_choice.value)
+                        try:
+                            installed_rule_ids = self._remember_approval(operations, scope=scope)
+                        except OSError as exc:
+                            decision = Decision.DENY
+                            reason = f"Could not persist the approved workspace policy: {exc}"
+                            source = "persistence"
+                elif reason == policy.reason:
                     decision = Decision.DENY
                     reason = "Rejected by the user."
-                source = "user"
+                if source != "persistence":
+                    source = "user"
         result = AuthorizationResult(
             operations=operations,
             policy=policy,
@@ -290,12 +318,99 @@ class PermissionManager:
             prompt=prompt,
             reason=reason,
             source=source,
+            approval_choice=approval_choice,
+            installed_rule_ids=installed_rule_ids,
         )
         self._audit(result)
         active_recorder = recorder if recorder is not None else self._recorder
         if active_recorder is not None:
             active_recorder.record_authorization(result)
         return result
+
+    def request_permission(
+        self,
+        prompt: str,
+        *,
+        interaction: Interaction | None = None,
+    ) -> ApprovalChoice:
+        """Request one scoped approval through a generic user interaction.
+
+        Args:
+            prompt (str): Complete operation description to display.
+            interaction (Interaction | None): Invocation interaction overriding the default.
+
+        Returns:
+            ApprovalChoice: Selected denial or approval lifetime. Cancellation denies.
+        """
+        choices = {
+            ApprovalChoice.DENY: "Deny",
+            ApprovalChoice.ONCE: "Allow once",
+            ApprovalChoice.SESSION: "Allow for this session",
+        }
+        if self._configuration_path is not None:
+            choices[ApprovalChoice.WORKSPACE] = (
+                "Allow in this workspace (save to .loop/permissions.yaml)"
+            )
+        active_interaction = interaction if interaction is not None else self._interaction
+        selected = active_interaction.prompt(
+            prompt,
+            exit_commands=None,
+            choices=choices,
+            default=ApprovalChoice.DENY,
+        )
+        return selected if isinstance(selected, ApprovalChoice) else ApprovalChoice.DENY
+
+    def _remember_approval(
+        self,
+        operations: tuple[Operation, ...],
+        *,
+        scope: PolicyScope,
+    ) -> tuple[str, ...]:
+        """Install exact, deduplicated allow rules for one approved operation set."""
+        existing = (*self._configuration.rules, *self._session_overrides.rules)
+        additions = []
+        for operation in operations:
+            target = self._approval_target(operation.target)
+            if any(
+                rule.decision is Decision.ALLOW
+                and rule.tool == operation.tool_id
+                and (rule.tool_exact or not any(character in rule.tool for character in "*?["))
+                and rule.action is operation.action
+                and rule.target == target
+                for rule in (*existing, *additions)
+            ):
+                continue
+            additions.append(
+                PermissionRule(
+                    decision=Decision.ALLOW,
+                    tool=operation.tool_id,
+                    tool_exact=True,
+                    action=operation.action,
+                    target=target,
+                    description=f"Approved interactively for this {scope.value}.",
+                )
+            )
+        if scope is PolicyScope.WORKSPACE:
+            updated = self._configuration.model_copy(deep=True)
+            updated.rules.extend(additions)
+            self._replace_configuration(updated)
+        else:
+            self._session_overrides.rules.extend(additions)
+        return tuple(rule.id for rule in additions)
+
+    @staticmethod
+    def _approval_target(target: OperationTarget) -> OperationTarget:
+        """Return the stable security-relevant identity of an operation target."""
+        if isinstance(target, FileTarget):
+            return FileTarget(path=target.path)
+        if isinstance(target, NetworkTarget):
+            return NetworkTarget(
+                url=target.url,
+                origin=target.origin,
+                method=target.method,
+                sends_body=target.sends_body,
+            )
+        return target.model_copy(deep=True)
 
     def evaluate(self, operations: tuple[Operation, ...]) -> PolicyDecision:
         """Evaluate a complete operation set without prompting or recording.
@@ -829,7 +944,10 @@ class PermissionManager:
                     "Effective policy", self.effective_configuration, annotate_sources=True
                 )
             )
-        lines.append("Precedence: protected boundary > deny rule > ask rule > allow rule > default")
+        lines.append(
+            "Precedence: protected boundary > deny rule > exact allow rule > ask rule > "
+            "allow rule > default"
+        )
         return "\n".join(lines)
 
     def _describe_configuration(
@@ -919,10 +1037,12 @@ class PermissionManager:
             if rule.source is not None
             else ""
         )
+        target = rule.target.model_dump_json() if rule.target is not None else None
+        tool_match = " tool_match=exact" if rule.tool_exact else ""
         return (
-            f"{rule.id} {rule.decision.value} tool={rule.tool} "
+            f"{rule.id} {rule.decision.value} tool={rule.tool}{tool_match} "
             f"action={rule.action.value if rule.action else '*'} "
-            f"resource={rule.resource or '*'}{description}{source}"
+            f"resource={target or rule.resource or '*'}{description}{source}"
         )
 
     def _read_configuration(self) -> PermissionConfiguration:
@@ -1059,10 +1179,31 @@ class PermissionManager:
             for rule in self._session_overrides.rules
             if self._matches(rule, operation)
         )
-        for decision in (Decision.DENY, Decision.ASK, Decision.ALLOW):
-            determining = tuple(
-                (scope, rule) for scope, rule in matching if rule.decision is decision
-            )
+        exact_allow = tuple(
+            (scope, rule)
+            for scope, rule in matching
+            if rule.decision is Decision.ALLOW and rule.target is not None
+        )
+        ordered = (
+            (
+                Decision.DENY,
+                tuple((scope, rule) for scope, rule in matching if rule.decision is Decision.DENY),
+            ),
+            (Decision.ALLOW, exact_allow),
+            (
+                Decision.ASK,
+                tuple((scope, rule) for scope, rule in matching if rule.decision is Decision.ASK),
+            ),
+            (
+                Decision.ALLOW,
+                tuple(
+                    (scope, rule)
+                    for scope, rule in matching
+                    if rule.decision is Decision.ALLOW and rule.target is None
+                ),
+            ),
+        )
+        for decision, determining in ordered:
             if determining:
                 return PolicyDecision(
                     decision=decision,
@@ -1132,9 +1273,19 @@ class PermissionManager:
 
     @staticmethod
     def _matches(rule: PermissionRule, operation: Operation) -> bool:
+        exact_target = (
+            PermissionManager._approval_target(operation.target) == rule.target
+            if rule.target is not None
+            else True
+        )
         return (
-            fnmatchcase(operation.tool_id, rule.tool)
+            (
+                operation.tool_id == rule.tool
+                if rule.tool_exact
+                else fnmatchcase(operation.tool_id, rule.tool)
+            )
             and (rule.action is None or rule.action is operation.action)
+            and exact_target
             and (
                 rule.resource is None
                 or operation.resource is not None

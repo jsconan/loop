@@ -13,6 +13,7 @@ from loop import (
     AgentRunResult,
     AnswerCompleted,
     AnswerDelta,
+    ApprovalChoice,
     BackendAuthenticationError,
     BackendConnectionError,
     BackendNotFoundError,
@@ -67,6 +68,7 @@ def output_interaction() -> MagicMock:
     interaction = MagicMock(spec=Interaction)
     interaction.response_context.return_value = nullcontext()
     interaction.confirm.return_value = True
+    interaction.prompt.return_value = ApprovalChoice.ONCE
     return interaction
 
 

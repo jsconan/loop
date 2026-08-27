@@ -9,6 +9,7 @@ import pytest
 
 from loop import (
     Action,
+    ApprovalChoice,
     AuthorizationResult,
     Decision,
     FileTarget,
@@ -42,6 +43,39 @@ def file_operation(action: Action, path) -> Operation:
     return operation(action, target=FileTarget(path=str(path)))
 
 
+@pytest.mark.parametrize(
+    ("workspace_available", "selection", "expected", "workspace_label"),
+    [
+        (True, ApprovalChoice.WORKSPACE, ApprovalChoice.WORKSPACE, True),
+        (False, ApprovalChoice.SESSION, ApprovalChoice.SESSION, False),
+        (True, False, ApprovalChoice.DENY, True),
+    ],
+)
+def test_request_permission_offers_valid_scopes_and_fails_closed(
+    workspace_available,
+    selection,
+    expected,
+    workspace_label,
+    tmp_path,
+):
+    """Permission prompting owns scoped labels and converts cancellation to denial."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = selection
+    recorder = Mock()
+    manager = PermissionManager(
+        tmp_path if workspace_available else None, interaction=interaction, recorder=recorder
+    )
+
+    result = manager.request_permission(
+        "Approve operations?",
+        interaction=interaction,
+    )
+
+    assert result is expected
+    choices = interaction.prompt.call_args.kwargs["choices"]
+    assert (ApprovalChoice.WORKSPACE in choices) is workspace_label
+
+
 def test_default_policy_allows_scoped_reads_and_fails_closed_for_approval(tmp_path):
     """The supervised default permits workspace inspection and denies headless mutations."""
     manager = PermissionManager(tmp_path)
@@ -61,7 +95,7 @@ def test_default_policy_allows_scoped_reads_and_fails_closed_for_approval(tmp_pa
 def test_authorization_approves_one_complete_operation_set_and_records_policy(tmp_path):
     """One prompt and recorder event preserve both policy and effective outcomes."""
     interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = True
+    interaction.prompt.return_value = ApprovalChoice.ONCE
     recorder = Mock()
     manager = PermissionManager(tmp_path, interaction=interaction, recorder=recorder)
     operations = (
@@ -77,14 +111,14 @@ def test_authorization_approves_one_complete_operation_set_and_records_policy(tm
     assert result.prompt is not None
     assert "filesystem.create" in result.prompt
     assert "filesystem.delete" in result.prompt
-    interaction.confirm.assert_called_once_with(result.prompt, default=False)
+    interaction.prompt.assert_called_once()
     recorder.record_authorization.assert_called_once_with(result)
 
 
 def test_authorization_rejection_and_recorder_override_are_atomic(tmp_path):
     """A rejected batch is recorded once by an invocation-scoped recorder."""
     interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = False
+    interaction.prompt.return_value = ApprovalChoice.DENY
     configured = Mock()
     override = Mock()
     manager = PermissionManager(tmp_path, interaction=interaction, recorder=configured)
@@ -99,6 +133,167 @@ def test_authorization_rejection_and_recorder_override_are_atomic(tmp_path):
     override.record_authorization.assert_called_once_with(result)
     configured.record_authorization.assert_not_called()
     assert manager.recorder is configured
+
+
+def test_session_approval_remembers_exact_batch_targets_and_deduplicates(tmp_path):
+    """Session approval installs exact grants once and reuses them without another prompt."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.SESSION
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    first = file_operation(Action.FILESYSTEM_CREATE, tmp_path / "literal[*].txt")
+    second = file_operation(Action.FILESYSTEM_DELETE, tmp_path / "old.txt")
+
+    approved = manager.authorize((first, second))
+    repeated = manager.authorize((first, second))
+    different = manager.evaluate(
+        (file_operation(Action.FILESYSTEM_CREATE, tmp_path / "literal-x.txt"),)
+    )
+
+    assert approved.approval_choice is ApprovalChoice.SESSION
+    assert len(approved.installed_rule_ids) == 2
+    assert repeated.prompted is False
+    assert repeated.decision is Decision.ALLOW
+    assert different.decision is Decision.ASK
+    assert len(manager.session_rules) == 2
+    interaction.prompt.assert_called_once()
+
+
+def test_session_approval_matches_tool_identifiers_literally(tmp_path):
+    """Generated grants do not interpret glob characters in tool identifiers."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.SESSION
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    target = FileTarget(path=str(tmp_path / "file.txt"))
+    approved = operation(Action.FILESYSTEM_CREATE, tool="writer[*]", target=target)
+
+    manager.authorize((approved,))
+
+    assert manager.evaluate((approved,)).decision is Decision.ALLOW
+    assert (
+        manager.evaluate(
+            (operation(Action.FILESYSTEM_CREATE, tool="writerx", target=target),)
+        ).decision
+        is Decision.ASK
+    )
+
+
+def test_workspace_approval_persists_exact_rules_and_audit_metadata(tmp_path):
+    """Workspace approval atomically persists reusable typed grants and their audit identity."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.WORKSPACE
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    target = file_operation(Action.FILESYSTEM_REPLACE, tmp_path / "module.py")
+
+    approved = manager.authorize((target, target))
+    reloaded = PermissionManager(tmp_path)
+
+    assert approved.decision is Decision.ALLOW
+    assert approved.approval_choice is ApprovalChoice.WORKSPACE
+    assert len(approved.installed_rule_ids) == 1
+    assert reloaded.persistent_rules[0].tool_exact is True
+    assert "tool_match=exact" in reloaded.describe("workspace")
+    assert reloaded.authorize((target,)).decision is Decision.ALLOW
+    stored = json.loads(
+        (tmp_path / ".loop" / "permissions-audit.jsonl").read_text("utf-8").splitlines()[0]
+    )
+    assert stored["approval_choice"] == "workspace"
+    assert stored["installed_rule_ids"] == list(approved.installed_rule_ids)
+
+
+def test_process_grants_distinguish_argument_boundaries_working_directory_and_sandbox(tmp_path):
+    """Remembered process approval compares argv, cwd, and execution boundary structurally."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.SESSION
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    approved = operation(
+        Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("tool", "a b"),
+            cwd=str(tmp_path),
+            boundary=ProcessBoundary.SANDBOXED,
+        ),
+    )
+    ambiguous = operation(
+        Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("tool", "a", "b"),
+            cwd=str(tmp_path),
+            boundary=ProcessBoundary.SANDBOXED,
+        ),
+    )
+
+    manager.authorize((approved,))
+
+    assert manager.evaluate((approved,)).decision is Decision.ALLOW
+    assert manager.evaluate((ambiguous,)).decision is Decision.ASK
+    assert (
+        manager.evaluate(
+            (
+                approved.model_copy(
+                    update={
+                        "target": approved.target.model_copy(update={"cwd": str(tmp_path / "sub")})
+                    }
+                ),
+            )
+        ).decision
+        is Decision.ASK
+    )
+
+
+def test_network_grants_ignore_dns_addresses_but_retain_request_semantics(tmp_path):
+    """Network grants survive DNS changes without widening method or body semantics."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.SESSION
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    get = operation(
+        Action.NETWORK_REQUEST,
+        target=NetworkTarget(
+            url="https://my-host.local/data",
+            origin="https://my-host.local",
+            addresses=("93.184.216.34",),
+        ),
+    )
+
+    manager.authorize((get,))
+
+    changed_dns = get.model_copy(
+        update={"target": get.target.model_copy(update={"addresses": ("93.184.216.35",)})}
+    )
+    post = get.model_copy(
+        update={"target": get.target.model_copy(update={"method": "POST", "sends_body": True})}
+    )
+    assert manager.evaluate((changed_dns,)).decision is Decision.ALLOW
+    assert manager.evaluate((post,)).decision is Decision.ASK
+
+
+def test_failed_workspace_persistence_denies_without_activating_grants(tmp_path, monkeypatch):
+    """A failed durable write fails closed and leaves the active policy unchanged."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.WORKSPACE
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    monkeypatch.setattr("pathlib.Path.write_text", Mock(side_effect=OSError("disk full")))
+
+    result = manager.authorize((file_operation(Action.FILESYSTEM_CREATE, tmp_path / "new.txt"),))
+
+    assert result.decision is Decision.DENY
+    assert result.source == "persistence"
+    assert not result.installed_rule_ids
+    assert not manager.persistent_rules
+
+
+def test_workspace_choice_is_rejected_when_no_workspace_is_available():
+    """A malformed interaction cannot persist workspace trust without a policy path."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.WORKSPACE
+    manager = PermissionManager(interaction=interaction)
+
+    result = manager.authorize(
+        (operation(Action.SESSION_MUTATE, target=SessionTarget(identifier="setting")),)
+    )
+
+    assert result.decision is Decision.DENY
+    assert "unavailable" in result.reason
+    interaction.prompt.assert_called_once()
 
 
 def test_no_authority_plan_is_allowed_without_prompting():
@@ -123,6 +318,16 @@ def test_interaction_property_and_non_persisted_default_changes():
 
     assert manager.interaction is interaction
     assert manager.effective_configuration.defaults[Action.FILESYSTEM_READ] is Decision.ALLOW
+
+
+def test_permission_rules_reject_ambiguous_exact_and_glob_matchers(tmp_path):
+    """One rule cannot combine a broad resource glob with an exact typed target."""
+    with pytest.raises(ValueError, match="cannot combine"):
+        PermissionRule(
+            decision=Decision.ALLOW,
+            resource="*.txt",
+            target=FileTarget(path=str(tmp_path / "file.txt")),
+        )
 
 
 def test_rule_composition_uses_forbid_then_approval_then_permit(tmp_path):
@@ -268,7 +473,7 @@ def test_approval_prompt_displays_targets_outside_the_workspace(tmp_path):
     """Approved expanded roots retain their absolute target in the prompt."""
     outside = tmp_path.parent / "shared" / "file.txt"
     interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = True
+    interaction.prompt.return_value = ApprovalChoice.ONCE
     manager = PermissionManager(
         tmp_path,
         interaction=interaction,
@@ -940,7 +1145,7 @@ def test_permission_manager_configuration_path_and_recorder(tmp_path):
 def test_approval_prompt_anchors_a_workspace_rooted_target(tmp_path):
     """A prompt for the workspace root renders an explicit workspace anchor."""
     interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = True
+    interaction.prompt.return_value = ApprovalChoice.ONCE
     manager = PermissionManager(tmp_path, interaction=interaction)
     manager.set_default(Action.FILESYSTEM_READ, Decision.ASK, scope=PolicyScope.SESSION)
 
@@ -953,7 +1158,7 @@ def test_approval_prompt_anchors_a_workspace_rooted_target(tmp_path):
 def test_approval_prompt_renders_session_targets_without_workspace():
     """A manager without a workspace renders session targets without a relative path."""
     interaction = Mock(spec=Interaction)
-    interaction.confirm.return_value = True
+    interaction.prompt.return_value = ApprovalChoice.ONCE
     manager = PermissionManager(interaction=interaction)
 
     result = manager.authorize(

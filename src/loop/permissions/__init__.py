@@ -2,6 +2,7 @@
 
 __all__ = [
     "Action",
+    "ApprovalChoice",
     "AuthorizationResult",
     "Decision",
     "FileTarget",
@@ -39,6 +40,7 @@ from .commands import PermissionCommands
 from .manager import PermissionManager
 from .models import (
     Action,
+    ApprovalChoice,
     AuthorizationResult,
     Decision,
     FileTarget,

@@ -13,6 +13,7 @@ from loop import (
     Action,
     AnswerCompleted,
     AnswerDelta,
+    ApprovalChoice,
     AuthorizationResult,
     Compaction,
     CompactionContextItem,
@@ -251,6 +252,7 @@ def test_manager_replays_permissions_and_run_statistics():
         prompted=True,
         reason="allowed",
         source="user",
+        approval_choice=ApprovalChoice.SESSION,
     )
     prompted = PermissionEvent(
         id="permission",
@@ -271,6 +273,12 @@ def test_manager_replays_permissions_and_run_statistics():
                 prompted,
                 prompted.model_copy(
                     update={
+                        "id": "legacy",
+                        "result": result.model_copy(update={"approval_choice": None}),
+                    }
+                ),
+                prompted.model_copy(
+                    update={
                         "id": "automatic",
                         "result": result.model_copy(update={"prompted": False}),
                     }
@@ -288,7 +296,10 @@ def test_manager_replays_permissions_and_run_statistics():
 
     manager.replay()
 
-    interaction.permission.assert_called_once_with("Permission requested.", "allow")
+    assert interaction.permission.call_args_list == [
+        call("Permission requested.", "allow (session)"),
+        call("Permission requested.", "allow"),
+    ]
     interaction.run_metrics.assert_called_once_with(metrics)
 
 
