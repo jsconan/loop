@@ -13,6 +13,9 @@ unrelated refactoring or new dependencies.
 
 - Reuse existing project patterns, standard-library features, and installed dependencies before
   adding new abstractions or packages.
+- Before adding a private helper, consider whether its semantics are generic and reusable across
+  modules. When they are, prefer a focused common helper in `src/loop/utils/`; keep behavior that
+  is specific to one implementation private to that module or class.
 - Keep domain knowledge behind one cohesive boundary. Let callers express intent without
   constructing another component's internal models, coordinating its lifecycle or rollback, or
   duplicating its parsing, validation, and completion rules.
