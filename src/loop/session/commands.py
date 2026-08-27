@@ -6,6 +6,7 @@ from pydantic import Field
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
 from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
+from .models import SessionNameGenerator
 from .session_manager import SessionManager
 
 
@@ -14,10 +15,17 @@ class SessionCommands:
 
     Args:
         session_manager (SessionManager): Session lifecycle owner controlled by the commands.
+        session_name_generator (SessionNameGenerator): Service used to automatically name the
+            active session.
     """
 
-    def __init__(self, session_manager: SessionManager) -> None:
+    def __init__(
+        self,
+        session_manager: SessionManager,
+        session_name_generator: SessionNameGenerator,
+    ) -> None:
         self._session_manager = session_manager
+        self._session_name_generator = session_name_generator
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return session command registrations.
@@ -64,9 +72,15 @@ class SessionCommands:
     def rename(
         self,
         context: CommandContext,
-        name: Annotated[str, Field(description="New human-readable session name.")],
+        name: Annotated[
+            str | None,
+            Field(description="New human-readable session name, or omit to generate one."),
+        ] = None,
     ) -> None:
-        """Rename the active session."""
+        """Rename the active session or generate a name automatically."""
+        if name is None:
+            self._session_manager.generate_session_name(self._session_name_generator)
+            return
         try:
             self._session_manager.rename_session(name)
         except ValueError as error:

@@ -21,7 +21,7 @@ from loop import (
     log_problem,
     register_shutdown_signals,
 )
-from loop.session import SessionCommands
+from loop.session import BackendSessionNameGenerator, SessionCommands
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,7 +41,19 @@ def main() -> None:
             interaction=interaction,
             session_store=MemorySessionStore(),
         )
-        providers = (SessionCommands(session_manager),)
+        interaction.info("Hello from Chat!")
+
+        context_window = os.getenv("CONTEXT_WINDOW")
+        max_retries = os.getenv("OPENAI_MAX_RETRIES")
+        backend = OpenAIBackend(
+            base_url=os.getenv("BASE_URL", _BASE_URL),
+            default_model=os.getenv("DEFAULT_MODEL", _DEFAULT_MODEL),
+            api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
+            context_window=int(context_window) if context_window else None,
+            max_retries=int(max_retries) if max_retries else 2,
+        )
+        name_generator = BackendSessionNameGenerator(backend)
+        providers = (SessionCommands(session_manager, name_generator),)
         command_manager = CommandManager(providers=providers, interaction=interaction)
 
         mention_manager = MentionManager((ProjectPathMentionHandler(Path.cwd),))
@@ -54,18 +66,6 @@ def main() -> None:
                 *mention_manager.completion_adapters,
             )
         )
-
-        context_window = os.getenv("CONTEXT_WINDOW")
-        max_retries = os.getenv("OPENAI_MAX_RETRIES")
-        backend = OpenAIBackend(
-            base_url=os.getenv("BASE_URL", _BASE_URL),
-            default_model=os.getenv("DEFAULT_MODEL", _DEFAULT_MODEL),
-            api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
-            context_window=int(context_window) if context_window else None,
-            max_retries=int(max_retries) if max_retries else 2,
-        )
-
-        interaction.info("Hello from Chat!")
 
         while not command_manager.exit_requested:
             prompt = interaction.prompt(completer=completion_manager)

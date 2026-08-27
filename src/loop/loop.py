@@ -192,7 +192,7 @@ class Loop:
             prompt_on_recoverable_error=prompt_on_recoverable_error,
         )
         providers = (
-            SessionCommands(self._session_manager),
+            SessionCommands(self._session_manager, self._session_name_generator),
             PermissionCommands(self._permission_manager),
             SkillCommands(self._instructions_manager),
             ToolCommands(self._tool_registry, self._instructions_manager),
