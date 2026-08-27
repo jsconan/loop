@@ -245,6 +245,35 @@ class PermissionManager:
         """
         self._recorder = recorder
 
+    @property
+    def persistent_rules(self) -> tuple[PermissionRule, ...]:
+        """Return persisted policy rules in display order.
+
+        Returns:
+            tuple[PermissionRule, ...]: Immutable snapshot of persisted rules.
+        """
+        return tuple(rule.model_copy(deep=True) for rule in self._configuration.rules)
+
+    @property
+    def session_rules(self) -> tuple[PermissionRule, ...]:
+        """Return process-local policy rules in display order.
+
+        Returns:
+            tuple[PermissionRule, ...]: Immutable snapshot of session rules.
+        """
+        return tuple(rule.model_copy(deep=True) for rule in self._session_overrides.rules)
+
+    @property
+    def presets(self) -> tuple[PermissionPreset, ...]:
+        """Return selectable permission presets ordered by stable identifier.
+
+        Returns:
+            tuple[PermissionPreset, ...]: Deep-copied preset catalog entries.
+        """
+        return tuple(
+            self._presets[identifier].model_copy(deep=True) for identifier in sorted(self._presets)
+        )
+
     def authorize(
         self,
         operations: tuple[Operation, ...],
@@ -536,35 +565,6 @@ class PermissionManager:
                     self._replace_configuration(updated)
                 return True
         return False
-
-    @property
-    def persistent_rules(self) -> tuple[PermissionRule, ...]:
-        """Return persisted policy rules in display order.
-
-        Returns:
-            tuple[PermissionRule, ...]: Immutable snapshot of persisted rules.
-        """
-        return tuple(rule.model_copy(deep=True) for rule in self._configuration.rules)
-
-    @property
-    def session_rules(self) -> tuple[PermissionRule, ...]:
-        """Return process-local policy rules in display order.
-
-        Returns:
-            tuple[PermissionRule, ...]: Immutable snapshot of session rules.
-        """
-        return tuple(rule.model_copy(deep=True) for rule in self._session_overrides.rules)
-
-    @property
-    def presets(self) -> tuple[PermissionPreset, ...]:
-        """Return selectable permission presets ordered by stable identifier.
-
-        Returns:
-            tuple[PermissionPreset, ...]: Deep-copied preset catalog entries.
-        """
-        return tuple(
-            self._presets[identifier].model_copy(deep=True) for identifier in sorted(self._presets)
-        )
 
     def preset(self, preset_id: str) -> PermissionPreset:
         """Return one named permission preset artifact.
