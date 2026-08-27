@@ -376,16 +376,22 @@ class PermissionManager:
             ApprovalChoice.ONCE: "Allow once",
             ApprovalChoice.SESSION: "Allow for this session",
         }
+        index = {
+            ApprovalChoice.DENY: "N",
+            ApprovalChoice.ONCE: "Y",
+            ApprovalChoice.SESSION: "S",
+        }
         if self._configuration_path is not None:
             choices[ApprovalChoice.WORKSPACE] = (
                 "Allow in this workspace (save to .loop/permissions.yaml)"
             )
+            index[ApprovalChoice.WORKSPACE] = "W"
         active_interaction = interaction if interaction is not None else self._interaction
         selected = active_interaction.prompt(
             prompt,
             exit_commands=None,
             choices=choices,
-            default=ApprovalChoice.DENY,
+            index=index,
         )
         return selected if isinstance(selected, ApprovalChoice) else ApprovalChoice.DENY
 

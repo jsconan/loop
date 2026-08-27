@@ -76,6 +76,33 @@ def test_request_permission_offers_valid_scopes_and_fails_closed(
     assert (ApprovalChoice.WORKSPACE in choices) is workspace_label
 
 
+def test_request_permission_forwards_index_map_to_prompt(tmp_path):
+    """Permission prompts forward short letter indexes to the generic prompt layer."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    manager = PermissionManager(tmp_path, interaction=interaction)
+
+    manager.request_permission("Approve?")
+
+    index = interaction.prompt.call_args.kwargs["index"]
+    assert index is not None
+    assert index[ApprovalChoice.DENY] == "N"
+    assert index[ApprovalChoice.ONCE] == "Y"
+    assert index[ApprovalChoice.SESSION] == "S"
+
+
+def test_request_permission_includes_workspace_index_when_configured(tmp_path):
+    """Workspace scope adds a ``W`` index letter when a configuration path exists."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    manager = PermissionManager(tmp_path, interaction=interaction)
+
+    manager.request_permission("Approve?")
+
+    index = interaction.prompt.call_args.kwargs["index"]
+    assert index[ApprovalChoice.WORKSPACE] == "W"
+
+
 def test_default_policy_allows_scoped_reads_and_fails_closed_for_approval(tmp_path):
     """The supervised default permits workspace inspection and denies headless mutations."""
     manager = PermissionManager(tmp_path)
