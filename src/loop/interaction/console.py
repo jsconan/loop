@@ -172,14 +172,18 @@ class ConsoleInteraction(Interaction):
         )
         self._plain_stream_has_output |= bool(delta)
 
+    # pylint: disable-next=too-many-branches
     def prompt(
         self,
         message: str | None = None,
         completer: Completer | None = None,
         exit_commands: str | Iterable[str] | None = "q",
         choices: Iterable[str] | Mapping[object, str] | None = None,
+        default: object | None = None,
     ) -> object | False:
         """Prompt for a non-empty user message or an exit command.
+
+        The choice, completion, cancellation, and default-input paths deliberately share one loop.
 
         Args:
             message (str | None): Prompt message displayed before reading input.
@@ -191,6 +195,8 @@ class ConsoleInteraction(Interaction):
                 Mapping keys are returned while their values are displayed and accepted as input.
                 One choice is confirmed directly, two through nine are shown as a numbered list,
                 and larger catalogs are arranged in columns. Defaults to ``None``.
+            default (object | None): Value returned for empty input, or ``None`` to require
+                non-empty input. Defaults to ``None``.
 
         Returns:
             object | False: The selected value or entered message, or ``False`` when the user
@@ -240,6 +246,8 @@ class ConsoleInteraction(Interaction):
             except (KeyboardInterrupt, EOFError):
                 return False
             if not user_input:
+                if default is not None:
+                    return default
                 self.warning("Please enter a message!")
                 continue
             if user_input.casefold() in exit_commands:

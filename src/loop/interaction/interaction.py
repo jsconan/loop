@@ -1,5 +1,7 @@
 """Define user interaction abstractions."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager
@@ -30,6 +32,7 @@ class Interaction(ABC):
         completer: Completer | None = None,
         exit_commands: str | Iterable[str] | None = None,
         choices: Iterable[str] | Mapping[object, str] | None = None,
+        default: object | None = None,
     ) -> object | False:
         """Read a non-empty user message or an exit command.
 
@@ -43,6 +46,8 @@ class Interaction(ABC):
                 Mapping keys are returned while their values are displayed and accepted as input.
                 Implementations may adapt their presentation to the catalog size. Defaults to
                 ``None``.
+            default (object | None): Value returned for empty input, or ``None`` to require
+                non-empty input. Defaults to ``None``.
 
         Returns:
             object | False: The selected value or stripped text entered by the user, or ``False``

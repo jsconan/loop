@@ -215,6 +215,15 @@ def test_prompt_reprompts_for_blank_input(capsys):
     assert session.prompt.call_count == 2
 
 
+def test_prompt_returns_its_empty_input_default():
+    """An empty input returns the caller-provided default without a retry."""
+    session = Mock()
+    session.prompt.return_value = "   "
+
+    assert ConsoleInteraction(session=session).prompt(default="default") == "default"
+    session.prompt.assert_called_once()
+
+
 def test_prompt_returns_false_for_its_default_exit_command():
     """Input treats the default exit command as an exit request."""
     session = Mock()
