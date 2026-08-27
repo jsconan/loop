@@ -91,10 +91,16 @@ class ConsoleInteraction(Interaction):
         console (Console | None): Rich console used for terminal output. Defaults to a new console.
         session (PromptSession[str] | None): Prompt session used for editable user input. Defaults
             to a new session.
+        choices_session (PromptSession[str] | None): Prompt session used for editable user input
+            with selectable choices. Defaults to a new session.
         markdown (bool): Whether to render model output as Markdown.
             Defaults to ``RENDER_MARKDOWN``.
     """
 
+    _console: Console
+    _session: PromptSession[str]
+    _choices_session: PromptSession[str]
+    _markdown: bool
     _stream_kind: Literal["reasoning", "answer"] | None
     _stream: MarkdownStream | None
     _plain_stream_has_output: bool
@@ -104,10 +110,12 @@ class ConsoleInteraction(Interaction):
         *,
         console: Console | None = None,
         session: PromptSession[str] | None = None,
+        choices_session: PromptSession[str] | None = None,
         markdown: bool = constants.RENDER_MARKDOWN,
     ) -> None:
         self._console = console or Console()
         self._session = session or PromptSession()
+        self._choices_session = choices_session or PromptSession()
         self._markdown = markdown
         self._stream_kind = None
         self._stream = None
@@ -230,7 +238,9 @@ class ConsoleInteraction(Interaction):
             exit_commands = ()
         if choice_index is not None and set(choice_index) & set(exit_commands):
             raise ValueError("selection indexes cannot conflict with exit commands.")
+        session = self._session
         if normalized_choices is not None:
+            session = self._choices_session
             if completer is not None:
                 raise ValueError("choices cannot be combined with a custom completer.")
             if len(normalized_choices) == 1:
@@ -255,7 +265,7 @@ class ConsoleInteraction(Interaction):
         message = str(message).rstrip()
         while True:
             try:
-                user_input = self._session.prompt(
+                user_input = session.prompt(
                     f"{message} " if message else "",
                     completer=completer,
                     complete_in_thread=True,

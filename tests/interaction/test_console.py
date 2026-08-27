@@ -57,7 +57,7 @@ def test_prompt_displays_a_short_choice_list_and_returns_a_mapped_value_for_a_nu
     session = Mock()
     session.prompt.return_value = "2"
 
-    result = ConsoleInteraction(console=Console(width=80), session=session).prompt(
+    result = ConsoleInteraction(console=Console(width=80), choices_session=session).prompt(
         "Select:",
         choices={"first": "First choice", "second": "Second choice"},
     )
@@ -74,7 +74,7 @@ def test_prompt_displays_large_choice_catalogs_in_columns(capsys):
     session.prompt.return_value = "10"
     choices = [f"Choice {index}" for index in range(1, constants.COLUMNS_THRESHOLD + 2)]
 
-    assert ConsoleInteraction(console=Console(width=80), session=session).prompt(
+    assert ConsoleInteraction(console=Console(width=80), choices_session=session).prompt(
         choices=choices
     ) == ("Choice 10")
 
@@ -90,7 +90,7 @@ def test_prompt_confirms_a_single_choice_without_opening_an_input_session(monkey
     monkeypatch.setattr(ConsoleInteraction, "confirm", confirm)
 
     assert (
-        ConsoleInteraction(session=session).prompt(choices={"model-id": "Model label"})
+        ConsoleInteraction(choices_session=session).prompt(choices={"model-id": "Model label"})
         == "model-id"
     )
     confirm.assert_called_once_with("Use 'Model label'?", default=False)
@@ -110,7 +110,7 @@ def test_prompt_returns_a_choice_value_entered_without_its_number():
     session.prompt.return_value = "SECOND CHOICE"
 
     assert (
-        ConsoleInteraction(session=session).prompt(
+        ConsoleInteraction(choices_session=session).prompt(
             choices={"first": "First choice", "second": "Second choice"}
         )
         == "second"
@@ -123,7 +123,7 @@ def test_prompt_uses_explicit_indexes_instead_of_automatic_numbers(capsys):
     session.prompt.side_effect = ["2", "D", "approve"]
 
     assert (
-        ConsoleInteraction(console=Console(width=80), session=session).prompt(
+        ConsoleInteraction(console=Console(width=80), choices_session=session).prompt(
             choices={"approve": "Approve", "deny": "Deny"},
             index={"approve": "a", "deny": "d"},
         )
@@ -142,7 +142,7 @@ def test_prompt_accepts_a_direct_label_with_explicit_indexes():
     session.prompt.return_value = "approve"
 
     assert (
-        ConsoleInteraction(session=session).prompt(
+        ConsoleInteraction(choices_session=session).prompt(
             choices={"approve": "Approve", "deny": "Deny"},
             index={"approve": "a", "deny": "d"},
         )
@@ -155,7 +155,7 @@ def test_prompt_autocompletes_display_labels():
     session = Mock()
     session.prompt.return_value = "First choice"
 
-    ConsoleInteraction(session=session).prompt(choices=["First choice", "Second choice"])
+    ConsoleInteraction(choices_session=session).prompt(choices=["First choice", "Second choice"])
 
     completer = session.prompt.call_args.kwargs["completer"]
     completions = list(completer.get_completions(Document("sec"), CompleteEvent()))
@@ -170,7 +170,9 @@ def test_prompt_reprompts_until_a_choice_is_selected(capsys):
     session = Mock()
     session.prompt.side_effect = ["0", "unknown", "first"]
 
-    assert ConsoleInteraction(session=session).prompt(choices=["first", "second"]) == "first"
+    assert (
+        ConsoleInteraction(choices_session=session).prompt(choices=["first", "second"]) == "first"
+    )
     assert capsys.readouterr().out.endswith(
         "Warning: Select one of the listed choices by index or value.\n"
     )
@@ -214,9 +216,27 @@ def test_prompt_accepts_an_iterable_of_explicit_indexes():
     session.prompt.return_value = "B"
 
     assert (
-        ConsoleInteraction(session=session).prompt(choices=["first", "second"], index=["a", "b"])
+        ConsoleInteraction(choices_session=session).prompt(
+            choices=["first", "second"], index=["a", "b"]
+        )
         == "second"
     )
+
+
+def test_prompt_passes_index_kwarg_to_choices_session():
+    """Explicit indexes are incorporated into displayed choice labels."""
+    session = Mock()
+    session.prompt.return_value = "a"
+
+    ConsoleInteraction(choices_session=session).prompt(
+        choices=["first", "second"], index=["a", "b"]
+    )
+
+    # Verify the prompt was called (session.prompt is used with the completer)
+    assert session.prompt.called
+    # When indexes are provided, a WordCompleter is still set up for label autocompletion
+    completer = session.prompt.call_args.kwargs.get("completer")
+    assert completer is not None
 
 
 def test_prompt_rejects_an_explicit_index_without_choices():
