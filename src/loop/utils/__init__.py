@@ -3,6 +3,7 @@
 __all__ = [
     "BoundedTextContent",
     "CachedContentMetadata",
+    "ChoiceItem",
     "IgnoreRule",
     "IgnoreRules",
     "ShutdownRequested",
@@ -57,6 +58,7 @@ from .hashing import sha256_digest
 from .models import (
     BoundedTextContent,
     CachedContentMetadata,
+    ChoiceItem,
     IgnoreRule,
     IgnoreRules,
     TextSearchContext,

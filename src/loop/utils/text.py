@@ -6,40 +6,104 @@ from difflib import unified_diff
 from typing import Any
 
 from .. import constants
+from .models import ChoiceItem
 
 
 def choice_items(
-    values: Iterable[str] | Mapping[object, str],
-) -> tuple[tuple[object, str], ...]:
+    values: Iterable[str | ChoiceItem] | Mapping[object, str],
+    *,
+    index: Iterable[str] | Mapping[object, str] | None = None,
+) -> tuple[ChoiceItem, ...]:
     """Normalize selectable values and enforce unambiguous input.
 
     Args:
-        values (Iterable[str] | Mapping[object, str]): Values to normalize. Mapping keys become
-            returned values while mapping values become displayed labels.
-
+        values (Iterable[str | ChoiceItem] | Mapping[object, str]): Values to normalize. Mapping
+            keys become returned values while mapping values become displayed labels.
+        index (Iterable[str] | Mapping[object, str] | None): Optional selection indexes to display
+            alongside each choice. If omitted, indexes are automatically generated as numeric
+            indexes.
     Returns:
-        tuple[tuple[object, str], ...]: Ordered pairs of returned values and displayed labels.
+        tuple[ChoiceItem, ...]: Ordered choices with normalized values, labels, and selection
+            indexes.
 
     Raises:
-        ValueError: If no values are supplied, a label is empty, labels are duplicated ignoring
-            case, or a label conflicts with its one-based selection number.
+        ValueError: If no values are supplied, a name is empty, names are duplicated ignoring
+            case, values are duplicated or unhashable, or indexes are invalid or conflict with
+            names.
     """
     items = (
         tuple(values.items())
         if isinstance(values, Mapping)
-        else tuple((value, value) for value in values)
+        else tuple(value if isinstance(value, ChoiceItem) else str(value) for value in values)
     )
     if not items:
         raise ValueError("choices cannot be empty.")
-    labels = tuple(label for _, label in items)
-    if any(not label for label in labels):
-        raise ValueError("choice labels cannot be empty.")
-    if len({label.casefold() for label in labels}) != len(labels):
-        raise ValueError("choice labels must be unique ignoring case.")
-    numbers = {str(index) for index in range(1, len(items) + 1)}
-    if any(label in numbers for label in labels):
-        raise ValueError("choice labels cannot conflict with selection numbers.")
-    return items
+    if index is None:
+        index = tuple(str(number) for number in range(1, len(items) + 1))
+    elif isinstance(index, Mapping):
+        keys = {_get_item_key(item) for item in items}
+        if set(index) != keys:
+            raise ValueError("index must map every choice value to a selection index.")
+        index = tuple(index[_get_item_key(item)] for item in items)
+    else:
+        index = tuple(index)
+    if len(index) != len(items):
+        raise ValueError("index must map every choice value to a selection index.")
+    if any(
+        not isinstance(selection, str) or not selection or selection != selection.strip()
+        for selection in index
+    ):
+        raise ValueError("choice indexes must be non-empty strings without surrounding whitespace.")
+    choices = tuple(_item_to_choice_item(item, i) for item, i in zip(items, index))
+    if any(not isinstance(choice.name, str) or not choice.name for choice in choices):
+        raise ValueError("choice names cannot be empty.")
+    try:
+        values = {choice.value for choice in choices}
+    except TypeError as error:
+        raise ValueError("choice values must be hashable.") from error
+    if len(values) != len(choices):
+        raise ValueError("choice values must be unique.")
+    if len({choice.index.casefold() for choice in choices}) != len(choices):
+        raise ValueError("choice indexes must be unique ignoring case.")
+    if len({choice.name.casefold() for choice in choices}) != len(choices):
+        raise ValueError("choice names must be unique ignoring case.")
+    if {choice.name.casefold() for choice in choices} & {
+        choice.index.casefold() for choice in choices
+    }:
+        raise ValueError("choice names cannot conflict with selection indexes.")
+    return choices
+
+
+def _get_item_key(item: str | tuple[object, str] | ChoiceItem) -> object:
+    """Return a unique key for a choice item."""
+    if isinstance(item, ChoiceItem):
+        return item.value
+    if isinstance(item, str):
+        return item
+    return item[0]
+
+
+def _item_to_choice_item(item: str | tuple[object, str] | ChoiceItem, index: str) -> ChoiceItem:
+    """Convert a single choice item to a normalized ChoiceItem."""
+    if isinstance(item, ChoiceItem):
+        return ChoiceItem(
+            index=index,
+            value=item.value,
+            name=item.name,
+            description=item.description,
+        )
+    if isinstance(item, str):
+        return ChoiceItem(
+            index=index,
+            value=item,
+            name=item,
+        )
+    value, name = item
+    return ChoiceItem(
+        index=index,
+        value=value,
+        name=name,
+    )
 
 
 def format_tool_call_arguments(

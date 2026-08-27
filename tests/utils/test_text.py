@@ -6,6 +6,7 @@ from loop.constants import (
     CONTENT_PREVIEW_MAX_CHARS,
     CONTENT_PREVIEW_MAX_LINES,
 )
+from loop.utils import ChoiceItem
 from loop.utils.text import (
     choice_items,
     format_content_diff,
@@ -15,21 +16,60 @@ from loop.utils.text import (
 
 
 def test_choice_items_normalizes_iterables_and_mappings():
-    """Selectable values preserve their order and separate returned keys from displayed labels."""
-    assert choice_items(["first", "second"]) == (("first", "first"), ("second", "second"))
-    assert choice_items({"first-id": "First", "second-id": "Second"}) == (
-        ("first-id", "First"),
-        ("second-id", "Second"),
+    """Selectable values preserve their order and generate complete display labels."""
+    assert choice_items(["first", "second"]) == (
+        ChoiceItem(index="1", value="first", name="first"),
+        ChoiceItem(index="2", value="second", name="second"),
     )
+    assert choice_items({"first-id": "First", "second-id": "Second"}) == (
+        ChoiceItem(index="1", value="first-id", name="First"),
+        ChoiceItem(index="2", value="second-id", name="Second"),
+    )
+
+
+def test_choice_items_applies_explicit_indexes_to_choice_models():
+    """Explicit indexes replace a model's display selector while retaining its metadata."""
+    assert choice_items(
+        [ChoiceItem("1", "approve", "Approve", "Proceed")],
+        index={"approve": "a"},
+    ) == (ChoiceItem("a", "approve", "Approve", "Proceed"),)
+
+
+@pytest.mark.parametrize(
+    "choices",
+    [
+        [
+            ChoiceItem("a", "same", "First", "(a) First"),
+            ChoiceItem("b", "same", "Second", "(b) Second"),
+        ],
+        [ChoiceItem("a", [], "First", "(a) First")],
+    ],
+)
+def test_choice_items_rejects_duplicate_or_unhashable_choice_values(choices):
+    """Choice model values must form a unique, hashable selection domain."""
+    with pytest.raises(ValueError, match="choice values must be"):
+        choice_items(choices)
+
+
+def test_choice_items_rejects_extra_mapping_indexes():
+    """Mapping indexes must not contain entries unrelated to the choice catalog."""
+    with pytest.raises(ValueError, match="must map"):
+        choice_items(["first"], index={"first": "a", "extra": "e"})
+
+
+def test_choice_items_rejects_an_index_iterable_with_the_wrong_length():
+    """Index iterables must provide precisely one selector for every choice."""
+    with pytest.raises(ValueError, match="must map"):
+        choice_items(["first", "second"], index=["a"])
 
 
 @pytest.mark.parametrize(
     ("values", "message"),
     [
         ([], "choices cannot be empty."),
-        ([""], "choice labels cannot be empty."),
-        (["same", "SAME"], "choice labels must be unique ignoring case."),
-        (["1"], "choice labels cannot conflict with selection numbers."),
+        ([""], "choice names cannot be empty."),
+        (["same", "SAME"], "choice names must be unique ignoring case."),
+        (["1"], "choice names cannot conflict with selection indexes."),
     ],
 )
 def test_choice_items_rejects_ambiguous_labels(values, message):

@@ -34,7 +34,7 @@ from ..models import (
     ToolResultPresentation,
     ToolResultPresentationSpec,
 )
-from ..utils import choice_items, format_tool_call_arguments
+from ..utils import ChoiceItem, choice_items, format_tool_call_arguments
 from .interaction import Interaction
 
 
@@ -178,7 +178,8 @@ class ConsoleInteraction(Interaction):
         message: str | None = None,
         completer: Completer | None = None,
         exit_commands: str | Iterable[str] | None = "q",
-        choices: Iterable[str] | Mapping[object, str] | None = None,
+        choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
+        index: Iterable[str] | Mapping[object, str] | None = None,
         default: object | None = None,
     ) -> object | False:
         """Prompt for a non-empty user message or an exit command.
@@ -191,10 +192,13 @@ class ConsoleInteraction(Interaction):
             completer (Completer | None): Optional input completer. Defaults to no completion.
             exit_commands (str | Iterable[str] | None): Optional list of exit terms that end the
                 prompt. Defaults to ``"q"``.
-            choices (Iterable[str] | Mapping[object, str] | None): Optional selectable values.
-                Mapping keys are returned while their values are displayed and accepted as input.
-                One choice is confirmed directly, two through nine are shown as a numbered list,
-                and larger catalogs are arranged in columns. Defaults to ``None``.
+            choices (Iterable[str | ChoiceItem] | Mapping[object, str] | None): Optional selectable
+                values. Mapping keys are returned while their values are displayed and accepted as
+                input. One choice is confirmed directly, two through nine are shown as a numbered
+                list, and larger catalogs are arranged in columns. Defaults to ``None``.
+            index (Iterable[str] | Mapping[object, str] | None): Optional selection indexes to
+                display alongside each choice. If omitted, indexes are automatically generated as
+                numeric indexes. Defaults to ``None``.
             default (object | None): Value returned for empty input, or ``None`` to require
                 non-empty input. Defaults to ``None``.
 
@@ -203,29 +207,17 @@ class ConsoleInteraction(Interaction):
             requests to exit.
 
         Raises:
-            ValueError: If ``choices`` are invalid or used with a custom ``completer``.
+            ValueError: If ``choices`` or ``index`` are invalid, or choices are used with a custom
+                ``completer``.
         """
-        normalized_choices = choice_items(choices) if choices is not None else None
-        if normalized_choices is not None:
-            if completer is not None:
-                raise ValueError("choices cannot be combined with a custom completer.")
-            if len(normalized_choices) == 1:
-                value, label = normalized_choices[0]
-                self.info(f"\nOnly one choice available: {label}")
-                return value if self.confirm(f"Use '{label}'?", default=False) else False
-            if len(normalized_choices) < constants.COLUMNS_THRESHOLD:
-                self.list(dict(normalized_choices), marker="numbered")
-            else:
-                self.columns(dict(normalized_choices), marker="numbered")
-            completer = WordCompleter(
-                [label for _, label in normalized_choices],
-                ignore_case=True,
-                sentence=True,
-                match_middle=True,
-            )
-        if message is None:
-            message = "\nYou:"
-        message = str(message).rstrip()
+        if index is not None and choices is None:
+            raise ValueError("index requires choices.")
+        normalized_choices = choice_items(choices, index=index) if choices is not None else None
+        choice_index = (
+            {choice.index.casefold(): choice.value for choice in normalized_choices}
+            if normalized_choices is not None
+            else None
+        )
         if isinstance(exit_commands, str):
             exit_commands = exit_commands.strip()
             if exit_commands:
@@ -236,6 +228,31 @@ class ConsoleInteraction(Interaction):
             )
         if not exit_commands:
             exit_commands = ()
+        if choice_index is not None and set(choice_index) & set(exit_commands):
+            raise ValueError("selection indexes cannot conflict with exit commands.")
+        if normalized_choices is not None:
+            if completer is not None:
+                raise ValueError("choices cannot be combined with a custom completer.")
+            if len(normalized_choices) == 1:
+                choice = normalized_choices[0]
+                self.info(f"\nOnly one choice available: {choice.name}")
+                return (
+                    choice.value if self.confirm(f"Use '{choice.name}'?", default=False) else False
+                )
+            displayed_choices = {choice.value: choice.label for choice in normalized_choices}
+            if len(normalized_choices) < constants.COLUMNS_THRESHOLD:
+                self.list(displayed_choices)
+            else:
+                self.columns(displayed_choices)
+            completer = WordCompleter(
+                [choice.name for choice in normalized_choices],
+                ignore_case=True,
+                sentence=True,
+                match_middle=True,
+            )
+        if message is None:
+            message = "\nYou:"
+        message = str(message).rstrip()
         while True:
             try:
                 user_input = self._session.prompt(
@@ -253,14 +270,12 @@ class ConsoleInteraction(Interaction):
             if user_input.casefold() in exit_commands:
                 return False
             if normalized_choices is not None:
-                if user_input.isdecimal():
-                    index = int(user_input) - 1
-                    if 0 <= index < len(normalized_choices):
-                        return normalized_choices[index][0]
-                for value, label in normalized_choices:
-                    if user_input.casefold() == label.casefold():
-                        return value
-                self.warning("Select one of the listed choices by number or value.")
+                if user_input.casefold() in choice_index:
+                    return choice_index[user_input.casefold()]
+                for choice in normalized_choices:
+                    if user_input.casefold() == choice.name.casefold():
+                        return choice.value
+                self.warning("Select one of the listed choices by index or value.")
                 continue
             return user_input
 

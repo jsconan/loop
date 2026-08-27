@@ -12,6 +12,7 @@ from prompt_toolkit.completion import Completer
 from .. import constants
 from ..errors import Problem
 from ..models import RAW_TOOL_RESULT_PRESENTATION, RunMetrics, ToolResultPresentationSpec
+from ..utils import ChoiceItem
 
 
 class Interaction(ABC):
@@ -31,7 +32,8 @@ class Interaction(ABC):
         message: str | None = None,
         completer: Completer | None = None,
         exit_commands: str | Iterable[str] | None = None,
-        choices: Iterable[str] | Mapping[object, str] | None = None,
+        choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
+        index: Iterable[str] | Mapping[object, str] | None = None,
         default: object | None = None,
     ) -> object | False:
         """Read a non-empty user message or an exit command.
@@ -42,16 +44,22 @@ class Interaction(ABC):
             completer (Completer | None): Optional input completer. Defaults to no completion.
             exit_commands (str | Iterable[str] | None): Optional list of exit terms that end the
                 prompt. Defaults to ``None``.
-            choices (Iterable[str] | Mapping[object, str] | None): Optional selectable values.
-                Mapping keys are returned while their values are displayed and accepted as input.
+            choices (Iterable[str | ChoiceItem] | Mapping[object, str] | None): Optional selectable
+                values. Mapping keys are returned while mapping values become displayed names.
                 Implementations may adapt their presentation to the catalog size. Defaults to
                 ``None``.
+            index (Iterable[str] | Mapping[object, str] | None): Optional indexes to display and
+                accept alongside choices. Defaults to automatic numeric indexes.
             default (object | None): Value returned for empty input, or ``None`` to require
                 non-empty input. Defaults to ``None``.
 
         Returns:
             object | False: The selected value or stripped text entered by the user, or ``False``
             when the user requests to exit.
+
+        Raises:
+            ValueError: If choices or their selection indexes are invalid, or choices cannot be
+                combined with the supplied completer.
         """
 
     @abstractmethod

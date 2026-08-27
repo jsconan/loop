@@ -64,7 +64,7 @@ def test_prompt_displays_a_short_choice_list_and_returns_a_mapped_value_for_a_nu
 
     assert result == "second"
     output = capsys.readouterr().out
-    assert output.splitlines() == ["1. First choice", "2. Second choice"]
+    assert output.splitlines() == ["(1) First choice", "(2) Second choice"]
     assert "complete_while_typing" not in session.prompt.call_args.kwargs
 
 
@@ -79,7 +79,7 @@ def test_prompt_displays_large_choice_catalogs_in_columns(capsys):
     ) == ("Choice 10")
 
     output = capsys.readouterr().out
-    assert "1. Choice 1" in output
+    assert "(1) Choice 1" in output
     assert len(output.splitlines()) < len(choices)
 
 
@@ -117,6 +117,39 @@ def test_prompt_returns_a_choice_value_entered_without_its_number():
     )
 
 
+def test_prompt_uses_explicit_indexes_instead_of_automatic_numbers(capsys):
+    """Custom indexes are displayed and selected without accepting automatic numbers."""
+    session = Mock()
+    session.prompt.side_effect = ["2", "D", "approve"]
+
+    assert (
+        ConsoleInteraction(console=Console(width=80), session=session).prompt(
+            choices={"approve": "Approve", "deny": "Deny"},
+            index={"approve": "a", "deny": "d"},
+        )
+        == "deny"
+    )
+
+    output = capsys.readouterr().out
+    assert output.splitlines()[:2] == ["(a) Approve", "(d) Deny"]
+    assert "Warning: Select one of the listed choices by index or value." in output
+    assert session.prompt.call_count == 2
+
+
+def test_prompt_accepts_a_direct_label_with_explicit_indexes():
+    """Custom indexes retain case-insensitive direct matching of displayed labels."""
+    session = Mock()
+    session.prompt.return_value = "approve"
+
+    assert (
+        ConsoleInteraction(session=session).prompt(
+            choices={"approve": "Approve", "deny": "Deny"},
+            index={"approve": "a", "deny": "d"},
+        )
+        == "approve"
+    )
+
+
 def test_prompt_autocompletes_display_labels():
     """Choice completion replaces a typed label fragment with the displayed value."""
     session = Mock()
@@ -139,7 +172,7 @@ def test_prompt_reprompts_until_a_choice_is_selected(capsys):
 
     assert ConsoleInteraction(session=session).prompt(choices=["first", "second"]) == "first"
     assert capsys.readouterr().out.endswith(
-        "Warning: Select one of the listed choices by number or value.\n"
+        "Warning: Select one of the listed choices by index or value.\n"
     )
     assert session.prompt.call_count == 3
 
@@ -148,15 +181,57 @@ def test_prompt_reprompts_until_a_choice_is_selected(capsys):
     ("choices", "message"),
     [
         ([], "choices cannot be empty."),
-        ([""], "choice labels cannot be empty."),
-        (["same", "SAME"], "choice labels must be unique ignoring case."),
-        (["1"], "choice labels cannot conflict with selection numbers."),
+        ([""], "choice names cannot be empty."),
+        (["same", "SAME"], "choice names must be unique ignoring case."),
+        (["1"], "choice names cannot conflict with selection indexes."),
     ],
 )
 def test_prompt_rejects_ambiguous_choices(choices, message):
     """Choice prompts reject catalog shapes that cannot be selected unambiguously."""
     with pytest.raises(ValueError, match=message):
         ConsoleInteraction().prompt(choices=choices)
+
+
+@pytest.mark.parametrize(
+    ("index", "message"),
+    [
+        ({"first": "a"}, "must map"),
+        ({"first": "a", "second": "A"}, "unique ignoring case"),
+        ({"first": "a", "second": "q"}, "exit commands"),
+        ({"first": "a", "second": " second "}, "without surrounding whitespace"),
+        ({"first": "a", "second": 2}, "non-empty strings"),
+    ],
+)
+def test_prompt_rejects_invalid_explicit_indexes(index, message):
+    """Explicit indexes must cover choices uniquely and remain typeable."""
+    with pytest.raises(ValueError, match=message):
+        ConsoleInteraction().prompt(choices=["first", "second"], index=index)
+
+
+def test_prompt_accepts_an_iterable_of_explicit_indexes():
+    """Index iterables select choices in their corresponding catalog order."""
+    session = Mock()
+    session.prompt.return_value = "B"
+
+    assert (
+        ConsoleInteraction(session=session).prompt(choices=["first", "second"], index=["a", "b"])
+        == "second"
+    )
+
+
+def test_prompt_rejects_an_explicit_index_without_choices():
+    """Explicit indexes only make sense when a choice catalog is supplied."""
+    with pytest.raises(ValueError, match="requires choices"):
+        ConsoleInteraction().prompt(index={})
+
+
+def test_prompt_rejects_a_label_that_conflicts_with_an_explicit_index():
+    """Explicit selection indexes cannot be mistaken for displayed choice labels."""
+    with pytest.raises(ValueError, match="selection indexes"):
+        ConsoleInteraction().prompt(
+            choices={"first": "A", "second": "Second"},
+            index={"first": "a", "second": "d"},
+        )
 
 
 def test_prompt_rejects_a_custom_completer_when_it_manages_choices():

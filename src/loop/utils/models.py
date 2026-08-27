@@ -1,5 +1,6 @@
 """Define passive path utility models."""
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
@@ -7,6 +8,29 @@ from pathspec import GitIgnoreSpec
 
 type IgnoreRule = tuple[Path, GitIgnoreSpec]
 type IgnoreRules = dict[str, list[IgnoreRule]]
+
+
+@dataclass(frozen=True)
+class ChoiceItem:
+    """Describe one selectable prompt option.
+
+    Args:
+        index (str): Text entered to select the option.
+        value (object): Value returned when the option is selected.
+        name (str): Human-readable option name accepted as direct input.
+        description (str | None): Optional supplementary description of the option.
+            Defaults to ``None``.
+    """
+
+    index: str
+    value: object
+    name: str
+    description: str | None = None
+
+    @property
+    def label(self) -> str:
+        """Return a human-readable label for the option."""
+        return f"({self.index}) {self.name}"
 
 
 class BoundedTextContent(TypedDict):
