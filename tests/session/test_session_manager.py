@@ -50,6 +50,7 @@ from loop.session import (
     ToolExecutionCompletedEvent,
     ToolExecutionStartedEvent,
 )
+from loop.session import session_manager as session_manager_module
 from loop.utils import cached_metadata, cached_path, store_content
 
 
@@ -419,11 +420,12 @@ def test_manager_constructs_and_persists_complete_user_messages():
 
 def test_manager_generates_names_regardless_of_the_current_name_source():
     """A completed exchange may replace both provisional and user-controlled names."""
+    interaction = Mock(spec=Interaction)
     store = Mock(spec=SessionStore)
     generator = Mock()
     generator.generate.return_value = "Review application architecture"
     session = Session()
-    manager = SessionManager(session=session, session_store=store)
+    manager = SessionManager(interaction=interaction, session=session, session_store=store)
     manager.add_user_message("Please review this app")
     manager.add_message(Message(role="assistant", content="The architecture is sound."))
 
@@ -440,6 +442,39 @@ def test_manager_generates_names_regardless_of_the_current_name_source():
     assert session.name_source == "generated"
     assert generator.generate.call_count == 2
     assert store.save.call_count == 5
+    assert interaction.info.call_args_list == [
+        call("Generating a session name..."),
+        call("Session name: Review application architecture"),
+        call("Generating a session name..."),
+        call("Session name: Review application architecture"),
+    ]
+
+
+def test_manager_reports_name_generation_failures(monkeypatch):
+    """Name generation reports a retryable problem and preserves the current name on failure."""
+    interaction = Mock(spec=Interaction)
+    generator = Mock()
+    error = RuntimeError("Generator is unavailable")
+    generator.generate.side_effect = error
+    logger = Mock()
+    monkeypatch.setattr(session_manager_module, "_LOGGER", logger)
+    session = Session()
+    manager = SessionManager(interaction=interaction, session=session)
+    manager.add_user_message("Please review this app")
+    manager.add_message(Message(role="assistant", content="The architecture is sound."))
+
+    manager.generate_session_name(generator)
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "session.name_generation_failed"
+    assert problem.title == "Could not generate session name"
+    assert problem.detail == "Could not generate the session name."
+    assert problem.severity == "warning"
+    assert problem.retryable is True
+    assert problem.operation == "generate_session_name"
+    assert session.name == "Please review this app"
+    interaction.info.assert_called_once_with("Generating a session name...")
+    assert logger.log.call_args.kwargs["exc_info"][1] is error
 
 
 def test_manager_keeps_provisional_name_without_a_usable_exchange_or_generated_name():

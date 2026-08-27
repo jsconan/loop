@@ -1,6 +1,7 @@
 """Session manager for handling user sessions."""
 
 import json
+import logging
 from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import fields
@@ -8,6 +9,7 @@ from datetime import UTC, datetime
 from uuid import uuid7
 
 from .. import constants
+from ..errors import Problem, log_problem
 from ..interaction import ConsoleInteraction, Interaction
 from ..models import (
     AgentRunStopReason,
@@ -58,6 +60,8 @@ from .models import (
 from .naming import initial_session_name
 from .session import Session, SessionStore
 from .store import MemorySessionStore
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SessionManager:
@@ -441,32 +445,50 @@ class SessionManager:
         self,
         generator: SessionNameGenerator,
     ) -> None:
-        """Generate a session name from the first completed exchange.
+        """Generate, persist, and report a session name from the first completed exchange.
 
         Args:
             generator (SessionNameGenerator): Auxiliary title generation service.
         """
-        user_message = next(
-            (
-                message.content
-                for message in self._session.messages
-                if isinstance(message, Message) and message.role == "user"
-            ),
-            "",
-        )
-        assistant_message = next(
-            (
-                message.content
-                for message in self._session.messages
-                if isinstance(message, Message) and message.role == "assistant"
-            ),
-            "",
-        )
-        if not user_message or not assistant_message.strip():
-            return
-        name = generator.generate(user_message, assistant_message, self._session.model)
-        if name:
-            self._commit(lambda session: session.rename(name, source=SESSION_NAME_SOURCE_GENERATED))
+        self._interaction.info("Generating a session name...")
+        try:
+            user_message = next(
+                (
+                    message.content
+                    for message in self._session.messages
+                    if isinstance(message, Message) and message.role == "user"
+                ),
+                "",
+            )
+            assistant_message = next(
+                (
+                    message.content
+                    for message in self._session.messages
+                    if isinstance(message, Message) and message.role == "assistant"
+                ),
+                "",
+            )
+            if not user_message or not assistant_message.strip():
+                self._interaction.info("No completed exchange found to generate a session name.")
+                return
+            name = generator.generate(user_message, assistant_message, self._session.model)
+            if name:
+                self._commit(
+                    lambda session: session.rename(name, source=SESSION_NAME_SOURCE_GENERATED)
+                )
+            self._interaction.info(f"Session name: {self._session.name}")
+        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            problem = Problem.from_exception(
+                error,
+                code="session.name_generation_failed",
+                title="Could not generate session name",
+                detail="Could not generate the session name.",
+                severity="warning",
+                retryable=True,
+                operation="generate_session_name",
+            )
+            log_problem(_LOGGER, problem, error)
+            self._interaction.report(problem)
 
     def add_message(self, message: ConversationItem | Response) -> None:
         """Add conversation items and persist the resulting complete session.

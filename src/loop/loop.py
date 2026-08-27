@@ -425,12 +425,7 @@ class Loop:
             return
 
         if self._session_manager.session.has_initial_name():
-            try:
-                self._interaction.info("Generating a session name...")
-                self._session_manager.generate_session_name(self._session_name_generator)
-                self._interaction.info(f"Session name: {self._session_manager.session.name}")
-            except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-                self._interaction.warning(f"Could not generate the session name: {error}")
+            self._session_manager.generate_session_name(self._session_name_generator)
 
     def _recover_session(self) -> bool:
         """Recover a previously interrupted run, if any."""

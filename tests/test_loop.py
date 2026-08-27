@@ -890,6 +890,38 @@ def test_run_does_not_generate_a_name_for_an_already_named_session(tmp_path):
     assert loop.session.name == "My session"
 
 
+def test_run_reports_a_problem_when_automatic_session_naming_fails(tmp_path):
+    """Completed runs report automatic naming failures without interrupting the conversation."""
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", False]
+    generator = Mock()
+    generator.generate.side_effect = RuntimeError("Generator is unavailable")
+    loop = Loop(
+        backend=loop_backend(
+            get_response=Mock(
+                return_value=[
+                    ResponseCompleted(items=(Message(role="assistant", content="answer"),))
+                ]
+            )
+        ),
+        working_directory=tmp_path,
+        interaction=interaction,
+        session_name_generator=generator,
+    )
+
+    loop.run()
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "session.name_generation_failed"
+    assert problem.title == "Could not generate session name"
+    assert problem.detail == "Could not generate the session name."
+    assert problem.severity == "warning"
+    assert problem.retryable is True
+    assert problem.operation == "generate_session_name"
+    interaction.warning.assert_not_called()
+    interaction.conversation_ended.assert_called_once()
+
+
 def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
     """A caller that omits persistence keeps completed queries entirely in memory."""
     interaction = output_interaction()
