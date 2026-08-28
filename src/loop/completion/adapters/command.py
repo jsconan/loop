@@ -1,20 +1,16 @@
-"""Define independently registered interactive completion adapters."""
+"""Complete registered commands and their declarative arguments."""
 
 from __future__ import annotations
 
 import shlex
-import time
-from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from enum import Enum
-from pathlib import Path
 from types import NoneType, UnionType
 from typing import TYPE_CHECKING, Literal, Union, get_args, get_origin
 
 from prompt_toolkit.document import Document
 
-from ..utils.path import iter_visible_paths
-from .models import (
+from ..models import (
     CommandCompletion,
     CompletionMatch,
     CompletionProvider,
@@ -24,248 +20,10 @@ from .models import (
     SchemaCompletionProviderRegistration,
     SchemaCompletionState,
 )
+from .adapter import CompletionAdapter
 
 if TYPE_CHECKING:
-    from ..commands.command import Command
-
-
-class CompletionAdapter(ABC):
-    """Provide candidates for one independently registered completion capability."""
-
-    @property
-    def front_markers(self) -> tuple[str, ...]:
-        """Return symbols that can activate the adapter.
-
-        Returns:
-            tuple[str, ...]: Declared front-marker symbols.
-        """
-        return ()
-
-    @property
-    def keywords(self) -> tuple[str, ...]:
-        """Return leading keywords that can activate the adapter.
-
-        Returns:
-            tuple[str, ...]: Declared activation keywords.
-        """
-        return ()
-
-    @abstractmethod
-    def match(self, document: Document) -> CompletionMatch | None:
-        """Match the input at the cursor and describe its replacement region.
-
-        Args:
-            document (Document): Current editable input and cursor position.
-
-        Returns:
-            CompletionMatch | None: Active match, or ``None`` when the adapter is inactive.
-        """
-
-    @abstractmethod
-    def complete(self, match: CompletionMatch) -> Iterable[CompletionValue]:
-        """Return candidates for an active match.
-
-        Args:
-            match (CompletionMatch): Activation returned by ``match``.
-
-        Returns:
-            Iterable[CompletionValue]: Candidates for the active fragment.
-        """
-
-
-class MarkerCompletionAdapter(CompletionAdapter):
-    """Complete bare, quoted, or bracket-bounded fragments after a configurable marker.
-
-    Args:
-        marker (str): Single non-alphanumeric symbol that activates completion.
-        provider (CompletionProvider): Lazy source of completion candidates.
-
-    Raises:
-        ValueError: If ``marker`` is invalid or a named completion source is invalid or duplicated.
-    """
-
-    _marker: str
-    _provider: CompletionProvider
-
-    def __init__(self, marker: str, provider: CompletionProvider) -> None:
-        if len(marker) != 1 or marker.isalnum() or marker.isspace():
-            raise ValueError("A completion marker must be one non-alphanumeric character.")
-        self._marker = marker
-        self._provider = provider
-
-    @property
-    def front_markers(self) -> tuple[str, ...]:
-        """Return the configured activation marker.
-
-        Returns:
-            tuple[str, ...]: Single configured marker.
-        """
-        return (self._marker,)
-
-    def match(self, document: Document) -> CompletionMatch | None:
-        """Match a bounded marker token before the cursor.
-
-        Args:
-            document (Document): Current editable input and cursor position.
-
-        Returns:
-            CompletionMatch | None: Active bare or unclosed delimited marker fragment, or ``None``
-                outside a marker token.
-        """
-        before = document.text_before_cursor
-        bounded, delimiter = max(
-            ((before.rfind(f"{self._marker}{item}"), item) for item in "[\"'"),
-            key=lambda item: item[0],
-        )
-        if bounded >= 0 and (not bounded or not before[bounded - 1].isalnum()):
-            fragment = self._unclosed_mention_fragment(before, bounded + 2, delimiter)
-            if fragment is not None:
-                return CompletionMatch(
-                    self._decode_mention_fragment(fragment, delimiter),
-                    before[bounded:],
-                    self._marker,
-                )
-        for index in range(len(before) - 1, -1, -1):
-            character = before[index]
-            if character.isspace():
-                return None
-            if character == self._marker:
-                if index and before[index - 1].isalnum():
-                    return None
-                fragment = before[index + 1 :]
-                return CompletionMatch(fragment, f"{self._marker}{fragment}", self._marker)
-        return None
-
-    def complete(self, match: CompletionMatch) -> Iterable[CompletionValue]:
-        """Return values from the bound provider.
-
-        Args:
-            match (CompletionMatch): Active marker match.
-
-        Returns:
-            Iterable[CompletionValue]: Provider values encoded for unambiguous insertion.
-        """
-        delimiter = match.replaced[1:2]
-        if delimiter not in "[\"'":
-            delimiter = ""
-        return tuple(self._mention_completion(value, delimiter) for value in self._provider())
-
-    @staticmethod
-    def _unclosed_mention_fragment(text: str, start: int, delimiter: str) -> str | None:
-        """Return text after an opener unless its unescaped closing delimiter is present."""
-        closing = "]" if delimiter == "[" else delimiter
-        index = start
-        while index < len(text):
-            if text[index] == "\\" and index + 1 < len(text) and text[index + 1] in ("\\", closing):
-                index += 2
-                continue
-            if text[index] == closing:
-                return None
-            index += 1
-        return text[start:]
-
-    @staticmethod
-    def _decode_mention_fragment(fragment: str, delimiter: str) -> str:
-        """Decode supported escapes in an incomplete bounded mention."""
-        closing = "]" if delimiter == "[" else delimiter
-        value = []
-        index = 0
-        while index < len(fragment):
-            character = fragment[index]
-            if (
-                character == "\\"
-                and index + 1 < len(fragment)
-                and fragment[index + 1]
-                in (
-                    "\\",
-                    closing,
-                )
-            ):
-                index += 1
-                character = fragment[index]
-            value.append(character)
-            index += 1
-        return "".join(value)
-
-    @staticmethod
-    def _mention_completion(value: CompletionValue, delimiter: str) -> CompletionValue:
-        """Return a safely bounded insertion value when its text requires one."""
-        if not delimiter and not any(character.isspace() for character in value.value):
-            return value
-        delimiter = delimiter or '"'
-        closing = "]" if delimiter == "[" else delimiter
-        escaped = value.value.replace("\\", "\\\\").replace(closing, f"\\{closing}")
-        return CompletionValue(
-            f"{delimiter}{escaped}{closing}",
-            value.description,
-            value.display or value.value,
-            value.sort_order,
-        )
-
-
-class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
-    """Complete current visible project paths after a marker with a short-lived cache.
-
-    Args:
-        marker (str): Single symbol that activates path completion.
-        working_directory (Path | Callable[[], Path]): Project root or lazy source of its current
-            value.
-        cache_ttl (float): Seconds to reuse a discovered path snapshot. Defaults to ``5.0``;
-            use ``0`` to disable caching.
-
-    Raises:
-        ValueError: If ``cache_ttl`` is negative.
-    """
-
-    _working_directory: Callable[[], Path]
-    _cache_ttl: float
-    _cached_root: Path | None
-    _cached_until: float
-    _cached_values: tuple[CompletionValue, ...]
-
-    def __init__(
-        self,
-        marker: str,
-        working_directory: Path | Callable[[], Path],
-        cache_ttl: float = 5.0,
-    ) -> None:
-        if cache_ttl < 0:
-            raise ValueError("Path completion cache TTL cannot be negative.")
-        self._working_directory = (
-            working_directory if callable(working_directory) else lambda: working_directory
-        )
-        self._cache_ttl = cache_ttl
-        self._cached_root = None
-        self._cached_until = 0.0
-        self._cached_values = ()
-        super().__init__(marker, self.values)
-
-    def values(self) -> tuple[CompletionValue, ...]:
-        """Return a current snapshot of visible project paths.
-
-        Returns:
-            tuple[CompletionValue, ...]: Cached or newly discovered project-relative paths.
-        """
-        root = self._working_directory().resolve()
-        now = time.monotonic()
-        if root == self._cached_root and now < self._cached_until:
-            return self._cached_values
-        if not root.is_dir():
-            values = ()
-        else:
-            discovered = []
-            for path in iter_visible_paths(root, recursive=True):
-                relative = path.relative_to(root).as_posix()
-                if path.is_dir():
-                    relative += "/"
-                discovered.append(
-                    CompletionValue(relative, "directory" if path.is_dir() else "file")
-                )
-            values = tuple(discovered)
-        self._cached_root = root
-        self._cached_until = time.monotonic() + self._cache_ttl
-        self._cached_values = values
-        return values
+    from ...commands.command import Command
 
 
 class CommandCompletionAdapter(CompletionAdapter):
@@ -379,9 +137,7 @@ class CommandCompletionAdapter(CompletionAdapter):
         body = before[len(self._marker) :]
         commands = tuple(self._commands())
         if not any(character.isspace() for character in body):
-            values = tuple(
-                CompletionValue(command.name, command.description) for command in commands
-            )
+            values = tuple(CompletionValue(command.name, command.description) for command in commands)
             return CompletionMatch(body, before, self._marker, values)
 
         parts = body.split(maxsplit=1)
@@ -449,12 +205,7 @@ class CommandCompletionAdapter(CompletionAdapter):
             values.extend(provider())
         return tuple(values)
 
-    def _match_model_arguments(
-        self,
-        model,
-        arguments: str,
-        before: str,
-    ) -> CompletionMatch | None:
+    def _match_model_arguments(self, model, arguments: str, before: str) -> CompletionMatch | None:
         """Match positional or named input against a Pydantic model schema."""
         try:
             tokens = shlex.split(arguments)
@@ -469,10 +220,7 @@ class CommandCompletionAdapter(CompletionAdapter):
                 if name not in fields or name in assigned:
                     return None
             else:
-                name = next(
-                    (field_name for field_name in fields if field_name not in assigned),
-                    "",
-                )
+                name = next((field_name for field_name in fields if field_name not in assigned), "")
                 if not name:
                     return None
             assigned.add(name)
@@ -485,9 +233,7 @@ class CommandCompletionAdapter(CompletionAdapter):
             if grammar is None:
                 return None
             return CompletionMatch(
-                value_fragment,
-                fragment,
-                state=SchemaCompletionState(grammar, f"{name}="),
+                value_fragment, fragment, state=SchemaCompletionState(grammar, f"{name}=")
             )
 
         remaining = [field_name for field_name in fields if field_name not in assigned]

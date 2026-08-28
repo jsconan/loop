@@ -1,4 +1,4 @@
-"""Tests for declarative interactive completion adapters."""
+"""Tests for command completion."""
 
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -11,15 +11,11 @@ from loop import (
     Command,
     CommandCompletion,
     CommandCompletionAdapter,
-    CompletionAdapter,
     CompletionManager,
     CompletionMatch,
     CompletionProviderRegistration,
     CompletionValue,
-    MarkerCompletionAdapter,
-    ProjectPathCompletionAdapter,
     SchemaCompletionProviderRegistration,
-    Skill,
 )
 from loop.commands.utils import get_command_arguments_model
 
@@ -61,14 +57,7 @@ def command_completer(
                 ),
             )
 
-    return CompletionManager(
-        (
-            CommandCompletionAdapter(
-                lambda: commands,
-                providers=(Provider(),),
-            ),
-        )
-    )
+    return CompletionManager((CommandCompletionAdapter(lambda: commands, providers=(Provider(),)),))
 
 
 def test_command_names_match_fragments_and_replace_the_complete_slash_token():
@@ -103,11 +92,7 @@ def test_schema_completion_infers_enum_literal_union_and_boolean_values():
 
     assert [item.text for item in complete(completer, "/mode work")] == ["workspace_write"]
     assert [item.text for item in complete(completer, "/level h")] == ["high"]
-    assert [item.text for item in complete(completer, "/enabled ")] == [
-        "false",
-        "true",
-        "value=",
-    ]
+    assert [item.text for item in complete(completer, "/enabled ")] == ["false", "true", "value="]
 
 
 def test_schema_completion_accepts_annotated_dynamic_metadata():
@@ -137,11 +122,7 @@ def test_schema_completion_offers_named_fields_and_tracks_positional_binding():
     completer = command_completer(command_for(text), command_for(pair))
 
     assert [item.text for item in complete(completer, "/text ")] == ["value="]
-    assert [item.text for item in complete(completer, "/pair ")] == [
-        "a",
-        "first=",
-        "second=",
-    ]
+    assert [item.text for item in complete(completer, "/pair ")] == ["a", "first=", "second="]
     assert [item.text for item in complete(completer, "/pair a ")] == ["b", "second="]
     assert [item.text for item in complete(completer, "/pair second=b ")] == ["a", "first="]
     assert [item.text for item in complete(completer, "/pair second=")] == ["second=b"]
@@ -156,10 +137,7 @@ def test_schema_completion_offers_named_fields_and_tracks_positional_binding():
 def test_nested_command_completion_uses_dynamic_values_and_continuations():
     """A declarative grammar follows selected branches and runtime provider values."""
     final = CommandCompletion(values=(CompletionValue("last", "final value"),))
-    dynamic = CommandCompletion(
-        provider="tools",
-        next=final,
-    )
+    dynamic = CommandCompletion(provider="tools", next=final)
     grammar = CommandCompletion(values=(CompletionValue("add"),), children={"add": dynamic})
 
     def configure(value: str) -> None:
@@ -186,8 +164,7 @@ def test_nested_command_completion_switches_to_a_selected_dynamic_schema():
         """Define selected tool arguments."""
 
     grammar = CommandCompletion(
-        provider="tools",
-        next=CommandCompletion(schema_provider="tool_arguments"),
+        provider="tools", next=CommandCompletion(schema_provider="tool_arguments")
     )
     completer = command_completer(
         command_for(invoke, completion=grammar),
@@ -200,11 +177,7 @@ def test_nested_command_completion_switches_to_a_selected_dynamic_schema():
             )
         },
     )
-
-    assert [item.text for item in complete(completer, "/invoke selected ")] == [
-        "count=",
-        "mode=",
-    ]
+    assert [item.text for item in complete(completer, "/invoke selected ")] == ["count=", "mode="]
     assert [item.text for item in complete(completer, "/invoke selected 2 mode=f")] == [
         "mode=fast",
         "mode=safe",
@@ -244,12 +217,10 @@ def test_command_adapter_validates_named_provider_registrations():
     adapter = CommandCompletionAdapter(lambda: (), providers=(object(),))
     with pytest.raises(ValueError, match="must not be empty"):
         adapter.register(CompletionProviderRegistration("", lambda: ()))
-
     registration = CompletionProviderRegistration("values", lambda: ())
     adapter.register_provider(Provider(registration))
     with pytest.raises(ValueError, match="already registered"):
         adapter.register_providers((Provider(registration),))
-
     schema = SchemaCompletionProviderRegistration("values", lambda _tokens: None)
     adapter.register(schema)
     with pytest.raises(ValueError, match="already registered"):
@@ -272,117 +243,20 @@ def test_invalid_command_paths_quotes_and_provider_failures_return_no_values():
         """Choose a value."""
 
     completer = command_completer(command_for(choose, completion=grammar))
-
     assert complete(completer, "/missing ") == []
     assert complete(completer, '/choose "') == []
     assert complete(completer, "/choose unknown ") == []
     assert complete(completer, "/choose known ") == []
 
 
-def test_skill_mentions_work_in_prose_and_require_a_token_boundary(tmp_path):
-    """Skill mentions replace only an active bounded token and expose descriptions."""
-    skill = Skill("coding", "Implement Python code.", tmp_path / "SKILL.md")
-    completer = CompletionManager(
-        (MarkerCompletionAdapter("$", lambda: (CompletionValue(skill.name, skill.description),)),)
-    )
-
-    results = complete(completer, "Please use ($din")
-
-    assert [(item.text, item.start_position) for item in results] == [("$coding", -4)]
-    assert results[0].display_meta_text == "Implement Python code."
-    assert complete(completer, "price$din") == []
-    assert complete(completer, "plain text") == []
-
-
-def test_marker_completion_quotes_spaces_and_continues_inside_delimiters():
-    """Multi-word targets insert quotes and remain completable inside supported delimiters."""
-    completer = CompletionManager(
-        (MarkerCompletionAdapter("$", lambda: (CompletionValue("code review"),)),)
-    )
-
-    bare = complete(completer, "Use $code")
-    quoted = complete(completer, 'Use $"code rev')
-    single_quoted = complete(completer, "Use $'code rev")
-    bracketed = complete(completer, "Use $[code rev")
-
-    assert [(item.text, item.start_position) for item in bare] == [('$"code review"', -5)]
-    assert [(item.text, item.start_position) for item in quoted] == [('$"code review"', -10)]
-    assert [(item.text, item.start_position) for item in single_quoted] == [("$'code review'", -10)]
-    assert [(item.text, item.start_position) for item in bracketed] == [("$[code review]", -10)]
-    assert complete(completer, 'Use $"code review"') == []
-    assert complete(completer, "Use $[code review]") == []
-
-    escaped = CompletionManager(
-        (MarkerCompletionAdapter("$", lambda: (CompletionValue('say "hi" \\ now'),)),)
-    )
-    assert [item.text for item in complete(escaped, r'Use $"say \"hi\" \\ n')] == [
-        '$"say \\"hi\\" \\\\ now"'
-    ]
-
-
-def test_project_path_completion_caches_paths_until_ttl_expires(monkeypatch, tmp_path):
-    """Project path completion reuses short-lived snapshots and refreshes after expiry."""
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "app.py").write_text("", encoding="utf-8")
-    (tmp_path / "ignored.py").write_text("", encoding="utf-8")
-    (tmp_path / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
-    current = [tmp_path]
-    now = [10.0]
-    monkeypatch.setattr("loop.completion.adapters.time.monotonic", lambda: now[0])
-    completer = CompletionManager((ProjectPathCompletionAdapter("@", lambda: current[0]),))
-
-    assert [item.text for item in complete(completer, "@app")] == ["@src/app.py"]
-    (tmp_path / "new.py").write_text("", encoding="utf-8")
-    assert complete(completer, "@new") == []
-    now[0] += 5.0
-    assert [item.text for item in complete(completer, "@new")] == ["@new.py"]
-    assert complete(completer, "@ignored") == []
-    current[0] = tmp_path / "missing"
-    assert complete(completer, "@") == []
-
-
-def test_project_path_completion_can_disable_cache_and_rejects_negative_ttl(tmp_path):
-    """A zero TTL always refreshes paths while negative durations are invalid."""
-    adapter = ProjectPathCompletionAdapter("@", tmp_path, cache_ttl=0)
-    completer = CompletionManager((adapter,))
-
-    assert complete(completer, "@new") == []
-    (tmp_path / "new.py").write_text("", encoding="utf-8")
-    assert [item.text for item in complete(completer, "@new")] == ["@new.py"]
-    with pytest.raises(ValueError, match="cannot be negative"):
-        ProjectPathCompletionAdapter("@", tmp_path, cache_ttl=-1)
-
-
-def test_adapter_declarations_expose_markers_and_dynamic_keywords():
-    """Adapters declare their activators without manager-specific domain knowledge."""
-
-    class KeywordAdapter(CompletionAdapter):
-        def match(self, document):
-            """Remain inactive for this declaration-only capability."""
-            return
-
-        def complete(self, match):
-            """Return no values for this declaration-only capability."""
-            return ()
-
+def test_command_adapter_declarations_expose_markers_and_dynamic_keywords():
+    """Command adapters declare their marker and current command names."""
     commands = [command_for(lambda: None)]
-    command_adapter = CommandCompletionAdapter(lambda: commands)
-    marker_adapter = MarkerCompletionAdapter("$", lambda: ())
+    adapter = CommandCompletionAdapter(lambda: commands)
 
-    assert KeywordAdapter().front_markers == ()
-    assert KeywordAdapter().keywords == ()
-    assert marker_adapter.front_markers == ("$",)
-    assert command_adapter.front_markers == ("/",)
-    assert command_adapter.keywords == ("<lambda>",)
-    assert command_adapter.complete(CompletionMatch("", "")) == ()
-    assert complete(CompletionManager((marker_adapter, command_adapter)), "plain") == []
-
-
-@pytest.mark.parametrize("marker", ["ab", "a", " "])
-def test_marker_adapters_reject_invalid_markers(marker):
-    """Marker capabilities reject ambiguous alphanumeric activators."""
-    with pytest.raises(ValueError, match="one non-alphanumeric"):
-        MarkerCompletionAdapter(marker, lambda: ())
+    assert adapter.front_markers == ("/",)
+    assert adapter.keywords == ("<lambda>",)
+    assert adapter.complete(CompletionMatch("", "")) == ()
 
 
 @pytest.mark.parametrize("marker", ["ab", "a", " "])
