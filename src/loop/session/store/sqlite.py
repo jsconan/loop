@@ -7,9 +7,9 @@ from pathlib import Path
 from uuid import uuid7
 
 from ...models import Message
-from ..models import SESSION_NAME_SOURCE_INITIAL, SessionInfo
+from ..models import SESSION_NAME_SOURCE_INITIAL, SessionInfo, SessionNotFoundError
 from ..naming import initial_session_name
-from ..session import Session, SessionNotFoundError
+from ..session import Session
 
 
 class SQLiteSessionStore:

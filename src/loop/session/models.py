@@ -21,6 +21,14 @@ SESSION_NAME_SOURCES: set[SessionNameSource] = {
 }
 
 
+class SessionNotFoundError(ValueError):
+    """Report that a requested persisted session does not exist."""
+
+
+class UnsupportedConversationItemError(ValueError):
+    """Report an unsupported conversation item type in a serialized context."""
+
+
 class GeneratedSessionName(BaseModel):
     """Validate structured output from the auxiliary title request."""
 

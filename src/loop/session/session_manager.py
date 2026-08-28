@@ -58,8 +58,8 @@ from .models import (
     ToolExecutionStartedEvent,
 )
 from .naming import initial_session_name
-from .session import Session, SessionStore
-from .store import MemorySessionStore
+from .session import Session
+from .store import MemorySessionStore, SessionStore
 
 _LOGGER = logging.getLogger(__name__)
 

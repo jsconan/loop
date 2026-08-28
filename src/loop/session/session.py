@@ -35,6 +35,7 @@ from .models import (
     SessionRecoveryState,
     ToolExecutionCompletedEvent,
     ToolExecutionStartedEvent,
+    UnsupportedConversationItemError,
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
@@ -47,14 +48,6 @@ _ITEM_TYPES = {
     "tool_result": ToolResult,
 }
 _TYPE_NAMES = {model: name for name, model in _ITEM_TYPES.items()}
-
-
-class SessionNotFoundError(ValueError):
-    """Report that a requested persisted session does not exist."""
-
-
-class UnsupportedConversationItemError(ValueError):
-    """Report an unsupported conversation item type in a serialized context."""
 
 
 @dataclass
