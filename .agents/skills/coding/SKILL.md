@@ -71,6 +71,24 @@ After implementing, compare each added or changed callable's docstring with its 
 return and yield paths, and explicit exceptions. Update stale documentation on the affected public
 surface without rewriting unrelated docstrings.
 
+## Preserve observability
+
+Preserve observability when changing operational activity, failures, auditable decisions or state
+changes, and execution boundaries.
+
+- Instrument through the process-wide `loop.telemetry` facade and use `telemetry_span` for operation
+  boundaries. Preserve existing correlation context; do not instantiate adapters or write storage
+  from call sites.
+- Report operational failures once, at the boundary that owns or handles them, through
+  `loop.errors.log_problem`. Keep this path independent of telemetry, isolate telemetry failures
+  from application behavior, and do not report expected control flow as errors.
+- Keep activity, error, and audit records sanitized and free of execution content or credentials.
+  Record full execution data only in traces at the owning boundary. At model boundaries, apply
+  `ModelInputPolicy` before transmission and trace the exact prepared input, excluding transport
+  credentials.
+- Audit security-relevant decisions and durable state changes. When observability behavior changes,
+  test the affected disclosure boundary, correlation, failure isolation, and outcomes.
+
 ## Verify the change
 
 Define an observable success criterion. Include docstring completeness in the check whenever a

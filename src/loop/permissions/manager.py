@@ -531,9 +531,7 @@ class PermissionManager:
         if scope is PolicyScope.SESSION:
             changed = self._session_overrides.defaults.pop(action, None) is not None
             if changed:
-                self._audit_policy_change(
-                    "permission.default_reset", scope, action=action.value
-                )
+                self._audit_policy_change("permission.default_reset", scope, action=action.value)
             return changed
         default = PermissionConfiguration().defaults[action]
         if self._configuration.defaults.get(action, Decision.DENY) is default:
@@ -599,9 +597,7 @@ class PermissionManager:
                 if scope is PolicyScope.WORKSPACE:
                     updated = self._configuration.model_copy(update={"rules": rules}, deep=True)
                     self._replace_configuration(updated)
-                self._audit_policy_change(
-                    "permission.rule_removed", scope, rule_id=rule_id
-                )
+                self._audit_policy_change("permission.rule_removed", scope, rule_id=rule_id)
                 return True
         return False
 
@@ -714,9 +710,7 @@ class PermissionManager:
             self._session_overrides.limits = self._session_overrides.limits.model_copy(
                 update={name: value}
             )
-        self._audit_policy_change(
-            "permission.limit_set", scope, limit=name, enabled=value
-        )
+        self._audit_policy_change("permission.limit_set", scope, limit=name, enabled=value)
 
     def update_limit_values(
         self,

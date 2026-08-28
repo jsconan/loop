@@ -137,7 +137,9 @@ class CommandCompletionAdapter(CompletionAdapter):
         body = before[len(self._marker) :]
         commands = tuple(self._commands())
         if not any(character.isspace() for character in body):
-            values = tuple(CompletionValue(command.name, command.description) for command in commands)
+            values = tuple(
+                CompletionValue(command.name, command.description) for command in commands
+            )
             return CompletionMatch(body, before, self._marker, values)
 
         parts = body.split(maxsplit=1)
