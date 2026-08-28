@@ -10,6 +10,7 @@ __all__ = [
     "ShutdownRequested",
     "TextSearchContext",
     "TextSearchMatch",
+    "as_utc",
     "bound_tool_result",
     "cached_metadata",
     "cached_path",
@@ -28,6 +29,7 @@ __all__ = [
     "is_path_ignored",
     "iter_visible_paths",
     "kill_process_group",
+    "local_now",
     "normalized_key",
     "parse_command_line",
     "payload_digest",
@@ -41,6 +43,7 @@ __all__ = [
     "sha256_digest",
     "store_content",
     "store_text_stream",
+    "utc_now",
     "write_text_atomically",
 ]
 
@@ -57,6 +60,7 @@ from .content import (
     store_content,
     store_text_stream,
 )
+from .dates import as_utc, local_now, utc_now
 from .files import is_binary_file, write_text_atomically
 from .hashing import payload_digest, sha256_digest
 from .models import (

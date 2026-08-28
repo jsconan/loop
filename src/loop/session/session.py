@@ -19,6 +19,7 @@ from ..models import (
     ToolCall,
     ToolResult,
 )
+from ..utils import utc_now
 from .models import (
     SESSION_NAME_SOURCE_INITIAL,
     SESSION_NAME_SOURCE_USER,
@@ -112,7 +113,7 @@ class Session:
     def __post_init__(self) -> None:
         if self.events:
             return
-        created_at = datetime.now(UTC)
+        created_at = utc_now()
         checkpoints = {
             compaction.boundary: index for index, compaction in enumerate(self.compactions)
         }
@@ -247,7 +248,7 @@ class Session:
         self.events.append(
             ConversationItemEvent(
                 id=str(uuid7()),
-                created_at=datetime.now(UTC),
+                created_at=utc_now(),
                 item_index=item_index,
             )
         )
@@ -271,7 +272,7 @@ class Session:
         self.events.append(
             CompactionEvent(
                 id=str(uuid7()),
-                created_at=datetime.now(UTC),
+                created_at=utc_now(),
                 compaction_index=len(self.compactions) - 1,
             )
         )

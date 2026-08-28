@@ -1,7 +1,7 @@
 """Tests for session state, serialization, and persistence contracts."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -464,6 +464,32 @@ def test_session_upcasts_version_five_run_metrics_without_rewriting_history():
     restored_metrics = restored.events[1].metrics
     assert restored_metrics.active_duration_seconds == 3
     assert restored_metrics.elapsed_duration_seconds == 8
+
+
+def test_session_serialization_normalizes_durable_event_timestamps_to_utc():
+    """Durable event timestamps are persisted in UTC regardless of their input offset."""
+    offset_time = datetime(2026, 8, 20, 12, tzinfo=timezone(timedelta(hours=2)))
+    session = Session(messages=[Message(role="user", content="question")])
+    session.events.append(
+        RunCompletedEvent(
+            id="run",
+            created_at=offset_time,
+            started_at=offset_time,
+            stop_reason="completed",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=0,
+                item_count=0,
+            ),
+        )
+    )
+
+    event = json.loads(session.serialize())["events"][1]
+
+    assert event["created_at"] == "2026-08-20T10:00:00Z"
+    assert event["started_at"] == "2026-08-20T10:00:00Z"
 
 
 def test_session_rejects_malformed_version_five_run_metrics():

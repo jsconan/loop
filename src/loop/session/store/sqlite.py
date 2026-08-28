@@ -2,11 +2,12 @@
 
 import sqlite3
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid7
 
 from ...models import Message
+from ...utils import utc_now
 from ..models import SESSION_NAME_SOURCE_INITIAL, SessionInfo, SessionNotFoundError
 from ..naming import initial_session_name
 from ..session import Session
@@ -49,7 +50,7 @@ class SQLiteSessionStore:
             session.name = initial_session_name()
             session.name_source = SESSION_NAME_SOURCE_INITIAL
 
-        now = datetime.now(UTC).isoformat()
+        now = utc_now().isoformat()
         payload = session.serialize()
         with closing(sqlite3.connect(self._path)) as connection:  # noqa: SIM117
             with connection:

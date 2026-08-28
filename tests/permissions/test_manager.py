@@ -2,7 +2,7 @@
 
 import json
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -237,7 +237,7 @@ def test_workspace_approval_persists_exact_rules_and_audit_metadata(tmp_path):
     stored = json.loads(
         (tmp_path / ".loop" / "permissions-audit.jsonl").read_text("utf-8").splitlines()[0]
     )
-    assert datetime.fromisoformat(stored["timestamp"]).tzinfo is not None
+    assert datetime.fromisoformat(stored["timestamp"]).tzinfo is UTC
     assert stored["audit_schema_version"] == 1
     assert stored["event_name"] == "permission.decided"
     assert stored["approval_choice"] == "workspace"
@@ -265,7 +265,7 @@ def test_policy_mutations_write_timestamped_local_and_structured_audit_records(t
         (tmp_path / ".loop" / "permissions-audit.jsonl").read_text("utf-8").splitlines()[0]
     )
     assert record["event_name"] == "permission.default_set"
-    assert datetime.fromisoformat(record["timestamp"]).tzinfo is not None
+    assert datetime.fromisoformat(record["timestamp"]).tzinfo is UTC
     assert adapter.records[0].event_name == "permission.default_set"
     assert adapter.records[0].attributes["scope"] == "session"
 

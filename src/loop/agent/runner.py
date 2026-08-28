@@ -3,7 +3,7 @@
 import json
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from time import perf_counter, sleep
 
@@ -28,6 +28,7 @@ from ..session import SessionManager, SessionRecoveryState
 from ..skills import InstructionsManager
 from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
 from ..tooling.utils import serialize_tool_problem
+from ..utils import utc_now
 from .agent import Agent
 from .models import AgentRecoveryStatus, AgentRunResult
 
@@ -178,7 +179,7 @@ class AgentRunner:
                 final_response=None,
                 turns=0,
                 stop_reason="completed",
-                started_at=datetime.now(UTC),
+                started_at=utc_now(),
                 calls=[],
                 tools=[],
             )
@@ -208,7 +209,7 @@ class AgentRunner:
         response = None
         calls = []
         tools = list(tools or ())
-        started_at = datetime.now(UTC)
+        started_at = utc_now()
         while True:
             turn += 1
 

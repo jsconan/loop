@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Literal, Protocol, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .. import constants
 from ..models import AgentRunStopReason, CompactionContextItem, RunMetrics, ToolCall
 from ..permissions import AuthorizationResult
+from ..utils import as_utc
 
 SessionNameSource = Literal["initial", "generated", "user"]
 SESSION_NAME_SOURCE_INITIAL: SessionNameSource = "initial"
@@ -78,6 +79,8 @@ class Compaction(BaseModel):
     input_tokens_before: int | None = Field(default=None, ge=0)
     input_tokens_after: int | None = Field(default=None, ge=0)
 
+    _normalize_created_at = field_validator("created_at")(as_utc)
+
 
 class SessionEventModel(BaseModel):
     """Provide identity and time shared by durable session events.
@@ -89,6 +92,8 @@ class SessionEventModel(BaseModel):
 
     id: str
     created_at: datetime
+
+    _normalize_created_at = field_validator("created_at")(as_utc)
 
 
 class ConversationItemEvent(SessionEventModel):
@@ -129,6 +134,8 @@ class RunCompletedEvent(SessionEventModel):
     stop_reason: AgentRunStopReason
     started_at: datetime
     metrics: RunMetrics
+
+    _normalize_started_at = field_validator("started_at")(as_utc)
 
 
 class ToolExecutionStartedEvent(SessionEventModel):

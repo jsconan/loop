@@ -11,7 +11,6 @@ import logging
 import shlex
 import tempfile
 from collections.abc import Iterable
-from datetime import datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -22,7 +21,7 @@ import yaml
 from .. import constants
 from ..errors import Problem, log_problem
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
-from ..utils import ShutdownRequested, canonical_path, sha256_digest
+from ..utils import ShutdownRequested, canonical_path, local_now, sha256_digest, utc_now
 from .models import (
     Action,
     ApprovalChoice,
@@ -845,7 +844,7 @@ class PermissionManager:
             raise ValueError("An in-memory PermissionManager cannot reset configuration.")
         backup_path = None
         if self._configuration_path.exists():
-            timestamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%f%z")
+            timestamp = local_now().strftime("%Y%m%dT%H%M%S%f%z")
             backup_path = self._configuration_path.with_name(
                 f"{self._configuration_path.name}.{timestamp}.bak"
             )
@@ -1458,7 +1457,7 @@ class PermissionManager:
             **payload,
             "audit_schema_version": 1,
             "event_name": event_name,
-            "timestamp": datetime.now().astimezone().isoformat(),
+            "timestamp": utc_now().isoformat(),
         }
         try:
             audit_path.parent.mkdir(parents=True, exist_ok=True)

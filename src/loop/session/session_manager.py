@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import fields
-from datetime import UTC, datetime
+from datetime import datetime
 from uuid import uuid4, uuid7
 
 from .. import constants
@@ -50,6 +50,7 @@ from ..utils import (
     register_cached_metadata,
     sha256_digest,
     store_text_stream,
+    utc_now,
 )
 from .models import (
     SESSION_NAME_SOURCE_GENERATED,
@@ -389,7 +390,7 @@ class SessionManager:
         compaction = Compaction(
             id=str(uuid7()),
             boundary=len(self._session.messages),
-            created_at=datetime.now(UTC),
+            created_at=utc_now(),
             provider=provider,
             model=model,
             context=result.items,
@@ -601,7 +602,7 @@ class SessionManager:
                 session.events.append(
                     ToolExecutionCompletedEvent(
                         id=str(uuid7()),
-                        created_at=datetime.now(UTC),
+                        created_at=utc_now(),
                         call_id=call_id,
                         succeeded=succeeded,
                         duration_seconds=duration_seconds,
@@ -636,9 +637,7 @@ class SessionManager:
         ):
             raise ValueError(f"Unknown tool call '{call_id}'.")
         self._persist_event(
-            ToolExecutionStartedEvent(
-                id=str(uuid7()), created_at=datetime.now(UTC), call_id=call_id
-            )
+            ToolExecutionStartedEvent(id=str(uuid7()), created_at=utc_now(), call_id=call_id)
         )
 
     @staticmethod
@@ -691,7 +690,7 @@ class SessionManager:
         """
         event = PermissionEvent(
             id=str(uuid7()),
-            created_at=datetime.now(UTC),
+            created_at=utc_now(),
             result=result,
         )
         self._persist_event(event)
@@ -714,7 +713,7 @@ class SessionManager:
         """
         event = RunCompletedEvent(
             id=str(uuid7()),
-            created_at=datetime.now(UTC),
+            created_at=utc_now(),
             stop_reason=stop_reason,
             started_at=started_at,
             metrics=metrics,

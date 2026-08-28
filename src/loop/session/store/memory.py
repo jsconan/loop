@@ -1,8 +1,8 @@
 """Persist session snapshots in memory."""
 
-from datetime import UTC, datetime
 from uuid import uuid7
 
+from ...utils import utc_now
 from ..models import SESSION_NAME_SOURCE_INITIAL, SessionInfo, SessionNotFoundError, StoredSession
 from ..naming import initial_session_name
 from ..session import Session
@@ -33,7 +33,7 @@ class MemorySessionStore:
         if session.name is None:
             session.name = initial_session_name()
             session.name_source = SESSION_NAME_SOURCE_INITIAL
-        now = datetime.now(UTC)
+        now = utc_now()
 
         stored_session = self._find_session(session.id)
         if stored_session:
