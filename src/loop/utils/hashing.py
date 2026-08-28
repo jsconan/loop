@@ -1,5 +1,6 @@
 """Provide general hashing utilities."""
 
+import json
 from hashlib import sha256
 
 
@@ -14,3 +15,16 @@ def sha256_digest(content: str | bytes) -> str:
     """
     encoded = content.encode("utf-8") if isinstance(content, str) else content
     return sha256(encoded).hexdigest()
+
+
+def payload_digest(payload: object) -> str:
+    """Return the digest of one canonical JSON payload.
+
+    Args:
+        payload (object): JSON-compatible value to serialize canonically.
+
+    Returns:
+        str: Lowercase SHA-256 hexadecimal digest.
+    """
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return sha256_digest(canonical)

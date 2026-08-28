@@ -6,6 +6,7 @@ __all__ = [
     "ChoiceItem",
     "IgnoreRule",
     "IgnoreRules",
+    "Scalar",
     "ShutdownRequested",
     "TextSearchContext",
     "TextSearchMatch",
@@ -27,12 +28,15 @@ __all__ = [
     "is_path_ignored",
     "iter_visible_paths",
     "kill_process_group",
+    "normalized_key",
     "parse_command_line",
+    "payload_digest",
     "read_bounded_stream",
     "read_bounded_text",
     "register_cached_metadata",
     "register_shutdown_signals",
     "ripgrep_path",
+    "safe_scalar",
     "search_text_paths",
     "sha256_digest",
     "store_content",
@@ -54,16 +58,18 @@ from .content import (
     store_text_stream,
 )
 from .files import is_binary_file, write_text_atomically
-from .hashing import sha256_digest
+from .hashing import payload_digest, sha256_digest
 from .models import (
     BoundedTextContent,
     CachedContentMetadata,
     ChoiceItem,
     IgnoreRule,
     IgnoreRules,
+    Scalar,
     TextSearchContext,
     TextSearchMatch,
 )
+from .normalization import normalized_key, safe_scalar
 from .path import (
     canonical_path,
     filter_paths_by_globs,

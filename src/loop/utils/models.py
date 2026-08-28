@@ -6,6 +6,7 @@ from typing import Literal, NotRequired, TypedDict
 
 from pathspec import GitIgnoreSpec
 
+type Scalar = str | int | float | bool | None
 type IgnoreRule = tuple[Path, GitIgnoreSpec]
 type IgnoreRules = dict[str, list[IgnoreRule]]
 
