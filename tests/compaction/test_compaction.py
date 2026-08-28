@@ -17,6 +17,7 @@ from loop import (
     SessionManager,
     Usage,
 )
+from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 
 
 def compaction_feature(
@@ -96,10 +97,23 @@ def test_compaction_reports_backend_that_cannot_produce_context(unsupported):
     )
     session = Session(messages=[Message(role="user", content="hello")], tokens=80)
     feature, _, _, interaction = compaction_feature(session=session, compact=compact)
+    telemetry = Telemetry(MemoryTelemetryAdapter(), flush_seconds=0.01)
+    if unsupported != "no_items":
+        set_telemetry(telemetry)
 
-    assert feature.compact_if_needed() is False
+    try:
+        assert feature.compact_if_needed() is False
+    finally:
+        telemetry.close(1)
+        set_telemetry(None)
     assert session.compactions == []
     assert interaction.warning.call_args.args[0].startswith("The selected backend")
+    if unsupported == "error":
+        unobserved, _, _, _ = compaction_feature(
+            session=Session(messages=[Message(role="user", content="hello")], tokens=80),
+            compact=Mock(side_effect=NotImplementedError),
+        )
+        assert unobserved.compact_if_needed() is False
 
 
 def test_compaction_persists_replacement_context_and_reports_usage():
@@ -118,8 +132,14 @@ def test_compaction_persists_replacement_context_and_reports_usage():
         session=session,
         compact=compact,
     )
+    telemetry = Telemetry(MemoryTelemetryAdapter(), flush_seconds=0.01)
+    set_telemetry(telemetry)
 
-    assert feature.compact_if_needed() is True
+    try:
+        assert feature.compact_if_needed() is True
+    finally:
+        telemetry.close(1)
+        set_telemetry(None)
 
     assert session.messages == [message]
     assert manager.model_context == [item]

@@ -47,6 +47,7 @@ from loop import (
     tool,
 )
 from loop.permissions import PermissionLoadFailure
+from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 
 
 def function_call() -> ToolCall:
@@ -869,6 +870,26 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
     ]
     assert loop.session.tokens == 9
     assert loop.session.model == "served-model"
+
+
+def test_loop_correlates_message_and_run_activity_with_a_provisional_session(tmp_path):
+    """A new unpersisted session receives telemetry correlation without early session storage."""
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", False]
+    backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted()]))
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    try:
+        Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    message = next(record for record in adapter.records if record.event_name == "message.accepted")
+    assert message.session_id.startswith("provisional_")
+    assert message.message_sequence == 0
+    assert message.trace_id is not None
 
 
 def test_run_does_not_generate_a_name_for_an_already_named_session(tmp_path):

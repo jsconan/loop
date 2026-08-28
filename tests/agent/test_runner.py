@@ -19,6 +19,7 @@ from loop import (
     ToolExecutionMetrics,
     Usage,
 )
+from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 
 
 def agent_runner(*, responses, max_turns=25):
@@ -66,6 +67,40 @@ def test_runner_returns_the_first_final_response():
     sessions.add_response.assert_called_once_with(response)
     sessions.record_run.assert_called_once()
     assert result.metrics is sessions.record_run.call_args.args[2]
+
+
+def test_runner_records_run_and_tool_execution_traces():
+    """Configured telemetry covers run boundaries and exact tool requests and responses."""
+    response = Response(
+        answer="",
+        reasoning="",
+        tool_calls=(ToolCall(call_id="call", name="demo", arguments='{"value":1}'),),
+    )
+    final = Response(answer="done", reasoning="")
+    runner, _, _ = agent_runner(responses=[response, final])
+    runner.agent.tool_registry.call_with_timing.return_value = ('{"ok":true}', 0.2)
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+
+    try:
+        result = runner.run()
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    assert result.stop_reason == "completed"
+    assert [record.event_name for record in adapter.records] == [
+        "agent.run.started",
+        "tool.request",
+        "tool.response",
+        "agent.run.completed",
+    ]
+    started, request, response_record, completed = adapter.records
+    assert started.span_id == completed.span_id
+    assert request.span_id == response_record.span_id
+    assert request.parent_span_id == started.span_id
+    assert request.span_id != started.span_id
 
 
 def test_runner_recovers_a_model_boundary_without_adding_user_input():

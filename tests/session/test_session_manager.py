@@ -51,6 +51,7 @@ from loop.session import (
     ToolExecutionStartedEvent,
 )
 from loop.session import session_manager as session_manager_module
+from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.utils import cached_metadata, cached_path, store_content
 
 
@@ -474,7 +475,8 @@ def test_manager_reports_name_generation_failures(monkeypatch):
     assert problem.operation == "generate_session_name"
     assert session.name == "Please review this app"
     interaction.info.assert_called_once_with("Generating a session name...")
-    assert logger.log.call_args.kwargs["exc_info"][1] is error
+    assert logger.log.call_args.kwargs["extra"]["exception.type"] == "builtins.RuntimeError"
+    assert "exc_info" not in logger.log.call_args.kwargs
 
 
 def test_manager_keeps_provisional_name_without_a_usable_exchange_or_generated_name():
@@ -854,3 +856,30 @@ def test_manager_rolls_back_every_mutation_when_persistence_fails(kind):
 
     assert session.events == []
     assert session.messages == [ToolCall(call_id="call", name="demo", arguments="{}")]
+
+
+def test_manager_records_persistence_binding_and_failure_without_changing_atomicity():
+    """Session persistence emits assignment audit and isolated failure diagnostics."""
+    store = Mock(spec=SessionStore)
+    store.save.side_effect = lambda session: setattr(session, "id", "session-id")
+    manager = SessionManager(session_store=store)
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    try:
+        manager.add_message(Message(role="assistant", content="complete"))
+        store.save.side_effect = OSError("disk full")
+        with pytest.raises(OSError, match="disk full"):
+            manager.add_message(Message(role="assistant", content="not persisted"))
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    assert [record.event_name for record in adapter.records] == [
+        "session.persistence.started",
+        "session.persistence.completed",
+        "session.bound",
+        "session.persistence.started",
+        "session.persistence.failed",
+    ]
+    assert manager.messages == [Message(role="assistant", content="complete")]

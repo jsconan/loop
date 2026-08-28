@@ -69,6 +69,8 @@ from ..models import (
     ToolResult,
     Usage,
 )
+from ..telemetry import ModelInputPolicy, telemetry_trace_event
+from ..utils import payload_digest
 from .backend import Backend
 from .errors import (
     BackendAuthenticationError,
@@ -121,6 +123,7 @@ class OpenAIBackend(Backend):
     _structured_output_max_retries: int
     _prompt_structured_models: set[str]
     _max_retries: int
+    _model_input_policy: ModelInputPolicy
 
     def __init__(
         self,
@@ -160,6 +163,7 @@ class OpenAIBackend(Backend):
         self._structured_output_max_retries = structured_output_max_retries
         self._prompt_structured_models = set()
         self._max_retries = max_retries
+        self._model_input_policy = ModelInputPolicy((api_key,) if api_key else ())
 
     @property
     def context_window(self) -> int | None:
@@ -252,6 +256,29 @@ class OpenAIBackend(Backend):
             retry_at = retry_at.replace(tzinfo=UTC)
         return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
 
+    def _prepared_request(self, **values: object) -> dict[str, object]:
+        """Return and trace the exact policy-prepared provider request."""
+        prepared = self._model_input_policy.apply(values)
+        telemetry_trace_event(
+            "gen_ai.request",
+            payload=prepared,
+            payload_sha256=payload_digest(prepared),
+            model=prepared.get("model"),
+            stream=prepared.get("stream"),
+        )
+        return prepared
+
+    @staticmethod
+    def _trace_provider_value(event_name: str, value: object) -> None:
+        """Trace one exact provider object when structured serialization is available."""
+        telemetry_trace_event(
+            event_name,
+            payload_factory=lambda: (
+                value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+            ),
+            digest_payload=True,
+        )
+
     def get_models(self) -> list[ModelInfo]:
         """Return the models available from the configured backend.
 
@@ -339,7 +366,7 @@ class OpenAIBackend(Backend):
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
         if output_format is None:
-            response = self._get_client().responses.create(
+            request = self._prepared_request(
                 model=selected_model,
                 input=serialized_input,
                 instructions=request_instructions,
@@ -347,12 +374,15 @@ class OpenAIBackend(Backend):
                 stream_options={"include_usage": True},
                 tools=serialized_tools,
             )
+            response = self._get_client().responses.create(**request)
             if stream:
                 items = []
                 reasoning_channels = {}
                 for event in response:
+                    self._trace_provider_value("gen_ai.response.stream_event", event)
                     yield from self._translated_stream_event(event, items, None, reasoning_channels)
                 return
+            self._trace_provider_value("gen_ai.response", response)
             yield from self._response_events(response, None)
             return
 
@@ -363,7 +393,7 @@ class OpenAIBackend(Backend):
             attempt += 1
             mode = self._structured_mode(selected_model)
             try:
-                response = self._get_client().responses.create(
+                request = self._prepared_request(
                     model=selected_model,
                     input=attempt_input,
                     instructions=request_instructions,
@@ -372,11 +402,12 @@ class OpenAIBackend(Backend):
                     tools=serialized_tools,
                     **self._structured_output_request(output_format, mode),
                 )
+                response = self._get_client().responses.create(**request)
             except APIStatusError as error:
                 if mode != "native" or not self._fallback_from_native(error, selected_model):
                     raise
                 mode = "prompt"
-                response = self._get_client().responses.create(
+                request = self._prepared_request(
                     model=selected_model,
                     input=attempt_input,
                     instructions=request_instructions,
@@ -384,6 +415,9 @@ class OpenAIBackend(Backend):
                     stream_options={"include_usage": True},
                     tools=serialized_tools,
                 )
+                response = self._get_client().responses.create(**request)
+            if not stream:
+                self._trace_provider_value("gen_ai.response", response)
             try:
                 events = (
                     self._buffered_stream_events(response, output_format)
@@ -465,7 +499,7 @@ class OpenAIBackend(Backend):
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
         if output_format is None:
-            response = await self._get_async_client().responses.create(
+            request = self._prepared_request(
                 model=selected_model,
                 input=serialized_input,
                 instructions=request_instructions,
@@ -473,13 +507,16 @@ class OpenAIBackend(Backend):
                 stream_options={"include_usage": True},
                 tools=serialized_tools,
             )
+            response = await self._get_async_client().responses.create(**request)
             if not stream:
+                self._trace_provider_value("gen_ai.response", response)
                 for event in self._response_events(response, None):
                     yield event
                 return
             items = []
             reasoning_channels = {}
             async for event in response:
+                self._trace_provider_value("gen_ai.response.stream_event", event)
                 for translated in self._translated_stream_event(
                     event, items, None, reasoning_channels
                 ):
@@ -493,7 +530,7 @@ class OpenAIBackend(Backend):
             attempt += 1
             mode = self._structured_mode(selected_model)
             try:
-                response = await self._get_async_client().responses.create(
+                request = self._prepared_request(
                     model=selected_model,
                     input=attempt_input,
                     instructions=request_instructions,
@@ -502,11 +539,12 @@ class OpenAIBackend(Backend):
                     tools=serialized_tools,
                     **self._structured_output_request(output_format, mode),
                 )
+                response = await self._get_async_client().responses.create(**request)
             except APIStatusError as error:
                 if mode != "native" or not self._fallback_from_native(error, selected_model):
                     raise
                 mode = "prompt"
-                response = await self._get_async_client().responses.create(
+                request = self._prepared_request(
                     model=selected_model,
                     input=attempt_input,
                     instructions=request_instructions,
@@ -514,6 +552,9 @@ class OpenAIBackend(Backend):
                     stream_options={"include_usage": True},
                     tools=serialized_tools,
                 )
+                response = await self._get_async_client().responses.create(**request)
+            if not stream:
+                self._trace_provider_value("gen_ai.response", response)
             try:
                 events = (
                     await self._buffered_stream_events_async(response, output_format)
@@ -713,11 +754,13 @@ class OpenAIBackend(Backend):
         """Compact context while retaining provider errors for endpoint fallback."""
         active_context = list(input)
         try:
-            response = self._get_client().responses.compact(
+            request = self._prepared_request(
                 model=model,
                 input=self._serialize_input(active_context),
                 instructions=instructions,
             )
+            response = self._get_client().responses.compact(**request)
+            self._trace_provider_value("gen_ai.response", response)
         except APIStatusError as error:
             if error.status_code not in (404, 405, 501):
                 raise
@@ -1042,6 +1085,7 @@ class OpenAIBackend(Backend):
         events = []
         reasoning_channels = {}
         for provider_event in response:
+            cls._trace_provider_value("gen_ai.response.stream_event", provider_event)
             cls._buffer_event(provider_event, events, items, output_format, reasoning_channels)
         return events
 
@@ -1056,6 +1100,7 @@ class OpenAIBackend(Backend):
         events = []
         reasoning_channels = {}
         async for provider_event in response:
+            cls._trace_provider_value("gen_ai.response.stream_event", provider_event)
             cls._buffer_event(provider_event, events, items, output_format, reasoning_channels)
         return events
 

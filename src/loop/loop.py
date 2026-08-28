@@ -1,5 +1,6 @@
 """Run an interactive conversation with an LLM backend."""
 
+import logging
 from pathlib import Path
 
 from . import constants
@@ -11,7 +12,7 @@ from .completion import (
     CommandCompletionAdapter,
     CompletionManager,
 )
-from .errors import Problem
+from .errors import Problem, log_problem
 from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
 from .model_selection import ModelCommands, ModelSelection
@@ -25,8 +26,11 @@ from .session import (
     SessionNameGenerator,
 )
 from .skills import InstructionsManager, RuntimeEnvironment, SkillCommands
+from .telemetry import telemetry_activity
 from .tooling import ToolCommands, ToolRegistry
 from .utils import find_project_root
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class Loop:
@@ -400,19 +404,20 @@ class Loop:
             try:
                 context = self._mention_manager.resolve(user_input)
             except (OSError, UnicodeError, ValueError) as error:
-                self._interaction.report(
-                    Problem.from_exception(
-                        error,
-                        code="mention.resolution_failed",
-                        title="Could not resolve mention",
-                        operation="resolve_mention",
-                    )
+                problem = Problem.from_exception(
+                    error,
+                    code="mention.resolution_failed",
+                    title="Could not resolve mention",
+                    operation="resolve_mention",
                 )
+                log_problem(_LOGGER, problem, error)
+                self._interaction.report(problem)
                 continue
-            self._session_manager.add_user_message(user_input, context=context)
-
-            result = self._agent_runner.run()
-            self._complete_agent_run(result)
+            with self._session_manager.next_message_span():
+                telemetry_activity("message.accepted", component="session_manager")
+                self._session_manager.add_user_message(user_input, context=context)
+                result = self._agent_runner.run()
+                self._complete_agent_run(result)
 
         self._interaction.conversation_ended()
 

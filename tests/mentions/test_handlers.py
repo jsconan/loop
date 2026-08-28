@@ -32,7 +32,7 @@ def test_project_paths_complete_after_cache_expiry_and_resolve_unique_snapshots(
 ):
     """Path completion refreshes after its TTL and resolution deduplicates references."""
     now = [10.0]
-    monkeypatch.setattr("loop.completion.adapters.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("loop.completion.adapters.project_path.time.monotonic", lambda: now[0])
     current = [tmp_path]
     handler = ProjectPathMentionHandler(lambda: current[0])
     assert complete(handler, "@") == []

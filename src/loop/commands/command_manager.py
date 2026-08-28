@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from ..completion import CommandCompletion
 from ..errors import Problem
+from ..telemetry import telemetry_activity, telemetry_error
 from .command import Command, CommandRegistration, CommandsProvider
 from .context import CommandContext
 from .models import CommandArgumentError
@@ -253,8 +254,16 @@ class CommandManager:
                 interaction=active_interaction,
             )
         try:
+            telemetry_activity("command.started", command=name)
             command.call(arguments, context)
+            telemetry_activity("command.completed", command=name)
         except (CommandArgumentError, ValidationError) as exc:
+            telemetry_error(
+                "command.failed",
+                error_type="command.invalid_arguments",
+                exception=exc,
+                command=name,
+            )
             if active_interaction is None:
                 raise
             active_interaction.report(

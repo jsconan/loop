@@ -295,7 +295,8 @@ def test_register_logs_headless_broken_tools_with_a_default_detail(caplog):
     registry = ToolRegistry([unavailable])
 
     assert registry.names == []
-    assert "Tool 'unavailable' is broken." in caplog.text
+    assert "Tool broken" in caplog.text
+    assert "unavailable" not in caplog.text
 
 
 def test_register_converts_unexpected_preflight_errors_and_logs_them(monkeypatch):
@@ -310,7 +311,8 @@ def test_register_converts_unexpected_preflight_errors_and_logs_them(monkeypatch
 
     ToolRegistry([unavailable])
 
-    assert logger.log.call_args.kwargs["exc_info"][1] is error
+    assert logger.log.call_args.kwargs["extra"]["exception.type"] == "builtins.RuntimeError"
+    assert "exc_info" not in logger.log.call_args.kwargs
 
 
 @pytest.mark.parametrize("raises", [False, True])

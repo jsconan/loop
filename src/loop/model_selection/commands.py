@@ -1,5 +1,6 @@
 """Expose active model selection through user commands."""
 
+import logging
 from types import SimpleNamespace
 from typing import Annotated
 
@@ -8,9 +9,11 @@ from pydantic import Field
 from ..backend import BackendError
 from ..commands import CommandContext, CommandRegistration
 from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
-from ..errors import Problem
+from ..errors import Problem, log_problem
 from ..models import ModelInfo
 from .selection import ModelSelection
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ModelCommands:
@@ -60,7 +63,8 @@ class ModelCommands:
         """Check backend reachability and the effective model's availability."""
         try:
             models = self._available()
-        except BackendError:
+        except BackendError as error:
+            self._log_unavailable(error)
             context.interaction.warning("The backend is not reachable.")
             return
         try:
@@ -133,7 +137,22 @@ class ModelCommands:
             retryable=error.recoverable,
             operation="list_models",
         )
+        log_problem(_LOGGER, problem, error)
         if error.recoverable:
             context.interaction.warning(problem.detail)
         else:
             context.interaction.report(problem)
+
+    @staticmethod
+    def _log_unavailable(error: BackendError) -> None:
+        """Record a sanitized model-catalog failure."""
+        problem = Problem.from_exception(
+            error,
+            code="backend.unavailable",
+            title="Backend unavailable",
+            detail="The backend is not reachable.",
+            severity="warning" if error.recoverable else "error",
+            retryable=error.recoverable,
+            operation="list_models",
+        )
+        log_problem(_LOGGER, problem, error)

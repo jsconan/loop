@@ -5,6 +5,7 @@ import logging
 import pytest
 
 from loop import Problem, ProblemException, log_problem
+from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 
 
 def test_problem_from_exception_uses_defaults_and_explicit_safe_context():
@@ -56,8 +57,8 @@ def test_log_problem_records_stable_attributes_and_severity(caplog, severity, le
     assert record.__dict__["error.operation"] == "example"
 
 
-def test_log_problem_records_exception_type_message_and_traceback(caplog):
-    """Exception-backed problem logs retain diagnostic context outside the user payload."""
+def test_log_problem_records_only_exception_type(caplog):
+    """Exception-backed logs retain type without arbitrary message or traceback contents."""
     error = ValueError("private diagnostic")
     problem = Problem(code="example.failed", title="Example failed", detail="Safe detail.")
 
@@ -66,12 +67,13 @@ def test_log_problem_records_exception_type_message_and_traceback(caplog):
 
     record = caplog.records[-1]
     assert record.__dict__["exception.type"] == "builtins.ValueError"
-    assert record.__dict__["exception.message"] == "private diagnostic"
-    assert record.exc_info[:2] == (ValueError, error)
+    assert "exception.message" not in record.__dict__
+    assert record.exc_info is None
+    assert "private diagnostic" not in record.getMessage()
 
 
-def test_log_problem_does_not_expose_tracebacks_without_configured_logging(capsys):
-    """Unconfigured logging does not send diagnostic tracebacks to the user terminal."""
+def test_log_problem_uses_safe_last_resort_without_configured_logging(capsys):
+    """Unconfigured logging reports a safe summary through Python's stderr fallback."""
     logger = logging.getLogger("tests.problem.unconfigured")
     logger.handlers.clear()
     logger.propagate = False
@@ -80,4 +82,30 @@ def test_log_problem_does_not_expose_tracebacks_without_configured_logging(capsy
 
     log_problem(logger, problem, error)
 
-    assert capsys.readouterr().err == ""
+    output = capsys.readouterr().err
+    assert "Example failed" in output
+    assert "private diagnostic" not in output
+
+
+def test_log_problem_also_records_structured_telemetry_when_available():
+    """The common problem boundary covers package-wide failures in structured telemetry."""
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    try:
+        problem = Problem(
+            code="example.failed",
+            title="Example failed",
+            detail="Safe detail.",
+            operation="example",
+        )
+        log_problem(logging.getLogger("tests.problem.telemetry"), problem, ValueError("private"))
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    record = adapter.records[0]
+    assert record.event_name == "problem.reported"
+    assert record.attributes["error.type"] == "example.failed"
+    assert record.attributes["exception.type"] == "builtins.ValueError"
+    assert "private" not in repr(record)

@@ -60,6 +60,8 @@ from loop import (
     ToolResult,
     Usage,
 )
+from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
+from loop.telemetry.policy import thaw
 
 
 class Person(BaseModel):
@@ -258,12 +260,19 @@ def test_native_compaction_round_trips_exact_provider_items():
         output=[], output_text="", usage=None, model="model"
     )
 
-    with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        backend = OpenAIBackend(default_model="model")
-        result = backend.compact(
-            [Message(role="user", content="hello")], instructions="rules", model="model"
-        )
-        list(backend.get_response(result.items, instructions="rules"))
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    try:
+        with patch("loop.backend.openai.OpenAI", return_value=sdk):
+            backend = OpenAIBackend(default_model="model")
+            result = backend.compact(
+                [Message(role="user", content="hello")], instructions="rules", model="model"
+            )
+            list(backend.get_response(result.items, instructions="rules"))
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
 
     assert result.items == (
         CompactionContextItem(
@@ -273,7 +282,10 @@ def test_native_compaction_round_trips_exact_provider_items():
     )
     assert result.usage.total_tokens == 110
     assert result.context_tokens == 20
+    compact_request = sdk.responses.compact.call_args.kwargs
     sdk.responses.compact.assert_called_once()
+    assert thaw(adapter.records[0].payload) == compact_request
+    assert adapter.records[0].payload_sha256 is not None
     assert sdk.responses.create.call_args.kwargs["input"] == [result.items[0].data]
 
 
@@ -804,6 +816,34 @@ def test_sync_response_forwards_schema_streaming_and_model_selection():
             }
         ],
     )
+
+
+def test_model_request_trace_matches_policy_prepared_sdk_arguments_exactly():
+    """Known secrets are removed before one identical request reaches tracing and the SDK."""
+    sdk = Mock()
+    sdk.responses.create.return_value = sdk_completion_event().response
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    client = OpenAIBackend(default_model="default", api_key="registered-secret")
+
+    try:
+        with patch("loop.backend.openai.OpenAI", return_value=sdk):
+            result = list(client.get_response("contains registered-secret"))
+            assert isinstance(result[-1], ResponseCompleted)
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    submitted = sdk.responses.create.call_args.kwargs
+    traced = thaw(adapter.records[0].payload)
+    assert submitted == traced
+    assert submitted["input"] == "contains <redacted:secret>"
+    assert "registered-secret" not in repr(adapter.records)
+    assert [record.event_name for record in adapter.records] == [
+        "gen_ai.request",
+        "gen_ai.response",
+    ]
 
 
 def test_sync_response_requests_and_validates_pydantic_structured_output():

@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -31,6 +32,8 @@ from loop import (
     SessionTarget,
 )
 from loop.permissions import PermissionLoadFailure
+from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
+from loop.telemetry.policy import thaw
 
 
 def operation(action: Action, *, tool: str = "demo", target=None, reason=None) -> Operation:
@@ -129,8 +132,15 @@ def test_authorization_approves_one_complete_operation_set_and_records_policy(tm
         file_operation(Action.FILESYSTEM_CREATE, tmp_path / "a.txt"),
         file_operation(Action.FILESYSTEM_DELETE, tmp_path / "b.txt"),
     )
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
 
-    result = manager.authorize(operations)
+    try:
+        result = manager.authorize(operations)
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
 
     assert result.policy.decision is Decision.ASK
     assert result.decision is Decision.ALLOW
@@ -140,6 +150,10 @@ def test_authorization_approves_one_complete_operation_set_and_records_policy(tm
     assert "filesystem.delete" in result.prompt
     interaction.prompt.assert_called_once()
     recorder.record_authorization.assert_called_once_with(result)
+    assert adapter.records[0].event_name == "permission.decided"
+    assert adapter.records[0].attributes["decision"] == "allow"
+    assert adapter.records[1].event_name == "permission.decision"
+    assert thaw(adapter.records[1].payload) == result.model_dump(mode="json")
 
 
 def test_authorization_rejection_and_recorder_override_are_atomic(tmp_path):
@@ -223,8 +237,37 @@ def test_workspace_approval_persists_exact_rules_and_audit_metadata(tmp_path):
     stored = json.loads(
         (tmp_path / ".loop" / "permissions-audit.jsonl").read_text("utf-8").splitlines()[0]
     )
+    assert datetime.fromisoformat(stored["timestamp"]).tzinfo is not None
+    assert stored["audit_schema_version"] == 1
+    assert stored["event_name"] == "permission.decided"
     assert stored["approval_choice"] == "workspace"
     assert stored["installed_rule_ids"] == list(approved.installed_rule_ids)
+
+
+def test_policy_mutations_write_timestamped_local_and_structured_audit_records(tmp_path):
+    """Permission configuration changes remain auditable with and without telemetry storage."""
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    manager = PermissionManager(tmp_path)
+
+    try:
+        manager.set_default(
+            Action.FILESYSTEM_DELETE,
+            Decision.DENY,
+            scope=PolicyScope.SESSION,
+        )
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    record = json.loads(
+        (tmp_path / ".loop" / "permissions-audit.jsonl").read_text("utf-8").splitlines()[0]
+    )
+    assert record["event_name"] == "permission.default_set"
+    assert datetime.fromisoformat(record["timestamp"]).tzinfo is not None
+    assert adapter.records[0].event_name == "permission.default_set"
+    assert adapter.records[0].attributes["scope"] == "session"
 
 
 def test_process_grants_distinguish_argument_boundaries_working_directory_and_sandbox(tmp_path):

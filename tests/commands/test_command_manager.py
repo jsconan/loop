@@ -18,6 +18,7 @@ from loop import (
     command,
 )
 from loop.commands.utils import get_command_arguments_model
+from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 
 
 def declared_command(name: str = "test") -> Command:
@@ -75,6 +76,33 @@ def test_interaction_property_can_be_replaced_and_cleared():
     assert manager.interaction is interaction
     manager.interaction = None
     assert manager.interaction is None
+
+
+def test_command_dispatch_records_success_and_sanitized_validation_failure():
+    """Central dispatch emits lifecycle activity and typed failures without argument contents."""
+    interaction = Mock(spec=Interaction)
+
+    def configured(value: int) -> None:
+        """Accept one integer."""
+
+    manager = CommandManager([CommandRegistration(configured, name="configured")], interaction)
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    try:
+        manager.call("configured", "1")
+        manager.call("configured", "private-invalid")
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    assert [record.event_name for record in adapter.records] == [
+        "command.started",
+        "command.completed",
+        "command.started",
+        "command.failed",
+    ]
+    assert "private-invalid" not in repr(adapter.records)
 
 
 def test_manager_registers_structural_command_providers():

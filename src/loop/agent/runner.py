@@ -25,6 +25,8 @@ from ..models import (
     Usage,
 )
 from ..session import SessionManager, SessionRecoveryState
+from ..skills import InstructionsManager
+from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
 from ..tooling.utils import serialize_tool_problem
 from .agent import Agent
 from .models import AgentRecoveryStatus, AgentRunResult
@@ -142,7 +144,16 @@ class AgentRunner:
         Returns:
             AgentRunResult: Final response, completed turn count, and termination reason.
         """
-        return self._run_from_boundary()
+        with telemetry_span():
+            telemetry_activity("agent.run.started", component="agent_runner")
+            result = self._run_from_boundary()
+            telemetry_activity(
+                "agent.run.completed",
+                component="agent_runner",
+                stop_reason=result.stop_reason,
+                turns=result.turns,
+            )
+            return result
 
     def recover_session(self) -> AgentRecoveryStatus:
         """Execute an approved recovery plan for the active session.
@@ -282,41 +293,65 @@ class AgentRunner:
         instructions = self._agent.instructions_manager
         executions = []
         for tool_call in tool_calls:
-            if present:
-                self._session_manager.add_tool_call_event(tool_call.call_id)
-            self._interaction.tool_call(tool_call.name, tool_call.arguments)
-            tool_result, duration = self._agent.tool_registry.call_with_timing(
-                tool_call.name,
-                tool_call.arguments,
-                interaction=self._interaction,
-                instructions_manager=instructions,
-                permission_manager=self._agent.permission_manager,
-                call_id=tool_call.call_id,
-                execution_started=lambda call_id=tool_call.call_id: (
-                    self._session_manager.record_tool_execution_started(call_id)
-                ),
-            )
-            try:
-                payload = json.loads(tool_result)
-            except json.JSONDecodeError:
-                payload = None
-            succeeded = isinstance(payload, dict) and payload.get("ok") is True
-            executions.append(
-                ToolExecutionMetrics(
-                    name=tool_call.name,
-                    duration_seconds=duration,
-                    succeeded=succeeded,
+            with telemetry_span():
+                executions.append(
+                    self._execute_tool_call(tool_call, instructions=instructions, present=present)
                 )
-            )
-            self._session_manager.add_tool_call(
-                call_id=tool_call.call_id,
-                output=tool_result,
-                working_directory=str(instructions.working_directory or self._working_directory()),
-                active_skills=instructions.active_skill_identities,
-                succeeded=succeeded,
-                duration_seconds=duration,
-            )
         return tuple(executions)
+
+    def _execute_tool_call(
+        self,
+        tool_call: ToolCall,
+        *,
+        instructions: InstructionsManager,
+        present: bool,
+    ) -> ToolExecutionMetrics:
+        """Execute, trace, and persist one tool request inside its correlation span."""
+        telemetry_trace_event(
+            "tool.request",
+            payload={
+                "call_id": tool_call.call_id,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+            },
+        )
+        if present:
+            self._session_manager.add_tool_call_event(tool_call.call_id)
+        self._interaction.tool_call(tool_call.name, tool_call.arguments)
+        tool_result, duration = self._agent.tool_registry.call_with_timing(
+            tool_call.name,
+            tool_call.arguments,
+            interaction=self._interaction,
+            instructions_manager=instructions,
+            permission_manager=self._agent.permission_manager,
+            call_id=tool_call.call_id,
+            execution_started=lambda call_id=tool_call.call_id: (
+                self._session_manager.record_tool_execution_started(call_id)
+            ),
+        )
+        telemetry_trace_event(
+            "tool.response",
+            payload={"call_id": tool_call.call_id, "output": tool_result},
+            duration_seconds=duration,
+        )
+        try:
+            payload = json.loads(tool_result)
+        except json.JSONDecodeError:
+            payload = None
+        succeeded = isinstance(payload, dict) and payload.get("ok") is True
+        self._session_manager.add_tool_call(
+            call_id=tool_call.call_id,
+            output=tool_result,
+            working_directory=str(instructions.working_directory or self._working_directory()),
+            active_skills=instructions.active_skill_identities,
+            succeeded=succeeded,
+            duration_seconds=duration,
+        )
+        return ToolExecutionMetrics(
+            name=tool_call.name,
+            duration_seconds=duration,
+            succeeded=succeeded,
+        )
 
     def _persist_interrupted_tool_result(self, call: ToolCall) -> None:
         """Resolve one uncertain invocation without risking a duplicate side effect."""
@@ -352,6 +387,11 @@ class AgentRunner:
             BackendError: If the backend cannot produce a complete response.
             ValueError: If neither the selection nor backend provides a model.
         """
+        with telemetry_span():
+            return self._query()
+
+    def _query(self) -> Response:
+        """Request and collect one response inside the active model-operation span."""
         selected_model = self._model_selection.effective
         instructions = self._agent.instructions_manager
         instructions.prepare()

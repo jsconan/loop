@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 
+from ..telemetry import telemetry_error
 from .adapters import CompletionAdapter
 from .models import CompletionMatch, CompletionValue
 
@@ -59,8 +60,15 @@ class CompletionManager(Completer):
                     collected.extend(
                         (value, match, adapter_index) for value in adapter.complete(match)
                     )
-            except Exception:  # noqa: BLE001,S112  # pylint: disable=broad-exception-caught
+            except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 # Completion capabilities are optional, best-effort UI integrations.
+                telemetry_error(
+                    "completion.adapter_failed",
+                    error_type="completion.adapter_failed",
+                    exception=error,
+                    component="completion_manager",
+                    adapter=type(adapter).__qualname__,
+                )
                 continue
 
         ranked = sorted(collected, key=self._rank)

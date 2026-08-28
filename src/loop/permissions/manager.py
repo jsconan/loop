@@ -20,7 +20,8 @@ from urllib.parse import urlsplit
 import yaml
 
 from .. import constants
-from ..errors import Problem
+from ..errors import Problem, log_problem
+from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import ShutdownRequested, canonical_path, sha256_digest
 from .models import (
     Action,
@@ -350,6 +351,20 @@ class PermissionManager:
             approval_choice=approval_choice,
             installed_rule_ids=installed_rule_ids,
         )
+        telemetry_audit(
+            "permission.decided",
+            decision=result.decision.value,
+            source=result.source,
+            prompted=result.prompted,
+            approval_scope=(
+                result.approval_choice.value if result.approval_choice is not None else None
+            ),
+            operation_count=len(result.operations),
+        )
+        telemetry_trace_event(
+            "permission.decision",
+            payload=result,
+        )
         self._audit(result)
         active_recorder = recorder if recorder is not None else self._recorder
         if active_recorder is not None:
@@ -496,6 +511,12 @@ class PermissionManager:
             self._replace_configuration(updated)
         else:
             self._session_overrides.defaults[action] = decision
+        self._audit_policy_change(
+            "permission.default_set",
+            scope,
+            action=action.value,
+            decision=decision.value,
+        )
 
     def reset_default(self, action: Action, *, scope: PolicyScope = PolicyScope.SESSION) -> bool:
         """Reset one default to its inherited or application value.
@@ -508,13 +529,19 @@ class PermissionManager:
             bool: Whether the selected layer changed.
         """
         if scope is PolicyScope.SESSION:
-            return self._session_overrides.defaults.pop(action, None) is not None
+            changed = self._session_overrides.defaults.pop(action, None) is not None
+            if changed:
+                self._audit_policy_change(
+                    "permission.default_reset", scope, action=action.value
+                )
+            return changed
         default = PermissionConfiguration().defaults[action]
         if self._configuration.defaults.get(action, Decision.DENY) is default:
             return False
         updated = self._configuration.model_copy(deep=True)
         updated.defaults[action] = default
         self._replace_configuration(updated)
+        self._audit_policy_change("permission.default_reset", scope, action=action.value)
         return True
 
     def add_rule(
@@ -542,6 +569,9 @@ class PermissionManager:
             self._replace_configuration(updated)
         else:
             self._session_overrides.rules.append(rule)
+        self._audit_policy_change(
+            "permission.rule_added", scope, rule_id=rule.id, decision=rule.decision.value
+        )
 
     def remove_rule(
         self,
@@ -569,6 +599,9 @@ class PermissionManager:
                 if scope is PolicyScope.WORKSPACE:
                     updated = self._configuration.model_copy(update={"rules": rules}, deep=True)
                     self._replace_configuration(updated)
+                self._audit_policy_change(
+                    "permission.rule_removed", scope, rule_id=rule_id
+                )
                 return True
         return False
 
@@ -647,6 +680,12 @@ class PermissionManager:
         else:
             self._session_overrides.defaults = dict(preview.installed_defaults)
             self._session_overrides.rules = replacement
+        self._audit_policy_change(
+            "permission.preset_replaced",
+            preview.scope,
+            preset_id=preview.preset.metadata.id,
+            revision=preview.preset.metadata.revision,
+        )
 
     def set_limit(
         self,
@@ -675,6 +714,9 @@ class PermissionManager:
             self._session_overrides.limits = self._session_overrides.limits.model_copy(
                 update={name: value}
             )
+        self._audit_policy_change(
+            "permission.limit_set", scope, limit=name, enabled=value
+        )
 
     def update_limit_values(
         self,
@@ -731,6 +773,12 @@ class PermissionManager:
             self._session_overrides.limits = self._session_overrides.limits.model_copy(
                 update={name: tuple(values)}
             )
+        self._audit_policy_change(
+            "permission.limit_value_updated",
+            scope,
+            limit=name,
+            operation="add" if add else "remove",
+        )
         return True
 
     def reset_limit(self, name: str, *, scope: PolicyScope = PolicyScope.SESSION) -> bool:
@@ -754,6 +802,7 @@ class PermissionManager:
             self._session_overrides.limits = self._session_overrides.limits.model_copy(
                 update={name: None}
             )
+            self._audit_policy_change("permission.limit_reset", scope, limit=name)
             return True
         default = getattr(PolicyLimits(), name)
         if getattr(self._configuration.limits, name) == default:
@@ -761,6 +810,7 @@ class PermissionManager:
         updated = self._configuration.model_copy(deep=True)
         updated.limits = updated.limits.model_copy(update={name: default})
         self._replace_configuration(updated)
+        self._audit_policy_change("permission.limit_reset", scope, limit=name)
         return True
 
     def reset_session(self) -> bool:
@@ -771,6 +821,8 @@ class PermissionManager:
         """
         changed = self._session_overrides != SessionPolicyOverrides()
         self._session_overrides = SessionPolicyOverrides()
+        if changed:
+            self._audit_policy_change("permission.session_reset", PolicyScope.SESSION)
         return changed
 
     def reload(self) -> PermissionLoadResult:
@@ -807,6 +859,7 @@ class PermissionManager:
         configuration = PermissionConfiguration()
         self._persist(configuration)
         self._configuration = configuration
+        self._audit_policy_change("permission.configuration_reset", PolicyScope.WORKSPACE)
         return backup_path
 
     def explain(self, tool: str, action: Action, resource: str) -> PolicyDecision:
@@ -1097,15 +1150,15 @@ class PermissionManager:
         retain_on_failure: bool,
     ) -> PermissionLoadResult:
         """Report one failure and return the user's selected recovery outcome."""
-        self._interaction.report(
-            Problem.from_exception(
-                error,
-                code="permission.configuration_invalid",
-                title="Invalid permission policy",
-                operation="load_permission_policy",
-                metadata={"path": error.path},
-            )
+        problem = Problem.from_exception(
+            error,
+            code="permission.configuration_invalid",
+            title="Invalid permission policy",
+            operation="load_permission_policy",
+            metadata={"path": error.path},
         )
+        log_problem(_LOGGER, problem, error)
+        self._interaction.report(problem)
         continue_description = (
             "Keep the current permission policy"
             if retain_on_failure
@@ -1141,19 +1194,19 @@ class PermissionManager:
 
     def _report_configuration_error(self, error: PermissionConfigurationError) -> None:
         """Report an automatically recovered configuration failure."""
+        problem = Problem.from_exception(
+            error,
+            code="permission.configuration_invalid",
+            title="Invalid permission policy",
+            operation="load_permission_policy",
+            metadata={"path": error.path},
+        )
+        log_problem(_LOGGER, problem, error)
         if self._interaction is not None:
-            self._interaction.report(
-                Problem.from_exception(
-                    error,
-                    code="permission.configuration_invalid",
-                    title="Invalid permission policy",
-                    operation="load_permission_policy",
-                    metadata={"path": error.path},
-                )
-            )
+            self._interaction.report(problem)
             self._interaction.warning("Recovered according to the automatic permission policy.")
         else:
-            _LOGGER.warning("%s; recovered according to the automatic permission policy", error)
+            _LOGGER.warning("Recovered according to the automatic permission policy")
 
     def _load_presets(self) -> tuple[PermissionPreset, ...]:
         """Load presets and completely handle invalid catalog artifacts."""
@@ -1168,7 +1221,10 @@ class PermissionManager:
             if self._interaction is not None:
                 self._interaction.warning(message)
             else:
-                _LOGGER.warning("%s", message)
+                _LOGGER.warning(
+                    "Excluded invalid permission preset",
+                    extra={"error.type": "permission.preset_invalid"},
+                )
         return presets
 
     def _evaluate_operation(self, operation: Operation) -> PolicyDecision:
@@ -1395,14 +1451,42 @@ class PermissionManager:
             return operation.resource
 
     def _audit(self, result: AuthorizationResult) -> None:
+        """Append one independently durable, timestamped permission decision."""
+        payload = result.model_dump(mode="json")
+        self._append_audit("permission.decided", payload)
+
+    def _append_audit(self, event_name: str, payload: dict[str, object]) -> None:
+        """Append one timestamped permission audit payload without affecting policy behavior."""
         if self._configuration_path is None:
             return
         audit_path = self._configuration_path.with_name(constants.PERMISSIONS_AUDIT_FILENAME)
+        record = {
+            **payload,
+            "audit_schema_version": 1,
+            "event_name": event_name,
+            "timestamp": datetime.now().astimezone().isoformat(),
+        }
         try:
             audit_path.parent.mkdir(parents=True, exist_ok=True)
             with audit_path.open("a", encoding="utf-8") as audit:
-                audit.write(json.dumps(result.model_dump(mode="json"), sort_keys=True) + "\n")
-        except OSError:
+                audit.write(json.dumps(record, sort_keys=True) + "\n")
+            audit_path.chmod(constants.PRIVATE_FILE_MODE)
+        except OSError as error:
             # The durable session recorder remains authoritative for application behavior;
             # diagnostic JSONL availability must not change an authorization outcome.
-            return
+            telemetry_error(
+                "permission.audit_write_failed",
+                error_type="permission.audit_write_failed",
+                exception=error,
+                component="permission_manager",
+            )
+
+    def _audit_policy_change(
+        self,
+        event_name: str,
+        scope: PolicyScope,
+        **attributes: object,
+    ) -> None:
+        """Record one minimized permission-policy mutation."""
+        telemetry_audit(event_name, scope=scope.value, **attributes)
+        self._append_audit(event_name, {"scope": scope.value, **attributes})

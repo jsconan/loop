@@ -3,10 +3,11 @@
 import json
 import logging
 from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import fields
 from datetime import UTC, datetime
-from uuid import uuid7
+from uuid import uuid4, uuid7
 
 from .. import constants
 from ..errors import Problem, log_problem
@@ -35,6 +36,13 @@ from ..models import (
     Usage,
 )
 from ..permissions import AuthorizationResult
+from ..telemetry import (
+    TelemetryContext,
+    telemetry_activity,
+    telemetry_audit,
+    telemetry_error,
+    telemetry_span,
+)
 from ..utils import (
     bound_tool_result,
     cached_metadata,
@@ -84,6 +92,7 @@ class SessionManager:
     _interaction: Interaction
     _session: Session
     _session_store: SessionStore
+    _telemetry_session_id: str
 
     def __init__(
         self,
@@ -93,6 +102,7 @@ class SessionManager:
     ) -> None:
         self._interaction = interaction or ConsoleInteraction()
         self._session_store = session_store or MemorySessionStore()
+        self._telemetry_session_id = f"provisional_{uuid4().hex}"
 
         if session and isinstance(session, (str, Session)):
             self.load_session(session)
@@ -134,6 +144,21 @@ class SessionManager:
             list[ConversationItem]: Items accumulated during the conversation.
         """
         return self._session.messages
+
+    def next_message_span(self) -> AbstractContextManager[TelemetryContext | None]:
+        """Return the correlation span for the next submitted user message.
+
+        Returns:
+            AbstractContextManager[TelemetryContext | None]: Active span or a no-op context
+                manager.
+        """
+        message_sequence = sum(
+            isinstance(item, Message) and item.role == "user" for item in self._session.messages
+        )
+        return telemetry_span(
+            session_id=self._session.id or self._telemetry_session_id,
+            message_sequence=message_sequence,
+        )
 
     def response(
         self,
@@ -706,8 +731,21 @@ class SessionManager:
         previous = deepcopy(self._session)
         try:
             mutation(self._session)
+            telemetry_activity("session.persistence.started", component="session_manager")
             self._session_store.save(self._session)
+            telemetry_activity(
+                "session.persistence.completed",
+                component="session_manager",
+                session_assigned=previous.id is None and self._session.id is not None,
+            )
+            if previous.id is None and self._session.id is not None:
+                telemetry_audit("session.bound", persistent_session_id=self._session.id)
         except Exception:
+            telemetry_error(
+                "session.persistence.failed",
+                error_type="session.persistence_failed",
+                component="session_manager",
+            )
             for session_field in fields(Session):
                 setattr(
                     self._session,

@@ -19,7 +19,19 @@ from loop import (
     log_problem,
     register_shutdown_signals,
 )
-from loop.constants import APP_DIRECTORY, SESSION_DATABASE_FILENAME
+from loop.constants import (
+    APP_DIRECTORY,
+    OPERATIONAL_LOG_FILENAME,
+    SESSION_DATABASE_FILENAME,
+    TELEMETRY_DATABASE_FILENAME,
+)
+from loop.telemetry import (
+    SQLiteTelemetryAdapter,
+    Telemetry,
+    configure_operational_logging,
+    set_telemetry,
+    telemetry_activity,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,11 +42,14 @@ _API_KEY = "local-api-key"
 
 def main() -> None:
     """Run an interactive conversation with an LLM backend."""
-    load_dotenv(find_dotenv(usecwd=True))
-    register_shutdown_signals()
-    interaction = ConsoleInteraction()
+    configure_operational_logging(Path.cwd() / APP_DIRECTORY / OPERATIONAL_LOG_FILENAME)
+    interaction = None
+    telemetry = None
 
     try:
+        interaction = ConsoleInteraction()
+        load_dotenv(find_dotenv(usecwd=True))
+        register_shutdown_signals()
         interaction.info("Hello from loop!")
         context_window = os.getenv("CONTEXT_WINDOW")
         max_retries = os.getenv("OPENAI_MAX_RETRIES")
@@ -47,6 +62,11 @@ def main() -> None:
         )
         working_directory = Path.cwd()
         project_root = find_project_root(working_directory) or working_directory
+        telemetry = Telemetry(
+            SQLiteTelemetryAdapter(project_root / APP_DIRECTORY / TELEMETRY_DATABASE_FILENAME)
+        )
+        set_telemetry(telemetry)
+        telemetry_activity("application.started", component="main")
         session_manager = SessionManager(
             interaction=interaction,
             session_store=SQLiteSessionStore(
@@ -63,7 +83,9 @@ def main() -> None:
         )
         loop.run()
     except (EOFError, KeyboardInterrupt, ShutdownRequested):
-        interaction.info("\nStopping loop. Goodbye!")
+        telemetry_activity("application.stopping", reason="interrupted")
+        if interaction is not None:
+            interaction.info("\nStopping loop. Goodbye!")
     except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
         problem = Problem(
             code="internal.unexpected",
@@ -73,7 +95,13 @@ def main() -> None:
             operation="main",
         )
         log_problem(_LOGGER, problem, error)
-        interaction.report(problem)
+        if interaction is not None:
+            interaction.report(problem)
+    finally:
+        if telemetry is not None:
+            telemetry_activity("application.stopped", component="main")
+            telemetry.close()
+        set_telemetry(None)
 
 
 if __name__ == "__main__":

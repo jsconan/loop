@@ -13,6 +13,9 @@ from loop import SessionManager, ShutdownRequested, main
 def isolate_main_environment(monkeypatch):
     """Keep CLI configuration independent of process variables and local dotenv files."""
     monkeypatch.setattr(main, "load_dotenv", Mock())
+    monkeypatch.setattr(main, "configure_operational_logging", Mock())
+    monkeypatch.setattr(main, "SQLiteTelemetryAdapter", Mock(return_value=Mock()))
+    monkeypatch.setattr(main, "Telemetry", Mock(return_value=Mock()))
     for variable in (
         "BASE_URL",
         "DEFAULT_MODEL",
@@ -133,6 +136,18 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
     loop.run.assert_called_once_with()
 
 
+def test_main_handles_shutdown_before_telemetry_initialization(monkeypatch):
+    """Early shutdown remains friendly when no structured telemetry exists yet."""
+    interaction = Mock()
+    monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
+    monkeypatch.setattr(main, "register_shutdown_signals", Mock())
+    monkeypatch.setattr(main, "OpenAIBackend", Mock(side_effect=ShutdownRequested))
+
+    main.main()
+
+    interaction.info.assert_has_calls([call("Hello from loop!"), call("\nStopping loop. Goodbye!")])
+
+
 def test_main_reports_unexpected_failures(monkeypatch):
     """Unexpected startup or runtime failures are converted into fatal problems."""
     interaction = Mock()
@@ -147,11 +162,58 @@ def test_main_reports_unexpected_failures(monkeypatch):
 
     logger.log.assert_called_once()
     assert logger.log.call_args.args[0] == 50
-    assert logger.log.call_args.kwargs["exc_info"][1] is error
+    assert logger.log.call_args.kwargs["extra"]["exception.type"] == "builtins.RuntimeError"
+    assert "exc_info" not in logger.log.call_args.kwargs
     interaction.report.assert_called_once()
     problem = interaction.report.call_args.args[0]
     assert problem.code == "internal.unexpected"
     assert problem.severity == "fatal"
+
+
+def test_main_logs_interaction_initialization_failure_without_presenting(monkeypatch):
+    """A failure before interaction construction still reaches independent low-level logging."""
+    error = RuntimeError("terminal private")
+    monkeypatch.setattr(main, "ConsoleInteraction", Mock(side_effect=error))
+    logger = Mock()
+    monkeypatch.setattr(main, "_LOGGER", logger)
+
+    main.main()
+
+    logger.log.assert_called_once()
+    assert logger.log.call_args.kwargs["extra"]["exception.type"] == "builtins.RuntimeError"
+    assert "terminal private" not in str(logger.log.call_args)
+
+
+def test_main_handles_shutdown_during_interaction_initialization(monkeypatch):
+    """A shutdown before interaction construction exits without presentation or failure."""
+    monkeypatch.setattr(main, "ConsoleInteraction", Mock(side_effect=ShutdownRequested))
+
+    main.main()
+
+
+def test_main_reports_runtime_failures_to_initialized_telemetry(monkeypatch):
+    """Failures after startup reach both independent logging and structured telemetry."""
+    interaction = Mock()
+    loop = Mock()
+    error = RuntimeError("runtime private")
+    loop.run.side_effect = error
+    telemetry = Mock()
+    monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
+    monkeypatch.setattr(main, "register_shutdown_signals", Mock())
+    monkeypatch.setattr(main, "OpenAIBackend", Mock(return_value=Mock()))
+    monkeypatch.setattr(main, "create_default_tool_registry", Mock(return_value=Mock()))
+    monkeypatch.setattr(main, "SQLiteSessionStore", Mock(return_value=Mock()))
+    monkeypatch.setattr(main, "SessionManager", Mock(return_value=Mock()))
+    monkeypatch.setattr(main, "Loop", Mock(return_value=loop))
+    monkeypatch.setattr(main, "find_project_root", Mock(return_value=Path("/project")))
+    monkeypatch.setattr(main, "Telemetry", Mock(return_value=telemetry))
+
+    main.main()
+
+    telemetry.error.assert_called_once()
+    assert telemetry.error.call_args.kwargs["exception"] is error
+    assert telemetry.error.call_args.args == ("problem.reported",)
+    telemetry.close.assert_called_once_with()
 
 
 def test_main_module_runs_entry_point(monkeypatch):
@@ -164,5 +226,9 @@ def test_main_module_runs_entry_point(monkeypatch):
     monkeypatch.setattr("loop.create_default_tool_registry", Mock(return_value=Mock()))
     monkeypatch.setattr("loop.find_project_root", Mock(return_value=Path.cwd()))
     monkeypatch.setattr("loop.register_shutdown_signals", Mock())
+    monkeypatch.setattr("loop.telemetry.Telemetry", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.telemetry.SQLiteTelemetryAdapter", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.telemetry.configure_operational_logging", Mock())
+    monkeypatch.setattr("loop.telemetry.set_telemetry", Mock())
 
     runpy.run_path(str(Path(main.__file__)), run_name="__main__")

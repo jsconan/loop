@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 from time import monotonic
 from typing import TYPE_CHECKING
 
 from .. import constants
 from ..backend import BackendError
-from ..errors import Problem
+from ..errors import Problem, log_problem
 from ..interaction import Interaction
 from ..models import ModelAssignment, ModelInfo
 
 if TYPE_CHECKING:
     from ..backend import Backend
     from ..session import SessionManager
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ModelSelection:
@@ -190,16 +193,16 @@ class ModelSelection:
         try:
             models = self.available()
         except BackendError as error:
-            interaction.report(
-                Problem.from_exception(
-                    error,
-                    code="backend.model_listing_failed",
-                    title="Could not list available models",
-                    detail="The backend is not reachable.",
-                    retryable=error.recoverable,
-                    operation="list_models",
-                )
+            problem = Problem.from_exception(
+                error,
+                code="backend.model_listing_failed",
+                title="Could not list available models",
+                detail="The backend is not reachable.",
+                retryable=error.recoverable,
+                operation="list_models",
             )
+            log_problem(_LOGGER, problem, error)
+            interaction.report(problem)
             return False
         if not models:
             interaction.warning("The backend reported no available models.")

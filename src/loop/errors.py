@@ -8,6 +8,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .telemetry import get_telemetry
+
 
 class Problem(BaseModel):
     """Describe one safe, structured application failure.
@@ -97,12 +99,9 @@ def log_problem(
     Args:
         logger (logging.Logger): Logger receiving the problem record.
         problem (Problem): Structured failure shared with the user or protocol consumer.
-        error (BaseException | None): Original exception whose type and traceback should be
-            recorded, or ``None`` when the problem did not originate from an exception.
+        error (BaseException | None): Original exception supplying only its qualified type, or
+            ``None`` when the problem did not originate from an exception.
     """
-    if not logger.hasHandlers():
-        return
-
     level = {
         "warning": logging.WARNING,
         "error": logging.ERROR,
@@ -113,21 +112,26 @@ def log_problem(
         "error.instance": problem.instance,
         "error.operation": problem.operation,
     }
-    exc_info = None
     if error is not None:
         attributes.update(
             {
                 "exception.type": f"{type(error).__module__}.{type(error).__qualname__}",
-                "exception.message": str(error),
             }
         )
-        exc_info = (type(error), error, error.__traceback__)
     logger.log(
         level,
-        "%s: %s [%s]",
+        "%s [%s]",
         problem.title,
-        problem.detail,
         problem.instance,
         extra=attributes,
-        exc_info=exc_info,
     )
+    telemetry = get_telemetry()
+    if telemetry is not None:
+        telemetry.error(
+            "problem.reported",
+            error_type=problem.code,
+            severity=problem.severity,
+            exception=error,
+            operation=problem.operation,
+            problem_instance=problem.instance,
+        )
