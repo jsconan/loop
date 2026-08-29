@@ -129,9 +129,7 @@ def test_permission_audit_rotates_valid_private_jsonl_archives(tmp_path, monkeyp
     manager = PermissionManager(tmp_path)
 
     for tool_id in ("first", "second", "third", "fourth"):
-        manager.authorize(
-            (file_operation(Action.FILESYSTEM_READ, tmp_path / f"{tool_id}.txt"),)
-        )
+        manager.authorize((file_operation(Action.FILESYSTEM_READ, tmp_path / f"{tool_id}.txt"),))
 
     audit_path = tmp_path / ".loop" / "permissions-audit.jsonl"
     audit_paths = (

@@ -6,14 +6,44 @@ import json
 import logging
 import sys
 from datetime import UTC, datetime
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .. import constants
+from ..utils import PrivateRotatingTextFile
 
 
-class SafeRotatingFileHandler(RotatingFileHandler):
-    """Report handler failures through a content-free stderr fallback."""
+class SafeRotatingFileHandler(logging.Handler):
+    """Write rotating private log records with a content-free failure fallback.
+
+    Args:
+        path (Path | str): Operational log destination.
+        max_bytes (int): Maximum active-file size before the next record rotates it.
+        backup_count (int): Number of numbered archives to retain.
+    """
+
+    _output: PrivateRotatingTextFile
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        max_bytes: int = constants.DEFAULT_OPERATIONAL_LOG_BYTES,
+        backup_count: int = constants.DEFAULT_OPERATIONAL_LOG_BACKUPS,
+    ) -> None:
+        super().__init__()
+        self._output = PrivateRotatingTextFile(
+            path,
+            max_bytes=max_bytes,
+            backup_count=backup_count,
+        )
+        self._output.prepare()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Write one formatted record without exposing handler failures."""
+        try:
+            self._output.append(self.format(record) + "\n")
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            self.handleError(record)
 
     def handleError(self, record: logging.LogRecord) -> None:
         """Report a failed log write without exposing the record or exception."""
@@ -72,17 +102,13 @@ def configure_operational_logging(path: Path | str) -> logging.Handler | None:
     """
     destination = Path(path)
     try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.parent.chmod(constants.PRIVATE_DIRECTORY_MODE)
         handler = SafeRotatingFileHandler(
             destination,
-            maxBytes=constants.DEFAULT_OPERATIONAL_LOG_BYTES,
-            backupCount=constants.DEFAULT_OPERATIONAL_LOG_BACKUPS,
-            encoding="utf-8",
+            max_bytes=constants.DEFAULT_OPERATIONAL_LOG_BYTES,
+            backup_count=constants.DEFAULT_OPERATIONAL_LOG_BACKUPS,
         )
         handler.addFilter(logging.Filter("loop"))
         handler.setFormatter(SafeOperationalFormatter())
-        destination.chmod(constants.PRIVATE_FILE_MODE)
         root = logging.getLogger()
         root.addHandler(handler)
         root.setLevel(constants.DEFAULT_OPERATIONAL_LOG_LEVEL)

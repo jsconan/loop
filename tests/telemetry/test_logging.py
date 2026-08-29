@@ -38,6 +38,27 @@ def test_configure_operational_logging_writes_rotating_local_file(tmp_path):
     assert (tmp_path / ".loop" / "loop.log").stat().st_mode & 0o777 == 0o600
 
 
+def test_configure_operational_logging_rotates_private_archives(tmp_path, monkeypatch):
+    """Rollover retains bounded operational JSONL archives with private permissions."""
+    monkeypatch.setattr("loop.constants.DEFAULT_OPERATIONAL_LOG_BYTES", 1)
+    monkeypatch.setattr("loop.constants.DEFAULT_OPERATIONAL_LOG_BACKUPS", 1)
+    path = tmp_path / ".loop" / "loop.log"
+    handler = configure_operational_logging(path)
+    logger = logging.getLogger("loop.operational.rotation")
+
+    logger.error("first")
+    logger.error("second")
+    handler.flush()
+    logging.getLogger().removeHandler(handler)
+    handler.close()
+
+    archive = path.with_name("loop.log.1")
+    assert json.loads(path.read_text(encoding="utf-8"))["message"] == "second"
+    assert json.loads(archive.read_text(encoding="utf-8"))["message"] == "first"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert archive.stat().st_mode & 0o777 == 0o600
+
+
 def test_configure_operational_logging_falls_back_when_file_setup_fails(monkeypatch, caplog):
     """Bootstrap file failures are reported safely through normal logging fallback."""
     monkeypatch.setattr(
@@ -69,6 +90,31 @@ def test_handler_failures_use_content_free_stderr_fallback(tmp_path, capsys):
 
     handler.handleError(record)
     handler.close()
+
+    output = capsys.readouterr().err
+    assert output == "Operational logging handler failed\n"
+    assert "private payload" not in output
+
+
+def test_handler_emit_failures_use_content_free_stderr_fallback(tmp_path, monkeypatch, capsys):
+    """A write failure during logging cannot expose the formatted record or propagate."""
+    monkeypatch.setattr(
+        logging_module.PrivateRotatingTextFile,
+        "append",
+        Mock(side_effect=OSError("unavailable")),
+    )
+    handler = logging_module.SafeRotatingFileHandler(tmp_path / "loop.log")
+    logger = logging.getLogger("loop.test.emit_failure")
+    previous_propagation = logger.propagate
+    logger.addHandler(handler)
+    logger.propagate = False
+
+    try:
+        logger.error("private payload")
+    finally:
+        logger.removeHandler(handler)
+        logger.propagate = previous_propagation
+        handler.close()
 
     output = capsys.readouterr().err
     assert output == "Operational logging handler failed\n"

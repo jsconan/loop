@@ -6,6 +6,7 @@ __all__ = [
     "ChoiceItem",
     "IgnoreRule",
     "IgnoreRules",
+    "PrivateRotatingTextFile",
     "Scalar",
     "ShutdownRequested",
     "TextSearchContext",
@@ -82,6 +83,7 @@ from .path import (
     iter_visible_paths,
 )
 from .process import kill_process_group, parse_command_line, read_bounded_stream
+from .rotating_file import PrivateRotatingTextFile
 from .search import ripgrep_path, search_text_paths
 from .signals import ShutdownRequested, register_shutdown_signals
 from .text import (

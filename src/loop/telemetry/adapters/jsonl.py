@@ -4,7 +4,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
-from ... import constants
+from ...utils import PrivateRotatingTextFile
 from ..models import TelemetryRecord
 from ..policy import thaw
 
@@ -17,7 +17,7 @@ class JSONLTelemetryAdapter:
     """
 
     def __init__(self, path: Path | str) -> None:
-        self._path = Path(path)
+        self._output = PrivateRotatingTextFile(path)
 
     def write_batch(self, records: Sequence[TelemetryRecord]) -> None:
         """Append one canonical line per record.
@@ -27,12 +27,7 @@ class JSONLTelemetryAdapter:
         """
         if not records:
             return
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.parent.chmod(constants.PRIVATE_DIRECTORY_MODE)
-        with self._path.open("a", encoding="utf-8") as output:
-            for record in records:
-                output.write(_record_json(record) + "\n")
-        self._path.chmod(constants.PRIVATE_FILE_MODE)
+        self._output.append("".join(_record_json(record) + "\n" for record in records))
 
     def flush(self) -> None:
         """Complete immediately because each batch closes its file."""
