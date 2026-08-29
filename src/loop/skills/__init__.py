@@ -2,6 +2,7 @@
 
 __all__ = [
     "AgentInstructionsSource",
+    "AgentPolicy",
     "InstructionSection",
     "InstructionsManager",
     "LoadedAgentInstructions",
@@ -21,6 +22,7 @@ from .commands import SkillCommands
 from .instructions import InstructionsManager
 from .models import (
     AgentInstructionsSource,
+    AgentPolicy,
     InstructionSection,
     LoadedAgentInstructions,
     RuntimeEnvironment,

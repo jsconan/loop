@@ -42,8 +42,8 @@ class Loop:
             ``"Assistant"``.
         model (str | None): Model selected for requests, or ``None`` to use the backend default.
         instructions_manager (InstructionsManager | None): Manager used to compose the complete
-            backend instructions. Defaults to discovering project instructions and Agent Skills
-            for ``working_directory``.
+            backend instructions. Defaults to Loop's base policy plus discovered project
+            instructions and Agent Skills for ``working_directory``.
         interaction (Interaction | None): Service used for all user input and output.
         permission_manager (PermissionManager | None): Manager used to authorize model tool calls.
             Defaults to loading local policy from the project ``.loop`` folder.
@@ -76,8 +76,6 @@ class Loop:
 
     """
 
-    _backend: Backend
-    _instructions_manager: InstructionsManager
     _session_manager: SessionManager
     _interaction: Interaction
     _working_directory: Path
@@ -86,8 +84,6 @@ class Loop:
     _model_selection: ModelSelection
     _compaction: ContextCompaction
     _command_manager: CommandManager
-    _permission_manager: PermissionManager
-    _tool_registry: ToolRegistry
     _completion_manager: CompletionManager
     _session_name_generator: SessionNameGenerator
     _mention_manager: MentionManager
@@ -127,7 +123,6 @@ class Loop:
                 session=session,
             )
         self._interaction = interaction or self._session_manager.interaction
-        self._backend = backend
         self._session_name_generator = session_name_generator or BackendSessionNameGenerator(
             backend
         )
@@ -136,53 +131,53 @@ class Loop:
         self._working_directory = Path(
             working_directory or restored_directory or Path.cwd()
         ).resolve()
-        self._permission_manager = permission_manager or PermissionManager(
+        configured_permissions = permission_manager or PermissionManager(
             find_project_root(self._working_directory) or self._working_directory,
             interaction=self._interaction,
         )
-        self._instructions_manager = instructions_manager or InstructionsManager.discover(
+        configured_instructions = instructions_manager or InstructionsManager.discover(
             self._working_directory,
             agents_filenames=agents_filenames,
         )
         if instructions_manager is None:
-            self._instructions_manager.reactivate_skills(
+            configured_instructions.reactivate_skills(
                 self._session_manager.session.active_skills
             )
-        self._instructions_manager.set_runtime_environment(
+        configured_instructions.set_runtime_environment(
             RuntimeEnvironment(
                 working_directory=self._working_directory,
-                temporary_directory=self._permission_manager.temporary_directory,
+                temporary_directory=configured_permissions.temporary_directory,
             )
+        )
+        configured_permissions.recorder = self._session_manager
+        configured_tools = tool_registry or ToolRegistry(
+            interaction=self._interaction,
+            permission_manager=configured_permissions,
+        )
+        self._agent = Agent(
+            agent_name,
+            backend=backend,
+            instructions_manager=configured_instructions,
+            tool_registry=configured_tools,
+            permission_manager=configured_permissions,
         )
         self._stream = stream
         self._debug = debug
         self._model_selection = ModelSelection(
-            self._backend,
+            self._agent.backend,
             self._session_manager,
             selected=model,
         )
         self._compaction = ContextCompaction(
-            self._backend,
+            self._agent.backend,
             self._session_manager,
             self._model_selection,
-            self._instructions_manager,
+            self._agent.instructions_manager,
             self._interaction,
             lambda: self._working_directory,
             threshold=compaction_threshold,
         )
         self._prompt_on_recoverable_error = prompt_on_recoverable_error
-        self._permission_manager.recorder = self._session_manager
-        self._tool_registry = tool_registry or ToolRegistry(
-            interaction=self._interaction,
-            permission_manager=self._permission_manager,
-        )
-        self._agent = Agent(
-            agent_name,
-            self._backend,
-            self._instructions_manager,
-            self._tool_registry,
-            self._permission_manager,
-        )
         self._agent_runner = AgentRunner(
             self._agent,
             self._session_manager,
@@ -197,9 +192,9 @@ class Loop:
         )
         providers = (
             SessionCommands(self._session_manager, self._session_name_generator),
-            PermissionCommands(self._permission_manager),
-            SkillCommands(self._instructions_manager),
-            ToolCommands(self._tool_registry, self._instructions_manager),
+            PermissionCommands(self._agent.permission_manager),
+            SkillCommands(self._agent.instructions_manager),
+            ToolCommands(self._agent.tool_registry, self._agent.instructions_manager),
             ModelCommands(self._model_selection),
             CompactionCommands(self._compaction),
         )
@@ -210,7 +205,7 @@ class Loop:
         self._mention_manager = mention_manager or MentionManager(
             (
                 ProjectPathMentionHandler(lambda: self._working_directory),
-                SkillMentionHandler(self._instructions_manager),
+                SkillMentionHandler(self._agent.instructions_manager),
             )
         )
         self._completion_manager = CompletionManager(
@@ -230,7 +225,7 @@ class Loop:
         Returns:
             PermissionManager: Active local permission manager.
         """
-        return self._permission_manager
+        return self._agent.permission_manager
 
     @property
     def agent(self) -> Agent:
@@ -257,7 +252,7 @@ class Loop:
         Returns:
             ToolRegistry: Agent-scoped tool declarations and implementations.
         """
-        return self._tool_registry
+        return self._agent.tool_registry
 
     @property
     def backend(self) -> Backend:
@@ -266,17 +261,16 @@ class Loop:
         Returns:
             Backend: The configured LLM backend.
         """
-        return self._backend
+        return self._agent.backend
 
     @property
-    def instructions(self) -> str | None:
+    def instructions(self) -> str:
         """Return the complete instructions for the next backend request.
 
         Returns:
-            str | None: Project, catalog, and activated-skill instructions, or ``None`` when no
-                instructions are available.
+            str: Base policy, project, runtime, catalog, and activated-skill instructions.
         """
-        return self._instructions_manager.instructions
+        return self._agent.instructions_manager.instructions
 
     @property
     def instructions_manager(self) -> InstructionsManager:
@@ -285,7 +279,7 @@ class Loop:
         Returns:
             InstructionsManager: The active instruction manager.
         """
-        return self._instructions_manager
+        return self._agent.instructions_manager
 
     @property
     def messages(self) -> list[ConversationItem]:
@@ -336,7 +330,7 @@ class Loop:
         if not directory.is_dir():
             raise NotADirectoryError(f"Working directory '{directory}' does not exist.")
         self._working_directory = directory
-        self._instructions_manager.observe_path(directory, directory=True)
+        self._agent.instructions_manager.observe_path(directory, directory=True)
 
     @property
     def debug(self) -> bool:

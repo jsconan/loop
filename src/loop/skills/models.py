@@ -1,11 +1,77 @@
 """Define skill-domain models and structured results."""
 
 from dataclasses import dataclass
+from html import escape
+from importlib.resources import files
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
+from ..constants import DEFAULT_AGENT_POLICY_SOURCE, DEFAULT_AGENT_POLICY_VERSION
 from ..errors import Problem
 from ..utils.hashing import sha256_digest
+
+
+@dataclass(frozen=True)
+class AgentPolicy:
+    """Define the stable application-owned behavior of an agent.
+
+    Args:
+        content (str): Model-facing policy body without its composition wrapper.
+        version (str): Stable policy version used for provenance and diagnostics.
+        source (str): Logical producer or canonical location of the policy.
+
+    Raises:
+        ValueError: If the content, version, or source is empty or whitespace-only.
+    """
+
+    content: str
+    version: str
+    source: str
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("content", self.content),
+            ("version", self.version),
+            ("source", self.source),
+        ):
+            if not value.strip():
+                raise ValueError(f"Agent policy {name} must not be empty.")
+
+    @classmethod
+    def default(cls) -> "AgentPolicy":
+        """Load Loop's bundled agent policy.
+
+        Returns:
+            AgentPolicy: Versioned default policy packaged with Loop.
+        """
+        package, resource_path = DEFAULT_AGENT_POLICY_SOURCE.split("/", maxsplit=1)
+        resource = files(package).joinpath(resource_path)
+        return cls(
+            content=resource.read_text(encoding="utf-8").strip(),
+            version=DEFAULT_AGENT_POLICY_VERSION,
+            source=DEFAULT_AGENT_POLICY_SOURCE,
+        )
+
+    @property
+    def digest(self) -> str:
+        """Return the policy body's stable content digest.
+
+        Returns:
+            str: SHA-256 hexadecimal digest.
+        """
+        return sha256_digest(self.content)
+
+    def render(self) -> str:
+        """Render the policy as a delimited instruction section.
+
+        Returns:
+            str: XML-like policy section including version and source provenance.
+        """
+        return (
+            f'<agent_policy version="{escape(self.version)}" source="{escape(self.source)}">\n'
+            f"{self.content}\n"
+            "</agent_policy>"
+        )
 
 
 @dataclass(frozen=True)

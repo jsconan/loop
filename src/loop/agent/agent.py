@@ -29,6 +29,7 @@ class Agent:
     def __init__(
         self,
         name: str,
+        *,
         backend: Backend,
         instructions_manager: InstructionsManager,
         tool_registry: ToolRegistry,

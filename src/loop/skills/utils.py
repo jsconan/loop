@@ -279,5 +279,5 @@ def build_instructions(*sections: str | None) -> str | None:
     Returns:
         str | None: Sections separated by blank lines, or ``None`` when every section is empty.
     """
-    included = [section for section in sections if section]
-    return "\n\n".join(included) or None
+    sections = [str(section).strip() for section in sections if section]
+    return "\n\n".join(section for section in sections if section) or None

@@ -5,7 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from loop import InstructionsManager, RuntimeEnvironment, Skill, SkillManager
+from loop import (
+    AgentPolicy,
+    InstructionsManager,
+    RuntimeEnvironment,
+    Skill,
+    SkillManager,
+)
+
+TEST_POLICY = AgentPolicy("Test policy.", "test", "tests")
 
 
 def write_skill(directory: Path, name: str, body: str = "Follow the workflow.") -> Skill:
@@ -33,7 +41,10 @@ def test_manager_combines_project_catalog_and_active_skills_in_stable_order(tmp_
     first_result = manager.activate_skill("first")
 
     assert isinstance(initial, str)
-    assert initial.startswith("Project rules.\n\n<available_skills>")
+    assert manager.agent_policy == AgentPolicy.default()
+    assert initial.startswith('<agent_policy version="1"')
+    assert initial.index("</agent_policy>") < initial.index("Project rules.")
+    assert initial.index("Project rules.") < initial.index("<available_skills>")
     assert manager.max_bytes == 64 * 1024
     assert "First instructions." not in initial
     assert second_result["instructions_updated"] is True
@@ -45,6 +56,7 @@ def test_manager_combines_project_catalog_and_active_skills_in_stable_order(tmp_
     )
     context = manager.list_skills()["instruction_context"]
     assert [section["kind"] for section in context["sections"]] == [
+        "agent_policy",
         "agents",
         "skill_catalog",
         "active_skill",
@@ -55,7 +67,8 @@ def test_manager_combines_project_catalog_and_active_skills_in_stable_order(tmp_
 
 def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
     """Runtime context participates in composition, generation, and the hard budget."""
-    manager = InstructionsManager(max_bytes=512)
+    baseline_size = len(InstructionsManager(agent_policy=TEST_POLICY).instructions.encode("utf-8"))
+    manager = InstructionsManager(agent_policy=TEST_POLICY, max_bytes=baseline_size + 512)
     environment = RuntimeEnvironment(tmp_path, tmp_path / "temporary")
     manager.set_runtime_environment(environment)
     generation = manager.generation
@@ -66,7 +79,7 @@ def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
     assert str(tmp_path) in manager.instructions
     assert manager.generation == generation
     with pytest.raises(ValueError, match="Runtime environment exceeds"):
-        manager.set_runtime_environment(RuntimeEnvironment(tmp_path, tmp_path / ("x" * 600)))
+        manager.set_runtime_environment(RuntimeEnvironment(tmp_path, tmp_path / ("x" * 900)))
 
 
 def test_runtime_environment_tracks_the_observed_instruction_directory(tmp_path):
@@ -86,7 +99,10 @@ def test_runtime_environment_tracks_the_observed_instruction_directory(tmp_path)
     assert manager.instructions is not None
     assert f"working_directory: {observed.resolve()}" in manager.instructions
     sections = manager.list_skills()["instruction_context"]["sections"]
-    assert [section["kind"] for section in sections] == ["runtime_environment"]
+    assert [section["kind"] for section in sections] == [
+        "agent_policy",
+        "runtime_environment",
+    ]
 
 
 def test_manager_discovers_project_instructions_and_skills(tmp_path):
@@ -97,7 +113,9 @@ def test_manager_discovers_project_instructions_and_skills(tmp_path):
 
     manager = InstructionsManager.discover(tmp_path)
 
-    assert manager.instructions.startswith("Project rules.")
+    assert manager.instructions.index("</agent_policy>") < manager.instructions.index(
+        "Project rules."
+    )
     assert manager.skill_manager.count == 1
 
 
@@ -133,8 +151,9 @@ def test_discovery_refresh_preserves_an_explicit_skill_manager(tmp_path):
     agents.write_text("short", encoding="utf-8")
     bounded = InstructionsManager.discover(
         tmp_path,
+        agent_policy=TEST_POLICY,
         skill_manager=SkillManager(),
-        max_bytes=20,
+        max_bytes=len(TEST_POLICY.render().encode("utf-8")) + 10,
     )
     agents.write_text("x" * 100, encoding="utf-8")
     with pytest.raises(ValueError, match="Refreshed base instructions exceed"):
@@ -153,7 +172,7 @@ def test_prepare_refreshes_changed_project_instructions_without_churning_stable_
     agents.write_text("Second and longer rules.", encoding="utf-8")
 
     assert manager.prepare() is True
-    assert manager.instructions == "Second and longer rules."
+    assert manager.instructions.endswith("Second and longer rules.")
     assert manager.generation == 1
     assert manager.list_skills()["instruction_context"]["refresh_changes"] == [
         f"Changed instruction source '{agents.resolve()}'."
@@ -173,7 +192,7 @@ def test_prepare_detects_content_changes_with_unchanged_file_metadata(tmp_path):
     os.utime(agents, ns=(original.st_atime_ns, original.st_mtime_ns))
 
     assert manager.prepare() is True
-    assert manager.instructions == "Other rules"
+    assert manager.instructions.endswith("Other rules")
 
 
 def test_observed_file_changes_scope_and_rediscovers_nested_sources(tmp_path):
@@ -193,7 +212,7 @@ def test_observed_file_changes_scope_and_rediscovers_nested_sources(tmp_path):
     assert manager.list_skills()["instruction_context"]["dirty"] is True
     assert manager.prepare() is True
     assert manager.working_directory == nested.resolve()
-    assert manager.instructions == "Root rules.\n\nNested rules."
+    assert manager.instructions.endswith("Root rules.\n\nNested rules.")
     changes = manager.list_skills()["instruction_context"]["refresh_changes"]
     assert changes[0] == f"Instruction scope changed to '{nested.resolve()}'."
     assert changes[1] == f"Added instruction source '{(nested / 'AGENTS.md').resolve()}'."
@@ -355,7 +374,12 @@ def test_refresh_deactivates_invalid_and_oversized_active_skills(tmp_path, monke
 
 def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path, monkeypatch):
     """Only instruction sources invalidate, and an invalid candidate preserves prior content."""
-    manager = InstructionsManager.discover(tmp_path, max_bytes=20)
+    limit = len(TEST_POLICY.render().encode("utf-8")) + 20
+    manager = InstructionsManager.discover(
+        tmp_path,
+        agent_policy=TEST_POLICY,
+        max_bytes=limit,
+    )
     manager.invalidate(tmp_path / "ordinary.py")
     assert manager.list_skills()["instruction_context"]["dirty"] is False
 
@@ -366,7 +390,7 @@ def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path
     (tmp_path / "AGENTS.md").write_text("x" * 100, encoding="utf-8")
     with pytest.raises(ValueError, match="Refreshed base instructions exceed"):
         manager.prepare()
-    assert manager.instructions is None
+    assert manager.instructions == TEST_POLICY.render()
 
     static = InstructionsManager()
     static.invalidate()

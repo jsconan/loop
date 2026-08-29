@@ -145,10 +145,11 @@ def test_compaction_persists_replacement_context_and_reports_usage():
     assert manager.model_context == [item]
     assert session.tokens == 20
     assert session.compactions[0].instructions.working_directory == "/project"
-    assert session.compactions[0].instructions.content == "instructions"
+    assert session.compactions[0].instructions.content.endswith("instructions")
+    assert "<agent_policy" in session.compactions[0].instructions.content
     backend.compact.assert_called_once_with(
         [message],
-        instructions="instructions",
+        instructions=session.compactions[0].instructions.content,
         model="model",
     )
     interaction.info.assert_any_call("Compacted session context from 80 to 20 tokens.")

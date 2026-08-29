@@ -11,6 +11,7 @@ from .. import constants
 from ..utils import sha256_digest
 from .models import (
     AgentInstructionsSource,
+    AgentPolicy,
     InstructionContext,
     InstructionSection,
     InstructionSectionSummary,
@@ -35,9 +36,11 @@ from .utils import (
 
 
 class InstructionsManager:
-    """Maintain project, catalog, and activated-skill instructions.
+    """Maintain base, project, runtime, catalog, and activated-skill instructions.
 
     Args:
+        agent_policy (AgentPolicy | None): Stable application-owned policy. Defaults to Loop's
+            bundled policy.
         project_instructions (str | None): Project instructions loaded from applicable AGENTS.md
             files, or ``None`` when none apply.
         runtime_environment (RuntimeEnvironment | None): Application-owned runtime paths and
@@ -51,10 +54,11 @@ class InstructionsManager:
             order. Defaults to ``("AGENTS.md",)``.
 
     Raises:
-        ValueError: If ``max_bytes`` is not a positive integer or the initial instructions exceed
-            the configured limit.
+        ValueError: If ``max_bytes`` is not a positive integer, the policy is invalid, or the
+            initial instructions exceed the configured limit.
     """
 
+    _agent_policy: AgentPolicy
     _project_instructions: str | None
     _runtime_environment: RuntimeEnvironment | None
     _skill_manager: SkillManager
@@ -63,7 +67,7 @@ class InstructionsManager:
     _dirty: bool
     _generation: int
     _signature: tuple
-    _instructions: str | None
+    _instructions: str
     _refresh_diagnostics: list[str]
     _project_sources: tuple[AgentInstructionsSource, ...]
     _skill_discovery_enabled: bool
@@ -74,6 +78,7 @@ class InstructionsManager:
     def __init__(
         self,
         *,
+        agent_policy: AgentPolicy | None = None,
         project_instructions: str | None = None,
         runtime_environment: RuntimeEnvironment | None = None,
         skill_manager: SkillManager | None = None,
@@ -83,6 +88,7 @@ class InstructionsManager:
     ) -> None:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise ValueError("Instruction limit must be a positive integer.")
+        self._agent_policy = agent_policy or AgentPolicy.default()
         self._project_instructions = project_instructions
         self._runtime_environment = runtime_environment
         self._skill_manager = skill_manager or SkillManager()
@@ -108,6 +114,7 @@ class InstructionsManager:
         cls,
         working_directory: Path | str,
         *,
+        agent_policy: AgentPolicy | None = None,
         skill_manager: SkillManager | None = None,
         max_bytes: int = constants.MAX_INSTRUCTIONS_BYTES,
         agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
@@ -116,6 +123,8 @@ class InstructionsManager:
 
         Args:
             working_directory (Path | str): Directory whose instruction scopes should apply.
+            agent_policy (AgentPolicy | None): Stable application-owned policy. Defaults to Loop's
+                bundled policy.
             skill_manager (SkillManager | None): Explicit skill manager to use instead of
                 discovering one.
             max_bytes (int): Maximum encoded size of the complete instruction document.
@@ -133,6 +142,7 @@ class InstructionsManager:
         directory = Path(working_directory).resolve()
         loaded = load_agents_instructions(directory, agents_filenames)
         manager = cls(
+            agent_policy=agent_policy,
             project_instructions=loaded.content,
             skill_manager=skill_manager or SkillManager.discover(directory),
             max_bytes=max_bytes,
@@ -145,14 +155,23 @@ class InstructionsManager:
         return manager
 
     @property
-    def instructions(self) -> str | None:
+    def instructions(self) -> str:
         """Return the complete instructions for the next backend request.
 
         Returns:
-            str | None: Project instructions, skill catalog, and active skill bodies in stable
-                order, or ``None`` when no instructions are available.
+            str: Base policy, project instructions, runtime context, skill catalog, and active
+                skill bodies in stable order.
         """
         return self._instructions
+
+    @property
+    def agent_policy(self) -> AgentPolicy:
+        """Return the stable application-owned agent policy.
+
+        Returns:
+            AgentPolicy: Active versioned base policy.
+        """
+        return self._agent_policy
 
     @property
     def working_directory(self) -> Path | None:
@@ -518,7 +537,7 @@ class InstructionsManager:
             self._generation += 1
         return changed
 
-    def _build_instructions(self) -> str | None:
+    def _build_instructions(self) -> str:
         """Render the current instruction sources."""
         return self._compose(
             self._project_instructions, self._skill_manager, self._runtime_environment
@@ -546,11 +565,16 @@ class InstructionsManager:
     def _instruction_sections(self) -> tuple[InstructionSection, ...]:
         """Return typed provenance for every currently composed section."""
         sections = [
+            InstructionSection(
+                "agent_policy", self._agent_policy.render(), self._agent_policy.source
+            ),
+        ]
+        sections.extend(
             InstructionSection("agents", source.content, str(source.path))
             for source in self._project_sources
             if source.content
-        ]
-        if self._project_instructions and not sections:
+        )
+        if self._project_instructions and not self._project_sources:
             sections.append(InstructionSection("agents", self._project_instructions, "injected"))
         if self._runtime_environment is not None:
             sections.append(
@@ -569,13 +593,12 @@ class InstructionsManager:
         )
         return tuple(sections)
 
-    @classmethod
     def _compose(
-        cls,
+        self,
         project_instructions: str | None,
         skill_manager: SkillManager,
         runtime_environment: RuntimeEnvironment | None = None,
-    ) -> str | None:
+    ) -> str:
         """Render an instruction document from candidate sources."""
         entries = []
         for skill, instructions in skill_manager.activated_instructions:
@@ -584,6 +607,7 @@ class InstructionsManager:
             "<active_skills>\n" + "\n".join(entries) + "\n</active_skills>" if entries else None
         )
         return build_instructions(
+            self._agent_policy.render(),
             project_instructions,
             runtime_environment.render() if runtime_environment is not None else None,
             skill_manager.catalog(),

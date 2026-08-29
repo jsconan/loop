@@ -791,7 +791,9 @@ def test_loop_passes_custom_instruction_fallbacks_to_discovery(tmp_path):
     )
 
     assert loop.instructions is not None
-    assert loop.instructions.startswith("custom instructions\n")
+    assert loop.instructions.index("</agent_policy>") < loop.instructions.index(
+        "custom instructions"
+    )
 
 
 def test_loop_uses_an_injected_permission_manager(tmp_path):
@@ -1030,7 +1032,7 @@ def test_loop_loads_project_instructions_for_its_normalized_working_directory(tm
     loop = Loop(backend=loop_backend(), working_directory=str(tmp_path))
 
     assert loop.instructions is not None
-    assert loop.instructions.startswith("project rules\n")
+    assert loop.instructions.index("</agent_policy>") < loop.instructions.index("project rules")
 
 
 def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
@@ -1054,7 +1056,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
 
     assert loop.working_directory == second.resolve()
     instructions = backend.get_response.call_args.kwargs["instructions"]
-    assert instructions.startswith("Second rules.\n")
+    assert instructions.index("</agent_policy>") < instructions.index("Second rules.")
     assert f"working_directory: {second.resolve()}" in instructions
 
 

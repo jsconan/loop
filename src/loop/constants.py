@@ -54,6 +54,8 @@ IGNORE_FILENAMES = (GIT_IGNORE_FILENAME, AGENT_IGNORE_FILENAME)
 
 # Default filenames and directories for agents and skills
 DEFAULT_AGENTS_FILENAME = "AGENTS.md"
+DEFAULT_AGENT_POLICY_SOURCE = "loop.skills/agent_policy.md"
+DEFAULT_AGENT_POLICY_VERSION = "1"
 DEFAULT_SKILL_FILENAME = "SKILL.md"
 DEFAULT_SKILLS_DIRECTORY = Path(".agents/skills")
 RESOURCE_DIRECTORIES = ("references", "scripts", "assets")

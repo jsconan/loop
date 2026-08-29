@@ -170,16 +170,23 @@ disable the limit (unlimited turns). Library callers can change the limit with
 `Loop(..., max_agent_turns=10)` and inspect the configured identity through `loop.agent`. When the
 turn limit is reached, the user is prompted to confirm whether to continue.
 
+Every agent starts with Loop's bundled, versioned base policy, so its minimum collaboration,
+verification, authorization, and communication behavior does not depend on model defaults. The
+policy is always the first instruction section and cannot be disabled or truncated; library callers
+that need a different product contract can inject an explicit `AgentPolicy` through
+`InstructionsManager`.
+
 At startup, the loop recursively indexes instruction files in the Git repository and loads the
 files applicable to the current working directory, from the project root through that directory.
 `AGENTS.md` is the default filename. Library callers can set `agents_filenames=("AGENTS.md",
 "CUSTOM.md")`; a later filename is used only when earlier names are absent in the same directory.
-Sources are combined from least to most specific. Files may optionally begin with YAML frontmatter
+Project sources are appended after the base policy from least to most specific, followed by runtime
+context, the skill catalog, and active skills. Files may optionally begin with YAML frontmatter
 delimited by `---`; its metadata is validated and excluded from the instruction body, with malformed
 frontmatter reported in `manage_skills` diagnostics. The 32 KiB project-instruction limit emits a
-visible truncation marker when space permits, while diagnostics report source paths and exact
-included and omitted sizes. Successful local file reads, directory listings, and writes update the
-active instruction scope before the next model request.
+visible truncation marker when space permits, while diagnostics report policy and source digests,
+source paths, and exact included and omitted sizes. Successful local file reads, directory listings,
+and writes update the active instruction scope before the next model request.
 
 When the model requests a file write or shell command, the loop displays the
 operation and asks for confirmation first. File and directory reads do not
@@ -533,7 +540,7 @@ src/loop/model_selection/ Active model selection and model commands
 src/loop/models.py    Conversation and response models
 src/loop/permissions/ Permission capabilities, requests, and policy management
 src/loop/session/     Session persistence contracts and implementations
-src/loop/skills/      Agent Skills, catalog, and instruction management
+src/loop/skills/      Base agent policy, Agent Skills, catalog, and instruction management
 src/loop/tooling/     Tool context, registration, definitions, and dispatch
 src/loop/tools/       Built-in tool implementations
 src/loop/utils/       Common utilities

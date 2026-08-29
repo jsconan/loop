@@ -14,7 +14,13 @@ def test_agent_exposes_its_identity_and_capabilities(tmp_path):
     tools = ToolRegistry()
     permissions = PermissionManager(tmp_path)
 
-    agent = Agent("Reviewer", backend, instructions, tools, permissions)
+    agent = Agent(
+        "Reviewer",
+        backend=backend,
+        instructions_manager=instructions,
+        tool_registry=tools,
+        permission_manager=permissions,
+    )
 
     assert agent.name == "Reviewer"
     assert agent.backend is backend
@@ -26,4 +32,10 @@ def test_agent_exposes_its_identity_and_capabilities(tmp_path):
 def test_agent_rejects_an_empty_identity(tmp_path):
     """Agent construction rejects identities that cannot be presented or traced."""
     with pytest.raises(ValueError, match="must not be empty"):
-        Agent("  ", Mock(), InstructionsManager(), ToolRegistry(), PermissionManager(tmp_path))
+        Agent(
+            "  ",
+            backend=Mock(),
+            instructions_manager=InstructionsManager(),
+            tool_registry=ToolRegistry(),
+            permission_manager=PermissionManager(tmp_path),
+        )

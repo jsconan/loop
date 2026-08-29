@@ -27,10 +27,10 @@ def agent_runner(*, responses, max_turns=25):
     backend = Mock()
     agent = Agent(
         "Assistant",
-        backend,
-        InstructionsManager(),
-        Mock(),
-        Mock(),
+        backend=backend,
+        instructions_manager=InstructionsManager(),
+        tool_registry=Mock(),
+        permission_manager=Mock(),
     )
     session_manager = Mock()
     session_manager.messages = []
@@ -307,7 +307,13 @@ def test_runner_continues_after_max_turns_when_user_affirms():
     interaction = MagicMock(spec=Interaction)
     interaction.confirm.return_value = True
     backend = Mock()
-    agent = Agent("Assistant", backend, InstructionsManager(), Mock(), Mock())
+    agent = Agent(
+        "Assistant",
+        backend=backend,
+        instructions_manager=InstructionsManager(),
+        tool_registry=Mock(),
+        permission_manager=Mock(),
+    )
     session_manager = Mock()
     session_manager.messages = []
     session_manager.session = Session()
