@@ -2,6 +2,7 @@
 
 __all__ = [
     "JSONLTelemetryAdapter",
+    "LifecycleRequest",
     "MemoryTelemetryAdapter",
     "ModelInputPolicy",
     "NoOpTelemetryAdapter",
@@ -11,6 +12,9 @@ __all__ = [
     "TelemetryAdapter",
     "TelemetryContext",
     "TelemetryRecord",
+    "TelemetrySeverity",
+    "TelemetrySignal",
+    "TelemetryValue",
     "configure_operational_logging",
     "get_telemetry",
     "set_telemetry",
@@ -29,7 +33,14 @@ from .adapters import (
     TelemetryAdapter,
 )
 from .logging import configure_operational_logging
-from .models import TelemetryContext, TelemetryRecord
+from .models import (
+    LifecycleRequest,
+    TelemetryContext,
+    TelemetryRecord,
+    TelemetrySeverity,
+    TelemetrySignal,
+    TelemetryValue,
+)
 from .policy import ModelInputPolicy, OperationalDisclosurePolicy
 from .telemetry import (
     Telemetry,

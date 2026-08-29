@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal
@@ -44,3 +45,12 @@ class TelemetryRecord:
     payload: TelemetryValue = None
     payload_sha256: str | None = None
     schema_version: int = 1
+
+
+@dataclass
+class LifecycleRequest:
+    """Request a writer-owned adapter lifecycle operation."""
+
+    completed: threading.Event
+    close: bool = False
+    succeeded: bool = False

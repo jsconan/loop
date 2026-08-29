@@ -100,8 +100,10 @@ def main() -> None:
     finally:
         if telemetry is not None:
             telemetry_activity("application.stopped", severity="info", component="main")
+            set_telemetry(None)
             telemetry.close()
-        set_telemetry(None)
+        else:
+            set_telemetry(None)
 
 
 if __name__ == "__main__":

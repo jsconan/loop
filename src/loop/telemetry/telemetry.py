@@ -16,7 +16,13 @@ from uuid import uuid4
 from .. import constants
 from ..utils import payload_digest, safe_scalar
 from .adapters import NoOpTelemetryAdapter, TelemetryAdapter
-from .models import TelemetryContext, TelemetryRecord, TelemetrySeverity, TelemetrySignal
+from .models import (
+    LifecycleRequest,
+    TelemetryContext,
+    TelemetryRecord,
+    TelemetrySeverity,
+    TelemetrySignal,
+)
 from .policy import OperationalDisclosurePolicy, freeze
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,7 +45,7 @@ class Telemetry:
 
     Args:
         adapter (TelemetryAdapter | None): Persistence adapter. Defaults to a no-op adapter.
-        queue_capacity (int): Maximum buffered records before overload behavior applies.
+        queue_capacity (int): Maximum pending activity records before activity overload applies.
         batch_size (int): Maximum records persisted in one adapter call.
         flush_seconds (float): Maximum delay before a partial batch is persisted.
     """
@@ -55,15 +61,17 @@ class Telemetry:
         if queue_capacity <= 0 or batch_size <= 0 or flush_seconds <= 0:
             raise ValueError("Telemetry queue, batch, and flush values must be positive.")
         self._adapter = adapter or NoOpTelemetryAdapter()
-        self._queue: queue.Queue[TelemetryRecord | object] = queue.Queue(queue_capacity)
+        self._queue: queue.Queue[TelemetryRecord | LifecycleRequest] = queue.Queue()
+        self._activity_slots = threading.BoundedSemaphore(queue_capacity)
         self._batch_size = batch_size
         self._flush_seconds = flush_seconds
         self._sequence = 0
         self._sequence_lock = threading.Lock()
-        self._write_lock = threading.Lock()
-        self._stop = object()
-        self._flush = object()
+        self._state_lock = threading.Lock()
         self._closed = False
+        self._closing = False
+        self._closed_event = threading.Event()
+        self._close_succeeded = False
         self._dropped_activity = 0
         self._write_failed = threading.Event()
         self._policy = OperationalDisclosurePolicy()
@@ -238,24 +246,20 @@ class Telemetry:
         Returns:
             bool: Whether the queue drained before the timeout.
         """
-        if self._closed:
-            return True
-        deadline = None if timeout is None else time.monotonic() + timeout
-        try:
-            self._queue.put(self._flush, timeout=timeout)
-        except queue.Full:
+        with self._state_lock:
+            if self._closed:
+                return True
+            if self._closing:
+                waiting_for_close = True
+            else:
+                waiting_for_close = False
+                request = LifecycleRequest(threading.Event())
+                self._queue.put_nowait(request)
+        if waiting_for_close:
+            return self._wait_for_close(timeout)
+        if not request.completed.wait(timeout):
             return False
-        while self._queue.unfinished_tasks:
-            if deadline is not None and time.monotonic() >= deadline:
-                return False
-            time.sleep(constants.DEFAULT_TELEMETRY_FLUSH_POLL_SECONDS)
-        try:
-            with self._write_lock:
-                self._adapter.flush()
-        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-            _diagnose("flush_failed", error)
-            return False
-        return not self._write_failed.is_set()
+        return request.succeeded
 
     def close(self, timeout: float | None = constants.DEFAULT_TELEMETRY_SHUTDOWN_TIMEOUT) -> bool:
         """Flush accepted records, stop the writer, and close the adapter.
@@ -266,22 +270,22 @@ class Telemetry:
         Returns:
             bool: Whether queued records flushed and adapter shutdown succeeded.
         """
-        if self._closed:
-            return True
-        flushed = self.flush(timeout)
-        if not flushed and self._queue.unfinished_tasks:
+        with self._state_lock:
+            if self._closed:
+                return True
+            if self._closing:
+                waiting_for_close = True
+            else:
+                waiting_for_close = False
+                self._closing = True
+                request = LifecycleRequest(threading.Event(), close=True)
+                self._queue.put_nowait(request)
+        if waiting_for_close:
+            return self._wait_for_close(timeout)
+        if not request.completed.wait(timeout):
             return False
-        self._queue.put(self._stop)
         self._thread.join()
-        closed = True
-        try:
-            with self._write_lock:
-                self._adapter.close()
-        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-            _diagnose("close_failed", error)
-            closed = False
-        self._closed = True
-        return flushed and closed
+        return request.succeeded
 
     def _emit(
         self,
@@ -293,8 +297,6 @@ class Telemetry:
         payload: object = None,
         payload_sha256: str | None = None,
     ) -> None:
-        if self._closed:
-            return
         try:
             context = _CURRENT_CONTEXT.get() or TelemetryContext()
             now = time.time_ns()
@@ -321,19 +323,56 @@ class Telemetry:
         except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             _diagnose("record_rejected", error)
             return
-        try:
-            self._queue.put_nowait(record)
-        except queue.Full:
-            if signal == "activity":
-                self._dropped_activity += 1
+        if signal == "activity" and not self._activity_slots.acquire(blocking=False):
+            self._dropped_activity += 1
+            return
+        with self._state_lock:
+            if self._closing or self._closed:
+                if signal == "activity":
+                    self._activity_slots.release()
                 return
-            try:
-                self._queue.put(
-                    record,
-                    timeout=constants.DEFAULT_TELEMETRY_PRIORITY_ENQUEUE_TIMEOUT,
-                )
-            except queue.Full:
-                self._write((record,))
+            self._queue.put_nowait(record)
+
+    def _wait_for_close(self, timeout: float | None) -> bool:
+        """Wait for a concurrent close operation to finish."""
+        if not self._closed_event.wait(timeout):
+            return False
+        return self._close_succeeded
+
+    def _release_activity_slot(self, record: TelemetryRecord) -> None:
+        """Release queue capacity once an activity record reaches the writer."""
+        if record.signal == "activity":
+            self._activity_slots.release()
+
+    def _flush_adapter(self) -> bool:
+        """Flush the adapter in its owning writer thread."""
+        try:
+            self._adapter.flush()
+        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            _diagnose("flush_failed", error)
+            return False
+        return not self._write_failed.is_set()
+
+    def _close_adapter(self) -> bool:
+        """Close the adapter in its owning writer thread."""
+        try:
+            self._adapter.close()
+        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            _diagnose("close_failed", error)
+            return False
+        return True
+
+    def _complete_request(self, request: LifecycleRequest, succeeded: bool) -> None:
+        """Publish a lifecycle operation result to its caller."""
+        request.succeeded = succeeded
+        request.completed.set()
+
+    def _finish_close(self, succeeded: bool) -> None:
+        """Mark writer-owned shutdown complete for all concurrent callers."""
+        with self._state_lock:
+            self._closed = True
+            self._close_succeeded = succeeded
+            self._closed_event.set()
 
     def _next_sequence(self) -> int:
         with self._sequence_lock:
@@ -350,16 +389,23 @@ class Telemetry:
                     self._write(tuple(batch))
                     batch.clear()
                 continue
-            if item is self._stop:
-                self._queue.task_done()
-                return
-            if item is self._flush:
+            if isinstance(item, LifecycleRequest):
                 if batch:
                     self._write(tuple(batch))
                     batch.clear()
+                if item.close:
+                    flushed = self._flush_adapter()
+                    closed = self._close_adapter()
+                    succeeded = flushed and closed
+                    self._complete_request(item, succeeded)
+                    self._finish_close(succeeded)
+                    self._queue.task_done()
+                    return
+                self._complete_request(item, self._flush_adapter())
                 self._queue.task_done()
                 continue
             batch.append(cast(TelemetryRecord, item))
+            self._release_activity_slot(cast(TelemetryRecord, item))
             self._queue.task_done()
             if len(batch) >= self._batch_size:
                 self._write(tuple(batch))
@@ -367,8 +413,7 @@ class Telemetry:
 
     def _write(self, records: tuple[TelemetryRecord, ...]) -> None:
         try:
-            with self._write_lock:
-                self._adapter.write_batch(records)
+            self._adapter.write_batch(records)
         except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             self._write_failed.set()
             _diagnose("adapter_failed", error)

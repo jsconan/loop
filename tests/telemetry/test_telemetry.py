@@ -2,6 +2,7 @@
 
 import logging
 import queue
+import sqlite3
 import threading
 from unittest.mock import Mock
 
@@ -9,6 +10,7 @@ import pytest
 
 from loop.telemetry import (
     MemoryTelemetryAdapter,
+    SQLiteTelemetryAdapter,
     Telemetry,
     TelemetryContext,
     get_telemetry,
@@ -185,41 +187,61 @@ def test_facade_rejects_invalid_configuration_and_unsupported_trace_values(caplo
     assert telemetry.close(1)
 
 
-def test_activity_overload_drops_only_activity_and_priority_falls_back_synchronously(
-    monkeypatch,
-):
-    """A saturated queue drops activity but synchronously offers priority records."""
+def test_activity_overload_drops_only_activity_and_preserves_priority_records():
+    """A saturated activity queue drops activity while retaining priority records."""
     adapter = BlockingAdapter()
     telemetry = Telemetry(adapter, queue_capacity=1, batch_size=1, flush_seconds=10)
     telemetry.activity("writing")
     assert adapter.started.wait(1)
     telemetry.activity("queued")
     telemetry.activity("dropped")
-    fallback_started = threading.Event()
-    original_put = queue.Queue.put
-
-    def reject_priority_record(target, item, *args, **kwargs):
-        """Force the priority record through the synchronous overload path."""
-        if getattr(item, "event_name", None) == "preserved":
-            fallback_started.set()
-            raise queue.Full
-        return original_put(target, item, *args, **kwargs)
-
-    monkeypatch.setattr(queue.Queue, "put", reject_priority_record)
-    audit = threading.Thread(
-        target=telemetry.audit,
-        args=("preserved",),
-        kwargs={"decision": "allow"},
-    )
-    audit.start()
-    assert fallback_started.wait(1)
+    telemetry.audit("preserved", decision="allow")
     adapter.release.set()
-    audit.join()
     assert telemetry.dropped_activity == 1
     assert telemetry.close(1)
     event_names = [record.event_name for record in adapter.records]
     assert event_names[0] == "writing"
     assert set(event_names[1:]) == {"preserved", "queued"}
+
+
+def test_sqlite_lifecycle_runs_in_writer_thread_and_closes_cleanly(tmp_path, caplog):
+    """SQLite telemetry owns writes, flushes, and closure in its writer thread."""
+    path = tmp_path / "telemetry.db"
+    telemetry = Telemetry(SQLiteTelemetryAdapter(path), batch_size=1, flush_seconds=1)
+    with caplog.at_level(logging.ERROR, logger="loop.telemetry.telemetry"):
+        telemetry.activity("persisted")
+        assert telemetry.close(1)
+    assert "Telemetry operation failed" not in caplog.text
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("SELECT event_name FROM telemetry_records").fetchall() == [
+            ("persisted",)
+        ]
+    finally:
+        connection.close()
+
+
+def test_shutdown_barrier_rejects_late_activity_and_coordinates_lifecycle_calls():
+    """Closing rejects later activity while concurrent flush and close calls wait safely."""
+    adapter = BlockingAdapter()
+    telemetry = Telemetry(adapter, batch_size=1, flush_seconds=10)
+    telemetry.activity("accepted")
+    assert adapter.started.wait(1)
+
+    closing = threading.Thread(target=telemetry.close, args=(1,))
+    closing.start()
+    assert telemetry.close(0) is False
+    assert telemetry.flush(0) is False
+    telemetry.activity("ignored")
+    telemetry.audit("also.ignored", decision="allow")
+    telemetry.error("ignored.error", error_type="test.ignored")
+    telemetry.error("ignored.error", error_type="test.ignored", exception=RuntimeError())
+
+    adapter.release.set()
+    closing.join()
+    assert telemetry.close(1)
+    assert [record.event_name for record in adapter.records] == ["accepted"]
 
 
 def test_adapter_failures_and_flush_timeouts_do_not_escape(caplog):
