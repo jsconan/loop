@@ -68,7 +68,9 @@ def test_manager_creates_default_services_and_an_empty_session():
 
     assert isinstance(manager.interaction, ConsoleInteraction)
     assert isinstance(manager.store, MemorySessionStore)
-    assert manager.session == Session()
+    assert manager.session.id is not None
+    assert manager.session.messages == []
+    assert manager.session.name is None
     assert manager.messages == []
     assert manager.model is None
 
@@ -511,7 +513,9 @@ def test_manager_starts_a_fresh_unpersisted_session():
 
     manager.new_session()
 
-    assert manager.session == Session()
+    assert manager.session.id != "old"
+    assert manager.session.messages == []
+    assert manager.session.name is None
     store.save.assert_not_called()
 
 
@@ -858,10 +862,9 @@ def test_manager_rolls_back_every_mutation_when_persistence_fails(kind):
     assert session.messages == [ToolCall(call_id="call", name="demo", arguments="{}")]
 
 
-def test_manager_records_persistence_binding_and_failure_without_changing_atomicity():
-    """Session persistence emits assignment audit and isolated failure diagnostics."""
+def test_manager_records_persistence_failure_without_changing_atomicity():
+    """Session persistence emits isolated failure diagnostics without changing atomicity."""
     store = Mock(spec=SessionStore)
-    store.save.side_effect = lambda session: setattr(session, "id", "session-id")
     manager = SessionManager(session_store=store)
     adapter = MemoryTelemetryAdapter()
     telemetry = Telemetry(adapter, flush_seconds=0.01)
@@ -878,7 +881,6 @@ def test_manager_records_persistence_binding_and_failure_without_changing_atomic
     assert [record.event_name for record in adapter.records] == [
         "session.persistence.started",
         "session.persistence.completed",
-        "session.bound",
         "session.persistence.started",
         "session.persistence.failed",
     ]

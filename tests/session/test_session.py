@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime, timedelta, timezone
+from uuid import UUID
 
 import pytest
 
@@ -50,6 +51,23 @@ def test_session_info_describes_a_persisted_session():
     info = SessionInfo(id="session-id", name="Useful title", updated_at=updated_at, message_count=2)
 
     assert info == SessionInfo("session-id", "Useful title", updated_at, 2)
+
+
+def test_session_generates_a_stable_uuidv7_identifier():
+    """Fresh sessions receive an identifier before persistence begins."""
+    session = Session()
+
+    assert session.id is not None
+    assert UUID(session.id).version == 7
+
+
+def test_session_deserialization_rejects_an_empty_identifier():
+    """Current snapshots require a non-empty session identifier."""
+    payload = json.loads(Session().serialize())
+    payload["id"] = ""
+
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        Session.deserialize(json.dumps(payload))
 
 
 def test_session_adds_one_or_multiple_messages():
@@ -656,7 +674,7 @@ def test_session_serialization_identifies_unsupported_item_types():
     [
         ("not-json", "Invalid serialized session"),
         ("[]", "Invalid serialized session"),
-        ('{"version":8,"messages":[],"tokens":0,"model":null}', "Unsupported session version 8"),
+        ('{"version":9,"messages":[],"tokens":0,"model":null}', "Unsupported session version 9"),
         ('{"messages":[],"tokens":0,"model":null}', "Unsupported session version None"),
         ('{"version":5,"messages":[]}', "Invalid serialized session"),
     ],

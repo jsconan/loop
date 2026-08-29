@@ -167,7 +167,7 @@ def test_store_upcasts_version_four_without_rewriting_the_snapshot(tmp_path):
     "payload",
     [
         "not-json",
-        '{"version":7,"messages":[],"tokens":0,"model":null}',
+        '{"version":8,"messages":[],"tokens":0,"model":null}',
         '{"version":1,"messages":[{"type":"unknown","data":{}}],"tokens":0,"model":null}',
         '{"version":1,"messages":[],"tokens":true,"model":null}',
         '{"version":1,"messages":[],"tokens":0,"model":42}',

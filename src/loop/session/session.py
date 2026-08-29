@@ -40,7 +40,7 @@ from .models import (
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -56,7 +56,7 @@ class Session:
     """Describe a living session.
 
     Args:
-        id (str): Persistent session identifier.
+        id (str): Stable session identifier, generated when omitted.
         name (str | None): Human-readable display name, or ``None`` before the first message.
         name_source (SessionNameSource | None): Origin controlling automatic replacement.
         messages (list[ConversationItem]): Conversation items.
@@ -77,7 +77,7 @@ class Session:
             Defaults to an empty list.
     """
 
-    id: str | None = None
+    id: str = field(default_factory=lambda: str(uuid7()))
     name: str | None = None
     name_source: SessionNameSource | None = None
     messages: list[ConversationItem] = field(default_factory=list)
@@ -377,6 +377,7 @@ class Session:
         return json.dumps(
             SerializedSession(
                 version=_SCHEMA_VERSION,
+                id=self.id,
                 name=self.name,
                 name_source=self.name_source,
                 messages=messages,
@@ -394,6 +395,7 @@ class Session:
     @staticmethod
     def _validate_snapshot_metadata(
         *,
+        id: object,
         name: object,
         name_source: object,
         tokens: object,
@@ -403,6 +405,8 @@ class Session:
         active_skills: object,
     ) -> None:
         """Validate scalar and instruction metadata from a current snapshot."""
+        if not isinstance(id, str) or not id:
+            raise TypeError("Invalid session identifier.")
         if name is not None and (not isinstance(name, str) or not normalize_session_name(name)):
             raise TypeError("Invalid serialized session name.")
         validate_session_source(name_source, allow_none=True)
@@ -495,7 +499,7 @@ class Session:
             )
 
         version = payload.get("version")
-        if version in {1, 2, 3, 4, 5, 6}:
+        if version in {1, 2, 3, 4, 5, 6, 7}:
             try:
                 payload = cls._upcast_payload(payload)
             except (KeyError, TypeError, ValueError) as error:
@@ -522,9 +526,11 @@ class Session:
             instruction_working_directory = payload["instruction_working_directory"]
             active_skills = payload["active_skills"]
             events = [_EVENT_ADAPTER.validate_python(item) for item in payload["events"]]
+            id = payload["id"]
             name = payload["name"]
             name_source = payload["name_source"]
             cls._validate_snapshot_metadata(
+                id=id,
                 name=name,
                 name_source=name_source,
                 tokens=tokens,
@@ -539,6 +545,7 @@ class Session:
             raise ValueError("Invalid serialized session.") from error
 
         return cls(
+            id=id,
             name=name,
             name_source=name_source,
             messages=messages,
@@ -623,6 +630,7 @@ class Session:
         )
         value.update(
             version=_SCHEMA_VERSION,
+            id=value.get("id", str(uuid7())),
             name=value.get("name", initial_session_name(first_user) if first_user else None),
             name_source=value.get(
                 "name_source", SESSION_NAME_SOURCE_INITIAL if first_user else None
@@ -640,13 +648,13 @@ class SessionStore(Protocol):
     """Persist and retrieve sessions by their identifier."""
 
     def save(self, session: Session) -> str:
-        """Persist a session, creating an identifier when needed.
+        """Persist a session under its stable identifier.
 
         Args:
             session (Session): Session to persist.
 
         Returns:
-            str: Existing or newly assigned persistent identifier.
+            str: The session's stable identifier.
         """
 
     def load(self, session_id: str) -> Session:

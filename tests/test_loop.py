@@ -100,7 +100,9 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.instructions_manager is not None
     assert loop.permission_manager.configuration_path == tmp_path / ".loop" / "permissions.yaml"
     assert loop.tool_registry.names == []
-    assert loop.session == Session(model="requested-model")
+    assert loop.session.id is not None
+    assert loop.session.model == "requested-model"
+    assert loop.session.messages == []
     assert loop.model == "requested-model"
 
     loop.debug = False
@@ -928,8 +930,8 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
     assert loop.session.model == "served-model"
 
 
-def test_loop_correlates_message_and_run_activity_with_a_provisional_session(tmp_path):
-    """A new unpersisted session receives telemetry correlation without early session storage."""
+def test_loop_correlates_first_message_and_run_with_its_session_identifier(tmp_path):
+    """A new session retains one identifier throughout its first traced run."""
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
     backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted()]))
@@ -937,15 +939,17 @@ def test_loop_correlates_message_and_run_activity_with_a_provisional_session(tmp
     telemetry = Telemetry(adapter, flush_seconds=0.01)
     set_telemetry(telemetry)
     try:
-        Loop.create_default(
+        loop = Loop.create_default(
             backend=backend, interaction=interaction, working_directory=tmp_path
-        ).run()
+        )
+        loop.run()
         assert telemetry.close(1)
     finally:
         set_telemetry(None)
 
     message = next(record for record in adapter.records if record.event_name == "message.accepted")
-    assert message.session_id.startswith("provisional_")
+    session_records = [record for record in adapter.records if record.session_id is not None]
+    assert {record.session_id for record in session_records} == {loop.session.id}
     assert message.message_sequence == 0
     assert message.trace_id is not None
 

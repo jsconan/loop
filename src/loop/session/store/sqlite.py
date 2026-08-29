@@ -4,7 +4,6 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from uuid import uuid7
 
 from ...models import Message
 from ...utils import utc_now
@@ -41,11 +40,9 @@ class SQLiteSessionStore:
             session (Session): Session to persist.
 
         Returns:
-            str: Existing or newly assigned persistent identifier.
+            str: The session's stable identifier.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        if session.id is None:
-            session.id = str(uuid7())
         if session.name is None:
             session.name = initial_session_name()
             session.name_source = SESSION_NAME_SOURCE_INITIAL

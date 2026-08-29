@@ -10,13 +10,13 @@ class SessionStore(Protocol):
     """Persist and retrieve sessions by their identifier."""
 
     def save(self, session: Session) -> str:
-        """Persist a session, creating an identifier when needed.
+        """Persist a session under its stable identifier.
 
         Args:
             session (Session): Session to persist.
 
         Returns:
-            str: Existing or newly assigned persistent identifier.
+            str: The session's stable identifier.
         """
 
     def load(self, session_id: str) -> Session:

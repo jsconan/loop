@@ -1,7 +1,5 @@
 """Persist session snapshots in memory."""
 
-from uuid import uuid7
-
 from ...utils import utc_now
 from ..models import SESSION_NAME_SOURCE_INITIAL, SessionInfo, SessionNotFoundError, StoredSession
 from ..naming import initial_session_name
@@ -26,10 +24,8 @@ class MemorySessionStore:
             session (Session): Session to persist.
 
         Returns:
-            str: Existing or newly assigned persistent identifier.
+            str: The session's stable identifier.
         """
-        if session.id is None:
-            session.id = str(uuid7())
         if session.name is None:
             session.name = initial_session_name()
             session.name_source = SESSION_NAME_SOURCE_INITIAL

@@ -266,6 +266,7 @@ class SerializedSession(TypedDict):
     """Define the JSON format for a persisted session."""
 
     version: int
+    id: str
     name: str | None
     name_source: SessionNameSource | None
     messages: list[SerializedMessage]
