@@ -10,6 +10,7 @@ from ..utils.models import Scalar
 
 type TelemetryValue = Scalar | tuple["TelemetryValue", ...] | MappingProxyType
 TelemetrySignal = Literal["activity", "error", "audit", "trace"]
+TelemetrySeverity = Literal["debug", "info", "warning", "error", "fatal"]
 
 
 @dataclass(frozen=True, slots=True)

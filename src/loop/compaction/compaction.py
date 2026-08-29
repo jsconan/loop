@@ -127,7 +127,12 @@ class ContextCompaction:
         model = self._model_selection.effective
         self._model_selection.synchronize_session()
         self._interaction.info("Compacting session context...")
-        telemetry_activity("compaction.started", component="compaction", model=model)
+        telemetry_activity(
+            "compaction.started",
+            severity="info",
+            component="compaction",
+            model=model,
+        )
         try:
             result = self._backend.compact(
                 self._session_manager.model_context,
@@ -135,7 +140,11 @@ class ContextCompaction:
                 model=model,
             )
         except NotImplementedError:
-            telemetry_activity("compaction.unsupported", component="compaction")
+            telemetry_activity(
+                "compaction.unsupported",
+                severity="warning",
+                component="compaction",
+            )
             self._interaction.warning("The selected backend does not support context compaction.")
             return False
         if result is None or not result.items:
@@ -161,6 +170,7 @@ class ContextCompaction:
         current_tokens = self._session_manager.tokens
         telemetry_activity(
             "compaction.completed",
+            severity="info",
             component="compaction",
             input_tokens_before=previous_tokens,
             input_tokens_after=current_tokens,

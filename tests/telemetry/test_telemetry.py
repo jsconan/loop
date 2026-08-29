@@ -74,6 +74,7 @@ def test_telemetry_records_all_signals_with_nested_w3c_correlation():
 
     records = adapter.records
     assert [record.signal for record in records] == ["activity", "error", "audit", "trace"]
+    assert records[0].severity == "debug"
     assert "prompt" not in records[0].attributes
     assert records[0].trace_id == root.trace_id
     assert records[1].span_id == child.span_id
@@ -146,15 +147,19 @@ def test_process_helpers_are_no_ops_without_a_facade_and_delegate_when_active():
     assert adapter.records[-1].payload_sha256 == payload_digest({"safe": True})
 
 
-def test_process_helpers_keep_low_level_activity_and_isolate_deferred_trace_failures(caplog):
-    """Low-level activity survives without telemetry and deferred payload failures stay isolated."""
-    with caplog.at_level(logging.INFO, logger="loop.operational"):
+def test_process_helpers_preserve_activity_severity_and_isolate_trace_failures(caplog):
+    """Activity preserves its level in both outputs and trace preparation failures stay isolated."""
+    with caplog.at_level(logging.DEBUG, logger="loop.operational"):
         telemetry_activity("startup.safe")
+        telemetry_activity("startup.visible", severity="info")
     assert "Operational activity" in caplog.text
+    assert [record.levelno for record in caplog.records[-2:]] == [logging.DEBUG, logging.INFO]
 
-    telemetry = Telemetry(MemoryTelemetryAdapter(), flush_seconds=0.01)
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
     set_telemetry(telemetry)
     try:
+        telemetry_activity("persisted", severity="warning")
         with caplog.at_level(logging.ERROR):
             telemetry_trace_event(
                 "trace.failed",
@@ -166,6 +171,7 @@ def test_process_helpers_keep_low_level_activity_and_isolate_deferred_trace_fail
         assert telemetry.close(1)
     finally:
         set_telemetry(None)
+    assert adapter.records[0].severity == "warning"
 
 
 def test_facade_rejects_invalid_configuration_and_unsupported_trace_values(caplog):

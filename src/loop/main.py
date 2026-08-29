@@ -66,7 +66,7 @@ def main() -> None:
             SQLiteTelemetryAdapter(project_root / APP_DIRECTORY / TELEMETRY_DATABASE_FILENAME)
         )
         set_telemetry(telemetry)
-        telemetry_activity("application.started", component="main")
+        telemetry_activity("application.started", severity="info", component="main")
         session_manager = SessionManager(
             interaction=interaction,
             session_store=SQLiteSessionStore(
@@ -83,7 +83,7 @@ def main() -> None:
         )
         loop.run()
     except (EOFError, KeyboardInterrupt, ShutdownRequested):
-        telemetry_activity("application.stopping", reason="interrupted")
+        telemetry_activity("application.stopping", severity="info", reason="interrupted")
         if interaction is not None:
             interaction.info("\nStopping loop. Goodbye!")
     except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
@@ -99,7 +99,7 @@ def main() -> None:
             interaction.report(problem)
     finally:
         if telemetry is not None:
-            telemetry_activity("application.stopped", component="main")
+            telemetry_activity("application.stopped", severity="info", component="main")
             telemetry.close()
         set_telemetry(None)
 

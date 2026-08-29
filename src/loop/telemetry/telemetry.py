@@ -16,7 +16,7 @@ from uuid import uuid4
 from .. import constants
 from ..utils import payload_digest, safe_scalar
 from .adapters import NoOpTelemetryAdapter, TelemetryAdapter
-from .models import TelemetryContext, TelemetryRecord, TelemetrySignal
+from .models import TelemetryContext, TelemetryRecord, TelemetrySeverity, TelemetrySignal
 from .policy import OperationalDisclosurePolicy, freeze
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,6 +25,13 @@ _CURRENT_CONTEXT: ContextVar[TelemetryContext | None] = ContextVar(
     "loop_telemetry_context", default=None
 )
 _ACTIVE_TELEMETRY: Telemetry | None = None
+_OPERATIONAL_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+    "fatal": logging.CRITICAL,
+}
 
 
 class Telemetry:
@@ -94,21 +101,28 @@ class Telemetry:
         """
         return secrets.token_hex(8)
 
-    def activity(self, event_name: str, **attributes: object) -> None:
+    def activity(
+        self,
+        event_name: str,
+        *,
+        severity: TelemetrySeverity = "debug",
+        **attributes: object,
+    ) -> None:
         """Record minimized operational activity.
 
         Args:
             event_name (str): Stable event class name.
+            severity (TelemetrySeverity): Operational importance. Defaults to ``"debug"``.
             **attributes (object): Structured operational metadata governed by minimization policy.
         """
-        self._emit("activity", event_name, attributes=attributes)
+        self._emit("activity", event_name, severity=severity, attributes=attributes)
 
     def error(
         self,
         event_name: str,
         *,
         error_type: str,
-        severity: str = "error",
+        severity: TelemetrySeverity = "error",
         exception: BaseException | None = None,
         **attributes: object,
     ) -> None:
@@ -117,7 +131,7 @@ class Telemetry:
         Args:
             event_name (str): Stable event class name.
             error_type (str): Stable machine-readable error code.
-            severity (str): Error severity label.
+            severity (TelemetrySeverity): Error severity label.
             exception (BaseException | None): Exception supplying only its qualified type.
             **attributes (object): Structured minimized diagnostic metadata.
         """
@@ -275,7 +289,7 @@ class Telemetry:
         event_name: str,
         *,
         attributes: Mapping[str, object],
-        severity: str | None = None,
+        severity: TelemetrySeverity | None = None,
         payload: object = None,
         payload_sha256: str | None = None,
     ) -> None:
@@ -379,26 +393,33 @@ def get_telemetry() -> Telemetry | None:
     return _ACTIVE_TELEMETRY
 
 
-def telemetry_activity(event_name: str, **attributes: object) -> None:
+def telemetry_activity(
+    event_name: str,
+    *,
+    severity: TelemetrySeverity = "debug",
+    **attributes: object,
+) -> None:
     """Record optional process-wide operational activity.
 
     Args:
         event_name (str): Stable event class name.
+        severity (TelemetrySeverity): Operational importance. Defaults to ``"debug"``.
         **attributes (object): Structured operational metadata governed by minimization policy.
     """
-    _OPERATIONAL_LOGGER.info(
+    _OPERATIONAL_LOGGER.log(
+        _OPERATIONAL_LEVELS.get(severity, logging.DEBUG),
         "Operational activity",
         extra={"event.name": safe_scalar(event_name)},
     )
     if _ACTIVE_TELEMETRY is not None:
-        _ACTIVE_TELEMETRY.activity(event_name, **attributes)
+        _ACTIVE_TELEMETRY.activity(event_name, severity=severity, **attributes)
 
 
 def telemetry_error(
     event_name: str,
     *,
     error_type: str,
-    severity: str = "error",
+    severity: TelemetrySeverity = "error",
     exception: BaseException | None = None,
     **attributes: object,
 ) -> None:
@@ -407,7 +428,7 @@ def telemetry_error(
     Args:
         event_name (str): Stable event class name.
         error_type (str): Stable machine-readable error code.
-        severity (str): Error severity label.
+        severity (TelemetrySeverity): Error severity label.
         exception (BaseException | None): Exception supplying only its qualified type.
         **attributes (object): Structured minimized diagnostic metadata.
     """
@@ -420,9 +441,7 @@ def telemetry_error(
             f"{type(exception).__module__}.{type(exception).__qualname__}"
         )
     _OPERATIONAL_LOGGER.log(
-        {"warning": logging.WARNING, "error": logging.ERROR, "fatal": logging.CRITICAL}.get(
-            severity, logging.ERROR
-        ),
+        _OPERATIONAL_LEVELS.get(severity, logging.ERROR),
         "Operational error",
         extra=diagnostic,
     )
