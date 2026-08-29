@@ -10,6 +10,7 @@ import json
 import logging
 import shlex
 import tempfile
+import threading
 from collections.abc import Iterable
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -103,6 +104,7 @@ class PermissionManager:
     _temporary_directory: tempfile.TemporaryDirectory[str]
     _temporary_path: Path
     _presets: dict[str, PermissionPreset]
+    _audit_lock: threading.Lock
 
     def __init__(
         self,
@@ -122,6 +124,7 @@ class PermissionManager:
             prefix=constants.TEMPORARY_DIRECTORY_PREFIX
         )
         self._temporary_path = Path(self._temporary_directory.name).resolve()
+        self._audit_lock = threading.Lock()
         self._configuration_path = (
             Path(configuration_path)
             if configuration_path is not None
@@ -1449,7 +1452,7 @@ class PermissionManager:
         self._append_audit("permission.decided", payload)
 
     def _append_audit(self, event_name: str, payload: dict[str, object]) -> None:
-        """Append one timestamped permission audit payload without affecting policy behavior."""
+        """Append one bounded audit payload without affecting policy behavior."""
         if self._configuration_path is None:
             return
         audit_path = self._configuration_path.with_name(constants.PERMISSIONS_AUDIT_FILENAME)
@@ -1460,10 +1463,19 @@ class PermissionManager:
             "timestamp": utc_now().isoformat(),
         }
         try:
-            audit_path.parent.mkdir(parents=True, exist_ok=True)
-            with audit_path.open("a", encoding="utf-8") as audit:
-                audit.write(json.dumps(record, sort_keys=True) + "\n")
-            audit_path.chmod(constants.PRIVATE_FILE_MODE)
+            encoded_record = json.dumps(record, sort_keys=True) + "\n"
+            with self._audit_lock:
+                audit_path.parent.mkdir(parents=True, exist_ok=True)
+                audit_path.parent.chmod(constants.PRIVATE_DIRECTORY_MODE)
+                if (
+                    audit_path.exists()
+                    and audit_path.stat().st_size + len(encoded_record.encode("utf-8"))
+                    > constants.DEFAULT_PERMISSIONS_AUDIT_BYTES
+                ):
+                    self._rotate_audit(audit_path)
+                with audit_path.open("a", encoding="utf-8") as audit:
+                    audit.write(encoded_record)
+                audit_path.chmod(constants.PRIVATE_FILE_MODE)
         except OSError as error:
             # The durable session recorder remains authoritative for application behavior;
             # diagnostic JSONL availability must not change an authorization outcome.
@@ -1473,6 +1485,19 @@ class PermissionManager:
                 exception=error,
                 component="permission_manager",
             )
+
+    @staticmethod
+    def _rotate_audit(audit_path: Path) -> None:
+        """Rotate one audit file while retaining the configured number of archives."""
+        oldest_backup = audit_path.with_name(
+            f"{audit_path.name}.{constants.DEFAULT_PERMISSIONS_AUDIT_BACKUPS}"
+        )
+        oldest_backup.unlink(missing_ok=True)
+        for backup_index in range(constants.DEFAULT_PERMISSIONS_AUDIT_BACKUPS - 1, 0, -1):
+            backup_path = audit_path.with_name(f"{audit_path.name}.{backup_index}")
+            if backup_path.exists():
+                backup_path.replace(audit_path.with_name(f"{audit_path.name}.{backup_index + 1}"))
+        audit_path.replace(audit_path.with_name(f"{audit_path.name}.1"))
 
     def _audit_policy_change(
         self,

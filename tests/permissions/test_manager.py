@@ -122,6 +122,42 @@ def test_default_policy_allows_scoped_reads_and_fails_closed_for_approval(tmp_pa
     assert json.loads(audit.read_text("utf-8").splitlines()[-1])["source"] == "headless"
 
 
+def test_permission_audit_rotates_valid_private_jsonl_archives(tmp_path, monkeypatch):
+    """Permission audit storage retains bounded, complete, private JSONL archives."""
+    monkeypatch.setattr("loop.constants.DEFAULT_PERMISSIONS_AUDIT_BYTES", 1)
+    monkeypatch.setattr("loop.constants.DEFAULT_PERMISSIONS_AUDIT_BACKUPS", 2)
+    manager = PermissionManager(tmp_path)
+
+    for tool_id in ("first", "second", "third", "fourth"):
+        manager.authorize(
+            (file_operation(Action.FILESYSTEM_READ, tmp_path / f"{tool_id}.txt"),)
+        )
+
+    audit_path = tmp_path / ".loop" / "permissions-audit.jsonl"
+    audit_paths = (
+        audit_path,
+        *(audit_path.with_name(f"{audit_path.name}.{index}") for index in (1, 2)),
+    )
+    assert all(path.exists() for path in audit_paths)
+    assert not audit_path.with_name(f"{audit_path.name}.3").exists()
+    assert all(json.loads(path.read_text("utf-8")) for path in audit_paths)
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in audit_paths)
+    assert (audit_path.parent.stat().st_mode & 0o777) == 0o700
+
+
+def test_permission_audit_rotation_failure_does_not_change_authorization(tmp_path, monkeypatch):
+    """A failed audit archive rotation cannot turn an allowed operation into a denial."""
+    monkeypatch.setattr("loop.constants.DEFAULT_PERMISSIONS_AUDIT_BYTES", 1)
+    manager = PermissionManager(tmp_path)
+    operation_set = (file_operation(Action.FILESYSTEM_READ, tmp_path / "file.txt"),)
+    manager.authorize(operation_set)
+    monkeypatch.setattr(Path, "replace", Mock(side_effect=OSError("unavailable")))
+
+    result = manager.authorize(operation_set)
+
+    assert result.decision is Decision.ALLOW
+
+
 def test_authorization_approves_one_complete_operation_set_and_records_policy(tmp_path):
     """One prompt and recorder event preserve both policy and effective outcomes."""
     interaction = Mock(spec=Interaction)
