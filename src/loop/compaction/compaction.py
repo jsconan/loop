@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .. import constants
 from ..backend import Backend
-from ..instructions import InstructionsManager
+from ..instructions import PreparedInstructions
 from ..interaction import Interaction
 from ..model_selection import ModelSelection
 from ..session import SessionManager
@@ -19,7 +19,8 @@ class ContextCompaction:
         backend (Backend): Backend used to produce replacement context.
         session_manager (SessionManager): Active session context and checkpoint persistence.
         model_selection (ModelSelection): Active model and context-window selection.
-        instructions_manager (InstructionsManager): Current instructions and active skills.
+        instructions (Callable[[], PreparedInstructions]): Provider that prepares exact
+            model-ready instructions for an explicit agent.
         interaction (Interaction): Service used to report compaction progress and outcomes.
         working_directory (Callable[[], Path | str]): Provider for the current fallback working
             directory when the instructions manager has no observed directory.
@@ -33,7 +34,7 @@ class ContextCompaction:
     _backend: Backend
     _session_manager: SessionManager
     _model_selection: ModelSelection
-    _instructions_manager: InstructionsManager
+    _instructions: Callable[[], PreparedInstructions]
     _interaction: Interaction
     _working_directory: Callable[[], Path | str]
     _threshold: float
@@ -43,7 +44,7 @@ class ContextCompaction:
         backend: Backend,
         session_manager: SessionManager,
         model_selection: ModelSelection,
-        instructions_manager: InstructionsManager,
+        instructions: Callable[[], PreparedInstructions],
         interaction: Interaction,
         working_directory: Callable[[], Path | str],
         *,
@@ -54,7 +55,7 @@ class ContextCompaction:
         self._backend = backend
         self._session_manager = session_manager
         self._model_selection = model_selection
-        self._instructions_manager = instructions_manager
+        self._instructions = instructions
         self._interaction = interaction
         self._working_directory = working_directory
         self._threshold = threshold
@@ -92,8 +93,12 @@ class ContextCompaction:
             and self.can_compact()
         )
 
-    def compact_if_needed(self) -> bool:
+    def compact_if_needed(self, instructions: PreparedInstructions | None = None) -> bool:
         """Compact the active context when its utilization policy is satisfied.
+
+        Args:
+            instructions (PreparedInstructions | None): Exact instructions prepared for the
+                surrounding model turn, or ``None`` to request a fresh explicit snapshot.
 
         Returns:
             bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
@@ -101,14 +106,21 @@ class ContextCompaction:
         Raises:
             ValueError: If compaction is required but no effective model is configured.
         """
-        return self.compact() if self.needed() else False
+        return self.compact(instructions=instructions) if self.needed() else False
 
-    def compact(self, *, force: bool = True) -> bool:
+    def compact(
+        self,
+        *,
+        force: bool = True,
+        instructions: PreparedInstructions | None = None,
+    ) -> bool:
         """Compact the active context and persist its replacement checkpoint.
 
         Args:
             force (bool): Whether to compact regardless of the utilization threshold. Defaults to
                 ``True`` for explicit calls.
+            instructions (PreparedInstructions | None): Exact prepared instructions to preserve,
+                or ``None`` to request a fresh explicit snapshot.
 
         Returns:
             bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
@@ -123,7 +135,7 @@ class ContextCompaction:
         if not force and not self.needed():
             return False
 
-        self._instructions_manager.prepare()
+        snapshot = instructions or self._instructions()
         model = self._model_selection.effective
         self._model_selection.synchronize_session()
         self._interaction.info("Compacting session context...")
@@ -136,7 +148,7 @@ class ContextCompaction:
         try:
             result = self._backend.compact(
                 self._session_manager.model_context,
-                instructions=self._instructions_manager.instructions,
+                instructions=snapshot.content,
                 model=model,
             )
         except NotImplementedError:
@@ -156,16 +168,14 @@ class ContextCompaction:
             self._interaction.warning("The selected backend did not produce compacted context.")
             return False
 
-        working_directory = str(
-            self._instructions_manager.working_directory or self._working_directory()
-        )
+        working_directory = str(snapshot.working_directory or self._working_directory())
         previous_tokens = self._session_manager.tokens
         self._session_manager.add_compaction(
             result,
             model=model,
-            instructions=self._instructions_manager.instructions,
+            instructions=snapshot.content,
             working_directory=working_directory,
-            active_skills=self._instructions_manager.active_skill_identities,
+            active_skills=list(snapshot.active_skills),
         )
         current_tokens = self._session_manager.tokens
         telemetry_activity(

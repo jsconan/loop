@@ -22,16 +22,11 @@ from loop import (
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 
 
-def agent_runner(*, responses, max_turns=25):
+def agent_runner(*, responses, max_turns=25, backend=None):
     """Build a runner with isolated execution collaborators."""
-    backend = Mock()
-    agent = Agent(
-        "Assistant",
-        backend=backend,
-        instructions_manager=InstructionsManager(),
-        tool_registry=Mock(),
-        permission_manager=Mock(),
-    )
+    backend = backend or Mock()
+    agent = Agent("Assistant", tools=Mock())
+    instructions = InstructionsManager()
     session_manager = Mock()
     session_manager.messages = []
     session_manager.session = Session()
@@ -41,6 +36,9 @@ def agent_runner(*, responses, max_turns=25):
     interaction = MagicMock(spec=Interaction)
     runner = AgentRunner(
         agent,
+        backend,
+        instructions,
+        Mock(),
         session_manager,
         Mock(),
         Mock(),
@@ -55,11 +53,13 @@ def agent_runner(*, responses, max_turns=25):
 def test_runner_returns_the_first_final_response():
     """A response without tool calls completes one logical agent run."""
     response = Response(answer="done", reasoning="")
-    runner, sessions, _ = agent_runner(responses=[response])
+    backend = Mock()
+    runner, sessions, _ = agent_runner(responses=[response], backend=backend)
 
     result = runner.run()
 
     assert runner.agent.name == "Assistant"
+    assert runner.backend is backend
     assert runner.max_turns == 25
     assert result.final_response is response
     assert result.turns == 1
@@ -78,7 +78,7 @@ def test_runner_records_run_and_tool_execution_traces():
     )
     final = Response(answer="done", reasoning="")
     runner, _, _ = agent_runner(responses=[response, final])
-    runner.agent.tool_registry.call_with_timing.return_value = ('{"ok":true}', 0.2)
+    runner.agent.tools.call_with_timing.return_value = ('{"ok":true}', 0.2)
     adapter = MemoryTelemetryAdapter()
     telemetry = Telemetry(adapter, flush_seconds=0.01)
     set_telemetry(telemetry)
@@ -123,7 +123,7 @@ def test_runner_recovers_unstarted_tools_before_requerying():
     final = Response(answer="done", reasoning="")
     runner, sessions, interaction = agent_runner(responses=[final])
     call = ToolCall(call_id="call", name="echo", arguments="{}")
-    runner.agent.tool_registry.call_with_timing.return_value = (
+    runner.agent.tools.call_with_timing.return_value = (
         '{"ok": true, "result": "done"}',
         0.5,
     )
@@ -137,16 +137,16 @@ def test_runner_recovers_unstarted_tools_before_requerying():
     runner.recover_session()
 
     sessions.add_tool_call_event.assert_called_once_with("call")
-    runner.agent.tool_registry.call_with_timing.assert_called_once_with(
+    runner.agent.tools.call_with_timing.assert_called_once_with(
         "echo",
         "{}",
         interaction=interaction,
-        instructions_manager=runner.agent.instructions_manager,
-        permission_manager=runner.agent.permission_manager,
+        instructions_manager=runner.instructions_manager,
+        permission_manager=runner.permission_manager,
         call_id="call",
         execution_started=ANY,
     )
-    runner.agent.tool_registry.call_with_timing.call_args.kwargs["execution_started"]()
+    runner.agent.tools.call_with_timing.call_args.kwargs["execution_started"]()
     sessions.record_tool_execution_started.assert_called_once_with("call")
     assert sessions.add_tool_call.call_args.kwargs["succeeded"] is True
 
@@ -155,7 +155,7 @@ def test_runner_skips_completed_calls_in_a_partially_recovered_batch():
     """Mixed recovery executes only calls whose durable results are still absent."""
     final = Response(answer="done", reasoning="")
     runner, sessions, interaction = agent_runner(responses=[final])
-    runner.agent.tool_registry.call_with_timing.return_value = ('{"ok": true}', 0.1)
+    runner.agent.tools.call_with_timing.return_value = ('{"ok": true}', 0.1)
     completed = ToolCall(call_id="completed", name="read", arguments="{}")
     pending = ToolCall(call_id="pending", name="write", arguments="{}")
 
@@ -170,7 +170,7 @@ def test_runner_skips_completed_calls_in_a_partially_recovered_batch():
 
     runner.recover_session()
 
-    callback = runner.agent.tool_registry.call_with_timing.call_args.kwargs["execution_started"]
+    callback = runner.agent.tools.call_with_timing.call_args.kwargs["execution_started"]
     callback()
     sessions.record_tool_execution_started.assert_called_once_with("pending")
 
@@ -188,7 +188,7 @@ def test_runner_resolves_uncertain_tools_without_retry_by_default():
     )
     runner.recover_session()
 
-    runner.agent.tool_registry.call_with_timing.assert_not_called()
+    runner.agent.tools.call_with_timing.assert_not_called()
     assert "outcome is unknown" in sessions.add_tool_call.call_args.kwargs["output"]
     assert interaction.confirm.call_args_list[-1].args == (
         "Tool 'mutate' may already have run. Retry it?",
@@ -200,7 +200,7 @@ def test_runner_retries_an_uncertain_tool_only_after_explicit_approval():
     final = Response(answer="done", reasoning="")
     runner, sessions, interaction = agent_runner(responses=[final])
     interaction.confirm.side_effect = [True, True]
-    runner.agent.tool_registry.call_with_timing.return_value = ('{"ok": false}', 0.1)
+    runner.agent.tools.call_with_timing.return_value = ('{"ok": false}', 0.1)
     call = ToolCall(call_id="call", name="mutate", arguments="{}")
 
     sessions.recovery_state = SessionRecoveryState(
@@ -210,7 +210,7 @@ def test_runner_retries_an_uncertain_tool_only_after_explicit_approval():
     runner.recover_session()
 
     sessions.add_tool_call_event.assert_not_called()
-    callback = runner.agent.tool_registry.call_with_timing.call_args.kwargs["execution_started"]
+    callback = runner.agent.tools.call_with_timing.call_args.kwargs["execution_started"]
     callback()
     sessions.record_tool_execution_started.assert_called_once_with("call")
 
@@ -307,13 +307,8 @@ def test_runner_continues_after_max_turns_when_user_affirms():
     interaction = MagicMock(spec=Interaction)
     interaction.confirm.return_value = True
     backend = Mock()
-    agent = Agent(
-        "Assistant",
-        backend=backend,
-        instructions_manager=InstructionsManager(),
-        tool_registry=Mock(),
-        permission_manager=Mock(),
-    )
+    agent = Agent("Assistant", tools=Mock())
+    instructions = InstructionsManager()
     session_manager = Mock()
     session_manager.messages = []
     session_manager.session = Session()
@@ -322,6 +317,9 @@ def test_runner_continues_after_max_turns_when_user_affirms():
     session_manager.context_window = None
     runner = AgentRunner(
         agent,
+        backend,
+        instructions,
+        Mock(),
         session_manager,
         Mock(),
         Mock(),

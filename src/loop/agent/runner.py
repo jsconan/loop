@@ -8,7 +8,7 @@ from pathlib import Path
 from time import perf_counter, sleep
 
 from .. import constants
-from ..backend import BackendError, BackendNotFoundError
+from ..backend import Backend, BackendError, BackendNotFoundError
 from ..compaction import ContextCompaction
 from ..errors import Problem, log_problem
 from ..instructions import InstructionsManager
@@ -25,6 +25,7 @@ from ..models import (
     ToolExecutionMetrics,
     Usage,
 )
+from ..permissions import PermissionManager
 from ..session import SessionManager, SessionRecoveryState
 from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
 from ..tooling.utils import serialize_tool_problem
@@ -39,7 +40,10 @@ class AgentRunner:
     """Run a configured agent against one conversation session.
 
     Args:
-        agent (Agent): Agent whose model, instructions, tools, and policy are executed.
+        agent (Agent): Reusable agent definition to execute.
+        backend (Backend): Backend used to produce model responses.
+        instructions_manager (InstructionsManager): Contextual instruction aggregation service.
+        permission_manager (PermissionManager): Host policy authorizing tool effects.
         session_manager (SessionManager): Manager owning conversation history and persistence.
         model_selection (ModelSelection): Active model selection for the conversation.
         compaction (ContextCompaction): Context compactor run before model requests.
@@ -57,6 +61,9 @@ class AgentRunner:
     """
 
     _agent: Agent
+    _backend: Backend
+    _instructions_manager: InstructionsManager
+    _permission_manager: PermissionManager
     _session_manager: SessionManager
     _model_selection: ModelSelection
     _compaction: ContextCompaction
@@ -70,6 +77,9 @@ class AgentRunner:
     def __init__(
         self,
         agent: Agent,
+        backend: Backend,
+        instructions_manager: InstructionsManager,
+        permission_manager: PermissionManager,
         session_manager: SessionManager,
         model_selection: ModelSelection,
         compaction: ContextCompaction,
@@ -84,6 +94,9 @@ class AgentRunner:
         if max_turns < 0:
             raise ValueError("Agent max turns must be non-negative.")
         self._agent = agent
+        self._backend = backend
+        self._instructions_manager = instructions_manager
+        self._permission_manager = permission_manager
         self._session_manager = session_manager
         self._model_selection = model_selection
         self._compaction = compaction
@@ -102,6 +115,69 @@ class AgentRunner:
             Agent: Configured agent.
         """
         return self._agent
+
+    @property
+    def backend(self) -> Backend:
+        """Return the backend used to produce model responses.
+
+        Returns:
+            Backend: Configured backend.
+        """
+        return self._backend
+
+    @property
+    def instructions_manager(self) -> InstructionsManager:
+        """Return the contextual instruction service used by this runtime.
+
+        Returns:
+            InstructionsManager: Active contextual instruction manager.
+        """
+        return self._instructions_manager
+
+    @property
+    def permission_manager(self) -> PermissionManager:
+        """Return the host policy used to authorize tool effects.
+
+        Returns:
+            PermissionManager: Active permission manager.
+        """
+        return self._permission_manager
+
+    @property
+    def session_manager(self) -> SessionManager:
+        """Return the conversation state owner used by this runtime.
+
+        Returns:
+            SessionManager: Active session manager.
+        """
+        return self._session_manager
+
+    @property
+    def model_selection(self) -> ModelSelection:
+        """Return the model selection used by this runtime.
+
+        Returns:
+            ModelSelection: Active model selection.
+        """
+        return self._model_selection
+
+    @property
+    def compaction(self) -> ContextCompaction:
+        """Return the context compaction service used by this runtime.
+
+        Returns:
+            ContextCompaction: Active context compaction service.
+        """
+        return self._compaction
+
+    @property
+    def interaction(self) -> Interaction:
+        """Return the interaction service used by this runtime.
+
+        Returns:
+            Interaction: Active user interaction service.
+        """
+        return self._interaction
 
     @property
     def debug(self) -> bool:
@@ -291,7 +367,7 @@ class AgentRunner:
     ) -> tuple[ToolExecutionMetrics, ...]:
         """Execute and persist canonical tool requests from one durable boundary."""
 
-        instructions = self._agent.instructions_manager
+        instructions = self._instructions_manager
         executions = []
         for tool_call in tool_calls:
             with telemetry_span():
@@ -319,12 +395,12 @@ class AgentRunner:
         if present:
             self._session_manager.add_tool_call_event(tool_call.call_id)
         self._interaction.tool_call(tool_call.name, tool_call.arguments)
-        tool_result, duration = self._agent.tool_registry.call_with_timing(
+        tool_result, duration = self._agent.tools.call_with_timing(
             tool_call.name,
             tool_call.arguments,
             interaction=self._interaction,
             instructions_manager=instructions,
-            permission_manager=self._agent.permission_manager,
+            permission_manager=self._permission_manager,
             call_id=tool_call.call_id,
             execution_started=lambda call_id=tool_call.call_id: (
                 self._session_manager.record_tool_execution_started(call_id)
@@ -356,7 +432,7 @@ class AgentRunner:
 
     def _persist_interrupted_tool_result(self, call: ToolCall) -> None:
         """Resolve one uncertain invocation without risking a duplicate side effect."""
-        instructions = self._agent.instructions_manager
+        instructions = self._instructions_manager
         output = serialize_tool_problem(
             Problem(
                 code="tool.execution_interrupted",
@@ -394,22 +470,21 @@ class AgentRunner:
     def _query(self) -> Response:
         """Request and collect one response inside the active model-operation span."""
         selected_model = self._model_selection.effective
-        instructions = self._agent.instructions_manager
-        instructions.prepare()
+        snapshot = self._instructions_manager.prepare(self._agent)
         self._session_manager.update_instruction_state(
-            working_directory=str(instructions.working_directory or self._working_directory()),
-            active_skills=instructions.active_skill_identities,
+            working_directory=str(snapshot.working_directory or self._working_directory()),
+            active_skills=list(snapshot.active_skills),
         )
         self._model_selection.synchronize_session()
-        self._compaction.compact_if_needed()
+        self._compaction.compact_if_needed(snapshot)
         started_at = perf_counter()
         first_chunk_at = None
-        events = self._agent.backend.get_response(
+        events = self._backend.get_response(
             input=self._session_manager.model_context,
-            instructions=instructions.instructions,
+            instructions=snapshot.content,
             stream=self._stream,
             model=selected_model,
-            tools=self._agent.tool_registry.definitions(),
+            tools=self._agent.tools.definitions(),
         )
 
         def measured_events():

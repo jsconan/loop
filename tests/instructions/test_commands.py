@@ -2,7 +2,7 @@
 
 from unittest.mock import Mock
 
-from loop import CommandManager, InstructionsManager, Interaction, Skill, SkillManager
+from loop import Agent, CommandManager, InstructionsManager, Interaction, Skill, SkillManager
 from loop.instructions import SkillCommands
 
 
@@ -13,6 +13,8 @@ def test_skill_commands_list_and_activate_skills_idempotently(tmp_path):
     instructions = InstructionsManager(
         skill_manager=SkillManager([Skill("review", "Review.", location)])
     )
+    agent = Agent("Assistant")
+    instructions.prepare(agent)
     interaction = Mock(spec=Interaction)
     provider = SkillCommands(instructions)
     manager = CommandManager(interaction=interaction)

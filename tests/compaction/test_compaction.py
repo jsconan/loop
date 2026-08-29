@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from loop import (
+    Agent,
     CompactionContextItem,
     CompactionResult,
     ContextCompaction,
@@ -18,6 +19,13 @@ from loop import (
     Usage,
 )
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
+
+
+def prepared_instructions():
+    """Build a provider of instructions for one reusable test agent definition."""
+    instructions = InstructionsManager()
+    agent = Agent("Assistant")
+    return lambda: instructions.prepare(agent)
 
 
 def compaction_feature(
@@ -36,11 +44,12 @@ def compaction_feature(
     selection = ModelSelection(backend, manager)
     interaction = Mock(spec=Interaction)
     instructions = InstructionsManager(project_instructions="instructions")
+    agent = Agent("Assistant")
     feature = ContextCompaction(
         backend,
         manager,
         selection,
-        instructions,
+        lambda: instructions.prepare(agent),
         interaction,
         lambda: "/project",
         threshold=threshold,
@@ -146,7 +155,7 @@ def test_compaction_persists_replacement_context_and_reports_usage():
     assert session.tokens == 20
     assert session.compactions[0].instructions.working_directory == "/project"
     assert session.compactions[0].instructions.content.endswith("instructions")
-    assert "<agent_policy" in session.compactions[0].instructions.content
+    assert "<agent_instructions" in session.compactions[0].instructions.content
     backend.compact.assert_called_once_with(
         [message],
         instructions=session.compactions[0].instructions.content,
@@ -180,7 +189,7 @@ def test_compaction_requires_an_effective_model():
         backend,
         manager,
         ModelSelection(backend, manager),
-        InstructionsManager(),
+        prepared_instructions(),
         Mock(spec=Interaction),
         lambda: "/project",
     )

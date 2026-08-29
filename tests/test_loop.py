@@ -10,6 +10,7 @@ from prompt_toolkit.document import Document
 
 from loop import (
     BUILTIN_TOOLS,
+    Agent,
     AgentRunResult,
     AnswerCompleted,
     AnswerDelta,
@@ -77,7 +78,7 @@ def test_loop_exposes_its_configured_state(tmp_path):
     """Loop accessors expose configured dependencies and mutable state."""
     backend = loop_backend()
     interaction = MagicMock(spec=Interaction)
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         agent_name="Reviewer",
         model="requested-model",
@@ -87,7 +88,6 @@ def test_loop_exposes_its_configured_state(tmp_path):
     )
 
     assert loop.backend is backend
-    assert loop.agent.backend is backend
     assert loop.agent.name == "Reviewer"
     assert loop.agent_runner.agent is loop.agent
     assert loop.messages == []
@@ -107,6 +107,54 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.debug is False
 
 
+def test_loop_accepts_an_explicitly_assembled_runtime(tmp_path):
+    """Core loop construction derives runtime services without applying fallback policy."""
+    agent = Agent("Explicit")
+    session_manager = Mock()
+    session_manager.messages = []
+    session_manager.session = Session()
+    model_selection = Mock(selected=None)
+    compaction = Mock()
+    interaction = Mock(spec=Interaction)
+    command_manager = Mock()
+    completion_manager = Mock()
+    name_generator = Mock()
+    mention_manager = Mock()
+    instructions = InstructionsManager()
+    permissions = Mock()
+    backend = Mock()
+    runner = Mock(
+        agent=agent,
+        backend=backend,
+        instructions_manager=instructions,
+        permission_manager=permissions,
+        session_manager=session_manager,
+        model_selection=model_selection,
+        compaction=compaction,
+        interaction=interaction,
+        stream=True,
+        debug=False,
+    )
+
+    loop = Loop(
+        agent_runner=runner,
+        command_manager=command_manager,
+        completion_manager=completion_manager,
+        session_name_generator=name_generator,
+        mention_manager=mention_manager,
+        working_directory=tmp_path,
+    )
+
+    assert loop.agent is agent
+    assert loop.agent_runner is runner
+    assert loop.command_manager is command_manager
+    assert loop.backend is backend
+    assert loop.instructions_manager is instructions
+    assert loop.permission_manager is permissions
+    assert loop.working_directory == tmp_path
+    assert loop.stream is True
+
+
 @pytest.mark.parametrize("choice", ["continue", None])
 def test_loop_continues_with_supervised_defaults_after_permission_load_failure(tmp_path, choice):
     """The manager completes interactive fallback during Loop construction."""
@@ -116,7 +164,7 @@ def test_loop_continues_with_supervised_defaults_after_permission_load_failure(t
     interaction = output_interaction()
     interaction.prompt.return_value = choice
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         interaction=interaction,
         working_directory=tmp_path,
@@ -135,7 +183,7 @@ def test_loop_resets_invalid_permission_policy_only_after_user_selection(tmp_pat
     interaction = output_interaction()
     interaction.prompt.return_value = "reset"
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         interaction=interaction,
         working_directory=tmp_path,
@@ -156,7 +204,9 @@ def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
     interaction.prompt.return_value = choice
 
     with pytest.raises(ShutdownRequested):
-        Loop(backend=loop_backend(), interaction=interaction, working_directory=tmp_path)
+        Loop.create_default(
+            backend=loop_backend(), interaction=interaction, working_directory=tmp_path
+        )
 
     assert path.read_text("utf-8") == "version: 2\n"
 
@@ -173,7 +223,7 @@ def test_loop_reports_presets_excluded_by_permission_manager(tmp_path, monkeypat
     )
     interaction = output_interaction()
 
-    Loop(backend=loop_backend(), interaction=interaction, working_directory=tmp_path)
+    Loop.create_default(backend=loop_backend(), interaction=interaction, working_directory=tmp_path)
 
     assert "Excluded invalid permission preset" in interaction.warning.call_args.args[0]
 
@@ -181,7 +231,7 @@ def test_loop_reports_presets_excluded_by_permission_manager(tmp_path, monkeypat
 def test_loop_rejects_an_invalid_compaction_threshold(tmp_path):
     """Loop construction validates automatic compaction policy at its composition boundary."""
     with pytest.raises(ValueError, match="between zero and one"):
-        Loop(
+        Loop.create_default(
             backend=loop_backend(),
             working_directory=tmp_path,
             compaction_threshold=1,
@@ -196,7 +246,7 @@ def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_p
     backend.get_models.return_value = [ModelInfo(id="selected-model")]
     now = [0.0]
     monkeypatch.setattr("loop.model_selection.selection.monotonic", lambda: now[0])
-    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+    loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
 
     loop.select_model("direct-model")
     assert loop.model == "direct-model"
@@ -239,7 +289,7 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
         return "done"
 
     registry.register(inspect)
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         tool_registry=registry,
         instructions_manager=instructions,
@@ -276,7 +326,7 @@ def test_resume_command_loads_a_persisted_session_id(tmp_path):
     )
     store.save(selected)
     sessions = SessionManager(interaction=interaction, session_store=store)
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         interaction=interaction,
         session_manager=sessions,
@@ -306,7 +356,7 @@ def test_resume_command_offers_and_completes_an_interrupted_agent_run(tmp_path):
         )
     )
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         interaction=interaction,
         session_manager=sessions,
@@ -328,7 +378,7 @@ def test_run_declining_recovery_blocks_new_input_without_mutating_history(tmp_pa
     interaction.confirm.return_value = False
     interaction.prompt.side_effect = ["new question", False]
     backend = loop_backend(get_response=Mock())
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         interaction=interaction,
         session=session,
@@ -361,7 +411,7 @@ def test_run_completes_approved_startup_recovery_before_prompting(tmp_path):
             ]
         )
     )
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         interaction=interaction,
         session=session,
@@ -390,7 +440,7 @@ def test_resumed_missing_model_uses_existing_query_fallback(tmp_path):
         ),
         [ResponseCompleted(model="replacement")],
     ]
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         interaction=interaction,
         session_manager=sessions,
@@ -411,7 +461,7 @@ def test_resume_command_reports_an_unknown_session_id(tmp_path):
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.side_effect = ["/resume missing-id", False]
     sessions = SessionManager(interaction=interaction)
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         interaction=interaction,
         session_manager=sessions,
@@ -443,7 +493,7 @@ def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(t
     interaction = output_interaction()
     interaction.prompt.side_effect = ['Use $review on @"my app.py"', False]
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         interaction=interaction,
         instructions_manager=instructions,
@@ -477,7 +527,7 @@ def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
     backend = Mock(default_model="model")
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.side_effect = ["Read @binary.bin", False]
-    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+    loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
 
     loop.run()
 
@@ -505,7 +555,9 @@ def test_run_retries_an_exhausted_recoverable_failure(tmp_path):
     interaction.prompt.side_effect = ["hello", False]
 
     with patch("loop.agent.runner.sleep") as sleep:
-        Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+        Loop.create_default(
+            backend=backend, interaction=interaction, working_directory=tmp_path
+        ).run()
 
     assert backend.get_response.call_count == 2
     problem = interaction.report.call_args.args[0]
@@ -535,7 +587,7 @@ def test_run_describes_partial_output_before_retrying(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
 
-    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+    Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     interaction.confirm.assert_called_once_with(
         "Partial output was discarded. Retry the complete response?", default=False
@@ -553,7 +605,7 @@ def test_run_declines_or_disables_recoverable_retries(tmp_path):
         interaction.confirm.return_value = False
         interaction.prompt.side_effect = ["hello", False]
 
-        loop = Loop(
+        loop = Loop.create_default(
             backend=backend,
             interaction=interaction,
             working_directory=tmp_path,
@@ -571,7 +623,7 @@ def test_run_rejects_a_runner_result_without_metrics(tmp_path):
     """The loop rejects an incomplete runner result before presenting statistics."""
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello"]
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(get_response=Mock(return_value=[])),
         interaction=interaction,
         working_directory=tmp_path,
@@ -595,7 +647,7 @@ def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
 
-    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+    Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     problem = interaction.report.call_args.args[0]
     assert problem.detail == "invalid key"
@@ -616,7 +668,7 @@ def test_run_selects_an_available_model_after_not_found(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", "second", False]
 
-    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+    loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
     loop.run()
 
     assert loop.model == "second"
@@ -641,7 +693,7 @@ def test_run_re_prompts_when_user_selects_same_failed_model(tmp_path):
     # First call returns False (re-prompt), second call returns True (accept)
     interaction.confirm.side_effect = [False, True]
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend, interaction=interaction, model="missing", working_directory=tmp_path
     )
     loop.run()
@@ -666,7 +718,7 @@ def test_run_accepts_same_failed_model_on_confirm(tmp_path):
     # confirm returns True to accept the same failed model
     interaction.confirm.return_value = True
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend, interaction=interaction, model="missing", working_directory=tmp_path
     )
     loop.run()
@@ -695,7 +747,7 @@ def test_run_stops_model_fallback_when_discovery_fails(tmp_path, models):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
 
-    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+    Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     if isinstance(models, Exception):
         assert any(
@@ -716,7 +768,7 @@ def test_run_can_stop_model_selection(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False, False]
 
-    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+    Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     assert backend.get_response.call_count == 1
     assert interaction.prompt.call_args_list[1].args == ("Select a replacement model:",)
@@ -735,7 +787,7 @@ def test_run_accepts_the_only_available_model_after_not_found(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", "replacement", False]
 
-    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+    loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
     loop.run()
 
     assert loop.model == "replacement"
@@ -753,7 +805,7 @@ def test_run_can_exit_multi_model_fallback_selection(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False, False]
 
-    Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+    Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path).run()
 
     assert backend.get_response.call_count == 1
     interaction.confirm.assert_not_called()
@@ -770,7 +822,7 @@ def test_loop_uses_an_injected_mention_registry(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["Custom !reference", False]
 
-    Loop(
+    Loop.create_default(
         backend=backend,
         interaction=interaction,
         mention_manager=mentions,
@@ -784,14 +836,14 @@ def test_loop_passes_custom_instruction_fallbacks_to_discovery(tmp_path):
     """Loop discovery exposes configured fallback instruction filenames to library callers."""
     (tmp_path / "CUSTOM.md").write_text("custom instructions", encoding="utf-8")
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         working_directory=tmp_path,
         agents_filenames=("AGENTS.md", "CUSTOM.md"),
     )
 
     assert loop.instructions is not None
-    assert loop.instructions.index("</agent_policy>") < loop.instructions.index(
+    assert loop.instructions.index("</agent_instructions>") < loop.instructions.index(
         "custom instructions"
     )
 
@@ -800,7 +852,7 @@ def test_loop_uses_an_injected_permission_manager(tmp_path):
     """An explicit permission manager replaces local policy discovery."""
     permissions = PermissionManager(configuration=PermissionConfiguration())
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         permission_manager=permissions,
         working_directory=tmp_path,
@@ -814,10 +866,12 @@ def test_loops_share_local_conversation_context(tmp_path):
     session = Session(
         messages=[Message(role="user", content="hello")], tokens=12, model="served-model"
     )
-    first = Loop(backend=loop_backend(), session=session, working_directory=tmp_path)
+    first = Loop.create_default(backend=loop_backend(), session=session, working_directory=tmp_path)
     second_backend = Mock(default_model="other-model")
     second_backend.get_response.return_value = []
-    second = Loop(backend=second_backend, session=session, working_directory=tmp_path, stream=True)
+    second = Loop.create_default(
+        backend=second_backend, session=session, working_directory=tmp_path, stream=True
+    )
 
     assert first.session is second.session is session
     assert second.messages == [Message(role="user", content="hello")]
@@ -853,7 +907,7 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
     interaction.prompt.side_effect = ["hello", False]
     store = SQLiteSessionStore(tmp_path / ".loop" / "sessions.db")
     session_manager = SessionManager(interaction=interaction, session_store=store)
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         working_directory=tmp_path,
         interaction=interaction,
@@ -883,7 +937,9 @@ def test_loop_correlates_message_and_run_activity_with_a_provisional_session(tmp
     telemetry = Telemetry(adapter, flush_seconds=0.01)
     set_telemetry(telemetry)
     try:
-        Loop(backend=backend, interaction=interaction, working_directory=tmp_path).run()
+        Loop.create_default(
+            backend=backend, interaction=interaction, working_directory=tmp_path
+        ).run()
         assert telemetry.close(1)
     finally:
         set_telemetry(None)
@@ -899,7 +955,7 @@ def test_run_does_not_generate_a_name_for_an_already_named_session(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
     generator = Mock()
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(get_response=Mock(return_value=[ResponseCompleted()])),
         working_directory=tmp_path,
         interaction=interaction,
@@ -919,7 +975,7 @@ def test_run_reports_a_problem_when_automatic_session_naming_fails(tmp_path):
     interaction.prompt.side_effect = ["hello", False]
     generator = Mock()
     generator.generate.side_effect = RuntimeError("Generator is unavailable")
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(
             get_response=Mock(
                 return_value=[
@@ -949,7 +1005,7 @@ def test_loop_without_a_session_store_never_creates_session_files(tmp_path):
     """A caller that omits persistence keeps completed queries entirely in memory."""
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(get_response=Mock(return_value=[ResponseCompleted()])),
         working_directory=tmp_path,
         interaction=interaction,
@@ -968,7 +1024,7 @@ def test_loop_delegates_a_session_identifier_to_an_injected_manager(tmp_path):
     manager.interaction = MagicMock(spec=Interaction)
     manager.model = None
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         session="session-id",
         session_manager=manager,
@@ -988,7 +1044,7 @@ def test_loop_loads_a_persisted_session_identifier(tmp_path):
     session_id = store.save(stored)
 
     manager = SessionManager(session_store=store)
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         session=session_id,
         session_manager=manager,
@@ -1005,7 +1061,9 @@ def test_loop_uses_an_injected_manager_session_without_reloading_it(tmp_path):
     session = Session(messages=[Message(role="user", content="saved")])
     manager = SessionManager(session=session)
 
-    loop = Loop(backend=loop_backend(), session_manager=manager, working_directory=tmp_path)
+    loop = Loop.create_default(
+        backend=loop_backend(), session_manager=manager, working_directory=tmp_path
+    )
 
     assert loop.session is session
 
@@ -1015,7 +1073,7 @@ def test_loop_prefers_an_explicit_interaction_over_the_manager_interaction(tmp_p
     manager = SessionManager(interaction=output_interaction())
     interaction = MagicMock(spec=Interaction)
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=loop_backend(),
         interaction=interaction,
         session_manager=manager,
@@ -1029,10 +1087,12 @@ def test_loop_loads_project_instructions_for_its_normalized_working_directory(tm
     """A loop exposes instructions discovered for its normalized working directory."""
     (tmp_path / "AGENTS.md").write_text("project rules", encoding="utf-8")
 
-    loop = Loop(backend=loop_backend(), working_directory=str(tmp_path))
+    loop = Loop.create_default(backend=loop_backend(), working_directory=str(tmp_path))
 
     assert loop.instructions is not None
-    assert loop.instructions.index("</agent_policy>") < loop.instructions.index("project rules")
+    assert loop.instructions.index("</agent_instructions>") < loop.instructions.index(
+        "project rules"
+    )
 
 
 def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
@@ -1045,7 +1105,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     (second / "AGENTS.md").write_text("Second rules.", encoding="utf-8")
     backend = Mock(default_model="default-model")
     backend.get_response.return_value = []
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         tool_registry=ToolRegistry(BUILTIN_TOOLS),
         working_directory=first,
@@ -1056,7 +1116,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
 
     assert loop.working_directory == second.resolve()
     instructions = backend.get_response.call_args.kwargs["instructions"]
-    assert instructions.index("</agent_policy>") < instructions.index("Second rules.")
+    assert instructions.index("</agent_instructions>") < instructions.index("Second rules.")
     assert f"working_directory: {second.resolve()}" in instructions
 
 
@@ -1066,7 +1126,7 @@ def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
     backend.get_context_window.return_value = 128000
     backend.get_response.return_value = []
     (tmp_path / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         tool_registry=ToolRegistry(BUILTIN_TOOLS),
         working_directory=tmp_path,
@@ -1097,8 +1157,12 @@ def test_shared_backend_receives_each_loops_agent_scoped_tools(tmp_path):
 
     first_registry = ToolRegistry([first_tool])
     second_registry = ToolRegistry([second_tool])
-    first = Loop(backend=backend, tool_registry=first_registry, working_directory=tmp_path)
-    second = Loop(backend=backend, tool_registry=second_registry, working_directory=tmp_path)
+    first = Loop.create_default(
+        backend=backend, tool_registry=first_registry, working_directory=tmp_path
+    )
+    second = Loop.create_default(
+        backend=backend, tool_registry=second_registry, working_directory=tmp_path
+    )
 
     first.agent_runner.query()
     second.agent_runner.query()
@@ -1120,7 +1184,7 @@ def test_loop_aligns_injected_session_capacity_with_backend(tmp_path):
         get_context_window=Mock(return_value=128000),
     )
 
-    Loop(backend=backend, session_manager=manager, working_directory=tmp_path)
+    Loop.create_default(backend=backend, session_manager=manager, working_directory=tmp_path)
 
     backend.get_context_window.assert_called_once_with("old-model")
     assert session.model == "old-model"
@@ -1151,7 +1215,7 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
         get_response=Mock(return_value=[]),
     )
     interaction = MagicMock(spec=Interaction)
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         session=session,
         interaction=interaction,
@@ -1178,7 +1242,7 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
 
 def test_loop_rejects_a_missing_explicit_working_directory(tmp_path):
     """Explicit directory changes reject missing targets without altering loop state."""
-    loop = Loop(backend=loop_backend(), working_directory=tmp_path)
+    loop = Loop.create_default(backend=loop_backend(), working_directory=tmp_path)
 
     with pytest.raises(NotADirectoryError, match="does not exist"):
         loop.set_working_directory(tmp_path / "missing")
@@ -1203,7 +1267,7 @@ def test_loop_restores_only_skills_with_the_same_discovered_identity(tmp_path):
         ],
     )
 
-    loop = Loop(backend=loop_backend(), session=session)
+    loop = Loop.create_default(backend=loop_backend(), session=session)
 
     assert loop.working_directory == tmp_path.resolve()
     assert "Restored body." in loop.instructions
@@ -1222,7 +1286,7 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
     backend.get_response.return_value = []
     manager = SkillManager([Skill("review", "Review code.", location)])
     instructions_manager = InstructionsManager(skill_manager=manager)
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         tool_registry=registry,
         interaction=output_interaction(),
@@ -1266,7 +1330,7 @@ def test_skill_activation_is_persisted_with_its_tool_result(tmp_path):
         skill_manager=SkillManager([Skill("review", "Review code.", location)])
     )
     interaction = output_interaction()
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         tool_registry=registry,
         instructions_manager=manager,
@@ -1302,7 +1366,7 @@ def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_p
     manager = SkillManager([Skill("review", "Review code.", location)])
     instructions_manager = InstructionsManager(skill_manager=manager)
     instructions_manager.activate_skill("review")
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         tool_registry=registry,
         interaction=output_interaction(),
@@ -1358,7 +1422,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
 
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         interaction=interaction,
         tool_registry=registry,
@@ -1406,7 +1470,7 @@ def test_run_keeps_handled_commands_out_of_model_history(tmp_path):
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.side_effect = ["/help", "/missing", False]
 
-    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+    loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
     loop.run()
 
     assert loop.messages == []
@@ -1420,7 +1484,7 @@ def test_run_exit_commands_end_the_conversation(command, tmp_path):
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.return_value = command
 
-    loop = Loop(backend=backend, interaction=interaction, working_directory=tmp_path)
+    loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
     loop.run()
 
     assert loop.messages == []
@@ -1437,7 +1501,7 @@ def test_handle_tool_calls_delegates_session_updates(tmp_path):
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
     session_manager.model = None
-    loop = Loop(
+    loop = Loop.create_default(
         backend=backend,
         tool_registry=registry,
         session_manager=session_manager,
@@ -1474,8 +1538,10 @@ def test_query_selects_only_the_event_production_mode(tmp_path):
     backend = loop_backend(get_response=Mock(return_value=[]))
     session = Session(messages=[Message(role="user", content="hello")])
 
-    Loop(backend=backend, session=session, working_directory=tmp_path).agent_runner.query()
-    Loop(
+    Loop.create_default(
+        backend=backend, session=session, working_directory=tmp_path
+    ).agent_runner.query()
+    Loop.create_default(
         backend=backend, session=session, stream=True, working_directory=tmp_path
     ).agent_runner.query()
 
@@ -1493,7 +1559,9 @@ def test_query_delegates_instruction_state_to_the_session_manager(tmp_path):
     session_manager.messages = []
     session_manager.model_context = []
     session_manager.context_window = None
-    loop = Loop(backend=backend, session_manager=session_manager, working_directory=tmp_path)
+    loop = Loop.create_default(
+        backend=backend, session_manager=session_manager, working_directory=tmp_path
+    )
 
     loop.agent_runner.query()
 
@@ -1508,7 +1576,7 @@ def test_query_prefers_the_explicit_model_over_response_metadata(tmp_path):
     backend = loop_backend(get_response=Mock(return_value=[]))
     session = Session(model="served-model")
 
-    Loop(
+    Loop.create_default(
         backend=backend,
         model="requested-model",
         session=session,
@@ -1523,6 +1591,6 @@ def test_query_rejects_missing_model_selection(tmp_path):
     backend = loop_backend(default_model=None, get_response=Mock())
 
     with pytest.raises(ValueError, match="No model was selected"):
-        Loop(backend=backend, working_directory=tmp_path).agent_runner.query()
+        Loop.create_default(backend=backend, working_directory=tmp_path).agent_runner.query()
 
     backend.get_response.assert_not_called()

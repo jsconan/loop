@@ -2,10 +2,10 @@
 
 __all__ = [
     "AgentInstructionsSource",
-    "AgentPolicy",
     "InstructionSection",
     "InstructionsManager",
     "LoadedAgentInstructions",
+    "PreparedInstructions",
     "RuntimeEnvironment",
     "Skill",
     "SkillCommands",
@@ -22,9 +22,9 @@ from .commands import SkillCommands
 from .instructions import InstructionsManager
 from .models import (
     AgentInstructionsSource,
-    AgentPolicy,
     InstructionSection,
     LoadedAgentInstructions,
+    PreparedInstructions,
     RuntimeEnvironment,
     Skill,
 )

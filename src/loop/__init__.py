@@ -5,8 +5,9 @@ __all__ = [
     "OMIT",
     "Action",
     "Agent",
+    "AgentIdentity",
+    "AgentInstructions",
     "AgentInstructionsSource",
-    "AgentPolicy",
     "AgentRecoveryStatus",
     "AgentRunResult",
     "AgentRunStopReason",
@@ -93,6 +94,7 @@ __all__ = [
     "PolicyLimitOverrides",
     "PolicyLimits",
     "PolicyScope",
+    "PreparedInstructions",
     "PresetMetadata",
     "PresetReplacementPreview",
     "PresetRule",
@@ -186,7 +188,15 @@ __all__ = [
 ]
 
 
-from .agent import Agent, AgentRecoveryStatus, AgentRunner, AgentRunResult, AgentRunStopReason
+from .agent import (
+    Agent,
+    AgentIdentity,
+    AgentInstructions,
+    AgentRecoveryStatus,
+    AgentRunner,
+    AgentRunResult,
+    AgentRunStopReason,
+)
 from .backend import (
     Backend,
     BackendAuthenticationError,
@@ -233,10 +243,10 @@ from .constants import OMIT, Omit
 from .errors import Problem, ProblemException, log_problem
 from .instructions import (
     AgentInstructionsSource,
-    AgentPolicy,
     InstructionSection,
     InstructionsManager,
     LoadedAgentInstructions,
+    PreparedInstructions,
     RuntimeEnvironment,
     Skill,
     SkillManager,

@@ -152,29 +152,34 @@ Library callers can supply a `Session` or a persisted session identifier directl
 ```python
 from loop import Loop, Session, SessionManager, SQLiteSessionStore
 
-fresh = Loop(backend, session=Session())
+fresh = Loop.create_default(backend, session=Session())
 store = SQLiteSessionStore(".loop/sessions.db")
 sessions = SessionManager(session_store=store)
-resumed = Loop(backend, session="019c...", session_manager=sessions)
+resumed = Loop.create_default(backend, session="019c...", session_manager=sessions)
 ```
 
 `Loop` does not choose or create a session file. Library callers opt into persistence by supplying
 a session manager configured with a durable store; without one, the session remains in memory.
 
-Each submitted user message starts one bounded agent run. The configured `Agent` owns the backend,
-dynamic instructions, tool registry, and permission policy; `AgentRunner` performs repeated model
-and tool turns until the model returns a final response. `Loop` remains responsible for user input,
-commands, mentions, session naming, and metrics display. Runs default to at most 25 model turns so a
+Each submitted user message starts one bounded agent run. An immutable `Agent` owns only its
+identity, intrinsic instructions, and model-visible tools, so the same definition can be reused
+across independent sessions. `AgentRunner` owns execution against the backend, contextual
+instruction service, host permission policy, and session lifecycle. `Loop` remains responsible for
+user input, commands, mentions, session naming, and metrics display. Runs default to at most 25
+model turns, so a
 model that repeatedly requests tools cannot continue indefinitely; set `max_agent_turns=0` to
 disable the limit (unlimited turns). Library callers can change the limit with
-`Loop(..., max_agent_turns=10)` and inspect the configured identity through `loop.agent`. When the
-turn limit is reached, the user is prompted to confirm whether to continue.
+`Loop.create_default(..., max_agent_turns=10)` and inspect the configured identity through
+`loop.agent`. When the turn limit is reached, the user is prompted to confirm whether to continue.
 
-Every agent starts with Loop's bundled, versioned base policy, so its minimum collaboration,
-verification, authorization, and communication behavior does not depend on model defaults. The
-policy is always the first instruction section and cannot be disabled or truncated; library callers
-that need a different product contract can inject an explicit `AgentPolicy` through
-`InstructionsManager`.
+Every default agent starts with Loop's bundled, versioned intrinsic instructions, so its minimum
+collaboration, verification, authorization, and communication behavior does not depend on model
+defaults. Agent identity is the first instruction section, immediately followed by intrinsic
+instructions; neither is disabled or truncated. Library callers that need a different product
+contract construct an `Agent` with explicit `AgentInstructions`.
+`Agent.render()` renders its intrinsic instructions and resolves their explicit identity
+placeholders. `InstructionsManager` then combines those rendered agent sections with workspace,
+runtime, and skill context into an immutable snapshot for each model turn.
 
 At startup, the loop recursively indexes instruction files in the Git repository and loads the
 files applicable to the current working directory, from the project root through that directory.
@@ -184,9 +189,10 @@ Project sources are appended after the base policy from least to most specific, 
 context, the skill catalog, and active skills. Files may optionally begin with YAML frontmatter
 delimited by `---`; its metadata is validated and excluded from the instruction body, with malformed
 frontmatter reported in `manage_skills` diagnostics. The 32 KiB project-instruction limit emits a
-visible truncation marker when space permits, while diagnostics report policy and source digests,
-source paths, and exact included and omitted sizes. Successful local file reads, directory listings,
-and writes update the active instruction scope before the next model request.
+visible truncation marker when space permits. Context diagnostics report source digests, paths, and
+exact included and omitted sizes; prepared snapshots additionally expose agent-section provenance.
+Successful local file reads, directory listings, and writes update the active instruction scope
+before the next model request.
 
 When the model requests a file write or shell command, the loop displays the
 operation and asks for confirmation first. File and directory reads do not
@@ -305,8 +311,9 @@ the declared planner for that registry only. Pure tools declare no actions. Auth
 declare an action upper bound and an operation planner that canonicalizes arguments and returns the
 complete typed effect set before any implementation code runs.
 
-The context provides invocation metadata and access to the injected user interaction service.
-For loop-managed calls it also exposes the active `SkillManager`.
+The context provides invocation metadata and access to the injected user interaction service. For
+loop-managed calls it also exposes instruction-scope observation through the active
+`InstructionsManager`.
 
 Tool declaration is passive: importing a tool does not register it anywhere. Compose the desired
 capabilities explicitly with `ToolRegistry(BUILTIN_TOOLS)` for all bundled tools, a selected tuple

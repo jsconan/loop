@@ -1,23 +1,25 @@
 """Compose the developer instructions used for backend requests."""
 
+from __future__ import annotations
+
 from collections.abc import Iterable
 from dataclasses import replace
 from html import escape
 from pathlib import Path
 from threading import RLock
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 from .. import constants
 from ..utils import sha256_digest
 from .models import (
     AgentInstructionsSource,
-    AgentPolicy,
     InstructionContext,
     InstructionSection,
     InstructionSectionSummary,
     InstructionSourceSummary,
     LoadedAgentInstructions,
     ManagedSkillListResult,
+    PreparedInstructions,
     RuntimeEnvironment,
     SkillActivationResponse,
     SkillActivationResult,
@@ -34,13 +36,14 @@ from .utils import (
     load_agents_instructions,
 )
 
+if TYPE_CHECKING:
+    from ..agent.agent import Agent
+
 
 class InstructionsManager:
     """Maintain base, project, runtime, catalog, and activated-skill instructions.
 
     Args:
-        agent_policy (AgentPolicy | None): Stable application-owned policy. Defaults to Loop's
-            bundled policy.
         project_instructions (str | None): Project instructions loaded from applicable AGENTS.md
             files, or ``None`` when none apply.
         runtime_environment (RuntimeEnvironment | None): Application-owned runtime paths and
@@ -54,11 +57,9 @@ class InstructionsManager:
             order. Defaults to ``("AGENTS.md",)``.
 
     Raises:
-        ValueError: If ``max_bytes`` is not a positive integer, the policy is invalid, or the
-            initial instructions exceed the configured limit.
+        ValueError: If ``max_bytes`` is not a positive integer.
     """
 
-    _agent_policy: AgentPolicy
     _project_instructions: str | None
     _runtime_environment: RuntimeEnvironment | None
     _skill_manager: SkillManager
@@ -67,7 +68,7 @@ class InstructionsManager:
     _dirty: bool
     _generation: int
     _signature: tuple
-    _instructions: str
+    _context_instructions: str
     _refresh_diagnostics: list[str]
     _project_sources: tuple[AgentInstructionsSource, ...]
     _skill_discovery_enabled: bool
@@ -78,7 +79,6 @@ class InstructionsManager:
     def __init__(
         self,
         *,
-        agent_policy: AgentPolicy | None = None,
         project_instructions: str | None = None,
         runtime_environment: RuntimeEnvironment | None = None,
         skill_manager: SkillManager | None = None,
@@ -88,7 +88,6 @@ class InstructionsManager:
     ) -> None:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise ValueError("Instruction limit must be a positive integer.")
-        self._agent_policy = agent_policy or AgentPolicy.default()
         self._project_instructions = project_instructions
         self._runtime_environment = runtime_environment
         self._skill_manager = skill_manager or SkillManager()
@@ -105,16 +104,13 @@ class InstructionsManager:
         self._skill_discovery_enabled = False
         self._lock = RLock()
         self._refresh_changes = []
-        self._instructions = self._build_instructions()
-        if self._encoded_size(self._instructions) > self._max_bytes:
-            raise ValueError("Initial instructions exceed the configured instruction limit.")
+        self._context_instructions = self._build_instructions()
 
     @classmethod
     def discover(
         cls,
         working_directory: Path | str,
         *,
-        agent_policy: AgentPolicy | None = None,
         skill_manager: SkillManager | None = None,
         max_bytes: int = constants.MAX_INSTRUCTIONS_BYTES,
         agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
@@ -123,8 +119,6 @@ class InstructionsManager:
 
         Args:
             working_directory (Path | str): Directory whose instruction scopes should apply.
-            agent_policy (AgentPolicy | None): Stable application-owned policy. Defaults to Loop's
-                bundled policy.
             skill_manager (SkillManager | None): Explicit skill manager to use instead of
                 discovering one.
             max_bytes (int): Maximum encoded size of the complete instruction document.
@@ -142,7 +136,6 @@ class InstructionsManager:
         directory = Path(working_directory).resolve()
         loaded = load_agents_instructions(directory, agents_filenames)
         manager = cls(
-            agent_policy=agent_policy,
             project_instructions=loaded.content,
             skill_manager=skill_manager or SkillManager.discover(directory),
             max_bytes=max_bytes,
@@ -156,22 +149,15 @@ class InstructionsManager:
 
     @property
     def instructions(self) -> str:
-        """Return the complete instructions for the next backend request.
+        """Return contextual instructions without an agent definition.
 
         Returns:
-            str: Base policy, project instructions, runtime context, skill catalog, and active
-                skill bodies in stable order.
-        """
-        return self._instructions
+            str: Project instructions, runtime context, skill catalog, and active skill bodies.
 
-    @property
-    def agent_policy(self) -> AgentPolicy:
-        """Return the stable application-owned agent policy.
-
-        Returns:
-            AgentPolicy: Active versioned base policy.
+        Note:
+            Use :meth:`prepare` to obtain model-ready instructions for a particular agent.
         """
-        return self._agent_policy
+        return self._context_instructions
 
     @property
     def working_directory(self) -> Path | None:
@@ -225,15 +211,10 @@ class InstructionsManager:
             environment (RuntimeEnvironment | None): Runtime paths and capabilities to announce,
                 or ``None``.
 
-        Raises:
-            ValueError: If the resulting instruction document exceeds the configured limit.
         """
-        candidate = self._compose(self._project_instructions, self._skill_manager, environment)
-        if self._encoded_size(candidate) > self._max_bytes:
-            raise ValueError("Runtime environment exceeds the configured instruction limit.")
         if self._runtime_environment != environment:
             self._runtime_environment = environment
-            self._instructions = candidate
+            self._context_instructions = self._build_instructions()
             self._generation += 1
 
     def list_skills(self) -> ManagedSkillListResult:
@@ -264,9 +245,9 @@ class InstructionsManager:
                 )
                 for source in self._project_sources
             ],
-            size_bytes=self._encoded_size(self._instructions),
+            size_bytes=self._encoded_size(self._context_instructions),
             max_bytes=self._max_bytes,
-            digest=sha256_digest(self._instructions or ""),
+            digest=sha256_digest(self._context_instructions),
             sections=[
                 InstructionSectionSummary(
                     kind=section.kind,
@@ -294,7 +275,7 @@ class InstructionsManager:
                 Missing or newly shadowed identities are omitted.
         """
         with self._lock:
-            self.prepare()
+            self._refresh_context()
             results = []
             for identity in identities:
                 restored = self._skill_manager.restore([identity])
@@ -339,24 +320,105 @@ class InstructionsManager:
             if self._working_directory is not None:
                 self._dirty = True
 
-    def prepare(self) -> bool:
-        """Refresh stale discovered instructions before a backend request.
+    def prepare(self, agent: Agent) -> PreparedInstructions:
+        """Prepare an immutable request snapshot for an explicit agent.
+
+        Args:
+            agent (Agent): Agent whose intrinsic identity and instructions start the document.
 
         Returns:
-            bool: Whether the effective instructions or target directory changed.
+            PreparedInstructions: Prepared document and exact provenance for one request.
 
         Raises:
             OSError: An applicable project instruction cannot be read.
             UnicodeError: An applicable project instruction is not valid UTF-8.
+            ValueError: If the prepared document exceeds the configured instruction limit.
         """
         with self._lock:
-            if self._working_directory is None:
-                return False
-            working_directory = self._working_directory
-            signature = self._discovery_signature(working_directory)
-            if not self._dirty and signature == self._signature:
-                return False
-            return self._refresh(working_directory, signature)
+            state = (
+                self._project_instructions,
+                self._runtime_environment,
+                self._skill_manager,
+                self._working_directory,
+                self._dirty,
+                self._generation,
+                self._signature,
+                self._context_instructions,
+                self._refresh_diagnostics,
+                self._project_sources,
+                self._refresh_changes,
+            )
+            self._refresh_context()
+            instructions = self._build_instructions(agent)
+            if self._encoded_size(instructions) > self._max_bytes:
+                (
+                    self._project_instructions,
+                    self._runtime_environment,
+                    self._skill_manager,
+                    self._working_directory,
+                    self._dirty,
+                    self._generation,
+                    self._signature,
+                    self._context_instructions,
+                    self._refresh_diagnostics,
+                    self._project_sources,
+                    self._refresh_changes,
+                ) = state
+                raise ValueError("Prepared instructions exceed the configured instruction limit.")
+            return self._snapshot(agent, instructions)
+
+    def _refresh_context(self) -> bool:
+        """Refresh stale contextual sources without requiring an agent binding."""
+        if self._working_directory is None:
+            return False
+        working_directory = self._working_directory
+        signature = self._discovery_signature(working_directory)
+        if not self._dirty and signature == self._signature:
+            return False
+        return self._refresh(working_directory, signature)
+
+    def refresh(self) -> bool:
+        """Refresh changed contextual instruction sources.
+
+        Returns:
+            bool: Whether the effective contextual instructions or target directory changed.
+
+        Raises:
+            OSError: An applicable project instruction cannot be read.
+            UnicodeError: An applicable project instruction is not valid UTF-8.
+            ValueError: If refreshed instructions exceed the configured size limit.
+        """
+        with self._lock:
+            return self._refresh_context()
+
+    def snapshot(self, agent: Agent) -> PreparedInstructions:
+        """Return an immutable snapshot for an explicit agent.
+
+        Args:
+            agent (Agent): Agent whose intrinsic identity and instructions start the document.
+
+        Returns:
+            PreparedInstructions: Current document and provenance.
+
+        Raises:
+            ValueError: If the composed document exceeds the configured instruction limit.
+        """
+        with self._lock:
+            instructions = self._build_instructions(agent)
+            if self._encoded_size(instructions) > self._max_bytes:
+                raise ValueError("Prepared instructions exceed the configured instruction limit.")
+            return self._snapshot(agent, instructions)
+
+    def _snapshot(self, agent: Agent, instructions: str) -> PreparedInstructions:
+        """Capture immutable provenance for an already composed agent document."""
+        return PreparedInstructions(
+            content=instructions,
+            generation=self._generation,
+            working_directory=self._working_directory,
+            active_skills=tuple(self._skill_manager.active_identities),
+            sections=self._instruction_sections(agent),
+            digest=sha256_digest(instructions),
+        )
 
     def activate_skill(self, name: str) -> SkillActivationResponse:
         """Activate a skill for subsequent backend requests.
@@ -374,7 +436,7 @@ class InstructionsManager:
             ValueError: The skill instruction file is malformed.
         """
         with self._lock:
-            self.prepare()
+            self._refresh_context()
             result = self._skill_manager.activate(name)
             if isinstance(result, SkillOperationError):
                 return result
@@ -390,10 +452,10 @@ class InstructionsManager:
             SkillDeactivationResponse: Compact deactivation acknowledgement or structured error.
         """
         with self._lock:
-            self.prepare()
+            self._refresh_context()
             result = self._skill_manager.deactivate(name)
             if not isinstance(result, SkillOperationError) and result["instructions_updated"]:
-                self._instructions = self._build_instructions()
+                self._context_instructions = self._build_instructions()
                 self._generation += 1
             return result
 
@@ -404,10 +466,10 @@ class InstructionsManager:
             SkillDeactivationAllResult: Acknowledgement with the number of deactivated skills.
         """
         with self._lock:
-            self.prepare()
+            self._refresh_context()
             count = self._skill_manager.deactivate_all()
             if count:
-                self._instructions = self._build_instructions()
+                self._context_instructions = self._build_instructions()
                 self._generation += 1
             return SkillDeactivationAllResult(
                 status="deactivated_all",
@@ -425,7 +487,7 @@ class InstructionsManager:
             SkillResourceListResponse: Bounded resource metadata or a structured error.
         """
         with self._lock:
-            self.prepare()
+            self._refresh_context()
             return self._skill_manager.list_resources(name)
 
     def read_skill_resource(
@@ -454,7 +516,7 @@ class InstructionsManager:
             SkillResourceContentResponse: Resource content or a structured error.
         """
         with self._lock:
-            self.prepare()
+            self._refresh_context()
             return self._skill_manager.read_resource(
                 name,
                 resource_path,
@@ -467,7 +529,7 @@ class InstructionsManager:
     def _refresh(self, working_directory: Path, signature: tuple) -> bool:
         """Build and atomically install a refreshed instruction snapshot."""
         previous_target = self._signature[0] if self._signature else None
-        previous_instructions = self._instructions
+        previous_instructions = self._context_instructions
         active = self._skill_manager.active_identities
         loaded = load_agents_instructions(working_directory, self._agents_filenames)
         project_instructions = loaded.content
@@ -487,7 +549,7 @@ class InstructionsManager:
 
         for skill in skill_manager.activated_skills:
             instructions = self._compose(
-                project_instructions, skill_manager, self._runtime_environment
+                None, project_instructions, skill_manager, self._runtime_environment
             )
             if self._encoded_size(instructions) > self._max_bytes:
                 skill_manager.deactivate(skill.name)
@@ -495,15 +557,15 @@ class InstructionsManager:
                     f"Deactivated '{skill.name}' during refresh: instruction budget exceeded."
                 )
 
-        instructions = self._compose(project_instructions, skill_manager, self._runtime_environment)
-        if self._encoded_size(instructions) > self._max_bytes:
-            raise ValueError("Refreshed base instructions exceed the configured instruction limit.")
+        instructions = self._compose(
+            None, project_instructions, skill_manager, self._runtime_environment
+        )
 
         changed = previous_target != str(working_directory) or previous_instructions != instructions
         self._project_instructions = project_instructions
         self._project_sources = loaded.sources
         self._skill_manager = skill_manager
-        self._instructions = instructions
+        self._context_instructions = instructions
         self._signature = signature
         self._refresh_diagnostics = diagnostics
         self._refresh_changes = refresh_changes
@@ -522,13 +584,13 @@ class InstructionsManager:
         previous_instructions: str | None,
     ) -> bool:
         """Install refreshed project content while preserving an injected skill manager."""
-        instructions = self._compose(loaded.content, self._skill_manager, self._runtime_environment)
-        if self._encoded_size(instructions) > self._max_bytes:
-            raise ValueError("Refreshed base instructions exceed the configured instruction limit.")
+        instructions = self._compose(
+            None, loaded.content, self._skill_manager, self._runtime_environment
+        )
         changed = previous_target != str(working_directory) or previous_instructions != instructions
         self._project_instructions = loaded.content
         self._project_sources = loaded.sources
-        self._instructions = instructions
+        self._context_instructions = instructions
         self._signature = signature
         self._refresh_diagnostics = self._load_diagnostics(loaded)
         self._refresh_changes = refresh_changes
@@ -537,10 +599,13 @@ class InstructionsManager:
             self._generation += 1
         return changed
 
-    def _build_instructions(self) -> str:
+    def _build_instructions(self, agent: Agent | None = None) -> str:
         """Render the current instruction sources."""
-        return self._compose(
-            self._project_instructions, self._skill_manager, self._runtime_environment
+        return (
+            self._compose(
+                agent, self._project_instructions, self._skill_manager, self._runtime_environment
+            )
+            or ""
         )
 
     def _commit_activation(self, result: SkillActivationResult) -> SkillActivationResponse:
@@ -558,17 +623,24 @@ class InstructionsManager:
                 metadata={"max_bytes": self._max_bytes, "required_bytes": size},
             )
         if result["instructions_updated"]:
-            self._instructions = instructions
+            self._context_instructions = instructions
             self._generation += 1
         return result
 
-    def _instruction_sections(self) -> tuple[InstructionSection, ...]:
+    def _instruction_sections(self, agent: Agent | None = None) -> tuple[InstructionSection, ...]:
         """Return typed provenance for every currently composed section."""
-        sections = [
-            InstructionSection(
-                "agent_policy", self._agent_policy.render(), self._agent_policy.source
-            ),
-        ]
+        sections = []
+        if agent is not None:
+            sections.extend(
+                (
+                    InstructionSection("agent_identity", agent.identity.render(), "agent"),
+                    InstructionSection(
+                        "agent_instructions",
+                        agent.render(),
+                        agent.instructions.source,
+                    ),
+                )
+            )
         sections.extend(
             InstructionSection("agents", source.content, str(source.path))
             for source in self._project_sources
@@ -595,6 +667,7 @@ class InstructionsManager:
 
     def _compose(
         self,
+        agent: Agent | None,
         project_instructions: str | None,
         skill_manager: SkillManager,
         runtime_environment: RuntimeEnvironment | None = None,
@@ -606,8 +679,11 @@ class InstructionsManager:
         active = (
             "<active_skills>\n" + "\n".join(entries) + "\n</active_skills>" if entries else None
         )
+        sources = []
+        if agent is not None:
+            sources.extend((agent.identity.render(), agent.render()))
         return build_instructions(
-            self._agent_policy.render(),
+            *sources,
             project_instructions,
             runtime_environment.render() if runtime_environment is not None else None,
             skill_manager.catalog(),

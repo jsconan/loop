@@ -2,6 +2,7 @@
 
 import logging
 from pathlib import Path
+from typing import Self
 
 from . import constants
 from .agent import Agent, AgentRunner, AgentRunResult
@@ -37,42 +38,12 @@ class Loop:
     """Run an interactive conversation using normalized response events.
 
     Args:
-        backend (Backend): Backend used to request model responses.
-        agent_name (str): Human-readable identity for the configured agent. Defaults to
-            ``"Assistant"``.
-        model (str | None): Model selected for requests, or ``None`` to use the backend default.
-        instructions_manager (InstructionsManager | None): Manager used to compose the complete
-            backend instructions. Defaults to Loop's base policy plus discovered project
-            instructions and Agent Skills for ``working_directory``.
-        interaction (Interaction | None): Service used for all user input and output.
-        permission_manager (PermissionManager | None): Manager used to authorize model tool calls.
-            Defaults to loading local policy from the project ``.loop`` folder.
-        tool_registry (ToolRegistry | None): Agent-scoped tools exposed to the model and used to
-            dispatch its calls. Defaults to an empty registry.
-        mention_manager (MentionManager | None): Injected mention capability registry. Defaults to
-            live project-path and skill handlers.
-        working_directory (Path | str | None): Directory used to discover applicable AGENTS.md
-            files.
-        agents_filenames (tuple[str, ...]): Ordered instruction filenames, where a later name is
-            used only when earlier names are absent in the same directory.
-        session (Session | str | None): Session or persisted session identifier to load.
-            Defaults to a fresh session; an injected store persists it after its first query.
-        session_manager (SessionManager | None): Manager used to persist and retrieve sessions.
-            Defaults to an instance-local memory store when ``None`` is provided.
-        session_name_generator (SessionNameGenerator | None): Service used to improve the
-            provisional name after the first response. Defaults to the conversation backend.
-        stream (bool): Whether the backend should produce response events incrementally.
-        debug (bool): Whether to print raw response events.
-        compaction_threshold (float): Context-window utilization that triggers automatic
-            compaction. Defaults to ``0.8``.
-        prompt_on_recoverable_error (bool): Whether to offer an interactive retry after automatic
-            retries exhaust a recoverable backend failure.
-        max_agent_turns (int): Maximum model turns permitted for one user input. Defaults to
-            ``25``.
-
-    Raises:
-        ValueError: If the session, agent name, compaction threshold, or model-turn limit is
-            invalid.
+        agent_runner (AgentRunner): Runtime executing the agent.
+        command_manager (CommandManager): Registered interactive commands.
+        completion_manager (CompletionManager): Interactive completion service.
+        session_name_generator (SessionNameGenerator): Session naming service.
+        mention_manager (MentionManager): Mention resolution service.
+        working_directory (Path): Initial workspace directory.
 
     """
 
@@ -87,15 +58,42 @@ class Loop:
     _completion_manager: CompletionManager
     _session_name_generator: SessionNameGenerator
     _mention_manager: MentionManager
-    _prompt_on_recoverable_error: bool
     _agent: Agent
     _agent_runner: AgentRunner
 
     def __init__(
         self,
+        *,
+        agent_runner: AgentRunner,
+        command_manager: CommandManager,
+        completion_manager: CompletionManager,
+        session_name_generator: SessionNameGenerator,
+        mention_manager: MentionManager,
+        working_directory: Path,
+    ) -> None:
+        self._agent_runner = agent_runner
+        self._agent = agent_runner.agent
+        self._session_manager = agent_runner.session_manager
+        self._model_selection = agent_runner.model_selection
+        self._compaction = agent_runner.compaction
+        self._interaction = agent_runner.interaction
+        self._command_manager = command_manager
+        self._completion_manager = completion_manager
+        self._session_name_generator = session_name_generator
+        self._mention_manager = mention_manager
+        self._instructions_manager = agent_runner.instructions_manager
+        self._permission_manager = agent_runner.permission_manager
+        self._backend = agent_runner.backend
+        self._working_directory = working_directory
+        self._stream = agent_runner.stream
+        self._debug = agent_runner.debug
+
+    @classmethod
+    def create_default(
+        cls,
         backend: Backend,
         *,
-        agent_name: str = "Assistant",
+        agent_name: str = "Loop",
         model: str | None = None,
         instructions_manager: InstructionsManager | None = None,
         interaction: Interaction | None = None,
@@ -112,109 +110,145 @@ class Loop:
         compaction_threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
         prompt_on_recoverable_error: bool = True,
         max_agent_turns: int = constants.DEFAULT_AGENT_MAX_TURNS,
-    ) -> None:
+    ) -> Self:
+        """Assemble an interactive loop with project defaults.
+
+        Args:
+            backend (Backend): Backend used to request model responses.
+            agent_name (str): Human-readable identity. Defaults to ``"Loop"``.
+            model (str | None): Explicit model, or ``None`` for the backend default.
+            instructions_manager (InstructionsManager | None): Injected contextual instruction
+                service, or ``None`` to discover one for the workspace.
+            interaction (Interaction | None): User interaction service.
+            permission_manager (PermissionManager | None): Tool authorization service.
+            tool_registry (ToolRegistry | None): Tools exposed by the default agent.
+            mention_manager (MentionManager | None): Mention resolution service.
+            working_directory (Path | str | None): Initial workspace directory.
+            agents_filenames (tuple[str, ...]): Project instruction filenames in precedence order.
+            session (Session | str | None): Initial session or persisted identifier.
+            session_manager (SessionManager | None): Injected session state owner.
+            session_name_generator (SessionNameGenerator | None): Injected session naming service.
+            stream (bool): Whether model response events are streamed.
+            debug (bool): Whether raw model response events are displayed.
+            compaction_threshold (float): Utilization threshold for automatic compaction.
+            prompt_on_recoverable_error (bool): Whether recoverable errors prompt after retries.
+            max_agent_turns (int): Maximum model turns per run, or zero for unlimited turns.
+
+        Returns:
+            Loop: Fully assembled interactive application.
+        """
         if session_manager is not None:
-            self._session_manager = session_manager
+            configured_sessions = session_manager
             if session:
-                self._session_manager.load_session(session)
+                configured_sessions.load_session(session)
         else:
-            self._session_manager = SessionManager(
+            configured_sessions = SessionManager(
                 interaction=interaction,
                 session=session,
             )
-        self._interaction = interaction or self._session_manager.interaction
-        self._session_name_generator = session_name_generator or BackendSessionNameGenerator(
-            backend
-        )
+        configured_interaction = interaction or configured_sessions.interaction
+        configured_name_generator = session_name_generator or BackendSessionNameGenerator(backend)
 
-        restored_directory = self._session_manager.session.instruction_working_directory
-        self._working_directory = Path(
-            working_directory or restored_directory or Path.cwd()
-        ).resolve()
+        restored_directory = configured_sessions.session.instruction_working_directory
+        configured_directory = Path(working_directory or restored_directory or Path.cwd()).resolve()
         configured_permissions = permission_manager or PermissionManager(
-            find_project_root(self._working_directory) or self._working_directory,
-            interaction=self._interaction,
+            find_project_root(configured_directory) or configured_directory,
+            interaction=configured_interaction,
         )
         configured_instructions = instructions_manager or InstructionsManager.discover(
-            self._working_directory,
+            configured_directory,
             agents_filenames=agents_filenames,
         )
         if instructions_manager is None:
-            configured_instructions.reactivate_skills(self._session_manager.session.active_skills)
+            configured_instructions.reactivate_skills(configured_sessions.session.active_skills)
         configured_instructions.set_runtime_environment(
             RuntimeEnvironment(
-                working_directory=self._working_directory,
+                working_directory=configured_directory,
                 temporary_directory=configured_permissions.temporary_directory,
             )
         )
-        configured_permissions.recorder = self._session_manager
+        configured_permissions.recorder = configured_sessions
         configured_tools = tool_registry or ToolRegistry(
-            interaction=self._interaction,
+            interaction=configured_interaction,
             permission_manager=configured_permissions,
         )
-        self._agent = Agent(
-            agent_name,
-            backend=backend,
-            instructions_manager=configured_instructions,
-            tool_registry=configured_tools,
-            permission_manager=configured_permissions,
-        )
-        self._stream = stream
-        self._debug = debug
-        self._model_selection = ModelSelection(
-            self._agent.backend,
-            self._session_manager,
+        configured_agent = Agent(agent_name, tools=configured_tools)
+        configured_instructions.prepare(configured_agent)
+        configured_selection = ModelSelection(
+            backend,
+            configured_sessions,
             selected=model,
         )
-        self._compaction = ContextCompaction(
-            self._agent.backend,
-            self._session_manager,
-            self._model_selection,
-            self._agent.instructions_manager,
-            self._interaction,
-            lambda: self._working_directory,
+        application: Loop
+        configured_compaction = ContextCompaction(
+            backend,
+            configured_sessions,
+            configured_selection,
+            lambda: configured_instructions.prepare(configured_agent),
+            configured_interaction,
+            lambda: application.working_directory,
             threshold=compaction_threshold,
         )
-        self._prompt_on_recoverable_error = prompt_on_recoverable_error
-        self._agent_runner = AgentRunner(
-            self._agent,
-            self._session_manager,
-            self._model_selection,
-            self._compaction,
-            self._interaction,
-            lambda: self._working_directory,
+        configured_runner = AgentRunner(
+            configured_agent,
+            backend,
+            configured_instructions,
+            configured_permissions,
+            configured_sessions,
+            configured_selection,
+            configured_compaction,
+            configured_interaction,
+            lambda: application.working_directory,
             stream=stream,
             debug=debug,
             max_turns=max_agent_turns,
             prompt_on_recoverable_error=prompt_on_recoverable_error,
         )
         providers = (
-            SessionCommands(self._session_manager, self._session_name_generator),
-            PermissionCommands(self._agent.permission_manager),
-            SkillCommands(self._agent.instructions_manager),
-            ToolCommands(self._agent.tool_registry, self._agent.instructions_manager),
-            ModelCommands(self._model_selection),
-            CompactionCommands(self._compaction),
+            SessionCommands(configured_sessions, configured_name_generator),
+            PermissionCommands(configured_permissions),
+            SkillCommands(configured_instructions),
+            ToolCommands(configured_agent.tools, configured_instructions),
+            ModelCommands(configured_selection),
+            CompactionCommands(configured_compaction),
         )
-        self._command_manager = CommandManager(
+        configured_commands = CommandManager(
             providers=providers,
-            interaction=self._interaction,
+            interaction=configured_interaction,
         )
-        self._mention_manager = mention_manager or MentionManager(
+        configured_mentions = mention_manager or MentionManager(
             (
-                ProjectPathMentionHandler(lambda: self._working_directory),
-                SkillMentionHandler(self._agent.instructions_manager),
+                ProjectPathMentionHandler(lambda: application.working_directory),
+                SkillMentionHandler(configured_instructions),
             )
         )
-        self._completion_manager = CompletionManager(
+        configured_completion = CompletionManager(
             (
                 CommandCompletionAdapter(
-                    lambda: self._command_manager.commands,
+                    lambda: configured_commands.commands,
                     providers=providers,
                 ),
-                *self._mention_manager.completion_adapters,
+                *configured_mentions.completion_adapters,
             )
         )
+        application = cls(
+            agent_runner=configured_runner,
+            command_manager=configured_commands,
+            completion_manager=configured_completion,
+            session_name_generator=configured_name_generator,
+            mention_manager=configured_mentions,
+            working_directory=configured_directory,
+        )
+        return application
+
+    @property
+    def command_manager(self) -> CommandManager:
+        """Return the registered interactive command manager.
+
+        Returns:
+            CommandManager: Active command manager.
+        """
+        return self._command_manager
 
     @property
     def permission_manager(self) -> PermissionManager:
@@ -223,7 +257,7 @@ class Loop:
         Returns:
             PermissionManager: Active local permission manager.
         """
-        return self._agent.permission_manager
+        return self._permission_manager
 
     @property
     def agent(self) -> Agent:
@@ -250,7 +284,7 @@ class Loop:
         Returns:
             ToolRegistry: Agent-scoped tool declarations and implementations.
         """
-        return self._agent.tool_registry
+        return self._agent.tools
 
     @property
     def backend(self) -> Backend:
@@ -259,16 +293,18 @@ class Loop:
         Returns:
             Backend: The configured LLM backend.
         """
-        return self._agent.backend
+        return self._backend
 
     @property
     def instructions(self) -> str:
         """Return the complete instructions for the next backend request.
 
         Returns:
-            str: Base policy, project, runtime, catalog, and activated-skill instructions.
+            str: Agent instructions (identity, intrinsic instructions), project, runtime, catalog,
+                and activated-skill instructions. Accessing this property refreshes stale project
+                sources before composing the document.
         """
-        return self._agent.instructions_manager.instructions
+        return self._instructions_manager.prepare(self._agent).content
 
     @property
     def instructions_manager(self) -> InstructionsManager:
@@ -277,7 +313,7 @@ class Loop:
         Returns:
             InstructionsManager: The active instruction manager.
         """
-        return self._agent.instructions_manager
+        return self._instructions_manager
 
     @property
     def messages(self) -> list[ConversationItem]:
@@ -328,7 +364,7 @@ class Loop:
         if not directory.is_dir():
             raise NotADirectoryError(f"Working directory '{directory}' does not exist.")
         self._working_directory = directory
-        self._agent.instructions_manager.observe_path(directory, directory=True)
+        self._instructions_manager.observe_path(directory, directory=True)
 
     @property
     def debug(self) -> bool:

@@ -33,6 +33,7 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     loop = Mock()
     loop.run.side_effect = interruption
     loop_factory = Mock(return_value=loop)
+    loop_factory.create_default.return_value = loop
     backend = Mock()
     backend_factory = Mock(return_value=backend)
     tool_registry = Mock()
@@ -67,7 +68,7 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
         interaction=interaction,
         session_store=session_store,
     )
-    loop_factory.assert_called_once_with(
+    loop_factory.create_default.assert_called_once_with(
         backend,
         interaction=interaction,
         tool_registry=tool_registry,
@@ -86,6 +87,7 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
     interaction = Mock()
     loop = Mock()
     loop_factory = Mock(return_value=loop)
+    loop_factory.create_default.return_value = loop
     backend = Mock()
     backend_factory = Mock(return_value=backend)
     tool_registry = Mock()
@@ -124,7 +126,7 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
         interaction=interaction,
         session_store=session_store,
     )
-    loop_factory.assert_called_once_with(
+    loop_factory.create_default.assert_called_once_with(
         backend,
         interaction=interaction,
         tool_registry=tool_registry,
@@ -197,6 +199,8 @@ def test_main_reports_runtime_failures_to_initialized_telemetry(monkeypatch):
     loop = Mock()
     error = RuntimeError("runtime private")
     loop.run.side_effect = error
+    loop_factory = Mock()
+    loop_factory.create_default.return_value = loop
     telemetry = Mock()
     monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
     monkeypatch.setattr(main, "register_shutdown_signals", Mock())
@@ -204,7 +208,7 @@ def test_main_reports_runtime_failures_to_initialized_telemetry(monkeypatch):
     monkeypatch.setattr(main, "create_default_tool_registry", Mock(return_value=Mock()))
     monkeypatch.setattr(main, "SQLiteSessionStore", Mock(return_value=Mock()))
     monkeypatch.setattr(main, "SessionManager", Mock(return_value=Mock()))
-    monkeypatch.setattr(main, "Loop", Mock(return_value=loop))
+    monkeypatch.setattr(main, "Loop", loop_factory)
     monkeypatch.setattr(main, "find_project_root", Mock(return_value=Path("/project")))
     monkeypatch.setattr(main, "Telemetry", Mock(return_value=telemetry))
 

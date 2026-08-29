@@ -73,7 +73,7 @@ def main() -> None:
                 project_root / APP_DIRECTORY / SESSION_DATABASE_FILENAME
             ),
         )
-        loop = Loop(
+        loop = Loop.create_default(
             backend,
             interaction=interaction,
             tool_registry=create_default_tool_registry(interaction=interaction),
