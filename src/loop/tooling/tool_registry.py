@@ -11,6 +11,7 @@ from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
 from ..constants import OMIT, Omit
 from ..errors import Problem, ProblemException, log_problem
+from ..instructions import InstructionsManager
 from ..interaction import Interaction
 from ..models import (
     ToolDefinition,
@@ -25,7 +26,6 @@ from ..permissions import (
     OperationPlanner,
     PermissionManager,
 )
-from ..skills import InstructionsManager
 from ..utils import callable_name
 from .context import ToolContext
 from .models import ToolPreflight, ToolRegistrationError, ToolStatus

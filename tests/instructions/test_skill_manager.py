@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from loop import Skill, SkillManager
+from loop.instructions import Skill, SkillManager
 
 
 def write_skill(directory: Path, name: str, description: str, body: str = "Instructions") -> Path:

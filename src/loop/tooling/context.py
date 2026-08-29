@@ -11,8 +11,8 @@ from ..errors import Problem, ProblemException
 from ..interaction import Interaction
 
 if TYPE_CHECKING:
+    from ..instructions import InstructionsManager
     from ..permissions import Operation, OperationPlan
-    from ..skills import InstructionsManager
 
 AdditionalAuthorizer = Callable[[dict[str, object]], "OperationPlan"]
 

@@ -1,4 +1,4 @@
-"""Expose the Skill classes."""
+"""Expose instruction composition and Agent Skill classes."""
 
 __all__ = [
     "AgentInstructionsSource",

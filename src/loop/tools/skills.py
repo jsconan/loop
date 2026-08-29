@@ -6,13 +6,13 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from .. import constants
-from ..models import ToolResultPresentation, ToolResultPresentationSpec
-from ..permissions import Action, Operation, OperationPlan, SessionTarget
-from ..skills.models import (
+from ..instructions.models import (
     PublicSkillOperationResult,
     SkillOperationError,
     SkillOperationResult,
 )
+from ..models import ToolResultPresentation, ToolResultPresentationSpec
+from ..permissions import Action, Operation, OperationPlan, SessionTarget
 from ..tooling import ToolContext, tool
 
 _FIELDS_BY_NAME = {

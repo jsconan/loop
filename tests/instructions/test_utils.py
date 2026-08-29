@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from loop.skills import (
+from loop.instructions import (
     build_instructions,
     get_agents_files,
     get_skill_directories,
@@ -36,9 +36,9 @@ def test_get_skill_directories_uses_local_and_user_scopes_outside_project(tmp_pa
     home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
-    assert get_skill_directories(tmp_path, Path("instructions")) == [
-        tmp_path / "instructions",
-        home / "instructions",
+    assert get_skill_directories(tmp_path, Path("skills")) == [
+        tmp_path / "skills",
+        home / "skills",
     ]
 
 

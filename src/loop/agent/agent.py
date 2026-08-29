@@ -1,8 +1,8 @@
 """Define an LLM agent independently from conversation orchestration."""
 
 from ..backend import Backend
+from ..instructions import InstructionsManager
 from ..permissions import PermissionManager
-from ..skills import InstructionsManager
 from ..tooling import ToolRegistry
 
 

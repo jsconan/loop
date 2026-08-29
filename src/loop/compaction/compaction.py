@@ -5,10 +5,10 @@ from pathlib import Path
 
 from .. import constants
 from ..backend import Backend
+from ..instructions import InstructionsManager
 from ..interaction import Interaction
 from ..model_selection import ModelSelection
 from ..session import SessionManager
-from ..skills import InstructionsManager
 from ..telemetry import telemetry_activity, telemetry_error
 
 

@@ -21,8 +21,8 @@ from loop import (
     ToolResultPresentation,
     ToolResultPresentationSpec,
 )
+from loop.instructions import InstructionsManager
 from loop.interaction import Interaction
-from loop.skills import InstructionsManager
 from loop.tooling import (
     ToolContext,
     ToolPreflightResult,

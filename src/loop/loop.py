@@ -13,6 +13,7 @@ from .completion import (
     CompletionManager,
 )
 from .errors import Problem, log_problem
+from .instructions import InstructionsManager, RuntimeEnvironment, SkillCommands
 from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
 from .model_selection import ModelCommands, ModelSelection
@@ -25,7 +26,6 @@ from .session import (
     SessionManager,
     SessionNameGenerator,
 )
-from .skills import InstructionsManager, RuntimeEnvironment, SkillCommands
 from .telemetry import telemetry_activity
 from .tooling import ToolCommands, ToolRegistry
 from .utils import find_project_root
@@ -140,9 +140,7 @@ class Loop:
             agents_filenames=agents_filenames,
         )
         if instructions_manager is None:
-            configured_instructions.reactivate_skills(
-                self._session_manager.session.active_skills
-            )
+            configured_instructions.reactivate_skills(self._session_manager.session.active_skills)
         configured_instructions.set_runtime_environment(
             RuntimeEnvironment(
                 working_directory=self._working_directory,

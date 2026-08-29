@@ -2,7 +2,7 @@
 
 import pytest
 
-from loop.skills.models import AgentPolicy, InstructionSection
+from loop.instructions.models import AgentPolicy, InstructionSection
 
 
 def test_agent_policy_loads_renders_and_digests_the_bundled_contract():
@@ -10,10 +10,10 @@ def test_agent_policy_loads_renders_and_digests_the_bundled_contract():
     policy = AgentPolicy.default()
 
     assert policy.version == "1"
-    assert policy.source == "loop.skills/agent_policy.md"
+    assert policy.source == "loop.instructions/agent_policy.md"
     assert "You are Loop" in policy.content
     assert policy.render().startswith(
-        '<agent_policy version="1" source="loop.skills/agent_policy.md">'
+        '<agent_policy version="1" source="loop.instructions/agent_policy.md">'
     )
     assert policy.render().endswith("</agent_policy>")
     assert len(policy.digest) == 64

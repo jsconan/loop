@@ -231,6 +231,16 @@ from .completion import (
 )
 from .constants import OMIT, Omit
 from .errors import Problem, ProblemException, log_problem
+from .instructions import (
+    AgentInstructionsSource,
+    AgentPolicy,
+    InstructionSection,
+    InstructionsManager,
+    LoadedAgentInstructions,
+    RuntimeEnvironment,
+    Skill,
+    SkillManager,
+)
 from .interaction import ConsoleInteraction, Interaction
 from .loop import Loop
 from .mentions import (
@@ -336,16 +346,6 @@ from .session import (
     initial_session_name,
     normalize_session_name,
     validate_session_source,
-)
-from .skills import (
-    AgentInstructionsSource,
-    AgentPolicy,
-    InstructionSection,
-    InstructionsManager,
-    LoadedAgentInstructions,
-    RuntimeEnvironment,
-    Skill,
-    SkillManager,
 )
 from .tooling import (
     Tool,

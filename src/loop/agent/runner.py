@@ -11,6 +11,7 @@ from .. import constants
 from ..backend import BackendError, BackendNotFoundError
 from ..compaction import ContextCompaction
 from ..errors import Problem, log_problem
+from ..instructions import InstructionsManager
 from ..interaction import Interaction
 from ..model_selection import ModelSelection
 from ..models import (
@@ -25,7 +26,6 @@ from ..models import (
     Usage,
 )
 from ..session import SessionManager, SessionRecoveryState
-from ..skills import InstructionsManager
 from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
 from ..tooling.utils import serialize_tool_problem
 from ..utils import utc_now

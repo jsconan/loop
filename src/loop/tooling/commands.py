@@ -11,7 +11,7 @@ from ..completion import (
     CompletionValue,
     SchemaCompletionProviderRegistration,
 )
-from ..skills import InstructionsManager
+from ..instructions import InstructionsManager
 from .tool_registry import ToolRegistry
 
 

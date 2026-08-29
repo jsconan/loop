@@ -401,7 +401,7 @@ def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path
     racing = InstructionsManager.discover(clean)
     missing = clean / "disappeared" / "AGENTS.md"
     monkeypatch.setattr(
-        "loop.skills.instructions.get_agents_files",
+        "loop.instructions.instructions.get_agents_files",
         lambda working_directory, _filenames: [missing],
     )
     racing.invalidate()

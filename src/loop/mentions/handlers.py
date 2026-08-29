@@ -13,9 +13,9 @@ from ..completion import (
     ProjectPathCompletionAdapter,
 )
 from ..errors import Problem
+from ..instructions import InstructionsManager
+from ..instructions.models import SkillOperationError
 from ..models import ContextReference
-from ..skills import InstructionsManager
-from ..skills.models import SkillOperationError
 from ..utils import encode_content_cursor, is_path_ignored, iter_visible_paths, store_content
 
 

@@ -3,7 +3,7 @@
 from unittest.mock import Mock
 
 from loop import CommandManager, InstructionsManager, Interaction, Skill, SkillManager
-from loop.skills import SkillCommands
+from loop.instructions import SkillCommands
 
 
 def test_skill_commands_list_and_activate_skills_idempotently(tmp_path):
