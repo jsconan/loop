@@ -86,6 +86,25 @@ def test_telemetry_records_all_signals_with_nested_w3c_correlation():
     assert records[-1].payload_sha256 == payload_digest({"input": "complete"})
 
 
+def test_trace_metadata_is_inherited_by_nested_traces_and_remains_scoped():
+    """Trace metadata reaches descendant traces, supports local overrides, and is reset."""
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    with telemetry.context(metadata={"conversation.id": "root", "feature.variant": "v1"}):
+        telemetry.trace_event("root")
+        with telemetry.context(metadata={"feature.variant": "v2"}):
+            telemetry.trace_event("child", **{"conversation.id": "event"})
+        telemetry.activity("activity")
+    telemetry.trace_event("outside")
+    assert telemetry.close(1)
+
+    root, child, activity, outside = adapter.records
+    assert dict(root.attributes) == {"conversation.id": "root", "feature.variant": "v1"}
+    assert dict(child.attributes) == {"conversation.id": "event", "feature.variant": "v2"}
+    assert not dict(activity.attributes)
+    assert not dict(outside.attributes)
+
+
 def test_telemetry_generates_public_w3c_identifiers():
     """Public helpers generate correctly sized lowercase hexadecimal identifiers."""
     trace_id = Telemetry.trace_id()

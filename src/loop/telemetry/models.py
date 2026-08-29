@@ -16,13 +16,14 @@ TelemetrySeverity = Literal["debug", "info", "warning", "error", "fatal"]
 
 @dataclass(frozen=True, slots=True)
 class TelemetryContext:
-    """Carry optional correlation metadata across component boundaries."""
+    """Carry correlation identifiers and inherited trace metadata across boundaries."""
 
     session_id: str | None = None
     message_sequence: int | None = None
     trace_id: str | None = None
     span_id: str | None = None
     parent_span_id: str | None = None
+    trace_metadata: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True, slots=True)

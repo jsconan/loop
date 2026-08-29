@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar, Token
+from types import MappingProxyType
 from typing import cast
 from uuid import uuid4
 
@@ -190,6 +191,7 @@ class Telemetry:
         message_sequence: int | None = None,
         trace_id: str | None = None,
         span_id: str | None = None,
+        metadata: Mapping[str, object] | None = None,
     ) -> Generator[TelemetryContext]:
         """Bind correlation metadata for nested component calls.
 
@@ -198,11 +200,15 @@ class Telemetry:
             message_sequence (int | None): Message sequence within the session.
             trace_id (str | None): W3C-compatible trace identifier, generated when omitted.
             span_id (str | None): Current span identifier, generated when omitted.
+            metadata (Mapping[str, object] | None): Trace attributes inherited by nested spans.
 
         Yields:
             TelemetryContext: Bound correlation context.
         """
         parent = _CURRENT_CONTEXT.get() or TelemetryContext()
+        trace_metadata = dict(parent.trace_metadata)
+        if metadata is not None:
+            trace_metadata.update(metadata)
         context = TelemetryContext(
             session_id=session_id if session_id is not None else parent.session_id,
             message_sequence=(
@@ -211,6 +217,7 @@ class Telemetry:
             trace_id=trace_id or parent.trace_id or self.trace_id(),
             span_id=span_id or self.span_id(),
             parent_span_id=parent.span_id,
+            trace_metadata=cast(MappingProxyType, freeze(trace_metadata)),
         )
         token = _CURRENT_CONTEXT.set(context)
         try:
@@ -301,7 +308,9 @@ class Telemetry:
             context = _CURRENT_CONTEXT.get() or TelemetryContext()
             now = time.time_ns()
             safe_attributes = (
-                self._policy.normalize(attributes) if signal != "trace" else freeze(attributes)
+                self._policy.normalize(attributes)
+                if signal != "trace"
+                else freeze({**context.trace_metadata, **attributes})
             )
             record = TelemetryRecord(
                 record_id=f"tel_{uuid4().hex}",
@@ -553,6 +562,7 @@ def telemetry_span(
     message_sequence: int | None = None,
     trace_id: str | None = None,
     span_id: str | None = None,
+    metadata: Mapping[str, object] | None = None,
 ) -> AbstractContextManager[TelemetryContext | None]:
     """Return an optional process-wide correlation span.
 
@@ -561,6 +571,7 @@ def telemetry_span(
         message_sequence (int | None): Message sequence within the session.
         trace_id (str | None): W3C-compatible trace identifier, generated when omitted.
         span_id (str | None): Current span identifier, generated when omitted.
+        metadata (Mapping[str, object] | None): Trace attributes inherited by nested spans.
 
     Returns:
         AbstractContextManager[TelemetryContext | None]: Active span or a no-op context manager.
@@ -572,6 +583,7 @@ def telemetry_span(
         message_sequence=message_sequence,
         trace_id=trace_id,
         span_id=span_id,
+        metadata=metadata,
     )
 
 
