@@ -110,21 +110,128 @@ def test_manager_rejects_unknown_fields_and_invalid_values(tmp_path):
     with pytest.raises(ValueError, match="Unknown configuration field"):
         manager.set("backend.unknown", "value")
     with pytest.raises(ValueError, match="Unknown configuration field"):
-        manager.unset("backend.unknown")
+        manager.reset("backend.unknown")
     with pytest.raises(ValidationError):
         manager.set("backend.max_retries", -1)
     with pytest.raises(ValidationError):
         manager.set("backend.temperature", 3)
 
 
-def test_unset_restores_default_and_missing_file_loads_defaults(tmp_path):
-    """Removing a value restores its model default and a missing file remains usable."""
+def test_reset_stores_default_and_missing_file_loads_defaults(tmp_path):
+    """Reset stores a model default and a missing file remains usable."""
     manager = ConfigurationManager(tmp_path)
     assert manager.load().backend.default_model == "nvidia/Qwen3.6-35B-A3B-NVFP4"
     manager.initialize()
     manager.set("backend.default_model", "configured-model")
 
     assert (
-        manager.unset("backend.default_model").backend.default_model
+        manager.reset("backend.default_model").backend.default_model
         == "nvidia/Qwen3.6-35B-A3B-NVFP4"
     )
+
+
+def test_session_reset_overrides_environment_without_writing_the_file(tmp_path):
+    """A session reset stores the default without changing the configuration file."""
+    manager = ConfigurationManager(tmp_path)
+    manager.initialize()
+    manager.load({"DEFAULT_MODEL": "environment-model"})
+    original = manager.path.read_text(encoding="utf-8")
+
+    settings = manager.set_session("backend.default_model", "session-model")
+
+    assert settings.backend.default_model == "session-model"
+    assert manager.source_for("backend.default_model") == "session"
+    assert manager.path.read_text(encoding="utf-8") == original
+    assert (
+        manager.reset_session("backend.default_model").backend.default_model
+        == "nvidia/Qwen3.6-35B-A3B-NVFP4"
+    )
+
+
+def test_file_edit_retains_environment_precedence_and_exposes_entries(tmp_path):
+    """Durable edits retain remembered environment precedence and schema-backed metadata."""
+    manager = ConfigurationManager(tmp_path)
+    manager.initialize()
+    manager.load({"DEFAULT_MODEL": "environment-model"})
+
+    manager.set("backend.default_model", "file-model")
+
+    entry = next(item for item in manager.entries if item.path == "backend.api_key")
+    assert manager.effective.backend.default_model == "environment-model"
+    assert manager.source_for("backend.default_model") == "environment"
+    assert entry.secret is True
+    assert str(entry.value) == "**********"
+    assert next(item for item in manager.entries if item.path == "loop.stream").choices == (
+        True,
+        False,
+    )
+    assert next(
+        item for item in manager.entries if item.path == "backend.file_input_mode"
+    ).choices == (
+        "text",
+        "native",
+    )
+
+
+def test_reset_all_stores_defaults_in_each_scope(tmp_path):
+    """File and session resets each retain explicitly stored built-in defaults."""
+    manager = ConfigurationManager(tmp_path)
+    manager.initialize()
+    manager.load()
+    manager.set("loop.debug", True)
+    manager.set_session("loop.stream", False)
+
+    assert manager.reset_all(scope="session").loop.stream is True
+    assert manager.reset_all(scope="file").loop.debug is False
+    assert 'api_key = "local-api-key"' in manager.path.read_text(encoding="utf-8")
+    assert manager.source_for("loop.debug") == "session"
+    assert manager.source_for("loop.stream") == "session"
+
+
+def test_unset_removes_a_file_value_and_reveals_environment_precedence(tmp_path):
+    """Removing a file value exposes the lower-precedence environment value."""
+    manager = ConfigurationManager(tmp_path)
+    manager.initialize()
+    manager.load({"DEFAULT_MODEL": "environment-model"})
+    manager.set("backend.default_model", "file-model")
+
+    settings = manager.unset("backend.default_model")
+
+    assert settings.backend.default_model == "environment-model"
+    assert manager.source_for("backend.default_model") == "environment"
+    assert "default_model" not in manager.path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="Unknown configuration field"):
+        manager.unset("backend.default_model")
+
+
+def test_unset_session_removes_one_override_and_requires_an_existing_value(tmp_path):
+    """Removing a session value exposes lower scopes and rejects a second removal."""
+    manager = ConfigurationManager(tmp_path)
+    manager.initialize()
+    manager.load({"DEFAULT_MODEL": "environment-model"})
+    manager.set_session("backend.default_model", "session-model")
+
+    settings = manager.unset_session("backend.default_model")
+
+    assert settings.backend.default_model == "environment-model"
+    assert manager.source_for("backend.default_model") == "environment"
+    with pytest.raises(ValueError, match="No session override"):
+        manager.unset_session("backend.default_model")
+
+
+def test_unset_all_removes_only_the_selected_scope(tmp_path):
+    """Clearing a scope leaves higher-precedence session values in effect."""
+    manager = ConfigurationManager(tmp_path)
+    manager.initialize()
+    manager.load()
+    manager.set("loop.debug", True)
+    manager.set_session("loop.stream", False)
+
+    assert manager.unset_all(scope="file").loop.debug is False
+    assert manager.effective.loop.stream is False
+    assert manager.source_for("loop.debug") == "default"
+    assert manager.source_for("loop.stream") == "session"
+    document = manager.path.read_text(encoding="utf-8")
+    assert "config_version" not in document
+    assert "[loop]" not in document
+    assert manager.unset_all(scope="session").loop.stream is True
