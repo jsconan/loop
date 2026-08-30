@@ -179,13 +179,52 @@ def test_reset_all_stores_defaults_in_each_scope(tmp_path):
     manager.initialize()
     manager.load()
     manager.set("loop.debug", True)
+    manager.set("backend.api_key", "configured-secret")
     manager.set_session("loop.stream", False)
 
     assert manager.reset_all(scope="session").loop.stream is True
-    assert manager.reset_all(scope="file").loop.debug is False
+    settings = manager.reset_all(scope="file")
+    assert settings.loop.debug is False
+    assert settings.backend.api_key.get_secret_value() == "local-api-key"
     assert 'api_key = "local-api-key"' in manager.path.read_text(encoding="utf-8")
     assert manager.source_for("loop.debug") == "session"
     assert manager.source_for("loop.stream") == "session"
+
+
+def test_file_reset_all_retains_comments_and_formatting(tmp_path):
+    """A file-wide reset restores values without replacing existing TOML layout."""
+    manager = ConfigurationManager(tmp_path)
+    manager.initialize()
+    manager.path.write_text(
+        manager.path.read_text(encoding="utf-8").replace(
+            'default_model = "nvidia/Qwen3.6-35B-A3B-NVFP4"',
+            '# Project-specific model\ndefault_model = "configured-model"',
+        ),
+        encoding="utf-8",
+    )
+    manager.load()
+
+    settings = manager.reset_all(scope="file")
+
+    document = manager.path.read_text(encoding="utf-8")
+    assert settings.backend.default_model == "nvidia/Qwen3.6-35B-A3B-NVFP4"
+    assert "# Project-specific model" in document
+    assert 'default_model = "nvidia/Qwen3.6-35B-A3B-NVFP4"' in document
+
+
+def test_file_reset_all_restores_missing_sections_and_removes_nullable_defaults(tmp_path):
+    """A file-wide reset recreates absent sections and removes values defaulting to null."""
+    manager = ConfigurationManager(tmp_path)
+    manager.path.parent.mkdir()
+    manager.path.write_text("[backend]\ncontext_window = 4096\n", encoding="utf-8")
+    manager.load()
+
+    settings = manager.reset_all(scope="file")
+
+    document = manager.path.read_text(encoding="utf-8")
+    assert settings.backend.context_window is None
+    assert "context_window" not in document
+    assert "[telemetry]" in document
 
 
 def test_unset_removes_a_file_value_and_reveals_environment_precedence(tmp_path):
