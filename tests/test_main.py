@@ -2,7 +2,7 @@
 
 import runpy
 from pathlib import Path
-from unittest.mock import Mock, call
+from unittest.mock import ANY, Mock, call
 
 import pytest
 
@@ -86,12 +86,18 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
         session_manager=session_manager,
         agent_name="Loop",
         model=None,
+        on_model_select=ANY,
         stream=True,
         debug=False,
         compaction_threshold=0.8,
         prompt_on_recoverable_error=True,
         max_agent_turns=25,
         working_directory=Path.cwd(),
+    )
+    persist = loop_factory.create_default.call_args.kwargs["on_model_select"]
+    persist("selected-model")
+    main.ConfigurationManager.return_value.set.assert_called_once_with(
+        "loop.model", "selected-model"
     )
     assert interaction.info.call_args_list == [
         call("Hello from loop!"),
@@ -121,6 +127,7 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
     monkeypatch.setattr(main, "SessionManager", session_manager_factory)
     monkeypatch.setattr(main, "find_project_root", Mock(return_value=None))
     monkeypatch.setattr(main, "register_shutdown_signals", Mock())
+    main.ConfigurationManager.return_value.source_for.return_value = "environment"
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("BASE_URL", "https://example.test/v1")
     monkeypatch.setenv("DEFAULT_MODEL", "configured-model")
@@ -156,6 +163,7 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
         session_manager=session_manager,
         agent_name="Loop",
         model=None,
+        on_model_select=None,
         stream=True,
         debug=False,
         compaction_threshold=0.8,

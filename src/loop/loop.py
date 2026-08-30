@@ -1,6 +1,7 @@
 """Run an interactive conversation with an LLM backend."""
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Self
 
@@ -95,6 +96,7 @@ class Loop:
         *,
         agent_name: str = "Loop",
         model: str | None = None,
+        on_model_select: Callable[[str], None] | None = None,
         instructions_manager: InstructionsManager | None = None,
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
@@ -117,6 +119,8 @@ class Loop:
             backend (Backend): Backend used to request model responses.
             agent_name (str): Human-readable identity. Defaults to ``"Loop"``.
             model (str | None): Explicit model, or ``None`` for the backend default.
+            on_model_select (Callable[[str], None] | None): Durable preference writer invoked
+                before an explicit model selection takes effect. Defaults to no durable writer.
             instructions_manager (InstructionsManager | None): Injected contextual instruction
                 service, or ``None`` to discover one for the workspace.
             interaction (Interaction | None): User interaction service.
@@ -177,7 +181,10 @@ class Loop:
         configured_selection = ModelSelection(
             backend,
             configured_sessions,
-            selected=model,
+            selected=(
+                configured_sessions.model if configured_sessions.model is not None else model
+            ),
+            on_select=on_model_select,
         )
         application: Loop
         configured_compaction = ContextCompaction(

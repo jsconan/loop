@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from time import monotonic
 from typing import TYPE_CHECKING
 
@@ -26,11 +27,14 @@ class ModelSelection:
         backend (Backend): Backend supplying the default model, catalog, and context metadata.
         session_manager (SessionManager): Active session that records successful assignments.
         selected (str | None): Explicit model selection, or ``None`` to use the backend default.
+        on_select (Callable[[str], None] | None): Durable preference writer invoked before an
+            explicit selection takes effect. Defaults to no durable writer.
     """
 
     _backend: Backend
     _session_manager: SessionManager
     _selected: str | None
+    _on_select: Callable[[str], None] | None
     _available_models: list[ModelInfo] | None
     _available_models_expires_at: float
 
@@ -39,10 +43,12 @@ class ModelSelection:
         backend: Backend,
         session_manager: SessionManager,
         selected: str | None = None,
+        on_select: Callable[[str], None] | None = None,
     ) -> None:
         self._backend = backend
         self._session_manager = session_manager
         self._selected = selected if selected is not None else session_manager.model
+        self._on_select = on_select
         self._available_models = None
         self._available_models_expires_at = 0.0
         if self._selected is not None or backend.default_model is not None:
@@ -125,14 +131,16 @@ class ModelSelection:
         Args:
             model (str): Exact backend model identifier to select.
         """
+        if self._on_select is not None:
+            self._on_select(model)
         self._selected = model
         self.synchronize_session()
 
     def restore(self, model: str | None) -> None:
-        """Restore a persisted selection and synchronize available model metadata.
+        """Restore a session model and synchronize its available metadata.
 
         Args:
-            model (str | None): Persisted model, or ``None`` to use the backend default.
+            model (str | None): Session model to restore, or ``None`` to use the backend default.
         """
         self._selected = model
         if model is not None or self._backend.default_model is not None:

@@ -63,16 +63,18 @@ def test_selection_normalizes_invalid_context_windows(context_window):
     assert session_manager.context_window is None
 
 
-def test_selection_lists_selects_restores_and_records_models():
-    """Selection controls discovery, future intent, restoration, and durable use records."""
+def test_selection_persists_explicit_intent_while_reconciling_session_assignments():
+    """Explicit choices persist, while restored and reported assignments update the session."""
     models = [ModelInfo(id="first"), ModelInfo(id="second")]
     active_backend = backend(get_models=Mock(return_value=models))
     session_manager = SessionManager()
-    selection = ModelSelection(active_backend, session_manager)
+    persist = Mock()
+    selection = ModelSelection(active_backend, session_manager, on_select=persist)
 
     assert selection.available() == models
     selection.select("second")
     assert selection.selected == "second"
+    persist.assert_called_once_with("second")
     assert session_manager.model == "second"
     assert selection.record_response(None).model == "second"
     assert session_manager.model == "second"
@@ -82,6 +84,10 @@ def test_selection_lists_selects_restores_and_records_models():
     assert selection.effective == "default"
     assert session_manager.model == "default"
 
+    assert selection.record_response("provider-alias").model == "provider-alias"
+    assert selection.selected == "provider-alias"
+    assert session_manager.model == "provider-alias"
+
     no_default = backend(default_model=None)
     unconfigured_session = SessionManager()
     unconfigured = ModelSelection(no_default, unconfigured_session, selected="temporary")
@@ -89,6 +95,28 @@ def test_selection_lists_selects_restores_and_records_models():
     assert unconfigured.selected is None
     assert unconfigured_session.model is None
     assert unconfigured_session.context_window is None
+
+    restored_session = SessionManager()
+    restored = ModelSelection(no_default, restored_session)
+    restored.restore(None)
+    assert restored.selected is None
+    assert restored_session.model is None
+
+
+def test_selection_does_not_change_when_its_durable_writer_fails():
+    """A failed preference write leaves the active model and session assignment unchanged."""
+    session_manager = SessionManager()
+    selection = ModelSelection(
+        backend(),
+        session_manager,
+        on_select=Mock(side_effect=OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        selection.select("second")
+
+    assert selection.selected is None
+    assert session_manager.model == "default"
 
 
 def test_selection_reuses_a_recent_non_empty_model_catalog(monkeypatch):

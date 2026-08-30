@@ -342,6 +342,41 @@ def test_resume_command_loads_a_persisted_session_id(tmp_path):
     assert interaction.prompt.call_args_list[0].args == ()
 
 
+def test_resume_command_restores_its_linked_model_over_the_application_default(tmp_path):
+    """Resuming history retains the model linked to that session for reproducibility."""
+    interaction = MagicMock(spec=Interaction)
+    interaction.prompt.side_effect = ["/resume internal-id", False]
+    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store.save(Session(id="internal-id", name="Alpha session", name_source="user", model="old"))
+    selection_writer = Mock()
+    sessions = SessionManager(interaction=interaction, session_store=store)
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        session_manager=sessions,
+        model="configured",
+        on_model_select=selection_writer,
+        working_directory=tmp_path,
+    )
+
+    loop.run()
+
+    assert loop.model == "old"
+    selection_writer.assert_not_called()
+
+
+def test_loop_uses_an_initial_session_model_over_the_application_default(tmp_path):
+    """An initial restored session retains its linked model for reproducible continuation."""
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        session=Session(model="session-model"),
+        model="application-default",
+        working_directory=tmp_path,
+    )
+
+    assert loop.model == "session-model"
+
+
 def test_resume_command_offers_and_completes_an_interrupted_agent_run(tmp_path):
     """Resuming unfinished history continues it before accepting another user turn."""
     interaction = output_interaction()
@@ -1575,8 +1610,8 @@ def test_query_delegates_instruction_state_to_the_session_manager(tmp_path):
     )
 
 
-def test_query_prefers_the_explicit_model_over_response_metadata(tmp_path):
-    """Request selection stays independent of a model reported by an earlier response."""
+def test_query_prefers_the_restored_session_model_over_the_application_default(tmp_path):
+    """A resumed query uses its session-linked model for reproducible continuation."""
     backend = loop_backend(get_response=Mock(return_value=[]))
     session = Session(model="served-model")
 
@@ -1587,7 +1622,7 @@ def test_query_prefers_the_explicit_model_over_response_metadata(tmp_path):
         working_directory=tmp_path,
     ).agent_runner.query()
 
-    assert backend.get_response.call_args.kwargs["model"] == "requested-model"
+    assert backend.get_response.call_args.kwargs["model"] == "served-model"
 
 
 def test_query_rejects_missing_model_selection(tmp_path):

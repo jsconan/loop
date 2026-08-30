@@ -90,6 +90,11 @@ def main() -> None:
             session_manager=session_manager,
             agent_name=settings.loop.agent_name,
             model=settings.loop.model,
+            on_model_select=(
+                None
+                if configuration.source_for("loop.model") == "environment"
+                else lambda model: configuration.set("loop.model", model)
+            ),
             stream=settings.loop.stream,
             debug=settings.loop.debug,
             compaction_threshold=settings.loop.compaction_threshold,
