@@ -69,6 +69,24 @@ def test_runner_returns_the_first_final_response():
     assert result.metrics is sessions.record_run.call_args.args[2]
 
 
+def test_runner_reconfigures_subsequent_runs():
+    """Runtime controls replace backend and update mutable execution preferences."""
+    runner, _, _ = agent_runner(responses=[Response(answer="done", reasoning="")])
+    backend = Mock()
+
+    runner.backend = backend
+    runner.stream = True
+    runner.max_turns = 0
+    runner.prompt_on_recoverable_error = False
+
+    assert runner.backend is backend
+    assert runner.stream is True
+    assert runner.max_turns == 0
+    assert runner.prompt_on_recoverable_error is False
+    with pytest.raises(ValueError, match="non-negative"):
+        runner.max_turns = -1
+
+
 def test_runner_records_run_and_tool_execution_traces():
     """Configured telemetry covers run boundaries and exact tool requests and responses."""
     response = Response(

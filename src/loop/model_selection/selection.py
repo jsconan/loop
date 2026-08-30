@@ -64,6 +64,26 @@ class ModelSelection:
         return self._selected
 
     @property
+    def backend(self) -> Backend:
+        """Return the backend supplying model information.
+
+        Returns:
+            Backend: Active model backend.
+        """
+        return self._backend
+
+    @backend.setter
+    def backend(self, backend: Backend) -> None:
+        """Replace the model backend and discard its cached catalog.
+
+        Args:
+            backend (Backend): Fully configured replacement backend.
+        """
+        self._backend = backend
+        self._available_models = None
+        self._available_models_expires_at = 0.0
+
+    @property
     def effective(self) -> str:
         """Return the explicit or backend-default model.
 

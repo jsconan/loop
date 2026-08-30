@@ -69,6 +69,38 @@ class ContextCompaction:
         """
         return self._threshold
 
+    @property
+    def backend(self) -> Backend:
+        """Return the backend used for context compaction.
+
+        Returns:
+            Backend: Active compaction backend.
+        """
+        return self._backend
+
+    @backend.setter
+    def backend(self, backend: Backend) -> None:
+        """Replace the backend used for future compaction.
+
+        Args:
+            backend (Backend): Fully configured replacement backend.
+        """
+        self._backend = backend
+
+    @threshold.setter
+    def threshold(self, threshold: float) -> None:
+        """Set the automatic compaction utilization threshold.
+
+        Args:
+            threshold (float): Utilization ratio strictly between zero and one.
+
+        Raises:
+            ValueError: If the threshold is outside the supported range.
+        """
+        if not 0 < threshold < 1:
+            raise ValueError("Compaction threshold must be between zero and one.")
+        self._threshold = threshold
+
     def can_compact(self) -> bool:
         """Return whether complete history advanced beyond the latest checkpoint.
 

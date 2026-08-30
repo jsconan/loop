@@ -79,6 +79,21 @@ def test_compaction_detects_known_capacity_and_new_history():
     assert feature.needed() is False
 
 
+def test_compaction_reconfigures_backend_and_threshold():
+    """Future compaction uses replacement backend and validates changed threshold."""
+    feature, _, backend, _ = compaction_feature()
+    replacement = Mock()
+
+    feature.backend = replacement
+    feature.threshold = 0.7
+
+    assert feature.backend is replacement
+    assert feature.threshold == 0.7
+    assert backend is not replacement
+    with pytest.raises(ValueError, match="between zero and one"):
+        feature.threshold = 1
+
+
 def test_compaction_declines_absent_or_unneeded_context():
     """Explicit and automatic requests avoid backend work when their policy is not satisfied."""
     feature, _, backend, interaction = compaction_feature()

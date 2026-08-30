@@ -104,6 +104,24 @@ class ToolRegistry:
         """
         return self._permission_manager
 
+    @property
+    def settings(self) -> ToolRuntimeSettings:
+        """Return settings supplied to context-aware tool invocations.
+
+        Returns:
+            ToolRuntimeSettings: Active scoped tool settings.
+        """
+        return self._settings
+
+    @settings.setter
+    def settings(self, settings: ToolRuntimeSettings) -> None:
+        """Replace settings supplied to subsequent context-aware tool invocations.
+
+        Args:
+            settings (ToolRuntimeSettings): Replacement runtime settings.
+        """
+        self._settings = settings
+
     @permission_manager.setter
     def permission_manager(self, manager: PermissionManager) -> None:
         """Replace the permission manager guarding dispatch.

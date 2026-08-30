@@ -125,6 +125,15 @@ class AgentRunner:
         """
         return self._backend
 
+    @backend.setter
+    def backend(self, backend: Backend) -> None:
+        """Replace the backend used for subsequent model requests.
+
+        Args:
+            backend (Backend): Fully configured replacement backend.
+        """
+        self._backend = backend
+
     @property
     def instructions_manager(self) -> InstructionsManager:
         """Return the contextual instruction service used by this runtime.
@@ -206,6 +215,15 @@ class AgentRunner:
         """
         return self._stream
 
+    @stream.setter
+    def stream(self, stream: bool) -> None:
+        """Enable or disable streaming for subsequent backend requests.
+
+        Args:
+            stream (bool): Whether subsequent responses should stream.
+        """
+        self._stream = stream
+
     @property
     def max_turns(self) -> int:
         """Return the model-turn limit for one run.
@@ -214,6 +232,38 @@ class AgentRunner:
             int: Maximum number of completed model turns. 0 means unlimited.
         """
         return self._max_turns
+
+    @max_turns.setter
+    def max_turns(self, max_turns: int) -> None:
+        """Set the completed-turn limit for subsequent agent runs.
+
+        Args:
+            max_turns (int): Maximum completed turns, or zero for unlimited turns.
+
+        Raises:
+            ValueError: If the limit is negative.
+        """
+        if max_turns < 0:
+            raise ValueError("Agent max turns must be non-negative.")
+        self._max_turns = max_turns
+
+    @property
+    def prompt_on_recoverable_error(self) -> bool:
+        """Return whether recoverable failures prompt for another attempt.
+
+        Returns:
+            bool: Whether exhausted recoverable failures prompt the user.
+        """
+        return self._prompt_on_recoverable_error
+
+    @prompt_on_recoverable_error.setter
+    def prompt_on_recoverable_error(self, enabled: bool) -> None:
+        """Set recovery prompting for subsequent agent runs.
+
+        Args:
+            enabled (bool): Whether exhausted recoverable failures prompt the user.
+        """
+        self._prompt_on_recoverable_error = enabled
 
     def run(self) -> AgentRunResult:
         """Run model and tool turns until completion, cancellation, or the safety limit.

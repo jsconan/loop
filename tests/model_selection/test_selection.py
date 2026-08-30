@@ -103,6 +103,19 @@ def test_selection_persists_explicit_intent_while_reconciling_session_assignment
     assert restored_session.model is None
 
 
+def test_selection_replaces_backend_and_invalidates_its_catalog():
+    """A replacement backend becomes the catalog source without retaining stale values."""
+    selection = ModelSelection(backend(), SessionManager())
+    selection.available()
+    replacement = backend(default_model="replacement")
+
+    selection.backend = replacement
+
+    assert selection.backend is replacement
+    assert selection.effective == "replacement"
+    assert selection.available() == replacement.get_models.return_value
+
+
 def test_selection_does_not_change_when_its_durable_writer_fails():
     """A failed preference write leaves the active model and session assignment unchanged."""
     session_manager = SessionManager()

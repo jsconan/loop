@@ -29,6 +29,7 @@ from loop.tooling import (
     ToolRegistration,
     ToolRegistrationError,
     ToolRegistry,
+    ToolRuntimeSettings,
     ToolStatus,
 )
 from loop.tooling import tool as declare_tool
@@ -510,6 +511,37 @@ def test_interaction_property_can_be_replaced_and_cleared():
     replacement = PermissionManager()
     registry.permission_manager = replacement
     assert registry.permission_manager is replacement
+
+
+def test_registry_exposes_and_replaces_runtime_settings():
+    """Runtime settings are readable and replaceable for subsequent tool calls."""
+    initial = ToolRuntimeSettings(user_agent="initial-agent")
+    replacement = ToolRuntimeSettings(user_agent="replacement-agent")
+    registry = ToolRegistry(settings=initial)
+
+    assert registry.settings is initial
+    registry.settings = replacement
+    assert registry.settings is replacement
+
+
+def test_registry_passes_replaced_runtime_settings_to_tool_context():
+    """Context-aware tools receive the registry's current runtime settings."""
+    registry = ToolRegistry(
+        interaction=Mock(spec=Interaction),
+        settings=ToolRuntimeSettings(user_agent="custom-agent"),
+    )
+    seen = []
+
+    @declare_tool
+    def inspect_settings(context: ToolContext) -> str:
+        """Return the configured user agent."""
+        seen.append(context.settings)
+        return context.settings.user_agent
+
+    registry.register(inspect_settings)
+
+    assert result_value(registry.call("inspect_settings", "{}")) == "custom-agent"
+    assert seen == [ToolRuntimeSettings(user_agent="custom-agent")]
 
 
 def test_call_reports_unknown_tools():
