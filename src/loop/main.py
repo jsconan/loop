@@ -1,69 +1,75 @@
 """Run the interactive loop command-line application."""
 
 import logging
-import os
 from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
-from loop import (
-    ConsoleInteraction,
-    Loop,
-    OpenAIBackend,
-    Problem,
-    SessionManager,
-    ShutdownRequested,
-    SQLiteSessionStore,
-    create_default_tool_registry,
-    find_project_root,
-    log_problem,
-    register_shutdown_signals,
-)
-from loop.constants import (
+from .backend import OpenAIBackend
+from .configuration import ConfigurationManager
+from .constants import (
     APP_DIRECTORY,
     OPERATIONAL_LOG_FILENAME,
     SESSION_DATABASE_FILENAME,
     TELEMETRY_DATABASE_FILENAME,
 )
-from loop.telemetry import (
+from .errors import Problem, log_problem
+from .interaction import ConsoleInteraction
+from .loop import Loop
+from .session import SessionManager, SQLiteSessionStore
+from .telemetry import (
     SQLiteTelemetryAdapter,
     Telemetry,
     configure_operational_logging,
     set_telemetry,
     telemetry_activity,
 )
+from .tooling import ToolRuntimeSettings
+from .tools import create_default_tool_registry
+from .utils import ShutdownRequested, find_project_root, register_shutdown_signals
 
 _LOGGER = logging.getLogger(__name__)
-
-_BASE_URL = "http://localhost:8000/v1"
-_DEFAULT_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
-_API_KEY = "local-api-key"
 
 
 def main() -> None:
     """Run an interactive conversation with an LLM backend."""
-    configure_operational_logging(Path.cwd() / APP_DIRECTORY / OPERATIONAL_LOG_FILENAME)
     interaction = None
     telemetry = None
 
     try:
-        interaction = ConsoleInteraction()
         load_dotenv(find_dotenv(usecwd=True))
-        register_shutdown_signals()
-        interaction.info("Hello from loop!")
-        context_window = os.getenv("CONTEXT_WINDOW")
-        max_retries = os.getenv("OPENAI_MAX_RETRIES")
-        backend = OpenAIBackend(
-            base_url=os.getenv("BASE_URL", _BASE_URL),
-            default_model=os.getenv("DEFAULT_MODEL", _DEFAULT_MODEL),
-            api_key=os.getenv("OPENAI_API_KEY", _API_KEY),
-            context_window=int(context_window) if context_window else None,
-            max_retries=int(max_retries) if max_retries else 2,
-        )
         working_directory = Path.cwd()
         project_root = find_project_root(working_directory) or working_directory
+        configuration = ConfigurationManager(project_root)
+        configuration.initialize()
+        settings = configuration.load()
+        configure_operational_logging(
+            project_root / APP_DIRECTORY / OPERATIONAL_LOG_FILENAME,
+            level=settings.logging.level,
+            max_bytes=settings.logging.max_bytes,
+            backup_count=settings.logging.backup_count,
+        )
+        interaction = ConsoleInteraction()
+        register_shutdown_signals()
+        interaction.info("Hello from loop!")
+        backend = OpenAIBackend(
+            base_url=settings.backend.base_url,
+            default_model=settings.backend.default_model,
+            api_key=settings.backend.api_key.get_secret_value(),
+            context_window=settings.backend.context_window,
+            file_input_mode=settings.backend.file_input_mode,
+            structured_output_mode=settings.backend.structured_output_mode,
+            structured_output_max_retries=settings.backend.structured_output_max_retries,
+            max_retries=settings.backend.max_retries,
+        )
         telemetry = Telemetry(
-            SQLiteTelemetryAdapter(project_root / APP_DIRECTORY / TELEMETRY_DATABASE_FILENAME)
+            SQLiteTelemetryAdapter(
+                project_root / APP_DIRECTORY / TELEMETRY_DATABASE_FILENAME,
+                busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
+            ),
+            queue_capacity=settings.telemetry.queue_capacity,
+            batch_size=settings.telemetry.batch_size,
+            flush_seconds=settings.telemetry.flush_seconds,
         )
         set_telemetry(telemetry)
         telemetry_activity("application.started", severity="info", component="main")
@@ -76,10 +82,19 @@ def main() -> None:
         loop = Loop.create_default(
             backend,
             interaction=interaction,
-            tool_registry=create_default_tool_registry(interaction=interaction),
+            tool_registry=create_default_tool_registry(
+                interaction=interaction,
+                settings=ToolRuntimeSettings(user_agent=settings.web.user_agent),
+            ),
             working_directory=working_directory,
             session_manager=session_manager,
-            stream=True,
+            agent_name=settings.loop.agent_name,
+            model=settings.loop.model,
+            stream=settings.loop.stream,
+            debug=settings.loop.debug,
+            compaction_threshold=settings.loop.compaction_threshold,
+            prompt_on_recoverable_error=settings.loop.prompt_on_recoverable_error,
+            max_agent_turns=settings.loop.max_agent_turns,
         )
         loop.run()
     except (EOFError, KeyboardInterrupt, ShutdownRequested):
@@ -101,7 +116,7 @@ def main() -> None:
         if telemetry is not None:
             telemetry_activity("application.stopped", severity="info", component="main")
             set_telemetry(None)
-            telemetry.close()
+            telemetry.close(timeout=settings.telemetry.shutdown_timeout)
         else:
             set_telemetry(None)
 

@@ -9,8 +9,17 @@ class Omit:
 
 OMIT = Omit()
 
-# Application home directory, used for storing session data and other application state.
+# Application directory and configuration
 APP_DIRECTORY = Path(".loop")
+APP_CONFIGURATION_FILENAME = "config.toml"
+
+# Default backend configuration constants
+DEFAULT_BASE_URL = "http://localhost:8000/v1"
+DEFAULT_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
+DEFAULT_API_KEY = "local-api-key"
+
+# Default agent configuration constants
+DEFAULT_AGENT_NAME = "Loop"
 TEMPORARY_DIRECTORY_PREFIX = "loop-"
 TEMPORARY_CONTENT_DIRECTORY_PREFIX = "loop-content-"
 

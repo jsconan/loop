@@ -355,6 +355,35 @@ Follow the repository's review workflow and report findings by severity.
 
 ## Configuration
 
+The CLI stores a complete, commented project configuration file at
+`.loop/config.toml`. It is created on first run with owner-only permissions, including the
+backend API key for a self-contained CLI setup. Keep `.loop/` private and do not commit it.
+
+Settings resolve in this order: explicit environment variables, values discovered through the
+nearest ancestor `.env`, `.loop/config.toml`, then built-in defaults. This keeps shared `.env`
+files useful while allowing a project-local durable configuration.
+
+```toml
+# .loop/config.toml
+config_version = 1
+
+[backend]
+base_url = "http://localhost:8000/v1"
+default_model = "nvidia/Qwen3.6-35B-A3B-NVFP4"
+api_key = "local-api-key"
+max_retries = 2
+
+[loop]
+stream = true
+max_agent_turns = 25
+```
+
+The configuration service validates every value at startup. Invalid fields and unknown keys stop
+startup without logging secret values. Configuration is injected into backend, loop, telemetry,
+logging, and web-tool composition; runtime components do not read environment variables directly.
+The configuration file retains comments and formatting when modified through the configuration
+manager API.
+
 Pass configuration directly to `OpenAIBackend` when using a different server or model:
 
 ```python
@@ -374,7 +403,7 @@ OpenAI-compatible servers do not implement `input_file`. Override either default
 `file_input_mode="text"` or `file_input_mode="native"`. Both modes retain the reference metadata
 manifest.
 
-The `loop` command resolves environment variables and applies these application defaults:
+The `loop` command accepts environment overrides for automation:
 
 | Setting           | Environment variable | Built-in default               |
 | ----------------- | -------------------- | ------------------------------ |
@@ -392,8 +421,8 @@ offers to retry the complete response. A missing selected model triggers model d
 the user choose an available replacement. Library callers still receive normalized backend
 exceptions and can apply their own recovery policy.
 
-The `fetch_content` tool sends a browser-like user agent by default. Set `USER_AGENT` to override
-it for web requests.
+The `fetch_content` tool sends a browser-like user agent by default. Configure `[web].user_agent`
+in `.loop/config.toml` (or set `USER_AGENT`) to override it for web requests.
 
 ### Tool permissions
 

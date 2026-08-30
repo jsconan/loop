@@ -7,6 +7,8 @@ from unittest.mock import Mock, call
 import pytest
 
 from loop import SessionManager, ShutdownRequested, main
+from loop.configuration import ApplicationSettings
+from loop.tooling import ToolRuntimeSettings
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +18,9 @@ def isolate_main_environment(monkeypatch):
     monkeypatch.setattr(main, "configure_operational_logging", Mock())
     monkeypatch.setattr(main, "SQLiteTelemetryAdapter", Mock(return_value=Mock()))
     monkeypatch.setattr(main, "Telemetry", Mock(return_value=Mock()))
+    configuration = Mock()
+    configuration.load.return_value = ApplicationSettings()
+    monkeypatch.setattr(main, "ConfigurationManager", Mock(return_value=configuration))
     for variable in (
         "BASE_URL",
         "DEFAULT_MODEL",
@@ -55,12 +60,18 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     main.main()
 
     register_shutdown_signals.assert_called_once_with()
-    registry_factory.assert_called_once_with(interaction=interaction)
+    registry_factory.assert_called_once_with(
+        interaction=interaction,
+        settings=ToolRuntimeSettings(user_agent=ApplicationSettings().web.user_agent),
+    )
     backend_factory.assert_called_once_with(
         base_url="http://localhost:8000/v1",
         default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
         api_key="local-api-key",
         context_window=None,
+        file_input_mode=None,
+        structured_output_mode="auto",
+        structured_output_max_retries=1,
         max_retries=2,
     )
     session_store_factory.assert_called_once_with(Path("/project/.loop/sessions.db"))
@@ -73,7 +84,13 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
         interaction=interaction,
         tool_registry=tool_registry,
         session_manager=session_manager,
+        agent_name="Loop",
+        model=None,
         stream=True,
+        debug=False,
+        compaction_threshold=0.8,
+        prompt_on_recoverable_error=True,
+        max_agent_turns=25,
         working_directory=Path.cwd(),
     )
     assert interaction.info.call_args_list == [
@@ -113,13 +130,19 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
 
     main.main()
 
-    registry_factory.assert_called_once_with(interaction=interaction)
+    registry_factory.assert_called_once_with(
+        interaction=interaction,
+        settings=ToolRuntimeSettings(user_agent=ApplicationSettings().web.user_agent),
+    )
     backend_factory.assert_called_once_with(
-        base_url="https://example.test/v1",
-        default_model="configured-model",
-        api_key="configured-key",
-        context_window=32768,
-        max_retries=5,
+        base_url="http://localhost:8000/v1",
+        default_model="nvidia/Qwen3.6-35B-A3B-NVFP4",
+        api_key="local-api-key",
+        context_window=None,
+        file_input_mode=None,
+        structured_output_mode="auto",
+        structured_output_max_retries=1,
+        max_retries=2,
     )
     session_store_factory.assert_called_once_with(tmp_path / ".loop" / "sessions.db")
     session_manager_factory.assert_called_once_with(
@@ -131,7 +154,13 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
         interaction=interaction,
         tool_registry=tool_registry,
         session_manager=session_manager,
+        agent_name="Loop",
+        model=None,
         stream=True,
+        debug=False,
+        compaction_threshold=0.8,
+        prompt_on_recoverable_error=True,
+        max_agent_turns=25,
         working_directory=tmp_path,
     )
     interaction.info.assert_called_once_with("Hello from loop!")
@@ -217,22 +246,23 @@ def test_main_reports_runtime_failures_to_initialized_telemetry(monkeypatch):
     telemetry.error.assert_called_once()
     assert telemetry.error.call_args.kwargs["exception"] is error
     assert telemetry.error.call_args.args == ("problem.reported",)
-    telemetry.close.assert_called_once_with()
+    telemetry.close.assert_called_once_with(timeout=2.0)
 
 
 def test_main_module_runs_entry_point(monkeypatch):
     """Executing the source module as a script invokes its entry point."""
-    monkeypatch.setattr("loop.ConsoleInteraction", Mock(return_value=Mock()))
-    monkeypatch.setattr("loop.OpenAIBackend", Mock(return_value=Mock()))
-    monkeypatch.setattr("loop.Loop", Mock(return_value=Mock()))
-    monkeypatch.setattr("loop.SessionManager", Mock(return_value=Mock()))
-    monkeypatch.setattr("loop.SQLiteSessionStore", Mock(return_value=Mock()))
-    monkeypatch.setattr("loop.create_default_tool_registry", Mock(return_value=Mock()))
-    monkeypatch.setattr("loop.find_project_root", Mock(return_value=Path.cwd()))
-    monkeypatch.setattr("loop.register_shutdown_signals", Mock())
+    monkeypatch.setattr("loop.interaction.ConsoleInteraction", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.backend.OpenAIBackend", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.loop.Loop", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.session.SessionManager", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.session.SQLiteSessionStore", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.tools.create_default_tool_registry", Mock(return_value=Mock()))
+    monkeypatch.setattr("loop.utils.find_project_root", Mock(return_value=Path.cwd()))
+    monkeypatch.setattr("loop.utils.register_shutdown_signals", Mock())
     monkeypatch.setattr("loop.telemetry.Telemetry", Mock(return_value=Mock()))
     monkeypatch.setattr("loop.telemetry.SQLiteTelemetryAdapter", Mock(return_value=Mock()))
     monkeypatch.setattr("loop.telemetry.configure_operational_logging", Mock())
     monkeypatch.setattr("loop.telemetry.set_telemetry", Mock())
 
-    runpy.run_path(str(Path(main.__file__)), run_name="__main__")
+    monkeypatch.setattr("loop.configuration.ConfigurationManager", Mock())
+    runpy.run_module("loop.main", run_name="__main__")

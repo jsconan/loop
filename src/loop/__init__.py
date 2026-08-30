@@ -50,6 +50,7 @@ __all__ = [
     "CompletionProviderRegistration",
     "CompletionProvidersProvider",
     "CompletionValue",
+    "ConfigurationManager",
     "ConsoleInteraction",
     "ContentArtifact",
     "ContextCompaction",
@@ -239,6 +240,7 @@ from .completion import (
     SchemaCompletionProviderRegistration,
     SchemaCompletionState,
 )
+from .configuration import ConfigurationManager
 from .constants import OMIT, Omit
 from .errors import Problem, ProblemException, log_problem
 from .instructions import (
