@@ -17,6 +17,7 @@ from loop import (
     PermissionManager,
     ToolContext,
     ToolRegistry,
+    constants,
 )
 from loop.tools import web as web_module
 from loop.utils import cached_path as resolve_cached_path
@@ -114,16 +115,15 @@ def test_fetch_content_requires_confirmation_before_fetching(monkeypatch):
     assert all("https://my-host.local/file.txt" in item.args[0] for item in confirm.call_args_list)
 
 
-def test_fetch_content_uses_configured_user_agent(monkeypatch):
-    """The user agent can be configured without changing application code."""
+def test_fetch_content_uses_default_user_agent(monkeypatch):
+    """The standalone declaration uses its stable built-in user agent."""
     response = stream_response(b"fetched content")
     stream = MagicMock(return_value=response)
-    monkeypatch.setenv("USER_AGENT", "LoopBot/1.0")
     monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.web.httpx.stream", stream)
 
     assert json.loads(fetch_content("https://my-host.local"))["content"] == "fetched content"
-    assert stream.call_args.kwargs["headers"] == {"User-Agent": "LoopBot/1.0"}
+    assert stream.call_args.kwargs["headers"] == {"User-Agent": constants.DEFAULT_USER_AGENT}
 
 
 def test_fetch_content_reports_failures(monkeypatch):

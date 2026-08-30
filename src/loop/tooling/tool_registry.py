@@ -28,7 +28,13 @@ from ..permissions import (
 )
 from ..utils import callable_name
 from .context import ToolContext
-from .models import ToolPreflight, ToolRegistrationError, ToolStatus
+from .models import (
+    DEFAULT_TOOL_RUNTIME_SETTINGS,
+    ToolPreflight,
+    ToolRegistrationError,
+    ToolRuntimeSettings,
+    ToolStatus,
+)
 from .tool import Tool, ToolRegistration
 from .utils import serialize_tool_problem
 
@@ -53,17 +59,20 @@ class ToolRegistry:
     _interaction: Interaction | None
     _permission_manager: PermissionManager
     _registration_problems: list[Problem]
+    _settings: ToolRuntimeSettings
 
     def __init__(
         self,
         tools: Iterable[Callable[..., Any] | ToolRegistration] | None = None,
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
+        settings: ToolRuntimeSettings = DEFAULT_TOOL_RUNTIME_SETTINGS,
     ) -> None:
         self._tools = {}
         self._registration_problems = []
         self._interaction = interaction
         self._permission_manager = permission_manager or PermissionManager(interaction=interaction)
+        self._settings = settings
         for tool in tools or ():
             self.register(tool)
 
@@ -612,4 +621,5 @@ class ToolRegistry:
             additional_authorizer=(
                 authorize_additional if permission_manager is not None else None
             ),
+            settings=self._settings,
         )

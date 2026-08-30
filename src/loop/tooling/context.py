@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from ..errors import Problem, ProblemException
 from ..interaction import Interaction
+from .models import DEFAULT_TOOL_RUNTIME_SETTINGS, ToolRuntimeSettings
 
 if TYPE_CHECKING:
     from ..instructions import InstructionsManager
@@ -31,6 +32,7 @@ class ToolContext:
             ``None`` for direct user-command invocations.
         additional_authorizer (AdditionalAuthorizer | None): Registry-owned callback that plans
             and authorizes effects discovered during execution, or ``None`` when unavailable.
+        settings (ToolRuntimeSettings): Scoped settings available to tool implementations.
     """
 
     interaction: Interaction
@@ -39,6 +41,7 @@ class ToolContext:
     operations: tuple[Operation, ...] = ()
     call_id: str | None = None
     additional_authorizer: AdditionalAuthorizer | None = None
+    settings: ToolRuntimeSettings = DEFAULT_TOOL_RUNTIME_SETTINGS
 
     def observe_file(self, path: Path | str) -> None:
         """Report a successfully loaded file to instruction management.

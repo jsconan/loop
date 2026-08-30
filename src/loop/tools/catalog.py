@@ -2,7 +2,7 @@
 
 from ..interaction import Interaction
 from ..permissions import PermissionManager
-from ..tooling import ToolRegistry
+from ..tooling import ToolRegistry, ToolRuntimeSettings
 from .dates import get_current_datetime
 from .files import (
     delete_path,
@@ -36,6 +36,7 @@ def create_default_tool_registry(
     *,
     interaction: Interaction | None = None,
     permission_manager: PermissionManager | None = None,
+    settings: ToolRuntimeSettings | None = None,
 ) -> ToolRegistry:
     """Create an isolated registry containing every built-in tool.
 
@@ -44,6 +45,8 @@ def create_default_tool_registry(
             ``None`` to require an invocation-specific interaction.
         permission_manager (PermissionManager | None): Policy manager guarding calls, or ``None``
             to create the registry's default manager.
+        settings (ToolRuntimeSettings | None): Scoped settings supplied to context-aware built-in
+            tools, or ``None`` to use built-in tool defaults.
 
     Returns:
         ToolRegistry: A new registry containing the complete built-in tool manifest.
@@ -52,4 +55,5 @@ def create_default_tool_registry(
         BUILTIN_TOOLS,
         interaction=interaction,
         permission_manager=permission_manager,
+        settings=settings or ToolRuntimeSettings(),
     )

@@ -2,7 +2,6 @@
 
 import ipaddress
 import logging
-import os
 import socket
 from typing import Annotated
 from urllib.parse import urlsplit
@@ -155,6 +154,7 @@ def _cache_url(
     url: str,
     addresses: tuple[str, ...],
     handle: str | None = None,
+    user_agent: str = constants.DEFAULT_USER_AGENT,
 ) -> str:
     """Stream one validated web source through separately authorized redirect hops."""
     source = url
@@ -166,7 +166,7 @@ def _cache_url(
         with httpx.stream(
             "GET",
             current_url,
-            headers={"User-Agent": os.getenv("USER_AGENT", constants.DEFAULT_USER_AGENT)},
+            headers={"User-Agent": user_agent},
             follow_redirects=False,
             timeout=30.0,
             transport=PinnedAddressTransport(current_addresses),
@@ -242,7 +242,7 @@ def fetch_content(
         target = operation.target if operation is not None else None
         if not isinstance(target, NetworkTarget):
             raise TypeError("Authorized network target is missing.")
-        handle = _cache_url(context, url, target.addresses)
+        handle = _cache_url(context, url, target.addresses, user_agent=context.settings.user_agent)
         resolved = cached_path(handle)
         if resolved is None:  # pragma: no cover - store and resolve are atomic
             raise RuntimeError("Fetched content could not be cached.")
@@ -308,7 +308,13 @@ def read_cached_content(
             target = operation.target if operation is not None else None
             if not isinstance(target, NetworkTarget):
                 raise TypeError("Authorized network target is missing.")
-            _cache_url(context, metadata["source"], target.addresses, handle)
+            _cache_url(
+                context,
+                metadata["source"],
+                target.addresses,
+                handle,
+                context.settings.user_agent,
+            )
             resolved = cached_path(handle)
             if resolved is None:  # pragma: no cover - cache writes and lookup are atomic
                 raise RuntimeError("Reloaded content could not be cached.")
