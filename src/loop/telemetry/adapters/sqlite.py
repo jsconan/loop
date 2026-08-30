@@ -17,8 +17,20 @@ class SQLiteTelemetryAdapter:
         path (Path | str): SQLite database path created lazily on the first write.
     """
 
-    def __init__(self, path: Path | str) -> None:
+    _path: Path
+    _busy_timeout_ms: int
+    _connection: sqlite3.Connection | None
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        busy_timeout_ms: int = constants.DEFAULT_TELEMETRY_SQLITE_BUSY_TIMEOUT_MS,
+    ) -> None:
         self._path = Path(path)
+        if busy_timeout_ms <= 0:
+            raise ValueError("SQLite busy timeout must be positive.")
+        self._busy_timeout_ms = busy_timeout_ms
         self._connection: sqlite3.Connection | None = None
 
     @property
@@ -106,9 +118,7 @@ class SQLiteTelemetryAdapter:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute(
-            f"PRAGMA busy_timeout={constants.DEFAULT_TELEMETRY_SQLITE_BUSY_TIMEOUT_MS}"
-        )
+        connection.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS telemetry_payloads (

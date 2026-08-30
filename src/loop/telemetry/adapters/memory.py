@@ -9,8 +9,11 @@ from ..models import TelemetryRecord
 class MemoryTelemetryAdapter:
     """Retain records in memory for embedding and deterministic tests."""
 
+    _records: list[TelemetryRecord]
+    _lock: Lock
+
     def __init__(self) -> None:
-        self._records: list[TelemetryRecord] = []
+        self._records = []
         self._lock = Lock()
 
     @property

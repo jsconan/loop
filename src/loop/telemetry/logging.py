@@ -91,7 +91,13 @@ class SafeOperationalFormatter(logging.Formatter):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def configure_operational_logging(path: Path | str) -> logging.Handler | None:
+def configure_operational_logging(
+    path: Path | str,
+    *,
+    level: str = constants.DEFAULT_OPERATIONAL_LOG_LEVEL,
+    max_bytes: int | None = None,
+    backup_count: int | None = None,
+) -> logging.Handler | None:
     """Install an owner-local rotating handler without disabling stderr fallback.
 
     Args:
@@ -101,17 +107,23 @@ def configure_operational_logging(path: Path | str) -> logging.Handler | None:
         logging.Handler | None: Installed handler, or ``None`` when setup failed.
     """
     destination = Path(path)
+    resolved_max_bytes = (
+        max_bytes if max_bytes is not None else constants.DEFAULT_OPERATIONAL_LOG_BYTES
+    )
+    resolved_backup_count = (
+        backup_count if backup_count is not None else constants.DEFAULT_OPERATIONAL_LOG_BACKUPS
+    )
     try:
         handler = SafeRotatingFileHandler(
             destination,
-            max_bytes=constants.DEFAULT_OPERATIONAL_LOG_BYTES,
-            backup_count=constants.DEFAULT_OPERATIONAL_LOG_BACKUPS,
+            max_bytes=resolved_max_bytes,
+            backup_count=resolved_backup_count,
         )
         handler.addFilter(logging.Filter("loop"))
         handler.setFormatter(SafeOperationalFormatter())
         root = logging.getLogger()
         root.addHandler(handler)
-        root.setLevel(constants.DEFAULT_OPERATIONAL_LOG_LEVEL)
+        root.setLevel(level)
         return handler
     except (OSError, ValueError):
         logging.getLogger(__name__).critical(

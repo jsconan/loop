@@ -5,6 +5,8 @@ import sqlite3
 from contextlib import closing
 from dataclasses import replace
 
+import pytest
+
 from loop.telemetry import SQLiteTelemetryAdapter
 
 
@@ -36,3 +38,9 @@ def test_sqlite_adapter_separates_payloads_and_indexes_metadata(tmp_path, teleme
     assert ("ix_telemetry_trace_time",) in indexes
     assert path.parent.stat().st_mode & 0o777 == 0o700
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_sqlite_adapter_rejects_non_positive_busy_timeouts(tmp_path):
+    """SQLite configuration rejects timeouts that cannot make progress."""
+    with pytest.raises(ValueError, match="busy timeout"):
+        SQLiteTelemetryAdapter(tmp_path / "telemetry.db", busy_timeout_ms=0)

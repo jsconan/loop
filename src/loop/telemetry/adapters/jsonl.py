@@ -16,6 +16,8 @@ class JSONLTelemetryAdapter:
         path (Path | str): Destination JSONL path created lazily on the first write.
     """
 
+    _output: PrivateRotatingTextFile
+
     def __init__(self, path: Path | str) -> None:
         self._output = PrivateRotatingTextFile(path)
 
