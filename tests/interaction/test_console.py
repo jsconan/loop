@@ -52,6 +52,15 @@ def test_prompt_forwards_an_explicit_completer_to_the_prompt_session():
     assert session.prompt.call_args.kwargs["complete_in_thread"] is True
 
 
+def test_prompt_masks_sensitive_input():
+    """Sensitive prompts request masked terminal input."""
+    session = Mock()
+    session.prompt.return_value = "secret"
+
+    assert ConsoleInteraction(session=session).prompt("API key:", secret=True) == "secret"
+    assert session.prompt.call_args.kwargs["is_password"] is True
+
+
 def test_prompt_displays_a_short_choice_list_and_returns_a_mapped_value_for_a_number(capsys):
     """Short catalogs render vertically and return the key associated with a selected number."""
     session = Mock()

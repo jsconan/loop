@@ -190,6 +190,7 @@ class ConsoleInteraction(Interaction):
         choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
         index: Iterable[str] | Mapping[object, str] | None = None,
         default: object | None = None,
+        secret: bool = False,
     ) -> object | False:
         """Prompt for a non-empty user message or an exit command.
 
@@ -210,6 +211,7 @@ class ConsoleInteraction(Interaction):
                 numeric indexes. Defaults to ``None``.
             default (object | None): Value returned for empty input, or ``None`` to require
                 non-empty input. Defaults to ``None``.
+            secret (bool): Whether entered text is masked. Defaults to ``False``.
 
         Returns:
             object | False: The selected value or entered message, or ``False`` when the user
@@ -270,6 +272,7 @@ class ConsoleInteraction(Interaction):
                     f"{message} " if message else "",
                     completer=completer,
                     complete_in_thread=True,
+                    is_password=secret,
                 ).strip()
             except (KeyboardInterrupt, EOFError):
                 return False

@@ -36,6 +36,7 @@ class Interaction(ABC):
         choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
         index: Iterable[str] | Mapping[object, str] | None = None,
         default: object | None = None,
+        secret: bool = False,
     ) -> object | False:
         """Read a non-empty user message or an exit command.
 
@@ -53,6 +54,8 @@ class Interaction(ABC):
                 accept alongside choices. Defaults to automatic numeric indexes.
             default (object | None): Value returned for empty input, or ``None`` to require
                 non-empty input. Defaults to ``None``.
+            secret (bool): Whether entered text must be masked by the interaction. Defaults to
+                ``False``.
 
         Returns:
             object | False: The selected value or stripped text entered by the user, or ``False``
