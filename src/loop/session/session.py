@@ -4,7 +4,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol, Self
+from typing import Self
 from uuid import uuid7
 
 from pydantic import TypeAdapter, ValidationError
@@ -31,7 +31,6 @@ from .models import (
     SerializedMessage,
     SerializedSession,
     SessionEvent,
-    SessionInfo,
     SessionNameSource,
     SessionRecoveryState,
     ToolExecutionCompletedEvent,
@@ -642,40 +641,3 @@ class Session:
             events=events,
         )
         return value
-
-
-class SessionStore(Protocol):
-    """Persist and retrieve sessions by their identifier."""
-
-    def save(self, session: Session) -> str:
-        """Persist a session under its stable identifier.
-
-        Args:
-            session (Session): Session to persist.
-
-        Returns:
-            str: The session's stable identifier.
-        """
-
-    def load(self, session_id: str) -> Session:
-        """Load a persisted session.
-
-        Args:
-            session_id (str): Identifier of the session to load.
-
-        Returns:
-            Session: Reconstructed session state.
-
-        Raises:
-            SessionNotFoundError: If the requested session does not exist.
-            UnsupportedConversationItemError: If a serialized conversation item type is not
-                supported.
-            ValueError: If its persisted format is invalid or unsupported.
-        """
-
-    def list(self) -> list[SessionInfo]:
-        """List persisted sessions from most to least recently updated.
-
-        Returns:
-            list[SessionInfo]: Lightweight persisted-session descriptions.
-        """

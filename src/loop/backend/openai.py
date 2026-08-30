@@ -52,6 +52,7 @@ from ..models import (
     CompactionResult,
     ContextReference,
     ConversationItem,
+    FileInputMode,
     HyperparameterPolicy,
     Message,
     ModelContextItem,
@@ -64,6 +65,8 @@ from ..models import (
     ResponseEvent,
     ResponseMetadata,
     StructuredOutputFormat,
+    StructuredOutputMode,
+    StructuredOutputTransport,
     StructuredOutputValidationError,
     ToolCall,
     ToolCallCompleted,
@@ -101,11 +104,11 @@ class OpenAIBackend(Backend):
         api_key (str | None): API key used privately by the backend client.
         context_window (int | None): Deployed model context limit, or ``None`` to use best-effort
             model metadata discovery.
-        file_input_mode (Literal["text", "native"] | None): How referenced text files cross the
+        file_input_mode (FileInputMode | None): How referenced text files cross the
             API boundary. ``"text"`` is portable across OpenAI-compatible servers; ``"native"``
             uses OpenAI ``input_file`` parts. Defaults to ``"text"`` when ``base_url`` is set and
             ``"native"`` otherwise.
-        structured_output_mode (Literal["auto", "native", "prompt"]): Structured-output
+        structured_output_mode (StructuredOutputMode): Structured-output
             transport. Auto prefers native JSON Schema and falls back to prompt guidance when a
             compatible backend rejects the native parameter.
         structured_output_max_retries (int): Number of corrective generations after a structured
@@ -125,8 +128,8 @@ class OpenAIBackend(Backend):
     _async_client: AsyncOpenAI | None
     _configured_context_window: int | None
     _context_windows: dict[str, int | None]
-    _file_input_mode: Literal["text", "native"]
-    _structured_output_mode: Literal["auto", "native", "prompt"]
+    _file_input_mode: FileInputMode
+    _structured_output_mode: StructuredOutputMode
     _structured_output_max_retries: int
     _prompt_structured_models: set[str]
     _max_retries: int
@@ -143,10 +146,8 @@ class OpenAIBackend(Backend):
         base_url: str | None = None,
         api_key: str | None = None,
         context_window: int | None = None,
-        file_input_mode: Literal["text", "native"] | None = None,
-        structured_output_mode: Literal["auto", "native", "prompt"] = (
-            constants.DEFAULT_STRUCTURED_OUTPUT_MODE
-        ),
+        file_input_mode: FileInputMode | None = None,
+        structured_output_mode: StructuredOutputMode = (constants.DEFAULT_STRUCTURED_OUTPUT_MODE),
         structured_output_max_retries: int = constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES,
         max_retries: int = constants.DEFAULT_MAX_RETRIES,
         temperature: float | None = None,
@@ -1074,7 +1075,7 @@ class OpenAIBackend(Backend):
     @staticmethod
     def _structured_output_request(
         output_format: StructuredOutputFormat | None,
-        mode: Literal["native", "prompt"] = "native",
+        mode: StructuredOutputTransport = "native",
     ) -> dict[str, object]:
         """Serialize a structured output contract when one is requested."""
         if output_format is None or mode == "prompt":
@@ -1089,7 +1090,7 @@ class OpenAIBackend(Backend):
             schema_format["description"] = output_format.description
         return {"text": {"format": schema_format}}
 
-    def _structured_mode(self, model: str) -> Literal["native", "prompt"]:
+    def _structured_mode(self, model: str) -> StructuredOutputTransport:
         """Resolve the configured structured-output transport for one model."""
         if self._structured_output_mode == "prompt" or model in self._prompt_structured_models:
             return "prompt"
@@ -1224,7 +1225,7 @@ class OpenAIBackend(Backend):
         error: StructuredOutputValidationError,
         attempt: int,
         model: str,
-        mode: Literal["native", "prompt"],
+        mode: StructuredOutputTransport,
         usage: Usage,
     ) -> None:
         """Attach terminal attempt metadata to a validation error."""

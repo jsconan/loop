@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings
 
 from . import constants
-from .models import HyperparameterPolicy, ReasoningEffort
+from .models import FileInputMode, HyperparameterPolicy, ReasoningEffort, StructuredOutputMode
 
 _CONFIGURATION_VERSION = 1
 
@@ -27,10 +27,8 @@ class BackendSettings(BaseModel):
     api_key: SecretStr = SecretStr(constants.DEFAULT_API_KEY)
     context_window: int | None = Field(default=None, gt=0)
     max_retries: int = Field(default=constants.DEFAULT_MAX_RETRIES, ge=0)
-    file_input_mode: Literal["text", "native"] | None = None
-    structured_output_mode: Literal["auto", "native", "prompt"] = (
-        constants.DEFAULT_STRUCTURED_OUTPUT_MODE
-    )
+    file_input_mode: FileInputMode | None = None
+    structured_output_mode: StructuredOutputMode = constants.DEFAULT_STRUCTURED_OUTPUT_MODE
     structured_output_max_retries: int = Field(
         default=constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES, ge=0
     )

@@ -18,8 +18,13 @@ from pydantic import ValidationError as PydanticValidationError
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 type StructuredOutputValidator = Callable[[JsonValue], Any]
 type AgentRunStopReason = Literal["completed", "cancelled", "max_turns"]
+type FileInputMode = Literal["text", "native"]
+type StructuredOutputMode = Literal["auto", "native", "prompt"]
+type StructuredOutputTransport = Literal["native", "prompt"]
 type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 type HyperparameterPolicy = Literal["fallback", "strict"]
+type ContextReferenceKind = Literal["file", "directory"]
+type MessageRole = Literal["user", "assistant"]
 
 _JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE | re.DOTALL)
 
@@ -396,7 +401,7 @@ class ContextReference(BaseModel):
     """Describe one resolved, bounded user context snapshot.
 
     Args:
-        kind (Literal["file", "directory"]): Referenced filesystem object kind.
+        kind (ContextReferenceKind): Referenced filesystem object kind.
         path (str): User-facing project-relative path.
         content (str): Bounded content captured when the turn was submitted.
         size_bytes (int): Complete source size in bytes.
@@ -408,7 +413,7 @@ class ContextReference(BaseModel):
             never sent to the model provider.
     """
 
-    kind: Literal["file", "directory"]
+    kind: ContextReferenceKind
     path: str
     content: str
     size_bytes: int
@@ -423,14 +428,14 @@ class Message(ConversationItemModel):
     """Represent a user or assistant conversation message.
 
     Args:
-        role (Literal["user", "assistant"]): Participant that produced the message.
+        role (MessageRole): Participant that produced the message.
         content (str): Message text.
         context (tuple[ContextReference, ...]): Explicit resolved context snapshots.
         metadata (ResponseMetadata | None): Metadata for the provider response that produced the
             message.
     """
 
-    role: Literal["user", "assistant"]
+    role: MessageRole
     content: str
     context: tuple[ContextReference, ...] = Field(
         default_factory=tuple,

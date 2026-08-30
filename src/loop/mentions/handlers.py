@@ -3,7 +3,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Literal
 
 from .. import constants
 from ..completion import (
@@ -15,7 +14,7 @@ from ..completion import (
 from ..errors import Problem
 from ..instructions import InstructionsManager
 from ..instructions.models import SkillOperationError
-from ..models import ContextReference
+from ..models import ContextReference, ContextReferenceKind
 from ..utils import encode_content_cursor, is_path_ignored, iter_visible_paths, store_content
 
 
@@ -237,7 +236,7 @@ class ProjectPathMentionHandler(MentionHandler):
 
     @staticmethod
     def _reference(
-        kind: Literal["file", "directory"],
+        kind: ContextReferenceKind,
         display_path: str,
         content: str,
         max_bytes: int,

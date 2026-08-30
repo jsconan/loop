@@ -9,6 +9,7 @@ __all__ = [
     "PrivateRotatingTextFile",
     "Scalar",
     "ShutdownRequested",
+    "TextSearchCase",
     "TextSearchContext",
     "TextSearchMatch",
     "as_utc",
@@ -71,6 +72,7 @@ from .models import (
     IgnoreRule,
     IgnoreRules,
     Scalar,
+    TextSearchCase,
     TextSearchContext,
     TextSearchMatch,
 )

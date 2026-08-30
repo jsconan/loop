@@ -9,6 +9,7 @@ from pathspec import GitIgnoreSpec
 type Scalar = str | int | float | bool | None
 type IgnoreRule = tuple[Path, GitIgnoreSpec]
 type IgnoreRules = dict[str, list[IgnoreRule]]
+type TextSearchCase = Literal["smart", "sensitive", "insensitive"]
 
 
 @dataclass(frozen=True)

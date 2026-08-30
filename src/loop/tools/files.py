@@ -13,6 +13,7 @@ from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, FileTarget, Operation, OperationPlan
 from ..tooling import TOOL_READY, ToolContext, ToolPreflightResult, ToolStatus, tool
 from ..utils import (
+    TextSearchCase,
     canonical_path,
     filter_paths_by_globs,
     format_content_diff,
@@ -348,7 +349,7 @@ def search_text(
         Field(description="Whether query is a regular expression instead of literal text."),
     ] = False,
     case: Annotated[
-        Literal["smart", "sensitive", "insensitive"],
+        TextSearchCase,
         Field(description="Case strategy; smart treats queries containing uppercase as sensitive."),
     ] = "smart",
     include: Annotated[

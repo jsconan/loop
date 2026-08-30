@@ -9,10 +9,9 @@ import shutil
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Literal
 
 from .. import constants
-from .models import TextSearchContext, TextSearchMatch
+from .models import TextSearchCase, TextSearchContext, TextSearchMatch
 from .process import kill_process_group
 
 _PATH_BATCH_SIZE = 200
@@ -52,7 +51,7 @@ def search_text_paths(  # pylint: disable=too-many-branches,too-many-statements
     *,
     root: Path,
     regex: bool = False,
-    case: Literal["smart", "sensitive", "insensitive"] = "smart",
+    case: TextSearchCase = "smart",
     context_lines: int = 0,
     max_results: int = 100,
     max_bytes: int = constants.MAX_TOOL_CONTENT_BYTES,
@@ -65,7 +64,7 @@ def search_text_paths(  # pylint: disable=too-many-branches,too-many-statements
         query (str): Literal text or regular expression to locate.
         root (Path): Directory used for execution and relative result paths.
         regex (bool): Whether ``query`` is a ripgrep regular expression. Defaults to literal text.
-        case (Literal["smart", "sensitive", "insensitive"]): Case matching strategy.
+        case (TextSearchCase): Case matching strategy.
         context_lines (int): Number of neighboring lines retained around every match.
         max_results (int): Maximum matching lines returned across every file.
         max_bytes (int): Maximum approximate result bytes retained across matches and context.

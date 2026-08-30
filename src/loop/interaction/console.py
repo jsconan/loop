@@ -36,6 +36,7 @@ from ..models import (
 )
 from ..utils import ChoiceItem, choice_items, format_tool_call_arguments
 from .interaction import Interaction
+from .models import ListMarker
 
 
 class MarkdownStream:
@@ -446,7 +447,7 @@ class ConsoleInteraction(Interaction):
         self,
         values: Iterable[object] | Mapping[object, str],
         *,
-        marker: Literal["plain", "numbered", "bullet"] = "plain",
+        marker: ListMarker = "plain",
     ) -> None:
         """Write values as a vertical list.
 
@@ -454,7 +455,7 @@ class ConsoleInteraction(Interaction):
             values (Iterable[object] | Mapping[object, str]): Values to display. Mapping values are
                 displayed while their keys remain available to callers that also retain the
                 mapping.
-            marker (Literal["plain", "numbered", "bullet"]): Prefix style for each displayed
+            marker (ListMarker): Prefix style for each displayed
                 value. Defaults to ``"plain"``.
         """
         self._console.print("\n".join(self._marked_values(values, marker)))
@@ -463,7 +464,7 @@ class ConsoleInteraction(Interaction):
         self,
         values: Iterable[object] | Mapping[object, str],
         *,
-        marker: Literal["plain", "numbered", "bullet"] = "plain",
+        marker: ListMarker = "plain",
     ) -> None:
         """Write values in terminal-width-aware columns.
 
@@ -471,7 +472,7 @@ class ConsoleInteraction(Interaction):
             values (Iterable[object] | Mapping[object, str]): Values to display. Mapping values are
                 displayed while their keys remain available to callers that also retain the
                 mapping.
-            marker (Literal["plain", "numbered", "bullet"]): Prefix style for each displayed
+            marker (ListMarker): Prefix style for each displayed
                 value. Defaults to ``"plain"``.
         """
         renderables = [Text(value) for value in self._marked_values(values, marker)]
@@ -655,7 +656,7 @@ class ConsoleInteraction(Interaction):
     @staticmethod
     def _marked_values(
         values: Iterable[object] | Mapping[object, str],
-        marker: Literal["plain", "numbered", "bullet"],
+        marker: ListMarker,
     ) -> list[str]:
         """Return display values with a requested list marker."""
         if marker not in {"plain", "numbered", "bullet"}:

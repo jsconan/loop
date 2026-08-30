@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager
-from typing import Any, Literal
+from typing import Any
 
 from prompt_toolkit.completion import Completer
 
@@ -13,6 +13,7 @@ from .. import constants
 from ..errors import Problem
 from ..models import RAW_TOOL_RESULT_PRESENTATION, RunMetrics, ToolResultPresentationSpec
 from ..utils import ChoiceItem
+from .models import ListMarker
 
 
 class Interaction(ABC):
@@ -175,7 +176,7 @@ class Interaction(ABC):
         self,
         values: Iterable[object] | Mapping[object, str],
         *,
-        marker: Literal["plain", "numbered", "bullet"] = "plain",
+        marker: ListMarker = "plain",
     ) -> None:
         """Display values in terminal-width-aware columns.
 
@@ -183,7 +184,7 @@ class Interaction(ABC):
             values (Iterable[object] | Mapping[object, str]): Values to display. Mapping values are
                 displayed while their keys remain available to callers that also retain the
                 mapping.
-            marker (Literal["plain", "numbered", "bullet"]): Prefix style for each displayed
+            marker (ListMarker): Prefix style for each displayed
                 value. Defaults to ``"plain"``.
         """
 
@@ -192,7 +193,7 @@ class Interaction(ABC):
         self,
         values: Iterable[object] | Mapping[object, str],
         *,
-        marker: Literal["plain", "numbered", "bullet"] = "plain",
+        marker: ListMarker = "plain",
     ) -> None:
         """Display values as a vertical list.
 
@@ -200,7 +201,7 @@ class Interaction(ABC):
             values (Iterable[object] | Mapping[object, str]): Values to display. Mapping values are
                 displayed while their keys remain available to callers that also retain the
                 mapping.
-            marker (Literal["plain", "numbered", "bullet"]): Prefix style for each displayed
+            marker (ListMarker): Prefix style for each displayed
                 value. Defaults to ``"plain"``.
         """
 
