@@ -14,6 +14,7 @@ from .completion import (
     CommandCompletionAdapter,
     CompletionManager,
 )
+from .configuration import ApplicationSettings
 from .errors import Problem, log_problem
 from .instructions import InstructionsManager, RuntimeEnvironment, SkillCommands
 from .interaction import Interaction
@@ -29,7 +30,7 @@ from .session import (
     SessionNameGenerator,
 )
 from .telemetry import telemetry_activity
-from .tooling import ToolCommands, ToolRegistry
+from .tooling import ToolCommands, ToolRegistry, ToolRuntimeSettings
 from .utils import find_project_root
 
 _LOGGER = logging.getLogger(__name__)
@@ -292,6 +293,48 @@ class Loop:
             ToolRegistry: Agent-scoped tool declarations and implementations.
         """
         return self._agent.tools
+
+    def apply_runtime_settings(self, path: str, settings: ApplicationSettings) -> str:
+        """Apply a supported live setting to the active loop.
+
+        Args:
+            path (str): Changed dot-separated configuration path.
+            settings (ApplicationSettings): Newly validated effective application settings.
+
+        Returns:
+            str: Whether the setting was applied now or requires restart.
+        """
+        if path == "loop.debug":
+            self._agent_runner.debug = settings.loop.debug
+        elif path == "loop.stream":
+            self._agent_runner.stream = settings.loop.stream
+        elif path == "loop.max_agent_turns":
+            self._agent_runner.max_turns = settings.loop.max_agent_turns
+        elif path == "loop.prompt_on_recoverable_error":
+            self._agent_runner.prompt_on_recoverable_error = (
+                settings.loop.prompt_on_recoverable_error
+            )
+        elif path == "loop.compaction_threshold":
+            self._compaction.threshold = settings.loop.compaction_threshold
+        elif path == "web.user_agent":
+            self._agent.tools.settings = ToolRuntimeSettings(user_agent=settings.web.user_agent)
+        elif path == "loop.model":
+            self._model_selection.restore(settings.loop.model)
+        else:
+            return "saved; restart required"
+        return "applied now"
+
+    def replace_backend(self, backend: Backend) -> None:
+        """Replace the shared backend used by all future loop operations.
+
+        Args:
+            backend (Backend): Fully configured replacement backend.
+        """
+        self._backend = backend
+        self._agent_runner.backend = backend
+        self._model_selection.backend = backend
+        self._compaction.backend = backend
+        self._model_selection.restore(self._model_selection.selected)
 
     @property
     def backend(self) -> Backend:

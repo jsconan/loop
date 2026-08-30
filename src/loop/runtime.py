@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .backend import OpenAIBackend
-from .configuration import ApplicationSettings, ConfigurationManager
+from .configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
 from .constants import (
     APP_DIRECTORY,
     OPERATIONAL_LOG_FILENAME,
@@ -74,19 +74,7 @@ class ApplicationRuntime:
         )
         telemetry = None
         try:
-            backend = OpenAIBackend(
-                base_url=settings.backend.base_url,
-                default_model=settings.backend.default_model,
-                api_key=settings.backend.api_key.get_secret_value(),
-                context_window=settings.backend.context_window,
-                file_input_mode=settings.backend.file_input_mode,
-                structured_output_mode=settings.backend.structured_output_mode,
-                structured_output_max_retries=settings.backend.structured_output_max_retries,
-                max_retries=settings.backend.max_retries,
-                temperature=settings.backend.temperature,
-                reasoning_effort=settings.backend.reasoning_effort,
-                hyperparameter_policy=settings.backend.hyperparameter_policy,
-            )
+            backend = cls._create_backend(settings)
             telemetry = Telemetry(
                 SQLiteTelemetryAdapter(
                     project_root / APP_DIRECTORY / TELEMETRY_DATABASE_FILENAME,
@@ -128,6 +116,9 @@ class ApplicationRuntime:
                 telemetry.close(timeout=settings.telemetry.shutdown_timeout)
             raise
         runtime = cls(loop, telemetry, settings.telemetry.shutdown_timeout)
+        loop.command_manager.register_all(
+            ConfigurationCommands(configuration, runtime.apply_configuration).get_commands()
+        )
         set_telemetry(telemetry)
         telemetry_activity("application.started", severity="info", component="main")
         return runtime
@@ -135,6 +126,38 @@ class ApplicationRuntime:
     def run(self) -> None:
         """Run the composed interactive loop."""
         self._loop.run()
+
+    def apply_configuration(self, path: str, settings: ApplicationSettings) -> str:
+        """Apply one validated configuration change to the active runtime.
+
+        Args:
+            path (str): Changed dot-separated configuration path.
+            settings (ApplicationSettings): Newly validated effective configuration.
+
+        Returns:
+            str: Whether the setting was applied now or requires restart.
+        """
+        if path.startswith("backend."):
+            self._loop.replace_backend(self._create_backend(settings))
+            return "applied now"
+        return self._loop.apply_runtime_settings(path, settings)
+
+    @staticmethod
+    def _create_backend(settings: ApplicationSettings) -> OpenAIBackend:
+        """Construct the backend described by one effective settings snapshot."""
+        return OpenAIBackend(
+            base_url=settings.backend.base_url,
+            default_model=settings.backend.default_model,
+            api_key=settings.backend.api_key.get_secret_value(),
+            context_window=settings.backend.context_window,
+            file_input_mode=settings.backend.file_input_mode,
+            structured_output_mode=settings.backend.structured_output_mode,
+            structured_output_max_retries=settings.backend.structured_output_max_retries,
+            max_retries=settings.backend.max_retries,
+            temperature=settings.backend.temperature,
+            reasoning_effort=settings.backend.reasoning_effort,
+            hyperparameter_policy=settings.backend.hyperparameter_policy,
+        )
 
     def stop(self) -> None:
         """Record an interrupted application shutdown."""

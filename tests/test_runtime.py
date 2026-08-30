@@ -5,6 +5,7 @@ from unittest.mock import ANY, Mock, call
 
 import pytest
 
+import loop.runtime as runtime_module
 from loop.configuration import ApplicationSettings
 from loop.runtime import ApplicationRuntime
 
@@ -12,7 +13,6 @@ from loop.runtime import ApplicationRuntime
 @pytest.fixture
 def runtime_dependencies(monkeypatch):
     """Replace runtime collaborators with isolated composition-boundary doubles."""
-    import loop.runtime as runtime_module
 
     dependencies = {
         name: Mock(return_value=Mock())
@@ -122,6 +122,24 @@ def test_create_does_not_persist_environment_selected_model(runtime_dependencies
     )
 
     assert runtime_dependencies["Loop"].create_default.call_args.kwargs["on_model_select"] is None
+
+
+def test_runtime_applies_backend_changes_by_replacing_the_shared_backend(runtime_dependencies):
+    """Backend settings construct a replacement backend for all future loop work."""
+    active_loop = Mock()
+    active_loop.apply_runtime_settings.return_value = "saved; restart required"
+    runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
+    settings = ApplicationSettings()
+
+    assert runtime.apply_configuration("backend.temperature", settings) == "applied now"
+
+    active_loop.replace_backend.assert_called_once_with(
+        runtime_dependencies["OpenAIBackend"].return_value
+    )
+    assert (
+        runtime.apply_configuration("telemetry.batch_size", settings) == "saved; restart required"
+    )
+    active_loop.apply_runtime_settings.assert_called_once_with("telemetry.batch_size", settings)
 
 
 @pytest.mark.parametrize("failure_after_telemetry", [False, True])

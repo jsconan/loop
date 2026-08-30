@@ -363,6 +363,10 @@ Settings resolve in this order: explicit environment variables, values discovere
 nearest ancestor `.env`, `.loop/config.toml`, then built-in defaults. This keeps shared `.env`
 files useful while allowing a project-local durable configuration.
 
+The generated file contains all settings and their built-in values. Nullable settings such as
+`context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort` are omitted
+until explicitly configured.
+
 ```toml
 # .loop/config.toml
 config_version = 1
@@ -372,13 +376,32 @@ base_url = "http://localhost:8000/v1"
 default_model = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 api_key = "local-api-key"
 max_retries = 2
-temperature = 0.2
-reasoning_effort = "medium"
+structured_output_mode = "auto"
+structured_output_max_retries = 1
 hyperparameter_policy = "fallback"
 
 [loop]
+agent_name = "Loop"
 stream = true
+debug = false
+compaction_threshold = 0.8
+prompt_on_recoverable_error = true
 max_agent_turns = 25
+
+[web]
+user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+
+[logging]
+level = "INFO"
+max_bytes = 5242880
+backup_count = 3
+
+[telemetry]
+queue_capacity = 4096
+batch_size = 128
+flush_seconds = 0.1
+shutdown_timeout = 2.0
+sqlite_busy_timeout_ms = 2500
 ```
 
 The configuration service validates every value at startup. Invalid fields and unknown keys stop
@@ -386,6 +409,25 @@ startup without logging secret values. Configuration is injected into backend, l
 logging, and web-tool composition; runtime components do not read environment variables directly.
 The configuration file retains comments and formatting when modified through the configuration
 manager API.
+
+While Loop is running, use `/config` to browse, inspect, change, or reset effective settings.
+Configuration-path completion prevents users from having to memorize setting names:
+
+```text
+/config
+/config get backend.temperature
+/config set backend.temperature 0.7 scope=session
+/config set loop.stream false scope=file
+/config secret backend.api_key
+/config reset backend.temperature scope=file
+/config reset  # prompts for scope and confirmation
+```
+
+Session settings override environment and file values for that Loop process only. File values are
+still saved when an environment variable currently wins, so a later run without that variable uses
+the saved value. Backend settings and supported interactive-loop settings apply immediately;
+logging, telemetry, and agent-identity changes are saved but require a restart. API-key input and
+configuration output remain masked.
 
 Pass configuration directly to `OpenAIBackend` when using a different server or model:
 
@@ -408,15 +450,32 @@ manifest.
 
 The `loop` command accepts environment overrides for automation:
 
-| Setting           | Environment variable | Built-in default               |
-| ----------------- | -------------------- | ------------------------------ |
-| Base URL          | `BASE_URL`           | `http://localhost:8000/v1`     |
-| Model             | `DEFAULT_MODEL`      | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
-| API key           | `OPENAI_API_KEY`     | `local-api-key`                |
-| Automatic retries | `OPENAI_MAX_RETRIES` | `2`                            |
-| Temperature       | `OPENAI_TEMPERATURE` | provider default               |
-| Reasoning effort  | `OPENAI_REASONING_EFFORT` | provider default           |
-| Hyperparameter policy | `OPENAI_HYPERPARAMETER_POLICY` | `fallback`          |
+| Setting                     | Environment variable                    | Built-in default               |
+| --------------------------- | --------------------------------------- | ------------------------------ |
+| Base URL                    | `BASE_URL`                              | `http://localhost:8000/v1`     |
+| Backend model               | `DEFAULT_MODEL`                         | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
+| API key                     | `OPENAI_API_KEY`                        | `local-api-key`                |
+| Context window              | `CONTEXT_WINDOW`                        | unset                          |
+| Automatic retries           | `OPENAI_MAX_RETRIES`                    | `2`                            |
+| Temperature                 | `OPENAI_TEMPERATURE`                    | unset                          |
+| Reasoning effort            | `OPENAI_REASONING_EFFORT`               | unset                          |
+| Hyperparameter policy       | `OPENAI_HYPERPARAMETER_POLICY`          | `fallback`                     |
+| Web user agent              | `USER_AGENT`                            | browser-like user agent        |
+| Loop agent name             | `LOOP_AGENT_NAME`                       | `Loop`                         |
+| Loop model                  | `LOOP_MODEL`                            | unset                          |
+| Stream responses            | `LOOP_STREAM`                           | `true`                         |
+| Debug responses             | `LOOP_DEBUG`                            | `false`                        |
+| Compaction threshold        | `LOOP_COMPACTION_THRESHOLD`             | `0.8`                          |
+| Prompt on recoverable error | `LOOP_PROMPT_ON_RECOVERABLE_ERROR`      | `true`                         |
+| Maximum agent turns         | `LOOP_MAX_AGENT_TURNS`                  | `25`                           |
+| Log level                   | `LOOP_LOG_LEVEL`                        | `INFO`                         |
+| Log size                    | `LOOP_LOG_MAX_BYTES`                    | `5242880`                      |
+| Log backups                 | `LOOP_LOG_BACKUP_COUNT`                 | `3`                            |
+| Telemetry queue capacity    | `LOOP_TELEMETRY_QUEUE_CAPACITY`         | `4096`                         |
+| Telemetry batch size        | `LOOP_TELEMETRY_BATCH_SIZE`             | `128`                          |
+| Telemetry flush interval    | `LOOP_TELEMETRY_FLUSH_SECONDS`          | `0.1`                          |
+| Telemetry shutdown timeout  | `LOOP_TELEMETRY_SHUTDOWN_TIMEOUT`       | `2.0`                          |
+| SQLite busy timeout         | `LOOP_TELEMETRY_SQLITE_BUSY_TIMEOUT_MS` | `2500`                         |
 
 `OpenAIBackend` itself does not read environment variables or provide deployment defaults. Library
 callers configure it explicitly, and credentials remain private backend state.

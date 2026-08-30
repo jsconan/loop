@@ -3,6 +3,7 @@
 __all__ = [
     "ApplicationSettings",
     "BackendSettings",
+    "ConfigurationCommands",
     "ConfigurationEntry",
     "ConfigurationManager",
     "LoggingSettings",
@@ -11,6 +12,7 @@ __all__ = [
     "WebSettings",
 ]
 
+from .commands import ConfigurationCommands
 from .manager import ConfigurationManager
 from .models import (
     ApplicationSettings,

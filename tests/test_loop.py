@@ -47,8 +47,10 @@ from loop import (
     manage_skills,
     tool,
 )
+from loop.configuration import ApplicationSettings
 from loop.permissions import PermissionLoadFailure
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
+from loop.tooling import ToolRuntimeSettings
 
 
 def function_call() -> ToolCall:
@@ -107,6 +109,52 @@ def test_loop_exposes_its_configured_state(tmp_path):
 
     loop.debug = False
     assert loop.debug is False
+
+
+def test_loop_applies_live_configuration_and_replaces_shared_backend(tmp_path):
+    """Supported configuration paths update future loop operations without restarting."""
+    backend = loop_backend()
+    loop = Loop.create_default(
+        backend=backend,
+        interaction=MagicMock(spec=Interaction),
+        working_directory=tmp_path,
+    )
+
+    settings = ApplicationSettings.model_validate(
+        {
+            "loop": {
+                "debug": True,
+                "stream": True,
+                "max_agent_turns": 0,
+                "prompt_on_recoverable_error": False,
+                "compaction_threshold": 0.7,
+                "model": "configured-model",
+            },
+            "web": {"user_agent": "Loop test"},
+        }
+    )
+    for path in (
+        "loop.debug",
+        "loop.stream",
+        "loop.max_agent_turns",
+        "loop.prompt_on_recoverable_error",
+        "loop.compaction_threshold",
+        "web.user_agent",
+        "loop.model",
+    ):
+        assert loop.apply_runtime_settings(path, settings) == "applied now"
+    replacement = loop_backend()
+    loop.replace_backend(replacement)
+
+    assert loop.agent_runner.debug is True
+    assert loop.agent_runner.stream is True
+    assert loop.agent_runner.max_turns == 0
+    assert loop.agent_runner.compaction.threshold == 0.7
+    assert loop.tool_registry.settings == ToolRuntimeSettings(user_agent="Loop test")
+    assert loop.backend is replacement
+    assert (
+        loop.apply_runtime_settings("telemetry.batch_size", settings) == "saved; restart required"
+    )
 
 
 def test_loop_accepts_an_explicitly_assembled_runtime(tmp_path):
