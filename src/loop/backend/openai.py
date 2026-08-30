@@ -52,12 +52,14 @@ from ..models import (
     CompactionResult,
     ContextReference,
     ConversationItem,
+    HyperparameterPolicy,
     Message,
     ModelContextItem,
     ModelInfo,
     Reasoning,
     ReasoningCompleted,
     ReasoningDelta,
+    ReasoningEffort,
     ResponseCompleted,
     ResponseEvent,
     ResponseMetadata,
@@ -69,7 +71,7 @@ from ..models import (
     ToolResult,
     Usage,
 )
-from ..telemetry import ModelInputPolicy, telemetry_trace_event
+from ..telemetry import ModelInputPolicy, telemetry_activity, telemetry_trace_event
 from ..utils import payload_digest
 from .backend import Backend
 from .errors import (
@@ -109,6 +111,11 @@ class OpenAIBackend(Backend):
         structured_output_max_retries (int): Number of corrective generations after a structured
             response fails local validation.
         max_retries (int): Number of automatic SDK retries for transient request failures.
+        temperature (float | None): Sampling temperature, or ``None`` to use the provider default.
+        reasoning_effort (ReasoningEffort | None): Requested reasoning effort, or ``None`` to use
+            the provider default.
+        hyperparameter_policy (HyperparameterPolicy): Whether to retry without a
+            hyperparameter explicitly rejected as unsupported, or preserve that rejection.
 
     Raises:
         ValueError: If a configured value is invalid.
@@ -123,6 +130,10 @@ class OpenAIBackend(Backend):
     _structured_output_max_retries: int
     _prompt_structured_models: set[str]
     _max_retries: int
+    _temperature: float | None
+    _reasoning_effort: ReasoningEffort | None
+    _hyperparameter_policy: HyperparameterPolicy
+    _unsupported_hyperparameters: dict[str, set[str]]
     _model_input_policy: ModelInputPolicy
 
     def __init__(
@@ -138,6 +149,9 @@ class OpenAIBackend(Backend):
         ),
         structured_output_max_retries: int = constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES,
         max_retries: int = constants.DEFAULT_MAX_RETRIES,
+        temperature: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        hyperparameter_policy: HyperparameterPolicy = (constants.DEFAULT_HYPERPARAMETER_POLICY),
     ) -> None:
         super().__init__(
             base_url=base_url,
@@ -163,6 +177,14 @@ class OpenAIBackend(Backend):
         self._structured_output_max_retries = structured_output_max_retries
         self._prompt_structured_models = set()
         self._max_retries = max_retries
+        if temperature is not None and (isinstance(temperature, bool) or not 0 <= temperature <= 2):
+            raise ValueError("Temperature must be between 0 and 2.")
+        if hyperparameter_policy not in ("fallback", "strict"):
+            raise ValueError("Hyperparameter policy must be 'fallback' or 'strict'.")
+        self._temperature = temperature
+        self._reasoning_effort = reasoning_effort
+        self._hyperparameter_policy = hyperparameter_policy
+        self._unsupported_hyperparameters = {}
         self._model_input_policy = ModelInputPolicy((api_key,) if api_key else ())
 
     @property
@@ -268,6 +290,83 @@ class OpenAIBackend(Backend):
         )
         return prepared
 
+    def _generation_request_parameters(self, model: str) -> dict[str, object]:
+        """Return configured generation parameters supported by the selected model."""
+        unsupported = self._unsupported_hyperparameters.get(model, set())
+        parameters = {}
+        if self._temperature is not None and "temperature" not in unsupported:
+            parameters["temperature"] = self._temperature
+        if self._reasoning_effort is not None and "reasoning" not in unsupported:
+            parameters["reasoning"] = {"effort": self._reasoning_effort}
+        return parameters
+
+    def _create_response(self, request: dict[str, object], model: str) -> Any:
+        """Create a response, retrying only explicit unsupported-hyperparameter rejections."""
+        effective_request = dict(request)
+        while True:
+            try:
+                return self._get_client().responses.create(
+                    **self._prepared_request(**effective_request)
+                )
+            except APIStatusError as error:
+                parameter = self._unsupported_hyperparameter(error, model, effective_request)
+                if parameter is None:
+                    raise
+                effective_request.pop(parameter)
+
+    async def _create_response_async(self, request: dict[str, object], model: str) -> Any:
+        """Asynchronously create a response with the synchronous fallback policy."""
+        effective_request = dict(request)
+        while True:
+            try:
+                return await self._get_async_client().responses.create(
+                    **self._prepared_request(**effective_request)
+                )
+            except APIStatusError as error:
+                parameter = self._unsupported_hyperparameter(error, model, effective_request)
+                if parameter is None:
+                    raise
+                effective_request.pop(parameter)
+
+    def _unsupported_hyperparameter(
+        self,
+        error: APIStatusError,
+        model: str,
+        request: dict[str, object],
+    ) -> str | None:
+        """Cache and return one explicitly rejected generation parameter, if any."""
+        if self._hyperparameter_policy != "fallback" or error.status_code not in (400, 422):
+            return None
+        body_message = error.body.get("message") if isinstance(error.body, dict) else None
+        message = f"{error} {body_message or ''}".lower()
+        markers = (
+            "unsupported",
+            "not supported",
+            "unknown parameter",
+            "unrecognized parameter",
+            "does not support",
+            "not allowed",
+            "cannot be set with",
+        )
+        if not any(marker in message for marker in markers):
+            return None
+        candidates = (
+            parameter
+            for parameter in ("temperature", "reasoning")
+            if parameter in request and parameter in message
+        )
+        parameter = next(candidates, None)
+        if parameter is None:
+            return None
+        self._unsupported_hyperparameters.setdefault(model, set()).add(parameter)
+        telemetry_activity(
+            "gen_ai.hyperparameter_unsupported",
+            severity="info",
+            model=model,
+            hyperparameter=parameter,
+        )
+        return parameter
+
     @staticmethod
     def _trace_provider_value(event_name: str, value: object) -> None:
         """Trace one exact provider object when structured serialization is available."""
@@ -366,15 +465,16 @@ class OpenAIBackend(Backend):
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
         if output_format is None:
-            request = self._prepared_request(
-                model=selected_model,
-                input=serialized_input,
-                instructions=request_instructions,
-                stream=stream,
-                stream_options={"include_usage": True},
-                tools=serialized_tools,
-            )
-            response = self._get_client().responses.create(**request)
+            request = {
+                "model": selected_model,
+                "input": serialized_input,
+                "instructions": request_instructions,
+                "stream": stream,
+                "stream_options": {"include_usage": True},
+                "tools": serialized_tools,
+                **self._generation_request_parameters(selected_model),
+            }
+            response = self._create_response(request, selected_model)
             if stream:
                 items = []
                 reasoning_channels = {}
@@ -393,29 +493,31 @@ class OpenAIBackend(Backend):
             attempt += 1
             mode = self._structured_mode(selected_model)
             try:
-                request = self._prepared_request(
-                    model=selected_model,
-                    input=attempt_input,
-                    instructions=request_instructions,
-                    stream=stream,
-                    stream_options={"include_usage": True},
-                    tools=serialized_tools,
+                request = {
+                    "model": selected_model,
+                    "input": attempt_input,
+                    "instructions": request_instructions,
+                    "stream": stream,
+                    "stream_options": {"include_usage": True},
+                    "tools": serialized_tools,
+                    **self._generation_request_parameters(selected_model),
                     **self._structured_output_request(output_format, mode),
-                )
-                response = self._get_client().responses.create(**request)
+                }
+                response = self._create_response(request, selected_model)
             except APIStatusError as error:
                 if mode != "native" or not self._fallback_from_native(error, selected_model):
                     raise
                 mode = "prompt"
-                request = self._prepared_request(
-                    model=selected_model,
-                    input=attempt_input,
-                    instructions=request_instructions,
-                    stream=stream,
-                    stream_options={"include_usage": True},
-                    tools=serialized_tools,
-                )
-                response = self._get_client().responses.create(**request)
+                request = {
+                    "model": selected_model,
+                    "input": attempt_input,
+                    "instructions": request_instructions,
+                    "stream": stream,
+                    "stream_options": {"include_usage": True},
+                    "tools": serialized_tools,
+                    **self._generation_request_parameters(selected_model),
+                }
+                response = self._create_response(request, selected_model)
             if not stream:
                 self._trace_provider_value("gen_ai.response", response)
             try:
@@ -499,15 +601,16 @@ class OpenAIBackend(Backend):
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
         if output_format is None:
-            request = self._prepared_request(
-                model=selected_model,
-                input=serialized_input,
-                instructions=request_instructions,
-                stream=stream,
-                stream_options={"include_usage": True},
-                tools=serialized_tools,
-            )
-            response = await self._get_async_client().responses.create(**request)
+            request = {
+                "model": selected_model,
+                "input": serialized_input,
+                "instructions": request_instructions,
+                "stream": stream,
+                "stream_options": {"include_usage": True},
+                "tools": serialized_tools,
+                **self._generation_request_parameters(selected_model),
+            }
+            response = await self._create_response_async(request, selected_model)
             if not stream:
                 self._trace_provider_value("gen_ai.response", response)
                 for event in self._response_events(response, None):
@@ -530,29 +633,31 @@ class OpenAIBackend(Backend):
             attempt += 1
             mode = self._structured_mode(selected_model)
             try:
-                request = self._prepared_request(
-                    model=selected_model,
-                    input=attempt_input,
-                    instructions=request_instructions,
-                    stream=stream,
-                    stream_options={"include_usage": True},
-                    tools=serialized_tools,
+                request = {
+                    "model": selected_model,
+                    "input": attempt_input,
+                    "instructions": request_instructions,
+                    "stream": stream,
+                    "stream_options": {"include_usage": True},
+                    "tools": serialized_tools,
+                    **self._generation_request_parameters(selected_model),
                     **self._structured_output_request(output_format, mode),
-                )
-                response = await self._get_async_client().responses.create(**request)
+                }
+                response = await self._create_response_async(request, selected_model)
             except APIStatusError as error:
                 if mode != "native" or not self._fallback_from_native(error, selected_model):
                     raise
                 mode = "prompt"
-                request = self._prepared_request(
-                    model=selected_model,
-                    input=attempt_input,
-                    instructions=request_instructions,
-                    stream=stream,
-                    stream_options={"include_usage": True},
-                    tools=serialized_tools,
-                )
-                response = await self._get_async_client().responses.create(**request)
+                request = {
+                    "model": selected_model,
+                    "input": attempt_input,
+                    "instructions": request_instructions,
+                    "stream": stream,
+                    "stream_options": {"include_usage": True},
+                    "tools": serialized_tools,
+                    **self._generation_request_parameters(selected_model),
+                }
+                response = await self._create_response_async(request, selected_model)
             if not stream:
                 self._trace_provider_value("gen_ai.response", response)
             try:

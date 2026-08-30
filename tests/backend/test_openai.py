@@ -203,6 +203,89 @@ def test_configuration_rejects_invalid_structured_output_policy():
     for value in (-1, True, 1.5):
         with pytest.raises(ValueError, match="Maximum retries"):
             OpenAIBackend(max_retries=value)
+    for value in (-0.1, 2.1, True):
+        with pytest.raises(ValueError, match="Temperature"):
+            OpenAIBackend(temperature=value)
+    with pytest.raises(ValueError, match="policy"):
+        OpenAIBackend(hyperparameter_policy="ignore")
+
+
+def test_generation_hyperparameter_fallback_removes_only_rejected_parameter_and_caches_model():
+    """Compatible backends retry and cache a model's explicitly rejected control."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "bad request",
+        response=httpx.Response(400, request=request),
+        body={"message": "unsupported parameter: temperature"},
+    )
+    sdk = Mock()
+    sdk.responses.create.side_effect = [rejected, [], []]
+    backend = OpenAIBackend(
+        default_model="model",
+        temperature=0.2,
+        reasoning_effort="medium",
+    )
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        assert list(backend.get_response("first", stream=True)) == []
+        assert list(backend.get_response("second", stream=True)) == []
+
+    first, retried, cached = [call.kwargs for call in sdk.responses.create.call_args_list]
+    assert first["temperature"] == 0.2
+    assert first["reasoning"] == {"effort": "medium"}
+    assert "temperature" not in retried
+    assert retried["reasoning"] == {"effort": "medium"}
+    assert "temperature" not in cached
+    assert cached["reasoning"] == {"effort": "medium"}
+
+
+def test_generation_hyperparameter_fallback_preserves_temperature_after_reasoning_rejection():
+    """Reasoning rejection retries a request with its independent sampling setting intact."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "reasoning is not supported for this model",
+        response=httpx.Response(422, request=request),
+        body=None,
+    )
+    sdk = Mock()
+    sdk.responses.create.side_effect = [rejected, []]
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        assert (
+            list(
+                OpenAIBackend(
+                    default_model="model", temperature=0.2, reasoning_effort="medium"
+                ).get_response("hello", stream=True)
+            )
+            == []
+        )
+
+    assert sdk.responses.create.call_args.kwargs["temperature"] == 0.2
+    assert "reasoning" not in sdk.responses.create.call_args.kwargs
+
+
+def test_strict_hyperparameter_policy_preserves_provider_rejection():
+    """Strict policy does not conceal an explicitly unsupported configured control."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "unsupported parameter: temperature",
+        response=httpx.Response(400, request=request),
+        body=None,
+    )
+    sdk = Mock()
+    sdk.responses.create.side_effect = rejected
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendBadRequestError),
+    ):
+        list(
+            OpenAIBackend(
+                default_model="model", temperature=0.2, hyperparameter_policy="strict"
+            ).get_response("hello")
+        )
+
+    sdk.responses.create.assert_called_once()
 
 
 def test_configured_transport_retries_reach_both_clients():
@@ -1185,6 +1268,34 @@ def test_async_response_uses_default_model():
         stream_options={"include_usage": True},
         tools=[],
     )
+
+
+def test_async_generation_hyperparameter_fallback_retries_without_rejected_control():
+    """Asynchronous compatible requests apply the cached capability fallback policy."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "unsupported parameter: temperature",
+        response=httpx.Response(400, request=request),
+        body=None,
+    )
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(side_effect=[rejected, AsyncEvents([])])
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        assert (
+            asyncio.run(
+                collect_events(
+                    OpenAIBackend(default_model="model", temperature=0.2).get_response_async(
+                        "hello", stream=True
+                    )
+                )
+            )
+            == []
+        )
+
+    first, retried = [call.kwargs for call in sdk.responses.create.await_args_list]
+    assert first["temperature"] == 0.2
+    assert "temperature" not in retried
 
 
 def test_async_response_forwards_and_validates_structured_output():

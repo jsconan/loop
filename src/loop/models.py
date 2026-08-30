@@ -18,6 +18,8 @@ from pydantic import ValidationError as PydanticValidationError
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 type StructuredOutputValidator = Callable[[JsonValue], Any]
 type AgentRunStopReason = Literal["completed", "cancelled", "max_turns"]
+type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+type HyperparameterPolicy = Literal["fallback", "strict"]
 
 _JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE | re.DOTALL)
 

@@ -27,6 +27,9 @@ def isolate_main_environment(monkeypatch):
         "OPENAI_API_KEY",
         "CONTEXT_WINDOW",
         "OPENAI_MAX_RETRIES",
+        "OPENAI_TEMPERATURE",
+        "OPENAI_REASONING_EFFORT",
+        "OPENAI_HYPERPARAMETER_POLICY",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -73,6 +76,9 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
         structured_output_mode="auto",
         structured_output_max_retries=1,
         max_retries=2,
+        temperature=None,
+        reasoning_effort=None,
+        hyperparameter_policy="fallback",
     )
     session_store_factory.assert_called_once_with(Path("/project/.loop/sessions.db"))
     session_manager_factory.assert_called_once_with(
@@ -150,6 +156,9 @@ def test_main_routes_startup_output_through_the_loop_interaction(monkeypatch, tm
         structured_output_mode="auto",
         structured_output_max_retries=1,
         max_retries=2,
+        temperature=None,
+        reasoning_effort=None,
+        hyperparameter_policy="fallback",
     )
     session_store_factory.assert_called_once_with(tmp_path / ".loop" / "sessions.db")
     session_manager_factory.assert_called_once_with(

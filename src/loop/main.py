@@ -61,6 +61,9 @@ def main() -> None:
             structured_output_mode=settings.backend.structured_output_mode,
             structured_output_max_retries=settings.backend.structured_output_max_retries,
             max_retries=settings.backend.max_retries,
+            temperature=settings.backend.temperature,
+            reasoning_effort=settings.backend.reasoning_effort,
+            hyperparameter_policy=settings.backend.hyperparameter_policy,
         )
         telemetry = Telemetry(
             SQLiteTelemetryAdapter(

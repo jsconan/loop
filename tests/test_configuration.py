@@ -34,10 +34,23 @@ def test_environment_overrides_persisted_values(tmp_path):
     manager = ConfigurationManager(tmp_path)
     manager.initialize()
     manager.set("backend.default_model", "file-model")
+    manager.set("backend.temperature", 0.2)
+    manager.set("backend.reasoning_effort", "high")
+    manager.set("backend.hyperparameter_policy", "strict")
 
-    settings = manager.load({"DEFAULT_MODEL": "environment-model"})
+    settings = manager.load(
+        {
+            "DEFAULT_MODEL": "environment-model",
+            "OPENAI_TEMPERATURE": "0.7",
+            "OPENAI_REASONING_EFFORT": "low",
+            "OPENAI_HYPERPARAMETER_POLICY": "fallback",
+        }
+    )
 
     assert settings.backend.default_model == "environment-model"
+    assert settings.backend.temperature == 0.7
+    assert settings.backend.reasoning_effort == "low"
+    assert settings.backend.hyperparameter_policy == "fallback"
 
 
 def test_set_preserves_existing_comments(tmp_path):
@@ -100,6 +113,8 @@ def test_manager_rejects_unknown_fields_and_invalid_values(tmp_path):
         manager.unset("backend.unknown")
     with pytest.raises(ValidationError):
         manager.set("backend.max_retries", -1)
+    with pytest.raises(ValidationError):
+        manager.set("backend.temperature", 3)
 
 
 def test_unset_restores_default_and_missing_file_loads_defaults(tmp_path):

@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings
 
 from . import constants
+from .models import HyperparameterPolicy, ReasoningEffort
 
 _CONFIGURATION_VERSION = 1
 
@@ -33,6 +34,9 @@ class BackendSettings(BaseModel):
     structured_output_max_retries: int = Field(
         default=constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES, ge=0
     )
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    reasoning_effort: ReasoningEffort | None = None
+    hyperparameter_policy: HyperparameterPolicy = constants.DEFAULT_HYPERPARAMETER_POLICY
 
 
 class LoopSettings(BaseModel):
@@ -102,6 +106,9 @@ _ENVIRONMENT_FIELDS = {
     "OPENAI_API_KEY": ("backend", "api_key"),
     "CONTEXT_WINDOW": ("backend", "context_window"),
     "OPENAI_MAX_RETRIES": ("backend", "max_retries"),
+    "OPENAI_TEMPERATURE": ("backend", "temperature"),
+    "OPENAI_REASONING_EFFORT": ("backend", "reasoning_effort"),
+    "OPENAI_HYPERPARAMETER_POLICY": ("backend", "hyperparameter_policy"),
     "USER_AGENT": ("web", "user_agent"),
     "LOOP_AGENT_NAME": ("loop", "agent_name"),
     "LOOP_MODEL": ("loop", "model"),
@@ -245,7 +252,12 @@ class ConfigurationManager:
         sections = self._split_path(dotted_path)
         self._document = self._read_document()
         table = self._document.get(sections[0])
-        if not isinstance(table, Mapping) or sections[1] not in table:
+        defaults = ApplicationSettings().model_dump(mode="python")
+        if (
+            not isinstance(table, Mapping)
+            or sections[0] not in defaults
+            or sections[1] not in defaults[sections[0]]
+        ):
             raise ValueError(f"Unknown configuration field '{dotted_path}'.")
         table[sections[1]] = value
         settings = ApplicationSettings.model_validate(self._plain_document_values())

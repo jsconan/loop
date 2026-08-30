@@ -372,6 +372,9 @@ base_url = "http://localhost:8000/v1"
 default_model = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 api_key = "local-api-key"
 max_retries = 2
+temperature = 0.2
+reasoning_effort = "medium"
+hyperparameter_policy = "fallback"
 
 [loop]
 stream = true
@@ -411,9 +414,19 @@ The `loop` command accepts environment overrides for automation:
 | Model             | `DEFAULT_MODEL`      | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
 | API key           | `OPENAI_API_KEY`     | `local-api-key`                |
 | Automatic retries | `OPENAI_MAX_RETRIES` | `2`                            |
+| Temperature       | `OPENAI_TEMPERATURE` | provider default               |
+| Reasoning effort  | `OPENAI_REASONING_EFFORT` | provider default           |
+| Hyperparameter policy | `OPENAI_HYPERPARAMETER_POLICY` | `fallback`          |
 
 `OpenAIBackend` itself does not read environment variables or provide deployment defaults. Library
 callers configure it explicitly, and credentials remain private backend state.
+
+`temperature` and `reasoning_effort` are optional generation controls. Loop sends them when set,
+then caches any parameter a selected model explicitly rejects as unsupported. The default
+`hyperparameter_policy = "fallback"` retries that request without only the rejected parameter;
+use `"strict"` to preserve the provider error instead. This keeps OpenAI-compatible backends
+usable when their supported controls differ by model. Configure one sampling control at a time:
+the OpenAI API recommends changing `temperature` or `top_p`, but not both.
 
 Transient connection, timeout, conflict, rate-limit, and server failures use the OpenAI SDK's
 bounded exponential-backoff retries. When those attempts are exhausted, the interactive loop
