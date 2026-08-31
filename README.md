@@ -131,8 +131,8 @@ message and item counts, model identity, and context occupancy. Human permission
 waits are excluded from active time. `/resume` renders this timeline, including the
 metrics originally shown after each run and any permission prompts originally presented to the
 user. Historical permission decisions are informational and are never reapplied as grants.
-Legacy session schemas are upcast in memory when read; loading or listing sessions never rewrites
-their stored payloads. A modified session is written using the current schema on its next save.
+Supported legacy snapshots are upcast on read. Path-owned snapshots are rewritten once with the
+workspace's durable ID; unsupported schemas fail explicitly.
 
 When startup or `/resume` finds history written after the last completed run, the loop offers to
 recover it before accepting another user message. Recovery resumes at the durable boundary: it
@@ -155,8 +155,8 @@ Library callers can supply a `Session` or a persisted session identifier directl
 from loop import Loop, Session, SessionManager, SQLiteSessionStore
 
 fresh = Loop.create_default(backend, session=Session())
-store = SQLiteSessionStore(".loop/sessions.db")
-sessions = SessionManager(session_store=store)
+store = SQLiteSessionStore(".loop/sessions.db", workspace_id="workspace-id")
+sessions = SessionManager(session_store=store, workspace_id="workspace-id")
 resumed = Loop.create_default(backend, session="019c...", session_manager=sessions)
 ```
 
@@ -369,6 +369,12 @@ Loop discovers one workspace at startup and uses that single context for configu
 telemetry, operational logs, permission policy, and permission audit records. All remain below the
 workspace's `.loop/` directory for now. Linked Git worktrees are distinct workspaces, matching
 Git's separation of worktree-specific state.
+
+The workspace database registers the workspace with a name and an opaque UUIDv4 identity. Every
+telemetry record carries that `workspace_id`; workspace paths are not copied into telemetry
+attributes. Workspace identity is stored separately from telemetry so both databases can move to
+centralized application storage independently in a later iteration. Telemetry schema migrations
+are versioned and run once rather than scanning historical records on every startup.
 
 The generated file contains all settings and their built-in values. Nullable settings such as
 `context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort` are omitted

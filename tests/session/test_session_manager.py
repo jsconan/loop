@@ -320,30 +320,36 @@ def test_manager_loads_a_session_identifier_during_initialization():
     store.load.assert_called_once_with("session-id")
 
 
-def test_manager_binds_new_and_unowned_sessions_to_its_workspace(tmp_path):
-    """A workspace-aware manager assigns its canonical root to every accepted session."""
-    manager = SessionManager(workspace_root=tmp_path)
-    assert manager.session.workspace_root == str(tmp_path)
+def test_manager_rejects_an_empty_workspace_identifier():
+    """A configured workspace identity must be non-empty."""
+    with pytest.raises(ValueError, match="must not be empty"):
+        SessionManager(workspace_id="")
+
+
+def test_manager_binds_new_and_unowned_sessions_to_its_workspace():
+    """A workspace-aware manager assigns its durable ID to every accepted session."""
+    manager = SessionManager(workspace_id="workspace")
+    assert manager.session.workspace_id == "workspace"
 
     loaded = Session(id="loaded")
     manager.load_session(loaded)
-    assert loaded.workspace_root == str(tmp_path)
+    assert loaded.workspace_id == "workspace"
 
-    owned = Session(id="owned", workspace_root=str(tmp_path))
+    owned = Session(id="owned", workspace_id="workspace")
     manager.load_session(owned)
     assert manager.session is owned
 
     manager.new_session()
-    assert manager.session.workspace_root == str(tmp_path)
+    assert manager.session.workspace_id == "workspace"
 
 
-def test_manager_rejects_sessions_owned_by_another_workspace(tmp_path):
+def test_manager_rejects_sessions_owned_by_another_workspace():
     """Cross-workspace session loading fails before replacing the active session."""
-    manager = SessionManager(workspace_root=tmp_path)
+    manager = SessionManager(workspace_id="workspace")
     original = manager.session
 
     with pytest.raises(SessionWorkspaceMismatchError, match="belongs to workspace"):
-        manager.load_session(Session(workspace_root="/another-workspace"))
+        manager.load_session(Session(workspace_id="another-workspace"))
 
     assert manager.session is original
 

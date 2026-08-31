@@ -36,6 +36,7 @@ class TelemetryRecord:
     signal: TelemetrySignal
     event_name: str
     event_sequence: int
+    workspace_id: str | None = None
     session_id: str | None = None
     message_sequence: int | None = None
     trace_id: str | None = None
@@ -45,7 +46,7 @@ class TelemetryRecord:
     attributes: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
     payload: TelemetryValue = None
     payload_sha256: str | None = None
-    schema_version: int = 1
+    schema_version: int = 2
 
 
 @dataclass

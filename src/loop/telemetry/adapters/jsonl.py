@@ -14,12 +14,17 @@ class JSONLTelemetryAdapter:
 
     Args:
         path (Path | str): Destination JSONL path created lazily on the first write.
+        workspace_id (str): Workspace identity linked from every stored record.
     """
 
     _output: PrivateRotatingTextFile
+    _workspace_id: str
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, workspace_id: str) -> None:
+        if not workspace_id:
+            raise ValueError("Workspace identifier must not be empty.")
         self._output = PrivateRotatingTextFile(path)
+        self._workspace_id = workspace_id
 
     def write_batch(self, records: Sequence[TelemetryRecord]) -> None:
         """Append one canonical line per record.
@@ -29,6 +34,12 @@ class JSONLTelemetryAdapter:
         """
         if not records:
             return
+        for record in records:
+            if record.workspace_id != self._workspace_id:
+                raise ValueError(
+                    f"Telemetry record workspace '{record.workspace_id}' does not match "
+                    f"storage workspace '{self._workspace_id}'."
+                )
         self._output.append("".join(_record_json(record) + "\n" for record in records))
 
     def flush(self) -> None:
@@ -46,6 +57,7 @@ def _record_json(record: TelemetryRecord) -> str:
         "signal": record.signal,
         "event_name": record.event_name,
         "severity": record.severity,
+        "workspace_id": record.workspace_id,
         "session_id": record.session_id,
         "message_sequence": record.message_sequence,
         "event_sequence": record.event_sequence,

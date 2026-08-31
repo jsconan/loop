@@ -172,6 +172,7 @@ __all__ = [
     "UnsupportedConversationItemError",
     "Usage",
     "Workspace",
+    "WorkspaceNameSource",
     "WorkspaceStorage",
     "command",
     "create_default_tool_registry",
@@ -414,4 +415,4 @@ from .utils import (
     iter_visible_paths,
     register_shutdown_signals,
 )
-from .workspace import Workspace, WorkspaceStorage
+from .workspace import Workspace, WorkspaceNameSource, WorkspaceStorage

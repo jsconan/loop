@@ -278,7 +278,7 @@ class SerializedSession(TypedDict):
     tokens: int
     model: str | None
     context_window: int | None
-    workspace_root: str | None
+    workspace_id: str | None
     instruction_working_directory: str | None
     active_skills: list[list[str]]
     events: list[dict]

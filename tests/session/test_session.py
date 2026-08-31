@@ -433,7 +433,7 @@ def test_session_serializes_and_deserializes_all_conversation_items():
 def test_session_round_trips_instruction_context_and_events():
     """Persistence retains workspace ownership, instruction state, and the replay timeline."""
     session = Session(
-        workspace_root="/project",
+        workspace_id="workspace",
         instruction_working_directory="/project/src",
         active_skills=[("review", "/project/.agents/skills/review/SKILL.md")],
     )
@@ -441,17 +441,17 @@ def test_session_round_trips_instruction_context_and_events():
     assert Session.deserialize(session.serialize()) == session
 
 
-def test_session_rejects_an_invalid_serialized_workspace_root():
-    """Workspace ownership accepts only a canonical root string or null."""
+def test_session_rejects_an_invalid_serialized_workspace_identifier():
+    """Workspace ownership accepts only a non-empty identifier or null."""
     payload = json.loads(Session().serialize())
-    payload["workspace_root"] = 42
+    payload["workspace_id"] = 42
 
     with pytest.raises(ValueError, match="Invalid serialized session"):
         Session.deserialize(json.dumps(payload))
 
 
 def test_session_upcasts_version_six_events_without_rewriting_them():
-    """The immediately previous schema retains its typed timeline during in-memory migration."""
+    """The previous event schema retains its typed timeline during in-memory migration."""
     session = Session(messages=[Message(role="user", content="question")])
     payload = json.loads(session.serialize())
     payload["version"] = 6
@@ -685,7 +685,7 @@ def test_session_serialization_identifies_unsupported_item_types():
         ("not-json", "Invalid serialized session"),
         ("[]", "Invalid serialized session"),
         ('{"version":8,"messages":[]}', "Unsupported session version 8"),
-        ('{"version":10,"messages":[],"tokens":0,"model":null}', "Unsupported session version 10"),
+        ('{"version":10,"messages":[],"tokens":0,"model":null}', "Invalid serialized session"),
         ('{"messages":[],"tokens":0,"model":null}', "Unsupported session version None"),
         ('{"version":5,"messages":[]}', "Invalid serialized session"),
     ],

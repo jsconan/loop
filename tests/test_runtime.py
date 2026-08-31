@@ -18,6 +18,11 @@ def workspace() -> Workspace:
         root=Path("/project"),
         working_directory=Path("/project/workspace"),
         storage=WorkspaceStorage(Path("/project/.loop")),
+        id="workspace-id",
+        name="project",
+        name_source="directory",
+        created_at_ns=1,
+        updated_at_ns=1,
     )
 
 
@@ -81,7 +86,21 @@ def test_create_composes_all_runtime_dependencies_from_one_settings_snapshot(
         queue_capacity=settings.telemetry.queue_capacity,
         batch_size=settings.telemetry.batch_size,
         flush_seconds=settings.telemetry.flush_seconds,
-        workspace_root=Path("/project"),
+        workspace_id="workspace-id",
+    )
+    runtime_dependencies["SQLiteTelemetryAdapter"].assert_called_once_with(
+        Path("/project/.loop/telemetry.db"),
+        workspace_id="workspace-id",
+        busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
+    )
+    runtime_dependencies["SQLiteSessionStore"].assert_called_once_with(
+        Path("/project/.loop/sessions.db"),
+        workspace_id="workspace-id",
+    )
+    runtime_dependencies["SessionManager"].assert_called_once_with(
+        interaction=interaction,
+        session_store=runtime_dependencies["SQLiteSessionStore"].return_value,
+        workspace_id="workspace-id",
     )
     runtime_dependencies["Loop"].create_default.assert_called_once_with(
         runtime_dependencies["OpenAIBackend"].return_value,

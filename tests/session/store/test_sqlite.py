@@ -12,6 +12,7 @@ from loop import (
     Reasoning,
     Session,
     SessionNotFoundError,
+    SessionWorkspaceMismatchError,
     SQLiteSessionStore,
     ToolCall,
     ToolResult,
@@ -30,7 +31,7 @@ def function_call() -> ToolCall:
 
 def test_store_stays_absent_until_save_and_reports_missing_sessions(tmp_path):
     """Read operations do not create storage and missing identifiers fail clearly."""
-    store = SQLiteSessionStore(tmp_path / ".loop" / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / ".loop" / "sessions.db", workspace_id="workspace")
 
     assert store.path == tmp_path / ".loop" / "sessions.db"
     assert store.list() == []
@@ -41,7 +42,7 @@ def test_store_stays_absent_until_save_and_reports_missing_sessions(tmp_path):
 
 def test_store_round_trips_complete_typed_contexts_and_updates_metadata(tmp_path):
     """SQLite snapshots preserve every item type, tokens, model, and stable identity."""
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     session = Session(
         messages=[
             Message(role="user", content="hello"),
@@ -67,9 +68,24 @@ def test_store_round_trips_complete_typed_contexts_and_updates_metadata(tmp_path
     assert listings[0].updated_at.tzinfo == UTC
 
 
+def test_store_preserves_session_ownership_after_the_workspace_moves(tmp_path):
+    """A relocated workspace reopens sessions through durable identity rather than its path."""
+    original = tmp_path / "original"
+    store = SQLiteSessionStore(original / ".loop" / "sessions.db", workspace_id="workspace")
+    session_id = store.save(Session())
+    moved = tmp_path / "moved"
+    original.rename(moved)
+
+    restored = SQLiteSessionStore(moved / ".loop" / "sessions.db", workspace_id="workspace").load(
+        session_id
+    )
+
+    assert restored.workspace_id == "workspace"
+
+
 def test_store_lists_most_recent_sessions_first(tmp_path):
     """Listings order sessions by their latest persisted update."""
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     first_id = store.save(Session())
     second_id = store.save(Session())
     with closing(sqlite3.connect(store.path)) as connection, connection:
@@ -100,14 +116,55 @@ def test_store_migrates_and_names_existing_sessions(tmp_path):
             ("legacy", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", 1, payload),
         )
 
-    store = SQLiteSessionStore(path)
+    store = SQLiteSessionStore(path, workspace_id="workspace")
 
     assert store.list()[0].name == "Recover legacy sessions"
     assert store.load("legacy").name == "Recover legacy sessions"
 
 
-def test_store_upcasts_version_four_without_rewriting_the_snapshot(tmp_path):
-    """Loading preserves legacy bytes while presenting current replay ordering in memory."""
+def test_store_upgrades_path_owned_snapshots_once_on_load(tmp_path):
+    """Loading replaces legacy path ownership with this database's durable workspace ID."""
+    path = tmp_path / "sessions.db"
+    session = Session(messages=[Message(role="user", content="question")])
+    payload = json.loads(session.serialize())
+    payload["version"] = 9
+    payload["workspace_root"] = "/old/location"
+    payload.pop("workspace_id")
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            """CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, name_source TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                message_count INTEGER NOT NULL, session TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy",
+                "Legacy",
+                "user",
+                "2026-08-20T00:00:00+00:00",
+                "2026-08-20T00:00:00+00:00",
+                1,
+                json.dumps(payload),
+            ),
+        )
+
+    restored = SQLiteSessionStore(path, workspace_id="workspace").load("legacy")
+
+    assert restored.workspace_id == "workspace"
+    with closing(sqlite3.connect(path)) as connection:
+        stored = json.loads(
+            connection.execute("SELECT session FROM sessions WHERE id = 'legacy'").fetchone()[0]
+        )
+    assert stored["version"] == 10
+    assert stored["workspace_id"] == "workspace"
+    assert "workspace_root" not in stored
+
+
+def test_store_upgrades_version_four_compactions_on_load(tmp_path):
+    """Loading preserves legacy checkpoints while durably adopting workspace identity."""
     path = tmp_path / "sessions.db"
     session = Session(messages=[Message(role="user", content="question")])
     payload = json.loads(session.serialize())
@@ -152,15 +209,10 @@ def test_store_upcasts_version_four_without_rewriting_the_snapshot(tmp_path):
             ),
         )
 
-    restored = SQLiteSessionStore(path).load("legacy")
+    restored = SQLiteSessionStore(path, workspace_id="workspace").load("legacy")
 
     assert [event.type for event in restored.events] == ["conversation_item", "compaction"]
-    with closing(sqlite3.connect(path)) as connection:
-        stored = json.loads(
-            connection.execute("SELECT session FROM sessions WHERE id = 'legacy'").fetchone()[0]
-        )
-    assert stored["version"] == 4
-    assert "events" not in stored
+    assert restored.workspace_id == "workspace"
 
 
 @pytest.mark.parametrize(
@@ -177,10 +229,40 @@ def test_store_upcasts_version_four_without_rewriting_the_snapshot(tmp_path):
 )
 def test_store_rejects_invalid_or_unsupported_persisted_data(tmp_path, payload):
     """Loading rejects corrupt, unknown, and incorrectly typed snapshot data."""
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     session_id = store.save(Session())
     with closing(sqlite3.connect(store.path)) as connection, connection:
         connection.execute("UPDATE sessions SET session = ?", (payload,))
 
     with pytest.raises(ValueError):
+        store.load(session_id)
+
+
+def test_store_rejects_an_empty_workspace_identifier(tmp_path):
+    """Workspace-scoped storage requires a non-empty durable identity."""
+    with pytest.raises(ValueError, match="must not be empty"):
+        SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="")
+
+
+def test_store_binds_unowned_sessions_and_rejects_other_workspaces(tmp_path):
+    """Storage stamps new sessions and refuses snapshots owned by another workspace."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    session = Session()
+
+    store.save(session)
+
+    assert session.workspace_id == "workspace"
+    with pytest.raises(SessionWorkspaceMismatchError, match="belongs to workspace"):
+        store.save(Session(workspace_id="another"))
+
+
+def test_store_rejects_loaded_sessions_from_another_workspace(tmp_path):
+    """Loading detects a snapshot whose durable owner does not match its database."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    session_id = store.save(Session())
+    payload = Session(workspace_id="another").serialize()
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        connection.execute("UPDATE sessions SET session = ? WHERE id = ?", (payload, session_id))
+
+    with pytest.raises(SessionWorkspaceMismatchError, match="belongs to workspace"):
         store.load(session_id)

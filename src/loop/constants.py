@@ -28,6 +28,7 @@ GIT_DIRECTORY = Path(".git")
 
 # Session-related constants
 SESSION_DATABASE_FILENAME = "sessions.db"
+WORKSPACE_DATABASE_FILENAME = "workspaces.db"
 TELEMETRY_DATABASE_FILENAME = "telemetry.db"
 OPERATIONAL_LOG_FILENAME = "loop.log"
 DEFAULT_SESSION_NAME = "Untitled session"

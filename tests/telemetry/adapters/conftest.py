@@ -17,6 +17,7 @@ def telemetry_record():
         signal="trace",
         event_name="test.event",
         event_sequence=3,
+        workspace_id="919108f7-52d1-4320-9bac-f847db4148a8",
         session_id="session",
         message_sequence=4,
         trace_id="a" * 32,

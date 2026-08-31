@@ -7,7 +7,6 @@ from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import fields
 from datetime import datetime
-from pathlib import Path
 from uuid import uuid7
 
 from .. import constants
@@ -84,7 +83,7 @@ class SessionManager:
             Defaults to a fresh session.
         session_store (SessionStore | None): Store used to persist and retrieve sessions. Defaults
             to an instance-local memory store.
-        workspace_root (Path | str | None): Canonical workspace owning every managed session.
+        workspace_id (str | None): Durable workspace identity owning every managed session.
 
     Raises:
         SessionNotFoundError: If the requested persisted session does not exist.
@@ -95,29 +94,25 @@ class SessionManager:
     _interaction: Interaction
     _session: Session
     _session_store: SessionStore
-    _workspace_root: Path | None
+    _workspace_id: str | None
 
     def __init__(
         self,
         interaction: Interaction | None = None,
         session: Session | str | None = None,
         session_store: SessionStore | None = None,
-        workspace_root: Path | str | None = None,
+        workspace_id: str | None = None,
     ) -> None:
         self._interaction = interaction or ConsoleInteraction()
         self._session_store = session_store or MemorySessionStore()
-        self._workspace_root = (
-            Path(workspace_root).resolve() if workspace_root is not None else None
-        )
+        if workspace_id == "":
+            raise ValueError("Workspace identifier must not be empty.")
+        self._workspace_id = workspace_id
 
         if session and isinstance(session, (str, Session)):
             self.load_session(session)
         else:
-            self._session = Session(
-                workspace_root=(
-                    str(self._workspace_root) if self._workspace_root is not None else None
-                )
-            )
+            self._session = Session(workspace_id=self._workspace_id)
 
     @property
     def session(self) -> Session:
@@ -438,14 +433,16 @@ class SessionManager:
             session = self._session_store.load(session)
         if not isinstance(session, Session):
             raise ValueError("Invalid session type.")  # noqa: TRY004 - public API contract.
-        workspace_root = str(self._workspace_root) if self._workspace_root is not None else None
-        if workspace_root is not None and session.workspace_root not in {None, workspace_root}:
+        if self._workspace_id is not None and session.workspace_id not in {
+            None,
+            self._workspace_id,
+        }:
             raise SessionWorkspaceMismatchError(
-                f"Session '{session.id}' belongs to workspace '{session.workspace_root}', "
-                f"not '{workspace_root}'."
+                f"Session '{session.id}' belongs to workspace '{session.workspace_id}', "
+                f"not '{self._workspace_id}'."
             )
-        if session.workspace_root is None:
-            session.workspace_root = workspace_root
+        if session.workspace_id is None:
+            session.workspace_id = self._workspace_id
         self._session = session
         for message in session.messages:
             if isinstance(message, Message):
@@ -474,9 +471,7 @@ class SessionManager:
         """Replace the active session with a fresh unpersisted session."""
         self._session = Session(
             model=self._session.model,
-            workspace_root=(
-                str(self._workspace_root) if self._workspace_root is not None else None
-            ),
+            workspace_id=self._workspace_id,
         )
 
     def rename_session(self, name: str) -> None:

@@ -7,7 +7,12 @@ from pathlib import Path
 
 from ...models import Message
 from ...utils import utc_now
-from ..models import SESSION_NAME_SOURCE_INITIAL, SessionInfo, SessionNotFoundError
+from ..models import (
+    SESSION_NAME_SOURCE_INITIAL,
+    SessionInfo,
+    SessionNotFoundError,
+    SessionWorkspaceMismatchError,
+)
 from ..naming import initial_session_name
 from ..session import Session
 
@@ -17,12 +22,20 @@ class SQLiteSessionStore:
 
     Args:
         path (Path | str): SQLite database path. Its parent is created on the first save.
+        workspace_id (str): Durable identity of the workspace owning the database.
+
+    Raises:
+        ValueError: If the workspace identifier is empty.
     """
 
     _path: Path
+    _workspace_id: str
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, workspace_id: str) -> None:
         self._path = Path(path)
+        if not workspace_id:
+            raise ValueError("Workspace identifier must not be empty.")
+        self._workspace_id = workspace_id
 
     @property
     def path(self) -> Path:
@@ -41,7 +54,13 @@ class SQLiteSessionStore:
 
         Returns:
             str: The session's stable identifier.
+
+        Raises:
+            SessionWorkspaceMismatchError: If the session belongs to another workspace.
         """
+        if session.workspace_id is None:
+            session.workspace_id = self._workspace_id
+        self._validate_workspace(session)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         if session.name is None:
             session.name = initial_session_name()
@@ -87,6 +106,7 @@ class SQLiteSessionStore:
 
         Raises:
             SessionNotFoundError: If the database or requested session does not exist.
+            SessionWorkspaceMismatchError: If the session belongs to another workspace.
             UnsupportedConversationItemError: If a serialized conversation item type is not
                 supported.
             ValueError: If the persisted session has an unsupported or invalid format.
@@ -99,13 +119,29 @@ class SQLiteSessionStore:
             row = connection.execute(
                 "SELECT name, name_source, session FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
-        if row is None:
-            raise SessionNotFoundError(f"Session '{session_id}' was not found.")
-        session = Session.deserialize(row[2])
-        session.id = session_id
-        session.name = row[0]
-        session.name_source = row[1]
+            if row is None:
+                raise SessionNotFoundError(f"Session '{session_id}' was not found.")
+            session = Session.deserialize(row[2])
+            session.id = session_id
+            session.name = row[0]
+            session.name_source = row[1]
+            if session.workspace_id is None:
+                session.workspace_id = self._workspace_id
+                connection.execute(
+                    "UPDATE sessions SET session = ? WHERE id = ?",
+                    (session.serialize(), session_id),
+                )
+                connection.commit()
+            self._validate_workspace(session)
         return session
+
+    def _validate_workspace(self, session: Session) -> None:
+        """Reject a session not owned by this workspace's storage."""
+        if session.workspace_id != self._workspace_id:
+            raise SessionWorkspaceMismatchError(
+                f"Session '{session.id}' belongs to workspace '{session.workspace_id}', "
+                f"not '{self._workspace_id}'."
+            )
 
     def list(self) -> list[SessionInfo]:
         """List persisted sessions from most to least recently updated.

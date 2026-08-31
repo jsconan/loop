@@ -327,7 +327,7 @@ def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
         skill_manager=SkillManager([skill]),
         working_directory=tmp_path,
     )
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     store.save(Session(id="older-session", name="Alpha session", name_source="user"))
     store.save(Session(id="newer-session", name="Zebra session", name_source="user"))
     session_manager = SessionManager(interaction=interaction, session_store=store)
@@ -367,7 +367,7 @@ def test_resume_command_loads_a_persisted_session_id(tmp_path):
     """Submitting a persisted session ID resumes its history and selected model."""
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.side_effect = ["/resume internal-id", False]
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     selected = Session(
         id="internal-id",
         name="Alpha session",
@@ -394,7 +394,7 @@ def test_resume_command_restores_its_linked_model_over_the_application_default(t
     """Resuming history retains the model linked to that session for reproducibility."""
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.side_effect = ["/resume internal-id", False]
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     store.save(Session(id="internal-id", name="Alpha session", name_source="user", model="old"))
     selection_writer = Mock()
     sessions = SessionManager(interaction=interaction, session_store=store)
@@ -430,7 +430,7 @@ def test_resume_command_offers_and_completes_an_interrupted_agent_run(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["/resume internal-id", False]
     interaction.confirm.return_value = True
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     interrupted = Session(id="internal-id", name="Interrupted", name_source="user")
     interrupted.add_message(Message(role="user", content="question"))
     store.save(interrupted)
@@ -513,7 +513,7 @@ def test_resumed_missing_model_uses_existing_query_fallback(tmp_path):
     """A resumed model is tried first and replaced through normal query recovery."""
     interaction = output_interaction()
     interaction.prompt.side_effect = ["/resume internal-id", "hello", "replacement", False]
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     store.save(Session(id="internal-id", model="missing"))
     sessions = SessionManager(interaction=interaction, session_store=store)
     backend = Mock(default_model="default-model")
@@ -990,7 +990,7 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
     )
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello", False]
-    store = SQLiteSessionStore(tmp_path / ".loop" / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / ".loop" / "sessions.db", workspace_id="workspace")
     session_manager = SessionManager(interaction=interaction, session_store=store)
     loop = Loop.create_default(
         backend=backend,
@@ -1124,7 +1124,7 @@ def test_loop_delegates_a_session_identifier_to_an_injected_manager(tmp_path):
 
 def test_loop_loads_a_persisted_session_identifier(tmp_path):
     """The constructor resumes persisted state under the attached backend model."""
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     stored = Session(
         messages=[Message(role="user", content="saved")], tokens=4, model="saved-model"
     )
@@ -1411,7 +1411,7 @@ def test_skill_activation_is_persisted_with_its_tool_result(tmp_path):
     )
     registry = ToolRegistry([manage_skills])
     backend = Mock(default_model="model")
-    store = SQLiteSessionStore(tmp_path / "sessions.db")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     sessions = SessionManager(session_store=store)
     manager = InstructionsManager(
         skill_manager=SkillManager([Skill("review", "Review code.", location)])

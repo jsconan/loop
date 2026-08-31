@@ -86,19 +86,18 @@ def test_telemetry_records_all_signals_with_nested_w3c_correlation():
     assert records[-1].payload_sha256 == payload_digest({"input": "complete"})
 
 
-def test_telemetry_attributes_every_signal_to_its_workspace(tmp_path):
-    """Workspace-aware telemetry attaches the canonical root to operational and trace records."""
+def test_telemetry_attributes_every_signal_to_its_workspace():
+    """Workspace-aware telemetry attaches identity without disclosing its path."""
     adapter = MemoryTelemetryAdapter()
-    telemetry = Telemetry(adapter, flush_seconds=0.01, workspace_root=tmp_path)
+    telemetry = Telemetry(adapter, flush_seconds=0.01, workspace_id="workspace")
 
     telemetry.activity("activity")
     telemetry.trace_event("trace")
     assert telemetry.close(1)
 
-    assert [record.attributes["workspace.root"] for record in adapter.records] == [
-        str(tmp_path),
-        str(tmp_path),
-    ]
+    assert [record.workspace_id for record in adapter.records] == ["workspace", "workspace"]
+    assert all("workspace.root" not in record.attributes for record in adapter.records)
+    assert all(record.schema_version == 2 for record in adapter.records)
 
 
 def test_trace_metadata_is_inherited_by_nested_traces_and_remains_scoped():
@@ -241,7 +240,8 @@ def test_activity_overload_drops_only_activity_and_preserves_priority_records():
 def test_sqlite_lifecycle_runs_in_writer_thread_and_closes_cleanly(tmp_path, caplog):
     """SQLite telemetry owns writes, flushes, and closure in its writer thread."""
     path = tmp_path / "telemetry.db"
-    telemetry = Telemetry(SQLiteTelemetryAdapter(path), batch_size=1, flush_seconds=1)
+    adapter = SQLiteTelemetryAdapter(path, workspace_id="workspace")
+    telemetry = Telemetry(adapter, workspace_id="workspace", batch_size=1, flush_seconds=1)
     with caplog.at_level(logging.ERROR, logger="loop.telemetry.telemetry"):
         telemetry.activity("persisted")
         assert telemetry.close(1)

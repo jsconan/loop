@@ -1,5 +1,5 @@
 """Expose workspace discovery and storage paths."""
 
-__all__ = ["Workspace", "WorkspaceStorage"]
+__all__ = ["Workspace", "WorkspaceNameSource", "WorkspaceStorage"]
 
-from .workspace import Workspace, WorkspaceStorage
+from .workspace import Workspace, WorkspaceNameSource, WorkspaceStorage

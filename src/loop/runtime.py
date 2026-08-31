@@ -66,16 +66,20 @@ class ApplicationRuntime:
         )
         telemetry = None
         try:
+            workspace = workspace.initialize(
+                busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms
+            )
             backend = cls._create_backend(settings)
             telemetry = Telemetry(
                 SQLiteTelemetryAdapter(
                     workspace.storage.telemetry,
+                    workspace_id=workspace.id,
                     busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
                 ),
                 queue_capacity=settings.telemetry.queue_capacity,
                 batch_size=settings.telemetry.batch_size,
                 flush_seconds=settings.telemetry.flush_seconds,
-                workspace_root=workspace.root,
+                workspace_id=workspace.id,
             )
             loop = Loop.create_default(
                 backend,
@@ -93,8 +97,11 @@ class ApplicationRuntime:
                 ),
                 session_manager=SessionManager(
                     interaction=interaction,
-                    session_store=SQLiteSessionStore(workspace.storage.sessions),
-                    workspace_root=workspace.root,
+                    session_store=SQLiteSessionStore(
+                        workspace.storage.sessions,
+                        workspace_id=workspace.id,
+                    ),
+                    workspace_id=workspace.id,
                 ),
                 agent_name=settings.loop.agent_name,
                 model=settings.loop.model,
