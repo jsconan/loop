@@ -510,7 +510,7 @@ class Session:
             payload.pop("workspace_root", None)
             payload.update(version=_SCHEMA_VERSION, workspace_id=None)
             version = payload["version"]
-        elif version in {1, 2, 3, 4, 5, 6, 7}:
+        elif version in {1, 2, 3, 4, 5, 6, 7, 8}:
             try:
                 payload = cls._upcast_payload(payload)
             except (KeyError, TypeError, ValueError) as error:
@@ -614,6 +614,10 @@ class Session:
                         "context_window": event.pop("context_window", None),
                     }
                 events.append(event)
+        elif version == 8:
+            events = value.get("events")
+            if not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
+                raise ValueError("Invalid serialized session.")
         else:
             created_at = datetime.fromtimestamp(0, UTC)
             events = []

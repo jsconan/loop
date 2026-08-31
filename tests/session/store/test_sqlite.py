@@ -3,13 +3,15 @@
 import json
 import sqlite3
 from contextlib import closing
-from datetime import UTC
+from datetime import UTC, datetime
 
 import pytest
 
 from loop import (
     Message,
     Reasoning,
+    RunCompletedEvent,
+    RunMetrics,
     Session,
     SessionNotFoundError,
     SessionWorkspaceMismatchError,
@@ -213,6 +215,89 @@ def test_store_upgrades_version_four_compactions_on_load(tmp_path):
 
     assert [event.type for event in restored.events] == ["conversation_item", "compaction"]
     assert restored.workspace_id == "workspace"
+
+
+def test_store_upgrades_version_eight_sessions_on_load(tmp_path):
+    """Loading a pre-workspace-identity session remains compatible."""
+    path = tmp_path / "sessions.db"
+    session = Session(messages=[Message(role="user", content="question")])
+    payload = json.loads(session.serialize())
+    payload["version"] = 8
+    payload.pop("workspace_id")
+
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            """CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, name_source TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                message_count INTEGER NOT NULL, session TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                session.id,
+                "Legacy",
+                "user",
+                "2026-08-20T00:00:00+00:00",
+                "2026-08-20T00:00:00+00:00",
+                1,
+                json.dumps(payload),
+            ),
+        )
+
+    restored = SQLiteSessionStore(path, workspace_id="workspace").load(session.id)
+
+    assert restored.workspace_id == "workspace"
+
+
+def test_store_preserves_version_eight_completion_events_on_load(tmp_path):
+    """Loading a completed pre-workspace session does not trigger recovery."""
+    path = tmp_path / "sessions.db"
+    session = Session(messages=[Message(role="user", content="question")])
+    session.events.append(
+        RunCompletedEvent(
+            id="run",
+            created_at=datetime(2026, 8, 20, tzinfo=UTC),
+            started_at=datetime(2026, 8, 20, tzinfo=UTC),
+            stop_reason="completed",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+    payload = json.loads(session.serialize())
+    payload["version"] = 8
+    payload.pop("workspace_id")
+
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            """CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, name_source TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                message_count INTEGER NOT NULL, session TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                session.id,
+                "Legacy",
+                "user",
+                "2026-08-20T00:00:00+00:00",
+                "2026-08-20T00:00:00+00:00",
+                1,
+                json.dumps(payload),
+            ),
+        )
+
+    restored = SQLiteSessionStore(path, workspace_id="workspace").load(session.id)
+
+    assert restored.recovery_state() is None
 
 
 @pytest.mark.parametrize(

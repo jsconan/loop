@@ -684,7 +684,7 @@ def test_session_serialization_identifies_unsupported_item_types():
     [
         ("not-json", "Invalid serialized session"),
         ("[]", "Invalid serialized session"),
-        ('{"version":8,"messages":[]}', "Unsupported session version 8"),
+        ('{"version":8,"messages":[]}', "Invalid serialized session"),
         ('{"version":10,"messages":[],"tokens":0,"model":null}', "Invalid serialized session"),
         ('{"messages":[],"tokens":0,"model":null}', "Unsupported session version None"),
         ('{"version":5,"messages":[]}', "Invalid serialized session"),
