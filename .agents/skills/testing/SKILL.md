@@ -73,6 +73,7 @@ Then run the complete suite with strict coverage:
 After changing tests, run:
 
 ```shell
+.venv/bin/ruff format tests
 .venv/bin/ruff check tests
 git diff --check
 ```

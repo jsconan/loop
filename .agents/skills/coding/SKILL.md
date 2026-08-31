@@ -95,3 +95,13 @@ Define an observable success criterion. Include docstring completeness in the ch
 public signature or behavior changes. Run the narrowest relevant checks first, then the broader
 project checks warranted by the risk. Use the `testing` skill when test code must be added or
 changed.
+
+After changing code, run:
+
+```shell
+.venv/bin/ruff format src
+.venv/bin/ruff check src
+git diff --check
+```
+
+Address any linter or formatting issues before committing.
