@@ -26,6 +26,10 @@ class SessionNotFoundError(ValueError):
     """Report that a requested persisted session does not exist."""
 
 
+class SessionWorkspaceMismatchError(ValueError):
+    """Report that a session belongs to a different workspace."""
+
+
 class UnsupportedConversationItemError(ValueError):
     """Report an unsupported conversation item type in a serialized context."""
 
@@ -274,6 +278,7 @@ class SerializedSession(TypedDict):
     tokens: int
     model: str | None
     context_window: int | None
+    workspace_root: str | None
     instruction_working_directory: str | None
     active_skills: list[list[str]]
     events: list[dict]

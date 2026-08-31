@@ -9,6 +9,7 @@ import pytest
 from loop import ShutdownRequested, main
 from loop.configuration import ApplicationSettings
 from loop.telemetry import set_telemetry as set_process_telemetry
+from loop.workspace import Workspace, WorkspaceStorage
 
 
 @pytest.fixture(autouse=True)
@@ -19,6 +20,10 @@ def isolate_main_environment(monkeypatch):
     configuration.load.return_value = ApplicationSettings()
     monkeypatch.setattr(main, "ConfigurationManager", Mock(return_value=configuration))
     monkeypatch.setattr(main, "set_telemetry", Mock())
+    workspace = Workspace(
+        Path("/project"), Path("/project/workspace"), WorkspaceStorage(Path("/project/.loop"))
+    )
+    monkeypatch.setattr(main, "Workspace", Mock(discover=Mock(return_value=workspace)))
 
 
 @pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt, ShutdownRequested])
@@ -30,7 +35,6 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
     factory = Mock(return_value=runtime)
     monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
     monkeypatch.setattr(main, "ApplicationRuntime", Mock(create=factory))
-    monkeypatch.setattr(main, "find_project_root", Mock(return_value=Path("/project")))
     register_shutdown_signals = Mock()
     monkeypatch.setattr(main, "register_shutdown_signals", register_shutdown_signals)
 
@@ -38,8 +42,7 @@ def test_main_gracefully_handles_shutdown_requests(monkeypatch, interruption):
 
     register_shutdown_signals.assert_called_once_with()
     factory.assert_called_once_with(
-        Path("/project"),
-        Path.cwd(),
+        main.Workspace.discover.return_value,
         ApplicationSettings(),
         main.ConfigurationManager.return_value,
         interaction,

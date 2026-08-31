@@ -41,7 +41,7 @@ class ConfigurationCommands:
         entry_completion = CommandCompletion(provider=self._public_entry_values)
         scope_completion = CommandCompletion(
             values=(
-                CompletionValue("scope=file", "Save to .loop/config.toml."),
+                CompletionValue("scope=workspace", "Save for this workspace."),
                 CompletionValue("scope=session", "Apply only for this session."),
             )
         )
@@ -117,7 +117,7 @@ class ConfigurationCommands:
             Field(description="New setting value for the set operation."),
         ] = None,
         scope: Annotated[
-            Literal["session", "file"] | None,
+            Literal["session", "workspace"] | None,
             Field(description="Override scope, or omit it to choose interactively."),
         ] = None,
     ) -> None:
@@ -170,34 +170,34 @@ class ConfigurationCommands:
     @staticmethod
     def _select_scope(
         context: CommandContext,
-        scope: Literal["session", "file"] | None,
-    ) -> Literal["session", "file"] | None:
+        scope: Literal["session", "workspace"] | None,
+    ) -> Literal["session", "workspace"] | None:
         """Return an explicit or letter-selected configuration scope.
 
         Args:
             context (CommandContext): Interaction used to select a scope.
-            scope (Literal["session", "file"] | None): Explicit scope, when supplied.
+            scope (Literal["session", "workspace"] | None): Explicit scope, when supplied.
         Returns:
-            Literal["session", "file"] | None: Selected scope, or ``None`` when cancelled.
+            Literal["session", "workspace"] | None: Selected scope, or ``None`` when cancelled.
         """
         if scope is not None:
             return scope
         selected = context.interaction.prompt(
             "Choose configuration scope:",
             choices={
-                "file": "Save to .loop/config.toml",
+                "workspace": "Save for this workspace",
                 "session": "This session only",
                 "cancel": "Cancel",
             },
-            index={"file": "f", "session": "s", "cancel": "c"},
+            index={"workspace": "w", "session": "s", "cancel": "c"},
         )
-        return selected if selected in {"session", "file"} else None
+        return selected if selected in {"session", "workspace"} else None
 
     @staticmethod
     def _confirm_reset(
         context: CommandContext,
         path: str | None,
-        scope: Literal["session", "file"],
+        scope: Literal["session", "workspace"],
         *,
         explicit_scope: bool,
     ) -> bool:
@@ -212,7 +212,7 @@ class ConfigurationCommands:
         target = path if path is not None else "all configuration entries"
         return context.interaction.confirm(f"Reset {target} for {scope}?", default=False)
 
-    def _reset_all(self, context: CommandContext, scope: Literal["session", "file"]) -> None:
+    def _reset_all(self, context: CommandContext, scope: Literal["session", "workspace"]) -> None:
         """Reset every setting in one selected scope to its built-in default."""
         paths = tuple(entry.path for entry in self._configuration.entries)
         settings = self._configuration.reset_all(scope=scope)

@@ -1,4 +1,4 @@
-"""Load, validate, and persist project configuration."""
+"""Load, validate, and persist workspace configuration."""
 
 from __future__ import annotations
 
@@ -45,21 +45,21 @@ _ENVIRONMENT_FIELDS = {
 
 
 class ConfigurationManager:
-    """Manage one project's comment-preserving TOML configuration document.
+    """Manage one workspace's comment-preserving TOML configuration document.
 
     Args:
-        project_root (Path | str): Root directory that owns the ``.loop`` application directory.
+        path (Path | str): Workspace TOML configuration path.
     """
 
-    _project_root: Path
+    _path: Path
     _document: tomlkit.TOMLDocument
     _effective: ApplicationSettings | None
     _sources: dict[str, str]
     _environment: dict[str, str]
     _session_values: dict[str, Any]
 
-    def __init__(self, project_root: Path | str) -> None:
-        self._project_root = Path(project_root).resolve()
+    def __init__(self, path: Path | str) -> None:
+        self._path = Path(path).resolve()
         self._document = tomlkit.document()
         self._effective = None
         self._sources = {}
@@ -71,9 +71,9 @@ class ConfigurationManager:
         """Return the durable configuration path.
 
         Returns:
-            Path: ``.loop/config.toml`` beneath the project root.
+            Path: Workspace TOML configuration path.
         """
-        return self._project_root / constants.APP_DIRECTORY / constants.APP_CONFIGURATION_FILENAME
+        return self._path
 
     def initialize(self) -> Path:
         """Create the complete default configuration document when it is absent.
@@ -179,7 +179,7 @@ class ConfigurationManager:
             dotted_path (str): Dot-separated configuration field path.
 
         Returns:
-            str: ``"environment"``, ``"config"``, or ``"default"``.
+            str: ``"environment"``, ``"workspace"``, ``"session"``, or ``"default"``.
         """
         self._split_path(dotted_path)
         return self._sources.get(dotted_path, "default")
@@ -228,7 +228,7 @@ class ConfigurationManager:
             raise
 
     def reset(self, dotted_path: str) -> ApplicationSettings:
-        """Reset one file-level setting to its built-in default.
+        """Reset one workspace setting to its built-in default.
 
         Args:
             dotted_path (str): Dot-separated configuration field path.
@@ -249,12 +249,12 @@ class ConfigurationManager:
         """
         return self.set_session(dotted_path, self._default_value(dotted_path))
 
-    def reset_all(self, *, scope: Literal["session", "file"]) -> ApplicationSettings:
+    def reset_all(self, *, scope: Literal["session", "workspace"]) -> ApplicationSettings:
         """Reset every value in one configuration scope.
 
         Args:
-            scope (Literal["session", "file"]): ``"session"`` stores defaults as process-only
-                values; ``"file"`` restores every managed value in the TOML document.
+            scope (Literal["session", "workspace"]): ``"session"`` stores defaults as
+                process-only values; ``"workspace"`` restores every managed workspace value.
 
         Returns:
             ApplicationSettings: Effective configuration after the reset.
@@ -284,7 +284,7 @@ class ConfigurationManager:
         return self._resolve()
 
     def unset(self, dotted_path: str) -> ApplicationSettings:
-        """Remove one file-level setting and return the new effective configuration.
+        """Remove one workspace setting and return the new effective configuration.
 
         Args:
             dotted_path (str): Dot-separated configuration field path.
@@ -323,12 +323,12 @@ class ConfigurationManager:
         del self._session_values[dotted_path]
         return self._resolve()
 
-    def unset_all(self, *, scope: Literal["session", "file"]) -> ApplicationSettings:
+    def unset_all(self, *, scope: Literal["session", "workspace"]) -> ApplicationSettings:
         """Remove every value from one configuration scope.
 
         Args:
-            scope (Literal["session", "file"]): ``"session"`` clears process-only values;
-                ``"file"`` clears the configuration document.
+            scope (Literal["session", "workspace"]): ``"session"`` clears process-only values;
+                ``"workspace"`` clears the workspace configuration document.
 
         Returns:
             ApplicationSettings: Effective configuration after the removal.
@@ -426,7 +426,7 @@ class ConfigurationManager:
     def _configured_sources(values: Mapping[str, Any]) -> dict[str, str]:
         """Return provenance for values explicitly present in a TOML document."""
         return {
-            f"{section}.{field}": "config"
+            f"{section}.{field}": "workspace"
             for section, table in values.items()
             if isinstance(table, Mapping)
             for field in table
@@ -438,7 +438,7 @@ class ConfigurationManager:
         document = tomlkit.document()
         document.add(
             tomlkit.comment(
-                "Loop project configuration. Environment variables override values here."
+                "Loop workspace configuration. Environment variables override values here."
             )
         )
         default_values = ConfigurationManager._stored_defaults()

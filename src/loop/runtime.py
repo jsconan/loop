@@ -2,18 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from .backend import OpenAIBackend
 from .configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
-from .constants import (
-    APP_DIRECTORY,
-    OPERATIONAL_LOG_FILENAME,
-    SESSION_DATABASE_FILENAME,
-    TELEMETRY_DATABASE_FILENAME,
-)
 from .interaction import Interaction
 from .loop import Loop
+from .permissions import PermissionManager
 from .session import SessionManager, SQLiteSessionStore
 from .telemetry import (
     SQLiteTelemetryAdapter,
@@ -24,6 +17,7 @@ from .telemetry import (
 )
 from .tooling import ToolRuntimeSettings
 from .tools import create_default_tool_registry
+from .workspace import Workspace
 
 
 class ApplicationRuntime:
@@ -47,8 +41,7 @@ class ApplicationRuntime:
     @classmethod
     def create(
         cls,
-        project_root: Path,
-        working_directory: Path,
+        workspace: Workspace,
         settings: ApplicationSettings,
         configuration: ConfigurationManager,
         interaction: Interaction,
@@ -56,8 +49,7 @@ class ApplicationRuntime:
         """Build an application runtime from one effective configuration snapshot.
 
         Args:
-            project_root (Path): Project directory that owns durable application artifacts.
-            working_directory (Path): Directory used to resolve workspace-local behavior.
+            workspace (Workspace): Active worktree and its durable artifact locations.
             settings (ApplicationSettings): Validated immutable application configuration.
             configuration (ConfigurationManager): Configuration owner used to persist model choices.
             interaction (Interaction): User interaction service for the assembled loop.
@@ -67,7 +59,7 @@ class ApplicationRuntime:
 
         """
         configure_operational_logging(
-            project_root / APP_DIRECTORY / OPERATIONAL_LOG_FILENAME,
+            workspace.storage.operational_log,
             level=settings.logging.level,
             max_bytes=settings.logging.max_bytes,
             backup_count=settings.logging.backup_count,
@@ -77,12 +69,13 @@ class ApplicationRuntime:
             backend = cls._create_backend(settings)
             telemetry = Telemetry(
                 SQLiteTelemetryAdapter(
-                    project_root / APP_DIRECTORY / TELEMETRY_DATABASE_FILENAME,
+                    workspace.storage.telemetry,
                     busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
                 ),
                 queue_capacity=settings.telemetry.queue_capacity,
                 batch_size=settings.telemetry.batch_size,
                 flush_seconds=settings.telemetry.flush_seconds,
+                workspace_root=workspace.root,
             )
             loop = Loop.create_default(
                 backend,
@@ -91,12 +84,17 @@ class ApplicationRuntime:
                     interaction=interaction,
                     settings=ToolRuntimeSettings(user_agent=settings.web.user_agent),
                 ),
-                working_directory=working_directory,
+                working_directory=workspace.working_directory,
+                permission_manager=PermissionManager(
+                    workspace.root,
+                    configuration_path=workspace.storage.permissions,
+                    audit_path=workspace.storage.permissions_audit,
+                    interaction=interaction,
+                ),
                 session_manager=SessionManager(
                     interaction=interaction,
-                    session_store=SQLiteSessionStore(
-                        project_root / APP_DIRECTORY / SESSION_DATABASE_FILENAME
-                    ),
+                    session_store=SQLiteSessionStore(workspace.storage.sessions),
+                    workspace_root=workspace.root,
                 ),
                 agent_name=settings.loop.agent_name,
                 model=settings.loop.model,

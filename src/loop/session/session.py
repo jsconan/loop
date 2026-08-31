@@ -39,7 +39,7 @@ from .models import (
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -68,6 +68,8 @@ class Session:
             or ``None`` when unknown. Defaults to ``None``.
         context_window (int | None): Context-window size in the latest successfully used
             assignment, or ``None`` when unknown. Defaults to ``None``.
+        workspace_root (str | None): Canonical root of the owning workspace. Defaults to ``None``
+            for sessions constructed outside a workspace-aware manager.
         instruction_working_directory (str | None): Last effective instruction directory.
             Defaults to ``None``.
         active_skills (list[tuple[str, str]]): Active skill names and canonical locations.
@@ -84,6 +86,7 @@ class Session:
     tokens: int = 0
     model: str | None = None
     context_window: int | None = None
+    workspace_root: str | None = None
     instruction_working_directory: str | None = None
     active_skills: list[tuple[str, str]] = field(default_factory=list)
     events: list[SessionEvent] = field(default_factory=list)
@@ -384,6 +387,7 @@ class Session:
                 tokens=self.tokens,
                 model=self.model,
                 context_window=self.context_window,
+                workspace_root=self.workspace_root,
                 instruction_working_directory=self.instruction_working_directory,
                 active_skills=[list(identity) for identity in self.active_skills],
                 events=[event.model_dump(mode="json") for event in self.events],
@@ -400,6 +404,7 @@ class Session:
         tokens: object,
         model: object,
         context_window: object,
+        workspace_root: object,
         instruction_working_directory: object,
         active_skills: object,
     ) -> None:
@@ -419,6 +424,8 @@ class Session:
             or context_window <= 0
         ):
             raise TypeError("Invalid serialized context window.")
+        if workspace_root is not None and not isinstance(workspace_root, str):
+            raise TypeError("Invalid serialized workspace root.")
         if instruction_working_directory is not None and not isinstance(
             instruction_working_directory, str
         ):
@@ -521,6 +528,7 @@ class Session:
             tokens = payload["tokens"]
             model = payload["model"]
             context_window = payload["context_window"]
+            workspace_root = payload["workspace_root"]
             compactions = [Compaction.model_validate(item) for item in payload["compactions"]]
             instruction_working_directory = payload["instruction_working_directory"]
             active_skills = payload["active_skills"]
@@ -535,6 +543,7 @@ class Session:
                 tokens=tokens,
                 model=model,
                 context_window=context_window,
+                workspace_root=workspace_root,
                 instruction_working_directory=instruction_working_directory,
                 active_skills=active_skills,
             )
@@ -552,6 +561,7 @@ class Session:
             tokens=tokens,
             model=model,
             context_window=context_window,
+            workspace_root=workspace_root,
             instruction_working_directory=instruction_working_directory,
             active_skills=[tuple(identity) for identity in active_skills],
             events=events,
@@ -636,6 +646,7 @@ class Session:
             ),
             compactions=compactions,
             context_window=value.get("context_window"),
+            workspace_root=value.get("workspace_root"),
             instruction_working_directory=value.get("instruction_working_directory"),
             active_skills=value.get("active_skills", []),
             events=events,

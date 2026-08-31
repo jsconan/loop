@@ -139,6 +139,7 @@ __all__ = [
     "SessionRecoveryState",
     "SessionStore",
     "SessionTarget",
+    "SessionWorkspaceMismatchError",
     "ShutdownRequested",
     "Skill",
     "SkillManager",
@@ -170,6 +171,8 @@ __all__ = [
     "ToolStatus",
     "UnsupportedConversationItemError",
     "Usage",
+    "Workspace",
+    "WorkspaceStorage",
     "command",
     "create_default_tool_registry",
     "delete_path",
@@ -366,6 +369,7 @@ from .session import (
     SessionNotFoundError,
     SessionRecoveryState,
     SessionStore,
+    SessionWorkspaceMismatchError,
     SQLiteSessionStore,
     StoredSession,
     ToolExecutionCompletedEvent,
@@ -410,3 +414,4 @@ from .utils import (
     iter_visible_paths,
     register_shutdown_signals,
 )
+from .workspace import Workspace, WorkspaceStorage

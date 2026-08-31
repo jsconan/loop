@@ -1,4 +1,4 @@
-"""Load, validate, and persist project configuration."""
+"""Define validated workspace configuration models."""
 
 from __future__ import annotations
 

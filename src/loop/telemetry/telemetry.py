@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar, Token
+from pathlib import Path
 from types import MappingProxyType
 from typing import cast
 from uuid import uuid4
@@ -49,6 +50,7 @@ class Telemetry:
         queue_capacity (int): Maximum pending activity records before activity overload applies.
         batch_size (int): Maximum records persisted in one adapter call.
         flush_seconds (float): Maximum delay before a partial batch is persisted.
+        workspace_root (Path | str | None): Canonical workspace root attached to every record.
     """
 
     def __init__(
@@ -58,6 +60,7 @@ class Telemetry:
         queue_capacity: int = constants.DEFAULT_TELEMETRY_QUEUE_CAPACITY,
         batch_size: int = constants.DEFAULT_TELEMETRY_BATCH_SIZE,
         flush_seconds: float = constants.DEFAULT_TELEMETRY_FLUSH_SECONDS,
+        workspace_root: Path | str | None = None,
     ) -> None:
         if queue_capacity <= 0 or batch_size <= 0 or flush_seconds <= 0:
             raise ValueError("Telemetry queue, batch, and flush values must be positive.")
@@ -76,6 +79,9 @@ class Telemetry:
         self._dropped_activity = 0
         self._write_failed = threading.Event()
         self._policy = OperationalDisclosurePolicy()
+        self._workspace_root = (
+            str(Path(workspace_root).resolve()) if workspace_root is not None else None
+        )
         self._thread = threading.Thread(
             target=self._run_writer,
             name="loop-telemetry-writer",
@@ -307,10 +313,13 @@ class Telemetry:
         try:
             context = _CURRENT_CONTEXT.get() or TelemetryContext()
             now = time.time_ns()
+            workspace_attributes = (
+                {"workspace.root": self._workspace_root} if self._workspace_root is not None else {}
+            )
             safe_attributes = (
-                self._policy.normalize(attributes)
+                self._policy.normalize({**workspace_attributes, **attributes})
                 if signal != "trace"
-                else freeze({**context.trace_metadata, **attributes})
+                else freeze({**workspace_attributes, **context.trace_metadata, **attributes})
             )
             record = TelemetryRecord(
                 record_id=f"tel_{uuid4().hex}",

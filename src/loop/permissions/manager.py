@@ -81,9 +81,10 @@ class PermissionManager:
     """Authorize complete operation plans using limits, policy rules, and approval.
 
     Args:
-        working_directory (Path | str | None): Workspace used to resolve policy root tokens.
+        workspace_root (Path | str | None): Workspace used to resolve policy root tokens.
         configuration_path (Path | str | None): YAML policy path. Defaults to
-            <working_directory>/.loop/permissions.yaml when a workspace is supplied.
+            <workspace_root>/.loop/permissions.yaml when a workspace is supplied.
+        audit_path (Path | str | None): Audit JSONL path. Defaults beside the policy path.
         interaction (Interaction | None): User interaction used for approval prompts.
         recorder (PermissionRecorder | None): Default sink for authorization observations.
         configuration (PermissionConfiguration | None): Explicit policy instead of the local file.
@@ -100,7 +101,7 @@ class PermissionManager:
             identifiers are duplicated.
     """
 
-    _working_directory: Path | None
+    _workspace_root: Path | None
     _configuration_path: Path | None
     _interaction: Interaction | None
     _recorder: PermissionRecorder | None
@@ -114,17 +115,18 @@ class PermissionManager:
 
     def __init__(
         self,
-        working_directory: Path | str | None = None,
+        workspace_root: Path | str | None = None,
         *,
         configuration_path: Path | str | None = None,
+        audit_path: Path | str | None = None,
         interaction: Interaction | None = None,
         recorder: PermissionRecorder | None = None,
         configuration: PermissionConfiguration | None = None,
         presets: Iterable[PermissionPreset] | None = None,
         load_policy: PermissionLoadPolicy | None = None,
     ) -> None:
-        self._working_directory = (
-            Path(working_directory).resolve() if working_directory is not None else None
+        self._workspace_root = (
+            Path(workspace_root).resolve() if workspace_root is not None else None
         )
         self._temporary_directory = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
             prefix=constants.TEMPORARY_DIRECTORY_PREFIX
@@ -133,13 +135,15 @@ class PermissionManager:
         self._configuration_path = (
             Path(configuration_path)
             if configuration_path is not None
-            else self._working_directory / constants.APP_DIRECTORY / constants.PERMISSIONS_FILENAME
-            if self._working_directory is not None
+            else self._workspace_root / constants.APP_DIRECTORY / constants.PERMISSIONS_FILENAME
+            if self._workspace_root is not None
             else None
         )
         self._audit_file = (
             PrivateRotatingTextFile(
-                self._configuration_path.with_name(constants.PERMISSIONS_AUDIT_FILENAME),
+                Path(audit_path)
+                if audit_path is not None
+                else self._configuration_path.with_name(constants.PERMISSIONS_AUDIT_FILENAME),
                 max_bytes=constants.DEFAULT_PERMISSIONS_AUDIT_BYTES,
                 backup_count=constants.DEFAULT_PERMISSIONS_AUDIT_BACKUPS,
             )
@@ -756,8 +760,8 @@ class PermissionManager:
             normalized = value
         else:
             path = Path(value)
-            if not path.is_absolute() and self._working_directory is not None:
-                path = self._working_directory / path
+            if not path.is_absolute() and self._workspace_root is not None:
+                path = self._workspace_root / path
             normalized = canonical_path(path)
         source = (
             self._configuration.limits
@@ -885,8 +889,8 @@ class PermissionManager:
         """
         if action in _READ_ACTIONS | _WRITE_ACTIONS:
             path = Path(resource)
-            if not path.is_absolute() and self._working_directory is not None:
-                path = self._working_directory / path
+            if not path.is_absolute() and self._workspace_root is not None:
+                path = self._workspace_root / path
             target = FileTarget(path=canonical_path(path))
         elif action is Action.NETWORK_REQUEST:
             parsed = urlsplit(resource)
@@ -902,7 +906,7 @@ class PermissionManager:
                 raise ValueError("Process explanation requires a non-empty command line.")
             target = ProcessTarget(
                 argv=argv,
-                cwd=str(self._working_directory or Path.cwd()),
+                cwd=str(self._workspace_root or Path.cwd()),
                 boundary=ProcessBoundary.HOST,
             )
         else:
@@ -1381,7 +1385,7 @@ class PermissionManager:
     def _root_path(self, configured: str) -> Path | None:
         """Resolve one configured filesystem root token or absolute path."""
         if configured == "workspace":
-            return self._working_directory.resolve() if self._working_directory else None
+            return self._workspace_root.resolve() if self._workspace_root else None
         if configured == "loop-temp":
             return self._temporary_path
         if configured == "system-temp":
@@ -1389,24 +1393,20 @@ class PermissionManager:
         path = Path(configured)
         if path.is_absolute():
             return path.resolve()
-        return (
-            (self._working_directory / path).resolve()
-            if self._working_directory is not None
-            else None
-        )
+        return (self._workspace_root / path).resolve() if self._workspace_root is not None else None
 
     def _is_protected_path(self, resource: str, *, mutation: bool) -> bool:
-        if self._working_directory is None:
+        if self._workspace_root is None:
             return False
         path = Path(resource)
         protected = (
-            self._working_directory / constants.APP_DIRECTORY,
-            self._working_directory / constants.GIT_DIRECTORY,
+            self._workspace_root / constants.APP_DIRECTORY,
+            self._workspace_root / constants.GIT_DIRECTORY,
         )
         if mutation:
             protected += (
-                self._working_directory / constants.GIT_IGNORE_FILENAME,
-                self._working_directory / constants.AGENT_IGNORE_FILENAME,
+                self._workspace_root / constants.GIT_IGNORE_FILENAME,
+                self._workspace_root / constants.AGENT_IGNORE_FILENAME,
             )
         for root in protected:
             try:
@@ -1446,14 +1446,14 @@ class PermissionManager:
     def _display_resource(self, operation: Operation) -> str | None:
         if (
             operation.resource is None
-            or self._working_directory is None
+            or self._workspace_root is None
             or not isinstance(operation.target, FileTarget)
         ):
             return operation.resource
         try:
-            relative = Path(operation.target.path).relative_to(self._working_directory)
+            relative = Path(operation.target.path).relative_to(self._workspace_root)
             return (
-                f"workspace root: {self._working_directory}"
+                f"workspace root: {self._workspace_root}"
                 if relative == Path(".")
                 else str(relative)
             )

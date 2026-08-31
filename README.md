@@ -115,9 +115,11 @@ manifest containing each reference's kind, path, original byte size, included by
 truncation state. Inline files use MIME-qualified base64 data URLs. File contents are not
 duplicated in the text manifest.
 
-The CLI persists conversations as sessions in `.loop/sessions.db` at the Git project root. The
-first user message assigns a provisional name from its first 48 characters and creates the stored
-session. After the first completed answer, a separate structured-output request generates a more
+The CLI persists conversations as sessions in `.loop/sessions.db` at the workspace root. A Git
+worktree is one workspace; outside Git, the launch directory is the workspace. Sessions retain
+their canonical workspace root and cannot be resumed from another workspace. The first user
+message assigns a provisional name from its first 48 characters and creates the stored session.
+After the first completed answer, a separate structured-output request generates a more
 descriptive name without adding the title request to conversation history. A failed title request
 leaves the provisional name intact.
 
@@ -355,13 +357,18 @@ Follow the repository's review workflow and report findings by severity.
 
 ## Configuration
 
-The CLI stores a complete, commented project configuration file at
+The CLI stores a complete, commented workspace configuration file at
 `.loop/config.toml`. It is created on first run with owner-only permissions, including the
 backend API key for a self-contained CLI setup. Keep `.loop/` private and do not commit it.
 
 Settings resolve in this order: explicit environment variables, values discovered through the
 nearest ancestor `.env`, `.loop/config.toml`, then built-in defaults. This keeps shared `.env`
-files useful while allowing a project-local durable configuration.
+files useful while allowing workspace-local durable configuration.
+
+Loop discovers one workspace at startup and uses that single context for configuration, sessions,
+telemetry, operational logs, permission policy, and permission audit records. All remain below the
+workspace's `.loop/` directory for now. Linked Git worktrees are distinct workspaces, matching
+Git's separation of worktree-specific state.
 
 The generated file contains all settings and their built-in values. Nullable settings such as
 `context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort` are omitted
@@ -417,9 +424,9 @@ Configuration-path completion prevents users from having to memorize setting nam
 /config
 /config get backend.temperature
 /config set backend.temperature 0.7 scope=session
-/config set loop.stream false scope=file
+/config set loop.stream false scope=workspace
 /config secret backend.api_key
-/config reset backend.temperature scope=file
+/config reset backend.temperature scope=workspace
 /config reset  # prompts for scope and confirmation
 ```
 

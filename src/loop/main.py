@@ -10,7 +10,8 @@ from .errors import Problem, log_problem
 from .interaction import ConsoleInteraction
 from .runtime import ApplicationRuntime
 from .telemetry import set_telemetry
-from .utils import ShutdownRequested, find_project_root, register_shutdown_signals
+from .utils import ShutdownRequested, register_shutdown_signals
+from .workspace import Workspace
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,17 +23,15 @@ def main() -> None:
 
     try:
         load_dotenv(find_dotenv(usecwd=True))
-        working_directory = Path.cwd()
-        project_root = find_project_root(working_directory) or working_directory
-        configuration = ConfigurationManager(project_root)
+        workspace = Workspace.discover(Path.cwd())
+        configuration = ConfigurationManager(workspace.storage.configuration)
         configuration.initialize()
         settings = configuration.load()
         interaction = ConsoleInteraction()
         register_shutdown_signals()
         interaction.info("Hello from loop!")
         runtime = ApplicationRuntime.create(
-            project_root,
-            working_directory,
+            workspace,
             settings,
             configuration,
             interaction,

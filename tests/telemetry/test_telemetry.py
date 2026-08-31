@@ -86,6 +86,21 @@ def test_telemetry_records_all_signals_with_nested_w3c_correlation():
     assert records[-1].payload_sha256 == payload_digest({"input": "complete"})
 
 
+def test_telemetry_attributes_every_signal_to_its_workspace(tmp_path):
+    """Workspace-aware telemetry attaches the canonical root to operational and trace records."""
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01, workspace_root=tmp_path)
+
+    telemetry.activity("activity")
+    telemetry.trace_event("trace")
+    assert telemetry.close(1)
+
+    assert [record.attributes["workspace.root"] for record in adapter.records] == [
+        str(tmp_path),
+        str(tmp_path),
+    ]
+
+
 def test_trace_metadata_is_inherited_by_nested_traces_and_remains_scoped():
     """Trace metadata reaches descendant traces, supports local overrides, and is reset."""
     adapter = MemoryTelemetryAdapter()
