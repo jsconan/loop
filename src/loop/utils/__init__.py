@@ -1,17 +1,22 @@
 """Provide utilities."""
 
 __all__ = [
+    "BoolValueHolder",
     "BoundedTextContent",
     "CachedContentMetadata",
     "ChoiceItem",
+    "FloatValueHolder",
     "IgnoreRule",
     "IgnoreRules",
+    "IntValueHolder",
     "PrivateRotatingTextFile",
     "Scalar",
     "ShutdownRequested",
+    "StrValueHolder",
     "TextSearchCase",
     "TextSearchContext",
     "TextSearchMatch",
+    "ValueHolder",
     "as_utc",
     "bound_tool_result",
     "cached_metadata",
@@ -93,4 +98,11 @@ from .text import (
     format_content_diff,
     format_content_preview,
     format_tool_call_arguments,
+)
+from .value_holder import (
+    BoolValueHolder,
+    FloatValueHolder,
+    IntValueHolder,
+    StrValueHolder,
+    ValueHolder,
 )
