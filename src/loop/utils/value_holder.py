@@ -1,15 +1,22 @@
-"""Provide stable mutable indirection around values."""
+"""Provide thread-safe mutable indirection around values."""
 
+import threading
+from collections.abc import Callable
 from typing import Any
 
 
 class ValueHolder[T]:
     """Hold a mutable value behind a stable object identity.
 
-    All holders expose the current value through :attr:`value` and :meth:`get`, and replace it
-    through either :attr:`value` assignment or :meth:`set`. They stringify and compare by their
-    current contained values while retaining object identity across mutation. Mutation makes
-    holders deliberately unhashable.
+    Individual reads and replacements are synchronized. Operations use a snapshot of the value
+    observed when they begin. Separate reads and writes, including ``holder.value += 1`` and
+    ``holder.set(holder.get() + 1)``, are not atomic; use :meth:`update` for an atomic
+    read-modify-write operation. The update callback executes while this holder's reentrant lock
+    is held and should remain short and non-blocking.
+
+    Comparisons snapshot each holder independently and never hold two holder locks at once. A
+    concurrent comparison therefore reflects whichever value was observed from each operand.
+    Holders retain object identity across mutation and are deliberately unhashable.
 
     Typed subclasses add conversion protocols appropriate to their contained type. They remain
     holders rather than subclasses or complete proxies of the wrapped built-in values.
@@ -18,10 +25,12 @@ class ValueHolder[T]:
         value (T): Initial contained value.
     """
 
+    _lock: threading.RLock
     _value: T
     __hash__ = None
 
     def __init__(self, value: T) -> None:
+        self._lock = threading.RLock()
         self._value = self._coerce(value)
 
     def _coerce(self, value: T) -> T:
@@ -35,7 +44,8 @@ class ValueHolder[T]:
         Returns:
             T: Current contained value.
         """
-        return self._value
+        with self._lock:
+            return self._value
 
     @value.setter
     def value(self, value: T) -> None:
@@ -44,7 +54,7 @@ class ValueHolder[T]:
         Args:
             value (T): New value to contain.
         """
-        self._value = self._coerce(value)
+        self.set(value)
 
     def get(self) -> T:
         """Return the current contained value.
@@ -52,7 +62,8 @@ class ValueHolder[T]:
         Returns:
             T: Current contained value.
         """
-        return self.value
+        with self._lock:
+            return self._value
 
     def set(self, value: T) -> None:
         """Replace the contained value while retaining this holder's identity.
@@ -60,39 +71,89 @@ class ValueHolder[T]:
         Args:
             value (T): New value to contain.
         """
-        self.value = value
+        coerced = self._coerce(value)
+        with self._lock:
+            self._value = coerced
+
+    def update(self, function: Callable[[T], T]) -> T:
+        """Atomically transform and replace the contained value.
+
+        The callback and coercion execute while this holder's reentrant lock is held. If either
+        raises, the previous value remains stored.
+
+        Args:
+            function (Callable[[T], T]): Short, non-blocking transformation of the current value.
+
+        Returns:
+            T: New stored value after coercion.
+        """
+        with self._lock:
+            candidate = function(self._value)
+            coerced = self._coerce(candidate)
+            self._value = coerced
+            return coerced
+
+    def compare_and_set(self, expected: object, value: T) -> bool:
+        """Replace the value atomically when it equals an expected value.
+
+        Another holder supplied as ``expected`` is snapshotted before this holder is locked, so
+        locks from two holders are never nested. Coercion occurs only after a match and failure
+        leaves the current value unchanged.
+
+        Args:
+            expected (object): Value required for replacement to proceed.
+            value (T): Replacement value to coerce and store.
+
+        Returns:
+            bool: Whether the expected value matched and replacement succeeded.
+        """
+        comparison = self._comparison_value(expected)
+        with self._lock:
+            if self._value != comparison:
+                return False
+            coerced = self._coerce(value)
+            self._value = coerced
+            return True
 
     def __str__(self) -> str:
-        return str(self.value)
+        return str(self.get())
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.value!r})"
+        return f"{type(self).__name__}({self.get()!r})"
 
     def __bool__(self) -> bool:
-        return bool(self.value)
+        return bool(self.get())
 
     def __eq__(self, other: object) -> bool:
-        return self.value == self._comparison_value(other)
+        return self.get() == self._comparison_value(other)
 
     def __ne__(self, other: object) -> bool:
-        return self.value != self._comparison_value(other)
+        return self.get() != self._comparison_value(other)
 
     def __lt__(self, other: Any) -> bool:
-        return self.value < self._comparison_value(other)
+        return self.get() < self._comparison_value(other)
 
     def __le__(self, other: Any) -> bool:
-        return self.value <= self._comparison_value(other)
+        return self.get() <= self._comparison_value(other)
 
     def __gt__(self, other: Any) -> bool:
-        return self.value > self._comparison_value(other)
+        return self.get() > self._comparison_value(other)
 
     def __ge__(self, other: Any) -> bool:
-        return self.value >= self._comparison_value(other)
+        return self.get() >= self._comparison_value(other)
 
     @staticmethod
     def _comparison_value(other: Any) -> Any:
         """Return another holder's value or an ordinary comparison operand."""
-        return other.value if isinstance(other, ValueHolder) else other
+        return other.get() if isinstance(other, ValueHolder) else other
+
+    def __getstate__(self) -> dict[str, Any]:
+        with self._lock:
+            return {name: value for name, value in self.__dict__.items() if name != "_lock"}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self._lock = threading.RLock()
+        self.__dict__.update(state)
 
 
 class StrValueHolder(ValueHolder[str]):
@@ -117,10 +178,10 @@ class IntValueHolder(ValueHolder[int]):
         return int(value)
 
     def __int__(self) -> int:
-        return self.value
+        return self.get()
 
     def __index__(self) -> int:
-        return self.value
+        return self.get()
 
 
 class FloatValueHolder(ValueHolder[float]):
@@ -134,7 +195,7 @@ class FloatValueHolder(ValueHolder[float]):
         return float(value)
 
     def __float__(self) -> float:
-        return self.value
+        return self.get()
 
 
 class BoolValueHolder(ValueHolder[bool]):

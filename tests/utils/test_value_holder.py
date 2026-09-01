@@ -1,6 +1,10 @@
 """Tests for mutable scalar value holders."""
 
+import copy
 import operator
+import pickle
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -171,3 +175,115 @@ def test_typed_holders_propagate_builtin_conversion_errors(holder_type, value, e
     """Invalid typed values expose the normal exception from the conversion builtin."""
     with pytest.raises(exception_type):
         holder_type(value)
+
+
+def test_failed_set_and_update_preserve_the_previous_value():
+    """Failed coercion and callbacks leave a typed holder unchanged."""
+    holder = IntValueHolder(10)
+
+    with pytest.raises(ValueError):
+        holder.set("invalid")
+    assert holder.get() == 10
+
+    with pytest.raises(ValueError):
+        holder.update(lambda _current: "invalid")
+    assert holder.get() == 10
+
+    with pytest.raises(RuntimeError, match="failed"):
+        holder.update(lambda _current: (_ for _ in ()).throw(RuntimeError("failed")))
+    assert holder.get() == 10
+
+
+def test_update_is_atomic_across_concurrent_workers():
+    """Concurrent atomic increments cannot lose read-modify-write updates."""
+    holder = IntValueHolder(0)
+    workers = 8
+    increments = 500
+
+    def increment() -> None:
+        """Increment the shared holder repeatedly through its atomic API."""
+        for _ in range(increments):
+            holder.update(lambda current: current + 1)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(executor.map(lambda _worker: increment(), range(workers)))
+
+    assert holder.get() == workers * increments
+
+
+def test_shared_reads_writes_and_conversions_remain_consistent():
+    """Readers observe complete coerced values while another thread replaces them."""
+    holder = IntValueHolder(0)
+    barrier = threading.Barrier(5)
+
+    def write(seed: int) -> None:
+        """Replace the shared value after all workers are ready."""
+        barrier.wait()
+        for offset in range(500):
+            holder.value = seed + offset
+
+    def read() -> None:
+        """Read and convert complete integer snapshots during replacement."""
+        barrier.wait()
+        for _ in range(500):
+            assert isinstance(holder.get(), int)
+            assert isinstance(holder.value, int)
+            assert isinstance(int(holder), int)
+            assert isinstance(str(holder), str)
+            assert holder == holder.get() or holder != holder.get()
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(write, seed * 1_000) for seed in range(2)]
+        futures.extend(executor.submit(read) for _ in range(3))
+        for future in futures:
+            future.result()
+
+
+def test_opposite_order_holder_comparisons_do_not_deadlock():
+    """Two threads can compare the same holders in opposite orders without lock nesting."""
+    first = IntValueHolder(1)
+    second = IntValueHolder(1)
+    barrier = threading.Barrier(2)
+
+    def compare(left: IntValueHolder, right: IntValueHolder) -> bool:
+        """Start with the peer and compare repeatedly in one operand order."""
+        barrier.wait()
+        return all(left == right for _ in range(1_000))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        forward = executor.submit(compare, first, second)
+        reverse = executor.submit(compare, second, first)
+        assert forward.result(timeout=2)
+        assert reverse.result(timeout=2)
+
+
+def test_compare_and_set_atomically_matches_and_coerces_replacements():
+    """Compare-and-set changes only a matching value and preserves it on errors."""
+    holder = IntValueHolder(10)
+
+    assert holder.compare_and_set(10, "20") is True
+    assert holder.get() == 20
+    assert holder.compare_and_set(10, 30) is False
+    assert holder.get() == 20
+    with pytest.raises(ValueError):
+        holder.compare_and_set(20, "invalid")
+    assert holder.get() == 20
+
+
+@pytest.mark.parametrize(
+    "holder",
+    [
+        ValueHolder("value"),
+        StrValueHolder("value"),
+        IntValueHolder(1),
+        FloatValueHolder(1),
+        BoolValueHolder(1),
+    ],
+)
+def test_value_holders_copy_and_pickle_with_independent_synchronization(holder):
+    """Copying and pickling preserve values without attempting to serialize locks."""
+    replicas = [copy.copy(holder), copy.deepcopy(holder), pickle.loads(pickle.dumps(holder))]
+
+    holder.set(holder.get())
+
+    assert all(replica is not holder and replica == holder for replica in replicas)

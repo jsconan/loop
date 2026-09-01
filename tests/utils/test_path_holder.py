@@ -1,6 +1,9 @@
 """Tests for mutable path references and path discovery helpers."""
 
 import os
+import pickle
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -264,3 +267,60 @@ def test_path_holder_is_unhashable_because_its_equality_value_is_mutable():
     """A holder cannot be hashed because replacing its path changes equality."""
     with pytest.raises(TypeError, match="unhashable type"):
         hash(PathHolder("value"))
+
+
+def test_path_iterators_snapshot_before_the_holder_is_retargeted(tmp_path):
+    """Lazy path iterators remain bound to the path current when each call began."""
+    original = tmp_path / "original"
+    original.mkdir()
+    child = original / "child.txt"
+    child.write_text("content", encoding="utf-8")
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    holder = PathHolder(original)
+
+    children = holder.iterdir()
+    globbed = holder.glob("*.txt")
+    recursively_globbed = holder.rglob("*.txt")
+    walked = holder.walk()
+    holder.set(replacement)
+
+    assert list(children) == [child]
+    assert list(globbed) == [child]
+    assert list(recursively_globbed) == [child]
+    assert next(walked)[0] == original
+
+
+def test_path_iteration_does_not_block_retargeting(tmp_path):
+    """An unconsumed filesystem iterator never retains the holder's synchronization lock."""
+    original = tmp_path / "original"
+    original.mkdir()
+    (original / "child").touch()
+    holder = PathHolder(original)
+    iterator_created = threading.Event()
+    allow_iteration = threading.Event()
+
+    def iterate() -> list[Path]:
+        """Create an iterator, pause, and consume its snapshotted directory later."""
+        iterator = holder.iterdir()
+        iterator_created.set()
+        assert allow_iteration.wait(timeout=2)
+        return list(iterator)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(iterate)
+        assert iterator_created.wait(timeout=2)
+        holder.set(tmp_path / "replacement")
+        allow_iteration.set()
+        assert future.result(timeout=2) == [original / "child"]
+
+
+def test_path_holder_pickle_preserves_the_path_with_a_fresh_lock(tmp_path):
+    """Pickle round trips retain PathHolder behavior without serializing its lock."""
+    holder = PathHolder(tmp_path)
+
+    restored = pickle.loads(pickle.dumps(holder))
+    restored.set(tmp_path / "other")
+
+    assert holder.get() == tmp_path
+    assert restored.get() == tmp_path / "other"

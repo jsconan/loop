@@ -16,7 +16,9 @@ class PathHolder(ValueHolder[Path], os.PathLike[str]):
 
     Like every value holder, this class provides :attr:`value`, :meth:`get`, and :meth:`set` as
     one stable mutable indirection. Changing the value retargets future operations through this
-    object. Paths derived from the holder are ordinary, independent snapshots::
+    object. Each path operation snapshots the current path and releases the holder lock before
+    performing filesystem I/O or iteration. Paths derived from the holder are ordinary,
+    independent snapshots::
 
         holder = PathHolder("/old")
         child = holder / "child"
@@ -128,7 +130,7 @@ class PathHolder(ValueHolder[Path], os.PathLike[str]):
         return self.value.suffixes
 
     def __fspath__(self) -> str:
-        return os.fspath(self.value)
+        return os.fspath(self.get())
 
     def __truediv__(self, key: PathInput) -> Path:
         return self.value / key
@@ -201,7 +203,8 @@ class PathHolder(ValueHolder[Path], os.PathLike[str]):
         Yields:
             Path: Each matching path.
         """
-        yield from self.value.glob(pattern, case_sensitive=case_sensitive)
+        path = self.get()
+        return path.glob(pattern, case_sensitive=case_sensitive)
 
     def group(self) -> str:
         """Return the group name owning the current path.
@@ -323,7 +326,8 @@ class PathHolder(ValueHolder[Path], os.PathLike[str]):
         Yields:
             Path: Each direct child path.
         """
-        yield from self.value.iterdir()
+        path = self.get()
+        return path.iterdir()
 
     def joinpath(self, *pathsegments: PathInput) -> Path:
         """Return a snapshot combining the current path and child components.
@@ -487,7 +491,8 @@ class PathHolder(ValueHolder[Path], os.PathLike[str]):
         Yields:
             Path: Each matching path.
         """
-        yield from self.value.rglob(pattern, case_sensitive=case_sensitive)
+        path = self.get()
+        return path.rglob(pattern, case_sensitive=case_sensitive)
 
     def rmdir(self) -> None:
         """Remove the current empty directory."""
@@ -554,9 +559,8 @@ class PathHolder(ValueHolder[Path], os.PathLike[str]):
         Yields:
             tuple[Path, list[str], list[str]]: Root snapshot, directory names, and file names.
         """
-        yield from self.value.walk(
-            top_down=top_down, on_error=on_error, follow_symlinks=follow_symlinks
-        )
+        path = self.get()
+        return path.walk(top_down=top_down, on_error=on_error, follow_symlinks=follow_symlinks)
 
     def with_name(self, name: str) -> Path:
         """Return a snapshot with a different final component.
