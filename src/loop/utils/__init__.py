@@ -9,6 +9,8 @@ __all__ = [
     "IgnoreRule",
     "IgnoreRules",
     "IntValueHolder",
+    "PathHolder",
+    "PathInput",
     "PrivateRotatingTextFile",
     "Scalar",
     "ShutdownRequested",
@@ -89,6 +91,7 @@ from .path import (
     is_path_ignored,
     iter_visible_paths,
 )
+from .path_holder import PathHolder, PathInput
 from .process import kill_process_group, parse_command_line, read_bounded_stream
 from .rotating_file import PrivateRotatingTextFile
 from .search import ripgrep_path, search_text_paths
