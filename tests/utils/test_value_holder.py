@@ -36,6 +36,31 @@ def test_value_holder_exposes_one_value_through_properties_and_methods():
     assert holder.value is initial
 
 
+def test_value_holder_from_value_returns_existing_holder_unchanged():
+    """The factory preserves an existing holder's identity and current value."""
+    holder = ValueHolder(object())
+
+    result = ValueHolder.from_value(holder)
+
+    assert result is holder
+
+
+@pytest.mark.parametrize(
+    ("holder_type", "value", "expected"),
+    [
+        (ValueHolder, "value", "value"),
+        (IntValueHolder, "42", 42),
+        (PathHolder, "folder/file.txt", Path("folder/file.txt")),
+    ],
+)
+def test_value_holder_from_value_constructs_requested_holder_type(holder_type, value, expected):
+    """The factory uses the requested class and applies its normal value coercion."""
+    holder = holder_type.from_value(value)
+
+    assert type(holder) is holder_type
+    assert holder.value == expected
+
+
 @pytest.mark.parametrize(
     ("holder", "expected", "value_type"),
     [

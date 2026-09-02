@@ -5,7 +5,7 @@ import threading
 from collections.abc import Callable
 from os import PathLike
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 
 type PathInput = str | PathLike[str]
 
@@ -161,6 +161,17 @@ class ValueHolder[T]:
 
     def __ge__(self, other: Any) -> bool:
         return self.get() >= self._comparison_value(other)
+
+    @classmethod
+    def from_value(cls, value: T | Self) -> Self:
+        """Create a new holder initialized with the given value.
+
+        Args:
+            value (T | Self): Value to store or another holder to snapshot.
+        """
+        if isinstance(value, ValueHolder):
+            return value
+        return cls(value)
 
     @staticmethod
     def _comparison_value(other: Any) -> Any:
