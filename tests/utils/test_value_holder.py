@@ -2,9 +2,11 @@
 
 import copy
 import operator
+import os
 import pickle
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +14,7 @@ from loop.utils import (
     BoolValueHolder,
     FloatValueHolder,
     IntValueHolder,
+    PathHolder,
     StrValueHolder,
     ValueHolder,
 )
@@ -287,3 +290,132 @@ def test_value_holders_copy_and_pickle_with_independent_synchronization(holder):
     holder.set(holder.get())
 
     assert all(replica is not holder and replica == holder for replica in replicas)
+
+
+class ExamplePathLike(os.PathLike[str]):
+    """Provide a minimal string-backed path-like value for compatibility tests."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __fspath__(self) -> str:
+        return self.value
+
+
+@pytest.mark.parametrize("value", ["folder/file.txt", Path("folder/file.txt")])
+def test_path_holder_constructs_from_string_and_path(value):
+    """Construction normalizes string and Path inputs into a Path value."""
+    holder = PathHolder(value)
+
+    assert holder.value == Path("folder/file.txt")
+    assert isinstance(holder.value, Path)
+
+
+def test_path_holder_shares_the_common_value_holder_api_and_storage():
+    """Value, get, and set expose one Path through a stable holder identity."""
+    holder = PathHolder("first")
+    consumer = holder
+
+    assert isinstance(holder, ValueHolder)
+    assert holder.value == holder.get() == Path("first")
+
+    holder.value = ExamplePathLike("second")
+    assert holder.value == holder.get() == Path("second")
+
+    assert holder.set("third") is None
+    assert consumer is holder
+    assert consumer.value == consumer.get() == Path("third")
+
+    holder.value = "fourth"
+    assert holder.value == holder.get() == Path("fourth")
+
+
+def test_path_holder_constructs_from_and_retargets_to_pathlike_values():
+    """Construction and mutation accept arbitrary compatible string path-like values."""
+    holder = PathHolder(ExamplePathLike("first"))
+
+    holder.set(ExamplePathLike("second"))
+
+    assert holder.value == Path("second")
+
+
+def test_path_holder_retargets_in_place():
+    """Replacing path changes future operations without replacing the holder object."""
+    holder = PathHolder("first")
+    identity = id(holder)
+
+    holder.set(Path("second"))
+
+    assert id(holder) == identity
+    assert str(holder) == "second"
+
+
+def test_path_holder_supports_pathlike_and_stdlib_filesystem_apis(tmp_path):
+    """The holder works directly with fspath, open, stat, and os.path APIs."""
+    target = tmp_path / "content.txt"
+    holder = PathHolder(target)
+
+    with open(holder, "w", encoding="utf-8") as stream:
+        stream.write("content")
+
+    assert os.fspath(holder) == os.fspath(target)
+    assert os.stat(holder).st_size == 7
+    assert os.path.exists(holder)
+
+
+def test_path_holder_string_and_representation_show_the_current_path():
+    """String conversion mirrors Path while repr identifies the mutable wrapper."""
+    holder = PathHolder("current/path")
+
+    assert str(holder) == str(Path("current/path"))
+    assert repr(holder) == f"PathHolder({Path('current/path')!r})"
+
+
+def test_path_holder_equality_tracks_current_path_and_supports_ordering():
+    """Equality and ordering use current Path values for holders and ordinary Paths."""
+    first = PathHolder("a")
+    same = PathHolder(Path("a"))
+    later = PathHolder("b")
+
+    assert first == same
+    assert first == Path("a")
+    assert first != Path("b")
+    assert first < later
+    assert first <= same
+    assert later > first
+    assert later >= Path("b")
+
+    same.set("c")
+
+    assert first != same
+
+
+def test_path_holder_comparisons_unwrap_other_value_holder_types():
+    """Cross-holder comparisons follow the underlying values' normal Python semantics."""
+    holder = PathHolder("a")
+    generic = ValueHolder(Path("a"))
+
+    assert holder == generic
+    assert generic == holder
+    assert holder <= generic
+
+
+def test_path_holder_is_unhashable_because_its_equality_value_is_mutable():
+    """A holder cannot be hashed because replacing its path changes equality."""
+    with pytest.raises(TypeError, match="unhashable type"):
+        hash(PathHolder("value"))
+
+
+def test_path_holder_derived_paths_are_path_snapshots():
+    """Path-producing lexical and normalization operations return immutable snapshots."""
+    holder = PathHolder("/old/report.txt")
+    snapshots = [
+        holder / "child",
+        "parent" / holder,
+    ]
+
+    holder.set("/new/report.txt")
+
+    assert all(isinstance(path, Path) for path in snapshots)
+    assert snapshots[0] == Path("/old/report.txt/child")
+    assert snapshots[1] == Path("parent/old/report.txt")

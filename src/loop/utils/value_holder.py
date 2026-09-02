@@ -1,8 +1,28 @@
 """Provide thread-safe mutable indirection around values."""
 
+import os
 import threading
 from collections.abc import Callable
-from typing import Any
+from os import PathLike
+from pathlib import Path
+from typing import Any, Protocol
+
+type PathInput = str | PathLike[str]
+
+
+class ValueReference[T](Protocol):
+    """Provide the current value without exposing mutation."""
+
+    def get(self) -> T:
+        """Return the current value.
+
+        Returns:
+            T: Current referenced value.
+        """
+
+
+class PathReference(ValueReference[Path], PathLike[str], Protocol):
+    """Provide the current filesystem path without exposing mutation."""
 
 
 class ValueHolder[T]:
@@ -160,7 +180,7 @@ class StrValueHolder(ValueHolder[str]):
     """Hold a mutable value coerced with :class:`str`.
 
     Args:
-        value (object): Initial value to convert to a string.
+        value (str): Initial value to convert to a string.
     """
 
     def _coerce(self, value: str) -> str:
@@ -171,7 +191,7 @@ class IntValueHolder(ValueHolder[int]):
     """Hold a mutable value coerced with :class:`int`.
 
     Args:
-        value (object): Initial value accepted by ``int(value)``.
+        value (int): Initial value accepted by ``int(value)``.
     """
 
     def _coerce(self, value: int) -> int:
@@ -188,7 +208,7 @@ class FloatValueHolder(ValueHolder[float]):
     """Hold a mutable value coerced with :class:`float`.
 
     Args:
-        value (object): Initial value accepted by ``float(value)``.
+        value (float): Initial value accepted by ``float(value)``.
     """
 
     def _coerce(self, value: float) -> float:
@@ -205,8 +225,29 @@ class BoolValueHolder(ValueHolder[bool]):
     string is false while every non-empty string, including ``"false"``, is true.
 
     Args:
-        value (object): Initial value to convert with :class:`bool`.
+        value (bool): Initial value to convert with :class:`bool`.
     """
 
     def _coerce(self, value: bool) -> bool:
         return bool(value)
+
+
+class PathHolder(ValueHolder[Path], os.PathLike[str]):
+    """Hold a mutable reference to a filesystem path.
+
+    Args:
+        path (PathInput): Initial filesystem path.
+    """
+
+    def _coerce(self, value: PathInput) -> Path:
+        """Normalize a path-like input into the sole contained Path value."""
+        return Path(value)
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.get())
+
+    def __truediv__(self, key: PathInput) -> Path:
+        return self.get() / key
+
+    def __rtruediv__(self, key: PathInput) -> Path:
+        return Path(key) / self.get().relative_to("/")

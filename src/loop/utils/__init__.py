@@ -11,6 +11,7 @@ __all__ = [
     "IntValueHolder",
     "PathHolder",
     "PathInput",
+    "PathReference",
     "PrivateRotatingTextFile",
     "Scalar",
     "ShutdownRequested",
@@ -19,6 +20,7 @@ __all__ = [
     "TextSearchContext",
     "TextSearchMatch",
     "ValueHolder",
+    "ValueReference",
     "as_utc",
     "bound_tool_result",
     "cached_metadata",
@@ -91,7 +93,6 @@ from .path import (
     is_path_ignored,
     iter_visible_paths,
 )
-from .path_holder import PathHolder, PathInput
 from .process import kill_process_group, parse_command_line, read_bounded_stream
 from .rotating_file import PrivateRotatingTextFile
 from .search import ripgrep_path, search_text_paths
@@ -106,6 +107,10 @@ from .value_holder import (
     BoolValueHolder,
     FloatValueHolder,
     IntValueHolder,
+    PathHolder,
+    PathInput,
+    PathReference,
     StrValueHolder,
     ValueHolder,
+    ValueReference,
 )
