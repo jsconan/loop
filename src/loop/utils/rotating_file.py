@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+from filelock import FileLock
+
 from .. import constants
 
 
@@ -26,6 +28,7 @@ class PrivateRotatingTextFile:
     _max_bytes: int | None
     _backup_count: int
     _lock: threading.Lock
+    _process_lock: FileLock
 
     def __init__(
         self,
@@ -42,6 +45,7 @@ class PrivateRotatingTextFile:
         self._max_bytes = max_bytes
         self._backup_count = backup_count
         self._lock = threading.Lock()
+        self._process_lock = FileLock(f"{self._path}.lock")
 
     def append(self, text: str) -> None:
         """Append complete text after applying the configured retention policy.
@@ -53,8 +57,9 @@ class PrivateRotatingTextFile:
             OSError: If preparing, rotating, or writing the file fails.
         """
         encoded_size = len(text.encode("utf-8"))
-        with self._lock:
+        with self._lock, self._process_lock:
             self._prepare_parent()
+            Path(self._process_lock.lock_file).chmod(constants.PRIVATE_FILE_MODE)
             if self._should_rotate(encoded_size):
                 self._rotate()
             with self._path.open("a", encoding="utf-8") as output:
@@ -67,8 +72,9 @@ class PrivateRotatingTextFile:
         Raises:
             OSError: If preparing the destination fails.
         """
-        with self._lock:
+        with self._lock, self._process_lock:
             self._prepare_parent()
+            Path(self._process_lock.lock_file).chmod(constants.PRIVATE_FILE_MODE)
             self._path.touch(exist_ok=True)
             self._path.chmod(constants.PRIVATE_FILE_MODE)
 

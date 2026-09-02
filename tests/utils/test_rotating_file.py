@@ -51,6 +51,22 @@ def test_private_rotating_text_file_can_disable_rotation(tmp_path):
     assert not path.with_name("audit.jsonl.1").exists()
 
 
+def test_private_rotating_text_file_secures_process_lock_file(tmp_path):
+    """Prepare and append create a private lock file beside the active file."""
+    path = tmp_path / "audit.jsonl"
+    lock_path = path.with_name("audit.jsonl.lock")
+
+    PrivateRotatingTextFile(path).prepare()
+
+    assert lock_path.exists()
+    assert lock_path.stat().st_mode & 0o777 == 0o600
+
+    path.unlink()
+    PrivateRotatingTextFile(path).append("entry\n")
+
+    assert lock_path.stat().st_mode & 0o777 == 0o600
+
+
 @pytest.mark.parametrize("kwargs", ({"max_bytes": -1}, {"backup_count": -1}))
 def test_private_rotating_text_file_rejects_negative_limits(tmp_path, kwargs):
     """Configuration rejects limits that cannot describe a valid retention policy."""
