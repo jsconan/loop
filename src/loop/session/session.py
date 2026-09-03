@@ -398,7 +398,7 @@ class Session:
     @staticmethod
     def _validate_snapshot_metadata(
         *,
-        id: object,
+        session_id: object,
         name: object,
         name_source: object,
         tokens: object,
@@ -409,7 +409,7 @@ class Session:
         active_skills: object,
     ) -> None:
         """Validate scalar and instruction metadata from a current snapshot."""
-        if not isinstance(id, str) or not id:
+        if not isinstance(session_id, str) or not session_id:
             raise TypeError("Invalid session identifier.")
         if name is not None and (not isinstance(name, str) or not normalize_session_name(name)):
             raise TypeError("Invalid serialized session name.")
@@ -538,11 +538,11 @@ class Session:
             instruction_working_directory = payload["instruction_working_directory"]
             active_skills = payload["active_skills"]
             events = [_EVENT_ADAPTER.validate_python(item) for item in payload["events"]]
-            id = payload["id"]
+            session_id = payload["id"]
             name = payload["name"]
             name_source = payload["name_source"]
             cls._validate_snapshot_metadata(
-                id=id,
+                session_id=session_id,
                 name=name,
                 name_source=name_source,
                 tokens=tokens,
@@ -558,7 +558,7 @@ class Session:
             raise ValueError("Invalid serialized session.") from error
 
         return cls(
-            id=id,
+            id=session_id,
             name=name,
             name_source=name_source,
             messages=messages,
