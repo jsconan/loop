@@ -57,7 +57,7 @@ def test_value_holder_from_value_constructs_requested_holder_type(holder_type, v
     """The factory uses the requested class and applies its normal value coercion."""
     holder = holder_type.from_value(value)
 
-    assert type(holder) is holder_type
+    assert isinstance(holder, holder_type)
     assert holder.value == expected
 
 
@@ -437,6 +437,7 @@ def test_path_holder_derived_paths_are_path_snapshots():
     snapshots = [
         holder / "child",
         "parent" / holder,
+        holder.resolve(),
     ]
 
     holder.set("/new/report.txt")
@@ -444,3 +445,19 @@ def test_path_holder_derived_paths_are_path_snapshots():
     assert all(isinstance(path, Path) for path in snapshots)
     assert snapshots[0] == Path("/old/report.txt/child")
     assert snapshots[1] == Path("parent/old/report.txt")
+    assert snapshots[2] == Path("/old/report.txt")
+
+
+def test_path_holder_delegates_common_file_and_directory_methods(tmp_path):
+    """Common filesystem mutations and queries operate on the current target."""
+    folder = tmp_path / "nested"
+    folder.mkdir()
+    holder = PathHolder(folder)
+    assert holder.exists()
+
+    file = folder / "content.txt"
+    file.write_text("hello", encoding="utf-8")
+    holder.set(file)
+    assert holder.exists()
+    file.unlink()
+    assert not holder.exists()

@@ -24,6 +24,26 @@ class ValueReference[T](Protocol):
 class PathReference(ValueReference[Path], PathLike[str], Protocol):
     """Provide the current filesystem path without exposing mutation."""
 
+    def resolve(self, strict: bool = False) -> Path:
+        """Return a resolved absolute snapshot.
+
+        Args:
+            strict (bool): Whether a missing target raises ``FileNotFoundError``.
+
+        Returns:
+            Path: Resolved path.
+        """
+
+    def exists(self, *, follow_symlinks: bool = True) -> bool:
+        """Return whether the current path exists.
+
+        Args:
+            follow_symlinks (bool): Whether to follow symbolic links.
+
+        Returns:
+            bool: Whether the target exists.
+        """
+
 
 class ValueHolder[T]:
     """Hold a mutable value behind a stable object identity.
@@ -262,3 +282,25 @@ class PathHolder(ValueHolder[Path], os.PathLike[str]):
 
     def __rtruediv__(self, key: PathInput) -> Path:
         return Path(key) / self.get().relative_to("/")
+
+    def resolve(self, strict: bool = False) -> Path:
+        """Return a resolved absolute snapshot.
+
+        Args:
+            strict (bool): Whether a missing target raises ``FileNotFoundError``.
+
+        Returns:
+            Path: Resolved path.
+        """
+        return self.get().resolve(strict=strict)
+
+    def exists(self, *, follow_symlinks: bool = True) -> bool:
+        """Return whether the current path exists.
+
+        Args:
+            follow_symlinks (bool): Whether to follow symbolic links.
+
+        Returns:
+            bool: Whether the target exists.
+        """
+        return self.get().exists(follow_symlinks=follow_symlinks)
