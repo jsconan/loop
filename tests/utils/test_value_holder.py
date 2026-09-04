@@ -20,6 +20,14 @@ from loop.utils import (
 )
 
 
+class PositiveIntValueHolder(IntValueHolder):
+    """Hold integer values greater than zero for validation-path tests."""
+
+    def _validate(self, value: int) -> None:
+        if value <= 0:
+            raise ValueError("Value must be positive.")
+
+
 def test_value_holder_exposes_one_value_through_properties_and_methods():
     """The generic holder preserves values and shares storage across its public API."""
     initial = object()
@@ -220,6 +228,30 @@ def test_failed_set_and_update_preserve_the_previous_value():
     with pytest.raises(RuntimeError, match="failed"):
         holder.update(lambda _current: (_ for _ in ()).throw(RuntimeError("failed")))
     assert holder.get() == 10
+
+
+def test_value_holder_validation_runs_after_coercion_and_rejects_invalid_values():
+    """Subclass validation sees coerced values and applies during construction and replacement."""
+    holder = PositiveIntValueHolder("2")
+
+    assert holder.get() == 2
+
+    with pytest.raises(ValueError, match="must be positive"):
+        holder.set("0")
+    assert holder.get() == 2
+
+
+def test_value_holder_validation_preserves_value_when_atomic_operations_fail():
+    """Validation failures from update and compare-and-set leave the prior value unchanged."""
+    holder = PositiveIntValueHolder(2)
+
+    with pytest.raises(ValueError, match="must be positive"):
+        holder.update(lambda _current: "0")
+    assert holder.get() == 2
+
+    with pytest.raises(ValueError, match="must be positive"):
+        holder.compare_and_set(2, "0")
+    assert holder.get() == 2
 
 
 def test_update_is_atomic_across_concurrent_workers():

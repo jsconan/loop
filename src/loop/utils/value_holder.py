@@ -75,7 +75,11 @@ class ValueHolder[T]:
 
     def _coerce(self, value: T) -> T:
         """Return the value to store."""
+        self._validate(value)
         return value
+
+    def _validate(self, value: T) -> None:
+        """Validate the value before storing it."""
 
     @property
     def value(self) -> T:
@@ -215,7 +219,7 @@ class StrValueHolder(ValueHolder[str]):
     """
 
     def _coerce(self, value: str) -> str:
-        return str(value)
+        return super()._coerce(str(value))
 
 
 class IntValueHolder(ValueHolder[int]):
@@ -226,7 +230,7 @@ class IntValueHolder(ValueHolder[int]):
     """
 
     def _coerce(self, value: int) -> int:
-        return int(value)
+        return super()._coerce(int(value))
 
     def __int__(self) -> int:
         return self.get()
@@ -243,7 +247,7 @@ class FloatValueHolder(ValueHolder[float]):
     """
 
     def _coerce(self, value: float) -> float:
-        return float(value)
+        return super()._coerce(float(value))
 
     def __float__(self) -> float:
         return self.get()
@@ -260,7 +264,7 @@ class BoolValueHolder(ValueHolder[bool]):
     """
 
     def _coerce(self, value: bool) -> bool:
-        return bool(value)
+        return super()._coerce(bool(value))
 
 
 class PathHolder(ValueHolder[Path], os.PathLike[str]):
@@ -272,7 +276,7 @@ class PathHolder(ValueHolder[Path], os.PathLike[str]):
 
     def _coerce(self, value: PathInput) -> Path:
         """Normalize a path-like input into the sole contained Path value."""
-        return Path(value)
+        return super()._coerce(Path(value))
 
     def __fspath__(self) -> str:
         return os.fspath(self.get())
