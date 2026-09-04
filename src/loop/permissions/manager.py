@@ -9,6 +9,7 @@ import ipaddress
 import json
 import logging
 import shlex
+import sqlite3
 import tempfile
 from collections.abc import Iterable
 from fnmatch import fnmatchcase
@@ -22,13 +23,12 @@ from .. import constants
 from ..errors import Problem, log_problem
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import (
-    PrivateRotatingTextFile,
     ShutdownRequested,
     canonical_path,
     local_now,
     sha256_digest,
-    utc_now,
 )
+from .audit import SQLitePermissionAudit
 from .models import (
     Action,
     ApprovalChoice,
@@ -84,7 +84,8 @@ class PermissionManager:
         workspace_root (Path | str | None): Workspace used to resolve policy root tokens.
         configuration_path (Path | str | None): YAML policy path. Defaults to
             <workspace_root>/.loop/permissions.yaml when a workspace is supplied.
-        audit_path (Path | str | None): Audit JSONL path. Defaults beside the policy path.
+        audit_path (Path | str | None): Central SQLite audit database path.
+        workspace_id (str | None): Stable identity attached to centralized audit records.
         interaction (Interaction | None): User interaction used for approval prompts.
         recorder (PermissionRecorder | None): Default sink for authorization observations.
         configuration (PermissionConfiguration | None): Explicit policy instead of the local file.
@@ -111,7 +112,8 @@ class PermissionManager:
     _temporary_directory: tempfile.TemporaryDirectory[str]
     _temporary_path: Path
     _presets: dict[str, PermissionPreset]
-    _audit_file: PrivateRotatingTextFile | None
+    _audit_store: SQLitePermissionAudit | None
+    _workspace_id: str | None
 
     def __init__(
         self,
@@ -119,6 +121,7 @@ class PermissionManager:
         *,
         configuration_path: Path | str | None = None,
         audit_path: Path | str | None = None,
+        workspace_id: str | None = None,
         interaction: Interaction | None = None,
         recorder: PermissionRecorder | None = None,
         configuration: PermissionConfiguration | None = None,
@@ -139,17 +142,8 @@ class PermissionManager:
             if self._workspace_root is not None
             else None
         )
-        self._audit_file = (
-            PrivateRotatingTextFile(
-                Path(audit_path)
-                if audit_path is not None
-                else self._configuration_path.with_name(constants.PERMISSIONS_AUDIT_FILENAME),
-                max_bytes=constants.DEFAULT_PERMISSIONS_AUDIT_BYTES,
-                backup_count=constants.DEFAULT_PERMISSIONS_AUDIT_BACKUPS,
-            )
-            if self._configuration_path is not None
-            else None
-        )
+        self._workspace_id = workspace_id
+        self._audit_store = SQLitePermissionAudit(audit_path) if audit_path is not None else None
         self._interaction = interaction
         self._recorder = recorder
         self._load_policy = load_policy or (
@@ -1467,18 +1461,11 @@ class PermissionManager:
 
     def _append_audit(self, event_name: str, payload: dict[str, object]) -> None:
         """Append one bounded audit payload without affecting policy behavior."""
-        if self._audit_file is None:
+        if self._audit_store is None or self._workspace_id is None:
             return
-        record = {
-            **payload,
-            "audit_schema_version": 1,
-            "event_name": event_name,
-            "timestamp": utc_now().isoformat(),
-        }
         try:
-            encoded_record = json.dumps(record, sort_keys=True) + "\n"
-            self._audit_file.append(encoded_record)
-        except OSError as error:
+            self._audit_store.append(self._workspace_id, event_name, payload)
+        except (OSError, sqlite3.Error) as error:
             # The durable session recorder remains authoritative for application behavior;
             # diagnostic JSONL availability must not change an authorization outcome.
             telemetry_error(

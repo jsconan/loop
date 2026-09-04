@@ -1,8 +1,7 @@
 """Tests for layered operation-policy evaluation, approval, and persistence."""
 
-import json
+import sqlite3
 import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -118,29 +117,23 @@ def test_default_policy_allows_scoped_reads_and_fails_closed_for_approval(tmp_pa
     assert write.policy.decision is Decision.ASK
     assert write.decision is Decision.DENY
     assert write.source == "headless"
-    audit = tmp_path / ".loop" / "permissions-audit.jsonl"
-    assert json.loads(audit.read_text("utf-8").splitlines()[-1])["source"] == "headless"
+    assert not (tmp_path / ".loop" / "permissions-audit.jsonl").exists()
 
 
-def test_permission_audit_rotates_valid_private_jsonl_archives(tmp_path, monkeypatch):
-    """Permission audit storage retains bounded, complete, private JSONL archives."""
-    monkeypatch.setattr("loop.constants.DEFAULT_PERMISSIONS_AUDIT_BYTES", 1)
-    monkeypatch.setattr("loop.constants.DEFAULT_PERMISSIONS_AUDIT_BACKUPS", 2)
-    manager = PermissionManager(tmp_path)
+def test_permission_audit_uses_central_sqlite_storage(tmp_path):
+    """Permission audit storage records workspace-correlated SQLite rows."""
+    audit_path = tmp_path / "state" / "audit.db"
+    manager = PermissionManager(tmp_path, audit_path=audit_path, workspace_id="workspace")
 
     for tool_id in ("first", "second", "third", "fourth"):
         manager.authorize((file_operation(Action.FILESYSTEM_READ, tmp_path / f"{tool_id}.txt"),))
 
-    audit_path = tmp_path / ".loop" / "permissions-audit.jsonl"
-    audit_paths = (
-        audit_path,
-        *(audit_path.with_name(f"{audit_path.name}.{index}") for index in (1, 2)),
-    )
-    assert all(path.exists() for path in audit_paths)
-    assert not audit_path.with_name(f"{audit_path.name}.3").exists()
-    assert all(json.loads(path.read_text("utf-8")) for path in audit_paths)
-    assert all(path.stat().st_mode & 0o777 == 0o600 for path in audit_paths)
-    assert (audit_path.parent.stat().st_mode & 0o777) == 0o700
+    with sqlite3.connect(audit_path) as connection:
+        rows = connection.execute(
+            "SELECT workspace_id, event_name FROM permission_audit_records"
+        ).fetchall()
+    assert rows == [("workspace", "permission.decided")] * 4
+    assert audit_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_permission_audit_rotation_failure_does_not_change_authorization(tmp_path, monkeypatch):
@@ -152,6 +145,23 @@ def test_permission_audit_rotation_failure_does_not_change_authorization(tmp_pat
     monkeypatch.setattr(Path, "replace", Mock(side_effect=OSError("unavailable")))
 
     result = manager.authorize(operation_set)
+
+    assert result.decision is Decision.ALLOW
+
+
+def test_sqlite_permission_audit_failure_does_not_change_authorization(tmp_path, monkeypatch):
+    """A failed centralized audit insert cannot change an authorization decision."""
+    manager = PermissionManager(
+        tmp_path,
+        audit_path=tmp_path / "audit.db",
+        workspace_id="workspace",
+    )
+    monkeypatch.setattr(
+        "loop.permissions.audit.SQLitePermissionAudit.append",
+        Mock(side_effect=sqlite3.OperationalError("busy")),
+    )
+
+    result = manager.authorize((file_operation(Action.FILESYSTEM_READ, tmp_path / "file.txt"),))
 
     assert result.decision is Decision.ALLOW
 
@@ -268,14 +278,6 @@ def test_workspace_approval_persists_exact_rules_and_audit_metadata(tmp_path):
     assert reloaded.persistent_rules[0].tool_exact is True
     assert "tool_match=exact" in reloaded.describe("workspace")
     assert reloaded.authorize((target,)).decision is Decision.ALLOW
-    stored = json.loads(
-        (tmp_path / ".loop" / "permissions-audit.jsonl").read_text("utf-8").splitlines()[0]
-    )
-    assert datetime.fromisoformat(stored["timestamp"]).tzinfo is UTC
-    assert stored["audit_schema_version"] == 1
-    assert stored["event_name"] == "permission.decided"
-    assert stored["approval_choice"] == "workspace"
-    assert stored["installed_rule_ids"] == list(approved.installed_rule_ids)
 
 
 def test_policy_mutations_write_timestamped_local_and_structured_audit_records(tmp_path):
@@ -295,11 +297,6 @@ def test_policy_mutations_write_timestamped_local_and_structured_audit_records(t
     finally:
         set_telemetry(None)
 
-    record = json.loads(
-        (tmp_path / ".loop" / "permissions-audit.jsonl").read_text("utf-8").splitlines()[0]
-    )
-    assert record["event_name"] == "permission.default_set"
-    assert datetime.fromisoformat(record["timestamp"]).tzinfo is UTC
     assert adapter.records[0].event_name == "permission.default_set"
     assert adapter.records[0].attributes["scope"] == "session"
 

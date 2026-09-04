@@ -32,10 +32,12 @@ __all__ = [
     "PresetSource",
     "ProcessBoundary",
     "ProcessTarget",
+    "SQLitePermissionAudit",
     "SessionPolicyOverrides",
     "SessionTarget",
 ]
 
+from .audit import SQLitePermissionAudit
 from .commands import PermissionCommands
 from .manager import PermissionManager
 from .models import (
