@@ -193,7 +193,7 @@ class ValueHolder[T]:
         Args:
             value (T | Self): Value to store or another holder to snapshot.
         """
-        if isinstance(value, ValueHolder):
+        if isinstance(value, cls):
             return value
         return cls(value)
 

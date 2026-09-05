@@ -53,6 +53,26 @@ def test_value_holder_from_value_returns_existing_holder_unchanged():
     assert result is holder
 
 
+def test_typed_value_holder_from_value_returns_matching_holder_unchanged():
+    """A typed factory preserves an existing holder of its requested type."""
+    holder = StrValueHolder("value")
+
+    result = StrValueHolder.from_value(holder)
+
+    assert result is holder
+
+
+def test_typed_value_holder_from_value_wraps_base_holder_with_requested_type():
+    """A typed factory converts a base holder instead of returning the base holder."""
+    holder = ValueHolder("value")
+
+    result = StrValueHolder.from_value(holder)
+
+    assert isinstance(result, StrValueHolder)
+    assert result is not holder
+    assert result.value == "value"
+
+
 @pytest.mark.parametrize(
     ("holder_type", "value", "expected"),
     [
