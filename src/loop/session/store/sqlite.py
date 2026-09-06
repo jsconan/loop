@@ -37,6 +37,32 @@ class SQLiteSessionStore:
             raise ValueError("Workspace identifier must not be empty.")
         self._workspace_id = workspace_id
 
+    def import_legacy(self, source: Path | str) -> bool:
+        """Import a legacy database when this store does not yet exist.
+
+        Args:
+            source (Path | str): Legacy session database copied through SQLite backup.
+
+        Returns:
+            bool: Whether the legacy database was imported.
+        """
+        legacy = Path(source).resolve()
+        if not legacy.is_file() or self.path.exists():
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.migration.tmp")
+        try:
+            with (
+                closing(sqlite3.connect(legacy)) as source_connection,
+                closing(sqlite3.connect(temporary)) as destination_connection,
+            ):
+                source_connection.backup(destination_connection)
+            temporary.chmod(0o600)
+            temporary.replace(self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return True
+
     @property
     def path(self) -> Path:
         """Return the configured database path.

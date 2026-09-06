@@ -29,7 +29,7 @@ def isolate_main(monkeypatch):
     repository = Mock()
     repository.initialize.return_value = initialized
     monkeypatch.setattr(main, "WorkspaceRepository", Mock(return_value=repository))
-    monkeypatch.setattr(main, "WorkspaceMigration", Mock())
+    monkeypatch.setattr(main, "ApplicationMigration", Mock())
     monkeypatch.setattr(main, "set_telemetry", Mock())
 
 

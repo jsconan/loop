@@ -32,9 +32,39 @@ def test_audit_validates_inputs_and_refuses_export_overwrite(tmp_path):
     audit = SQLitePermissionAudit(tmp_path / "audit.db")
     with pytest.raises(ValueError, match="non-empty"):
         audit.append("", "event", {})
+    with pytest.raises(ValueError, match="workspace"):
+        audit.import_legacy_jsonl(tmp_path / "missing.jsonl", workspace_id="")
+    assert audit.import_legacy_jsonl(tmp_path / "missing.jsonl", workspace_id="workspace") == 0
     destination = audit.export_jsonl(tmp_path / "audit.jsonl")
     with pytest.raises(FileExistsError, match="already exists"):
         audit.export_jsonl(destination)
+
+
+def test_audit_imports_legacy_jsonl_idempotently_and_rolls_back_errors(tmp_path):
+    """Legacy audit imports deduplicate identities and remain atomic on malformed input."""
+    audit = SQLitePermissionAudit(tmp_path / "audit.db")
+    source = tmp_path / "legacy.jsonl"
+    source.write_text(
+        json.dumps({"event_name": "first", "payload": {"decision": "allow"}})
+        + "\n"
+        + json.dumps({"record_id": "second", "timestamp_ns": 2})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert audit.import_legacy_jsonl(source, workspace_id="workspace") == 2
+    assert audit.import_legacy_jsonl(source, workspace_id="workspace") == 0
+    source.write_text(json.dumps({"record_id": "third"}) + "\ninvalid\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="line 2"):
+        audit.import_legacy_jsonl(source, workspace_id="workspace")
+
+    with sqlite3.connect(audit.path) as connection:
+        assert (
+            connection.execute(
+                "SELECT record_id FROM permission_audit_records WHERE record_id = 'third'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_audit_export_applies_payload_time_and_event_filters(tmp_path, monkeypatch):

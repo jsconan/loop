@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
-from .application import ApplicationPaths, ApplicationRuntime
+from .application import ApplicationMigration, ApplicationPaths, ApplicationRuntime
 from .configuration import ConfigurationManager
 from .errors import Problem, log_problem
 from .interaction import ConsoleInteraction
@@ -13,7 +13,6 @@ from .telemetry import set_telemetry
 from .utils import ShutdownRequested, register_shutdown_signals
 from .workspace import (
     Workspace,
-    WorkspaceMigration,
     WorkspaceRepository,
     WorkspaceSwitchRequested,
 )
@@ -41,10 +40,11 @@ def main() -> None:
             )
             configuration.initialize()
             settings = configuration.load()
-            WorkspaceMigration(
+            ApplicationMigration(
                 workspace,
-                workspace_paths.sessions,
-                workspace_paths.permissions,
+                paths,
+                workspace_paths,
+                busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
             ).run()
             runtime = ApplicationRuntime.create(
                 workspace,

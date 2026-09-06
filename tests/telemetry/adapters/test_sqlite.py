@@ -68,6 +68,75 @@ def test_sqlite_adapter_rejects_records_owned_by_another_workspace(tmp_path, tel
     adapter.close()
 
 
+def test_sqlite_adapter_imports_legacy_records_idempotently(tmp_path):
+    """Legacy telemetry import owns schema translation, payload copying, and deduplication."""
+    source = tmp_path / "legacy.db"
+    with closing(sqlite3.connect(source)) as connection, connection:
+        connection.execute(
+            "CREATE TABLE telemetry_payloads(payload_id INTEGER PRIMARY KEY, encoding TEXT NOT NULL, "
+            "size_bytes INTEGER NOT NULL, payload BLOB NOT NULL)"
+        )
+        connection.execute("INSERT INTO telemetry_payloads VALUES (1, 'json', 2, '{}')")
+        connection.execute(
+            "CREATE TABLE telemetry_records(record_id TEXT PRIMARY KEY,timestamp_ns INTEGER NOT NULL,"
+            "observed_ns INTEGER NOT NULL,signal TEXT NOT NULL,event_name TEXT NOT NULL,severity TEXT,"
+            "workspace_id TEXT,session_id TEXT,message_sequence INTEGER,event_sequence INTEGER NOT NULL,"
+            "trace_id TEXT,span_id TEXT,parent_span_id TEXT,attributes TEXT NOT NULL,payload_id INTEGER,"
+            "payload_sha256 TEXT,schema_version INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO telemetry_records VALUES "
+            "('record',1,1,'trace','legacy',NULL,NULL,NULL,NULL,1,NULL,NULL,NULL,'{}',1,NULL,1)"
+        )
+    adapter = SQLiteTelemetryAdapter(tmp_path / "central.db", workspace_id="workspace")
+
+    assert adapter.import_legacy(tmp_path / "missing.db") == 0
+    assert adapter.import_legacy(source) == 1
+    assert adapter.import_legacy(source) == 0
+    adapter.close()
+
+    with closing(sqlite3.connect(tmp_path / "central.db")) as connection:
+        assert connection.execute(
+            "SELECT r.workspace_id, p.payload FROM telemetry_records r "
+            "JOIN telemetry_payloads p ON p.payload_id = r.payload_id"
+        ).fetchone() == ("workspace", "{}")
+
+
+def test_sqlite_adapter_rejects_malformed_legacy_sources_atomically(tmp_path):
+    """Unsupported schemas and missing payloads never leave partial imported records."""
+    malformed = tmp_path / "malformed.db"
+    with closing(sqlite3.connect(malformed)) as connection, connection:
+        connection.execute("CREATE TABLE telemetry_records(value TEXT)")
+    adapter = SQLiteTelemetryAdapter(tmp_path / "central.db", workspace_id="workspace")
+    with pytest.raises(ValueError, match="unsupported schema"):
+        adapter.import_legacy(malformed)
+
+    broken = tmp_path / "broken.db"
+    with closing(sqlite3.connect(broken)) as connection, connection:
+        connection.execute(
+            "CREATE TABLE telemetry_payloads(payload_id INTEGER PRIMARY KEY, encoding TEXT NOT NULL, "
+            "size_bytes INTEGER NOT NULL, payload BLOB NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE telemetry_records(record_id TEXT PRIMARY KEY,timestamp_ns INTEGER NOT NULL,"
+            "observed_ns INTEGER NOT NULL,signal TEXT NOT NULL,event_name TEXT NOT NULL,severity TEXT,"
+            "workspace_id TEXT,session_id TEXT,message_sequence INTEGER,event_sequence INTEGER NOT NULL,"
+            "trace_id TEXT,span_id TEXT,parent_span_id TEXT,attributes TEXT NOT NULL,payload_id INTEGER,"
+            "payload_sha256 TEXT,schema_version INTEGER NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO telemetry_records VALUES "
+            "(?,1,1,'trace','legacy',NULL,NULL,NULL,NULL,1,NULL,NULL,NULL,'{}',?,NULL,1)",
+            (("valid", None), ("broken", 9)),
+        )
+    with pytest.raises(ValueError, match="missing payload"):
+        adapter.import_legacy(broken)
+    adapter.close()
+
+    with closing(sqlite3.connect(tmp_path / "central.db")) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM telemetry_records").fetchone() == (0,)
+
+
 def test_sqlite_adapter_rolls_back_an_invalid_existing_telemetry_schema(tmp_path):
     """Invalid telemetry schemas fail without leaving an open migration transaction."""
     path = tmp_path / "telemetry.db"

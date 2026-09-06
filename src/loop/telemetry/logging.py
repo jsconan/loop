@@ -4,12 +4,34 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .. import constants
 from ..utils import PrivateRotatingTextFile
+
+
+def import_legacy_operational_log(source: Path | str, destination: Path | str) -> bool:
+    """Import a legacy operational log when the central log is absent.
+
+    Args:
+        source (Path | str): Legacy operational log path.
+        destination (Path | str): Central operational log path.
+
+    Returns:
+        bool: Whether the legacy log was imported.
+    """
+    legacy = Path(source).resolve()
+    target = Path(destination).resolve()
+    if not legacy.is_file() or target.exists():
+        return False
+    target.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+    with legacy.open("rb") as input_file, target.open("xb") as output_file:
+        shutil.copyfileobj(input_file, output_file)
+    target.chmod(constants.PRIVATE_FILE_MODE)
+    return True
 
 
 class SafeRotatingFileHandler(logging.Handler):

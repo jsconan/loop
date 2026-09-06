@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .. import constants
+from ..utils import sha256_digest
 
 
 class SQLitePermissionAudit:
@@ -70,6 +71,60 @@ class SQLitePermissionAudit:
                     1,
                 ),
             )
+
+    def import_legacy_jsonl(self, source: Path | str, *, workspace_id: str) -> int:
+        """Import a legacy JSONL audit stream into centralized storage.
+
+        Args:
+            source (Path | str): Legacy permission audit JSONL path.
+            workspace_id (str): Workspace identity assigned to imported records.
+
+        Returns:
+            int: Number of newly imported audit records.
+
+        Raises:
+            ValueError: If the workspace is empty or a source line is malformed.
+        """
+        if not workspace_id:
+            raise ValueError("Audit workspace must be non-empty.")
+        legacy = Path(source).resolve()
+        if not legacy.is_file():
+            return 0
+        imported = 0
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                with legacy.open(encoding="utf-8") as input_file:
+                    for line_number, line in enumerate(input_file, 1):
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError as error:
+                            raise ValueError(
+                                f"Malformed legacy audit record at line {line_number}."
+                            ) from error
+                        identity = record.get("record_id") or sha256_digest(line)
+                        cursor = connection.execute(
+                            "INSERT OR IGNORE INTO permission_audit_records VALUES (?,?,?,?,?,?,?)",
+                            (
+                                identity,
+                                record.get("timestamp_ns", 0),
+                                workspace_id,
+                                record.get("process_id", 0),
+                                record.get("event_name", "permission.legacy"),
+                                json.dumps(
+                                    record.get("payload", {}),
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                                record.get("schema_version", 1),
+                            ),
+                        )
+                        imported += cursor.rowcount
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return imported
 
     def export_jsonl(
         self,

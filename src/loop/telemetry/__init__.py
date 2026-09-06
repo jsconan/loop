@@ -17,6 +17,7 @@ __all__ = [
     "TelemetryValue",
     "configure_operational_logging",
     "get_telemetry",
+    "import_legacy_operational_log",
     "set_telemetry",
     "telemetry_activity",
     "telemetry_audit",
@@ -32,7 +33,7 @@ from .adapters import (
     SQLiteTelemetryAdapter,
     TelemetryAdapter,
 )
-from .logging import configure_operational_logging
+from .logging import configure_operational_logging, import_legacy_operational_log
 from .models import (
     LifecycleRequest,
     TelemetryContext,

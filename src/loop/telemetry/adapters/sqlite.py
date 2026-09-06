@@ -113,6 +113,83 @@ class SQLiteTelemetryAdapter:
                     ),
                 )
 
+    def import_legacy(self, source: Path | str) -> int:
+        """Import legacy telemetry records into this adapter's database.
+
+        Args:
+            source (Path | str): Legacy telemetry database.
+
+        Returns:
+            int: Number of newly imported telemetry records.
+
+        Raises:
+            ValueError: If the legacy schema is unsupported or a payload is missing.
+        """
+        legacy = Path(source).resolve()
+        if not legacy.is_file():
+            return 0
+        required = {
+            "record_id",
+            "timestamp_ns",
+            "observed_ns",
+            "signal",
+            "event_name",
+            "event_sequence",
+            "attributes",
+            "schema_version",
+        }
+        destination = self._connect()
+        with sqlite3.connect(legacy) as source_connection:
+            columns = {
+                row[1] for row in source_connection.execute("PRAGMA table_info(telemetry_records)")
+            }
+            if not required <= columns:
+                raise ValueError("Legacy telemetry database has an unsupported schema.")
+            names = [row[1] for row in destination.execute("PRAGMA table_info(telemetry_records)")]
+            selected = [name for name in names if name in columns and name != "payload_id"]
+            query_names = selected + (["payload_id"] if "payload_id" in columns else [])
+            imported = 0
+            destination.execute("BEGIN IMMEDIATE")
+            try:
+                for row in source_connection.execute(
+                    f"SELECT {','.join(query_names)} FROM telemetry_records"
+                ):
+                    values = dict(zip(query_names, row, strict=True))
+                    if destination.execute(
+                        "SELECT 1 FROM telemetry_records WHERE record_id = ?",
+                        (values["record_id"],),
+                    ).fetchone():
+                        continue
+                    values["workspace_id"] = values.get("workspace_id") or self._workspace_id
+                    old_payload_id = values.pop("payload_id", None)
+                    if old_payload_id is not None:
+                        payload = source_connection.execute(
+                            "SELECT encoding, size_bytes, payload FROM telemetry_payloads "
+                            "WHERE payload_id = ?",
+                            (old_payload_id,),
+                        ).fetchone()
+                        if payload is None:
+                            raise ValueError(
+                                "Legacy telemetry record references a missing payload."
+                            )
+                        values["payload_id"] = destination.execute(
+                            "INSERT INTO telemetry_payloads(encoding, size_bytes, payload) "
+                            "VALUES (?, ?, ?)",
+                            payload,
+                        ).lastrowid
+                    keys = list(values)
+                    destination.execute(
+                        f"INSERT INTO telemetry_records({','.join(keys)}) "
+                        f"VALUES ({','.join('?' for _ in keys)})",
+                        [values[key] for key in keys],
+                    )
+                    imported += 1
+                destination.commit()
+            except BaseException:
+                destination.rollback()
+                raise
+        return imported
+
     def flush(self) -> None:
         """Commit pending adapter work."""
         if self._connection is not None:
