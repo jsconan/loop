@@ -16,6 +16,7 @@ dependencies = [
     "markdown-it-py>=4.0.0,<5",
     "openai>=2.46.0,<3",
     "pathspec>=1.0.0,<2",
+    "platformdirs>=4.9.4,<5",
     "prompt-toolkit>=3.0.52,<4",
     "pydantic>=2.13.0,<3",
     "pydantic-settings>=2.15.0,<3",
