@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import time
 from contextlib import closing
 from dataclasses import replace
@@ -50,6 +51,7 @@ class WorkspaceRepository:
         name = workspace.root.name or "Untitled workspace"
         name_source: WorkspaceNameSource = "directory" if workspace.root.name else "default"
         legacy = self._legacy_identity(workspace.root)
+        locator_kind, locator = self._locator(workspace.root)
         connection = self._connect(busy_timeout_ms)
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -59,6 +61,28 @@ class WorkspaceRepository:
                 "ON l.workspace_id = w.workspace_id WHERE l.canonical_path = ?",
                 (str(workspace.root),),
             ).fetchone()
+            relocated = False
+            if row is None and locator is not None:
+                matches = connection.execute(
+                    "SELECT w.workspace_id, w.name, w.name_source, w.created_at_ns, "
+                    "w.updated_at_ns, l.canonical_path FROM workspaces AS w "
+                    "JOIN workspace_locations AS l ON l.workspace_id = w.workspace_id "
+                    "WHERE l.locator_kind = ? AND l.locator = ? AND l.status = 'active'",
+                    (locator_kind, locator),
+                ).fetchall()
+                if len(matches) == 1:
+                    match = matches[0]
+                    previous = Path(match[5])
+                    if not previous.exists():
+                        row = match[:5]
+                        relocated = True
+                        now = time.time_ns()
+                        connection.execute(
+                            "UPDATE workspace_locations SET canonical_path = ?, "
+                            "last_seen_at_ns = ? WHERE workspace_id = ? AND canonical_path = ?",
+                            (str(workspace.root), now, row[0], str(previous)),
+                        )
+                        row = self._refresh_directory_name(connection, row, workspace.root, now)
             if row is None:
                 now = time.time_ns()
                 row = None
@@ -89,14 +113,26 @@ class WorkspaceRepository:
                     connection.execute(
                         "INSERT INTO workspace_locations("
                         "location_id, workspace_id, canonical_path, first_seen_at_ns, "
-                        "last_seen_at_ns, status) VALUES (?, ?, ?, ?, ?, ?)",
-                        (str(uuid4()), row[0], str(workspace.root), now, now, "active"),
+                        "last_seen_at_ns, status, locator_kind, locator) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            str(uuid4()),
+                            row[0],
+                            str(workspace.root),
+                            now,
+                            now,
+                            "active",
+                            locator_kind,
+                            locator,
+                        ),
                     )
             else:
-                connection.execute(
-                    "UPDATE workspace_locations SET last_seen_at_ns = ? WHERE canonical_path = ?",
-                    (time.time_ns(), str(workspace.root)),
-                )
+                if not relocated:
+                    connection.execute(
+                        "UPDATE workspace_locations SET last_seen_at_ns = ?, locator_kind = ?, "
+                        "locator = ? WHERE canonical_path = ?",
+                        (time.time_ns(), locator_kind, locator, str(workspace.root)),
+                    )
             connection.commit()
             initialized = replace(
                 workspace,
@@ -125,11 +161,11 @@ class WorkspaceRepository:
         query = (
             "SELECT w.workspace_id, w.name, w.name_source, w.created_at_ns, w.updated_at_ns, "
             "l.canonical_path FROM workspaces AS w JOIN workspace_locations AS l "
-            "ON l.workspace_id = w.workspace_id"
+            "ON l.workspace_id = w.workspace_id WHERE l.status = 'active'"
         )
         parameters: tuple[str, ...] = ()
         if workspace_id is not None:
-            query += " WHERE w.workspace_id = ?"
+            query += " AND w.workspace_id = ?"
             parameters = (workspace_id,)
         query += " ORDER BY w.name, w.workspace_id"
         with closing(self._connect(constants.DEFAULT_STORAGE_SQLITE_BUSY_TIMEOUT_MS)) as connection:
@@ -153,7 +189,7 @@ class WorkspaceRepository:
             workspace_id (str): Durable identifier of the workspace to rename.
             name (str): Validated non-empty replacement name.
         """
-        with (
+        with (  # pylint: disable=confusing-with-statement
             closing(self._connect(constants.DEFAULT_STORAGE_SQLITE_BUSY_TIMEOUT_MS)) as connection,
             connection,
         ):
@@ -162,6 +198,257 @@ class WorkspaceRepository:
                 "WHERE workspace_id = ?",
                 (name, time.time_ns(), workspace_id),
             )
+
+    def refresh_name(
+        self,
+        workspace_id: str,
+        name: str,
+        source: WorkspaceNameSource,
+        *,
+        relocation_confirmed: bool = False,
+    ) -> bool:
+        """Conservatively refresh a workspace name from a trusted source.
+
+        Args:
+            workspace_id (str): Durable workspace identity.
+            name (str): Non-empty candidate name.
+            source (WorkspaceNameSource): Source supplying the candidate.
+            relocation_confirmed (bool): Whether locator resolution confirmed a directory move.
+
+        Returns:
+            bool: Whether the durable name changed.
+
+        Raises:
+            ValueError: If the candidate is empty or the workspace is unknown.
+        """
+        candidate = name.strip()
+        if not candidate:
+            raise ValueError("Workspace name must not be empty.")
+        with (  # pylint: disable=confusing-with-statement
+            closing(self._connect(constants.DEFAULT_STORAGE_SQLITE_BUSY_TIMEOUT_MS)) as connection,
+            connection,
+        ):
+            row = connection.execute(
+                "SELECT name,name_source FROM workspaces WHERE workspace_id=?", (workspace_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown workspace identity '{workspace_id}'.")
+            current_name, current_source = row
+            allowed = current_source == "default" and source != "default"
+            allowed = allowed or (source in {"provider", "remote"} and current_source == source)
+            allowed = allowed or (
+                source == "directory" and current_source == "directory" and relocation_confirmed
+            )
+            if not allowed or (current_name == candidate and current_source == source):
+                return False
+            connection.execute(
+                "UPDATE workspaces SET name=?,name_source=?,updated_at_ns=? WHERE workspace_id=?",
+                (candidate, source, time.time_ns(), workspace_id),
+            )
+        return True
+
+    def attach(self, path: Path | str, workspace_id: str | None = None) -> Workspace:
+        """Attach a path to a new or existing durable workspace identity.
+
+        Args:
+            path (Path | str): Existing workspace path to associate.
+            workspace_id (str | None): Existing identity, or ``None`` to create one.
+
+        Returns:
+            Workspace: Initialized attached workspace.
+
+        Raises:
+            FileNotFoundError: If the path is not an existing directory.
+            ValueError: If the identity is unknown or either side is already active elsewhere.
+        """
+        root = Path(path).expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Workspace path is not a directory: {root}")
+        if workspace_id is None:
+            return self.initialize(Workspace.discover(root))
+        kind, locator = self._locator(root)
+        with closing(self._connect(constants.DEFAULT_STORAGE_SQLITE_BUSY_TIMEOUT_MS)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT workspace_id, name, name_source, created_at_ns, updated_at_ns "
+                    "FROM workspaces WHERE workspace_id = ?",
+                    (workspace_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"Unknown workspace identity '{workspace_id}'.")
+                conflict = connection.execute(
+                    "SELECT workspace_id FROM workspace_locations WHERE canonical_path = ? "
+                    "AND status = 'active'",
+                    (str(root),),
+                ).fetchone()
+                if conflict is not None and conflict[0] != workspace_id:
+                    raise ValueError("Workspace path is already attached to another identity.")
+                live = connection.execute(
+                    "SELECT canonical_path FROM workspace_locations WHERE workspace_id = ? "
+                    "AND status = 'active' AND canonical_path != ?",
+                    (workspace_id, str(root)),
+                ).fetchall()
+                if any(Path(item[0]).exists() for item in live):
+                    raise ValueError("Workspace identity is already attached to an active path.")
+                now = time.time_ns()
+                connection.execute(
+                    "UPDATE workspace_locations SET status = 'inactive' WHERE workspace_id = ?",
+                    (workspace_id,),
+                )
+                connection.execute(
+                    "INSERT INTO workspace_locations(location_id, workspace_id, canonical_path, "
+                    "locator_kind, locator, first_seen_at_ns, last_seen_at_ns, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'active') ON CONFLICT(canonical_path) DO UPDATE "
+                    "SET workspace_id=excluded.workspace_id, locator_kind=excluded.locator_kind, "
+                    "locator=excluded.locator, last_seen_at_ns=excluded.last_seen_at_ns, "
+                    "status='active'",
+                    (str(uuid4()), workspace_id, str(root), kind, locator, now, now),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return Workspace(root, root, *row)
+
+    def forget(self, identity_or_path: str | Path) -> bool:
+        """Deactivate location mappings without deleting workspace-owned data.
+
+        Args:
+            identity_or_path (str | Path): Workspace UUID or canonical location.
+
+        Returns:
+            bool: Whether an active mapping was deactivated.
+        """
+        value = str(identity_or_path)
+        candidate = str(Path(value).expanduser().resolve())
+        with (  # pylint: disable=confusing-with-statement
+            closing(self._connect(constants.DEFAULT_STORAGE_SQLITE_BUSY_TIMEOUT_MS)) as connection,
+            connection,
+        ):
+            cursor = connection.execute(
+                "UPDATE workspace_locations SET status = 'inactive' WHERE status = 'active' "
+                "AND (workspace_id = ? OR canonical_path = ?)",
+                (value, candidate),
+            )
+        return cursor.rowcount > 0
+
+    def rekey(self, path: Path | str) -> Workspace:
+        """Assign a fresh UUID to an attached copied workspace path.
+
+        Args:
+            path (Path | str): Existing copied workspace path.
+
+        Returns:
+            Workspace: Workspace carrying the new identity.
+        """
+        root = Path(path).expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Workspace path is not a directory: {root}")
+        kind, locator = self._locator(root)
+        now = time.time_ns()
+        workspace_id = str(uuid4())
+        name = root.name or "Untitled workspace"
+        source: WorkspaceNameSource = "directory" if root.name else "default"
+        with closing(self._connect(constants.DEFAULT_STORAGE_SQLITE_BUSY_TIMEOUT_MS)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "INSERT INTO workspaces("
+                    "workspace_id,name,name_source,created_at_ns,updated_at_ns) "
+                    "VALUES (?,?,?,?,?)",
+                    (workspace_id, name, source, now, now),
+                )
+                cursor = connection.execute(
+                    "UPDATE workspace_locations SET workspace_id=?,locator_kind=?,locator=?,"
+                    "last_seen_at_ns=?,status='active' WHERE canonical_path=?",
+                    (workspace_id, kind, locator, now, str(root)),
+                )
+                if cursor.rowcount == 0:
+                    connection.execute(
+                        "INSERT INTO workspace_locations(location_id,workspace_id,canonical_path,"
+                        "locator_kind,locator,first_seen_at_ns,last_seen_at_ns,status) "
+                        "VALUES (?,?,?,?,?,?,?,'active')",
+                        (str(uuid4()), workspace_id, str(root), kind, locator, now, now),
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return Workspace(root, root, workspace_id, name, source, now, now)
+
+    def list_by_path(self, path: Path | str) -> Workspace | None:
+        """Return the active workspace at a canonical path.
+
+        Args:
+            path (Path | str): Location to query.
+
+        Returns:
+            Workspace | None: Matching workspace when registered.
+        """
+        root = Path(path).expanduser().resolve()
+        with closing(self._connect(constants.DEFAULT_STORAGE_SQLITE_BUSY_TIMEOUT_MS)) as connection:
+            row = connection.execute(
+                "SELECT w.workspace_id, w.name, w.name_source, w.created_at_ns, w.updated_at_ns "
+                "FROM workspaces AS w JOIN workspace_locations AS l "
+                "ON l.workspace_id=w.workspace_id WHERE l.canonical_path=? AND l.status='active'",
+                (str(root),),
+            ).fetchone()
+        return None if row is None else Workspace(root, root, *row)
+
+    def resolve(self, identity_or_path: str | Path) -> Workspace:
+        """Resolve an active workspace by UUID or path, attaching a new path when needed.
+
+        Args:
+            identity_or_path (str | Path): Registered UUID or existing workspace path.
+
+        Returns:
+            Workspace: Unambiguously resolved initialized workspace.
+
+        Raises:
+            ValueError: If an identifier is unknown.
+        """
+        value = str(identity_or_path)
+        matches = self.list(value)
+        if len(matches) == 1:
+            return matches[0]
+        path = Path(value).expanduser()
+        if path.is_dir():
+            return self.initialize(Workspace.discover(path))
+        raise ValueError(f"Unknown workspace identity or path '{value}'.")
+
+    @staticmethod
+    def _locator(path: Path) -> tuple[str | None, bytes | None]:
+        """Return an advisory platform locator for an existing directory."""
+        try:
+            stat = path.stat()
+        except OSError:
+            return None, None
+        kind = (
+            "windows_file"
+            if sys.platform == "win32"
+            else ("macos_resource" if sys.platform == "darwin" else "posix_inode")
+        )
+        return kind, f"{stat.st_dev}:{stat.st_ino}".encode("ascii")
+
+    @staticmethod
+    def _refresh_directory_name(
+        connection: sqlite3.Connection,
+        row: tuple[str, str, WorkspaceNameSource, int, int],
+        root: Path,
+        now: int,
+    ) -> tuple[str, str, WorkspaceNameSource, int, int]:
+        """Refresh only directory/default names after confirmed relocation."""
+        workspace_id, _name, source, created, _updated = row
+        replacement = root.name or "Untitled workspace"
+        replacement_source: WorkspaceNameSource = "directory" if root.name else "default"
+        if source == "directory" or (source == "default" and replacement_source != "default"):
+            connection.execute(
+                "UPDATE workspaces SET name=?, name_source=?, updated_at_ns=? WHERE workspace_id=?",
+                (replacement, replacement_source, now, workspace_id),
+            )
+            return workspace_id, replacement, replacement_source, created, now
+        return row
 
     def _connect(self, busy_timeout_ms: int) -> sqlite3.Connection:
         """Open the workspace catalog and ensure its schema exists."""
