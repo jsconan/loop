@@ -6,9 +6,10 @@ __all__ = [
     "WorkspaceMigration",
     "WorkspaceNameSource",
     "WorkspaceRepository",
+    "WorkspaceSwitchRequested",
 ]
 
 from .commands import WorkspaceCommands
 from .migration import WorkspaceMigration
 from .repository import WorkspaceRepository
-from .workspace import Workspace, WorkspaceNameSource
+from .workspace import Workspace, WorkspaceNameSource, WorkspaceSwitchRequested

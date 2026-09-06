@@ -8,7 +8,7 @@ import pytest
 
 from loop import ShutdownRequested, main
 from loop.configuration import ApplicationSettings
-from loop.workspace import Workspace
+from loop.workspace import Workspace, WorkspaceSwitchRequested
 
 
 @pytest.fixture(autouse=True)
@@ -114,3 +114,21 @@ def test_main_module_runs_entry_point(monkeypatch):
 
     with pytest.warns(RuntimeWarning, match="'loop.main' found in sys.modules"):
         runpy.run_module("loop.main", run_name="__main__")
+
+
+def test_main_closes_active_runtime_before_rebuilding_for_workspace_switch(monkeypatch):
+    """A switch signal tears down global owners before composing the target runtime."""
+    target = Workspace(Path("/target"), Path("/target"), "target", "target", "directory", 2, 2)
+    first = Mock()
+    first.run.side_effect = WorkspaceSwitchRequested(target)
+    second = Mock()
+    runtime_factory = Mock(side_effect=[first, second])
+    monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=Mock()))
+    monkeypatch.setattr(main, "ApplicationRuntime", Mock(create=runtime_factory))
+    monkeypatch.setattr(main, "register_shutdown_signals", Mock())
+
+    main.main()
+
+    first.close.assert_called_once_with()
+    assert runtime_factory.call_args_list[1].args[0] is target
+    second.close.assert_called_once_with()

@@ -11,6 +11,20 @@ from ..utils import PathHolder, find_project_root
 WorkspaceNameSource = Literal["user", "provider", "remote", "directory", "default"]
 
 
+class WorkspaceSwitchRequested(Exception):
+    """Request a composition-root rebuild for a resolved workspace.
+
+    Args:
+        workspace (Workspace): Initialized target workspace.
+    """
+
+    workspace: Workspace
+
+    def __init__(self, workspace: Workspace) -> None:
+        super().__init__(f"Switch to workspace {workspace.id}")
+        self.workspace = workspace
+
+
 @dataclass(slots=True)
 class Workspace:
     """Represent one worktree and its durable identity.
