@@ -8,8 +8,8 @@ from pydantic import Field
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
 from ..completion import CommandCompletion, CompletionValue
+from .models import Workspace, WorkspaceSwitchRequested
 from .repository import WorkspaceRepository
-from .workspace import Workspace, WorkspaceSwitchRequested
 
 
 class WorkspaceCommands:

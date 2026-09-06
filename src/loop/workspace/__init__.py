@@ -11,5 +11,5 @@ __all__ = [
 
 from .commands import WorkspaceCommands
 from .migration import WorkspaceMigration
+from .models import Workspace, WorkspaceNameSource, WorkspaceSwitchRequested
 from .repository import WorkspaceRepository
-from .workspace import Workspace, WorkspaceNameSource, WorkspaceSwitchRequested
