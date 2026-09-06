@@ -71,12 +71,29 @@ class SQLitePermissionAudit:
                 ),
             )
 
-    def export_jsonl(self, destination: Path | str, *, workspace_id: str | None = None) -> Path:
+    def export_jsonl(
+        self,
+        destination: Path | str,
+        *,
+        workspace_id: str | None = None,
+        session_id: str | None = None,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        decision: str | None = None,
+        event_name: str | None = None,
+        force: bool = False,
+    ) -> Path:
         """Export a stable, ordered JSONL audit snapshot.
 
         Args:
             destination (Path | str): New export file path.
             workspace_id (str | None): Optional workspace filter.
+            session_id (str | None): Optional session identifier stored in the payload.
+            start_ns (int | None): Inclusive lower timestamp bound.
+            end_ns (int | None): Inclusive upper timestamp bound.
+            decision (str | None): Optional decision value stored in the payload.
+            event_name (str | None): Optional exact event-name filter.
+            force (bool): Whether an existing destination may be replaced.
 
         Returns:
             Path: Created export file path.
@@ -85,30 +102,44 @@ class SQLitePermissionAudit:
             FileExistsError: If the destination already exists.
         """
         target = Path(destination).resolve()
-        if target.exists():
+        if target.exists() and not force:
             raise FileExistsError(f"Audit export already exists: {target}")
         query = (
             "SELECT record_id, timestamp_ns, workspace_id, process_id, event_name, payload_json, "
             "schema_version FROM permission_audit_records"
         )
-        parameters: tuple[str, ...] = ()
-        if workspace_id is not None:
-            query += " WHERE workspace_id = ?"
-            parameters = (workspace_id,)
+        clauses = []
+        parameters = []
+        for clause, value in (
+            ("workspace_id = ?", workspace_id),
+            ("timestamp_ns >= ?", start_ns),
+            ("timestamp_ns <= ?", end_ns),
+            ("event_name = ?", event_name),
+        ):
+            if value is not None:
+                clauses.append(clause)
+                parameters.append(value)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY timestamp_ns, record_id"
         target.parent.mkdir(parents=True, exist_ok=True)
         with (
             closing(self._connect()) as connection,
-            target.open("x", encoding="utf-8") as output,
+            target.open("w" if force else "x", encoding="utf-8") as output,
         ):
             for row in connection.execute(query, parameters):
+                payload = json.loads(row[5])
+                if session_id is not None and payload.get("session_id") != session_id:
+                    continue
+                if decision is not None and payload.get("decision") != decision:
+                    continue
                 record = {
                     "record_id": row[0],
                     "timestamp_ns": row[1],
                     "workspace_id": row[2],
                     "process_id": row[3],
                     "event_name": row[4],
-                    "payload": json.loads(row[5]),
+                    "payload": payload,
                     "schema_version": row[6],
                 }
                 output.write(json.dumps(record, sort_keys=True) + "\n")

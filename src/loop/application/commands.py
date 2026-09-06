@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import shutil
+import json
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -71,10 +71,33 @@ class ApplicationCommands:
         destination: Annotated[
             str | None, Field(description="New export path for logs or audit records.")
         ] = None,
+        workspace_id: Annotated[str | None, Field(description="Workspace filter.")] = None,
+        start_ns: Annotated[int | None, Field(description="Inclusive start timestamp.")] = None,
+        end_ns: Annotated[int | None, Field(description="Inclusive end timestamp.")] = None,
+        severity: Annotated[str | None, Field(description="Log severity filter.")] = None,
+        event_name: Annotated[str | None, Field(description="Event-name filter.")] = None,
+        session_id: Annotated[str | None, Field(description="Audit session filter.")] = None,
+        decision: Annotated[str | None, Field(description="Audit decision filter.")] = None,
+        force: Annotated[bool, Field(description="Allow replacing an export file.")] = False,
     ) -> None:
         """Print application directories or export operational records."""
         if action == "dirs":
-            if destination is not None:
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        destination,
+                        workspace_id,
+                        start_ns,
+                        end_ns,
+                        severity,
+                        event_name,
+                        session_id,
+                        decision,
+                    )
+                )
+                or force
+            ):
                 raise CommandArgumentError("The dirs operation does not accept a destination.")
             context.interaction.table(
                 self._directories(),
@@ -87,9 +110,30 @@ class ApplicationCommands:
         target = Path(destination).expanduser().resolve()
         try:
             if action == "logs":
-                self._export_logs(target)
+                if session_id is not None or decision is not None:
+                    raise CommandArgumentError("Log exports do not accept audit-only filters.")
+                self._export_logs(
+                    target,
+                    workspace_id=workspace_id,
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    severity=severity,
+                    event_name=event_name,
+                    force=force,
+                )
             else:
-                self._export_audit(target)
+                if severity is not None:
+                    raise CommandArgumentError("Audit exports do not accept severity filters.")
+                self._export_audit(
+                    target,
+                    workspace_id=workspace_id,
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    event_name=event_name,
+                    session_id=session_id,
+                    decision=decision,
+                    force=force,
+                )
         except FileExistsError as error:
             raise CommandArgumentError(str(error)) from error
         context.interaction.info(f"Exported {action} to {target}.")
@@ -115,22 +159,67 @@ class ApplicationCommands:
             if not isinstance(path, Path) or path.exists()
         )
 
-    def _export_audit(self, destination: Path) -> None:
+    def _export_audit(self, destination: Path, **filters: object) -> None:
         """Export the current permissions audit without overwriting a destination."""
-        if destination.exists():
-            raise FileExistsError(f"Audit export already exists: {destination}")
         destination.parent.mkdir(parents=True, exist_ok=True)
         SQLitePermissionAudit(self._paths.permissions_audit).export_jsonl(
-            destination, workspace_id=self._workspace_id
+            destination,
+            workspace_id=filters.pop("workspace_id") or self._workspace_id,
+            **filters,
         )
 
-    def _export_logs(self, destination: Path) -> None:
-        """Copy the current global operational log without overwriting a destination."""
-        if destination.exists():
+    def _export_logs(
+        self,
+        destination: Path,
+        *,
+        workspace_id: str | None,
+        start_ns: int | None,
+        end_ns: int | None,
+        severity: str | None,
+        event_name: str | None,
+        force: bool,
+    ) -> None:
+        """Stream matching rotated and active global log records in chronological order."""
+        if destination.exists() and not force:
             raise FileExistsError(f"Log export already exists: {destination}")
         destination.parent.mkdir(parents=True, exist_ok=True)
         source_path = self._paths.operational_log
-        with destination.open("xb") as output:
-            if source_path.exists():
-                with source_path.open("rb") as source:
-                    shutil.copyfileobj(source, output)
+        archives = sorted(
+            source_path.parent.glob(f"{source_path.name}.*"),
+            key=lambda path: int(path.suffix[1:]) if path.suffix[1:].isdigit() else -1,
+            reverse=True,
+        )
+        sources = [*archives, source_path]
+        with destination.open("w" if force else "x", encoding="utf-8") as output:
+            for source_path in sources:
+                if not source_path.is_file():
+                    continue
+                with source_path.open(encoding="utf-8") as source:
+                    for line in source:
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            if not any((workspace_id, start_ns, end_ns, severity, event_name)):
+                                output.write(line)
+                            continue
+                        timestamp = record.get("timestamp_ns")
+                        if start_ns is not None and (
+                            not isinstance(timestamp, int) or timestamp < start_ns
+                        ):
+                            continue
+                        if end_ns is not None and (
+                            not isinstance(timestamp, int) or timestamp > end_ns
+                        ):
+                            continue
+                        if workspace_id is not None and record.get("workspace_id") != workspace_id:
+                            continue
+                        if (
+                            severity is not None
+                            and record.get("level", "").lower() != severity.lower()
+                        ):
+                            continue
+                        if event_name is not None and record.get("event.name") != event_name:
+                            continue
+                        output.write(
+                            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                        )
