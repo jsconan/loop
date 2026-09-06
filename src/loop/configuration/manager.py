@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import tomlkit
+from filelock import FileLock
 from pydantic import SecretStr
 
 from .. import constants
@@ -211,28 +212,29 @@ class ConfigurationManager:
         Returns:
             ApplicationSettings: Validated configuration after the edit.
         """
-        sections = self._split_path(dotted_path)
-        document = self._document_for_write(scope)
-        original = tomlkit.dumps(document)
-        table = document.get(sections[0])
-        defaults = ApplicationSettings().model_dump(mode="python")
-        if sections[0] not in defaults or sections[1] not in defaults[sections[0]]:
-            raise ValueError(f"Unknown configuration field '{dotted_path}'.")
-        if not isinstance(table, Mapping):
-            table = tomlkit.table()
-            document[sections[0]] = table
-        table[sections[1]] = value
-        try:
-            self._validate_candidate()
-        except Exception:
-            if scope == "workspace" and self._workspace_path is not None:
-                self._workspace_document = tomlkit.parse(original)
-            else:
-                self._document = tomlkit.parse(original)
-            self._resolve()
-            raise
-        self._save_scope(scope)
-        return self._resolve()
+        with self._lock_for(scope):
+            sections = self._split_path(dotted_path)
+            document = self._document_for_write(scope)
+            original = tomlkit.dumps(document)
+            table = document.get(sections[0])
+            defaults = ApplicationSettings().model_dump(mode="python")
+            if sections[0] not in defaults or sections[1] not in defaults[sections[0]]:
+                raise ValueError(f"Unknown configuration field '{dotted_path}'.")
+            if not isinstance(table, Mapping):
+                table = tomlkit.table()
+                document[sections[0]] = table
+            table[sections[1]] = value
+            try:
+                self._validate_candidate()
+            except Exception:
+                if scope == "workspace" and self._workspace_path is not None:
+                    self._workspace_document = tomlkit.parse(original)
+                else:
+                    self._document = tomlkit.parse(original)
+                self._resolve()
+                raise
+            self._save_scope(scope)
+            return self._resolve()
 
     def set_session(self, dotted_path: str, value: Any) -> ApplicationSettings:
         """Set one in-memory override without changing the configuration file.
@@ -302,26 +304,28 @@ class ConfigurationManager:
             }
             return self._resolve()
         if scope == "workspace":
-            self._workspace_document = tomlkit.document()
-            self._save_scope("workspace")
+            with self._lock_for(scope):
+                self._workspace_document = tomlkit.document()
+                self._save_scope("workspace")
             return self._resolve()
-        self._document = self._read_document()
-        default_values = self._stored_defaults()
-        self._document["config_version"] = default_values["config_version"]
-        for section, settings in default_values.items():
-            if section == "config_version":
-                continue
-            table = self._document.get(section)
-            if not isinstance(table, Mapping):
-                table = tomlkit.table()
-                self._document[section] = table
-            for field, value in settings.items():
-                if value is None:
-                    if field in table:
-                        del table[field]
-                else:
-                    table[field] = value
-        self.save()
+        with self._lock_for(scope):
+            self._document = self._read_document()
+            default_values = self._stored_defaults()
+            self._document["config_version"] = default_values["config_version"]
+            for section, settings in default_values.items():
+                if section == "config_version":
+                    continue
+                table = self._document.get(section)
+                if not isinstance(table, Mapping):
+                    table = tomlkit.table()
+                    self._document[section] = table
+                for field, value in settings.items():
+                    if value is None:
+                        if field in table:
+                            del table[field]
+                    else:
+                        table[field] = value
+            self.save()
         return self._resolve()
 
     def unset(
@@ -344,16 +348,17 @@ class ConfigurationManager:
         """
         if scope == "user":
             return self.set(dotted_path, self._default_value(dotted_path), scope="user")
-        section, field = self._split_path(dotted_path)
-        document = self._document_for_write(scope)
-        table = document.get(section)
-        if not isinstance(table, Mapping) or field not in table:
-            raise ValueError(f"Unknown configuration field '{dotted_path}'.")
-        del table[field]
-        if not table:
-            del document[section]
-        self._validate_candidate()
-        self._save_scope(scope)
+        with self._lock_for(scope):
+            section, field = self._split_path(dotted_path)
+            document = self._document_for_write(scope)
+            table = document.get(section)
+            if not isinstance(table, Mapping) or field not in table:
+                raise ValueError(f"Unknown configuration field '{dotted_path}'.")
+            del table[field]
+            if not table:
+                del document[section]
+            self._validate_candidate()
+            self._save_scope(scope)
         return self._resolve()
 
     def unset_session(self, dotted_path: str) -> ApplicationSettings:
@@ -444,6 +449,14 @@ class ConfigurationManager:
             path.unlink(missing_ok=True)
             return path
         return self._save_document(self._workspace_path, self._workspace_document)
+
+    def _lock_for(self, scope: Literal["user", "workspace"]) -> FileLock:
+        """Return the interprocess lock protecting one complete TOML transaction."""
+        path = (
+            self._path if scope == "user" or self._workspace_path is None else self._workspace_path
+        )
+        path.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+        return FileLock(path.with_name(f".{path.name}.lock"), mode=constants.PRIVATE_FILE_MODE)
 
     def _plain_document_values(self) -> dict[str, Any]:
         """Return ordinary Python values from a TOML document."""

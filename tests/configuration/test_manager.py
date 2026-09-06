@@ -198,6 +198,24 @@ def test_set_preserves_existing_comments(tmp_path):
     assert manager.load().backend.default_model == "configured-model"
 
 
+def test_independent_managers_merge_writes_under_the_interprocess_lock(tmp_path):
+    """Two stale manager snapshots cannot lose each other's durable TOML updates."""
+    path = tmp_path / "config.toml"
+    first = ConfigurationManager(path)
+    first.initialize()
+    first.load()
+    second = ConfigurationManager(path)
+    second.load()
+
+    first.set("loop.debug", True, scope="user")
+    second.set("loop.stream", False, scope="user")
+
+    settings = ConfigurationManager(path).load({})
+    assert settings.loop.debug is True
+    assert settings.loop.stream is False
+    assert path.with_name(".config.toml.lock").stat().st_mode & 0o777 == 0o600
+
+
 def test_manager_exposes_effective_values_sources_and_reload(tmp_path):
     """Loaded settings support redacted reads, provenance, and explicit reloads."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
