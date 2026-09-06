@@ -156,3 +156,13 @@ def test_create_closes_only_successfully_created_telemetry(
         )
     else:
         dependencies["Telemetry"].return_value.close.assert_not_called()
+
+
+def test_close_without_owned_log_handler_remains_safe():
+    """Injected runtimes can close telemetry without owning process logging."""
+    telemetry = Mock()
+    runtime = ApplicationRuntime(Mock(), telemetry, 1.0)
+
+    runtime.close()
+
+    telemetry.close.assert_called_once_with(timeout=1.0)

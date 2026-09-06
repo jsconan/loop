@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
 from ..interaction import Interaction
@@ -29,16 +31,25 @@ class ApplicationRuntime:
         loop (Loop): Fully assembled interactive application.
         telemetry (Telemetry): Application telemetry service.
         shutdown_timeout (float): Maximum seconds allowed for telemetry shutdown.
+        logging_handler (logging.Handler | None): Owned process-global log handler.
     """
 
     _loop: Loop
     _telemetry: Telemetry
     _shutdown_timeout: float
+    _logging_handler: logging.Handler | None
 
-    def __init__(self, loop: Loop, telemetry: Telemetry, shutdown_timeout: float) -> None:
+    def __init__(
+        self,
+        loop: Loop,
+        telemetry: Telemetry,
+        shutdown_timeout: float,
+        logging_handler: logging.Handler | None = None,
+    ) -> None:
         self._loop = loop
         self._telemetry = telemetry
         self._shutdown_timeout = shutdown_timeout
+        self._logging_handler = logging_handler
 
     @classmethod
     def create(
@@ -70,7 +81,7 @@ class ApplicationRuntime:
         """
         if workspace.id is None:
             raise ValueError("Application runtime requires an initialized workspace.")
-        configure_operational_logging(
+        logging_handler = configure_operational_logging(
             paths.operational_log,
             level=settings.logging.level,
             max_bytes=settings.logging.max_bytes,
@@ -130,7 +141,7 @@ class ApplicationRuntime:
             if telemetry is not None:
                 telemetry.close(timeout=settings.telemetry.shutdown_timeout)
             raise
-        runtime = cls(loop, telemetry, settings.telemetry.shutdown_timeout)
+        runtime = cls(loop, telemetry, settings.telemetry.shutdown_timeout, logging_handler)
         loop.command_manager.register_all(
             ConfigurationCommands(configuration, runtime.apply_configuration).get_commands()
         )
@@ -189,3 +200,7 @@ class ApplicationRuntime:
         telemetry_activity("application.stopped", severity="info", component="main")
         set_telemetry(None)
         self._telemetry.close(timeout=self._shutdown_timeout)
+        if self._logging_handler is not None:
+            logging.getLogger().removeHandler(self._logging_handler)
+            self._logging_handler.close()
+            self._logging_handler = None
