@@ -373,6 +373,18 @@ are UUID-scoped; telemetry, `audit.db`, and the interprocess-safe `loop.log` are
 The registry stores an opaque UUIDv4 identity separately from mutable canonical locations. Every
 telemetry and audit record carries that `workspace_id`. Legacy local identity, sessions, and
 permission policy are imported conservatively; a live copy sharing an identity is rejected.
+Platform file identifiers are stored only as move-detection hints: Loop changes a canonical path
+only after one unique stale-location match. User-authored names never refresh automatically;
+directory names refresh only after a confirmed move, while provider and remote names refresh only
+from the same source.
+
+Use `/workspace attach <path>` to register a location, `/workspace forget <id-or-path>` to
+deactivate only its mapping, `/workspace rekey <path>` to give a copy a fresh UUID, and
+`/workspace switch <id-or-path>` to close the current runtime and rebuild every workspace-scoped
+service. Forget and rekey require confirmation, and none of these commands deletes legacy files or
+UUID-scoped data. Legacy telemetry, operational logs, and permission-audit JSONL are imported into
+their global stores transactionally; verified source digests make migration resumable and
+idempotent while originals remain in place.
 
 The generated file contains all settings and their built-in values. Nullable settings such as
 `context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort` appear as
@@ -533,8 +545,11 @@ The policy is stored in centralized UUID-scoped workspace data and is created wh
 Decisions are appended to the application-global SQLite `audit.db` with `workspace_id` correlation
 and recorded as structured events in the active session. The session event includes the normalized
 request, effective result and source, whether the user was prompted, and the exact displayed
-prompt. Use `/app logs <destination>` and `/app audit <destination>` to export operational records
-without overwriting existing files. Use `/permissions` to display the active policy:
+prompt. Use `/app logs <destination>` and `/app audit <destination>` to stream stable JSONL exports
+without overwriting existing files. Log exports include rotated archives and support timestamp,
+workspace, severity, and event filters. Audit exports support timestamp, workspace, session,
+decision, and event filters; pass `force=true` only when replacement is intentional. Use
+`/permissions` to display the active policy:
 
 ```text
 /permissions
