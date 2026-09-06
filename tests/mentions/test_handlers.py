@@ -18,7 +18,7 @@ from loop import (
     SkillMentionHandler,
     constants,
 )
-from loop.utils import cached_path, decode_content_cursor
+from loop.utils import PathHolder, cached_path, decode_content_cursor
 
 
 def complete(handler, text):
@@ -34,7 +34,8 @@ def test_project_paths_complete_after_cache_expiry_and_resolve_unique_snapshots(
     now = [10.0]
     monkeypatch.setattr("loop.completion.adapters.project_path.time.monotonic", lambda: now[0])
     current = [tmp_path]
-    handler = ProjectPathMentionHandler(lambda: current[0])
+    directory = PathHolder(current[0])
+    handler = ProjectPathMentionHandler(directory)
     assert complete(handler, "@") == []
     (tmp_path / "code.py").write_text("print('ok')\n", encoding="utf-8")
     now[0] += 5.0
@@ -52,7 +53,7 @@ def test_project_paths_complete_after_cache_expiry_and_resolve_unique_snapshots(
         ),
     )
 
-    current[0] = tmp_path / "missing"
+    directory.set(tmp_path / "missing")
     assert complete(handler, "@") == []
 
 
@@ -64,7 +65,7 @@ def test_directory_paths_attach_only_a_visible_bounded_listing(tmp_path):
     (folder / "nested").mkdir()
     (folder / "nested" / "deep.py").write_text("pass", encoding="utf-8")
 
-    context = ProjectPathMentionHandler(lambda: tmp_path).resolve(("src/",))
+    context = ProjectPathMentionHandler(PathHolder(tmp_path)).resolve(("src/",))
 
     assert set(context[0].content.splitlines()) == {"main.py", "nested/"}
 
@@ -75,7 +76,7 @@ def test_project_paths_deduplicate_aliases_by_resolved_resource(tmp_path):
     source.write_text("content", encoding="utf-8")
     (tmp_path / "alias.txt").symlink_to(source)
 
-    context = ProjectPathMentionHandler(lambda: tmp_path).resolve(("alias.txt", "source.txt"))
+    context = ProjectPathMentionHandler(PathHolder(tmp_path)).resolve(("alias.txt", "source.txt"))
 
     assert len(context) == 1
     assert context[0].path == "alias.txt"
@@ -85,7 +86,7 @@ def test_project_paths_reject_binary_changed_escaping_and_special_files(tmp_path
     """Unsafe, unavailable, binary, and unsupported paths cannot become attachments."""
     binary = tmp_path / "data.bin"
     binary.write_bytes(b"binary\0data")
-    handler = ProjectPathMentionHandler(lambda: tmp_path)
+    handler = ProjectPathMentionHandler(PathHolder(tmp_path))
     with pytest.raises(ValueError, match="binary"):
         handler.resolve(("data.bin",))
 
@@ -115,7 +116,7 @@ def test_project_paths_allocate_fair_resumable_attachment_previews(tmp_path):
     size = constants.MAX_ATTACHMENT_CONTENT_BYTES
     (tmp_path / "first.txt").write_text("a" * size, encoding="utf-8")
     (tmp_path / "second.txt").write_text("b" * size, encoding="utf-8")
-    handler = ProjectPathMentionHandler(lambda: tmp_path)
+    handler = ProjectPathMentionHandler(PathHolder(tmp_path))
 
     first, second = handler.resolve(("first.txt", "second.txt"))
 
@@ -133,7 +134,9 @@ def test_project_paths_reclaim_unused_attachment_shares(tmp_path):
     (tmp_path / "small.txt").write_text("small", encoding="utf-8")
     (tmp_path / "large.txt").write_text("x" * size, encoding="utf-8")
 
-    small, large = ProjectPathMentionHandler(lambda: tmp_path).resolve(("small.txt", "large.txt"))
+    small, large = ProjectPathMentionHandler(PathHolder(tmp_path)).resolve(
+        ("small.txt", "large.txt")
+    )
 
     assert small.content == "small"
     assert small.handle is None
@@ -150,7 +153,7 @@ def test_project_paths_reject_snapshots_above_the_hard_source_limit(monkeypatch,
     folder.mkdir()
 
     with pytest.raises(ValueError, match="snapshot limit"):
-        ProjectPathMentionHandler(lambda: tmp_path).resolve(("huge.txt",))
+        ProjectPathMentionHandler(PathHolder(tmp_path)).resolve(("huge.txt",))
     child = Mock()
     child.relative_to.return_value.as_posix.return_value = "x" * (constants.MAX_FETCH_BYTES + 1)
     child.is_dir.return_value = False
@@ -159,14 +162,14 @@ def test_project_paths_reject_snapshots_above_the_hard_source_limit(monkeypatch,
         lambda _: (child,),
     )
     with pytest.raises(ValueError, match="snapshot limit"):
-        ProjectPathMentionHandler(lambda: tmp_path).resolve(("folder",))
+        ProjectPathMentionHandler(PathHolder(tmp_path)).resolve(("folder",))
 
 
 def test_project_paths_gracefully_resolve_valid_markdown_link_destinations(tmp_path):
     """Optional links attach safe project files and ignore invalid or unsupported destinations."""
     (tmp_path / "guide.md").write_text("Guide", encoding="utf-8")
     (tmp_path / "binary.bin").write_bytes(b"binary\0data")
-    handler = ProjectPathMentionHandler(lambda: tmp_path)
+    handler = ProjectPathMentionHandler(PathHolder(tmp_path))
 
     context = handler.resolve_optional(
         ("https://my-host.local", "missing.md", "binary.bin", "guide.md")

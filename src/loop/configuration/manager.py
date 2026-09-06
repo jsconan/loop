@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -45,22 +46,29 @@ _ENVIRONMENT_FIELDS = {
 
 
 class ConfigurationManager:
-    """Manage one workspace's comment-preserving TOML configuration document.
+    """Manage complete user and sparse workspace TOML configuration documents.
 
     Args:
-        path (Path | str): Workspace TOML configuration path.
+        path (Path | str): Complete user TOML configuration path.
+        workspace_path (Path | str | None): Optional sparse workspace override path.
     """
 
     _path: Path
     _document: tomlkit.TOMLDocument
+    _workspace_path: Path | None
+    _workspace_document: tomlkit.TOMLDocument
     _effective: ApplicationSettings | None
     _sources: dict[str, str]
     _environment: dict[str, str]
     _session_values: dict[str, Any]
 
-    def __init__(self, path: Path | str) -> None:
-        self._path = Path(path).resolve()
+    def __init__(self, path: Path | str, workspace_path: Path | str | None = None) -> None:
+        self._path = Path(path).expanduser().resolve()
+        self._workspace_path = (
+            Path(workspace_path).expanduser().resolve() if workspace_path is not None else None
+        )
         self._document = tomlkit.document()
+        self._workspace_document = tomlkit.document()
         self._effective = None
         self._sources = {}
         self._environment = {}
@@ -98,6 +106,7 @@ class ConfigurationManager:
             ApplicationSettings: Immutable settings resolved from environment, TOML, and defaults.
         """
         self._document = self._read_document()
+        self._workspace_document = self._read_workspace_document()
         if environment is None:
             environment = os.environ
         self._environment = dict(environment)
@@ -179,34 +188,50 @@ class ConfigurationManager:
             dotted_path (str): Dot-separated configuration field path.
 
         Returns:
-            str: ``"environment"``, ``"workspace"``, ``"session"``, or ``"default"``.
+            str: ``"session"``, ``"environment"``, ``"workspace"``, ``"user"``, or
+                ``"default"``.
         """
         self._split_path(dotted_path)
         return self._sources.get(dotted_path, "default")
 
-    def set(self, dotted_path: str, value: Any) -> ApplicationSettings:
+    def set(
+        self,
+        dotted_path: str,
+        value: Any,
+        *,
+        scope: Literal["user", "workspace"] = "workspace",
+    ) -> ApplicationSettings:
         """Set one TOML value and return the validated effective configuration.
 
         Args:
             dotted_path (str): Dot-separated configuration field path.
             value (Any): Replacement value stored in the TOML document.
+            scope (Literal["user", "workspace"]): Durable destination. Defaults to workspace.
 
         Returns:
             ApplicationSettings: Validated configuration after the edit.
         """
         sections = self._split_path(dotted_path)
-        self._document = self._read_document()
-        table = self._document.get(sections[0])
+        document = self._document_for_write(scope)
+        original = tomlkit.dumps(document)
+        table = document.get(sections[0])
         defaults = ApplicationSettings().model_dump(mode="python")
-        if (
-            not isinstance(table, Mapping)
-            or sections[0] not in defaults
-            or sections[1] not in defaults[sections[0]]
-        ):
+        if sections[0] not in defaults or sections[1] not in defaults[sections[0]]:
             raise ValueError(f"Unknown configuration field '{dotted_path}'.")
+        if not isinstance(table, Mapping):
+            table = tomlkit.table()
+            document[sections[0]] = table
         table[sections[1]] = value
-        self._validate_candidate()
-        self.save()
+        try:
+            self._validate_candidate()
+        except Exception:
+            if scope == "workspace" and self._workspace_path is not None:
+                self._workspace_document = tomlkit.parse(original)
+            else:
+                self._document = tomlkit.parse(original)
+            self._resolve()
+            raise
+        self._save_scope(scope)
         return self._resolve()
 
     def set_session(self, dotted_path: str, value: Any) -> ApplicationSettings:
@@ -227,16 +252,24 @@ class ConfigurationManager:
             del self._session_values[dotted_path]
             raise
 
-    def reset(self, dotted_path: str) -> ApplicationSettings:
-        """Reset one workspace setting to its built-in default.
+    def reset(
+        self,
+        dotted_path: str,
+        *,
+        scope: Literal["user", "workspace"] = "workspace",
+    ) -> ApplicationSettings:
+        """Reset one setting to its built-in default in the specified scope.
 
         Args:
             dotted_path (str): Dot-separated configuration field path.
+            scope (Literal["user", "workspace"]): Scope to reset. Defaults to workspace.
 
         Returns:
             ApplicationSettings: Validated settings after storing the default.
         """
-        return self.set(dotted_path, self._default_value(dotted_path))
+        if scope == "workspace":
+            return self.unset(dotted_path, scope="workspace")
+        return self.set(dotted_path, self._default_value(dotted_path), scope=scope)
 
     def reset_session(self, dotted_path: str) -> ApplicationSettings:
         """Reset one in-memory override to its built-in default.
@@ -249,12 +282,16 @@ class ConfigurationManager:
         """
         return self.set_session(dotted_path, self._default_value(dotted_path))
 
-    def reset_all(self, *, scope: Literal["session", "workspace"]) -> ApplicationSettings:
+    def reset_all(
+        self,
+        *,
+        scope: Literal["session", "user", "workspace"] = "workspace",
+    ) -> ApplicationSettings:
         """Reset every value in one configuration scope.
 
         Args:
-            scope (Literal["session", "workspace"]): ``"session"`` stores defaults as
-                process-only values; ``"workspace"`` restores every managed workspace value.
+            scope (Literal["session", "user", "workspace"]): Scope whose values are restored.
+                Defaults to workspace.
 
         Returns:
             ApplicationSettings: Effective configuration after the reset.
@@ -263,6 +300,10 @@ class ConfigurationManager:
             self._session_values = {
                 entry.path: self._default_value(entry.path) for entry in self.entries
             }
+            return self._resolve()
+        if scope == "workspace":
+            self._workspace_document = tomlkit.document()
+            self._save_scope("workspace")
             return self._resolve()
         self._document = self._read_document()
         default_values = self._stored_defaults()
@@ -283,11 +324,17 @@ class ConfigurationManager:
         self.save()
         return self._resolve()
 
-    def unset(self, dotted_path: str) -> ApplicationSettings:
-        """Remove one workspace setting and return the new effective configuration.
+    def unset(
+        self,
+        dotted_path: str,
+        *,
+        scope: Literal["user", "workspace"] = "workspace",
+    ) -> ApplicationSettings:
+        """Reset one user value or remove one workspace override.
 
         Args:
             dotted_path (str): Dot-separated configuration field path.
+            scope (Literal["user", "workspace"]): Durable scope. Defaults to workspace.
 
         Returns:
             ApplicationSettings: Validated settings after the removal.
@@ -295,14 +342,18 @@ class ConfigurationManager:
         Raises:
             ValueError: If the field is not present in the configuration document.
         """
+        if scope == "user":
+            return self.set(dotted_path, self._default_value(dotted_path), scope="user")
         section, field = self._split_path(dotted_path)
-        self._document = self._read_document()
-        table = self._document.get(section)
+        document = self._document_for_write(scope)
+        table = document.get(section)
         if not isinstance(table, Mapping) or field not in table:
             raise ValueError(f"Unknown configuration field '{dotted_path}'.")
         del table[field]
+        if not table:
+            del document[section]
         self._validate_candidate()
-        self.save()
+        self._save_scope(scope)
         return self._resolve()
 
     def unset_session(self, dotted_path: str) -> ApplicationSettings:
@@ -323,12 +374,16 @@ class ConfigurationManager:
         del self._session_values[dotted_path]
         return self._resolve()
 
-    def unset_all(self, *, scope: Literal["session", "workspace"]) -> ApplicationSettings:
+    def unset_all(
+        self,
+        *,
+        scope: Literal["session", "user", "workspace"] = "workspace",
+    ) -> ApplicationSettings:
         """Remove every value from one configuration scope.
 
         Args:
-            scope (Literal["session", "workspace"]): ``"session"`` clears process-only values;
-                ``"workspace"`` clears the workspace configuration document.
+            scope (Literal["session", "user", "workspace"]): Scope to clear or restore.
+                Defaults to workspace.
 
         Returns:
             ApplicationSettings: Effective configuration after the removal.
@@ -336,9 +391,7 @@ class ConfigurationManager:
         if scope == "session":
             self._session_values.clear()
             return self._resolve()
-        self._document.clear()
-        self.save()
-        return self._resolve()
+        return self.reset_all(scope=scope)
 
     def save(self) -> Path:
         """Atomically save the current comment-preserving TOML document.
@@ -346,20 +399,51 @@ class ConfigurationManager:
         Returns:
             Path: Persisted configuration path.
         """
-        self.path.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
-        self.path.parent.chmod(constants.PRIVATE_DIRECTORY_MODE)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(tomlkit.dumps(self._document), encoding="utf-8")
+        return self._save_document(self.path, self._document)
+
+    @staticmethod
+    def _save_document(path: Path, document: tomlkit.TOMLDocument) -> Path:
+        """Atomically persist one private TOML document."""
+        path.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+        path.parent.chmod(constants.PRIVATE_DIRECTORY_MODE)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        temporary.write_text(tomlkit.dumps(document), encoding="utf-8")
         temporary.chmod(constants.PRIVATE_FILE_MODE)
-        temporary.replace(self.path)
-        self.path.chmod(constants.PRIVATE_FILE_MODE)
-        return self.path
+        temporary.replace(path)
+        path.chmod(constants.PRIVATE_FILE_MODE)
+        return path
 
     def _read_document(self) -> tomlkit.TOMLDocument:
         """Return the current comment-preserving TOML document, or a default if absent."""
         if not self.path.exists():
             return self._default_document()
         return tomlkit.parse(self.path.read_text(encoding="utf-8"))
+
+    def _read_workspace_document(self) -> tomlkit.TOMLDocument:
+        """Return the sparse workspace document or an empty document."""
+        if self._workspace_path is None or not self._workspace_path.exists():
+            return tomlkit.document()
+        return tomlkit.parse(self._workspace_path.read_text(encoding="utf-8"))
+
+    def _document_for_write(self, scope: Literal["user", "workspace"]) -> tomlkit.TOMLDocument:
+        """Reload and return the requested durable configuration document."""
+        if scope == "workspace":
+            self._workspace_document = self._read_workspace_document()
+            return self._workspace_document
+        self._document = self._read_document()
+        return self._document
+
+    def _save_scope(self, scope: Literal["user", "workspace"]) -> Path:
+        """Persist one durable configuration scope."""
+        if scope == "user":
+            return self.save()
+        if self._workspace_path is None:
+            raise RuntimeError("Workspace path is not configured.")
+        if not self._workspace_document:
+            path = self._workspace_path
+            path.unlink(missing_ok=True)
+            return path
+        return self._save_document(self._workspace_path, self._workspace_document)
 
     def _plain_document_values(self) -> dict[str, Any]:
         """Return ordinary Python values from a TOML document."""
@@ -368,7 +452,18 @@ class ConfigurationManager:
     def _resolve(self) -> ApplicationSettings:
         """Resolve configured, environment, and session values into one snapshot."""
         values = self._plain_document_values()
-        self._sources = self._configured_sources(values)
+        self._sources = self._configured_sources(
+            values, "user" if self._workspace_path is not None else "workspace"
+        )
+        workspace_values = self._workspace_document.unwrap()
+        for section, table in workspace_values.items():
+            if section == "config_version":
+                continue
+            if isinstance(table, Mapping):
+                values.setdefault(section, {}).update(table)
+            else:
+                values[section] = table
+        self._sources.update(self._configured_sources(workspace_values, "workspace"))
         for variable, (section, field) in _ENVIRONMENT_FIELDS.items():
             value = self._environment.get(variable)
             if value is not None:
@@ -423,10 +518,10 @@ class ConfigurationManager:
         return sections[0], sections[1]
 
     @staticmethod
-    def _configured_sources(values: Mapping[str, Any]) -> dict[str, str]:
+    def _configured_sources(values: Mapping[str, Any], source: str = "workspace") -> dict[str, str]:
         """Return provenance for values explicitly present in a TOML document."""
         return {
-            f"{section}.{field}": "workspace"
+            f"{section}.{field}": source
             for section, table in values.items()
             if isinstance(table, Mapping)
             for field in table
@@ -450,6 +545,8 @@ class ConfigurationManager:
             for key, value in settings.items():
                 if value is not None:
                     table.add(key, value)
+                else:
+                    table.add(tomlkit.comment(f"{key} = <unset>"))
             document.add(name, table)
         return document
 

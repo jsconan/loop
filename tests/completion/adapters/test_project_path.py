@@ -6,6 +6,7 @@ import pytest
 from prompt_toolkit.document import Document
 
 from loop import CompletionManager, ProjectPathCompletionAdapter
+from loop.utils import PathHolder
 
 
 def complete(completer: CompletionManager, text: str):
@@ -22,7 +23,8 @@ def test_project_path_completion_caches_paths_until_ttl_expires(monkeypatch, tmp
     current = [tmp_path]
     now = [10.0]
     monkeypatch.setattr("loop.completion.adapters.project_path.time.monotonic", lambda: now[0])
-    completer = CompletionManager((ProjectPathCompletionAdapter("@", lambda: current[0]),))
+    directory = PathHolder(current[0])
+    completer = CompletionManager((ProjectPathCompletionAdapter("@", directory),))
 
     assert [item.text for item in complete(completer, "@app")] == ["@src/app.py"]
     (tmp_path / "new.py").write_text("", encoding="utf-8")
@@ -30,17 +32,17 @@ def test_project_path_completion_caches_paths_until_ttl_expires(monkeypatch, tmp
     now[0] += 5.0
     assert [item.text for item in complete(completer, "@new")] == ["@new.py"]
     assert complete(completer, "@ignored") == []
-    current[0] = tmp_path / "missing"
+    directory.set(tmp_path / "missing")
     assert complete(completer, "@") == []
 
 
 def test_project_path_completion_can_disable_cache_and_rejects_negative_ttl(tmp_path):
     """A zero TTL always refreshes paths while negative durations are invalid."""
-    adapter = ProjectPathCompletionAdapter("@", tmp_path, cache_ttl=0)
+    adapter = ProjectPathCompletionAdapter("@", PathHolder(tmp_path), cache_ttl=0)
     completer = CompletionManager((adapter,))
 
     assert complete(completer, "@new") == []
     (tmp_path / "new.py").write_text("", encoding="utf-8")
     assert [item.text for item in complete(completer, "@new")] == ["@new.py"]
     with pytest.raises(ValueError, match="cannot be negative"):
-        ProjectPathCompletionAdapter("@", tmp_path, cache_ttl=-1)
+        ProjectPathCompletionAdapter("@", PathHolder(tmp_path), cache_ttl=-1)

@@ -1,8 +1,7 @@
 """Define independently injectable mention capabilities."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
-from pathlib import Path
+from collections.abc import Sequence
 
 from .. import constants
 from ..completion import (
@@ -15,7 +14,13 @@ from ..errors import Problem
 from ..instructions import InstructionsManager
 from ..instructions.models import SkillOperationError
 from ..models import ContextReference, ContextReferenceKind
-from ..utils import encode_content_cursor, is_path_ignored, iter_visible_paths, store_content
+from ..utils import (
+    PathReference,
+    encode_content_cursor,
+    is_path_ignored,
+    iter_visible_paths,
+    store_content,
+)
 
 
 class MentionHandler(ABC):
@@ -83,15 +88,15 @@ class ProjectPathMentionHandler(MentionHandler):
     """Attach bounded snapshots for project path mentions.
 
     Args:
-        working_directory (Callable[[], Path]): Lazy source of the current project directory.
+        working_directory (PathReference): Current project-directory reference.
         marker (str): Marker introducing project paths. Defaults to ``@``.
     """
 
-    _working_directory: Callable[[], Path]
+    _working_directory: PathReference
     _marker: str
     _completion_adapter: ProjectPathCompletionAdapter
 
-    def __init__(self, working_directory: Callable[[], Path], marker: str = "@") -> None:
+    def __init__(self, working_directory: PathReference, marker: str = "@") -> None:
         self._working_directory = working_directory
         self._marker = marker
         self._completion_adapter = ProjectPathCompletionAdapter(marker, working_directory)
@@ -165,7 +170,7 @@ class ProjectPathMentionHandler(MentionHandler):
         ignore_invalid: bool,
     ) -> tuple[ContextReference, ...]:
         """Resolve unique paths under one shared attachment budget."""
-        root = self._working_directory().resolve()
+        root = self._working_directory.resolve()
         sources = []
         resolved_paths = set()
         for value in dict.fromkeys(values):

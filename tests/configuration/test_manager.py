@@ -6,6 +6,132 @@ from pydantic import ValidationError
 from loop.configuration import ConfigurationManager
 
 
+def test_manager_snapshots_its_configuration_path(tmp_path):
+    """Configuration owns one immutable destination selected at construction."""
+    path = tmp_path / "first.toml"
+    manager = ConfigurationManager(path)
+    manager.initialize()
+    manager.load()
+    manager.save()
+
+    assert manager.path == path
+    assert path.is_file()
+
+
+def test_user_defaults_merge_with_sparse_workspace_overrides(tmp_path):
+    """A complete user document remains editable while the workspace stores only overrides."""
+    user_path = tmp_path / "config" / "config.toml"
+    workspace_path = tmp_path / "project" / ".loop" / "config.toml"
+    manager = ConfigurationManager(user_path, workspace_path)
+    manager.initialize()
+    manager.load()
+
+    manager.set("loop.debug", True)
+    manager.set("loop.stream", False, scope="user")
+
+    assert "stream = false" in user_path.read_text(encoding="utf-8")
+    assert workspace_path.read_text(encoding="utf-8") == "[loop]\ndebug = true\n"
+    assert manager.effective.loop.debug is True
+    assert manager.effective.loop.stream is False
+    assert manager.source_for("loop.debug") == "workspace"
+    assert manager.source_for("loop.stream") == "user"
+
+    manager.set("loop.debug", True, scope="user")
+    manager.set("loop.stream", True, scope="workspace")
+    manager.reset("loop.debug", scope="workspace")
+
+    assert manager.effective.loop.debug is True
+    assert manager.effective.loop.stream is True
+    assert manager.source_for("loop.debug") == "user"
+    workspace_document = workspace_path.read_text(encoding="utf-8")
+    assert "debug" not in workspace_document
+    assert "stream = true" in workspace_document
+
+    manager.set("loop.debug", True, scope="workspace")
+    assert manager.unset_all(scope="workspace").loop.debug is True
+    assert not workspace_path.exists()
+
+
+def test_sparse_workspace_reset_and_validation_cover_layer_edge_cases(tmp_path):
+    """Workspace-wide reset clears overrides and malformed sparse operations fail safely."""
+    user_path = tmp_path / "config.toml"
+    workspace_path = tmp_path / ".loop" / "config.toml"
+    manager = ConfigurationManager(user_path, workspace_path)
+    manager.initialize()
+    manager.load()
+    manager.set("loop.debug", True, scope="workspace")
+    manager.set("loop.stream", False, scope="workspace")
+    manager.unset("loop.debug", scope="workspace")
+    assert manager.effective.loop.stream is False
+
+    assert manager.reset_all(scope="workspace").loop.debug is False
+    assert manager.reset_all(scope="user").loop.debug is False
+    with pytest.raises(ValueError, match="Unknown configuration field"):
+        manager.unset("loop.debug", scope="workspace")
+
+    workspace_path.parent.mkdir(parents=True, exist_ok=True)
+    workspace_path.write_text("config_version = 1\nloop = true\n", encoding="utf-8")
+    with pytest.raises(ValidationError):
+        manager.load()
+
+
+def test_single_path_manager_rejects_workspace_writes(tmp_path):
+    """Managers without a workspace path reject writes to the workspace scope."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.initialize()
+    manager.load()
+
+    with pytest.raises(RuntimeError, match="Workspace path is not configured"):
+        manager.set("loop.debug", True)
+
+
+def test_user_reset_and_unset_restore_the_user_scope(tmp_path):
+    """User-scope edits persist in the complete document and do not create workspace overrides."""
+    user_path = tmp_path / "config.toml"
+    workspace_path = tmp_path / ".loop" / "config.toml"
+    manager = ConfigurationManager(user_path, workspace_path)
+    manager.initialize()
+    manager.load()
+    manager.set("loop.debug", True, scope="user")
+
+    manager.reset("loop.debug", scope="user")
+
+    assert manager.effective.loop.debug is False
+    assert manager.source_for("loop.debug") == "user"
+    assert not workspace_path.exists()
+    assert "debug = false" in user_path.read_text(encoding="utf-8")
+
+    manager.set("loop.debug", True, scope="user")
+    manager.unset("loop.debug", scope="user")
+
+    assert manager.effective.loop.debug is False
+    assert "debug = false" in user_path.read_text(encoding="utf-8")
+
+
+def test_invalid_session_value_is_rolled_back(tmp_path):
+    """Rejecting an invalid session override leaves the prior effective settings unchanged."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.initialize()
+    manager.load()
+
+    with pytest.raises(ValidationError):
+        manager.set_session("backend.temperature", 3)
+
+    assert manager.effective.backend.temperature is None
+    with pytest.raises(ValueError, match="No session override"):
+        manager.unset_session("backend.temperature")
+
+
+def test_reset_rejects_unknown_default_field(tmp_path):
+    """Reset rejects syntactically valid paths that are absent from the settings model."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.initialize()
+    manager.load()
+
+    with pytest.raises(ValueError, match="Unknown configuration field"):
+        manager.reset("backend.unknown")
+
+
 def test_initialize_creates_private_commented_defaults(tmp_path):
     """A new project receives a complete editable default configuration file."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
@@ -15,6 +141,7 @@ def test_initialize_creates_private_commented_defaults(tmp_path):
     content = path.read_text(encoding="utf-8")
     assert "# Loop workspace configuration" in content
     assert 'api_key = "local-api-key"' in content
+    assert "# context_window = <unset>" in content
     assert path.stat().st_mode & 0o777 == 0o600
     assert manager.load().backend.api_key.get_secret_value() == "local-api-key"
 
@@ -33,10 +160,10 @@ def test_environment_overrides_persisted_values(tmp_path):
     """Environment values take precedence over configuration-file values."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
-    manager.set("backend.default_model", "file-model")
-    manager.set("backend.temperature", 0.2)
-    manager.set("backend.reasoning_effort", "high")
-    manager.set("backend.hyperparameter_policy", "strict")
+    manager.set("backend.default_model", "file-model", scope="user")
+    manager.set("backend.temperature", 0.2, scope="user")
+    manager.set("backend.reasoning_effort", "high", scope="user")
+    manager.set("backend.hyperparameter_policy", "strict", scope="user")
 
     settings = manager.load(
         {
@@ -65,7 +192,7 @@ def test_set_preserves_existing_comments(tmp_path):
         encoding="utf-8",
     )
 
-    manager.set("backend.default_model", "configured-model")
+    manager.set("backend.default_model", "configured-model", scope="user")
 
     assert "# Project-specific model" in manager.path.read_text(encoding="utf-8")
     assert manager.load().backend.default_model == "configured-model"
@@ -117,15 +244,29 @@ def test_manager_rejects_unknown_fields_and_invalid_values(tmp_path):
         manager.set("backend.temperature", 3)
 
 
+def test_invalid_workspace_edit_restores_the_previous_document(tmp_path):
+    """A rejected sparse override does not contaminate later configuration operations."""
+    workspace_path = tmp_path / "project" / ".loop" / "config.toml"
+    manager = ConfigurationManager(tmp_path / "config.toml", workspace_path)
+    manager.initialize()
+    manager.load()
+
+    with pytest.raises(ValidationError):
+        manager.set("backend.temperature", 3, scope="workspace")
+
+    assert manager.effective.backend.temperature is None
+    assert not workspace_path.exists()
+
+
 def test_reset_stores_default_and_missing_file_loads_defaults(tmp_path):
     """Reset stores a model default and a missing file remains usable."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     assert manager.load().backend.default_model == "nvidia/Qwen3.6-35B-A3B-NVFP4"
     manager.initialize()
-    manager.set("backend.default_model", "configured-model")
+    manager.set("backend.default_model", "configured-model", scope="user")
 
     assert (
-        manager.reset("backend.default_model").backend.default_model
+        manager.reset("backend.default_model", scope="user").backend.default_model
         == "nvidia/Qwen3.6-35B-A3B-NVFP4"
     )
 
@@ -154,7 +295,7 @@ def test_file_edit_retains_environment_precedence_and_exposes_entries(tmp_path):
     manager.initialize()
     manager.load({"DEFAULT_MODEL": "environment-model"})
 
-    manager.set("backend.default_model", "file-model")
+    manager.set("backend.default_model", "file-model", scope="user")
 
     entry = next(item for item in manager.entries if item.path == "backend.api_key")
     assert manager.effective.backend.default_model == "environment-model"
@@ -178,12 +319,12 @@ def test_reset_all_stores_defaults_in_each_scope(tmp_path):
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
-    manager.set("loop.debug", True)
-    manager.set("backend.api_key", "configured-secret")
+    manager.set("loop.debug", True, scope="user")
+    manager.set("backend.api_key", "configured-secret", scope="user")
     manager.set_session("loop.stream", False)
 
     assert manager.reset_all(scope="session").loop.stream is True
-    settings = manager.reset_all(scope="workspace")
+    settings = manager.reset_all(scope="user")
     assert settings.loop.debug is False
     assert settings.backend.api_key.get_secret_value() == "local-api-key"
     assert 'api_key = "local-api-key"' in manager.path.read_text(encoding="utf-8")
@@ -204,7 +345,7 @@ def test_file_reset_all_retains_comments_and_formatting(tmp_path):
     )
     manager.load()
 
-    settings = manager.reset_all(scope="workspace")
+    settings = manager.reset_all(scope="user")
 
     document = manager.path.read_text(encoding="utf-8")
     assert settings.backend.default_model == "nvidia/Qwen3.6-35B-A3B-NVFP4"
@@ -219,7 +360,7 @@ def test_file_reset_all_restores_missing_sections_and_removes_nullable_defaults(
     manager.path.write_text("[backend]\ncontext_window = 4096\n", encoding="utf-8")
     manager.load()
 
-    settings = manager.reset_all(scope="workspace")
+    settings = manager.reset_all(scope="user")
 
     document = manager.path.read_text(encoding="utf-8")
     assert settings.backend.context_window is None
@@ -227,20 +368,20 @@ def test_file_reset_all_restores_missing_sections_and_removes_nullable_defaults(
     assert "[telemetry]" in document
 
 
-def test_unset_removes_a_file_value_and_reveals_environment_precedence(tmp_path):
-    """Removing a file value exposes the lower-precedence environment value."""
+def test_unset_user_value_restores_the_stored_default(tmp_path):
+    """Unsetting a user value stores its built-in default beneath environment precedence."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load({"DEFAULT_MODEL": "environment-model"})
-    manager.set("backend.default_model", "file-model")
+    manager.set("backend.default_model", "file-model", scope="user")
 
-    settings = manager.unset("backend.default_model")
+    settings = manager.unset("backend.default_model", scope="user")
 
     assert settings.backend.default_model == "environment-model"
     assert manager.source_for("backend.default_model") == "environment"
-    assert "default_model" not in manager.path.read_text(encoding="utf-8")
-    with pytest.raises(ValueError, match="Unknown configuration field"):
-        manager.unset("backend.default_model")
+    assert 'default_model = "nvidia/Qwen3.6-35B-A3B-NVFP4"' in manager.path.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_unset_session_removes_one_override_and_requires_an_existing_value(tmp_path):
@@ -263,14 +404,14 @@ def test_unset_all_removes_only_the_selected_scope(tmp_path):
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
-    manager.set("loop.debug", True)
+    manager.set("loop.debug", True, scope="user")
     manager.set_session("loop.stream", False)
 
-    assert manager.unset_all(scope="workspace").loop.debug is False
+    assert manager.unset_all(scope="user").loop.debug is False
     assert manager.effective.loop.stream is False
-    assert manager.source_for("loop.debug") == "default"
+    assert manager.source_for("loop.debug") == "workspace"
     assert manager.source_for("loop.stream") == "session"
     document = manager.path.read_text(encoding="utf-8")
-    assert "config_version" not in document
-    assert "[loop]" not in document
+    assert "config_version" in document
+    assert "[loop]" in document
     assert manager.unset_all(scope="session").loop.stream is True

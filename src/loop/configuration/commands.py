@@ -41,6 +41,7 @@ class ConfigurationCommands:
         entry_completion = CommandCompletion(provider=self._public_entry_values)
         scope_completion = CommandCompletion(
             values=(
+                CompletionValue("scope=user", "Save for this user."),
                 CompletionValue("scope=workspace", "Save for this workspace."),
                 CompletionValue("scope=session", "Apply only for this session."),
             )
@@ -117,7 +118,7 @@ class ConfigurationCommands:
             Field(description="New setting value for the set operation."),
         ] = None,
         scope: Annotated[
-            Literal["session", "workspace"] | None,
+            Literal["session", "user", "workspace"] | None,
             Field(description="Override scope, or omit it to choose interactively."),
         ] = None,
     ) -> None:
@@ -131,19 +132,7 @@ class ConfigurationCommands:
             self._show(context, path)
             return
         if action == "secret":
-            if path is None:
-                raise CommandArgumentError("The secret operation requires a setting path.")
-            if value is not None:
-                raise CommandArgumentError("The secret operation accepts its value only by prompt.")
-            if not self._is_secret(path):
-                raise CommandArgumentError(f"Configuration field '{path}' is not a secret.")
-            secret_value = context.interaction.prompt(f"Enter {path}:", secret=True)
-            if secret_value is False:
-                context.interaction.info(f"Secret {path} was not changed.")
-                return
-            selected_scope = self._select_scope(context, scope)
-            if selected_scope is not None:
-                self._set(context, path, str(secret_value), selected_scope, allow_secret=True)
+            self._set_secret(context, path, value, scope)
             return
         if action == "reset" and path is None:
             selected_scope = self._select_scope(context, scope)
@@ -170,34 +159,36 @@ class ConfigurationCommands:
     @staticmethod
     def _select_scope(
         context: CommandContext,
-        scope: Literal["session", "workspace"] | None,
-    ) -> Literal["session", "workspace"] | None:
+        scope: Literal["session", "user", "workspace"] | None,
+    ) -> Literal["session", "user", "workspace"] | None:
         """Return an explicit or letter-selected configuration scope.
 
         Args:
             context (CommandContext): Interaction used to select a scope.
-            scope (Literal["session", "workspace"] | None): Explicit scope, when supplied.
+            scope (Literal["session", "user", "workspace"] | None): Explicit scope, when supplied.
         Returns:
-            Literal["session", "workspace"] | None: Selected scope, or ``None`` when cancelled.
+            Literal["session", "user", "workspace"] | None: Selected scope, or ``None`` when
+                cancelled.
         """
         if scope is not None:
             return scope
         selected = context.interaction.prompt(
             "Choose configuration scope:",
             choices={
-                "workspace": "Save for this workspace",
+                "user": "Save for current user",
+                "workspace": "Save for current workspace",
                 "session": "This session only",
                 "cancel": "Cancel",
             },
-            index={"workspace": "w", "session": "s", "cancel": "c"},
+            index={"user": "u", "workspace": "w", "session": "s", "cancel": "c"},
         )
-        return selected if selected in {"session", "workspace"} else None
+        return selected if selected in {"session", "user", "workspace"} else None
 
     @staticmethod
     def _confirm_reset(
         context: CommandContext,
         path: str | None,
-        scope: Literal["session", "workspace"],
+        scope: Literal["session", "user", "workspace"],
         *,
         explicit_scope: bool,
     ) -> bool:
@@ -212,7 +203,11 @@ class ConfigurationCommands:
         target = path if path is not None else "all configuration entries"
         return context.interaction.confirm(f"Reset {target} for {scope}?", default=False)
 
-    def _reset_all(self, context: CommandContext, scope: Literal["session", "workspace"]) -> None:
+    def _reset_all(
+        self,
+        context: CommandContext,
+        scope: Literal["session", "user", "workspace"],
+    ) -> None:
         """Reset every setting in one selected scope to its built-in default."""
         paths = tuple(entry.path for entry in self._configuration.entries)
         settings = self._configuration.reset_all(scope=scope)
@@ -258,12 +253,34 @@ class ConfigurationCommands:
             settings = (
                 self._configuration.set_session(path, value)
                 if scope == "session"
-                else self._configuration.set(path, value)
+                else self._configuration.set(path, value, scope=scope)
             )
             status = self._apply(path, settings)
         except (ValueError, ValidationError) as error:
             raise CommandArgumentError(str(error)) from error
         context.interaction.info(f"Updated {path} for {scope}: {status}")
+
+    def _set_secret(
+        self,
+        context: CommandContext,
+        path: str | None,
+        value: str | None,
+        scope: Literal["session", "user", "workspace"] | None,
+    ) -> None:
+        """Prompt for and persist one secret configuration value."""
+        if path is None:
+            raise CommandArgumentError("The secret operation requires a setting path.")
+        if value is not None:
+            raise CommandArgumentError("The secret operation accepts its value only by prompt.")
+        if not self._is_secret(path):
+            raise CommandArgumentError(f"Configuration field '{path}' is not a secret.")
+        secret_value = context.interaction.prompt(f"Enter {path}:", secret=True)
+        if secret_value is False:
+            context.interaction.info(f"Secret {path} was not changed.")
+            return
+        selected_scope = self._select_scope(context, scope)
+        if selected_scope is not None:
+            self._set(context, path, str(secret_value), selected_scope, allow_secret=True)
 
     def _is_secret(self, path: str) -> bool:
         """Return whether a known configuration path is secret."""
@@ -278,7 +295,7 @@ class ConfigurationCommands:
             settings = (
                 self._configuration.reset_session(path)
                 if scope == "session"
-                else self._configuration.reset(path)
+                else self._configuration.reset(path, scope=scope)
             )
             status = self._apply(path, settings)
         except (ValueError, ValidationError) as error:

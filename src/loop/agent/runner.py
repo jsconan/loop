@@ -1,10 +1,10 @@
 """Run one agent through bounded model and tool turns."""
 
+from __future__ import annotations
+
 import json
 import logging
-from collections.abc import Callable
 from datetime import datetime
-from pathlib import Path
 from time import perf_counter, sleep
 
 from .. import constants
@@ -29,7 +29,7 @@ from ..permissions import PermissionManager
 from ..session import SessionManager, SessionRecoveryState
 from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
 from ..tooling.utils import serialize_tool_problem
-from ..utils import utc_now
+from ..utils import PathReference, utc_now
 from .agent import Agent
 from .models import AgentRecoveryStatus, AgentRunResult
 
@@ -48,7 +48,7 @@ class AgentRunner:
         model_selection (ModelSelection): Active model selection for the conversation.
         compaction (ContextCompaction): Context compactor run before model requests.
         interaction (Interaction): Service used to render responses and request recovery choices.
-        working_directory (Callable[[], Path]): Provider of the current instruction directory.
+        working_directory (PathReference): Current instruction-directory reference.
         stream (bool): Whether backend response events should be streamed.
         debug (bool): Whether raw response events should be displayed.
         max_turns (int): Maximum completed model turns allowed in one run. Set to ``0`` to disable
@@ -68,7 +68,7 @@ class AgentRunner:
     _model_selection: ModelSelection
     _compaction: ContextCompaction
     _interaction: Interaction
-    _working_directory: Callable[[], Path]
+    _working_directory: PathReference
     _stream: bool
     _debug: bool
     _max_turns: int
@@ -84,7 +84,7 @@ class AgentRunner:
         model_selection: ModelSelection,
         compaction: ContextCompaction,
         interaction: Interaction,
-        working_directory: Callable[[], Path],
+        working_directory: PathReference,
         *,
         stream: bool = False,
         debug: bool = False,
@@ -371,7 +371,7 @@ class AgentRunner:
                 )
             tools.extend(executions)
 
-            if self._max_turns > 0 and turn >= self._max_turns:
+            if 0 < self._max_turns <= turn:
                 prompt = (
                     f"Agent has reached the {self._max_turns}-turn safety limit. "
                     "Do you want to continue?"
@@ -469,7 +469,7 @@ class AgentRunner:
         self._session_manager.add_tool_call(
             call_id=tool_call.call_id,
             output=tool_result,
-            working_directory=str(instructions.working_directory or self._working_directory()),
+            working_directory=str(instructions.working_directory or self._working_directory),
             active_skills=instructions.active_skill_identities,
             succeeded=succeeded,
             duration_seconds=duration,
@@ -498,7 +498,7 @@ class AgentRunner:
         self._session_manager.add_tool_call(
             call_id=call.call_id,
             output=output,
-            working_directory=str(instructions.working_directory or self._working_directory()),
+            working_directory=str(instructions.working_directory or self._working_directory),
             active_skills=instructions.active_skill_identities,
             succeeded=False,
             duration_seconds=0,
@@ -522,7 +522,7 @@ class AgentRunner:
         selected_model = self._model_selection.effective
         snapshot = self._instructions_manager.prepare(self._agent)
         self._session_manager.update_instruction_state(
-            working_directory=str(snapshot.working_directory or self._working_directory()),
+            working_directory=str(snapshot.working_directory or self._working_directory),
             active_skills=list(snapshot.active_skills),
         )
         self._model_selection.synchronize_session()

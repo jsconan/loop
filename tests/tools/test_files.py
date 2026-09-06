@@ -641,7 +641,7 @@ def test_write_text_file_removes_its_temporary_file_when_commit_fails(tmp_path, 
     result = write_text_file(target, "content")
 
     assert problem(result)["detail"] == "commit failed"
-    assert set(tmp_path.iterdir()) == {tmp_path / ".loop", target}
+    assert set(tmp_path.iterdir()) == {target}
     assert target.read_text(encoding="utf-8") == "old"
 
 
@@ -794,7 +794,7 @@ def test_edit_text_file_reports_commit_failures_and_cleans_up_staging(tmp_path, 
 
     assert problem(result)["detail"] == "commit failed"
     assert target.read_text(encoding="utf-8") == "old"
-    assert set(tmp_path.iterdir()) == {tmp_path / ".loop", target}
+    assert set(tmp_path.iterdir()) == {target}
 
 
 def test_edit_executor_requires_an_authorized_digest(tmp_path):

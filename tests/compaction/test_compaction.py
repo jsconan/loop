@@ -9,7 +9,6 @@ from loop import (
     Agent,
     CompactionContextItem,
     CompactionResult,
-    ContextCompaction,
     InstructionsManager,
     Interaction,
     Message,
@@ -18,7 +17,9 @@ from loop import (
     SessionManager,
     Usage,
 )
+from loop.compaction import ContextCompaction
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
+from loop.utils import PathHolder
 
 
 def prepared_instructions():
@@ -51,7 +52,7 @@ def compaction_feature(
         selection,
         lambda: instructions.prepare(agent),
         interaction,
-        lambda: "/project",
+        PathHolder("/project"),
         threshold=threshold,
     )
     return feature, manager, backend, interaction
@@ -80,8 +81,8 @@ def test_compaction_detects_known_capacity_and_new_history():
 
 
 def test_compaction_reconfigures_backend_and_threshold():
-    """Future compaction uses replacement backend and validates changed threshold."""
-    feature, _, backend, _ = compaction_feature()
+    """Future compaction reads an owner-updated threshold and replacement backend."""
+    feature, _, backend, _ = compaction_feature(threshold=0.8)
     replacement = Mock()
 
     feature.backend = replacement
@@ -206,7 +207,7 @@ def test_compaction_requires_an_effective_model():
         ModelSelection(backend, manager),
         prepared_instructions(),
         Mock(spec=Interaction),
-        lambda: "/project",
+        PathHolder("/project"),
     )
 
     with pytest.raises(ValueError, match="No model was selected"):

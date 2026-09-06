@@ -1,9 +1,9 @@
 """Complete visible project paths after a marker."""
 
 import time
-from collections.abc import Callable
 from pathlib import Path
 
+from ...utils import PathReference
 from ...utils.path import iter_visible_paths
 from ..models import CompletionValue
 from .marker import MarkerCompletionAdapter
@@ -14,8 +14,7 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
 
     Args:
         marker (str): Single symbol that activates path completion.
-        working_directory (Path | Callable[[], Path]): Project root or lazy source of its current
-            value.
+        working_directory (PathReference): Current project-directory reference.
         cache_ttl (float): Seconds to reuse a discovered path snapshot. Defaults to ``5.0``;
             use ``0`` to disable caching.
 
@@ -23,7 +22,7 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         ValueError: If ``cache_ttl`` is negative.
     """
 
-    _working_directory: Callable[[], Path]
+    _working_directory: PathReference
     _cache_ttl: float
     _cached_root: Path | None
     _cached_until: float
@@ -32,14 +31,12 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
     def __init__(
         self,
         marker: str,
-        working_directory: Path | Callable[[], Path],
+        working_directory: PathReference,
         cache_ttl: float = 5.0,
     ) -> None:
         if cache_ttl < 0:
             raise ValueError("Path completion cache TTL cannot be negative.")
-        self._working_directory = (
-            working_directory if callable(working_directory) else lambda: working_directory
-        )
+        self._working_directory = working_directory
         self._cache_ttl = cache_ttl
         self._cached_root = None
         self._cached_until = 0.0
@@ -52,7 +49,7 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         Returns:
             tuple[CompletionValue, ...]: Cached or newly discovered project-relative paths.
         """
-        root = self._working_directory().resolve()
+        root = self._working_directory.resolve()
         now = time.monotonic()
         if root == self._cached_root and now < self._cached_until:
             return self._cached_values

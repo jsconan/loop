@@ -1,17 +1,17 @@
-"""Run the interactive loop command-line application."""
+"""Run the interactive loop application composition root."""
 
 import logging
 from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
+from .application import ApplicationPaths, ApplicationRuntime
 from .configuration import ConfigurationManager
 from .errors import Problem, log_problem
 from .interaction import ConsoleInteraction
-from .runtime import ApplicationRuntime
 from .telemetry import set_telemetry
 from .utils import ShutdownRequested, register_shutdown_signals
-from .workspace import Workspace
+from .workspace import Workspace, WorkspaceMigration, WorkspaceRepository
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,20 +20,34 @@ def main() -> None:
     """Run an interactive conversation with an LLM backend."""
     interaction = None
     runtime = None
-
     try:
         load_dotenv(find_dotenv(usecwd=True))
-        workspace = Workspace.discover(Path.cwd())
-        configuration = ConfigurationManager(workspace.storage.configuration)
+        paths = ApplicationPaths.discover()
+        repository = WorkspaceRepository(paths.workspace_catalog)
+        workspace = repository.initialize(Workspace.discover(Path.cwd()))
+        workspace_paths = paths.for_workspace(workspace.id, workspace.root)
+
+        configuration = ConfigurationManager(
+            paths.user_configuration,
+            workspace_paths.configuration,
+        )
         configuration.initialize()
         settings = configuration.load()
+        WorkspaceMigration(
+            workspace,
+            workspace_paths.sessions,
+            workspace_paths.permissions,
+        ).run()
         interaction = ConsoleInteraction()
         register_shutdown_signals()
         interaction.info("Hello from loop!")
         runtime = ApplicationRuntime.create(
             workspace,
+            paths,
+            workspace_paths,
             settings,
             configuration,
+            repository,
             interaction,
         )
         runtime.run()

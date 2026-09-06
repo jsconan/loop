@@ -115,7 +115,7 @@ manifest containing each reference's kind, path, original byte size, included by
 truncation state. Inline files use MIME-qualified base64 data URLs. File contents are not
 duplicated in the text manifest.
 
-The CLI persists conversations as sessions in `.loop/sessions.db` at the workspace root. A Git
+The CLI persists conversations in the active workspace's UUID-scoped centralized `sessions.db`. A Git
 worktree is one workspace; outside Git, the launch directory is the workspace. Sessions retain
 their canonical workspace root and cannot be resumed from another workspace. The first user
 message assigns a provisional name from its first 48 characters and creates the stored session.
@@ -357,31 +357,29 @@ Follow the repository's review workflow and report findings by severity.
 
 ## Configuration
 
-The CLI stores a complete, commented workspace configuration file at
-`.loop/config.toml`. It is created on first run with owner-only permissions, including the
-backend API key for a self-contained CLI setup. Keep `.loop/` private and do not commit it.
+The CLI stores a complete, commented user configuration in the platform-native Loop configuration
+directory. An optional `.loop/config.toml` contains only workspace overrides. Both use owner-only
+permissions; keep the local override private and do not commit secrets.
 
-Settings resolve in this order: explicit environment variables, values discovered through the
-nearest ancestor `.env`, `.loop/config.toml`, then built-in defaults. This keeps shared `.env`
-files useful while allowing workspace-local durable configuration.
+Settings resolve from built-in defaults, user configuration, workspace overrides, environment,
+and session overrides, in increasing precedence. Configuration commands write user scope by
+default; pass `scope=workspace` or `scope=session` for narrower overrides.
 
-Loop discovers one workspace at startup and uses that single context for configuration, sessions,
-telemetry, operational logs, permission policy, and permission audit records. All remain below the
-workspace's `.loop/` directory for now. Linked Git worktrees are distinct workspaces, matching
-Git's separation of worktree-specific state.
+Loop discovers one active workspace per process and resolves it through a centralized registry.
+`LOOP_CONFIG_HOME`, `LOOP_DATA_HOME`, and `LOOP_STATE_HOME` independently override the three
+platform-native roots. `/app dirs` prints every resolved path. Sessions and permission policies
+are UUID-scoped; telemetry, `audit.db`, and the interprocess-safe `loop.log` are application-global.
 
-The workspace database registers the workspace with a name and an opaque UUIDv4 identity. Every
-telemetry record carries that `workspace_id`; workspace paths are not copied into telemetry
-attributes. Workspace identity is stored separately from telemetry so both databases can move to
-centralized application storage independently in a later iteration. Telemetry schema migrations
-are versioned and run once rather than scanning historical records on every startup.
+The registry stores an opaque UUIDv4 identity separately from mutable canonical locations. Every
+telemetry and audit record carries that `workspace_id`. Legacy local identity, sessions, and
+permission policy are imported conservatively; a live copy sharing an identity is rejected.
 
 The generated file contains all settings and their built-in values. Nullable settings such as
-`context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort` are omitted
-until explicitly configured.
+`context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort` appear as
+commented `<unset>` entries because TOML has no null literal.
 
 ```toml
-# .loop/config.toml
+# user config.toml
 config_version = 1
 
 [backend]
@@ -423,6 +421,12 @@ logging, and web-tool composition; runtime components do not read environment va
 The configuration file retains comments and formatting when modified through the configuration
 manager API.
 
+Application and workspace-storage paths are immutable values resolved during startup. The active
+workspace alone owns the mutable working-directory `PathHolder` and exposes a read-only
+`PathReference` to consumers. Live scalar settings are updated through explicit operations on the
+components that own them; resources that own files or databases snapshot their path when they are
+constructed.
+
 While Loop is running, use `/config` to browse, inspect, change, or reset effective settings.
 Configuration-path completion prevents users from having to memorize setting names:
 
@@ -435,6 +439,10 @@ Configuration-path completion prevents users from having to memorize setting nam
 /config reset backend.temperature scope=workspace
 /config reset  # prompts for scope and confirmation
 ```
+
+At workspace scope, reset removes the override so the user setting becomes effective. At user or
+session scope, reset restores the built-in default explicitly. The configuration manager's
+`unset` operations remove values from their selected scope instead of writing defaults.
 
 Session settings override environment and file values for that Loop process only. File values are
 still saved when an environment variable currently wins, so a later run without that variable uses
@@ -507,7 +515,7 @@ the user choose an available replacement. Library callers still receive normaliz
 exceptions and can apply their own recovery policy.
 
 The `fetch_content` tool sends a browser-like user agent by default. Configure `[web].user_agent`
-in `.loop/config.toml` (or set `USER_AGENT`) to override it for web requests.
+in the user or workspace `config.toml` (or set `USER_AGENT`) to override it for web requests.
 
 ### Tool permissions
 
@@ -521,11 +529,12 @@ mutations and network access, and denies host-process execution at a user-config
 Ordinary rules cannot override boundaries. A required approval is denied when no interactive user
 is available.
 
-The local policy is stored at `.loop/permissions.yaml` under the Git project root. It is created
-when the policy is first changed. Decisions are appended to `.loop/permissions-audit.jsonl` and
-recorded as structured events in the active session. The session event includes the normalized
+The policy is stored in centralized UUID-scoped workspace data and is created when first changed.
+Decisions are appended to the application-global SQLite `audit.db` with `workspace_id` correlation
+and recorded as structured events in the active session. The session event includes the normalized
 request, effective result and source, whether the user was prompted, and the exact displayed
-prompt. Use `/permissions` to display the active policy:
+prompt. Use `/app logs <destination>` and `/app audit <destination>` to export operational records
+without overwriting existing files. Use `/permissions` to display the active policy:
 
 ```text
 /permissions
@@ -557,8 +566,9 @@ determining source for one concrete operation. Creating a rule with a wildcard t
 resource requires explicit confirmation because it may affect more operations than intended.
 
 Permission presets are versioned YAML artifacts rather than compiled Python modes. The built-in
-`observe`, `supervised`, `workspace`, and `locked` presets define a complete fallback decision for
-every action and may include rules. Use `/permissions preset list` and `show` to inspect them,
+`observe`, `supervised`, `workspace`, `locked`, and `unsupervised` presets define a complete
+fallback decision for every action and may include rules. Use `/permissions preset list` and `show`
+to inspect them,
 `diff` to preview one replacement, and `replace` to replace only the selected scope's defaults and
 rules after confirmation. Presets never change filesystem, network, or process enforcement limits,
 nor the other policy layer. The replacement prompt lists the replaced and installed defaults and
@@ -675,6 +685,7 @@ The package uses a `src` layout. Its main components are:
 
 ```text
 src/loop/backend/     Backend contract and OpenAI-compatible adapter
+src/loop/application/ Application composition, immutable storage paths, and commands
 src/loop/commands/    User-command definitions and dispatch
 src/loop/completion/  Declarative completion models, adapters, and aggregation
 src/loop/constants.py Shared application constants
@@ -685,8 +696,9 @@ src/loop/model_selection/ Active model selection and model commands
 src/loop/models.py    Conversation and response models
 src/loop/permissions/ Permission capabilities, requests, and policy management
 src/loop/session/     Session persistence contracts and implementations
-src/loop/skills/      Base agent policy, Agent Skills, catalog, and instruction management
+src/loop/instructions/ Base agent policy, Agent Skills, catalog, and instruction management
 src/loop/tooling/     Tool context, registration, definitions, and dispatch
 src/loop/tools/       Built-in tool implementations
 src/loop/utils/       Common utilities
+src/loop/workspace/   Workspace discovery, identity, catalog, and commands
 ```

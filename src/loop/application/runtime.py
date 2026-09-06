@@ -2,30 +2,32 @@
 
 from __future__ import annotations
 
-from .backend import OpenAIBackend
-from .configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
-from .interaction import Interaction
-from .loop import Loop
-from .permissions import PermissionManager
-from .session import SessionManager, SQLiteSessionStore
-from .telemetry import (
+from ..backend import OpenAIBackend
+from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
+from ..interaction import Interaction
+from ..loop import Loop
+from ..permissions import PermissionManager
+from ..session import SessionManager, SQLiteSessionStore
+from ..telemetry import (
     SQLiteTelemetryAdapter,
     Telemetry,
     configure_operational_logging,
     set_telemetry,
     telemetry_activity,
 )
-from .tooling import ToolRuntimeSettings
-from .tools import create_default_tool_registry
-from .workspace import Workspace
+from ..tooling import ToolRuntimeSettings
+from ..tools import create_default_tool_registry
+from ..workspace import Workspace, WorkspaceCommands, WorkspaceRepository
+from .commands import ApplicationCommands
+from .paths import ApplicationPaths, WorkspacePaths
 
 
 class ApplicationRuntime:
-    """Manage the assembled application and its process-wide telemetry lifecycle.
+    """Manage the assembled application and process-wide telemetry lifecycle.
 
     Args:
         loop (Loop): Fully assembled interactive application.
-        telemetry (Telemetry): Application telemetry service to start and close with the runtime.
+        telemetry (Telemetry): Application telemetry service.
         shutdown_timeout (float): Maximum seconds allowed for telemetry shutdown.
     """
 
@@ -42,37 +44,44 @@ class ApplicationRuntime:
     def create(
         cls,
         workspace: Workspace,
+        paths: ApplicationPaths,
+        workspace_paths: WorkspacePaths,
         settings: ApplicationSettings,
         configuration: ConfigurationManager,
+        workspace_repository: WorkspaceRepository,
         interaction: Interaction,
     ) -> ApplicationRuntime:
-        """Build an application runtime from one effective configuration snapshot.
+        """Build a runtime from initialized workspace and application-owned references.
 
         Args:
-            workspace (Workspace): Active worktree and its durable artifact locations.
+            workspace (Workspace): Initialized active workspace.
+            paths (ApplicationPaths): Immutable global application paths.
+            workspace_paths (WorkspacePaths): Immutable active-workspace storage paths.
             settings (ApplicationSettings): Validated immutable application configuration.
-            configuration (ConfigurationManager): Configuration owner used to persist model choices.
-            interaction (Interaction): User interaction service for the assembled loop.
+            configuration (ConfigurationManager): Persistent configuration owner.
+            workspace_repository (WorkspaceRepository): Owner of workspace registry operations.
+            interaction (Interaction): User interaction service.
 
         Returns:
-            ApplicationRuntime: Fully composed runtime with active process-wide telemetry.
+            ApplicationRuntime: Fully composed active runtime.
 
+        Raises:
+            ValueError: If the workspace has not been initialized.
         """
+        if workspace.id is None:
+            raise ValueError("Application runtime requires an initialized workspace.")
         configure_operational_logging(
-            workspace.storage.operational_log,
+            paths.operational_log,
             level=settings.logging.level,
             max_bytes=settings.logging.max_bytes,
             backup_count=settings.logging.backup_count,
         )
         telemetry = None
         try:
-            workspace = workspace.initialize(
-                busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms
-            )
             backend = cls._create_backend(settings)
             telemetry = Telemetry(
                 SQLiteTelemetryAdapter(
-                    workspace.storage.telemetry,
+                    paths.telemetry,
                     workspace_id=workspace.id,
                     busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
                 ),
@@ -91,14 +100,15 @@ class ApplicationRuntime:
                 working_directory=workspace.working_directory,
                 permission_manager=PermissionManager(
                     workspace.root,
-                    configuration_path=workspace.storage.permissions,
-                    audit_path=workspace.storage.permissions_audit,
+                    configuration_path=workspace_paths.permissions,
+                    audit_path=paths.permissions_audit,
+                    workspace_id=workspace.id,
                     interaction=interaction,
                 ),
                 session_manager=SessionManager(
                     interaction=interaction,
                     session_store=SQLiteSessionStore(
-                        workspace.storage.sessions,
+                        workspace_paths.sessions,
                         workspace_id=workspace.id,
                     ),
                     workspace_id=workspace.id,
@@ -123,6 +133,12 @@ class ApplicationRuntime:
         runtime = cls(loop, telemetry, settings.telemetry.shutdown_timeout)
         loop.command_manager.register_all(
             ConfigurationCommands(configuration, runtime.apply_configuration).get_commands()
+        )
+        loop.command_manager.register_all(
+            ApplicationCommands(paths, workspace_paths, workspace.id).get_commands()
+        )
+        loop.command_manager.register_all(
+            WorkspaceCommands(workspace, workspace_repository).get_commands()
         )
         set_telemetry(telemetry)
         telemetry_activity("application.started", severity="info", component="main")

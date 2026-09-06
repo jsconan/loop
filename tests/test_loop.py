@@ -50,7 +50,7 @@ from loop import (
 from loop.configuration import ApplicationSettings
 from loop.permissions import PermissionLoadFailure
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
-from loop.tooling import ToolRuntimeSettings
+from loop.utils import PathHolder
 
 
 def function_call() -> ToolCall:
@@ -107,12 +107,9 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.session.messages == []
     assert loop.model == "requested-model"
 
-    loop.debug = False
-    assert loop.debug is False
 
-
-def test_loop_applies_live_configuration_and_replaces_shared_backend(tmp_path):
-    """Supported configuration paths update future loop operations without restarting."""
+def test_loop_replaces_shared_backend(tmp_path):
+    """Explicit backend replacement updates every backend consumer."""
     backend = loop_backend()
     loop = Loop.create_default(
         backend=backend,
@@ -120,41 +117,79 @@ def test_loop_applies_live_configuration_and_replaces_shared_backend(tmp_path):
         working_directory=tmp_path,
     )
 
+    replacement = loop_backend()
+    loop.replace_backend(replacement)
+
+    assert loop.backend is replacement
+
+
+def test_loop_consumes_workspace_owned_path_reference(tmp_path):
+    """A stable directory holder propagates loop-owned path changes."""
+    directory = PathHolder(tmp_path)
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        working_directory=directory,
+        stream=False,
+        debug=False,
+        compaction_threshold=0.8,
+        prompt_on_recoverable_error=True,
+        max_agent_turns=25,
+    )
+
+    loop.set_working_directory(tmp_path)
+    loop.restore_model(None)
+
+    assert loop.stream is False
+    assert loop.debug is False
+    assert directory.get() == tmp_path
+
+
+def test_loop_exposes_stream_and_debug_setters(tmp_path):
+    """Loop callers can change response presentation through the public facade."""
+    loop = Loop.create_default(backend=loop_backend(), working_directory=tmp_path)
+
+    loop.stream = True
+    loop.debug = True
+
+    assert loop.stream is True
+    assert loop.debug is True
+
+
+def test_loop_applies_live_settings_through_owning_components(tmp_path):
+    """Live configuration updates component state while static settings require restart."""
+    loop = Loop.create_default(backend=loop_backend(), working_directory=tmp_path)
     settings = ApplicationSettings.model_validate(
         {
             "loop": {
                 "debug": True,
-                "stream": True,
-                "max_agent_turns": 0,
+                "stream": False,
+                "max_agent_turns": 7,
                 "prompt_on_recoverable_error": False,
                 "compaction_threshold": 0.7,
-                "model": "configured-model",
+                "model": "configured",
             },
-            "web": {"user_agent": "Loop test"},
+            "web": {"user_agent": "updated"},
         }
     )
+
     for path in (
         "loop.debug",
         "loop.stream",
         "loop.max_agent_turns",
         "loop.prompt_on_recoverable_error",
         "loop.compaction_threshold",
-        "web.user_agent",
         "loop.model",
+        "web.user_agent",
     ):
         assert loop.apply_runtime_settings(path, settings) == "applied now"
-    replacement = loop_backend()
-    loop.replace_backend(replacement)
-
-    assert loop.agent_runner.debug is True
-    assert loop.agent_runner.stream is True
-    assert loop.agent_runner.max_turns == 0
-    assert loop.agent_runner.compaction.threshold == 0.7
-    assert loop.tool_registry.settings == ToolRuntimeSettings(user_agent="Loop test")
-    assert loop.backend is replacement
-    assert (
-        loop.apply_runtime_settings("telemetry.batch_size", settings) == "saved; restart required"
+    assert loop.apply_runtime_settings("telemetry.batch_size", settings) == (
+        "saved; restart required"
     )
+    assert loop.debug is True
+    assert loop.agent_runner.max_turns == 7
+    assert loop.agent_runner.prompt_on_recoverable_error is False
+    assert loop.model == "configured"
+    assert loop.tool_registry.settings.user_agent == "updated"
 
 
 def test_loop_accepts_an_explicitly_assembled_runtime(tmp_path):
@@ -203,6 +238,9 @@ def test_loop_accepts_an_explicitly_assembled_runtime(tmp_path):
     assert loop.permission_manager is permissions
     assert loop.working_directory == tmp_path
     assert loop.stream is True
+    loop.set_working_directory(tmp_path)
+    with pytest.raises(NotADirectoryError, match="does not exist"):
+        loop.set_working_directory(tmp_path / "missing")
 
 
 @pytest.mark.parametrize("choice", ["continue", None])

@@ -31,7 +31,7 @@ from .session import (
 )
 from .telemetry import telemetry_activity
 from .tooling import ToolCommands, ToolRegistry, ToolRuntimeSettings
-from .utils import find_project_root
+from .utils import PathHolder, PathReference, find_project_root
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,15 +45,13 @@ class Loop:
         completion_manager (CompletionManager): Interactive completion service.
         session_name_generator (SessionNameGenerator): Session naming service.
         mention_manager (MentionManager): Mention resolution service.
-        working_directory (Path): Initial workspace directory.
+        working_directory (PathReference): Current workspace-directory reference.
 
     """
 
     _session_manager: SessionManager
     _interaction: Interaction
-    _working_directory: Path
-    _debug: bool
-    _stream: bool
+    _working_directory: PathReference
     _model_selection: ModelSelection
     _compaction: ContextCompaction
     _command_manager: CommandManager
@@ -71,7 +69,7 @@ class Loop:
         completion_manager: CompletionManager,
         session_name_generator: SessionNameGenerator,
         mention_manager: MentionManager,
-        working_directory: Path,
+        working_directory: Path | PathReference,
     ) -> None:
         self._agent_runner = agent_runner
         self._agent = agent_runner.agent
@@ -86,9 +84,7 @@ class Loop:
         self._instructions_manager = agent_runner.instructions_manager
         self._permission_manager = agent_runner.permission_manager
         self._backend = agent_runner.backend
-        self._working_directory = working_directory
-        self._stream = agent_runner.stream
-        self._debug = agent_runner.debug
+        self._working_directory = PathHolder.from_value(working_directory)
 
     @classmethod
     def create_default(
@@ -103,7 +99,7 @@ class Loop:
         permission_manager: PermissionManager | None = None,
         tool_registry: ToolRegistry | None = None,
         mention_manager: MentionManager | None = None,
-        working_directory: Path | str | None = None,
+        working_directory: Path | str | PathReference | None = None,
         agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
         session: Session | str | None = None,
         session_manager: SessionManager | None = None,
@@ -128,16 +124,17 @@ class Loop:
             permission_manager (PermissionManager | None): Tool authorization service.
             tool_registry (ToolRegistry | None): Tools exposed by the default agent.
             mention_manager (MentionManager | None): Mention resolution service.
-            working_directory (Path | str | None): Initial workspace directory.
+            working_directory (Path | str | PathReference | None): Initial directory or stable
+                workspace-owned reference.
             agents_filenames (tuple[str, ...]): Project instruction filenames in precedence order.
             session (Session | str | None): Initial session or persisted identifier.
             session_manager (SessionManager | None): Injected session state owner.
             session_name_generator (SessionNameGenerator | None): Injected session naming service.
             stream (bool): Whether model response events are streamed.
-            debug (bool): Whether raw model response events are displayed.
-            compaction_threshold (float): Utilization threshold for automatic compaction.
+            debug (bool): Whether raw model events are displayed.
+            compaction_threshold (float): Automatic compaction threshold.
             prompt_on_recoverable_error (bool): Whether recoverable errors prompt after retries.
-            max_agent_turns (int): Maximum model turns per run, or zero for unlimited turns.
+            max_agent_turns (int): Maximum turns, or zero for unlimited.
 
         Returns:
             Loop: Fully assembled interactive application.
@@ -155,7 +152,14 @@ class Loop:
         configured_name_generator = session_name_generator or BackendSessionNameGenerator(backend)
 
         restored_directory = configured_sessions.session.instruction_working_directory
-        configured_directory = Path(working_directory or restored_directory or Path.cwd()).resolve()
+        if isinstance(working_directory, PathReference):
+            directory_reference = working_directory
+            configured_directory = working_directory.resolve()
+        else:
+            configured_directory = Path(
+                working_directory or restored_directory or Path.cwd()
+            ).resolve()
+            directory_reference = PathHolder(configured_directory)
         configured_permissions = permission_manager or PermissionManager(
             find_project_root(configured_directory) or configured_directory,
             interaction=configured_interaction,
@@ -187,14 +191,13 @@ class Loop:
             ),
             on_select=on_model_select,
         )
-        application: Loop
         configured_compaction = ContextCompaction(
             backend,
             configured_sessions,
             configured_selection,
             lambda: configured_instructions.prepare(configured_agent),
             configured_interaction,
-            lambda: application.working_directory,
+            directory_reference,
             threshold=compaction_threshold,
         )
         configured_runner = AgentRunner(
@@ -206,7 +209,7 @@ class Loop:
             configured_selection,
             configured_compaction,
             configured_interaction,
-            lambda: application.working_directory,
+            directory_reference,
             stream=stream,
             debug=debug,
             max_turns=max_agent_turns,
@@ -226,7 +229,7 @@ class Loop:
         )
         configured_mentions = mention_manager or MentionManager(
             (
-                ProjectPathMentionHandler(lambda: application.working_directory),
+                ProjectPathMentionHandler(directory_reference),
                 SkillMentionHandler(configured_instructions),
             )
         )
@@ -239,15 +242,14 @@ class Loop:
                 *configured_mentions.completion_adapters,
             )
         )
-        application = cls(
+        return cls(
             agent_runner=configured_runner,
             command_manager=configured_commands,
             completion_manager=configured_completion,
             session_name_generator=configured_name_generator,
             mention_manager=configured_mentions,
-            working_directory=configured_directory,
+            working_directory=directory_reference,
         )
-        return application
 
     @property
     def command_manager(self) -> CommandManager:
@@ -399,7 +401,7 @@ class Loop:
         Returns:
             Path: The resolved working directory.
         """
-        return self._working_directory
+        return self._working_directory.get()
 
     def set_working_directory(self, working_directory: Path | str) -> None:
         """Change the working and instruction-discovery directory.
@@ -413,7 +415,7 @@ class Loop:
         directory = Path(working_directory).resolve()
         if not directory.is_dir():
             raise NotADirectoryError(f"Working directory '{directory}' does not exist.")
-        self._working_directory = directory
+        self._working_directory.set(directory)
         self._instructions_manager.observe_path(directory, directory=True)
 
     @property
@@ -432,7 +434,6 @@ class Loop:
         Args:
             debug (bool): Whether to enable debug output.
         """
-        self._debug = debug
         self._agent_runner.debug = debug
 
     @property
@@ -443,6 +444,15 @@ class Loop:
             bool: Whether response streaming is enabled.
         """
         return self._agent_runner.stream
+
+    @stream.setter
+    def stream(self, stream: bool) -> None:
+        """Enable or disable streaming for subsequent backend requests.
+
+        Args:
+            stream (bool): Whether subsequent responses should stream.
+        """
+        self._agent_runner.stream = stream
 
     @property
     def model(self) -> str | None:
@@ -460,6 +470,14 @@ class Loop:
             model (str): Exact backend model identifier to select.
         """
         self._model_selection.select(model)
+
+    def restore_model(self, model: str | None) -> None:
+        """Restore a configured model selection and synchronize session metadata.
+
+        Args:
+            model (str | None): Explicit model or ``None`` to use the backend default.
+        """
+        self._model_selection.restore(model)
 
     def run(self):
         """Run the conversation until the user requests to exit."""

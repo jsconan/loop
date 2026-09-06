@@ -6,8 +6,6 @@ from unittest.mock import ANY, MagicMock, Mock
 import pytest
 
 from loop import (
-    Agent,
-    AgentRunner,
     InstructionsManager,
     Interaction,
     PendingToolCall,
@@ -19,10 +17,12 @@ from loop import (
     ToolExecutionMetrics,
     Usage,
 )
+from loop.agent import Agent, AgentRunner
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
+from loop.utils import PathHolder
 
 
-def agent_runner(*, responses, max_turns=25, backend=None):
+def agent_runner(*, responses, max_turns=25, backend=None, options=None):
     """Build a runner with isolated execution collaborators."""
     backend = backend or Mock()
     agent = Agent("Assistant", tools=Mock())
@@ -34,6 +34,12 @@ def agent_runner(*, responses, max_turns=25, backend=None):
     session_manager.tokens = 0
     session_manager.context_window = None
     interaction = MagicMock(spec=Interaction)
+    options = options or {
+        "stream": False,
+        "debug": False,
+        "max_turns": max_turns,
+        "prompt": True,
+    }
     runner = AgentRunner(
         agent,
         backend,
@@ -43,8 +49,11 @@ def agent_runner(*, responses, max_turns=25, backend=None):
         Mock(),
         Mock(),
         interaction,
-        lambda: Path.cwd(),
-        max_turns=max_turns,
+        PathHolder(Path.cwd()),
+        stream=options["stream"],
+        debug=options["debug"],
+        max_turns=options["max_turns"],
+        prompt_on_recoverable_error=options["prompt"],
     )
     runner.query = Mock(side_effect=responses)
     return runner, session_manager, interaction
@@ -70,16 +79,18 @@ def test_runner_returns_the_first_final_response():
 
 
 def test_runner_reconfigures_subsequent_runs():
-    """Runtime controls replace backend and update mutable execution preferences."""
+    """The runner validates and owns live execution preferences."""
     runner, _, _ = agent_runner(responses=[Response(answer="done", reasoning="")])
     backend = Mock()
 
     runner.backend = backend
+    runner.debug = True
     runner.stream = True
     runner.max_turns = 0
     runner.prompt_on_recoverable_error = False
 
     assert runner.backend is backend
+    assert runner.debug is True
     assert runner.stream is True
     assert runner.max_turns == 0
     assert runner.prompt_on_recoverable_error is False
@@ -342,7 +353,7 @@ def test_runner_continues_after_max_turns_when_user_affirms():
         Mock(),
         Mock(),
         interaction,
-        lambda: Path.cwd(),
+        PathHolder(Path.cwd()),
         max_turns=1,
     )
     runner.query = Mock(side_effect=[response_with_tools, response_without_tools])

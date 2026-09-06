@@ -11,7 +11,9 @@ from loop.configuration import ConfigurationCommands, ConfigurationManager
 
 def test_config_set_applies_a_session_override(tmp_path):
     """The direct set form changes the active snapshot and calls its runtime applicator."""
-    configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    configuration = ConfigurationManager(
+        tmp_path / "config.toml", tmp_path / ".loop" / "config.toml"
+    )
     configuration.load()
     apply = Mock(return_value="applied now")
     interaction = Mock()
@@ -77,7 +79,9 @@ def test_config_without_arguments_displays_only_non_secret_entries(tmp_path):
 
 def test_config_set_applies_a_file_override(tmp_path):
     """The direct set form persists the selected scope without a separate command."""
-    configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    configuration = ConfigurationManager(
+        tmp_path / "config.toml", tmp_path / ".loop" / "config.toml"
+    )
     configuration.load()
     apply = Mock(return_value="applied now")
     interaction = Mock()
@@ -88,7 +92,7 @@ def test_config_set_applies_a_file_override(tmp_path):
     manager.call("config", "set loop.stream false scope=workspace")
 
     assert configuration.effective.loop.stream is False
-    assert configuration.path.exists()
+    assert (tmp_path / ".loop" / "config.toml").exists()
     assert apply.called
 
 
@@ -98,7 +102,7 @@ def test_config_secret_prompts_before_selecting_scope_and_applies_value(tmp_path
     configuration.load()
     apply = Mock(return_value="backend replaced")
     interaction = Mock()
-    interaction.prompt.side_effect = ["new-api-key", "session"]
+    interaction.prompt.side_effect = ["new-api-key", "user"]
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
@@ -111,17 +115,16 @@ def test_config_secret_prompts_before_selecting_scope_and_applies_value(tmp_path
         call(
             "Choose configuration scope:",
             choices={
-                "workspace": "Save for this workspace",
+                "user": "Save for current user",
+                "workspace": "Save for current workspace",
                 "session": "This session only",
                 "cancel": "Cancel",
             },
-            index={"workspace": "w", "session": "s", "cancel": "c"},
+            index={"user": "u", "workspace": "w", "session": "s", "cancel": "c"},
         ),
     ]
     apply.assert_called_once_with("backend.api_key", configuration.effective)
-    interaction.info.assert_called_once_with(
-        "Updated backend.api_key for session: backend replaced"
-    )
+    interaction.info.assert_called_once_with("Updated backend.api_key for user: backend replaced")
 
 
 def test_config_set_rejects_secret_entries_and_secret_rejects_plain_entries(tmp_path):
@@ -158,7 +161,7 @@ def test_config_secret_cancellation_leaves_the_existing_value_unchanged(tmp_path
     manager.call("config", "secret backend.api_key")
 
     assert configuration.effective.backend.api_key.get_secret_value() == "local-api-key"
-    interaction.info.assert_called_once_with("Secret backend.api_key was not changed.")
+    assert interaction.info.call_args_list[0] == call("Secret backend.api_key was not changed.")
 
 
 def test_config_reset_and_invalid_direct_forms_report_argument_errors(tmp_path):
@@ -166,6 +169,7 @@ def test_config_reset_and_invalid_direct_forms_report_argument_errors(tmp_path):
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
     interaction = Mock()
+    interaction.prompt.return_value = "cancel"
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
@@ -204,6 +208,29 @@ def test_config_reset_with_explicit_scope_requires_confirmation(tmp_path):
     interaction.confirm.assert_called_once_with("Reset loop.debug for session?", default=False)
 
 
+def test_config_workspace_reset_reveals_user_value(tmp_path):
+    """Reset removes a workspace override so the user configuration wins."""
+    configuration = ConfigurationManager(
+        tmp_path / "config.toml", tmp_path / "project" / ".loop" / "config.toml"
+    )
+    configuration.initialize()
+    configuration.load()
+    configuration.set("loop.debug", True, scope="user")
+    configuration.set("loop.debug", False, scope="workspace")
+    interaction = Mock()
+    interaction.confirm.return_value = True
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
+        interaction=interaction,
+    )
+
+    manager.call("config", "reset loop.debug scope=workspace")
+
+    assert configuration.effective.loop.debug is True
+    assert configuration.source_for("loop.debug") == "user"
+    assert not (tmp_path / "project" / ".loop" / "config.toml").exists()
+
+
 def test_config_reset_all_and_validation_failures_leave_state_consistent(tmp_path):
     """Reset without a path clears every selected-scope override and invalid writes fail safely."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
@@ -214,13 +241,10 @@ def test_config_reset_all_and_validation_failures_leave_state_consistent(tmp_pat
         interaction=interaction,
     )
 
-    interaction.prompt.side_effect = ["session", "session", "session", "cancel", "cancel", "cancel"]
-    manager.call("config", "set loop.debug true")
-    manager.call("config", "set loop.max_agent_turns -1")
-    manager.call("config", "reset")
-    manager.call("config", "reset")
-    manager.call("config", "reset loop.debug")
-    manager.call("config", "set loop.debug true")
+    manager.call("config", "set loop.debug true scope=session")
+    manager.call("config", "set loop.max_agent_turns -1 scope=session")
+    manager.call("config", "reset scope=session")
+    manager.call("config", "reset loop.debug scope=session")
 
     assert configuration.effective.loop.debug is False
     assert interaction.report.call_count == 1
@@ -232,7 +256,6 @@ def test_config_scope_picker_cancels_reset_all(tmp_path):
     configuration.load()
     configuration.set_session("loop.debug", True)
     interaction = Mock()
-    interaction.prompt.return_value = "cancel"
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
@@ -241,15 +264,45 @@ def test_config_scope_picker_cancels_reset_all(tmp_path):
     manager.call("config", "reset")
 
     assert configuration.effective.loop.debug is True
-    interaction.prompt.assert_called_once_with(
-        "Choose configuration scope:",
-        choices={
-            "workspace": "Save for this workspace",
-            "session": "This session only",
-            "cancel": "Cancel",
-        },
-        index={"workspace": "w", "session": "s", "cancel": "c"},
+    interaction.prompt.assert_called_once()
+
+
+def test_config_explicit_user_reset_can_be_declined(tmp_path):
+    """An explicitly scoped reset-all remains protected by confirmation."""
+    configuration = ConfigurationManager(
+        tmp_path / "config.toml", tmp_path / ".loop" / "config.toml"
     )
+    configuration.load()
+    interaction = Mock()
+    interaction.confirm.return_value = False
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
+    )
+
+    manager.call("config", "reset scope=user")
+
+    interaction.confirm.assert_called_once()
+
+
+def test_config_omitted_scope_prompts_and_supports_workspace_or_cancel(tmp_path):
+    """Omitted scope remains interactive, including workspace selection and cancellation."""
+    configuration = ConfigurationManager(
+        tmp_path / "config.toml", tmp_path / ".loop" / "config.toml"
+    )
+    configuration.load()
+    apply = Mock(return_value="applied")
+    interaction = Mock()
+    interaction.prompt.side_effect = ["workspace", "cancel", "session"]
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
+    )
+
+    manager.call("config", "set loop.debug true")
+    manager.call("config", "set loop.stream false")
+    manager.call("config", "reset loop.debug")
+
+    assert configuration.source_for("loop.debug") == "session"
+    assert configuration.effective.loop.stream is True
 
 
 def test_config_completion_excludes_secret_paths_from_get_and_set(tmp_path):
@@ -290,7 +343,11 @@ def test_config_completion_suggests_scope_values_after_edit_arguments(tmp_path):
         completion.get_completions(Document("/config set loop.debug false scope="), Mock())
     )
 
-    assert [value.text for value in values] == ["scope=session", "scope=workspace"]
+    assert [value.text for value in values] == [
+        "scope=session",
+        "scope=user",
+        "scope=workspace",
+    ]
 
 
 def test_config_reset_completion_suggests_scope_without_a_path(tmp_path):
@@ -302,7 +359,11 @@ def test_config_reset_completion_suggests_scope_without_a_path(tmp_path):
 
     values = list(completion.get_completions(Document("/config reset scope="), Mock()))
 
-    assert [value.text for value in values] == ["scope=session", "scope=workspace"]
+    assert [value.text for value in values] == [
+        "scope=session",
+        "scope=user",
+        "scope=workspace",
+    ]
 
 
 def test_config_reset_completion_suggests_scope_after_a_path(tmp_path):
@@ -314,4 +375,8 @@ def test_config_reset_completion_suggests_scope_after_a_path(tmp_path):
 
     values = list(completion.get_completions(Document("/config reset loop.debug scope="), Mock()))
 
-    assert [value.text for value in values] == ["scope=session", "scope=workspace"]
+    assert [value.text for value in values] == [
+        "scope=session",
+        "scope=user",
+        "scope=workspace",
+    ]

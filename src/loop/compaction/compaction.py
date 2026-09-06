@@ -1,5 +1,7 @@
 """Coordinate context compaction for one active conversation session."""
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from pathlib import Path
 
@@ -10,6 +12,7 @@ from ..interaction import Interaction
 from ..model_selection import ModelSelection
 from ..session import SessionManager
 from ..telemetry import telemetry_activity, telemetry_error
+from ..utils import PathHolder, PathReference
 
 
 class ContextCompaction:
@@ -22,8 +25,7 @@ class ContextCompaction:
         instructions (Callable[[], PreparedInstructions]): Provider that prepares exact
             model-ready instructions for an explicit agent.
         interaction (Interaction): Service used to report compaction progress and outcomes.
-        working_directory (Callable[[], Path | str]): Provider for the current fallback working
-            directory when the instructions manager has no observed directory.
+        working_directory (str | Path | PathReference): Current working-directory reference.
         threshold (float): Context-window utilization that triggers automatic compaction.
             Defaults to ``0.8``.
 
@@ -36,7 +38,7 @@ class ContextCompaction:
     _model_selection: ModelSelection
     _instructions: Callable[[], PreparedInstructions]
     _interaction: Interaction
-    _working_directory: Callable[[], Path | str]
+    _working_directory: PathReference
     _threshold: float
 
     def __init__(
@@ -46,7 +48,7 @@ class ContextCompaction:
         model_selection: ModelSelection,
         instructions: Callable[[], PreparedInstructions],
         interaction: Interaction,
-        working_directory: Callable[[], Path | str],
+        working_directory: str | Path | PathReference,
         *,
         threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
     ) -> None:
@@ -57,7 +59,7 @@ class ContextCompaction:
         self._model_selection = model_selection
         self._instructions = instructions
         self._interaction = interaction
-        self._working_directory = working_directory
+        self._working_directory = PathHolder.from_value(working_directory)
         self._threshold = threshold
 
     @property
@@ -68,6 +70,20 @@ class ContextCompaction:
             float: Utilization ratio that triggers compaction.
         """
         return self._threshold
+
+    @threshold.setter
+    def threshold(self, threshold: float) -> None:
+        """Set the automatic compaction utilization threshold.
+
+        Args:
+            threshold (float): Utilization ratio strictly between zero and one.
+
+        Raises:
+            ValueError: If the threshold is outside the supported range.
+        """
+        if not 0 < threshold < 1:
+            raise ValueError("Compaction threshold must be between zero and one.")
+        self._threshold = threshold
 
     @property
     def backend(self) -> Backend:
@@ -86,20 +102,6 @@ class ContextCompaction:
             backend (Backend): Fully configured replacement backend.
         """
         self._backend = backend
-
-    @threshold.setter
-    def threshold(self, threshold: float) -> None:
-        """Set the automatic compaction utilization threshold.
-
-        Args:
-            threshold (float): Utilization ratio strictly between zero and one.
-
-        Raises:
-            ValueError: If the threshold is outside the supported range.
-        """
-        if not 0 < threshold < 1:
-            raise ValueError("Compaction threshold must be between zero and one.")
-        self._threshold = threshold
 
     def can_compact(self) -> bool:
         """Return whether complete history advanced beyond the latest checkpoint.
@@ -200,7 +202,7 @@ class ContextCompaction:
             self._interaction.warning("The selected backend did not produce compacted context.")
             return False
 
-        working_directory = str(snapshot.working_directory or self._working_directory())
+        working_directory = str(snapshot.working_directory or self._working_directory)
         previous_tokens = self._session_manager.tokens
         self._session_manager.add_compaction(
             result,

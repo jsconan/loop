@@ -173,7 +173,7 @@ __all__ = [
     "Usage",
     "Workspace",
     "WorkspaceNameSource",
-    "WorkspaceStorage",
+    "WorkspaceRepository",
     "command",
     "create_default_tool_registry",
     "delete_path",
@@ -210,6 +210,7 @@ from .agent import (
     AgentRunResult,
     AgentRunStopReason,
 )
+from .application import ApplicationRuntime
 from .backend import (
     Backend,
     BackendAuthenticationError,
@@ -348,7 +349,6 @@ from .permissions import (
     SessionPolicyOverrides,
     SessionTarget,
 )
-from .runtime import ApplicationRuntime
 from .session import (
     BackendSessionNameGenerator,
     Compaction,
@@ -415,4 +415,4 @@ from .utils import (
     iter_visible_paths,
     register_shutdown_signals,
 )
-from .workspace import Workspace, WorkspaceNameSource, WorkspaceStorage
+from .workspace import Workspace, WorkspaceNameSource, WorkspaceRepository
