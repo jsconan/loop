@@ -19,6 +19,21 @@ from loop import (
     ToolCall,
     ToolResult,
 )
+from loop.utils import PathHolder
+
+
+def test_store_snapshots_its_database_path(tmp_path):
+    """A store keeps the immutable database destination selected at construction."""
+    path = PathHolder(tmp_path / "first.db")
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    path.set(tmp_path / "second.db")
+    session = Session(workspace_id="workspace")
+
+    store.save(session)
+
+    assert store.path == tmp_path / "first.db"
+    assert store.load(session.id).id == session.id
+    assert not (tmp_path / "second.db").exists()
 
 
 def function_call() -> ToolCall:

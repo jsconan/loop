@@ -32,7 +32,7 @@ class SQLiteSessionStore:
     _workspace_id: str
 
     def __init__(self, path: Path | str, *, workspace_id: str) -> None:
-        self._path = Path(path)
+        self._path = Path(path).resolve()
         if not workspace_id:
             raise ValueError("Workspace identifier must not be empty.")
         self._workspace_id = workspace_id
