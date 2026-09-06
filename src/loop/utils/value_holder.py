@@ -5,11 +5,12 @@ import threading
 from collections.abc import Callable
 from os import PathLike
 from pathlib import Path
-from typing import Any, Protocol, Self
+from typing import Any, Protocol, Self, runtime_checkable
 
 type PathInput = str | PathLike[str]
 
 
+@runtime_checkable
 class ValueReference[T](Protocol):
     """Provide the current value without exposing mutation."""
 
@@ -21,6 +22,7 @@ class ValueReference[T](Protocol):
         """
 
 
+@runtime_checkable
 class PathReference(ValueReference[Path], PathLike[str], Protocol):
     """Provide the current filesystem path without exposing mutation."""
 
