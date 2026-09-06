@@ -11,26 +11,25 @@ from pathlib import Path
 from uuid import uuid4
 
 from .. import constants
-from ..utils import PathHolder, PathReference
 
 
 class SQLitePermissionAudit:
     """Store permission audit records for every workspace in one SQLite database.
 
     Args:
-        path (Path | str | PathReference): Central audit database path.
+        path (Path | str): Central audit database path.
         busy_timeout_ms (int): Maximum milliseconds to wait for a database lock.
     """
 
     def __init__(
         self,
-        path: Path | str | PathReference,
+        path: Path | str,
         *,
         busy_timeout_ms: int = constants.DEFAULT_TELEMETRY_SQLITE_BUSY_TIMEOUT_MS,
     ) -> None:
         if busy_timeout_ms <= 0:
             raise ValueError("SQLite busy timeout must be positive.")
-        self._path = PathHolder.from_value(path).resolve()
+        self._path = Path(path).resolve()
         self._busy_timeout_ms = busy_timeout_ms
         self._initialize()
 
