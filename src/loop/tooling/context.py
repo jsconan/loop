@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..errors import Problem, ProblemException
 from ..interaction import Interaction
-from .models import DEFAULT_TOOL_RUNTIME_SETTINGS, ToolRuntimeSettings
+from .models import ToolRuntimeSettings
 
 if TYPE_CHECKING:
     from ..instructions import InstructionsManager
@@ -41,7 +41,7 @@ class ToolContext:
     operations: tuple[Operation, ...] = ()
     call_id: str | None = None
     additional_authorizer: AdditionalAuthorizer | None = None
-    settings: ToolRuntimeSettings = DEFAULT_TOOL_RUNTIME_SETTINGS
+    settings: ToolRuntimeSettings = field(default_factory=ToolRuntimeSettings)
 
     def observe_file(self, path: Path | str) -> None:
         """Report a successfully loaded file to instruction management.

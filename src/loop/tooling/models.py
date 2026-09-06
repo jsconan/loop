@@ -37,7 +37,7 @@ class ToolRegistrationError(ValueError):
     """Indicate that a Python function cannot be registered as a tool."""
 
 
-@dataclass(frozen=True)
+@dataclass
 class ToolRuntimeSettings:
     """Provide scoped configuration values to tool implementations.
 
@@ -46,6 +46,3 @@ class ToolRuntimeSettings:
     """
 
     user_agent: str = DEFAULT_USER_AGENT
-
-
-DEFAULT_TOOL_RUNTIME_SETTINGS = ToolRuntimeSettings()

@@ -29,7 +29,6 @@ from ..permissions import (
 from ..utils import callable_name
 from .context import ToolContext
 from .models import (
-    DEFAULT_TOOL_RUNTIME_SETTINGS,
     ToolPreflight,
     ToolRegistrationError,
     ToolRuntimeSettings,
@@ -53,6 +52,8 @@ class ToolRegistry:
             interaction.
         permission_manager (PermissionManager | None): Central policy manager guarding every call.
             Defaults to an in-memory supervised policy manager.
+        settings (ToolRuntimeSettings | None): Scoped settings supplied to context-aware tools, or
+            ``None`` to use an independent default instance.
     """
 
     _tools: dict[str, Tool]
@@ -66,13 +67,13 @@ class ToolRegistry:
         tools: Iterable[Callable[..., Any] | ToolRegistration] | None = None,
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
-        settings: ToolRuntimeSettings = DEFAULT_TOOL_RUNTIME_SETTINGS,
+        settings: ToolRuntimeSettings | None = None,
     ) -> None:
         self._tools = {}
         self._registration_problems = []
         self._interaction = interaction
         self._permission_manager = permission_manager or PermissionManager(interaction=interaction)
-        self._settings = settings
+        self._settings = settings or ToolRuntimeSettings()
         for tool in tools or ():
             self.register(tool)
 
