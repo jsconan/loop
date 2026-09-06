@@ -10,7 +10,8 @@ class Omit:
 OMIT = Omit()
 
 # Application directory and configuration
-APP_DIRECTORY = Path(".loop")
+APP_NAME = "loop"
+APP_DIRECTORY = Path(f".{APP_NAME}")
 APP_CONFIGURATION_FILENAME = "config.toml"
 
 # Default backend configuration constants
