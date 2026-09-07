@@ -39,7 +39,7 @@ from .models import (
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -505,10 +505,13 @@ class Session:
             )
 
         version = payload.get("version")
-        if version == 9:
+        legacy_reasoning = version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+        if version in {9, 10}:
             payload = dict(payload)
-            payload.pop("workspace_root", None)
-            payload.update(version=_SCHEMA_VERSION, workspace_id=None)
+            if version == 9:
+                payload.pop("workspace_root", None)
+                payload["workspace_id"] = None
+            payload["version"] = _SCHEMA_VERSION
             version = payload["version"]
         elif version in {1, 2, 3, 4, 5, 6, 7, 8}:
             try:
@@ -528,7 +531,11 @@ class Session:
                         f"Unsupported conversation item type: {item_type!r}."
                     )
                 model = _ITEM_TYPES[item_type]
-                messages.append(model.model_validate(item["data"]))
+                data = item["data"]
+                if legacy_reasoning and item_type == "reasoning" and "summary" not in data:
+                    data = dict(data)
+                    data.update(content="", summary=data.get("content", ""))
+                messages.append(model.model_validate(data))
 
             tokens = payload["tokens"]
             model = payload["model"]

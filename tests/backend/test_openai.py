@@ -1,6 +1,7 @@
 """Tests for the OpenAI-compatible backend adapter."""
 
 import asyncio
+from base64 import b64decode
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -15,7 +16,9 @@ from openai import (
 )
 from openai.types.responses import (
     ResponseCompletedEvent,
+    ResponseFailedEvent,
     ResponseFunctionToolCall,
+    ResponseIncompleteEvent,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseReasoningItem,
@@ -116,9 +119,40 @@ def sdk_completion_event(total_tokens=12, model="served-model", output=None):
                 "parallel_tool_calls": True,
                 "tool_choice": "auto",
                 "tools": [],
+                "status": "completed",
                 "usage": usage,
             },
         }
+    )
+
+
+def sdk_response(**values):
+    """Build one explicitly completed non-streaming provider response fixture."""
+    values.setdefault("status", "completed")
+    return SimpleNamespace(**values)
+
+
+def sdk_terminal_event(status):
+    """Build one failed or incomplete SDK terminal event."""
+    event_type = f"response.{status}"
+    response = {
+        "id": "response_terminal",
+        "created_at": 0,
+        "model": "served-model",
+        "object": "response",
+        "output": [],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "status": status,
+        "error": (
+            {"code": "server_error", "message": "provider exploded"} if status == "failed" else None
+        ),
+        "incomplete_details": ({"reason": "max_output_tokens"} if status == "incomplete" else None),
+    }
+    event_class = ResponseFailedEvent if status == "failed" else ResponseIncompleteEvent
+    return event_class.model_validate(
+        {"type": event_type, "sequence_number": 1, "response": response}
     )
 
 
@@ -219,7 +253,11 @@ def test_generation_hyperparameter_fallback_removes_only_rejected_parameter_and_
         body={"message": "unsupported parameter: temperature"},
     )
     sdk = Mock()
-    sdk.responses.create.side_effect = [rejected, [], []]
+    sdk.responses.create.side_effect = [
+        rejected,
+        [sdk_completion_event(total_tokens=None)],
+        [sdk_completion_event(total_tokens=None)],
+    ]
     backend = OpenAIBackend(
         default_model="model",
         temperature=0.2,
@@ -227,8 +265,8 @@ def test_generation_hyperparameter_fallback_removes_only_rejected_parameter_and_
     )
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        assert list(backend.get_response("first", stream=True)) == []
-        assert list(backend.get_response("second", stream=True)) == []
+        assert isinstance(list(backend.get_response("first", stream=True))[-1], ResponseCompleted)
+        assert isinstance(list(backend.get_response("second", stream=True))[-1], ResponseCompleted)
 
     first, retried, cached = [call.kwargs for call in sdk.responses.create.call_args_list]
     assert first["temperature"] == 0.2
@@ -248,16 +286,16 @@ def test_generation_hyperparameter_fallback_preserves_temperature_after_reasonin
         body=None,
     )
     sdk = Mock()
-    sdk.responses.create.side_effect = [rejected, []]
+    sdk.responses.create.side_effect = [rejected, [sdk_completion_event(total_tokens=None)]]
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        assert (
+        assert isinstance(
             list(
                 OpenAIBackend(
                     default_model="model", temperature=0.2, reasoning_effort="medium"
                 ).get_response("hello", stream=True)
-            )
-            == []
+            )[-1],
+            ResponseCompleted,
         )
 
     assert sdk.responses.create.call_args.kwargs["temperature"] == 0.2
@@ -339,7 +377,7 @@ def test_native_compaction_round_trips_exact_provider_items():
         output=[item],
         usage=SimpleNamespace(input_tokens=90, output_tokens=20, total_tokens=110),
     )
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model="model"
     )
 
@@ -419,7 +457,7 @@ def test_native_compaction_propagates_operational_api_failures():
 def test_portable_compaction_context_serializes_as_a_user_checkpoint():
     """Portable checkpoints cross the OpenAI request boundary as ordinary messages."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model="model"
     )
 
@@ -481,7 +519,7 @@ def test_file_input_mode_defaults_from_the_endpoint_and_allows_overrides():
     def content_for(**options):
         """Return serialized content for one backend configuration."""
         sdk = Mock()
-        sdk.responses.create.return_value = SimpleNamespace(
+        sdk.responses.create.return_value = sdk_response(
             output=[], output_text="", usage=None, model="model"
         )
         with patch("loop.backend.openai.OpenAI", return_value=sdk):
@@ -868,7 +906,7 @@ def test_sync_response_forwards_schema_streaming_and_model_selection():
         name="demo", description="Demo.", parameters={"type": "object"}, strict=True
     )
     sdk = Mock()
-    sdk.responses.create.return_value = []
+    sdk.responses.create.return_value = [sdk_completion_event(total_tokens=None)]
     client = OpenAIBackend(default_model="default")
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
@@ -882,7 +920,7 @@ def test_sync_response_forwards_schema_streaming_and_model_selection():
             )
         )
 
-    assert result == []
+    assert result == [ResponseCompleted(model="served-model")]
     sdk.responses.create.assert_called_once_with(
         model="override",
         input="hello",
@@ -929,10 +967,59 @@ def test_model_request_trace_matches_policy_prepared_sdk_arguments_exactly():
     ]
 
 
+def test_native_text_attachment_is_redacted_before_encoding_and_traced_exactly():
+    """Text attachment policy changes bytes and metadata before encoding, tracing, and sending."""
+    secret = "fixture-secret-value"
+    content = f"before {secret} after"
+    reference = ContextReference(
+        kind="file",
+        path="notes.txt",
+        content=content,
+        size_bytes=len(content.encode()),
+        included_bytes=len(content.encode()),
+        truncated=False,
+    )
+    sdk = Mock()
+    sdk.responses.create.return_value = sdk_response(
+        output=[], output_text="", usage=None, model="model"
+    )
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+
+    try:
+        with patch("loop.backend.openai.OpenAI", return_value=sdk):
+            list(
+                OpenAIBackend(
+                    default_model="model", api_key=secret, file_input_mode="native"
+                ).get_response(
+                    [Message(role="user", content=f"also {secret}", context=(reference,))]
+                )
+            )
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    submitted = sdk.responses.create.call_args.kwargs
+    traced = thaw(adapter.records[0].payload)
+    message = submitted["input"][0]
+    manifest = message["content"][1]["text"]
+    data_url = message["content"][2]["file_data"]
+    decoded = b64decode(data_url.partition(",")[2]).decode()
+    sanitized = "before <redacted:secret> after"
+    assert submitted == traced
+    assert message["content"][0]["text"] == "also <redacted:secret>"
+    assert decoded == sanitized
+    assert f'"size_bytes":{len(sanitized.encode())}' in manifest
+    assert f'"included_bytes":{len(sanitized.encode())}' in manifest
+    assert secret not in repr(submitted)
+    assert secret not in repr(adapter.records)
+
+
 def test_sync_response_requests_and_validates_pydantic_structured_output():
     """Pydantic formats use the portable wire schema and return a typed result."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[],
         output_text='{"name":"Ada","age":36}',
         usage=None,
@@ -966,7 +1053,7 @@ def test_sync_response_requests_and_validates_pydantic_structured_output():
 def test_sync_response_uses_raw_schema_validator_without_nullable_description():
     """Raw schema callbacks validate decoded JSON and omit absent wire descriptions."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="[1,2]", usage=None, model=None
     )
     output_format = StructuredOutputFormat(
@@ -990,13 +1077,13 @@ def test_structured_response_retries_with_diagnostics_and_aggregates_usage():
     """Invalid output is replaced through one bounded corrective generation."""
     sdk = Mock()
     sdk.responses.create.side_effect = [
-        SimpleNamespace(
+        sdk_response(
             output=[],
             output_text='{"name":"Ada","age":"old"}',
             usage=SimpleNamespace(input_tokens=5, output_tokens=2, total_tokens=7),
             model="served-model",
         ),
-        SimpleNamespace(
+        sdk_response(
             output=[],
             output_text='{"name":"Ada","age":36}',
             usage=SimpleNamespace(input_tokens=8, output_tokens=3, total_tokens=11),
@@ -1031,13 +1118,13 @@ def test_structured_retry_applies_aggregate_usage_to_item_metadata():
     valid_text = '{"name":"Ada","age":36}'
     sdk = Mock()
     sdk.responses.create.side_effect = [
-        SimpleNamespace(
+        sdk_response(
             output=[],
             output_text="{}",
             usage=SimpleNamespace(total_tokens=2),
             model="served-model",
         ),
-        SimpleNamespace(
+        sdk_response(
             id="response_2",
             output=[sdk_output_message(valid_text)],
             output_text=valid_text,
@@ -1065,9 +1152,7 @@ def test_prompt_mode_omits_native_format_and_auto_mode_caches_rejection():
         response=httpx.Response(400, request=request),
         body=None,
     )
-    valid = SimpleNamespace(
-        output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None
-    )
+    valid = sdk_response(output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None)
     sdk = Mock()
     sdk.responses.create.side_effect = [rejected, valid, valid]
     output_format = StructuredOutputFormat.from_model(Person)
@@ -1088,8 +1173,8 @@ def test_explicit_prompt_mode_uses_serialized_history_for_correction():
     """Prompt mode retries iterable context without sending a native schema parameter."""
     sdk = Mock()
     sdk.responses.create.side_effect = [
-        SimpleNamespace(output=[], output_text="{}", usage=None, model=None),
-        SimpleNamespace(output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None),
+        sdk_response(output=[], output_text="{}", usage=None, model=None),
+        sdk_response(output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None),
     ]
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
@@ -1131,7 +1216,7 @@ def test_structured_provider_refusal_fails_without_retry():
     """Provider refusals are classified and are not regenerated as validation mistakes."""
     refusal = SimpleNamespace(type="refusal")
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         status="completed",
         output=[SimpleNamespace(content=[refusal])],
         output_text="",
@@ -1155,15 +1240,15 @@ def test_structured_provider_refusal_fails_without_retry():
 
 
 def test_incomplete_structured_response_is_classified_after_retry():
-    """Incomplete terminal responses remain distinguishable after retry exhaustion."""
+    """Incomplete non-streaming responses enter backend recovery before validation."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         status="incomplete", output=[], output_text="", usage=None, model=None
     )
 
     with (
         patch("loop.backend.openai.OpenAI", return_value=sdk),
-        pytest.raises(StructuredOutputValidationError) as captured,
+        pytest.raises(BackendResponseError) as captured,
     ):
         list(
             OpenAIBackend(default_model="default").get_response(
@@ -1171,14 +1256,55 @@ def test_incomplete_structured_response_is_classified_after_retry():
             )
         )
 
-    assert captured.value.category == "incomplete"
-    assert captured.value.attempt == 2
+    assert captured.value.details["terminal_state"] == "incomplete"
+    assert sdk.responses.create.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "error_type", "terminal_state"),
+    [
+        (
+            sdk_response(
+                status="failed",
+                id="failed_response",
+                error=SimpleNamespace(code="provider_error", message="generation failed"),
+                incomplete_details=None,
+                output=[],
+                output_text="",
+                usage=None,
+                model="model",
+            ),
+            BackendStatusError,
+            "failed",
+        ),
+        (
+            SimpleNamespace(
+                output=[], output_text="", usage=None, model="model", id="missing_status"
+            ),
+            BackendResponseError,
+            "missing",
+        ),
+    ],
+)
+def test_non_streaming_response_requires_explicit_completion(response, error_type, terminal_state):
+    """Non-streaming failed or status-less responses cannot become successful responses."""
+    sdk = Mock()
+    sdk.responses.create.return_value = response
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(error_type) as raised,
+    ):
+        list(OpenAIBackend(default_model="model").get_response("hello"))
+
+    assert raised.value.operation == "create_response"
+    assert raised.value.details["terminal_state"] == terminal_state
 
 
 def test_structured_failure_exposes_terminal_attempt_context():
     """Retry exhaustion reports the model, mode, attempt, output, and aggregate usage."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[],
         output_text="not-json",
         usage=SimpleNamespace(input_tokens=2, output_tokens=1, total_tokens=3),
@@ -1205,7 +1331,7 @@ def test_structured_failure_exposes_terminal_attempt_context():
 def test_structured_response_rejects_empty_final_text():
     """A final response without JSON fails its requested structured contract."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model=None
     )
 
@@ -1221,7 +1347,8 @@ def test_structured_response_rejects_empty_final_text():
         )
 
 
-def test_structured_response_allows_an_intermediate_tool_only_completion():
+@pytest.mark.parametrize("response_model", [None, "served-model"])
+def test_structured_response_allows_an_intermediate_tool_only_completion(response_model):
     """Tool-only turns defer structured validation until a later answer is produced."""
     call = ResponseFunctionToolCall(
         id="fc_1",
@@ -1232,8 +1359,8 @@ def test_structured_response_allows_an_intermediate_tool_only_completion():
         status="completed",
     )
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
-        output=[call], output_text="", usage=None, model=None
+    sdk.responses.create.return_value = sdk_response(
+        output=[call], output_text="", usage=None, model=response_model
     )
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
@@ -1250,7 +1377,7 @@ def test_async_response_uses_default_model():
     """Asynchronous requests use the default model when none is supplied."""
     sdk = Mock()
     sdk.responses.create = AsyncMock(
-        return_value=SimpleNamespace(output=[], output_text="", usage=None, model="served-model")
+        return_value=sdk_response(output=[], output_text="", usage=None, model="served-model")
     )
     client = OpenAIBackend(default_model="default")
 
@@ -1279,18 +1406,20 @@ def test_async_generation_hyperparameter_fallback_retries_without_rejected_contr
         body=None,
     )
     sdk = Mock()
-    sdk.responses.create = AsyncMock(side_effect=[rejected, AsyncEvents([])])
+    sdk.responses.create = AsyncMock(
+        side_effect=[rejected, AsyncEvents([sdk_completion_event(total_tokens=None)])]
+    )
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
-        assert (
+        assert isinstance(
             asyncio.run(
                 collect_events(
                     OpenAIBackend(default_model="model", temperature=0.2).get_response_async(
                         "hello", stream=True
                     )
                 )
-            )
-            == []
+            )[-1],
+            ResponseCompleted,
         )
 
     first, retried = [call.kwargs for call in sdk.responses.create.await_args_list]
@@ -1302,7 +1431,7 @@ def test_async_response_forwards_and_validates_structured_output():
     """Asynchronous structured requests share the synchronous wire and result contract."""
     sdk = Mock()
     sdk.responses.create = AsyncMock(
-        return_value=SimpleNamespace(
+        return_value=sdk_response(
             output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None
         )
     )
@@ -1328,10 +1457,8 @@ def test_async_structured_response_retries_invalid_output():
     sdk = Mock()
     sdk.responses.create = AsyncMock(
         side_effect=[
-            SimpleNamespace(output=[], output_text="{}", usage=None, model=None),
-            SimpleNamespace(
-                output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None
-            ),
+            sdk_response(output=[], output_text="{}", usage=None, model=None),
+            sdk_response(output=[], output_text='{"name":"Ada","age":36}', usage=None, model=None),
         ]
     )
 
@@ -1356,7 +1483,7 @@ def test_async_auto_mode_falls_back_and_reports_terminal_validation_failure():
         response=httpx.Response(422, request=request),
         body=None,
     )
-    invalid = SimpleNamespace(output=[], output_text="bad", usage=None, model=None)
+    invalid = sdk_response(output=[], output_text="bad", usage=None, model=None)
     sdk = Mock()
     sdk.responses.create = AsyncMock(side_effect=[rejected, invalid, invalid])
 
@@ -1434,7 +1561,7 @@ def test_completed_response_normalizes_items_and_serializes_local_history():
         status="completed",
     )
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[reasoning, message, sdk_call, SimpleNamespace(type="unknown")],
         output_text="authoritative answer",
         usage=SimpleNamespace(total_tokens=21),
@@ -1500,10 +1627,57 @@ def test_completed_response_normalizes_items_and_serializes_local_history():
     ]
 
 
+def test_reasoning_summary_content_and_encrypted_state_round_trip_separately():
+    """Reasoning replay preserves display, canonical, and opaque provider semantics."""
+    opaque_state = "sk_" + "a" * 20
+    provider_reasoning = ResponseReasoningItem.model_validate(
+        {
+            "id": "reasoning_opaque",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "display summary"}],
+            "content": [{"type": "reasoning_text", "text": "provider reasoning"}],
+            "encrypted_content": opaque_state,
+            "status": "completed",
+        }
+    )
+    sdk = Mock()
+    sdk.responses.create.side_effect = [
+        sdk_response(output=[provider_reasoning], output_text="", usage=None, model="served-model"),
+        sdk_response(output=[], output_text="", usage=None, model="served-model"),
+    ]
+    backend = OpenAIBackend(default_model="model")
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        first_events = list(backend.get_response("hello"))
+        reasoning = first_events[-1].items[0]
+        list(backend.get_response([reasoning]))
+
+    assert reasoning == Reasoning(
+        content="provider reasoning",
+        summary="display summary",
+        encrypted_content=opaque_state,
+        status="completed",
+        id="reasoning_opaque",
+        metadata=ResponseMetadata(model="served-model"),
+    )
+    assert first_events[0] == ReasoningCompleted(text="display summary")
+    assert first_events[-1].reasoning == "display summary"
+    assert sdk.responses.create.call_args.kwargs["input"] == [
+        {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "display summary"}],
+            "content": [{"type": "reasoning_text", "text": "provider reasoning"}],
+            "encrypted_content": opaque_state,
+            "status": "completed",
+            "id": "reasoning_opaque",
+        }
+    ]
+
+
 def test_user_context_preserves_metadata_and_uses_native_multipart_input():
     """File snapshots expose truncation metadata beside their native input-file payload."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model="model"
     )
     reference = ContextReference(
@@ -1550,7 +1724,7 @@ def test_user_context_preserves_metadata_and_uses_native_multipart_input():
 def test_file_context_defaults_unknown_extensions_to_plain_text_data_urls():
     """Unknown text extensions remain valid native file inputs with a conservative MIME type."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model="model"
     )
     reference = ContextReference(
@@ -1576,7 +1750,7 @@ def test_file_context_defaults_unknown_extensions_to_plain_text_data_urls():
 def test_directory_context_is_serialized_as_a_separate_text_part():
     """Generated directory listings remain distinct from the user's prompt text."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model="model"
     )
     reference = ContextReference(
@@ -1617,7 +1791,7 @@ def test_directory_context_is_serialized_as_a_separate_text_part():
 def test_custom_endpoint_file_context_defaults_to_portable_text_parts():
     """Custom endpoints receive readable source in a fenced untrusted-data envelope."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model="model"
     )
     reference = ContextReference(
@@ -1649,7 +1823,7 @@ def test_custom_endpoint_file_context_defaults_to_portable_text_parts():
 def test_portable_text_file_context_escapes_payload_boundaries():
     """File-controlled fences cannot close the portable source envelope."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model="model"
     )
     reference = ContextReference(
@@ -1692,7 +1866,7 @@ def test_custom_endpoint_file_context_uses_multimodal_content_parts(
 ):
     """Compatible endpoints receive media snapshots through their supported URL parts."""
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model="model"
     )
     reference = ContextReference(
@@ -1737,7 +1911,7 @@ def test_completed_response_emits_only_final_reasoning():
         }
     )
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[first, final], output_text="", usage=None, model=None
     )
 
@@ -1770,7 +1944,7 @@ def test_completed_response_uses_reasoning_summary_when_content_is_absent():
         }
     )
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[reasoning], output_text="", usage=None, model=None
     )
 
@@ -1780,7 +1954,7 @@ def test_completed_response_uses_reasoning_summary_when_content_is_absent():
     assert events == [
         ReasoningCompleted(text="first thought"),
         ResponseCompleted(
-            items=(Reasoning(content="first thought", id="reasoning_1"),),
+            items=(Reasoning(content="", summary="first thought", id="reasoning_1"),),
             reasoning="first thought",
         ),
     ]
@@ -1793,7 +1967,7 @@ def test_completed_response_ignores_empty_text_and_invalid_metadata():
         id="m", type="message", role="assistant", status="completed", content=[]
     )
     sdk = Mock()
-    sdk.responses.create.return_value = SimpleNamespace(
+    sdk.responses.create.return_value = sdk_response(
         output=[reasoning, message],
         output_text="",
         usage=SimpleNamespace(total_tokens=-1),
@@ -1898,7 +2072,6 @@ def test_streaming_response_normalizes_provider_events():
             type="response.output_item.done",
         ),
         sdk_completion_event(output=[reasoning, message, call]),
-        SimpleNamespace(type="unknown"),
     ]
     sdk = Mock()
     sdk.responses.create.return_value = provider_events
@@ -1986,6 +2159,89 @@ def test_stream_failure_records_that_normalized_output_started():
         list(OpenAIBackend(default_model="model").get_response("hello", stream=True))
 
     assert raised.value.response_started is True
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [("failed", BackendStatusError), ("incomplete", BackendResponseError)],
+)
+def test_sync_stream_rejects_provider_failure_terminals(status, error_type):
+    """Synchronous streams normalize failed and incomplete terminal outcomes."""
+    sdk = Mock()
+    sdk.responses.create.return_value = [sdk_terminal_event(status)]
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(error_type) as raised,
+    ):
+        list(OpenAIBackend(default_model="model").get_response("hello", stream=True))
+
+    assert raised.value.operation == "stream_response"
+    assert raised.value.request_id == "response_terminal"
+    assert raised.value.details["terminal_state"] == status
+    if status == "failed":
+        assert raised.value.code == "server_error"
+        assert str(raised.value) == "provider exploded"
+
+
+@pytest.mark.parametrize("output_format", [None, StructuredOutputFormat.from_model(Person)])
+def test_sync_stream_rejects_eof_without_a_terminal_event(output_format):
+    """Synchronous stream EOF cannot stand in for an explicit completion."""
+    sdk = Mock()
+    sdk.responses.create.return_value = []
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendResponseError, match="before response.completed") as raised,
+    ):
+        list(
+            OpenAIBackend(default_model="model").get_response(
+                "hello", stream=True, output_format=output_format
+            )
+        )
+
+    assert raised.value.operation == "stream_response"
+    assert raised.value.response_started is False
+
+
+@pytest.mark.parametrize("output_format", [None, StructuredOutputFormat.from_model(Person)])
+def test_sync_stream_rejects_multiple_completion_events(output_format):
+    """Synchronous streams reject a second successful terminal event."""
+    sdk = Mock()
+    output = [sdk_output_message('{"name":"Ada","age":36}')] if output_format is not None else None
+    completion = sdk_completion_event(total_tokens=None, output=output)
+    sdk.responses.create.return_value = [completion, completion]
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendResponseError, match="multiple completed events"),
+    ):
+        list(
+            OpenAIBackend(default_model="model").get_response(
+                "hello", stream=True, output_format=output_format
+            )
+        )
+
+
+def test_sync_stream_rejects_nonterminal_events_after_completion():
+    """A synchronous completion is terminal even when the transport yields more data."""
+    trailing = ResponseTextDeltaEvent(
+        type="response.output_text.delta",
+        sequence_number=11,
+        item_id="m",
+        output_index=0,
+        content_index=0,
+        delta="late",
+        logprobs=[],
+    )
+    sdk = Mock()
+    sdk.responses.create.return_value = [sdk_completion_event(), trailing]
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendResponseError, match="event after response.completed"),
+    ):
+        list(OpenAIBackend(default_model="model").get_response("hello", stream=True))
 
 
 def test_async_streaming_response_uses_the_normalized_event_contract():
@@ -2100,6 +2356,91 @@ def test_async_stream_failure_records_that_normalized_output_started():
         )
 
     assert raised.value.response_started is True
+
+
+@pytest.mark.parametrize("status", ["failed", "incomplete"])
+def test_async_stream_rejects_non_success_terminals(status):
+    """Asynchronous streams enforce the same terminal outcome contract as sync streams."""
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=AsyncEvents([sdk_terminal_event(status)]))
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(BackendError) as raised,
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async("hello", stream=True)
+            )
+        )
+
+    assert raised.value.operation == "stream_response"
+    assert raised.value.details["terminal_state"] == status
+
+
+@pytest.mark.parametrize("output_format", [None, StructuredOutputFormat.from_model(Person)])
+def test_async_stream_rejects_eof_without_a_terminal_event(output_format):
+    """Asynchronous stream EOF is rejected when no completion event was received."""
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=AsyncEvents([]))
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(BackendResponseError, match="before response.completed"),
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async(
+                    "hello", stream=True, output_format=output_format
+                )
+            )
+        )
+
+
+@pytest.mark.parametrize("output_format", [None, StructuredOutputFormat.from_model(Person)])
+def test_async_stream_rejects_multiple_completion_events(output_format):
+    """Asynchronous streams reject a second successful terminal event."""
+    output = [sdk_output_message('{"name":"Ada","age":36}')] if output_format is not None else None
+    completion = sdk_completion_event(total_tokens=None, output=output)
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=AsyncEvents([completion, completion]))
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(BackendResponseError, match="multiple completed events"),
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async(
+                    "hello", stream=True, output_format=output_format
+                )
+            )
+        )
+
+
+def test_async_stream_rejects_nonterminal_events_after_completion():
+    """An asynchronous completion rejects every later provider event."""
+    trailing = ResponseTextDeltaEvent(
+        type="response.output_text.delta",
+        sequence_number=11,
+        item_id="m",
+        output_index=0,
+        content_index=0,
+        delta="late",
+        logprobs=[],
+    )
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=AsyncEvents([sdk_completion_event(), trailing]))
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(BackendResponseError, match="event after response.completed"),
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async("hello", stream=True)
+            )
+        )
 
 
 def test_structured_streaming_buffers_and_discards_invalid_attempts():

@@ -175,7 +175,7 @@ def test_store_upgrades_path_owned_snapshots_once_on_load(tmp_path):
         stored = json.loads(
             connection.execute("SELECT session FROM sessions WHERE id = 'legacy'").fetchone()[0]
         )
-    assert stored["version"] == 10
+    assert stored["version"] == 11
     assert stored["workspace_id"] == "workspace"
     assert "workspace_root" not in stored
 

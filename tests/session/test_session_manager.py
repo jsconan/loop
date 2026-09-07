@@ -15,6 +15,7 @@ from loop import (
     AnswerDelta,
     ApprovalChoice,
     AuthorizationResult,
+    BackendResponseError,
     Compaction,
     CompactionContextItem,
     CompactionResult,
@@ -173,6 +174,18 @@ def test_manager_response_defaults_missing_metadata():
     response = manager.response([ResponseCompleted()])
 
     assert response == Response(answer="", reasoning="")
+
+
+def test_manager_response_rejects_missing_and_duplicate_completion_events():
+    """The shared collector accepts exactly one explicit response completion."""
+    manager = SessionManager(interaction=response_interaction())
+
+    with pytest.raises(BackendResponseError, match="without an explicit completion"):
+        manager.response([AnswerDelta(text="partial")])
+    with pytest.raises(BackendResponseError, match="more than one"):
+        manager.response([ResponseCompleted(), ResponseCompleted()])
+    with pytest.raises(BackendResponseError, match="event after response completion"):
+        manager.response([ResponseCompleted(), AnswerDelta(text="late")])
 
 
 def test_manager_replays_visible_session_items_in_durable_order():

@@ -10,6 +10,7 @@ from datetime import datetime
 from uuid import uuid7
 
 from .. import constants
+from ..backend.errors import BackendResponseError
 from ..errors import Problem, log_problem
 from ..interaction import ConsoleInteraction, Interaction
 from ..models import (
@@ -182,6 +183,9 @@ class SessionManager:
 
         Returns:
             Response: The collected answer, reasoning, tool calls, items, usage, and model.
+
+        Raises:
+            BackendResponseError: If the event sequence has no completion or more than one.
         """
         output = interaction or self._interaction
         reasoning = ""
@@ -191,6 +195,8 @@ class SessionManager:
         usage = None
         model = None
         structured_output = None
+        completed = False
+        response_observed = False
         reasoning_started = False
         answer_started = False
 
@@ -199,34 +205,61 @@ class SessionManager:
                 if debug:
                     output.debug(event)
 
+                if completed:
+                    reason = (
+                        "more than one response completion"
+                        if isinstance(event, ResponseCompleted)
+                        else "an event after response completion"
+                    )
+                    raise BackendResponseError(
+                        f"Backend emitted {reason}.",
+                        provider="backend",
+                        operation="collect_response",
+                        response_started=True,
+                    )
+
                 if isinstance(event, ReasoningDelta):
+                    response_observed = True
                     output.reasoning_delta(event.text)
                     reasoning_started = True
                     continue
                 if isinstance(event, AnswerDelta):
+                    response_observed = True
                     output.answer_delta(event.text)
                     answer_started = True
                     continue
                 if isinstance(event, ReasoningCompleted):
+                    response_observed = True
                     reasoning = event.text
                     if not reasoning_started:
                         output.reasoning(event.text)
                     continue
                 if isinstance(event, AnswerCompleted):
+                    response_observed = True
                     answer = event.text
                     if not answer_started:
                         output.answer(event.text)
                     continue
                 if isinstance(event, ToolCallCompleted):
+                    response_observed = True
                     tool_calls.append(event.call)
                     continue
                 if isinstance(event, ResponseCompleted):
+                    completed = True
                     items = event.items
                     usage = event.usage
                     model = event.model
                     answer = event.answer
                     reasoning = event.reasoning
                     structured_output = event.structured_output
+
+        if not completed:
+            raise BackendResponseError(
+                "Backend response ended without an explicit completion.",
+                provider="backend",
+                operation="collect_response",
+                response_started=response_observed,
+            )
 
         return Response(
             answer=answer,
@@ -276,7 +309,7 @@ class SessionManager:
                 display = output.user if item.role == "user" else output.answer
                 display(item.content)
             elif isinstance(item, Reasoning):
-                output.reasoning(item.content)
+                output.reasoning(item.summary or item.content)
             elif isinstance(item, ToolCall):
                 output.tool_call(item.name, item.arguments)
 

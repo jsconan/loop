@@ -447,13 +447,23 @@ class Reasoning(ConversationItemModel):
     """Represent reasoning retained for conversation continuity.
 
     Args:
-        content (str): Completed reasoning text.
+        content (str): Provider reasoning text used for conversation continuation.
+        summary (str): Human-readable reasoning summary used for display.
+        encrypted_content (str | None): Opaque provider continuation state when available.
+        status (Literal["in_progress", "completed", "incomplete"] | None): Provider item status
+            when available.
         id (str | None): Response item identifier when available.
         metadata (ResponseMetadata | None): Metadata for the provider response that produced the
             reasoning.
     """
 
     content: str
+    summary: str = Field(default="", exclude_if=lambda value: not value)
+    encrypted_content: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    status: Literal["in_progress", "completed", "incomplete"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     id: str | None = None
 
 

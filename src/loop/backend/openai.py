@@ -23,8 +23,10 @@ from openai.types.responses import EasyInputMessageParam as OpenAIMessageParam
 from openai.types.responses import FunctionToolParam as OpenAIFunctionToolParam
 from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses import ResponseCompletedEvent as OpenAIResponseCompletedEvent
+from openai.types.responses import ResponseFailedEvent as OpenAIResponseFailedEvent
 from openai.types.responses import ResponseFunctionToolCall as OpenAIFunctionToolCall
 from openai.types.responses import ResponseFunctionToolCallParam as OpenAIFunctionToolCallParam
+from openai.types.responses import ResponseIncompleteEvent as OpenAIResponseIncompleteEvent
 from openai.types.responses import ResponseInputFileParam as OpenAIInputFileParam
 from openai.types.responses import ResponseInputItemParam as OpenAIInputItemParam
 from openai.types.responses import ResponseInputTextParam as OpenAIInputTextParam
@@ -43,6 +45,7 @@ from openai.types.responses.response_input_item_param import (
     FunctionCallOutput as OpenAIFunctionCallOutputParam,
 )
 from openai.types.responses.response_reasoning_item_param import Content as OpenAIReasoningContent
+from openai.types.responses.response_reasoning_item_param import Summary as OpenAIReasoningSummary
 
 from .. import constants
 from ..models import (
@@ -282,6 +285,7 @@ class OpenAIBackend(Backend):
     def _prepared_request(self, **values: object) -> dict[str, object]:
         """Return and trace the exact policy-prepared provider request."""
         prepared = self._model_input_policy.apply(values)
+        self._restore_opaque_reasoning_state(values.get("input"), prepared.get("input"))
         telemetry_trace_event(
             "gen_ai.request",
             payload=prepared,
@@ -290,6 +294,18 @@ class OpenAIBackend(Backend):
             stream=prepared.get("stream"),
         )
         return prepared
+
+    @classmethod
+    def _restore_opaque_reasoning_state(cls, original: object, prepared: object) -> None:
+        """Restore provider-owned reasoning fields after semantic text policy is applied."""
+        if not isinstance(original, list) or not isinstance(prepared, list):
+            return
+        for original_item, prepared_item in zip(original, prepared, strict=True):
+            if original_item.get("type") != "reasoning":
+                continue
+            for field in ("encrypted_content", "id"):
+                if field in original_item:
+                    prepared_item[field] = original_item[field]
 
     def _generation_request_parameters(self, model: str) -> dict[str, object]:
         """Return configured generation parameters supported by the selected model."""
@@ -450,6 +466,10 @@ class OpenAIBackend(Backend):
             translated = self._translated_error(error, operation)
             translated.response_started = response_started
             raise translated from error
+        except BackendError as error:
+            error.operation = operation
+            error.response_started = response_started
+            raise
 
     def _get_response(
         self,
@@ -479,9 +499,20 @@ class OpenAIBackend(Backend):
             if stream:
                 items = []
                 reasoning_channels = {}
+                completed = False
                 for event in response:
                     self._trace_provider_value("gen_ai.response.stream_event", event)
-                    yield from self._translated_stream_event(event, items, None, reasoning_channels)
+                    if completed:
+                        reason = self._invalid_completion_event(event)
+                        raise self._invalid_terminal_error(reason)
+                    translated = self._translated_stream_event(
+                        event, items, None, reasoning_channels
+                    )
+                    if any(isinstance(item, ResponseCompleted) for item in translated):
+                        completed = True
+                    yield from translated
+                if not completed:
+                    raise self._invalid_terminal_error("stream ended before response.completed")
                 return
             self._trace_provider_value("gen_ai.response", response)
             yield from self._response_events(response, None)
@@ -586,6 +617,10 @@ class OpenAIBackend(Backend):
             translated = self._translated_error(error, operation)
             translated.response_started = response_started
             raise translated from error
+        except BackendError as error:
+            error.operation = operation
+            error.response_started = response_started
+            raise
 
     async def _get_response_async(
         self,
@@ -619,12 +654,21 @@ class OpenAIBackend(Backend):
                 return
             items = []
             reasoning_channels = {}
+            completed = False
             async for event in response:
                 self._trace_provider_value("gen_ai.response.stream_event", event)
-                for translated in self._translated_stream_event(
+                if completed:
+                    reason = self._invalid_completion_event(event)
+                    raise self._invalid_terminal_error(reason)
+                translated_events = self._translated_stream_event(
                     event, items, None, reasoning_channels
-                ):
+                )
+                if any(isinstance(item, ResponseCompleted) for item in translated_events):
+                    completed = True
+                for translated in translated_events:
                     yield translated
+            if not completed:
+                raise self._invalid_terminal_error("stream ended before response.completed")
             return
 
         attempt_input = serialized_input
@@ -932,6 +976,40 @@ class OpenAIBackend(Backend):
             ),
         }
 
+    def _prepared_reference(self, reference: ContextReference) -> ContextReference:
+        """Apply model-input policy to one semantic text snapshot before transport encoding."""
+        media_type = guess_type(reference.path)[0] or "text/plain"
+        if reference.kind != "directory" and not self._textual_media_type(media_type):
+            return reference
+        sanitized = self._model_input_policy.apply(reference.content)
+        if not isinstance(sanitized, str) or sanitized == reference.content:
+            return reference
+        original_bytes = len(reference.content.encode("utf-8"))
+        included_bytes = len(sanitized.encode("utf-8"))
+        return reference.model_copy(
+            update={
+                "content": sanitized,
+                "included_bytes": included_bytes,
+                "size_bytes": max(0, reference.size_bytes - original_bytes + included_bytes),
+            }
+        )
+
+    @staticmethod
+    def _textual_media_type(media_type: str) -> bool:
+        """Return whether a MIME type represents text safe for semantic string policy."""
+        return (
+            media_type.startswith("text/")
+            or media_type
+            in {
+                "application/json",
+                "application/ld+json",
+                "application/javascript",
+                "application/xml",
+                "application/x-yaml",
+            }
+            or media_type.endswith(("+json", "+xml", "+yaml"))
+        )
+
     @staticmethod
     def _data_url(media_type: str, content: str) -> str:
         """Encode snapshot content as a MIME-qualified data URL."""
@@ -956,6 +1034,7 @@ class OpenAIBackend(Backend):
         """Translate one conversation message and its explicit context."""
         if not item.context:
             return OpenAIMessageParam(role=item.role, content=item.content)
+        references = tuple(self._prepared_reference(reference) for reference in item.context)
         content = [
             OpenAIInputTextParam(type="input_text", text=item.content),
             OpenAIInputTextParam(
@@ -984,7 +1063,7 @@ class OpenAIBackend(Backend):
                                     else {}
                                 ),
                             }
-                            for reference in item.context
+                            for reference in references
                         ],
                         ensure_ascii=False,
                         separators=(",", ":"),
@@ -992,7 +1071,7 @@ class OpenAIBackend(Backend):
                 ),
             ),
         ]
-        for reference in item.context:
+        for reference in references:
             if reference.kind == "file":
                 content.append(self._attachment_message(reference))
                 continue
@@ -1015,7 +1094,14 @@ class OpenAIBackend(Backend):
             if item.content
             else []
         )
-        result = OpenAIReasoningItemParam(type="reasoning", summary=[], content=content)
+        summary = (
+            [OpenAIReasoningSummary(type="summary_text", text=item.summary)] if item.summary else []
+        )
+        result = OpenAIReasoningItemParam(type="reasoning", summary=summary, content=content)
+        if item.encrypted_content is not None:
+            result["encrypted_content"] = item.encrypted_content
+        if item.status is not None:
+            result["status"] = item.status
         if item.id is not None:
             result["id"] = item.id
         return result
@@ -1190,9 +1276,17 @@ class OpenAIBackend(Backend):
         items = []
         events = []
         reasoning_channels = {}
+        completed = False
         for provider_event in response:
             cls._trace_provider_value("gen_ai.response.stream_event", provider_event)
+            if completed:
+                reason = cls._invalid_completion_event(provider_event)
+                raise cls._invalid_terminal_error(reason)
             cls._buffer_event(provider_event, events, items, output_format, reasoning_channels)
+            if events and isinstance(events[-1], ResponseCompleted):
+                completed = True
+        if not completed:
+            raise cls._invalid_terminal_error("stream ended before response.completed")
         return events
 
     @classmethod
@@ -1205,9 +1299,17 @@ class OpenAIBackend(Backend):
         items = []
         events = []
         reasoning_channels = {}
+        completed = False
         async for provider_event in response:
             cls._trace_provider_value("gen_ai.response.stream_event", provider_event)
+            if completed:
+                reason = cls._invalid_completion_event(provider_event)
+                raise cls._invalid_terminal_error(reason)
             cls._buffer_event(provider_event, events, items, output_format, reasoning_channels)
+            if events and isinstance(events[-1], ResponseCompleted):
+                completed = True
+        if not completed:
+            raise cls._invalid_terminal_error("stream ended before response.completed")
         return events
 
     @staticmethod
@@ -1250,19 +1352,24 @@ class OpenAIBackend(Backend):
         output_format: StructuredOutputFormat | None,
     ) -> Iterator[ResponseEvent]:
         """Translate a completed OpenAI response into normalized events."""
+        cls._require_completed_response(response)
         items = [
             translated
             for item in response.output
             if (translated := cls._translate_item(item)) is not None
         ]
         final_reasoning = next(
-            (item for item in reversed(items) if isinstance(item, Reasoning) and item.content),
+            (
+                item
+                for item in reversed(items)
+                if isinstance(item, Reasoning) and (item.summary or item.content)
+            ),
             None,
         )
         for translated in items:
-            if isinstance(translated, Reasoning) and translated.content:
+            if isinstance(translated, Reasoning) and (translated.summary or translated.content):
                 if translated is final_reasoning:
-                    yield ReasoningCompleted(text=translated.content)
+                    yield ReasoningCompleted(text=translated.summary or translated.content)
             elif isinstance(translated, ToolCall):
                 yield ToolCallCompleted(call=translated)
         answer = response.output_text
@@ -1299,6 +1406,10 @@ class OpenAIBackend(Backend):
             return [ToolCallCompleted(call=item)] if isinstance(item, ToolCall) else []
         if isinstance(event, OpenAIResponseCompletedEvent):
             return [cls._completion(event.response, items, output_format)]
+        if isinstance(event, OpenAIResponseFailedEvent):
+            raise cls._provider_terminal_error(event.response, "failed")
+        if isinstance(event, OpenAIResponseIncompleteEvent):
+            raise cls._provider_terminal_error(event.response, "incomplete")
         return []
 
     @staticmethod
@@ -1306,7 +1417,10 @@ class OpenAIBackend(Backend):
         """Translate a supported OpenAI output item into a conversation item."""
         if isinstance(item, OpenAIReasoningItem):
             return Reasoning(
-                content=OpenAIBackend._reasoning_text(item),
+                content="".join(part.text for part in item.content or []),
+                summary="".join(part.text for part in item.summary or []),
+                encrypted_content=item.encrypted_content,
+                status=item.status,
                 id=item.id,
             )
         if isinstance(item, OpenAIOutputMessage):
@@ -1324,13 +1438,61 @@ class OpenAIBackend(Backend):
             )
         return None
 
+    @classmethod
+    def _require_completed_response(cls, response: object) -> None:
+        """Reject a non-streaming response without an explicit successful status."""
+        status = getattr(response, "status", None)
+        if status != "completed":
+            raise cls._provider_terminal_error(response, status or "missing")
+
     @staticmethod
-    def _reasoning_text(item: OpenAIReasoningItem) -> str:
-        """Return full reasoning content, falling back to its shareable summary."""
-        content = "".join(part.text for part in item.content or [])
-        if content:
-            return content
-        return "".join(part.text for part in item.summary or [])
+    def _invalid_terminal_error(reason: str) -> BackendResponseError:
+        """Return the normalized error for an invalid provider terminal sequence."""
+        return BackendResponseError(
+            f"OpenAI response {reason}.",
+            provider="openai",
+            operation="stream_response",
+            details={"terminal_state": "invalid"},
+        )
+
+    @staticmethod
+    def _invalid_completion_event(event: object) -> str:
+        return (
+            "multiple completed events"
+            if isinstance(event, OpenAIResponseCompletedEvent)
+            else "emitted an event after response.completed"
+        )
+
+    @staticmethod
+    def _provider_terminal_error(response: object, status: str) -> BackendError:
+        """Translate a provider terminal status into the backend failure contract."""
+        provider_error = getattr(response, "error", None)
+        message = getattr(provider_error, "message", None)
+        code = getattr(provider_error, "code", None)
+        response_id = getattr(response, "id", None)
+        incomplete_details = getattr(response, "incomplete_details", None)
+        details = {
+            "terminal_state": status,
+            "error": (
+                provider_error.model_dump(mode="json")
+                if hasattr(provider_error, "model_dump")
+                else provider_error
+            ),
+            "incomplete_details": (
+                incomplete_details.model_dump(mode="json")
+                if hasattr(incomplete_details, "model_dump")
+                else incomplete_details
+            ),
+        }
+        error_type = BackendStatusError if status == "failed" else BackendResponseError
+        return error_type(
+            message or f"OpenAI response ended with terminal state {status!r}.",
+            provider="openai",
+            operation="create_response",
+            code=code if isinstance(code, str) else None,
+            request_id=response_id if isinstance(response_id, str) else None,
+            details=details,
+        )
 
     @classmethod
     def _completion(
@@ -1353,20 +1515,21 @@ class OpenAIBackend(Backend):
             for item in completed_items:
                 item.metadata = metadata
         answer = response.output_text
-        reasoning = next(
+        reasoning_item = next(
             (
-                item.content
+                item
                 for item in reversed(completed_items)
-                if isinstance(item, Reasoning) and item.content
+                if isinstance(item, Reasoning) and (item.summary or item.content)
             ),
-            "",
+            None,
         )
+        reasoning = reasoning_item.summary or reasoning_item.content if reasoning_item else ""
         answer_text = answer if isinstance(answer, str) else ""
         structured_output = None
         if output_format is not None and (
             answer_text or not any(isinstance(item, ToolCall) for item in completed_items)
         ):
-            category = OpenAIBackend._structured_response_failure(response)
+            category = cls._structured_response_failure(response)
             if category is not None:
                 raise StructuredOutputValidationError(
                     output_format.name,
@@ -1385,10 +1548,8 @@ class OpenAIBackend(Backend):
         )
 
     @staticmethod
-    def _structured_response_failure(response: object) -> Literal["refusal", "incomplete"] | None:
+    def _structured_response_failure(response: object) -> Literal["refusal"] | None:
         """Classify provider terminal states that cannot contain a valid structured answer."""
-        if getattr(response, "status", None) == "incomplete":
-            return "incomplete"
         for output_item in getattr(response, "output", ()):
             for content in getattr(output_item, "content", ()) or ():
                 if getattr(content, "type", None) == "refusal":

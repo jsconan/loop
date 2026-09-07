@@ -430,6 +430,17 @@ def test_session_serializes_and_deserializes_all_conversation_items():
     assert Session.deserialize(session.serialize()) == session
 
 
+def test_session_upcasts_legacy_collapsed_reasoning_as_display_only():
+    """Legacy reasoning summaries are not replayed as canonical provider reasoning text."""
+    session = Session(messages=[Reasoning(content="legacy display summary")])
+    payload = json.loads(session.serialize())
+    payload["version"] = 10
+
+    restored = Session.deserialize(json.dumps(payload))
+
+    assert restored.messages == [Reasoning(content="", summary="legacy display summary")]
+
+
 def test_session_round_trips_instruction_context_and_events():
     """Persistence retains workspace ownership, instruction state, and the replay timeline."""
     session = Session(

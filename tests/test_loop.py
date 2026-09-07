@@ -747,7 +747,7 @@ def test_run_rejects_a_runner_result_without_metrics(tmp_path):
     interaction = output_interaction()
     interaction.prompt.side_effect = ["hello"]
     loop = Loop.create_default(
-        backend=loop_backend(get_response=Mock(return_value=[])),
+        backend=loop_backend(get_response=Mock(return_value=[ResponseCompleted()])),
         interaction=interaction,
         working_directory=tmp_path,
     )
@@ -991,7 +991,7 @@ def test_loops_share_local_conversation_context(tmp_path):
     )
     first = Loop.create_default(backend=loop_backend(), session=session, working_directory=tmp_path)
     second_backend = Mock(default_model="other-model")
-    second_backend.get_response.return_value = []
+    second_backend.get_response.return_value = [ResponseCompleted()]
     second = Loop.create_default(
         backend=second_backend, session=session, working_directory=tmp_path, stream=True
     )
@@ -1229,7 +1229,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     (first / "AGENTS.md").write_text("First rules.", encoding="utf-8")
     (second / "AGENTS.md").write_text("Second rules.", encoding="utf-8")
     backend = Mock(default_model="default-model")
-    backend.get_response.return_value = []
+    backend.get_response.return_value = [ResponseCompleted()]
     loop = Loop.create_default(
         backend=backend,
         tool_registry=ToolRegistry(BUILTIN_TOOLS),
@@ -1249,7 +1249,7 @@ def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
     """A query persists model context capacity without hidden tokenization calls."""
     backend = Mock(default_model="model")
     backend.get_context_window.return_value = 128000
-    backend.get_response.return_value = []
+    backend.get_response.return_value = [ResponseCompleted()]
     (tmp_path / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
     loop = Loop.create_default(
         backend=backend,
@@ -1268,7 +1268,7 @@ def test_shared_backend_receives_each_loops_agent_scoped_tools(tmp_path):
     """Loops sharing one backend expose only their own tool definitions on each request."""
     backend = Mock(default_model="model")
     backend.get_context_window.return_value = None
-    backend.get_response.return_value = []
+    backend.get_response.return_value = [ResponseCompleted()]
 
     @tool
     def first_tool() -> str:
@@ -1337,7 +1337,7 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
                 context_tokens=20,
             )
         ),
-        get_response=Mock(return_value=[]),
+        get_response=Mock(return_value=[ResponseCompleted()]),
     )
     interaction = MagicMock(spec=Interaction)
     loop = Loop.create_default(
@@ -1408,7 +1408,7 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
     )
     registry = ToolRegistry([manage_skills])
     backend = Mock(default_model="model")
-    backend.get_response.return_value = []
+    backend.get_response.return_value = [ResponseCompleted()]
     manager = SkillManager([Skill("review", "Review code.", location)])
     instructions_manager = InstructionsManager(skill_manager=manager)
     loop = Loop.create_default(
@@ -1487,7 +1487,7 @@ def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_p
     )
     registry = ToolRegistry([manage_skills])
     backend = Mock(default_model="model")
-    backend.get_response.return_value = []
+    backend.get_response.return_value = [ResponseCompleted()]
     manager = SkillManager([Skill("review", "Review code.", location)])
     instructions_manager = InstructionsManager(skill_manager=manager)
     instructions_manager.activate_skill("review")
@@ -1621,7 +1621,7 @@ def test_handle_tool_calls_delegates_session_updates(tmp_path):
     """Tool results and instruction state are delegated to the session manager."""
     registry = Mock()
     registry.call_with_timing.return_value = ("tool result", 0.25)
-    backend = loop_backend(get_response=Mock(return_value=[]))
+    backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted()]))
     session_manager = Mock(spec=SessionManager)
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
@@ -1660,7 +1660,7 @@ def test_handle_tool_calls_delegates_session_updates(tmp_path):
 
 def test_query_selects_only_the_event_production_mode(tmp_path):
     """Both loop modes forward identical history with only the stream flag differing."""
-    backend = loop_backend(get_response=Mock(return_value=[]))
+    backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted()]))
     session = Session(messages=[Message(role="user", content="hello")])
 
     Loop.create_default(
@@ -1676,7 +1676,7 @@ def test_query_selects_only_the_event_production_mode(tmp_path):
 
 def test_query_delegates_instruction_state_to_the_session_manager(tmp_path):
     """Queries delegate their prepared instruction state to the session manager."""
-    backend = loop_backend(get_response=Mock(return_value=[]))
+    backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted()]))
     session_manager = Mock(spec=SessionManager)
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
@@ -1698,7 +1698,7 @@ def test_query_delegates_instruction_state_to_the_session_manager(tmp_path):
 
 def test_query_prefers_the_restored_session_model_over_the_application_default(tmp_path):
     """A resumed query uses its session-linked model for reproducible continuation."""
-    backend = loop_backend(get_response=Mock(return_value=[]))
+    backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted()]))
     session = Session(model="served-model")
 
     Loop.create_default(
