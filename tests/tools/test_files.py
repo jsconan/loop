@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -19,6 +20,7 @@ from loop import (
 )
 from loop.tooling import ToolContext
 from loop.tools import files as files_module
+from loop.tools.files import delete_path as delete_path_tool
 from loop.tools.files import edit_text_file as edit_text_file_tool
 from loop.tools.files import list_folder as list_folder_tool
 from loop.tools.files import write_text_file as write_text_file_tool
@@ -632,6 +634,20 @@ def test_write_text_file_reports_open_failure(tmp_path, monkeypatch):
     assert problem(result)["code"] == "filesystem.write_failed"
 
 
+def test_write_text_file_reports_directory_and_special_targets_during_planning(tmp_path):
+    """Unsupported existing write targets return structured planning problems."""
+    fifo = tmp_path / "events"
+    os.mkfifo(fifo)
+
+    assert problem(write_text_file(tmp_path, "content"))["code"] == "filesystem.path_not_file"
+    assert problem(write_text_file(fifo, "content"))["code"] == "filesystem.unsupported_path"
+    parent_file = tmp_path / "parent-file"
+    parent_file.write_text("not a directory", encoding="utf-8")
+    assert problem(write_text_file(parent_file / "child", "content"))["code"] == (
+        "tool.planning_failed"
+    )
+
+
 def test_write_text_file_removes_its_temporary_file_when_commit_fails(tmp_path, monkeypatch):
     """An atomic replacement failure does not leave staged content in the destination folder."""
     target = tmp_path / "target.txt"
@@ -665,6 +681,96 @@ def test_write_text_file_cancels_when_approved_target_changes(tmp_path, monkeypa
 
     assert problem(result)["detail"].startswith("The target changed after approval")
     assert target.read_text(encoding="utf-8") == "changed"
+
+
+def test_write_planning_rejects_kind_and_metadata_changes_during_inspection(tmp_path, monkeypatch):
+    """Authorized inspection fails closed when target kind or metadata changes mid-read."""
+    target = tmp_path / "target.txt"
+    target.write_text("approved", encoding="utf-8")
+    original_lstat = Path.lstat
+    target_lstats = 0
+
+    def changing_lstat(path):
+        nonlocal target_lstats
+        if path == target:
+            target_lstats += 1
+            if target_lstats == 3:
+                target.unlink()
+                target.mkdir()
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", changing_lstat)
+    kind_result = write_text_file(target, "replacement")
+    assert problem(kind_result)["code"] == "tool.planning_failed"
+    assert target.is_dir()
+
+    target.rmdir()
+    target.write_text("approved", encoding="utf-8")
+    original_read = Path.read_bytes
+
+    def changing_read(path):
+        content = original_read(path)
+        if path == target:
+            target.chmod(0o600)
+        return content
+
+    monkeypatch.setattr(Path, "lstat", original_lstat)
+    monkeypatch.setattr(Path, "read_bytes", changing_read)
+    metadata_result = write_text_file(target, "replacement")
+    assert problem(metadata_result)["code"] == "tool.planning_failed"
+    assert target.read_text(encoding="utf-8") == "approved"
+
+
+def test_write_and_edit_denials_do_not_read_unauthorized_existing_content(tmp_path, monkeypatch):
+    """Denied mutation planning never inspects unauthorized file contents or metadata."""
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_text("outside secret", encoding="utf-8")
+    git = tmp_path / ".git"
+    git.mkdir()
+    protected = git / "config"
+    protected.write_text("protected secret", encoding="utf-8")
+    protected_alias = tmp_path / "protected-alias"
+    protected_alias.symlink_to(git, target_is_directory=True)
+    original = Path.read_bytes
+    reads = []
+    original_lstat = Path.lstat
+    metadata_reads = []
+
+    def tracked_read(path):
+        reads.append(path)
+        return original(path)
+
+    def tracked_lstat(path):
+        metadata_reads.append(path)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "read_bytes", tracked_read)
+    monkeypatch.setattr(Path, "lstat", tracked_lstat)
+
+    edit_result = edit_text_file(outside, "outside", "changed")
+    write_result = write_text_file(protected, "replacement")
+    delete_result = delete_path(protected)
+    alias_result = edit_text_file(protected_alias / "config", "protected", "changed")
+
+    assert problem(edit_result)["code"] == "tool.denied"
+    assert problem(write_result)["code"] == "tool.denied"
+    assert problem(delete_result)["code"] == "tool.denied"
+    assert problem(alias_result)["code"] == "tool.denied"
+    assert reads == []
+    assert metadata_reads == []
+    assert outside.read_text(encoding="utf-8") == "outside secret"
+    assert protected.read_text(encoding="utf-8") == "protected secret"
+
+
+def test_atomic_replacement_preserves_executable_permission_bits(tmp_path):
+    """Editing an executable regular file preserves its existing permission bits."""
+    target = tmp_path / "script.sh"
+    target.write_text("#!/bin/sh\necho old\n", encoding="utf-8")
+    target.chmod(0o755)
+
+    assert "(1 replacement)" in edit_text_file(target, "old", "new")
+
+    assert target.stat().st_mode & 0o777 == 0o755
 
 
 def test_write_executor_requires_authorized_state_and_existing_replacement(tmp_path, monkeypatch):
@@ -915,3 +1021,336 @@ def test_delete_path_reports_removal_failures(tmp_path, monkeypatch):
 
     assert problem(delete_path(target))["detail"] == "access denied"
     assert target.exists()
+
+
+def test_recursive_delete_rejects_workspace_root_containing_protected_git(tmp_path):
+    """Recursive ancestor permission cannot override a protected Git descendant."""
+    git_config = tmp_path / ".git" / "config"
+    git_config.parent.mkdir()
+    git_config.write_text("keep", encoding="utf-8")
+    ordinary = tmp_path / "ordinary.txt"
+    ordinary.write_text("keep", encoding="utf-8")
+
+    result = delete_path(tmp_path)
+
+    assert problem(result)["code"] == "tool.denied"
+    assert git_config.read_text(encoding="utf-8") == "keep"
+    assert ordinary.read_text(encoding="utf-8") == "keep"
+
+
+def test_recursive_delete_rejects_manifest_changes_after_approval(tmp_path):
+    """A recursive deletion fails closed when its approved object set changes."""
+    target = tmp_path / "tree"
+    target.mkdir()
+    approved = target / "approved.txt"
+    approved.write_text("approved", encoding="utf-8")
+
+    output = tool_registry.call(
+        "delete_path",
+        json.dumps({"path": str(target)}),
+        interaction=ConsoleInteraction(),
+        execution_started=lambda: (target / "late.txt").write_text("late", encoding="utf-8"),
+    )
+
+    assert problem(output)["code"] == "filesystem.delete_failed"
+    assert approved.exists()
+    assert (target / "late.txt").exists()
+
+
+def test_recursive_delete_handles_empty_trees_and_directory_symlinks(tmp_path):
+    """Recursive contracts cover empty trees and never traverse directory symlinks."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    kept = outside / "kept.txt"
+    kept.write_text("keep", encoding="utf-8")
+    tree = tmp_path / "tree-with-link"
+    tree.mkdir()
+    (tree / "outside-link").symlink_to(outside, target_is_directory=True)
+
+    assert delete_path(empty) == f"Successfully deleted path '{empty}'."
+    assert delete_path(tree) == f"Successfully deleted path '{tree}'."
+    assert kept.read_text(encoding="utf-8") == "keep"
+
+    special = tmp_path / "special-tree"
+    special.mkdir()
+    os.mkfifo(special / "events")
+    special_result = delete_path(special)
+    assert problem(special_result)["code"] == "tool.planning_failed"
+    assert special.exists()
+
+
+def test_recursive_delete_rejects_content_changes_and_unsafe_platforms(tmp_path, monkeypatch):
+    """Recursive deletion requires an unchanged manifest and symlink-safe platform support."""
+    changed = tmp_path / "changed"
+    changed.mkdir()
+    child = changed / "child.txt"
+    child.write_text("approved", encoding="utf-8")
+    changed_output = tool_registry.call(
+        "delete_path",
+        json.dumps({"path": str(changed)}),
+        interaction=ConsoleInteraction(),
+        execution_started=lambda: child.write_text("changed", encoding="utf-8"),
+    )
+    assert problem(changed_output)["code"] == "filesystem.delete_failed"
+    assert child.read_text(encoding="utf-8") == "changed"
+
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir()
+    monkeypatch.setattr(shutil.rmtree, "avoids_symlink_attacks", False)
+    unsafe_output = delete_path(unsafe)
+    assert problem(unsafe_output)["code"] == "filesystem.delete_failed"
+    assert unsafe.exists()
+    monkeypatch.setattr(shutil.rmtree, "avoids_symlink_attacks", True)
+
+    rebound = tmp_path / "rebound"
+    rebound.mkdir()
+
+    def replace_tree_with_file():
+        rebound.rmdir()
+        rebound.write_text("replacement", encoding="utf-8")
+
+    rebound_output = tool_registry.call(
+        "delete_path",
+        json.dumps({"path": str(rebound)}),
+        interaction=ConsoleInteraction(),
+        execution_started=replace_tree_with_file,
+    )
+    assert problem(rebound_output)["code"] == "filesystem.delete_failed"
+    assert rebound.read_text(encoding="utf-8") == "replacement"
+
+
+@pytest.mark.parametrize("replacement_kind", ["file", "directory", "symlink"])
+def test_file_delete_rejects_replacement_after_approval(tmp_path, replacement_kind):
+    """Deletion cannot unlink a file path rebound to any unapproved object."""
+    target = tmp_path / "target"
+    target.write_text("approved", encoding="utf-8")
+    link_target = tmp_path / "link-target"
+    link_target.write_text("keep", encoding="utf-8")
+
+    def replace_target():
+        target.unlink()
+        if replacement_kind == "directory":
+            target.mkdir()
+        elif replacement_kind == "symlink":
+            target.symlink_to(link_target)
+        else:
+            target.write_text("replacement", encoding="utf-8")
+
+    output = tool_registry.call(
+        "delete_path",
+        json.dumps({"path": str(target)}),
+        interaction=ConsoleInteraction(),
+        execution_started=replace_target,
+    )
+
+    assert problem(output)["code"] == "filesystem.delete_failed"
+    assert target.exists() or target.is_symlink()
+    if replacement_kind == "symlink":
+        assert target.is_symlink()
+        assert link_target.read_text(encoding="utf-8") == "keep"
+
+
+def test_file_delete_rejects_disappearance_and_executor_without_capability(tmp_path):
+    """Deletion fails closed when a target disappears or no executable capability is supplied."""
+    target = tmp_path / "target"
+    target.write_text("approved", encoding="utf-8")
+    output = tool_registry.call(
+        "delete_path",
+        json.dumps({"path": str(target)}),
+        interaction=ConsoleInteraction(),
+        execution_started=target.unlink,
+    )
+    assert problem(output)["code"] == "filesystem.delete_failed"
+
+    context = ToolContext(ConsoleInteraction(), "delete_path")
+    result = delete_path_tool(context, str(target))
+    assert result.code == "filesystem.delete_failed"
+    assert result.detail == "Authorized deletion capability is missing."
+
+    unsupported = ToolContext(
+        ConsoleInteraction(),
+        "delete_path",
+        operations=(
+            Operation(
+                tool_id="delete_path",
+                action=Action.FILESYSTEM_DELETE,
+                target=FileTarget(
+                    path=str(target), expected_exists=True, expected_kind="directory"
+                ),
+            ),
+        ),
+    )
+    unsupported_result = delete_path_tool(unsupported, str(target))
+    assert unsupported_result.detail == (
+        "Authorized deletion capability has an unsupported target kind."
+    )
+
+
+def test_file_and_recursive_deletes_reject_rebound_parent_directories(tmp_path):
+    """Deletion capabilities bind the canonical parent directory as well as the leaf."""
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    file_target = parent / "target"
+    file_target.write_text("approved", encoding="utf-8")
+    moved_parent = tmp_path / "moved-parent"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_target = outside / "target"
+    outside_target.write_text("outside", encoding="utf-8")
+
+    def rebind_file_parent():
+        parent.rename(moved_parent)
+        parent.symlink_to(outside, target_is_directory=True)
+
+    file_output = tool_registry.call(
+        "delete_path",
+        json.dumps({"path": str(file_target)}),
+        interaction=ConsoleInteraction(),
+        execution_started=rebind_file_parent,
+    )
+    assert problem(file_output)["code"] == "filesystem.delete_failed"
+    assert outside_target.read_text(encoding="utf-8") == "outside"
+    assert (moved_parent / "target").read_text(encoding="utf-8") == "approved"
+
+    recursive_parent = tmp_path / "recursive-parent"
+    recursive_parent.mkdir()
+    tree = recursive_parent / "tree"
+    tree.mkdir()
+    (tree / "child").write_text("approved", encoding="utf-8")
+    moved_recursive_parent = tmp_path / "moved-recursive-parent"
+    outside_recursive = tmp_path / "outside-recursive"
+    outside_recursive.mkdir()
+    outside_tree = outside_recursive / "tree"
+    outside_tree.mkdir()
+    (outside_tree / "child").write_text("outside", encoding="utf-8")
+
+    def rebind_recursive_parent():
+        recursive_parent.rename(moved_recursive_parent)
+        recursive_parent.symlink_to(outside_recursive, target_is_directory=True)
+
+    recursive_output = tool_registry.call(
+        "delete_path",
+        json.dumps({"path": str(tree)}),
+        interaction=ConsoleInteraction(),
+        execution_started=rebind_recursive_parent,
+    )
+    assert problem(recursive_output)["code"] == "filesystem.delete_failed"
+    assert (outside_tree / "child").read_text(encoding="utf-8") == "outside"
+    assert (moved_recursive_parent / "tree" / "child").read_text(encoding="utf-8") == ("approved")
+
+
+def test_file_delete_rejects_a_missing_parent_after_approval(tmp_path):
+    """A missing canonical parent invalidates the executable deletion capability."""
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "target"
+    target.write_text("approved", encoding="utf-8")
+    moved = tmp_path / "moved"
+
+    output = tool_registry.call(
+        "delete_path",
+        json.dumps({"path": str(target)}),
+        interaction=ConsoleInteraction(),
+        execution_started=lambda: parent.rename(moved),
+    )
+
+    assert problem(output)["code"] == "filesystem.delete_failed"
+    assert (moved / "target").read_text(encoding="utf-8") == "approved"
+
+
+def test_delete_rejects_targets_rebound_during_authorization_phases(tmp_path, monkeypatch):
+    """File execution and directory planning reject targets rebound during authorization."""
+    file_target = tmp_path / "file-target"
+    file_target.write_text("approved", encoding="utf-8")
+    manager = tool_registry.permission_manager
+    original_authorize = manager.authorize
+    changed_file = False
+
+    def change_file_after_inspection(operations, **kwargs):
+        nonlocal changed_file
+        result = original_authorize(operations, **kwargs)
+        if not changed_file and operations and operations[0].action is Action.FILESYSTEM_DELETE:
+            changed_file = True
+            file_target.unlink()
+            file_target.mkdir()
+        return result
+
+    monkeypatch.setattr(manager, "authorize", change_file_after_inspection)
+    file_output = delete_path(file_target)
+    assert problem(file_output)["code"] == "filesystem.delete_failed"
+    assert file_target.is_dir()
+
+    directory = tmp_path / "directory-target"
+    directory.mkdir()
+    changed_directory = False
+
+    def change_directory_after_list(operations, **kwargs):
+        nonlocal changed_directory
+        result = original_authorize(operations, **kwargs)
+        if not changed_directory and operations and operations[0].action is Action.FILESYSTEM_LIST:
+            changed_directory = True
+            directory.rmdir()
+            directory.write_text("replacement", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(manager, "authorize", change_directory_after_list)
+    directory_output = delete_path(directory)
+    assert problem(directory_output)["code"] == "tool.planning_failed"
+    assert directory.read_text(encoding="utf-8") == "replacement"
+
+
+def test_file_delete_rejects_kind_change_during_capability_capture(tmp_path, monkeypatch):
+    """File deletion fails closed when the target changes during state capture."""
+    target = tmp_path / "target"
+    target.write_text("approved", encoding="utf-8")
+    original_lstat = Path.lstat
+    target_lstats = 0
+
+    def changing_lstat(path):
+        nonlocal target_lstats
+        if path == target:
+            target_lstats += 1
+            if target_lstats == 2:
+                target.unlink()
+                target.mkdir()
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", changing_lstat)
+
+    output = delete_path(target)
+
+    assert problem(output)["code"] == "filesystem.target_changed"
+    assert target.is_dir()
+
+
+def test_recursive_delete_rejects_metadata_drift_between_planning_phases(tmp_path, monkeypatch):
+    """A tree change after listing but before digest capture invalidates the plan."""
+    directory = tmp_path / "tree"
+    directory.mkdir()
+    child = directory / "child.txt"
+    child.write_text("approved", encoding="utf-8")
+    manager = tool_registry.permission_manager
+    original_authorize = manager.authorize
+    changed = False
+
+    read_authorizations = 0
+
+    def change_after_prerequisite_read(operations, **kwargs):
+        nonlocal read_authorizations
+        nonlocal changed
+        result = original_authorize(operations, **kwargs)
+        if operations and operations[0].action is Action.FILESYSTEM_READ:
+            read_authorizations += 1
+        if not changed and read_authorizations == 2:
+            changed = True
+            child.write_text("changed", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(manager, "authorize", change_after_prerequisite_read)
+
+    output = delete_path(directory)
+
+    assert problem(output)["code"] == "filesystem.target_changed"
+    assert child.read_text(encoding="utf-8") == "changed"

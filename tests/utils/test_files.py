@@ -31,6 +31,18 @@ def test_write_text_atomically_creates_and_replaces_expected_files(tmp_path):
     assert target.read_text(encoding="utf-8") == "replaced"
 
 
+def test_write_text_atomically_preserves_existing_permission_bits(tmp_path):
+    """Atomic replacement copies regular-file permission bits to staged content."""
+    target = tmp_path / "executable"
+    target.write_text("old", encoding="utf-8")
+    target.chmod(0o755)
+    digest = sha256_digest(target.read_bytes())
+
+    write_text_atomically(target, "new", expected_digest=digest)
+
+    assert target.stat().st_mode & 0o777 == 0o755
+
+
 def test_write_text_atomically_rejects_changed_creation_and_replacement_targets(tmp_path):
     """Atomic text writes fail closed when destination state differs from the precondition."""
     target = tmp_path / "target.txt"
@@ -42,6 +54,41 @@ def test_write_text_atomically_rejects_changed_creation_and_replacement_targets(
         write_text_atomically(target, "new", expected_digest="wrong")
 
     assert target.read_text(encoding="utf-8") == "existing"
+
+
+def test_write_text_atomically_rejects_a_disappeared_replacement_target(tmp_path):
+    """A destination removed after approval is normalized as failed replacement state."""
+    target = tmp_path / "target.txt"
+    target.write_text("approved", encoding="utf-8")
+    digest = sha256_digest(target.read_bytes())
+    target.unlink()
+
+    with pytest.raises(RuntimeError, match="replacement was cancelled"):
+        write_text_atomically(target, "new", expected_digest=digest)
+
+    assert not target.exists()
+
+
+def test_write_text_atomically_rejects_missing_and_rebound_parent_directories(tmp_path):
+    """Atomic writes validate parent directory identity before staging any content."""
+    missing_target = tmp_path / "missing" / "target"
+    with pytest.raises(RuntimeError, match="parent changed"):
+        write_text_atomically(missing_target, "new", expected_digest=None)
+
+    target = tmp_path / "target"
+    with pytest.raises(RuntimeError, match="parent changed"):
+        write_text_atomically(
+            target,
+            "new",
+            expected_digest=None,
+            expected_parent_device=tmp_path.stat().st_dev,
+            expected_parent_inode=tmp_path.stat().st_ino + 1,
+        )
+
+    parent_file = tmp_path / "parent-file"
+    parent_file.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="parent changed"):
+        write_text_atomically(parent_file / "target", "new", expected_digest=None)
 
 
 def test_write_text_atomically_treats_a_symbolic_link_as_an_existing_creation_target(tmp_path):

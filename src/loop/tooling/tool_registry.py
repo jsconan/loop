@@ -21,9 +21,9 @@ from ..models import (
 from ..permissions import (
     Action,
     Decision,
-    Operation,
     OperationPlan,
     OperationPlanner,
+    Operations,
     PermissionManager,
 )
 from ..utils import callable_name
@@ -375,22 +375,19 @@ class ToolRegistry:
         if error is not None:
             return error, 0
         active_permissions = permission_manager or self._permission_manager
-        try:
-            plan = tool.plan(validated)
-        except ProblemException as exc:
-            return serialize_tool_problem(exc.problem), 0
-        except ValueError as exc:
-            return self._problem("tool.planning_failed", "Tool planning failed", str(exc), name), 0
-        denied = self._authorize(tool, plan.operations, interaction, active_permissions)
-        if denied is not None:
-            return denied, 0
+        plan, planning_error = self._authorized_plan(
+            tool, validated, interaction, active_permissions
+        )
+        if planning_error is not None:
+            return planning_error, 0
         context = self._context_for(
             tool,
-            interaction,
-            instructions_manager,
-            plan.operations,
-            call_id,
-            active_permissions,
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+            operations=plan.operations,
+            prerequisite_operations=plan.prerequisite_operations,
+            call_id=call_id,
+            permission_manager=active_permissions,
         )
         if execution_started is not None:
             execution_started()
@@ -480,22 +477,19 @@ class ToolRegistry:
         if error is not None:
             return error, 0
         active_permissions = permission_manager or self._permission_manager
-        try:
-            plan = tool.plan(validated)
-        except ProblemException as exc:
-            return serialize_tool_problem(exc.problem), 0
-        except ValueError as exc:
-            return self._problem("tool.planning_failed", "Tool planning failed", str(exc), name), 0
-        denied = self._authorize(tool, plan.operations, interaction, active_permissions)
-        if denied is not None:
-            return denied, 0
+        plan, planning_error = self._authorized_plan(
+            tool, validated, interaction, active_permissions
+        )
+        if planning_error is not None:
+            return planning_error, 0
         context = self._context_for(
             tool,
-            interaction,
-            instructions_manager,
-            plan.operations,
-            call_id,
-            active_permissions,
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+            operations=plan.operations,
+            prerequisite_operations=plan.prerequisite_operations,
+            call_id=call_id,
+            permission_manager=active_permissions,
         )
         if execution_started is not None:
             execution_started()
@@ -553,26 +547,77 @@ class ToolRegistry:
                     )
                 )
             )
-        try:
-            plan = tool.plan(validated)
-        except ProblemException as exc:
-            return ToolExecutionResult(serialize_tool_problem(exc.problem))
-        except ValueError as exc:
-            return ToolExecutionResult(
-                self._problem("tool.planning_failed", "Tool planning failed", str(exc), name)
-            )
+        plan, planning_error = self._command_plan(tool, validated)
+        if planning_error is not None:
+            return ToolExecutionResult(planning_error)
         context = self._context_for(
             tool,
-            interaction,
-            instructions_manager,
-            plan.operations,
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+            operations=plan.operations,
+            prerequisite_operations=plan.prerequisite_operations,
         )
         return tool.execute(plan.arguments, context)
+
+    def _authorized_plan(
+        self,
+        tool: Tool,
+        arguments: dict[str, object],
+        interaction: Interaction | None,
+        permission_manager: PermissionManager,
+    ) -> tuple[OperationPlan | None, str | None]:
+        """Resolve and authorize every phase of one operation plan."""
+        try:
+            plan = tool.plan(arguments)
+            prerequisites = ()
+            while True:
+                boundary_denial = permission_manager.check_boundaries(plan.boundary_operations)
+                if boundary_denial is not None:
+                    return None, self._denied_problem(tool, boundary_denial.reason)
+                denied = self._authorize(tool, plan.operations, interaction, permission_manager)
+                if denied is not None:
+                    return None, denied
+                if plan.continuation is None:
+                    return plan.model_copy(
+                        update={
+                            "prerequisite_operations": (
+                                prerequisites + plan.prerequisite_operations
+                            )
+                        }
+                    ), None
+                prerequisites += plan.operations
+                plan = tool.normalize_plan(plan.continuation())
+        except ProblemException as exc:
+            return None, serialize_tool_problem(exc.problem)
+        except (OSError, ValueError) as exc:
+            return None, self._problem(
+                "tool.planning_failed", "Tool planning failed", str(exc), tool.name or "tool"
+            )
+
+    def _command_plan(
+        self, tool: Tool, arguments: dict[str, object]
+    ) -> tuple[OperationPlan | None, str | None]:
+        """Resolve every planning phase for a direct user command."""
+        try:
+            plan = tool.plan(arguments)
+            prerequisites = ()
+            while plan.continuation is not None:
+                prerequisites += plan.operations
+                plan = tool.normalize_plan(plan.continuation())
+            return plan.model_copy(
+                update={"prerequisite_operations": prerequisites + plan.prerequisite_operations}
+            ), None
+        except ProblemException as exc:
+            return None, serialize_tool_problem(exc.problem)
+        except (OSError, ValueError) as exc:
+            return None, self._problem(
+                "tool.planning_failed", "Tool planning failed", str(exc), tool.name or "tool"
+            )
 
     def _authorize(
         self,
         tool: Tool,
-        operations: tuple[Operation, ...],
+        operations: Operations,
         interaction: Interaction | None,
         permission_manager: PermissionManager,
     ) -> str | None:
@@ -580,16 +625,21 @@ class ToolRegistry:
         active_interaction = interaction if interaction is not None else self._interaction
         result = permission_manager.authorize(operations, interaction=active_interaction)
         if result.decision is Decision.DENY:
-            return serialize_tool_problem(
-                Problem(
-                    code="tool.denied",
-                    title="Tool call denied",
-                    detail=f"Tool '{tool.name}' was not executed: {result.reason}",
-                    severity="warning",
-                    operation=tool.name,
-                )
-            )
+            return self._denied_problem(tool, result.reason)
         return None
+
+    @staticmethod
+    def _denied_problem(tool: Tool, reason: str) -> str:
+        """Serialize one centralized authorization denial."""
+        return serialize_tool_problem(
+            Problem(
+                code="tool.denied",
+                title="Tool call denied",
+                detail=f"Tool '{tool.name}' was not executed: {reason}",
+                severity="warning",
+                operation=tool.name,
+            )
+        )
 
     @staticmethod
     def _problem(code: str, title: str, detail: str, operation: str) -> str:
@@ -603,7 +653,8 @@ class ToolRegistry:
         tool: Tool,
         interaction: Interaction | None,
         instructions_manager: InstructionsManager | None,
-        operations: tuple[Operation, ...] = (),
+        operations: Operations = (),
+        prerequisite_operations: Operations = (),
         call_id: str | None = None,
         permission_manager: PermissionManager | None = None,
     ) -> ToolContext | None:
@@ -637,6 +688,7 @@ class ToolRegistry:
             call_id=call_id,
             instructions_manager=instructions_manager,
             operations=operations,
+            prerequisite_operations=prerequisite_operations,
             additional_authorizer=(
                 authorize_additional if permission_manager is not None else None
             ),

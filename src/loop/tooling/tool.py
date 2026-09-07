@@ -19,7 +19,7 @@ from ..models import (
     ToolResultPresentationDeclaration,
     ToolResultPresentationSpec,
 )
-from ..permissions import Action, OperationPlan, OperationPlanner
+from ..permissions import Action, OperationPlan, OperationPlanner, Operations
 from ..utils import callable_name
 from .context import ToolContext
 from .models import ToolPreflight
@@ -287,7 +287,24 @@ class Tool:
             if self.operation_planner is not None
             else OperationPlan(arguments=arguments)
         )
-        undeclared = {operation.action for operation in plan.operations} - self.actions
+        return self.normalize_plan(plan)
+
+    def normalize_plan(self, plan: OperationPlan) -> OperationPlan:
+        """Validate and bind one planner-produced phase to this registered tool.
+
+        Args:
+            plan (OperationPlan): Planner-produced phase to validate and bind.
+
+        Returns:
+            OperationPlan: Phase whose operation identities name this tool.
+
+        Raises:
+            ValueError: If the phase contains an undeclared action.
+        """
+        planned_operations = (
+            plan.operations + plan.prerequisite_operations + plan.boundary_operations
+        )
+        undeclared = {operation.action for operation in planned_operations} - self.actions
         if undeclared:
             values = ", ".join(sorted(action.value for action in undeclared))
             raise ValueError(
@@ -295,11 +312,17 @@ class Tool:
             )
         return plan.model_copy(
             update={
-                "operations": tuple(
-                    operation.model_copy(update={"tool_id": self._name_for_error()})
-                    for operation in plan.operations
-                )
+                "operations": self._copy_operations(plan.operations),
+                "prerequisite_operations": self._copy_operations(plan.prerequisite_operations),
+                "boundary_operations": self._copy_operations(plan.boundary_operations),
             }
+        )
+
+    def _copy_operations(self, operations: Operations) -> Operations:
+        """Return a copy of the operations with the tool_id updated to this tool's name."""
+        return tuple(
+            operation.model_copy(update={"tool_id": self._name_for_error()})
+            for operation in operations
         )
 
     def _name_for_error(self) -> str:

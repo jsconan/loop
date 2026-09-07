@@ -13,7 +13,7 @@ from .models import ToolRuntimeSettings
 
 if TYPE_CHECKING:
     from ..instructions import InstructionsManager
-    from ..permissions import Operation, OperationPlan
+    from ..permissions import OperationPlan, Operations
 
 AdditionalAuthorizer = Callable[[dict[str, object]], "OperationPlan"]
 
@@ -27,7 +27,9 @@ class ToolContext:
         tool_name (str): Public name of the tool being invoked.
         instructions_manager (InstructionsManager | None): Manager for instructions active in the
             current conversation, or ``None`` when instruction management is unavailable.
-        operations (tuple[Operation, ...]): Authorized operations for this invocation.
+        operations (Operations): Authorized operations for this invocation.
+        prerequisite_operations (Operations): Authorized inspection operations that
+            produced the executable plan.
         call_id (str | None): Stable model call identifier suitable as an idempotency key, or
             ``None`` for direct user-command invocations.
         additional_authorizer (AdditionalAuthorizer | None): Registry-owned callback that plans
@@ -38,7 +40,8 @@ class ToolContext:
     interaction: Interaction
     tool_name: str
     instructions_manager: InstructionsManager | None = None
-    operations: tuple[Operation, ...] = ()
+    operations: Operations = ()
+    prerequisite_operations: Operations = ()
     call_id: str | None = None
     additional_authorizer: AdditionalAuthorizer | None = None
     settings: ToolRuntimeSettings = field(default_factory=ToolRuntimeSettings)

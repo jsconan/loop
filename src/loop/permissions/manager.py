@@ -37,6 +37,7 @@ from .models import (
     FileTarget,
     NetworkTarget,
     Operation,
+    Operations,
     OperationTarget,
     PermissionConfiguration,
     PermissionConfigurationError,
@@ -291,7 +292,7 @@ class PermissionManager:
 
     def authorize(
         self,
-        operations: tuple[Operation, ...],
+        operations: Operations,
         *,
         interaction: Interaction | None = None,
         recorder: PermissionRecorder | None = None,
@@ -299,7 +300,7 @@ class PermissionManager:
         """Evaluate and approve one complete operation set atomically.
 
         Args:
-            operations (tuple[Operation, ...]): Complete normalized effects of one tool call.
+            operations (Operations): Complete normalized effects of one tool call.
             interaction (Interaction | None): Invocation interaction overriding the default.
             recorder (PermissionRecorder | None): Invocation recorder overriding the default.
 
@@ -426,7 +427,7 @@ class PermissionManager:
 
     def _remember_approval(
         self,
-        operations: tuple[Operation, ...],
+        operations: Operations,
         *,
         scope: PolicyScope,
     ) -> tuple[str, ...]:
@@ -476,11 +477,11 @@ class PermissionManager:
             )
         return target.model_copy(deep=True)
 
-    def evaluate(self, operations: tuple[Operation, ...]) -> PolicyDecision:
+    def evaluate(self, operations: Operations) -> PolicyDecision:
         """Evaluate a complete operation set without prompting or recording.
 
         Args:
-            operations (tuple[Operation, ...]): Complete normalized effects to evaluate.
+            operations (Operations): Complete normalized effects to evaluate.
 
         Returns:
             PolicyDecision: Composed allow, ask, or deny outcome and determining sources.
@@ -1295,7 +1296,11 @@ class PermissionManager:
         target = operation.target
         limits = self.effective_configuration.limits
         if isinstance(target, FileTarget):
-            if self._is_protected_path(target.path, mutation=operation.action in _WRITE_ACTIONS):
+            if self._is_protected_path(
+                target.path,
+                mutation=operation.action in _WRITE_ACTIONS,
+                recursive=target.recursive,
+            ):
                 return self._boundary_denial("protected_path")
             roots = (
                 limits.readable_roots
@@ -1389,10 +1394,30 @@ class PermissionManager:
             return path.resolve()
         return (self._workspace_root / path).resolve() if self._workspace_root is not None else None
 
-    def _is_protected_path(self, resource: str, *, mutation: bool) -> bool:
+    def check_boundaries(self, operations: Operations) -> PolicyDecision | None:
+        """Return the first non-overridable boundary denial for planned effects.
+
+        This check performs no policy matching or interactive approval. It lets phased planners
+        reject an unsafe eventual effect before prerequisite filesystem inspection.
+
+        Args:
+            operations (Operations): Future typed effects to check.
+
+        Returns:
+            PolicyDecision | None: First boundary denial, or ``None`` when all effects are inside
+                the fixed safety boundaries.
+        """
+        for operation in operations:
+            denial = self._boundary_decision(operation)
+            if denial is not None:
+                return denial
+        return None
+
+    def _is_protected_path(self, resource: str, *, mutation: bool, recursive: bool = False) -> bool:
         if self._workspace_root is None:
             return False
-        path = Path(resource)
+        requested = Path(resource)
+        path = requested.parent.resolve() / requested.name if mutation else requested.resolve()
         protected = (
             self._workspace_root / constants.APP_DIRECTORY,
             self._workspace_root / constants.GIT_DIRECTORY,
@@ -1405,6 +1430,12 @@ class PermissionManager:
         for root in protected:
             try:
                 path.relative_to(root)
+                return True
+            except ValueError:
+                if not (mutation and recursive):
+                    continue
+            try:
+                root.relative_to(path)
                 return True
             except ValueError:
                 continue
@@ -1424,7 +1455,7 @@ class PermissionManager:
             not ipaddress.ip_address(address).is_global for address in addresses
         )
 
-    def _prompt(self, operations: tuple[Operation, ...]) -> str:
+    def _prompt(self, operations: Operations) -> str:
         lines = ["Agent requests approval for the following operations:"]
         for operation in operations:
             resource = self._display_resource(operation)

@@ -517,6 +517,84 @@ def test_filesystem_boundaries_cannot_be_overridden(tmp_path, path, action, sour
     assert result.sources == (source,)
 
 
+@pytest.mark.parametrize(
+    ("action", "target", "limits", "source"),
+    [
+        (
+            Action.FILESYSTEM_READ,
+            lambda root: FileTarget(path=str(root.parent / "outside")),
+            PolicyLimits(),
+            "limit:workspace:readable_roots",
+        ),
+        (
+            Action.NETWORK_REQUEST,
+            lambda root: NetworkTarget(
+                url="https://outside.test/data", origin="https://outside.test"
+            ),
+            PolicyLimits(network_origins=("https://allowed.test",)),
+            "limit:workspace:network_origins",
+        ),
+        (
+            Action.PROCESS_EXECUTE,
+            lambda root: ProcessTarget(
+                argv=("git", "status"), cwd=str(root), boundary=ProcessBoundary.HOST
+            ),
+            PolicyLimits(),
+            "limit:workspace:allow_host_processes",
+        ),
+    ],
+)
+def test_check_boundaries_returns_first_hard_denial_without_policy_matching(
+    tmp_path, action, target, limits, source
+):
+    """Boundary preflight rejects unsafe effects before rules or defaults are evaluated."""
+    manager = PermissionManager(
+        tmp_path,
+        configuration=PermissionConfiguration(
+            defaults={action: Decision.ALLOW},
+            limits=limits,
+            rules=[PermissionRule(decision=Decision.ALLOW)],
+        ),
+    )
+    operation_target = target(tmp_path)
+    operation_value = operation(action, target=operation_target)
+
+    result = manager.check_boundaries((operation_value,))
+
+    assert result is not None
+    assert result.decision is Decision.DENY
+    assert result.sources == (source,)
+
+
+def test_check_boundaries_allows_safe_plans_and_stops_at_first_denial(tmp_path):
+    """Boundary preflight ignores policy-only effects and returns the first unsafe effect."""
+    manager = PermissionManager(tmp_path)
+    safe = file_operation(Action.FILESYSTEM_READ, tmp_path / "file.txt")
+    unsafe = file_operation(Action.FILESYSTEM_READ, tmp_path.parent / "outside.txt")
+
+    assert manager.check_boundaries((safe,)) is None
+    result = manager.check_boundaries((safe, unsafe, safe))
+
+    assert result is not None
+    assert result.sources == ("limit:workspace:readable_roots",)
+
+
+def test_recursive_mutations_cannot_remove_protected_directories(tmp_path):
+    """Recursive mutations are denied when they would contain protected control data."""
+    target = FileTarget(path=str(tmp_path), recursive=True)
+    manager = PermissionManager(
+        tmp_path,
+        configuration=PermissionConfiguration(
+            rules=[PermissionRule(decision=Decision.ALLOW)],
+        ),
+    )
+
+    result = manager.evaluate((operation(Action.FILESYSTEM_DELETE, target=target),))
+
+    assert result.decision is Decision.DENY
+    assert result.sources == ("boundary:protected_path",)
+
+
 def test_explicit_filesystem_roots_expand_the_hard_boundary(tmp_path):
     """Configured absolute roots deliberately extend readable and writable scope."""
     outside = tmp_path.parent / "shared"

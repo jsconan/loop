@@ -784,6 +784,54 @@ def test_sync_and_async_dispatch_report_operation_planning_failures():
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        IsADirectoryError("is a directory"),
+        FileNotFoundError("missing"),
+        NotADirectoryError("not a directory"),
+        PermissionError("permission denied"),
+    ],
+)
+def test_all_dispatch_paths_normalize_expected_filesystem_planning_failures(failure):
+    """Expected filesystem planning errors remain structured across every dispatcher."""
+
+    def fail_plan(_arguments):
+        raise failure
+
+    @declare_tool(operation_planner=fail_plan)
+    def calculate() -> None:
+        """Expose one expected filesystem planning failure."""
+
+    registry = ToolRegistry([calculate])
+
+    sync = json.loads(registry.call("calculate", "{}"))["problem"]
+    asynchronous = json.loads(asyncio.run(registry.call_async("calculate", "{}")))["problem"]
+    command = json.loads(registry.command("calculate", ()).output)["problem"]
+
+    assert sync["code"] == asynchronous["code"] == command["code"] == "tool.planning_failed"
+    assert sync["detail"] == asynchronous["detail"] == command["detail"] == str(failure)
+
+
+def test_command_dispatch_resolves_planning_continuations():
+    """Direct command dispatch executes a phased planner before invoking its tool."""
+
+    def initial_plan(arguments):
+        return OperationPlan(
+            arguments=arguments,
+            continuation=lambda: OperationPlan(arguments={"number": 7}),
+        )
+
+    @declare_tool(operation_planner=initial_plan)
+    def calculate(number: int = 1) -> int:
+        """Return the fully planned value."""
+        return number
+
+    registry = ToolRegistry([calculate])
+
+    assert result_value(registry.command("calculate", ()).output) == 7
+
+
 def test_all_dispatch_paths_preserve_structured_operation_planning_problems():
     """Structured planning failures retain their problem contract across every dispatcher."""
     planning_problem = Problem(

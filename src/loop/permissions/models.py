@@ -15,6 +15,9 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validat
 
 from ..utils import sha256_digest
 
+type FileKind = Literal["file", "directory", "symlink"]
+type Operations = tuple[Operation, ...]
+
 
 class Action(StrEnum):
     """Identify one authority-bearing effect planned by a tool."""
@@ -81,6 +84,32 @@ class ProcessBoundary(StrEnum):
     SANDBOXED = "sandboxed"
 
 
+class FileManifestEntry(BaseModel):
+    """Capture one approved object in a recursive filesystem mutation.
+
+    Args:
+        relative_path (str): POSIX path relative to the recursive target, or ``."`` for its root.
+        kind (FileKind): Object kind without following symlinks.
+        device (int): Device identity where exposed by the platform.
+        inode (int): Inode identity where exposed by the platform.
+        size (int): Byte size reported by ``lstat``.
+        mtime_ns (int): Nanosecond modification time reported by ``lstat``.
+        mode (int): Permission and type bits reported by ``lstat``.
+        digest (str | None): SHA-256 file-content or symbolic-link-target digest when applicable.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    relative_path: str
+    kind: FileKind
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    mode: int
+    digest: str | None = None
+
+
 class FileTarget(BaseModel):
     """Identify a canonical filesystem object and its planned state.
 
@@ -88,7 +117,17 @@ class FileTarget(BaseModel):
         kind (Literal["file"]): Target discriminator.
         path (str): Canonical path that the executor must use.
         expected_exists (bool | None): Expected existence for guarded mutations.
-        expected_digest (str | None): Expected SHA-256 content digest for replacement.
+        expected_digest (str | None): Expected SHA-256 content or link-target digest.
+        expected_kind (FileKind | None): Expected object kind.
+        expected_device (int | None): Expected device identity where exposed by the platform.
+        expected_inode (int | None): Expected inode identity where exposed by the platform.
+        expected_size (int | None): Expected byte size for a regular file.
+        expected_mtime_ns (int | None): Expected nanosecond modification time.
+        expected_mode (int | None): Expected permission and type bits.
+        expected_parent_device (int | None): Expected parent-directory device identity.
+        expected_parent_inode (int | None): Expected parent-directory inode identity.
+        recursive (bool): Whether the target represents a recursive tree mutation.
+        manifest (tuple[FileManifestEntry, ...]): Approved recursive descendant states.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -97,6 +136,16 @@ class FileTarget(BaseModel):
     path: str
     expected_exists: bool | None = None
     expected_digest: str | None = None
+    expected_kind: FileKind | None = None
+    expected_device: int | None = None
+    expected_inode: int | None = None
+    expected_size: int | None = None
+    expected_mtime_ns: int | None = None
+    expected_mode: int | None = None
+    expected_parent_device: int | None = None
+    expected_parent_inode: int | None = None
+    recursive: bool = False
+    manifest: tuple[FileManifestEntry, ...] = ()
 
 
 class NetworkTarget(BaseModel):
@@ -225,13 +274,22 @@ class OperationPlan(BaseModel):
 
     Args:
         arguments (dict[str, object]): Canonical arguments passed to the executor.
-        operations (tuple[Operation, ...]): Complete effects requiring authorization.
+        operations (Operations): Effects requiring authorization at this phase.
+        prerequisite_operations (Operations): Earlier inspection effects completed
+            before this executable phase was produced.
+        boundary_operations (Operations): Future effects whose non-overridable
+            boundaries must be checked before prerequisite inspection.
+        continuation (Callable[[], OperationPlan] | None): Authorized inspection continuation
+            producing the next phase, or ``None`` when this plan is executable.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     arguments: dict[str, object]
-    operations: tuple[Operation, ...] = ()
+    operations: Operations = ()
+    prerequisite_operations: Operations = ()
+    boundary_operations: Operations = ()
+    continuation: Callable[[], OperationPlan] | None = Field(default=None, exclude=True)
 
 
 class PresetSource(BaseModel):
@@ -671,7 +729,7 @@ class AuthorizationResult(BaseModel):
     """Record one atomic authorization of a complete operation set.
 
     Args:
-        operations (tuple[Operation, ...]): Operations evaluated together.
+        operations (Operations): Operations evaluated together.
         policy (PolicyDecision): Outcome before interactive approval.
         decision (Decision): Effective allow or deny result.
         prompted (bool): Whether a user approval prompt was displayed.
@@ -684,7 +742,7 @@ class AuthorizationResult(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    operations: tuple[Operation, ...]
+    operations: Operations
     policy: PolicyDecision
     decision: Decision
     prompted: bool = False
