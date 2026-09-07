@@ -14,6 +14,7 @@ from ..utils import sha256_digest
 from .models import (
     AgentInstructionsSource,
     InstructionContext,
+    InstructionReference,
     InstructionSection,
     InstructionSectionSummary,
     InstructionSourceSummary,
@@ -55,6 +56,8 @@ class InstructionsManager:
             refreshed, or ``None`` for static injected instructions.
         agents_filenames (tuple[str, ...]): Candidate project instruction filenames in precedence
             order. Defaults to ``("AGENTS.md",)``.
+        workspace_id (str | None): Durable workspace identity for relocatable provenance.
+        workspace_root (Path | str | None): Current root used to capture workspace-relative paths.
 
     Raises:
         ValueError: If ``max_bytes`` is not a positive integer.
@@ -75,6 +78,8 @@ class InstructionsManager:
     _lock: RLock
     _refresh_changes: list[str]
     _agents_filenames: tuple[str, ...]
+    _workspace_id: str | None
+    _workspace_root: Path | None
 
     def __init__(
         self,
@@ -85,6 +90,8 @@ class InstructionsManager:
         max_bytes: int = constants.MAX_INSTRUCTIONS_BYTES,
         working_directory: Path | str | None = None,
         agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
+        workspace_id: str | None = None,
+        workspace_root: Path | str | None = None,
     ) -> None:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise ValueError("Instruction limit must be a positive integer.")
@@ -96,6 +103,10 @@ class InstructionsManager:
             Path(working_directory).resolve() if working_directory is not None else None
         )
         self._agents_filenames = tuple(dict.fromkeys(agents_filenames))
+        self._workspace_id = workspace_id
+        self._workspace_root = (
+            Path(workspace_root).resolve() if workspace_root is not None else None
+        )
         self._dirty = False
         self._generation = 0
         self._signature = self._discovery_signature(self._working_directory)
@@ -114,6 +125,8 @@ class InstructionsManager:
         skill_manager: SkillManager | None = None,
         max_bytes: int = constants.MAX_INSTRUCTIONS_BYTES,
         agents_filenames: tuple[str, ...] = (constants.DEFAULT_AGENTS_FILENAME,),
+        workspace_id: str | None = None,
+        workspace_root: Path | str | None = None,
     ) -> Self:
         """Discover project instructions and skills for a working directory.
 
@@ -124,6 +137,8 @@ class InstructionsManager:
             max_bytes (int): Maximum encoded size of the complete instruction document.
             agents_filenames (tuple[str, ...]): Candidate instruction filenames in precedence
                 order, deduplicated with ``AGENTS.md`` normally first.
+            workspace_id (str | None): Durable workspace identity for relocatable provenance.
+            workspace_root (Path | str | None): Current root for workspace-relative references.
 
         Returns:
             InstructionsManager: Manager containing the discovered instruction sources.
@@ -141,6 +156,8 @@ class InstructionsManager:
             max_bytes=max_bytes,
             working_directory=directory,
             agents_filenames=agents_filenames,
+            workspace_id=workspace_id,
+            workspace_root=workspace_root,
         )
         manager._skill_discovery_enabled = skill_manager is None
         manager._project_sources = loaded.sources
@@ -642,7 +659,12 @@ class InstructionsManager:
                 )
             )
         sections.extend(
-            InstructionSection("agents", source.content, str(source.path))
+            InstructionSection(
+                "agents",
+                source.content,
+                str(source.path),
+                self._reference(source.path, source.content, snapshot=True),
+            )
             for source in self._project_sources
             if source.content
         )
@@ -660,10 +682,25 @@ class InstructionsManager:
         if catalog:
             sections.append(InstructionSection("skill_catalog", catalog, "skill_discovery"))
         sections.extend(
-            InstructionSection("active_skill", instructions, str(skill.location))
+            InstructionSection(
+                "active_skill",
+                instructions,
+                str(skill.location),
+                self._reference(skill.location, instructions, snapshot=True),
+            )
             for skill, instructions in self._skill_manager.activated_instructions
         )
         return tuple(sections)
+
+    def _reference(self, path: Path, content: str, *, snapshot: bool) -> InstructionReference:
+        """Capture file provenance using the manager's durable workspace context."""
+        return InstructionReference.capture(
+            path,
+            content,
+            workspace_id=self._workspace_id,
+            workspace_root=self._workspace_root,
+            snapshot=snapshot,
+        )
 
     def _compose(
         self,

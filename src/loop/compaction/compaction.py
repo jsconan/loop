@@ -210,6 +210,9 @@ class ContextCompaction:
             instructions=snapshot.content,
             working_directory=working_directory,
             active_skills=list(snapshot.active_skills),
+            references=tuple(
+                section.reference for section in snapshot.sections if section.reference is not None
+            ),
         )
         current_tokens = self._session_manager.tokens
         telemetry_activity(

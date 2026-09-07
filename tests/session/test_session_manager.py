@@ -44,6 +44,7 @@ from loop import (
     ToolResult,
     Usage,
 )
+from loop.instructions import InstructionReference
 from loop.interaction import Interaction
 from loop.session import (
     PermissionEvent,
@@ -796,6 +797,13 @@ def test_manager_persists_compaction_with_instruction_and_skill_snapshot():
         usage=Usage(input_tokens=90, output_tokens=20, total_tokens=110),
         context_tokens=20,
     )
+    reference = InstructionReference.capture(
+        "/project/AGENTS.md",
+        "project rules",
+        workspace_id="workspace-id",
+        workspace_root="/project",
+        snapshot=True,
+    )
 
     manager.add_compaction(
         result,
@@ -803,6 +811,7 @@ def test_manager_persists_compaction_with_instruction_and_skill_snapshot():
         instructions="project rules",
         working_directory="/project",
         active_skills=iter([("review", "/skills/review/SKILL.md")]),
+        references=(reference,),
     )
 
     checkpoint = session.compactions[0]
@@ -810,6 +819,10 @@ def test_manager_persists_compaction_with_instruction_and_skill_snapshot():
     assert checkpoint.boundary == 1
     assert checkpoint.instructions.content == "project rules"
     assert checkpoint.instructions.active_skills == (("review", "/skills/review/SKILL.md"),)
+    assert checkpoint.instructions.references == (reference,)
+    assert Session.deserialize(session.serialize()).compactions[0].instructions.references == (
+        reference,
+    )
     assert checkpoint.input_tokens_before == 90
     assert checkpoint.input_tokens_after == 20
     assert session.tokens == 20

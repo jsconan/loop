@@ -6,6 +6,7 @@ import logging
 
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
+from ..instructions import InstructionsManager
 from ..interaction import Interaction
 from ..loop import Loop
 from ..permissions import PermissionManager
@@ -109,6 +110,11 @@ class ApplicationRuntime:
                     settings=ToolRuntimeSettings(user_agent=settings.web.user_agent),
                 ),
                 working_directory=workspace.working_directory,
+                instructions_manager=InstructionsManager.discover(
+                    workspace.working_directory.resolve(),
+                    workspace_id=workspace.id,
+                    workspace_root=workspace.root,
+                ),
                 permission_manager=PermissionManager(
                     workspace.root,
                     configuration_path=workspace_paths.permissions,

@@ -12,6 +12,7 @@ from uuid import uuid7
 from .. import constants
 from ..backend.errors import BackendResponseError
 from ..errors import Problem, log_problem
+from ..instructions.models import InstructionReference
 from ..interaction import ConsoleInteraction, Interaction
 from ..models import (
     AgentRunStopReason,
@@ -409,6 +410,7 @@ class SessionManager:
         instructions: str | None,
         working_directory: str,
         active_skills: Iterable[tuple[str, str]],
+        references: Iterable[InstructionReference] = (),
     ) -> None:
         """Persist one compaction checkpoint and its exact instruction state.
 
@@ -418,11 +420,13 @@ class SessionManager:
             instructions (str | None): Complete instructions supplied to the compactor.
             working_directory (str): Effective instruction-discovery directory.
             active_skills (Iterable[tuple[str, str]]): Active skill identities.
+            references (Iterable[InstructionReference]): Durable instruction-file provenance.
 
         Raises:
             ValueError: If the checkpoint does not advance or has invalid context.
         """
         identities = tuple(active_skills)
+        instruction_references = tuple(references)
         provider = result.items[0].provider if result.items else ""
         compaction = Compaction(
             id=str(uuid7()),
@@ -436,6 +440,7 @@ class SessionManager:
                 content=instructions,
                 digest=sha256_digest(instructions or ""),
                 active_skills=identities,
+                references=instruction_references,
             ),
             input_tokens_before=self._session.tokens,
             input_tokens_after=result.context_tokens,

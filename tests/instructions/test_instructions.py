@@ -146,6 +146,44 @@ def test_manager_discovers_project_instructions_and_skills(tmp_path):
     assert manager.skill_manager.count == 1
 
 
+def test_prepared_sections_capture_relocatable_workspace_and_external_provenance(tmp_path):
+    """Prepared snapshots attach relocatable references only to file-backed sections."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
+    internal = write_skill(workspace / ".agents" / "skills" / "local", "local")
+    external = write_skill(tmp_path / "shared" / "external", "external")
+    manager = configured_discovered(
+        workspace,
+        workspace_id="workspace-id",
+        workspace_root=workspace,
+        skill_manager=SkillManager([internal, external]),
+    )
+    manager.activate_skill("local")
+    manager.activate_skill("external")
+
+    sections = manager.prepare(TEST_AGENT).sections
+    references = {
+        section.source: section.reference for section in sections if section.reference is not None
+    }
+    project_reference = references[str((workspace / "AGENTS.md").resolve())]
+    internal_reference = references[str(internal.location)]
+    external_reference = references[str(external.location)]
+    moved = tmp_path / "moved"
+
+    assert project_reference.workspace_id == "workspace-id"
+    assert project_reference.workspace_relative_path == "AGENTS.md"
+    assert internal_reference.workspace_relative_path == ".agents/skills/local/SKILL.md"
+    assert project_reference.resolve("workspace-id", moved) == moved / "AGENTS.md"
+    assert project_reference.snapshot_content == "Project rules."
+    assert external_reference.workspace_id is None
+    assert external_reference.workspace_relative_path is None
+    assert external_reference.resolve("workspace-id", moved) == external.location
+    assert (
+        next(section for section in sections if section.kind == "agent_identity").reference is None
+    )
+
+
 def test_manager_reports_truncated_project_instruction_sources(tmp_path):
     """Discovery exposes bounded source sizes and a persistent truncation diagnostic."""
     (tmp_path / "AGENTS.md").write_text("x" * 33_000, encoding="utf-8")

@@ -7,6 +7,7 @@ from typing import Annotated, Literal, Protocol, TypedDict
 from pydantic import BaseModel, Field, field_validator
 
 from .. import constants
+from ..instructions.models import InstructionReference
 from ..models import AgentRunStopReason, CompactionContextItem, RunMetrics, ToolCall
 from ..permissions import AuthorizationResult
 from ..utils import as_utc
@@ -50,12 +51,14 @@ class InstructionSnapshot(BaseModel):
         content (str | None): Complete instructions supplied to the backend.
         digest (str): SHA-256 digest of the complete instruction content.
         active_skills (tuple[tuple[str, str], ...]): Active skill names and canonical locations.
+        references (tuple[InstructionReference, ...]): Durable instruction-file provenance.
     """
 
     working_directory: str
     content: str | None
     digest: str
     active_skills: tuple[tuple[str, str], ...] = ()
+    references: tuple[InstructionReference, ...] = ()
 
 
 class Compaction(BaseModel):
