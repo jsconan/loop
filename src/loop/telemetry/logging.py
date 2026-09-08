@@ -4,34 +4,65 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from filelock import FileLock
+
 from .. import constants
-from ..utils import PrivateRotatingTextFile
+from ..utils import PrivateRotatingTextFile, sha256_digest
 
 
-def import_legacy_operational_log(source: Path | str, destination: Path | str) -> bool:
-    """Import a legacy operational log when the central log is absent.
+def import_legacy_operational_log(source: Path | str, destination: Path | str) -> int:
+    """Idempotently append legacy operational records to the central log.
 
     Args:
         source (Path | str): Legacy operational log path.
         destination (Path | str): Central operational log path.
 
     Returns:
-        bool: Whether the legacy log was imported.
+        int: Number of newly imported records.
     """
     legacy = Path(source).resolve()
     target = Path(destination).resolve()
-    if not legacy.is_file() or target.exists():
-        return False
+    if not legacy.is_file():
+        return 0
     target.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
-    with legacy.open("rb") as input_file, target.open("xb") as output_file:
-        shutil.copyfileobj(input_file, output_file)
-    target.chmod(constants.PRIVATE_FILE_MODE)
-    return True
+    imported = 0
+    lock = FileLock(f"{target}.lock", mode=constants.PRIVATE_FILE_MODE)
+    with lock:
+        known = set()
+        for candidate in target.parent.glob(f"{target.name}*"):
+            if not candidate.is_file() or candidate.name.endswith(".lock"):
+                continue
+            with candidate.open(encoding="utf-8", errors="replace") as existing:
+                for line in existing:
+                    try:
+                        migration_id = json.loads(line).get("migration_id")
+                    except (AttributeError, json.JSONDecodeError):
+                        continue
+                    if migration_id is not None:
+                        known.add(migration_id)
+        with (
+            legacy.open(encoding="utf-8", errors="replace") as input_file,
+            target.open("a", encoding="utf-8") as output,
+        ):
+            for line_number, line in enumerate(input_file, 1):
+                migration_id = sha256_digest(f"{legacy}:{line_number}:{line}")
+                if migration_id in known:
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    value = {"message": line.rstrip("\r\n"), "level": "UNKNOWN"}
+                if not isinstance(value, dict):
+                    value = {"message": value, "level": "UNKNOWN"}
+                value["migration_id"] = migration_id
+                output.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
+                imported += 1
+        target.chmod(constants.PRIVATE_FILE_MODE)
+    return imported
 
 
 class SafeRotatingFileHandler(logging.Handler):
@@ -87,6 +118,7 @@ class SafeOperationalFormatter(logging.Formatter):
         "exception.type",
         "telemetry.component",
         "telemetry.failure",
+        "workspace_id",
     )
 
     def format(self, record: logging.LogRecord) -> str:
@@ -100,6 +132,7 @@ class SafeOperationalFormatter(logging.Formatter):
         """
         value = {
             "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
+            "timestamp_ns": int(record.created * 1_000_000_000),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage().replace("\r", "\\r").replace("\n", "\\n"),
@@ -113,17 +146,35 @@ class SafeOperationalFormatter(logging.Formatter):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+class WorkspaceFilter(logging.Filter):
+    """Stamp one sanitized workspace identity on operational records."""
+
+    def __init__(self, workspace_id: str) -> None:
+        super().__init__()
+        self._workspace_id = workspace_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Attach workspace context and accept the record."""
+        record.workspace_id = self._workspace_id
+        return True
+
+
 def configure_operational_logging(
     path: Path | str,
     *,
     level: str = constants.DEFAULT_OPERATIONAL_LOG_LEVEL,
     max_bytes: int | None = None,
     backup_count: int | None = None,
+    workspace_id: str | None = None,
 ) -> logging.Handler | None:
     """Install an owner-local rotating handler without disabling stderr fallback.
 
     Args:
         path (Path | str): Operational log destination.
+        level (str): Minimum logging severity.
+        max_bytes (int | None): Maximum active log size before rotation.
+        backup_count (int | None): Number of rotated archives to retain.
+        workspace_id (str | None): Active workspace stamped on emitted records.
 
     Returns:
         logging.Handler | None: Installed handler, or ``None`` when setup failed.
@@ -142,6 +193,8 @@ def configure_operational_logging(
             backup_count=resolved_backup_count,
         )
         handler.addFilter(logging.Filter("loop"))
+        if workspace_id is not None:
+            handler.addFilter(WorkspaceFilter(workspace_id))
         handler.setFormatter(SafeOperationalFormatter())
         root = logging.getLogger()
         root.addHandler(handler)

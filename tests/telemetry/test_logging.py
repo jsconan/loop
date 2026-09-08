@@ -5,7 +5,29 @@ import logging
 from unittest.mock import Mock
 
 import loop.telemetry.logging as logging_module
-from loop.telemetry.logging import SafeOperationalFormatter, configure_operational_logging
+from loop.telemetry.logging import (
+    SafeOperationalFormatter,
+    configure_operational_logging,
+    import_legacy_operational_log,
+)
+
+
+def test_legacy_log_import_is_streaming_idempotent_and_normalizes_records(tmp_path):
+    """Legacy JSON, scalar, and malformed lines append once using durable record identities."""
+    source = tmp_path / "legacy.log"
+    destination = tmp_path / "state" / "loop.log"
+    assert import_legacy_operational_log(tmp_path / "missing", destination) == 0
+    source.write_text('{"event.name":"one"}\n"scalar"\nmalformed\n', encoding="utf-8")
+    destination.parent.mkdir()
+    destination.write_text("not-json\n{}\n", encoding="utf-8")
+    (destination.parent / "loop.log.1").write_text('{"migration_id":"known"}\n', encoding="utf-8")
+
+    assert import_legacy_operational_log(source, destination) == 3
+    assert import_legacy_operational_log(source, destination) == 0
+    values = [json.loads(line) for line in destination.read_text().splitlines()[2:]]
+    assert values[0]["event.name"] == "one"
+    assert values[1]["message"] == "scalar"
+    assert values[2]["message"] == "malformed"
 
 
 def test_safe_formatter_excludes_exception_contents_and_normalizes_fields():
@@ -24,7 +46,9 @@ def test_safe_formatter_excludes_exception_contents_and_normalizes_fields():
 
 def test_configure_operational_logging_writes_rotating_local_file(tmp_path):
     """Bootstrap configuration installs a working owner-local file handler."""
-    handler = configure_operational_logging(tmp_path / ".loop" / "loop.log")
+    handler = configure_operational_logging(
+        tmp_path / ".loop" / "loop.log", workspace_id="workspace"
+    )
     logger = logging.getLogger("loop.operational.test")
     logger.error("Safe failure", extra={"error.type": "test.failed"})
     handler.flush()
@@ -34,6 +58,8 @@ def test_configure_operational_logging_writes_rotating_local_file(tmp_path):
     value = json.loads((tmp_path / ".loop" / "loop.log").read_text(encoding="utf-8"))
     assert value["message"] == "Safe failure"
     assert value["error.type"] == "test.failed"
+    assert value["workspace_id"] == "workspace"
+    assert isinstance(value["timestamp_ns"], int)
     assert (tmp_path / ".loop").stat().st_mode & 0o777 == 0o700
     assert (tmp_path / ".loop" / "loop.log").stat().st_mode & 0o777 == 0o600
 

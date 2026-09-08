@@ -87,6 +87,7 @@ class ApplicationRuntime:
             level=settings.logging.level,
             max_bytes=settings.logging.max_bytes,
             backup_count=settings.logging.backup_count,
+            workspace_id=workspace.id,
         )
         telemetry = None
         try:
@@ -146,6 +147,9 @@ class ApplicationRuntime:
         except Exception:
             if telemetry is not None:
                 telemetry.close(timeout=settings.telemetry.shutdown_timeout)
+            if logging_handler is not None:
+                logging.getLogger().removeHandler(logging_handler)
+                logging_handler.close()
             raise
         runtime = cls(loop, telemetry, settings.telemetry.shutdown_timeout, logging_handler)
         loop.command_manager.register_all(

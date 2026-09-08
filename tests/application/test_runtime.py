@@ -156,6 +156,7 @@ def test_create_closes_only_successfully_created_telemetry(
         )
     else:
         dependencies["Telemetry"].return_value.close.assert_not_called()
+    dependencies["configure_operational_logging"].return_value.close.assert_called_once_with()
 
 
 def test_close_without_owned_log_handler_remains_safe():
@@ -166,3 +167,15 @@ def test_close_without_owned_log_handler_remains_safe():
     runtime.close()
 
     telemetry.close.assert_called_once_with(timeout=1.0)
+
+
+def test_failed_create_without_logging_or_telemetry_owners_is_safe(dependencies, assembled):
+    """Early composition failure needs no cleanup when global owners were unavailable."""
+    workspace, paths, workspace_paths, settings = assembled
+    dependencies["configure_operational_logging"].return_value = None
+    dependencies["OpenAIBackend"].side_effect = RuntimeError("failed")
+
+    with pytest.raises(RuntimeError, match="failed"):
+        ApplicationRuntime.create(
+            workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+        )
