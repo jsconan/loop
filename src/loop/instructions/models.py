@@ -11,22 +11,26 @@ from ..utils.hashing import sha256_digest
 
 
 @dataclass(frozen=True)
-class InstructionReference:
-    """Preserve durable, relocatable provenance for instruction and context content.
+class CapturedInstruction:
+    """Preserve immutable instruction content with relocatable source provenance.
 
     Args:
         workspace_id (str | None): Owning workspace identity for an internal reference.
         workspace_relative_path (str | None): POSIX-style path relative to the workspace root.
         captured_absolute_path (Path): Absolute path observed when the reference was captured.
         content_digest (str): SHA-256 digest of the captured content.
-        snapshot_content (str | None): Optional immutable content snapshot.
+        captured_content (str): Exact immutable captured content.
     """
 
     workspace_id: str | None
     workspace_relative_path: str | None
     captured_absolute_path: Path
     content_digest: str
-    snapshot_content: str | None = None
+    captured_content: str
+
+    def __post_init__(self) -> None:
+        if sha256_digest(self.captured_content) != self.content_digest:
+            raise ValueError("Instruction content does not match its digest.")
 
     @classmethod
     def capture(
@@ -36,19 +40,16 @@ class InstructionReference:
         *,
         workspace_id: str | None = None,
         workspace_root: Path | str | None = None,
-        snapshot: bool = False,
-    ) -> InstructionReference:
-        """Capture provenance and an optional content snapshot.
+    ) -> CapturedInstruction:
+        """Capture immutable content and its source provenance.
 
         Args:
             path (Path | str): Source file path.
             content (str): Exact captured source content.
             workspace_id (str | None): Durable workspace identity.
             workspace_root (Path | str | None): Workspace root used to derive a relative path.
-            snapshot (bool): Whether to retain exact content for missing-file recovery.
-
         Returns:
-            InstructionReference: Durable reference with relocation metadata when applicable.
+            CapturedInstruction: Immutable capture with relocation metadata when applicable.
         """
         absolute = Path(path).expanduser().resolve()
         relative = None
@@ -58,7 +59,7 @@ class InstructionReference:
             if absolute.is_relative_to(root):
                 relative = absolute.relative_to(root).as_posix()
                 owner = workspace_id
-        return cls(owner, relative, absolute, sha256_digest(content), content if snapshot else None)
+        return cls(owner, relative, absolute, sha256_digest(content), content)
 
     def resolve(self, workspace_id: str, workspace_root: Path | str) -> Path:
         """Resolve the current source path without rewriting historical provenance.
@@ -79,26 +80,102 @@ class InstructionReference:
             raise ValueError("Instruction reference belongs to a different workspace.")
         return Path(workspace_root).expanduser().resolve() / self.workspace_relative_path
 
+    def content(self) -> str:
+        """Return the exact captured content without consulting the filesystem.
+
+        Returns:
+            str: Immutable captured content matching ``content_digest``.
+        """
+        return self.captured_content
+
+
+@dataclass(frozen=True)
+class LiveInstructionSource:
+    """Represent a relocatable filesystem source whose current content may change.
+
+    Args:
+        workspace_id (str | None): Owning workspace identity for an internal source.
+        workspace_relative_path (str | None): POSIX-style path relative to the workspace root.
+        captured_absolute_path (Path): Absolute path observed when the source was created.
+    """
+
+    workspace_id: str | None
+    workspace_relative_path: str | None
+    captured_absolute_path: Path
+
+    @classmethod
+    def from_path(
+        cls,
+        path: Path | str,
+        *,
+        workspace_id: str | None = None,
+        workspace_root: Path | str | None = None,
+    ) -> LiveInstructionSource:
+        """Create a live source with relocation metadata when applicable.
+
+        Args:
+            path (Path | str): Current source file path.
+            workspace_id (str | None): Durable workspace identity.
+            workspace_root (Path | str | None): Workspace root used to derive a relative path.
+
+        Returns:
+            LiveInstructionSource: Source that reads the current filesystem state.
+        """
+        absolute = Path(path).expanduser().resolve()
+        if workspace_id is not None and workspace_root is not None:
+            root = Path(workspace_root).expanduser().resolve()
+            if absolute.is_relative_to(root):
+                return cls(workspace_id, absolute.relative_to(root).as_posix(), absolute)
+        return cls(None, None, absolute)
+
+    def resolve(self, workspace_id: str, workspace_root: Path | str) -> Path:
+        """Resolve the current source path.
+
+        Args:
+            workspace_id (str): Active workspace identity.
+            workspace_root (Path | str): Current canonical root for that identity.
+
+        Returns:
+            Path: Relocated internal path or unchanged external absolute path.
+
+        Raises:
+            ValueError: If an internal source is resolved for a different workspace.
+        """
+        if self.workspace_relative_path is None:
+            return self.captured_absolute_path
+        if self.workspace_id != workspace_id:
+            raise ValueError("Instruction source belongs to a different workspace.")
+        return Path(workspace_root).expanduser().resolve() / self.workspace_relative_path
+
     def content(self, workspace_id: str, workspace_root: Path | str) -> str:
-        """Read current content or return a required snapshot when the file is missing.
+        """Read the source's current filesystem content.
 
         Args:
             workspace_id (str): Active workspace identity.
             workspace_root (Path | str): Current canonical workspace root.
 
         Returns:
-            str: Current file content or the stored snapshot.
+            str: Current source content.
+        """
+        return self.resolve(workspace_id, workspace_root).read_text(encoding="utf-8")
 
-        Raises:
-            FileNotFoundError: If neither the current source nor a snapshot exists.
+    def capture(self, workspace_id: str, workspace_root: Path | str) -> CapturedInstruction:
+        """Capture the source's current content and fresh digest.
+
+        Args:
+            workspace_id (str): Active workspace identity.
+            workspace_root (Path | str): Current canonical workspace root.
+
+        Returns:
+            CapturedInstruction: Immutable capture of the current source state.
         """
         path = self.resolve(workspace_id, workspace_root)
-        try:
-            return path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            if self.snapshot_content is None:
-                raise
-            return self.snapshot_content
+        return CapturedInstruction.capture(
+            path,
+            path.read_text(encoding="utf-8"),
+            workspace_id=self.workspace_id,
+            workspace_root=workspace_root if self.workspace_relative_path is not None else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -109,13 +186,13 @@ class InstructionSection:
         kind (str): Stable section category.
         content (str): Exact rendered section content.
         source (str | None): Canonical source path or logical producer.
-        reference (InstructionReference | None): Durable file provenance when source is a path.
+        reference (CapturedInstruction | None): Immutable file provenance when source is a path.
     """
 
     kind: str
     content: str
     source: str | None = None
-    reference: InstructionReference | None = None
+    reference: CapturedInstruction | None = None
 
     @property
     def size_bytes(self) -> int:

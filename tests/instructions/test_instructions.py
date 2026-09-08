@@ -175,7 +175,7 @@ def test_prepared_sections_capture_relocatable_workspace_and_external_provenance
     assert project_reference.workspace_relative_path == "AGENTS.md"
     assert internal_reference.workspace_relative_path == ".agents/skills/local/SKILL.md"
     assert project_reference.resolve("workspace-id", moved) == moved / "AGENTS.md"
-    assert project_reference.snapshot_content == "Project rules."
+    assert project_reference.captured_content == "Project rules."
     assert external_reference.workspace_id is None
     assert external_reference.workspace_relative_path is None
     assert external_reference.resolve("workspace-id", moved) == external.location

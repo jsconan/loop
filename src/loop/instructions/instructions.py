@@ -13,8 +13,8 @@ from .. import constants
 from ..utils import sha256_digest
 from .models import (
     AgentInstructionsSource,
+    CapturedInstruction,
     InstructionContext,
-    InstructionReference,
     InstructionSection,
     InstructionSectionSummary,
     InstructionSourceSummary,
@@ -663,7 +663,7 @@ class InstructionsManager:
                 "agents",
                 source.content,
                 str(source.path),
-                self._reference(source.path, source.content, snapshot=True),
+                self._reference(source.path, source.content),
             )
             for source in self._project_sources
             if source.content
@@ -686,20 +686,19 @@ class InstructionsManager:
                 "active_skill",
                 instructions,
                 str(skill.location),
-                self._reference(skill.location, instructions, snapshot=True),
+                self._reference(skill.location, instructions),
             )
             for skill, instructions in self._skill_manager.activated_instructions
         )
         return tuple(sections)
 
-    def _reference(self, path: Path, content: str, *, snapshot: bool) -> InstructionReference:
+    def _reference(self, path: Path, content: str) -> CapturedInstruction:
         """Capture file provenance using the manager's durable workspace context."""
-        return InstructionReference.capture(
+        return CapturedInstruction.capture(
             path,
             content,
             workspace_id=self._workspace_id,
             workspace_root=self._workspace_root,
-            snapshot=snapshot,
         )
 
     def _compose(

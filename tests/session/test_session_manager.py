@@ -47,7 +47,7 @@ from loop import (
     ToolResult,
     Usage,
 )
-from loop.instructions import InstructionReference
+from loop.instructions import CapturedInstruction
 from loop.interaction import Interaction
 from loop.session import (
     PermissionEvent,
@@ -888,12 +888,11 @@ def test_manager_persists_compaction_with_instruction_and_skill_snapshot():
         usage=Usage(input_tokens=90, output_tokens=20, total_tokens=110),
         context_tokens=20,
     )
-    reference = InstructionReference.capture(
+    reference = CapturedInstruction.capture(
         "/project/AGENTS.md",
         "project rules",
         workspace_id="workspace-id",
         workspace_root="/project",
-        snapshot=True,
     )
 
     manager.add_compaction(

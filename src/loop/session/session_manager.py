@@ -14,7 +14,7 @@ from uuid import uuid7
 from .. import constants
 from ..backend.errors import BackendResponseError
 from ..errors import Problem, log_problem
-from ..instructions.models import InstructionReference
+from ..instructions.models import CapturedInstruction
 from ..interaction import ConsoleInteraction, Interaction
 from ..models import (
     AgentRunStopReason,
@@ -463,7 +463,7 @@ class SessionManager:
         instructions: str | None,
         working_directory: str,
         active_skills: Iterable[tuple[str, str]],
-        references: Iterable[InstructionReference] = (),
+        references: Iterable[CapturedInstruction] = (),
     ) -> None:
         """Persist one compaction checkpoint and its exact instruction state.
 
@@ -473,7 +473,7 @@ class SessionManager:
             instructions (str | None): Complete instructions supplied to the compactor.
             working_directory (str): Effective instruction-discovery directory.
             active_skills (Iterable[tuple[str, str]]): Active skill identities.
-            references (Iterable[InstructionReference]): Durable instruction-file provenance.
+            references (Iterable[CapturedInstruction]): Immutable instruction-file provenance.
 
         Raises:
             ValueError: If the checkpoint does not advance or has invalid context.
