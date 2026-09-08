@@ -160,7 +160,7 @@ class SQLiteTelemetryAdapter:
                         (values["record_id"],),
                     ).fetchone():
                         continue
-                    values["workspace_id"] = values.get("workspace_id") or self._workspace_id
+                    values["workspace_id"] = self._workspace_id
                     old_payload_id = values.pop("payload_id", None)
                     if old_payload_id is not None:
                         payload = source_connection.execute(

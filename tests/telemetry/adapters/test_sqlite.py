@@ -86,7 +86,8 @@ def test_sqlite_adapter_imports_legacy_records_idempotently(tmp_path):
         )
         connection.execute(
             "INSERT INTO telemetry_records VALUES "
-            "('record',1,1,'trace','legacy',NULL,NULL,NULL,NULL,1,NULL,NULL,NULL,'{}',1,NULL,1)"
+            "('record',1,1,'trace','legacy',NULL,'legacy-workspace',NULL,NULL,1,NULL,NULL,NULL,"
+            "'{}',1,NULL,1)"
         )
     adapter = SQLiteTelemetryAdapter(tmp_path / "central.db", workspace_id="workspace")
 
