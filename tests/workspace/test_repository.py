@@ -9,6 +9,7 @@ from unittest.mock import Mock
 from uuid import UUID
 
 import pytest
+from filelock import Timeout
 
 from loop import Session, SQLiteSessionStore
 from loop.workspace import Workspace, WorkspaceRepository
@@ -324,6 +325,37 @@ def test_repository_rekey_rejects_destination_conflicts_and_malformed_sessions(
     (data_root / "fixed").mkdir()
     with pytest.raises(FileExistsError, match="already exists"):
         store.rekey(project)
+
+
+def test_repository_rekey_rejects_concurrent_identity_changes(tmp_path: Path, monkeypatch) -> None:
+    """A held process lock rejects a concurrent rekey before copying workspace data."""
+    store = repository(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    workspace = store.initialize(Workspace.discover(project))
+    data = tmp_path / "app" / "workspaces" / workspace.id
+    data.mkdir(parents=True)
+    (data / "preserved").touch()
+    lock = Mock()
+    lock.__enter__ = Mock(side_effect=Timeout("held"))
+    lock.__exit__ = Mock()
+    monkeypatch.setattr("loop.workspace.repository.FileLock", Mock(return_value=lock))
+
+    with pytest.raises(ValueError, match="already in progress"):
+        store.rekey(project)
+
+    assert [path.name for path in data.parent.iterdir()] == [workspace.id]
+
+
+def test_repository_rekey_prepares_storage_before_taking_the_process_lock(tmp_path: Path) -> None:
+    """A fresh repository can rekey without a pre-existing application data directory."""
+    project = tmp_path / "project"
+    project.mkdir()
+
+    workspace = repository(tmp_path).rekey(project)
+
+    assert workspace.id is not None
+    assert (tmp_path / "app" / "workspaces.db").is_file()
 
 
 def test_repository_rekey_handles_absent_data_non_session_databases_and_catalog_failure(

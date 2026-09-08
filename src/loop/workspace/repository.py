@@ -12,6 +12,8 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+from filelock import FileLock, Timeout
+
 from .. import constants
 from .models import Workspace, WorkspaceNameSource
 
@@ -364,6 +366,25 @@ class WorkspaceRepository:
         root = Path(path).expanduser().resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"Workspace path is not a directory: {root}")
+        self._catalog.parent.mkdir(
+            mode=constants.PRIVATE_DIRECTORY_MODE,
+            parents=True,
+            exist_ok=True,
+        )
+        self._catalog.parent.chmod(constants.PRIVATE_DIRECTORY_MODE)
+        lock = FileLock(
+            self._catalog.with_name(f".{self._catalog.name}.rekey.lock"),
+            timeout=0,
+            mode=constants.PRIVATE_FILE_MODE,
+        )
+        try:
+            with lock:
+                return self._rekey(root)
+        except Timeout as error:
+            raise ValueError("A workspace rekey is already in progress.") from error
+
+    def _rekey(self, root: Path) -> Workspace:
+        """Rekey one validated workspace while holding the process lock."""
         kind, locator = self._locator(root)
         now = time.time_ns()
         workspace_id = str(uuid4())
