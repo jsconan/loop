@@ -2,11 +2,13 @@
 
 import json
 import logging
-from collections.abc import Callable, Iterable
-from contextlib import AbstractContextManager
+from asyncio import current_task
+from collections.abc import Callable, Generator, Iterable
+from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from dataclasses import fields
 from datetime import datetime
+from threading import Lock, get_ident
 from uuid import uuid7
 
 from .. import constants
@@ -62,6 +64,7 @@ from .models import (
     PermissionEvent,
     RunCompletedEvent,
     SessionEventModel,
+    SessionExecutionConflictError,
     SessionNameGenerator,
     SessionRecoveryState,
     SessionWorkspaceMismatchError,
@@ -72,7 +75,21 @@ from .naming import initial_session_name
 from .session import Session
 from .store import MemorySessionStore, SessionStore
 
+type ExecutionKey = tuple[tuple[str, str | int], str]
+type ExecutionOwner = tuple[int, int, int | None]
+
 _LOGGER = logging.getLogger(__name__)
+_EXECUTION_OWNERS: dict[ExecutionKey, tuple[ExecutionOwner, int]] = {}
+_EXECUTION_OWNERS_LOCK = Lock()
+
+
+def _execution_owner(manager: "SessionManager") -> ExecutionOwner:
+    """Identify one synchronous thread or asynchronous task execution owner."""
+    try:
+        task = current_task()
+    except RuntimeError:
+        task = None
+    return (id(manager), get_ident(), id(task) if task is not None else None)
 
 
 class SessionManager:
@@ -166,6 +183,42 @@ class SessionManager:
             session_id=self._session.id,
             message_sequence=message_sequence,
         )
+
+    @contextmanager
+    def execution(self) -> Generator[None, None, None]:
+        """Own this logical session's execution within the current process.
+
+        This lease intentionally provides process-local exclusion only. Persisted revision checks
+        independently prevent stale writers in other processes from overwriting newer snapshots.
+
+        Yields:
+            None: Control while this manager exclusively owns session execution.
+
+        Raises:
+            SessionExecutionConflictError: If another execution in this process owns the session.
+        """
+        namespace = (
+            ("workspace", self._session.workspace_id)
+            if self._session.workspace_id is not None
+            else ("store", id(self._session_store))
+        )
+        key = (namespace, self._session.id)
+        owner = _execution_owner(self)
+        with _EXECUTION_OWNERS_LOCK:
+            existing = _EXECUTION_OWNERS.get(key)
+            if existing is not None and existing[0] != owner:
+                raise SessionExecutionConflictError(self._session.id)
+            depth = existing[1] + 1 if existing is not None else 1
+            _EXECUTION_OWNERS[key] = (owner, depth)
+        try:
+            yield
+        finally:
+            with _EXECUTION_OWNERS_LOCK:
+                current_owner, depth = _EXECUTION_OWNERS[key]
+                if depth == 1:
+                    del _EXECUTION_OWNERS[key]
+                else:
+                    _EXECUTION_OWNERS[key] = (current_owner, depth - 1)
 
     def response(
         self,

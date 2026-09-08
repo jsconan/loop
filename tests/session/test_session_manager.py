@@ -1,8 +1,10 @@
 """Tests for session coordination and persistence."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from threading import Barrier, Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call
 from uuid import uuid4
@@ -37,6 +39,7 @@ from loop import (
     ResponseCompleted,
     RunMetrics,
     Session,
+    SessionExecutionConflictError,
     SessionManager,
     SessionWorkspaceMismatchError,
     ToolCall,
@@ -409,6 +412,94 @@ def test_manager_exposes_durable_recovery_classification():
     assert manager.recovery_state.action == "query_model"
     manager.new_session()
     assert manager.recovery_state is None
+
+
+def test_manager_rejects_overlapping_execution_and_releases_normal_ownership():
+    """One process cannot own the same logical session twice and releases a completed lease."""
+    first = SessionManager(session=Session(id="shared", workspace_id="workspace"))
+    second = SessionManager(session=Session(id="shared", workspace_id="workspace"))
+
+    with (
+        first.execution(),
+        pytest.raises(SessionExecutionConflictError, match="already executing"),
+        second.execution(),
+    ):
+        pass
+
+    with second.execution():
+        pass
+
+
+@pytest.mark.parametrize("error", [RuntimeError("failed"), KeyboardInterrupt()])
+def test_manager_releases_execution_ownership_after_failure_or_cancellation(error):
+    """Exceptions and cancellation cannot strand a process-local session lease."""
+    first = SessionManager(session=Session(id="shared", workspace_id="workspace"))
+    second = SessionManager(session=Session(id="shared", workspace_id="workspace"))
+
+    with pytest.raises(type(error)), first.execution():
+        raise error
+
+    with second.execution():
+        pass
+
+
+def test_manager_allows_separate_sessions_to_execute_concurrently():
+    """Ownership isolation does not serialize executions of different logical sessions."""
+    first = SessionManager(session=Session(id="first", workspace_id="workspace"))
+    second = SessionManager(session=Session(id="second", workspace_id="workspace"))
+
+    with first.execution(), second.execution():
+        pass
+
+
+def test_manager_does_not_conflate_sessions_from_independent_memory_stores():
+    """Equal IDs without workspace identity remain independent across isolated stores."""
+    first = SessionManager(session=Session(id="shared"))
+    second = SessionManager(session=Session(id="shared"))
+
+    with first.execution(), second.execution():
+        pass
+
+
+def test_manager_rejects_same_session_execution_across_threads():
+    """A second thread cannot inherit or bypass an active session owner."""
+    first = SessionManager(session=Session(id="shared", workspace_id="workspace"))
+    second = SessionManager(session=Session(id="shared", workspace_id="workspace"))
+    acquired = Event()
+    release = Event()
+
+    def hold_execution() -> None:
+        """Hold ownership until the competing execution has been attempted."""
+        with first.execution():
+            acquired.set()
+            release.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(hold_execution)
+        assert acquired.wait(timeout=5)
+        with pytest.raises(SessionExecutionConflictError), second.execution():
+            pass
+        release.set()
+        future.result(timeout=5)
+
+
+def test_manager_allows_different_sessions_across_threads():
+    """Distinct session ownership does not suppress actual threaded concurrency."""
+    barrier = Barrier(2)
+    managers = [
+        SessionManager(session=Session(id=session_id, workspace_id="workspace"))
+        for session_id in ("first", "second")
+    ]
+
+    def overlap(manager: SessionManager) -> None:
+        """Reach a shared boundary while retaining the session lease."""
+        with manager.execution():
+            barrier.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(overlap, manager) for manager in managers]
+        for future in futures:
+            future.result(timeout=5)
 
 
 def test_manager_adds_and_persists_one_conversation_item():

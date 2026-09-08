@@ -76,6 +76,7 @@ class Session:
             Defaults to an empty list.
         events (list[SessionEvent]): Ordered durable replay and observability events.
             Defaults to an empty list.
+        revision (int): Store-managed persisted snapshot revision. New sessions start at zero.
     """
 
     id: str = field(default_factory=lambda: str(uuid7()))
@@ -90,6 +91,7 @@ class Session:
     instruction_working_directory: str | None = None
     active_skills: list[tuple[str, str]] = field(default_factory=list)
     events: list[SessionEvent] = field(default_factory=list)
+    revision: int = field(default=0, compare=False, repr=False)
 
     @property
     def assignment(self) -> ModelAssignment | None:

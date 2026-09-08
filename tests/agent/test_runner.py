@@ -1,5 +1,6 @@
 """Tests for bounded single-agent execution."""
 
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import ANY, MagicMock, Mock
 
@@ -12,6 +13,7 @@ from loop import (
     Response,
     ResponseMetrics,
     Session,
+    SessionExecutionConflictError,
     SessionRecoveryState,
     ToolCall,
     ToolExecutionMetrics,
@@ -33,6 +35,7 @@ def agent_runner(*, responses, max_turns=25, backend=None, options=None):
     session_manager.model = None
     session_manager.tokens = 0
     session_manager.context_window = None
+    session_manager.execution.side_effect = nullcontext
     interaction = MagicMock(spec=Interaction)
     options = options or {
         "stream": False,
@@ -76,6 +79,21 @@ def test_runner_returns_the_first_final_response():
     sessions.add_response.assert_called_once_with(response)
     sessions.record_run.assert_called_once()
     assert result.metrics is sessions.record_run.call_args.args[2]
+
+
+def test_runner_rejects_owned_sessions_before_tool_execution():
+    """A conflicting execution lease prevents model and side-effecting tool work."""
+    call = ToolCall(call_id="call", name="mutate", arguments="{}")
+    runner, sessions, _ = agent_runner(
+        responses=[Response(answer="", reasoning="", tool_calls=(call,), items=(call,))]
+    )
+    sessions.execution.side_effect = SessionExecutionConflictError("already executing")
+
+    with pytest.raises(SessionExecutionConflictError, match="already executing"):
+        runner.run()
+
+    runner.query.assert_not_called()
+    runner.agent.tools.call_with_timing.assert_not_called()
 
 
 def test_runner_reconfigures_subsequent_runs():
@@ -344,6 +362,7 @@ def test_runner_continues_after_max_turns_when_user_affirms():
     session_manager.model = None
     session_manager.tokens = 0
     session_manager.context_window = None
+    session_manager.execution.side_effect = nullcontext
     runner = AgentRunner(
         agent,
         backend,

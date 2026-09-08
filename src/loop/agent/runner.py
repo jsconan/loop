@@ -271,7 +271,7 @@ class AgentRunner:
         Returns:
             AgentRunResult: Final response, completed turn count, and termination reason.
         """
-        with telemetry_span():
+        with self._session_manager.execution(), telemetry_span():
             telemetry_activity("agent.run.started", component="agent_runner")
             result = self._run_from_boundary()
             telemetry_activity(
@@ -296,7 +296,8 @@ class AgentRunner:
             default=False,
         ):
             return AgentRecoveryStatus(pending=True)
-        return AgentRecoveryStatus(pending=False, result=self._recover(state))
+        with self._session_manager.execution():
+            return AgentRecoveryStatus(pending=False, result=self._recover(state))
 
     def _recover(self, state: SessionRecoveryState) -> AgentRunResult:
         """Continue one approved recovery plan from its durable execution boundary."""
@@ -407,7 +408,8 @@ class AgentRunner:
         if not response.tool_calls:
             return ()
 
-        return self._execute_tool_calls(response.tool_calls, present=True)
+        with self._session_manager.execution():
+            return self._execute_tool_calls(response.tool_calls, present=True)
 
     def _execute_tool_calls(
         self,

@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -21,7 +22,7 @@ def test_audit_appends_private_records_and_exports_filtered_jsonl(tmp_path):
     assert record["workspace_id"] == "first"
     assert record["payload"] == {"decision": "allow"}
     assert audit.path.stat().st_mode & 0o777 == 0o600
-    with sqlite3.connect(audit.path) as connection:
+    with closing(sqlite3.connect(audit.path)) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
@@ -58,7 +59,7 @@ def test_audit_imports_legacy_jsonl_idempotently_and_rolls_back_errors(tmp_path)
     with pytest.raises(ValueError, match="line 2"):
         audit.import_legacy_jsonl(source, workspace_id="workspace")
 
-    with sqlite3.connect(audit.path) as connection:
+    with closing(sqlite3.connect(audit.path)) as connection:
         assert (
             connection.execute(
                 "SELECT record_id FROM permission_audit_records WHERE record_id = 'third'"

@@ -3,6 +3,7 @@
 import json
 import sqlite3
 from collections.abc import Sequence
+from contextlib import closing
 from pathlib import Path
 
 from ... import constants
@@ -139,7 +140,7 @@ class SQLiteTelemetryAdapter:
             "schema_version",
         }
         destination = self._connect()
-        with sqlite3.connect(legacy) as source_connection:
+        with closing(sqlite3.connect(legacy)) as source_connection:
             columns = {
                 row[1] for row in source_connection.execute("PRAGMA table_info(telemetry_records)")
             }

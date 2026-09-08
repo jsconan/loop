@@ -1626,6 +1626,7 @@ def test_handle_tool_calls_delegates_session_updates(tmp_path):
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
     session_manager.model = None
+    session_manager.execution.side_effect = nullcontext
     loop = Loop.create_default(
         backend=backend,
         tool_registry=registry,

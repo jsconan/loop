@@ -17,6 +17,9 @@ class SessionStore(Protocol):
 
         Returns:
             str: The session's stable identifier.
+
+        Raises:
+            SessionRevisionConflictError: If the snapshot is based on a stale revision.
         """
 
     def load(self, session_id: str) -> Session:

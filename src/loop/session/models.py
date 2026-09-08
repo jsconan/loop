@@ -31,6 +31,48 @@ class SessionWorkspaceMismatchError(ValueError):
     """Report that a session belongs to a different workspace."""
 
 
+class SessionRevisionConflictError(ValueError):
+    """Report that a stale session snapshot cannot replace newer persisted state.
+
+    Args:
+        session_id (str): Identifier of the conflicting session.
+        expected_revision (int): Persisted revision on which the attempted save was based.
+        current_revision (int): Revision currently held by the store.
+    """
+
+    session_id: str
+    expected_revision: int
+    current_revision: int
+
+    def __init__(
+        self,
+        session_id: str,
+        expected_revision: int,
+        current_revision: int,
+    ) -> None:
+        self.session_id = session_id
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
+        super().__init__(
+            f"Session '{session_id}' changed from revision {expected_revision} "
+            f"to {current_revision}; reload it before saving again."
+        )
+
+
+class SessionExecutionConflictError(RuntimeError):
+    """Report that this process already owns execution of a logical session.
+
+    Args:
+        session_id (str): Identifier of the session whose execution is already owned.
+    """
+
+    session_id: str
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"Session '{session_id}' is already executing in this process.")
+
+
 class UnsupportedConversationItemError(ValueError):
     """Report an unsupported conversation item type in a serialized context."""
 
@@ -297,3 +339,4 @@ class StoredSession(TypedDict):
     updated_at: datetime
     message_count: int
     session: str
+    revision: int

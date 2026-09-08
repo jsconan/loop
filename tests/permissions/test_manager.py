@@ -2,6 +2,7 @@
 
 import sqlite3
 import tempfile
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -128,7 +129,7 @@ def test_permission_audit_uses_central_sqlite_storage(tmp_path):
     for tool_id in ("first", "second", "third", "fourth"):
         manager.authorize((file_operation(Action.FILESYSTEM_READ, tmp_path / f"{tool_id}.txt"),))
 
-    with sqlite3.connect(audit_path) as connection:
+    with closing(sqlite3.connect(audit_path)) as connection:
         rows = connection.execute(
             "SELECT workspace_id, event_name FROM permission_audit_records"
         ).fetchall()

@@ -14,6 +14,7 @@ from loop import (
     RunMetrics,
     Session,
     SessionNotFoundError,
+    SessionRevisionConflictError,
     SessionWorkspaceMismatchError,
     SQLiteSessionStore,
     ToolCall,
@@ -95,6 +96,78 @@ def test_store_round_trips_complete_typed_contexts_and_updates_metadata(tmp_path
     assert listings[0].updated_at.tzinfo == UTC
 
 
+def test_store_rejects_stale_snapshots_without_losing_newer_history(tmp_path):
+    """Independent loads share a base revision and stale history cannot overwrite a winner."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    original = Session(messages=[Message(role="user", content="start")])
+    store.save(original)
+    writer_a = store.load(original.id)
+    writer_b = store.load(original.id)
+
+    assert writer_a.revision == writer_b.revision == 1
+    writer_a.add_message(Message(role="assistant", content="winner"))
+    store.save(writer_a)
+
+    assert writer_a.revision == 2
+    writer_b.add_message(Message(role="assistant", content="stale"))
+    with pytest.raises(SessionRevisionConflictError) as conflict:
+        store.save(writer_b)
+
+    assert conflict.value.expected_revision == 1
+    assert conflict.value.current_revision == 2
+    preserved = store.load(original.id)
+    assert [message.content for message in preserved.messages] == ["start", "winner"]
+
+    rebased = store.load(original.id)
+    rebased.add_message(Message(role="assistant", content="rebased"))
+    store.save(rebased)
+    assert rebased.revision == 3
+    assert [message.content for message in store.load(original.id).messages] == [
+        "start",
+        "winner",
+        "rebased",
+    ]
+
+
+def test_store_advances_snapshot_and_revision_in_one_transaction(tmp_path):
+    """Each committed snapshot exposes exactly its matching advanced revision."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    session = Session(messages=[Message(role="user", content="one")])
+
+    store.save(session)
+    session.add_message(Message(role="assistant", content="two"))
+    store.save(session)
+
+    with closing(sqlite3.connect(store.path)) as connection:
+        row = connection.execute(
+            "SELECT revision, message_count, session FROM sessions WHERE id = ?", (session.id,)
+        ).fetchone()
+    assert row[:2] == (2, 2)
+    assert len(Session.deserialize(row[2]).messages) == 2
+
+
+def test_store_rejects_duplicate_new_and_deleted_loaded_snapshots(tmp_path):
+    """Revision conflicts distinguish duplicate identities and vanished persisted bases."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    session = Session()
+    store.save(session)
+
+    with pytest.raises(SessionRevisionConflictError) as duplicate:
+        store.save(Session(id=session.id))
+    assert duplicate.value.current_revision == 1
+
+    loaded = store.load(session.id)
+    with (
+        closing(sqlite3.connect(store.path)) as connection,
+        connection,
+        closing(connection.execute("DELETE FROM sessions WHERE id = ?", (session.id,))),
+    ):
+        pass
+    with pytest.raises(SessionRevisionConflictError) as deleted:
+        store.save(loaded)
+    assert deleted.value.current_revision == 0
+
+
 def test_store_preserves_session_ownership_after_the_workspace_moves(tmp_path):
     """A relocated workspace reopens sessions through durable identity rather than its path."""
     original = tmp_path / "original"
@@ -146,7 +219,17 @@ def test_store_migrates_and_names_existing_sessions(tmp_path):
     store = SQLiteSessionStore(path, workspace_id="workspace")
 
     assert store.list()[0].name == "Recover legacy sessions"
-    assert store.load("legacy").name == "Recover legacy sessions"
+    restored = store.load("legacy")
+    assert restored.name == "Recover legacy sessions"
+    assert restored.revision == 2
+    store.save(restored)
+    with closing(sqlite3.connect(path)) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)").fetchall()}
+        revision = connection.execute(
+            "SELECT revision FROM sessions WHERE id = 'legacy'"
+        ).fetchone()[0]
+    assert "revision" in columns
+    assert revision == 3
 
 
 def test_store_upgrades_path_owned_snapshots_once_on_load(tmp_path):
@@ -188,6 +271,45 @@ def test_store_upgrades_path_owned_snapshots_once_on_load(tmp_path):
     assert stored["version"] == 11
     assert stored["workspace_id"] == "workspace"
     assert "workspace_root" not in stored
+    assert restored.revision == 2
+
+
+def test_store_rejects_a_concurrent_write_during_workspace_upgrade(tmp_path, monkeypatch):
+    """Legacy adoption uses revision CAS and cannot overwrite a concurrent writer."""
+    path = tmp_path / "sessions.db"
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    session = Session()
+    store.save(session)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "UPDATE sessions SET session = ? WHERE id = ?",
+            (Session(id=session.id).serialize(), session.id),
+        )
+
+    connect = sqlite3.connect
+
+    class RacingConnection(sqlite3.Connection):
+        """Advance the durable revision immediately before legacy adoption CAS."""
+
+        def execute(self, sql, parameters=()):
+            """Inject one competing revision update at the migration boundary."""
+            if "UPDATE sessions SET session = ?, revision = revision + 1" in sql:
+                with closing(connect(path)) as competing, competing:
+                    competing.execute(
+                        "UPDATE sessions SET revision = revision + 1 WHERE id = ?", (session.id,)
+                    )
+            return super().execute(sql, parameters)
+
+    monkeypatch.setattr(
+        "loop.session.store.sqlite.sqlite3.connect",
+        lambda database: connect(database, factory=RacingConnection),
+    )
+
+    with pytest.raises(SessionRevisionConflictError) as conflict:
+        store.load(session.id)
+
+    assert conflict.value.expected_revision == 1
+    assert conflict.value.current_revision == 2
 
 
 def test_store_upgrades_version_four_compactions_on_load(tmp_path):

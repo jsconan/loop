@@ -4,7 +4,13 @@ from datetime import UTC
 
 import pytest
 
-from loop import MemorySessionStore, Message, Session, SessionNotFoundError
+from loop import (
+    MemorySessionStore,
+    Message,
+    Session,
+    SessionNotFoundError,
+    SessionRevisionConflictError,
+)
 
 
 def test_store_starts_empty_and_reports_missing_sessions():
@@ -35,6 +41,24 @@ def test_store_round_trips_snapshots_and_updates_metadata():
     assert listings[0].id == session_id
     assert listings[0].message_count == 2
     assert listings[0].updated_at.tzinfo == UTC
+
+
+def test_store_rejects_stale_in_memory_snapshots():
+    """The adapter contract rejects divergent snapshots consistently in memory."""
+    store = MemorySessionStore()
+    session = Session()
+    store.save(session)
+    first = store.load(session.id)
+    stale = store.load(session.id)
+
+    first.add_message(Message(role="user", content="winner"))
+    store.save(first)
+
+    with pytest.raises(SessionRevisionConflictError):
+        store.save(stale)
+
+    with pytest.raises(SessionRevisionConflictError):
+        store.save(Session(id="missing", revision=1))
 
 
 def test_store_lists_recent_sessions_first_and_keeps_instances_isolated():
