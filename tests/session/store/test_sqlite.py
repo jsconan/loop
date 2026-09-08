@@ -57,6 +57,16 @@ def test_store_stays_absent_until_save_and_reports_missing_sessions(tmp_path):
     assert not (tmp_path / ".loop").exists()
 
 
+def test_legacy_import_refuses_to_replace_an_existing_session_database(tmp_path):
+    """A completed legacy import is idempotent at the session-store boundary."""
+    source = tmp_path / "legacy.db"
+    destination = tmp_path / "sessions.db"
+    sqlite3.connect(source).close()
+    destination.touch()
+
+    assert not SQLiteSessionStore(destination, workspace_id="workspace").import_legacy(source)
+
+
 def test_store_round_trips_complete_typed_contexts_and_updates_metadata(tmp_path):
     """SQLite snapshots preserve every item type, tokens, model, and stable identity."""
     store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")

@@ -90,10 +90,11 @@ class ConfigurationManager:
         Returns:
             Path: The existing or newly created configuration path.
         """
-        if self.path.exists():
-            return self.path
-        self._document = self._default_document()
-        self.save()
+        with self._lock_for("user"):
+            if self.path.exists():
+                return self.path
+            self._document = self._default_document()
+            self._save_document(self.path, self._document)
         return self.path
 
     def load(self, environment: Mapping[str, str] | None = None) -> ApplicationSettings:
@@ -325,7 +326,7 @@ class ConfigurationManager:
                             del table[field]
                     else:
                         table[field] = value
-            self.save()
+            self._save_document(self.path, self._document)
         return self._resolve()
 
     def unset(
@@ -404,7 +405,8 @@ class ConfigurationManager:
         Returns:
             Path: Persisted configuration path.
         """
-        return self._save_document(self.path, self._document)
+        with self._lock_for("user"):
+            return self._save_document(self.path, self._document)
 
     @staticmethod
     def _save_document(path: Path, document: tomlkit.TOMLDocument) -> Path:
@@ -412,8 +414,13 @@ class ConfigurationManager:
         path.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
         path.parent.chmod(constants.PRIVATE_DIRECTORY_MODE)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-        temporary.write_text(tomlkit.dumps(document), encoding="utf-8")
-        temporary.chmod(constants.PRIVATE_FILE_MODE)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            constants.PRIVATE_FILE_MODE,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(tomlkit.dumps(document))
         temporary.replace(path)
         path.chmod(constants.PRIVATE_FILE_MODE)
         return path
@@ -441,7 +448,7 @@ class ConfigurationManager:
     def _save_scope(self, scope: Literal["user", "workspace"]) -> Path:
         """Persist one durable configuration scope."""
         if scope == "user":
-            return self.save()
+            return self._save_document(self.path, self._document)
         if self._workspace_path is None:
             raise RuntimeError("Workspace path is not configured.")
         if not self._workspace_document:
