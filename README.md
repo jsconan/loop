@@ -630,8 +630,16 @@ The default registry exposes these functions to the model:
 | `get_current_datetime` | Returns the current local date and time                                  |
 | `fetch_content`        | Streams authorized HTTP(S) text into a bounded resumable cache           |
 | `read_cached_content`  | Reads cached text by line or opaque cursor, optionally re-fetching a URL |
-| `run_command`          | Runs an authorized argument vector with a 30-second timeout              |
+| `run_command`          | Runs an authorized argument vector within a 30-second lifecycle deadline |
 | `manage_skills`        | Manages skill activation and progressively loads bounded skill resources |
+
+`run_command` applies one monotonic deadline to process execution, output draining, reader
+completion, termination, and direct-child reaping. Output is decoded as UTF-8 with invalid byte
+sequences replaced. On POSIX, each command starts an isolated session and timeout cleanup kills
+that owned process group, including descendants that retain output pipes. On Windows, the command
+starts a new process group, but Python's portable process API can forcibly terminate only the
+direct child; descendant cleanup is therefore best-effort and waiting for readers remains bounded
+by the deadline.
 
 Text reads report exact source and included byte sizes, returned ranges, truncation reasons, and
 continuation positions. File reads also report line ranges while retaining the byte ceiling. As a

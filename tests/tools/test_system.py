@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
+import sys
+import time
 from typing import ClassVar
 from unittest.mock import MagicMock, call
 
@@ -39,11 +42,11 @@ def fresh_tool_registry():
     )
 
 
-def run_command(command):
+def run_command(command, cwd="."):
     """Dispatch the context-aware command tool."""
     output = tool_registry.call(
         "run_command",
-        json.dumps({"command": command}),
+        json.dumps({"command": command, "cwd": cwd}),
         interaction=ConsoleInteraction(),
     )
     payload = json.loads(output)
@@ -71,17 +74,40 @@ class ImmediateThread:
         """Execute the target as soon as the thread is started."""
         self.target(*self.args)
 
-    def join(self):
+    def join(self, timeout=None):
         """Record that command cleanup joined the reader."""
         self.joined = True
 
+    def is_alive(self):
+        """Report synchronous completion after start returns."""
+        return False
+
 
 @pytest.fixture
-def confirmed(monkeypatch):
+def authorized(monkeypatch):
+    """Confirm command execution while retaining real process and thread behavior."""
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
+
+
+@pytest.fixture
+def confirmed(monkeypatch, authorized):
     """Confirm command execution and make stream readers synchronous."""
     ImmediateThread.instances = []
-    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
     monkeypatch.setattr("loop.tools.system.threading.Thread", ImmediateThread)
+
+
+def python_command(script, *arguments):
+    """Build a restricted command line for the current Python interpreter."""
+    return " ".join(shlex.quote(value) for value in (sys.executable, "-c", script, *arguments))
+
+
+def process_exists(pid):
+    """Report whether an operating-system process still has the given identifier."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def make_process(*, stdout=("",), stderr=("",), returncode=0):
@@ -127,7 +153,10 @@ def test_run_command_returns_stripped_stdout_and_passes_safe_process_options(
     assert kwargs["stdout"] is subprocess.PIPE
     assert kwargs["stderr"] is subprocess.PIPE
     assert kwargs["text"] is True
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
     assert kwargs["start_new_session"] is (os.name == "posix")
+    assert kwargs["creationflags"] == 0
     assert all(reader.joined for reader in ImmediateThread.instances)
 
 
@@ -201,6 +230,15 @@ def test_successful_run_command_invalidates_instruction_scope(monkeypatch, tmp_p
     manager.invalidate.assert_called_once_with(None)
 
 
+def test_run_command_completes_a_normal_process_within_its_lifecycle_timeout(
+    monkeypatch, authorized
+):
+    """A short real command completes normally under the shared lifecycle deadline."""
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.5)
+
+    assert run_command(python_command("print('complete')")) == "complete"
+
+
 def test_run_command_reports_exit_code_stdout_and_stderr(monkeypatch, confirmed):
     """A failed command exposes its exit code and both captured streams."""
     process = make_process(
@@ -236,28 +274,196 @@ def test_run_command_caps_each_output_stream_while_draining_it(monkeypatch, conf
     assert process.stderr.read.call_count == 3
 
 
+def test_run_command_drains_large_stdout_and_stderr_without_deadlocking(monkeypatch, authorized):
+    """Concurrent readers drain both full pipes while retaining their independent caps."""
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 3)
+    script = (
+        "import os,sys;"
+        f"os.write(1,b'x'*{MAX_OUTPUT_CHARS + 8192});"
+        f"os.write(2,b'y'*{MAX_OUTPUT_CHARS + 8192});"
+        "sys.exit(7)"
+    )
+
+    failure = problem(run_command(python_command(script)))
+
+    assert failure["code"] == "process.nonzero_exit"
+    assert failure["metadata"] == {
+        "exit_code": 7,
+        "stdout": "x" * MAX_OUTPUT_CHARS,
+        "stderr": "y" * MAX_OUTPUT_CHARS,
+    }
+
+
+def test_run_command_replaces_undecodable_output(monkeypatch, authorized):
+    """Invalid UTF-8 output is represented with replacement characters instead of failing."""
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.5)
+
+    assert run_command(python_command("import os; os.write(1, b'ok\\xff')")) == "ok�"
+
+
+def test_run_command_surfaces_reader_failures(monkeypatch, confirmed):
+    """A pipe read failure interrupts a live command and becomes an execution problem."""
+    process = make_process(stdout=(OSError("pipe read failed"),))
+    process.poll.return_value = None
+    monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
+    monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock())
+
+    failure = problem(run_command("broken-reader"))
+
+    assert failure["code"] == "process.execution_failed"
+    assert failure["detail"] == "pipe read failed"
+    assert process.wait.call_count == 1
+
+
+def test_run_command_surfaces_reader_failures_observed_after_process_exit(monkeypatch, confirmed):
+    """A reader failure racing with process exit still becomes an execution problem."""
+    process = make_process(stdout=(OSError("late pipe read failed"),))
+
+    class JoinThread(ImmediateThread):
+        """Defer each reader target until its join operation."""
+
+        def start(self):
+            """Leave the reader pending until join."""
+
+        def join(self, timeout=None):
+            """Execute the reader target while modeling reader completion."""
+            if not self.joined:
+                self.target(*self.args)
+                self.joined = True
+
+    JoinThread.instances = []
+    monkeypatch.setattr("loop.tools.system.threading.Thread", JoinThread)
+    monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
+    monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock())
+
+    failure = problem(run_command("late-broken-reader"))
+
+    assert failure["code"] == "process.execution_failed"
+    assert failure["detail"] == "late pipe read failed"
+
+
 def test_run_command_kills_a_posix_process_group_after_timeout(monkeypatch, confirmed):
     """Timeout kills the entire POSIX process group before reporting it."""
     process = make_process()
     process.pid = 123
-    process.wait.side_effect = [subprocess.TimeoutExpired("sleep", 30), 0]
+    process.wait.side_effect = subprocess.TimeoutExpired("sleep", 30)
     process.poll.return_value = 0
     killpg = MagicMock()
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", killpg)
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
 
     assert problem(run_command("sleep 60"))["code"] == "process.timeout"
-    assert process.wait.call_args_list == [call(timeout=30), call()]
+    assert len(process.wait.call_args_list) >= 2
+    assert all(call_.kwargs["timeout"] >= 0 for call_ in process.wait.call_args_list)
     killpg.assert_called_once_with(123, 9)
+
+
+def test_run_command_bounds_reaping_after_timeout(monkeypatch, confirmed):
+    """A child that is not promptly reaped cannot extend timeout cleanup indefinitely."""
+    process = make_process()
+    process.wait.side_effect = subprocess.TimeoutExpired("sleep", 30)
+    monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
+    monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock())
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
+
+    assert problem(run_command("sleep 60"))["code"] == "process.timeout"
+    assert process.wait.call_count >= 2
+
+
+def test_run_command_interrupts_pipe_descriptors_held_by_stuck_readers(monkeypatch, confirmed):
+    """Cleanup interrupts stuck pipe reads without contending on text-stream locks."""
+    process = make_process()
+    process.wait.side_effect = subprocess.TimeoutExpired("sleep", 30)
+    process.stdout.fileno.return_value = 10
+    process.stderr.fileno.side_effect = OSError("already closed")
+    close_descriptor = MagicMock()
+
+    class StuckThread(ImmediateThread):
+        """Model a reader that remains blocked after bounded joins."""
+
+        def start(self):
+            """Leave the modeled reader pending."""
+
+        def is_alive(self):
+            """Report that the modeled reader remains blocked."""
+            return True
+
+    StuckThread.instances = []
+    monkeypatch.setattr("loop.tools.system.threading.Thread", StuckThread)
+    monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
+    monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock())
+    monkeypatch.setattr("loop.tools.system.os.close", close_descriptor)
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
+
+    assert problem(run_command("sleep 60"))["code"] == "process.timeout"
+    assert call(10) in close_descriptor.call_args_list
+    process.stdout.close.assert_not_called()
+    process.stderr.close.assert_not_called()
+
+
+def test_run_command_times_out_a_long_running_direct_child(monkeypatch, authorized):
+    """The lifecycle deadline terminates a direct child that does not exit in time."""
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.2)
+    started = time.monotonic()
+
+    failure = problem(run_command(python_command("import time; time.sleep(30)")))
+
+    assert failure["code"] == "process.timeout"
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group behavior")
+def test_run_command_times_out_and_cleans_a_descendant_holding_output_pipes(
+    monkeypatch, tmp_path, authorized
+):
+    """An exited leader cannot let a pipe-owning descendant outlive the lifecycle deadline."""
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.3)
+    pid_path = tmp_path / "descendant.pid"
+    script = (
+        "import pathlib,subprocess,sys;"
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='utf-8')"
+    )
+    started = time.monotonic()
+
+    failure = problem(run_command(python_command(script, str(pid_path)), cwd=str(tmp_path)))
+
+    assert failure["code"] == "process.timeout"
+    assert time.monotonic() - started < 0.6
+    descendant_pid = int(pid_path.read_text(encoding="utf-8"))
+    for _ in range(50):
+        if not process_exists(descendant_pid):
+            break
+        time.sleep(0.01)
+    assert not process_exists(descendant_pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group behavior")
+def test_run_command_cleanup_does_not_terminate_an_unrelated_process(monkeypatch, authorized):
+    """Timeout cleanup remains scoped to the isolated command process group."""
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.2)
+    unrelated = subprocess.Popen(  # pylint: disable=consider-using-with
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        assert problem(run_command(python_command("import time; time.sleep(30)")))["code"] == (
+            "process.timeout"
+        )
+        assert unrelated.poll() is None
+    finally:
+        unrelated.kill()
+        unrelated.wait(timeout=1)
 
 
 def test_run_command_ignores_a_process_that_disappears_during_posix_cleanup(monkeypatch, confirmed):
     """A process-group lookup race does not replace the timeout result."""
     process = make_process()
-    process.wait.side_effect = [subprocess.TimeoutExpired("sleep", 30), 0]
+    process.wait.side_effect = subprocess.TimeoutExpired("sleep", 30)
     process.poll.return_value = 0
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock(side_effect=ProcessLookupError))
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
 
     assert problem(run_command("sleep 60"))["code"] == "process.timeout"
 
@@ -265,10 +471,11 @@ def test_run_command_ignores_a_process_that_disappears_during_posix_cleanup(monk
 def test_run_command_kills_only_the_process_on_non_posix_systems(monkeypatch, confirmed):
     """Non-POSIX timeout handling uses the portable process kill method."""
     process = make_process()
-    process.wait.side_effect = [subprocess.TimeoutExpired("sleep", 30), 0]
+    process.wait.side_effect = subprocess.TimeoutExpired("sleep", 30)
     process.poll.return_value = 0
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.name", "nt")
+    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
 
     assert problem(run_command("sleep 60"))["code"] == "process.timeout"
     process.kill.assert_called_once_with()
@@ -312,6 +519,22 @@ def test_run_command_cleans_up_readers_that_started_before_start_failure(monkeyp
     assert problem(run_command("broken"))["detail"] == "thread failed"
     assert FailingSecondThread.instances[0].joined
     assert not FailingSecondThread.instances[1].joined
+
+
+def test_run_command_rejects_missing_process_pipe_handles(monkeypatch, confirmed):
+    """Missing pipe handles fail explicitly and still clean up the created process."""
+    process = make_process()
+    process.stdout = None
+    killpg = MagicMock()
+    monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
+    monkeypatch.setattr("loop.utils.process.os.killpg", killpg)
+
+    failure = problem(run_command("broken-pipes"))
+
+    assert failure["code"] == "process.execution_failed"
+    assert failure["detail"] == "Command process did not expose its output streams."
+    process.stderr.close.assert_called_once_with()
+    killpg.assert_called_once()
 
 
 def test_run_command_reports_process_creation_errors(monkeypatch, confirmed):

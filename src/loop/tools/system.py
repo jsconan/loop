@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import threading
+import time
 from typing import Annotated
 
 from pydantic import Field
@@ -15,6 +16,103 @@ from ..tooling import ToolContext, tool
 from ..utils import kill_process_group, parse_command_line, read_bounded_stream
 
 _LOGGER = logging.getLogger(__name__)
+_CLEANUP_RESERVE_SECONDS = 0.1
+_PROCESS_POLL_SECONDS = 0.01
+
+
+def _remaining(deadline: float) -> float:
+    """Return the non-negative time remaining before a monotonic deadline."""
+    return max(0.0, deadline - time.monotonic())
+
+
+def _read_stream(
+    stream,
+    chunks: list[str],
+    errors: list[Exception | None],
+    index: int,
+    changed: threading.Event,
+) -> None:
+    """Capture a bounded stream and retain a reader failure for the calling thread."""
+    try:
+        read_bounded_stream(stream, chunks, constants.MAX_OUTPUT_CHARS)
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
+        errors[index] = exc
+    finally:
+        changed.set()
+
+
+def _join_readers(readers: list[threading.Thread], deadline: float) -> bool:
+    """Join readers against one deadline and report whether every reader completed."""
+    for reader in readers:
+        reader.join(_remaining(deadline))
+    return all(not reader.is_alive() for reader in readers)
+
+
+def _close_process_streams(process: subprocess.Popen[str]) -> None:
+    """Close parent-owned process pipe endpoints."""
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+
+
+def _interrupt_process_streams(process: subprocess.Popen[str]) -> None:
+    """Close pipe descriptors without waiting for locks held by blocked text readers."""
+    for stream in (process.stdout, process.stderr):
+        try:
+            os.close(stream.fileno())  # type: ignore[union-attr]
+        except (OSError, TypeError, ValueError):
+            pass
+
+
+def _wait_for_process(
+    process: subprocess.Popen[str],
+    changed: threading.Event,
+    errors: list[Exception | None],
+    deadline: float,
+) -> int:
+    """Wait for process exit while surfacing reader failures before the deadline."""
+    while True:
+        if reader_error := next((error for error in errors if error is not None), None):
+            raise reader_error
+        try:
+            return process.wait(timeout=min(_PROCESS_POLL_SECONDS, _remaining(deadline)))
+        except subprocess.TimeoutExpired:
+            if _remaining(deadline) == 0:
+                raise
+            changed.clear()
+            changed.wait(min(_PROCESS_POLL_SECONDS, _remaining(deadline)))
+
+
+def _cleanup_process(
+    process: subprocess.Popen[str],
+    readers: list[threading.Thread],
+    deadline: float,
+) -> None:
+    """Kill owned processes, reap the child, and finish readers within the deadline."""
+    kill_process_group(process)
+    remaining = _remaining(deadline)
+    reap_deadline = time.monotonic() + remaining / 3
+    try:
+        process.wait(timeout=_remaining(reap_deadline))
+    except subprocess.TimeoutExpired:
+        pass
+    reader_deadline = time.monotonic() + _remaining(deadline) / 2
+    if _join_readers(readers, reader_deadline):
+        _close_process_streams(process)
+        return
+    _interrupt_process_streams(process)
+    _join_readers(readers, deadline)
+
+
+def _timeout_error(timeout: int = constants.COMMAND_TIMEOUT_SECONDS) -> Problem:
+    """Return a standardized timeout error problem."""
+    return Problem(
+        code="process.timeout",
+        title="Command timed out",
+        detail=(f"Command did not complete within {timeout} seconds."),
+        retryable=True,
+        operation="run_command",
+    )
 
 
 def _command_plan(arguments: dict[str, object]) -> OperationPlan:
@@ -56,12 +154,17 @@ def run_command(
     ] = ".",
 ) -> str | Problem:
     """Run a shell-free process and return its output."""
+    process = None
+    started_readers = []
+    deadline = time.monotonic() + constants.COMMAND_TIMEOUT_SECONDS
+    cleanup_reserve = min(_CLEANUP_RESERVE_SECONDS, constants.COMMAND_TIMEOUT_SECONDS / 2)
+    execution_deadline = deadline - cleanup_reserve
     try:
         operation = context.operations[0] if context.operations else None
         target = operation.target if operation is not None else None
         if not isinstance(target, ProcessTarget):
             raise TypeError("Authorized process target is missing.")
-        with subprocess.Popen(
+        process = subprocess.Popen(  # pylint: disable=consider-using-with
             list(target.argv),
             shell=False,
             cwd=target.cwd,
@@ -73,63 +176,67 @@ def run_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             start_new_session=os.name == "posix",
-        ) as process:
-            stdout_chunks = []
-            stderr_chunks = []
-            readers = [
-                threading.Thread(
-                    target=read_bounded_stream,
-                    args=(process.stdout, stdout_chunks, constants.MAX_OUTPUT_CHARS),
-                    daemon=True,
-                ),
-                threading.Thread(
-                    target=read_bounded_stream,
-                    args=(process.stderr, stderr_chunks, constants.MAX_OUTPUT_CHARS),
-                    daemon=True,
-                ),
-            ]
-            started_readers = []
-            try:
-                for reader in readers:
-                    reader.start()
-                    started_readers.append(reader)
+            creationflags=(
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+            ),
+        )
+        if process.stdout is None or process.stderr is None:
+            raise RuntimeError("Command process did not expose its output streams.")
+        stdout_chunks = []
+        stderr_chunks = []
+        reader_errors: list[Exception | None] = [None, None]
+        reader_changed = threading.Event()
+        readers = [
+            threading.Thread(
+                target=_read_stream,
+                args=(process.stdout, stdout_chunks, reader_errors, 0, reader_changed),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_read_stream,
+                args=(process.stderr, stderr_chunks, reader_errors, 1, reader_changed),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+            started_readers.append(reader)
 
-                try:
-                    returncode = process.wait(timeout=constants.COMMAND_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired:
-                    kill_process_group(process)
-                    process.wait()
-                    return Problem(
-                        code="process.timeout",
-                        title="Command timed out",
-                        detail=(f"Command exceeded {constants.COMMAND_TIMEOUT_SECONDS} seconds."),
-                        retryable=True,
-                        operation="run_command",
-                    )
-            finally:
-                if process.poll() is None:
-                    kill_process_group(process)
-                    process.wait()
-                for reader in started_readers:
-                    reader.join()
+        try:
+            returncode = _wait_for_process(
+                process, reader_changed, reader_errors, execution_deadline
+            )
+        except subprocess.TimeoutExpired:
+            _cleanup_process(process, started_readers, deadline)
+            return _timeout_error(constants.COMMAND_TIMEOUT_SECONDS)
+        if not _join_readers(started_readers, execution_deadline):
+            _cleanup_process(process, started_readers, deadline)
+            return _timeout_error(constants.COMMAND_TIMEOUT_SECONDS)
+        if reader_error := next((error for error in reader_errors if error is not None), None):
+            raise reader_error
 
-            output = "".join(stdout_chunks).strip()
-            error_msg = "".join(stderr_chunks).strip()
-            if returncode != 0:
-                return Problem(
-                    code="process.nonzero_exit",
-                    title="Command failed",
-                    detail=f"Command exited with code {returncode}.",
-                    operation="run_command",
-                    metadata={"exit_code": returncode, "stdout": output, "stderr": error_msg},
-                )
-            # Commands may create, remove, or edit instruction files. Their exact effects are
-            # intentionally not inferred from arbitrary command text; a successful command
-            # therefore triggers a bounded signature refresh on the next request.
-            context.invalidate_instructions()
-            return output
+        _close_process_streams(process)
+        output = "".join(stdout_chunks).strip()
+        error_msg = "".join(stderr_chunks).strip()
+        if returncode != 0:
+            return Problem(
+                code="process.nonzero_exit",
+                title="Command failed",
+                detail=f"Command exited with code {returncode}.",
+                operation="run_command",
+                metadata={"exit_code": returncode, "stdout": output, "stderr": error_msg},
+            )
+        # Commands may create, remove, or edit instruction files. Their exact effects are
+        # intentionally not inferred from arbitrary command text; a successful command
+        # therefore triggers a bounded signature refresh on the next request.
+        context.invalidate_instructions()
+        return output
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
+        if process is not None:
+            _cleanup_process(process, started_readers, deadline)
         problem = Problem.from_exception(
             exc,
             code="process.execution_failed",

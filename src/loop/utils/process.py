@@ -98,7 +98,11 @@ def read_bounded_stream(stream: TextStream, chunks: list[str], maximum: int) -> 
 
 
 def kill_process_group(process: subprocess.Popen[str]) -> None:
-    """Terminate a process and, on POSIX, its process group.
+    """Terminate a process and, on POSIX, its isolated process group.
+
+    POSIX callers must create the process with ``start_new_session=True`` so the stored PID is
+    also the owned process-group ID. Python's portable Windows process API cannot forcibly
+    terminate a complete descendant tree, so that platform falls back to the direct process.
 
     Args:
         process (subprocess.Popen[str]): Running process to terminate.
