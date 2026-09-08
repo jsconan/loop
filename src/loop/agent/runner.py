@@ -332,24 +332,25 @@ class AgentRunner:
         tools: list[ToolExecutionMetrics] | None = None,
     ) -> AgentRunResult:
         """Run model turns from a fresh or recovered durable boundary."""
-        turn = 0
+        total_turns = 0
+        turns_since_confirmation = 0
         response = None
         calls = []
         tools = list(tools or ())
         started_at = utc_now()
         while True:
-            turn += 1
-
             response = self._query_with_recovery()
             if response is None:
                 return self._record_run_result(
                     final_response=None,
-                    turns=turn - 1,
+                    turns=total_turns,
                     stop_reason="cancelled",
                     started_at=started_at,
                     calls=calls,
                     tools=tools,
                 )
+            total_turns += 1
+            turns_since_confirmation += 1
             calls.append(
                 ModelCallMetrics(
                     model=response.model,
@@ -364,7 +365,7 @@ class AgentRunner:
             if not executions:
                 return self._record_run_result(
                     final_response=response,
-                    turns=turn,
+                    turns=total_turns,
                     stop_reason="completed",
                     started_at=started_at,
                     calls=calls,
@@ -372,21 +373,21 @@ class AgentRunner:
                 )
             tools.extend(executions)
 
-            if 0 < self._max_turns <= turn:
+            if 0 < self._max_turns <= turns_since_confirmation:
                 prompt = (
                     f"Agent has reached the {self._max_turns}-turn safety limit. "
                     "Do you want to continue?"
                 )
                 if self._interaction.confirm(prompt, default=False) is not True:
                     break
-                turn = 0  # reset counter to allow another round
+                turns_since_confirmation = 0
 
         self._interaction.warning(
             f"Agent stopped after reaching the {self._max_turns}-turn safety limit."
         )
         return self._record_run_result(
             final_response=response,
-            turns=self._max_turns,
+            turns=total_turns,
             stop_reason="max_turns",
             started_at=started_at,
             calls=calls,

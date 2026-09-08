@@ -7,6 +7,7 @@ from unittest.mock import ANY, MagicMock, Mock
 import pytest
 
 from loop import (
+    BackendConnectionError,
     InstructionsManager,
     Interaction,
     PendingToolCall,
@@ -161,6 +162,8 @@ def test_runner_recovers_a_model_boundary_without_adding_user_input():
     recovery = runner.recover_session()
 
     assert recovery.result.final_response is response
+    assert recovery.result.turns == 1
+    assert len(recovery.result.metrics.model_calls) == recovery.result.turns
     assert recovery.pending is False
     sessions.add_response.assert_called_once_with(response)
 
@@ -289,6 +292,21 @@ def test_runner_cancels_when_response_recovery_is_exhausted():
     sessions.record_run.assert_called_once()
 
 
+def test_runner_counts_a_retried_model_request_as_one_completed_turn():
+    """Recoverable request retries do not count as separate completed agent turns."""
+    error = BackendConnectionError("offline", provider="test", operation="respond")
+    final = Response(answer="done", reasoning="")
+    runner, _, interaction = agent_runner(responses=[error, final])
+    interaction.confirm.return_value = True
+
+    result = runner.run()
+
+    assert result.turns == 1
+    assert len(result.metrics.model_calls) == 1
+    assert runner.query.call_count == 2
+    interaction.confirm.assert_called_once_with("Retry the complete response?", default=False)
+
+
 def test_runner_stops_repeated_tool_calls_at_the_safety_limit():
     """Repeated tool requests persist their last result and stop before another model call."""
     call = ToolCall(call_id="call", name="echo", arguments="{}")
@@ -347,7 +365,7 @@ def test_runner_rejects_a_negative_turn_limit():
 
 
 def test_runner_continues_after_max_turns_when_user_affirms():
-    """When the safety limit is reached and the user confirms, another round starts."""
+    """One approved safety window preserves the run's total completed-turn count."""
     call = ToolCall(call_id="call", name="echo", arguments="{}")
     response_with_tools = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
     response_without_tools = Response(answer="finished", reasoning="")
@@ -380,6 +398,63 @@ def test_runner_continues_after_max_turns_when_user_affirms():
     runner.handle_tool_calls = Mock(side_effect=[(execution,), ()])
     result = runner.run()
     assert result.final_response is response_without_tools
-    assert result.turns == 1
+    assert result.turns == 2
     assert result.stop_reason == "completed"
     assert interaction.confirm.call_count == 1
+    assert len(result.metrics.model_calls) == result.turns
+
+
+def test_runner_counts_turns_across_multiple_safety_confirmations():
+    """Repeated approvals reset only the safety interval, not total run accounting."""
+    call = ToolCall(call_id="call", name="echo", arguments="{}")
+    response_with_tools = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    final = Response(answer="finished", reasoning="")
+    runner, sessions, interaction = agent_runner(
+        responses=[response_with_tools, response_with_tools, response_with_tools, final],
+        max_turns=1,
+    )
+    interaction.confirm.return_value = True
+    execution = ToolExecutionMetrics(name="echo", duration_seconds=0.1, succeeded=True)
+    runner.handle_tool_calls = Mock(side_effect=[(execution,), (execution,), (execution,), ()])
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+
+    try:
+        result = runner.run()
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    assert result.turns == 4
+    assert len(result.metrics.model_calls) == 4
+    assert sessions.add_response.call_count == 4
+    assert interaction.confirm.call_count == 3
+    assert all(
+        call.args == ("Agent has reached the 1-turn safety limit. Do you want to continue?",)
+        for call in interaction.confirm.call_args_list
+    )
+    completed = next(
+        record for record in adapter.records if record.event_name == "agent.run.completed"
+    )
+    assert completed.attributes["turns"] == result.turns
+
+
+def test_runner_declines_after_a_confirmed_safety_window():
+    """Declining a later safety prompt reports turns from every completed window."""
+    call = ToolCall(call_id="call", name="echo", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    runner, sessions, interaction = agent_runner(
+        responses=[response, response, response, response], max_turns=2
+    )
+    interaction.confirm.side_effect = [True, False]
+    execution = ToolExecutionMetrics(name="echo", duration_seconds=0.1, succeeded=True)
+    runner.handle_tool_calls = Mock(return_value=(execution,))
+
+    result = runner.run()
+
+    assert result.turns == 4
+    assert result.stop_reason == "max_turns"
+    assert len(result.metrics.model_calls) == 4
+    assert sessions.add_response.call_count == 4
+    assert interaction.confirm.call_count == 2
