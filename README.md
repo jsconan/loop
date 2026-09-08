@@ -378,13 +378,17 @@ only after one unique stale-location match. User-authored names never refresh au
 directory names refresh only after a confirmed move, while provider and remote names refresh only
 from the same source.
 
-Use `/workspace attach <path>` to register a location, `/workspace forget <id-or-path>` to
-deactivate only its mapping, `/workspace rekey <path>` to give a copy a fresh UUID, and
+Use `/workspace attach <path> [workspace-id]` to register a location or explicitly associate it
+with an existing identity, `/workspace forget <id-or-path>` to deactivate only its mapping,
+`/workspace rekey <path>` to give a copy a fresh UUID, and
 `/workspace switch <id-or-path>` to close the current runtime and rebuild every workspace-scoped
-service. Forget and rekey require confirmation, and none of these commands deletes legacy files or
-UUID-scoped data. Legacy telemetry, operational logs, and permission-audit JSONL are imported into
-their global stores transactionally; verified source digests make migration resumable and
-idempotent while originals remain in place.
+service. A failed rebuild restores the previous workspace, and overlapping switch requests are
+rejected. Forget and rekey require confirmation; rekey copies retained UUID-scoped data and rewrites
+session ownership without deleting the source identity. Legacy files are never deleted. Legacy
+telemetry, operational logs, and permission-audit JSONL are imported into their global stores.
+After every import succeeds, Loop writes one private migration marker in the legacy `.loop`
+directory. Interrupted imports safely retry because the destination importers are idempotent, and
+the original files remain in place.
 
 The generated file contains all settings and their built-in values. Nullable settings such as
 `context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort` appear as
