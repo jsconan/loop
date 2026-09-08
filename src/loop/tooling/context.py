@@ -23,7 +23,7 @@ class ToolContext:
     """Provide runtime services and metadata to a context-aware tool.
 
     Args:
-        interaction (Interaction): Service used to communicate with the user.
+        interaction (Interaction | None): Optional service used to communicate with the user.
         tool_name (str): Public name of the tool being invoked.
         instructions_manager (InstructionsManager | None): Manager for instructions active in the
             current conversation, or ``None`` when instruction management is unavailable.
@@ -37,7 +37,7 @@ class ToolContext:
         settings (ToolRuntimeSettings): Scoped settings available to tool implementations.
     """
 
-    interaction: Interaction
+    interaction: Interaction | None
     tool_name: str
     instructions_manager: InstructionsManager | None = None
     operations: Operations = ()
@@ -83,6 +83,16 @@ class ToolContext:
         Returns:
             bool: Whether the user approved the action.
         """
+        if self.interaction is None:
+            raise ProblemException(
+                Problem(
+                    code="tool.interaction_unavailable",
+                    title="Interaction unavailable",
+                    detail=f"Tool '{self.tool_name}' requires user interaction.",
+                    severity="warning",
+                    operation=self.tool_name,
+                )
+            )
         return self.interaction.confirm(message, default=default)
 
     def authorize_additional(self, arguments: dict[str, object]) -> OperationPlan:

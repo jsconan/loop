@@ -672,8 +672,6 @@ class ToolRegistry:
         """Build a tool context from the invocation override or registry default."""
         if interaction is None:
             interaction = self._interaction
-        if interaction is None:
-            return None
 
         def authorize_additional(arguments: dict[str, object]) -> OperationPlan:
             """Plan and authorize one runtime-discovered operation set."""

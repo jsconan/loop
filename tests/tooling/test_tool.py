@@ -13,6 +13,8 @@ from loop import (
     Action,
     Operation,
     OperationPlan,
+    Problem,
+    ProblemException,
     SessionTarget,
     ToolRegistrationError,
     ToolRegistry,
@@ -283,3 +285,15 @@ def test_call_async_handles_execution_failures(monkeypatch):
 
     failure = json.loads(asyncio.run(tool.call_async({"number": 3})))
     assert failure["problem"]["code"] == "tool.execution_failed"
+
+
+def test_call_async_preserves_structured_tool_problems(monkeypatch):
+    """Asynchronous dispatch preserves deliberate structured tool failures."""
+    problem = Problem(code="tool.unavailable", title="Unavailable", detail="Try later.")
+    function = Mock(side_effect=ProblemException(problem))
+    monkeypatch.setattr(tool_module, "takes_tool_context", Mock(return_value=False))
+
+    failure = json.loads(asyncio.run(make_tool(function).call_async({"number": 3})))
+
+    assert failure["problem"]["code"] == "tool.unavailable"
+    assert failure["problem"]["detail"] == "Try later."

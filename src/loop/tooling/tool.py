@@ -11,7 +11,7 @@ from typing import Any, overload
 from pydantic import BaseModel, ValidationError
 
 from ..constants import OMIT, Omit
-from ..errors import Problem, log_problem
+from ..errors import Problem, ProblemException, log_problem
 from ..models import (
     RAW_TOOL_RESULT_PRESENTATION,
     ToolDefinition,
@@ -183,6 +183,8 @@ class Tool:
             return ToolExecutionResult(
                 serialize_tool_result(result), self._presentation_for(arguments, result)
             )
+        except ProblemException as exc:
+            return ToolExecutionResult(serialize_tool_problem(exc.problem))
         except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
             problem = Problem.from_exception(
                 exc,
@@ -229,6 +231,8 @@ class Tool:
             return ToolExecutionResult(
                 serialize_tool_result(result), self._presentation_for(arguments, result)
             )
+        except ProblemException as exc:
+            return ToolExecutionResult(serialize_tool_problem(exc.problem))
         except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
             problem = Problem.from_exception(
                 exc,

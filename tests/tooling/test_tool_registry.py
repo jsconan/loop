@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from loop import (
     Action,
     ApprovalChoice,
+    Decision,
     NetworkTarget,
     Operation,
     OperationPlan,
@@ -601,6 +603,22 @@ def test_registry_passes_replaced_runtime_settings_to_tool_context():
     assert seen == [ToolRuntimeSettings(user_agent="custom-agent")]
 
 
+def test_registry_shares_mutated_runtime_settings_with_later_calls():
+    """In-place configuration changes remain visible to subsequent tool invocations."""
+    settings = ToolRuntimeSettings(user_agent="initial")
+    registry = ToolRegistry(settings=settings)
+
+    @declare_tool
+    def identify(context: ToolContext) -> str:
+        """Return the configured user agent."""
+        return context.settings.user_agent
+
+    registry.register(identify)
+    settings.user_agent = "updated"
+
+    assert result_value(registry.call("identify", "{}")) == "updated"
+
+
 def test_call_reports_unknown_tools():
     """Synchronous routing serializes an unknown-tool error at the registry boundary."""
     problem = json.loads(ToolRegistry().call("missing", "{}"))["problem"]
@@ -646,7 +664,7 @@ def test_call_routes_arguments_and_runtime_context():
 
 
 def test_call_uses_default_or_no_context():
-    """Synchronous routing uses the default interaction and omits context when none exists."""
+    """Synchronous routing retains context when no interaction capability exists."""
     interaction = Mock(spec=Interaction)
     registry = ToolRegistry(interaction=interaction)
     seen = []
@@ -662,8 +680,80 @@ def test_call_uses_default_or_no_context():
     registry.call("calculate", "{}")
     assert seen[0].interaction is interaction
     registry.interaction = None
-    assert "execution_failed" in registry.call("calculate", "{}")
-    assert len(seen) == 1
+    assert result_value(registry.call("calculate", "{}")) == "result"
+    assert seen[1].interaction is None
+
+
+def test_headless_authorized_tool_receives_execution_metadata():
+    """Authorized headless calls receive plans and invocation identity without a UI."""
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+    permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
+    registry = ToolRegistry(permission_manager=permissions)
+    seen = []
+
+    @declare_tool(
+        actions={Action.SESSION_MUTATE},
+        operation_planner=planner_for(Action.SESSION_MUTATE),
+    )
+    def inspect(context: ToolContext) -> str:
+        """Inspect authorized execution metadata."""
+        seen.append(context)
+        return context.call_id or "missing"
+
+    registry.register(inspect)
+
+    assert result_value(registry.call("inspect", "{}", call_id="headless-call")) == (
+        "headless-call"
+    )
+    assert seen[0].interaction is None
+    assert seen[0].operations[0].action is Action.SESSION_MUTATE
+    permissions.authorize.assert_called_once()
+
+
+def test_headless_authorization_denial_prevents_execution():
+    """Removing the UI never bypasses centralized authorization."""
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+    permissions.authorize.return_value = SimpleNamespace(
+        decision=Decision.DENY,
+        reason="headless policy denied the operation",
+    )
+    registry = ToolRegistry(permission_manager=permissions)
+    called = []
+
+    @declare_tool(
+        actions={Action.SESSION_MUTATE},
+        operation_planner=planner_for(Action.SESSION_MUTATE),
+    )
+    def mutate(context: ToolContext) -> None:
+        """Record an authorized mutation."""
+        called.append(context)
+
+    registry.register(mutate)
+
+    problem = json.loads(registry.call("mutate", "{}"))["problem"]
+
+    assert problem["code"] == "tool.denied"
+    assert called == []
+    permissions.authorize.assert_called_once()
+
+
+def test_headless_interaction_requirement_is_structured():
+    """A headless tool that requests UI returns the standard interaction problem."""
+    registry = ToolRegistry()
+
+    @declare_tool
+    def confirm(context: ToolContext) -> bool:
+        """Require an explicit user confirmation."""
+        return context.confirm("Continue?")
+
+    registry.register(confirm)
+
+    problem = json.loads(registry.call("confirm", "{}"))["problem"]
+
+    assert problem["code"] == "tool.interaction_unavailable"
+    assert problem["title"] == "Interaction unavailable"
 
 
 def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
