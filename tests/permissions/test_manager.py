@@ -32,6 +32,7 @@ from loop import (
     SessionTarget,
 )
 from loop.permissions import PermissionLoadFailure
+from loop.permissions import manager as manager_module
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.telemetry.policy import thaw
 
@@ -44,6 +45,15 @@ def operation(action: Action, *, tool: str = "demo", target=None, reason=None) -
 def file_operation(action: Action, path) -> Operation:
     """Build one filesystem operation for a canonical path."""
     return operation(action, target=FileTarget(path=str(path)))
+
+
+def test_shutdown_cleanup_releases_live_manager_temporary_directories():
+    """Process shutdown cleanup releases temporary directories retained by live managers."""
+    manager = PermissionManager()
+
+    manager_module._close_live_managers()  # pylint: disable=protected-access
+
+    assert not manager.temporary_directory.exists()
 
 
 @pytest.mark.parametrize(

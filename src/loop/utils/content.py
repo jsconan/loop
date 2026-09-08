@@ -3,6 +3,7 @@
 import base64
 import binascii
 import json
+from atexit import register
 from codecs import getincrementaldecoder
 from collections.abc import Iterable
 from pathlib import Path
@@ -14,6 +15,7 @@ from .. import constants
 from .models import BoundedTextContent, CachedContentMetadata
 
 _CACHE = TemporaryDirectory(prefix=constants.TEMPORARY_CONTENT_DIRECTORY_PREFIX)
+register(_CACHE.cleanup)
 _SOURCES: dict[str, str] = {}
 _METADATA: dict[str, CachedContentMetadata] = {}
 _LOCK = RLock()

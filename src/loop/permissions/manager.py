@@ -11,11 +11,13 @@ import logging
 import shlex
 import sqlite3
 import tempfile
+from atexit import register
 from collections.abc import Iterable
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+from weakref import WeakSet
 
 import yaml
 
@@ -76,6 +78,16 @@ _LIMIT_NAMES = (
     "allow_host_processes",
 )
 _LOGGER = logging.getLogger(__name__)
+_LIVE_MANAGERS: WeakSet[PermissionManager] = WeakSet()
+
+
+def _close_live_managers() -> None:
+    """Release temporary directories held by managers alive at process shutdown."""
+    for manager in _LIVE_MANAGERS:
+        manager.close()
+
+
+register(_close_live_managers)
 
 
 class PermissionManager:
@@ -136,38 +148,48 @@ class PermissionManager:
             prefix=constants.TEMPORARY_DIRECTORY_PREFIX
         )
         self._temporary_path = Path(self._temporary_directory.name).resolve()
-        self._configuration_path = (
-            Path(configuration_path)
-            if configuration_path is not None
-            else self._workspace_root / constants.APP_DIRECTORY / constants.PERMISSIONS_FILENAME
-            if self._workspace_root is not None
-            else None
-        )
-        self._workspace_id = workspace_id
-        self._audit_store = SQLitePermissionAudit(audit_path) if audit_path is not None else None
-        self._interaction = interaction
-        self._recorder = recorder
-        self._load_policy = load_policy or (
-            PermissionLoadPolicy.INTERACTIVE
-            if interaction is not None
-            else PermissionLoadPolicy.ERROR
-        )
-        if self._load_policy is PermissionLoadPolicy.INTERACTIVE and interaction is None:
-            raise ValueError("Interactive permission loading requires an Interaction.")
-        self._configuration = configuration or PermissionConfiguration()
-        if configuration is None:
-            self._load_configuration()
-        self._session_overrides = SessionPolicyOverrides()
-        builtin_presets = self._load_presets()
-        catalog = (*builtin_presets, *(presets or ()))
-        identifiers = [preset.metadata.id for preset in catalog]
-        if len(identifiers) != len(set(identifiers)):
-            raise ValueError("Permission preset identifiers must be unique.")
-        self._presets = {preset.metadata.id: preset for preset in catalog}
+        _LIVE_MANAGERS.add(self)
+        try:
+            self._configuration_path = (
+                Path(configuration_path)
+                if configuration_path is not None
+                else self._workspace_root / constants.APP_DIRECTORY / constants.PERMISSIONS_FILENAME
+                if self._workspace_root is not None
+                else None
+            )
+            self._workspace_id = workspace_id
+            self._audit_store = (
+                SQLitePermissionAudit(audit_path) if audit_path is not None else None
+            )
+            self._interaction = interaction
+            self._recorder = recorder
+            self._load_policy = load_policy or (
+                PermissionLoadPolicy.INTERACTIVE
+                if interaction is not None
+                else PermissionLoadPolicy.ERROR
+            )
+            if self._load_policy is PermissionLoadPolicy.INTERACTIVE and interaction is None:
+                raise ValueError("Interactive permission loading requires an Interaction.")
+            self._configuration = configuration or PermissionConfiguration()
+            if configuration is None:
+                self._load_configuration()
+            self._session_overrides = SessionPolicyOverrides()
+            builtin_presets = self._load_presets()
+            catalog = (*builtin_presets, *(presets or ()))
+            identifiers = [preset.metadata.id for preset in catalog]
+            if len(identifiers) != len(set(identifiers)):
+                raise ValueError("Permission preset identifiers must be unique.")
+            self._presets = {preset.metadata.id: preset for preset in catalog}
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
         """Release the manager-owned temporary directory."""
         self._temporary_directory.cleanup()
+
+    def __del__(self) -> None:
+        self.close()
 
     @property
     def configuration(self) -> PermissionConfiguration:
