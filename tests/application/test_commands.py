@@ -70,7 +70,9 @@ def test_logs_and_audit_export_create_files_and_filter_workspace(application, tm
     commands.app(context, "logs", str(log_export))
     commands.app(context, "audit", str(audit_export))
 
-    assert log_export.read_text(encoding="utf-8") == "record\n"
+    exported_log = json.loads(log_export.read_text(encoding="utf-8"))
+    assert exported_log["message"] == "record"
+    assert exported_log["level"] == "UNKNOWN"
     audit_records = audit_export.read_text(encoding="utf-8").splitlines()
     assert len(audit_records) == 1
     assert "workspace-id" in audit_records[0]
@@ -131,7 +133,9 @@ def test_log_export_streams_archives_with_filters_and_force(application, tmp_pat
     commands.app(context, "logs", str(target), "workspace-id", 1, 3, "info", "keep")
     assert [json.loads(line)["timestamp_ns"] for line in target.read_text().splitlines()] == [1, 3]
     commands.app(context, "logs", str(target), force=True)
-    assert "malformed" in target.read_text(encoding="utf-8")
+    assert any(
+        json.loads(line).get("message") == "malformed" for line in target.read_text().splitlines()
+    )
     with pytest.raises(CommandArgumentError, match="audit-only"):
         commands.app(context, "logs", str(tmp_path / "bad"), session_id="session")
     empty = tmp_path / "empty-filtered"
@@ -143,6 +147,22 @@ def test_log_export_streams_archives_with_filters_and_force(application, tmp_pat
     wrong_event = tmp_path / "wrong-event"
     commands.app(context, "logs", str(wrong_event), event_name="absent")
     assert wrong_event.read_text(encoding="utf-8") == ""
+
+
+def test_log_export_filters_iso_timestamps_and_rejects_source_overwrite(application, tmp_path):
+    """Older ISO timestamps remain filterable and exports cannot replace their own input."""
+    commands, paths = application
+    paths.operational_log.parent.mkdir(parents=True, exist_ok=True)
+    paths.operational_log.write_text(
+        '{"timestamp":"1970-01-01T00:00:01+00:00","level":"INFO"}\n'
+        '{"timestamp":"invalid","level":"INFO"}\n',
+        encoding="utf-8",
+    )
+    target = tmp_path / "filtered.jsonl"
+    commands.app(CommandContext("app", Mock()), "logs", str(target), start_ns=1_000_000_000)
+    assert json.loads(target.read_text())["timestamp_ns"] == 1_000_000_000
+    with pytest.raises(CommandArgumentError, match="must not be"):
+        commands.app(CommandContext("app", Mock()), "logs", str(paths.operational_log), force=True)
 
 
 def test_audit_export_supports_all_filters_and_force(application, tmp_path):

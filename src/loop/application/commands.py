@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -134,7 +135,7 @@ class ApplicationCommands:
                     decision=decision,
                     force=force,
                 )
-        except FileExistsError as error:
+        except (FileExistsError, ValueError) as error:
             raise CommandArgumentError(str(error)) from error
         context.interaction.info(f"Exported {action} to {target}.")
 
@@ -168,6 +169,7 @@ class ApplicationCommands:
             **filters,
         )
 
+    # pylint: disable-next=too-many-branches
     def _export_logs(
         self,
         destination: Path,
@@ -190,6 +192,8 @@ class ApplicationCommands:
             reverse=True,
         )
         sources = [*archives, source_path]
+        if destination in {path.resolve() for path in sources}:
+            raise ValueError("Log export destination must not be an active or rotated log file.")
         with destination.open("w" if force else "x", encoding="utf-8") as output:
             for source_path in sources:
                 if not source_path.is_file():
@@ -199,10 +203,26 @@ class ApplicationCommands:
                         try:
                             record = json.loads(line)
                         except json.JSONDecodeError:
-                            if not any((workspace_id, start_ns, end_ns, severity, event_name)):
-                                output.write(line)
-                            continue
+                            record = {
+                                "timestamp": None,
+                                "timestamp_ns": None,
+                                "workspace_id": None,
+                                "level": "UNKNOWN",
+                                "event.name": None,
+                                "message": line.rstrip("\r\n"),
+                            }
                         timestamp = record.get("timestamp_ns")
+                        if not isinstance(timestamp, int) and isinstance(
+                            record.get("timestamp"), str
+                        ):
+                            try:
+                                timestamp = int(
+                                    datetime.fromisoformat(record["timestamp"]).timestamp()
+                                    * 1_000_000_000
+                                )
+                            except ValueError:
+                                timestamp = None
+                        record["timestamp_ns"] = timestamp
                         if start_ns is not None and (
                             not isinstance(timestamp, int) or timestamp < start_ns
                         ):
