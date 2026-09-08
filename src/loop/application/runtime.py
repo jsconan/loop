@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from types import TracebackType
+from typing import Self
 
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
@@ -15,6 +18,7 @@ from ..telemetry import (
     SQLiteTelemetryAdapter,
     Telemetry,
     configure_operational_logging,
+    get_telemetry,
     set_telemetry,
     telemetry_activity,
 )
@@ -33,24 +37,39 @@ class ApplicationRuntime:
         telemetry (Telemetry): Application telemetry service.
         shutdown_timeout (float): Maximum seconds allowed for telemetry shutdown.
         logging_handler (logging.Handler | None): Owned process-global log handler.
+        cleanup_callbacks (list[Callable[[], object]] | None): Acquired-resource cleanup actions in
+            acquisition order. Defaults to telemetry and optional logging cleanup.
     """
 
     _loop: Loop
     _telemetry: Telemetry
     _shutdown_timeout: float
     _logging_handler: logging.Handler | None
+    _cleanup_callbacks: list[Callable[[], object]]
+    _closed: bool
 
     def __init__(
         self,
         loop: Loop,
         telemetry: Telemetry,
         shutdown_timeout: float,
+        *,
         logging_handler: logging.Handler | None = None,
+        cleanup_callbacks: list[Callable[[], object]] | None = None,
     ) -> None:
         self._loop = loop
         self._telemetry = telemetry
         self._shutdown_timeout = shutdown_timeout
         self._logging_handler = logging_handler
+        if cleanup_callbacks is None:
+            self._cleanup_callbacks = [lambda: self._close_telemetry(telemetry, shutdown_timeout)]
+            if logging_handler is not None:
+                self._cleanup_callbacks.insert(
+                    0, lambda: self._close_logging_handler(logging_handler)
+                )
+        else:
+            self._cleanup_callbacks = cleanup_callbacks
+        self._closed = False
 
     @classmethod
     def create(
@@ -82,27 +101,51 @@ class ApplicationRuntime:
         """
         if workspace.id is None:
             raise ValueError("Application runtime requires an initialized workspace.")
-        logging_handler = configure_operational_logging(
-            paths.operational_log,
-            level=settings.logging.level,
-            max_bytes=settings.logging.max_bytes,
-            backup_count=settings.logging.backup_count,
-            workspace_id=workspace.id,
-        )
-        telemetry = None
+        cleanup_callbacks = []
         try:
+            root_logger = logging.getLogger()
+            previous_logging_level = root_logger.level
+            logging_handler = configure_operational_logging(
+                paths.operational_log,
+                level=settings.logging.level,
+                max_bytes=settings.logging.max_bytes,
+                backup_count=settings.logging.backup_count,
+                workspace_id=workspace.id,
+            )
+            if logging_handler is not None:
+                installed_logging_level = root_logger.level
+                cleanup_callbacks.append(
+                    lambda: cls._close_logging_handler(
+                        logging_handler,
+                        previous_level=previous_logging_level,
+                        installed_level=installed_logging_level,
+                    )
+                )
             backend = cls._create_backend(settings)
+            cls._track_close(backend, cleanup_callbacks)
+            telemetry_adapter = SQLiteTelemetryAdapter(
+                paths.telemetry,
+                workspace_id=workspace.id,
+                busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
+            )
+            adapter_tracked = cls._track_close(telemetry_adapter, cleanup_callbacks)
             telemetry = Telemetry(
-                SQLiteTelemetryAdapter(
-                    paths.telemetry,
-                    workspace_id=workspace.id,
-                    busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
-                ),
+                telemetry_adapter,
                 queue_capacity=settings.telemetry.queue_capacity,
                 batch_size=settings.telemetry.batch_size,
                 flush_seconds=settings.telemetry.flush_seconds,
                 workspace_id=workspace.id,
             )
+            if adapter_tracked:
+                cleanup_callbacks.pop()
+            cleanup_callbacks.append(
+                lambda: cls._close_telemetry(telemetry, settings.telemetry.shutdown_timeout)
+            )
+            session_store = SQLiteSessionStore(
+                workspace_paths.sessions,
+                workspace_id=workspace.id,
+            )
+            cls._track_close(session_store, cleanup_callbacks)
             loop = Loop.create_default(
                 backend,
                 interaction=interaction,
@@ -125,10 +168,7 @@ class ApplicationRuntime:
                 ),
                 session_manager=SessionManager(
                     interaction=interaction,
-                    session_store=SQLiteSessionStore(
-                        workspace_paths.sessions,
-                        workspace_id=workspace.id,
-                    ),
+                    session_store=session_store,
                     workspace_id=workspace.id,
                 ),
                 agent_name=settings.loop.agent_name,
@@ -144,26 +184,41 @@ class ApplicationRuntime:
                 prompt_on_recoverable_error=settings.loop.prompt_on_recoverable_error,
                 max_agent_turns=settings.loop.max_agent_turns,
             )
-        except Exception:
-            if telemetry is not None:
-                telemetry.close(timeout=settings.telemetry.shutdown_timeout)
-            if logging_handler is not None:
-                logging.getLogger().removeHandler(logging_handler)
-                logging_handler.close()
+            runtime = cls(
+                loop,
+                telemetry,
+                settings.telemetry.shutdown_timeout,
+                logging_handler=logging_handler,
+                cleanup_callbacks=cleanup_callbacks,
+            )
+            loop.command_manager.register_all(
+                ConfigurationCommands(configuration, runtime.apply_configuration).get_commands()
+            )
+            loop.command_manager.register_all(
+                ApplicationCommands(paths, workspace_paths, workspace.id).get_commands()
+            )
+            loop.command_manager.register_all(
+                WorkspaceCommands(workspace, workspace_repository).get_commands()
+            )
+            previous_telemetry = get_telemetry()
+            set_telemetry(telemetry)
+            cleanup_callbacks.append(lambda: cls._restore_telemetry(telemetry, previous_telemetry))
+            telemetry_activity("application.started", severity="info", component="main")
+            return runtime
+        except BaseException as error:
+            cls._cleanup(cleanup_callbacks, primary=error)
             raise
-        runtime = cls(loop, telemetry, settings.telemetry.shutdown_timeout, logging_handler)
-        loop.command_manager.register_all(
-            ConfigurationCommands(configuration, runtime.apply_configuration).get_commands()
-        )
-        loop.command_manager.register_all(
-            ApplicationCommands(paths, workspace_paths, workspace.id).get_commands()
-        )
-        loop.command_manager.register_all(
-            WorkspaceCommands(workspace, workspace_repository).get_commands()
-        )
-        set_telemetry(telemetry)
-        telemetry_activity("application.started", severity="info", component="main")
-        return runtime
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
 
     def run(self) -> None:
         """Run the composed interactive loop."""
@@ -206,11 +261,84 @@ class ApplicationRuntime:
         telemetry_activity("application.stopping", severity="info", reason="interrupted")
 
     def close(self) -> None:
-        """Record shutdown and close process-wide telemetry."""
-        telemetry_activity("application.stopped", severity="info", component="main")
-        set_telemetry(None)
-        self._telemetry.close(timeout=self._shutdown_timeout)
-        if self._logging_handler is not None:
-            logging.getLogger().removeHandler(self._logging_handler)
-            self._logging_handler.close()
+        """Record shutdown and deterministically release every owned resource.
+
+        Raises:
+            TimeoutError: If telemetry cannot flush and shut down within its configured timeout.
+            BaseException: The first resource-specific cleanup failure after all cleanup is tried.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
+        try:
+            telemetry_activity("application.stopped", severity="info", component="main")
+        except BaseException as error:
+            self._cleanup(callbacks, primary=error)
             self._logging_handler = None
+            raise
+        self._cleanup(callbacks)
+        self._logging_handler = None
+
+    @staticmethod
+    def _track_close(resource: object, callbacks: list[Callable[[], object]]) -> bool:
+        """Track an acquired resource exposing an explicit close operation."""
+        close = getattr(resource, "close", None)
+        if callable(close):
+            callbacks.append(close)
+            return True
+        return False
+
+    @staticmethod
+    def _close_logging_handler(
+        handler: logging.Handler,
+        *,
+        previous_level: int | None = None,
+        installed_level: int | None = None,
+    ) -> None:
+        """Remove one owned handler and restore its root level when still current."""
+        root_logger = logging.getLogger()
+        root_logger.removeHandler(handler)
+        if (
+            previous_level is not None
+            and installed_level is not None
+            and root_logger.level == installed_level
+        ):
+            root_logger.setLevel(previous_level)
+        handler.close()
+
+    @staticmethod
+    def _restore_telemetry(telemetry: Telemetry, previous_telemetry: Telemetry | None) -> None:
+        """Restore the prior facade only while this runtime still owns publication."""
+        if get_telemetry() is telemetry:
+            set_telemetry(previous_telemetry)
+
+    @staticmethod
+    def _close_telemetry(telemetry: Telemetry, timeout: float) -> None:
+        """Flush and close telemetry, exposing an incomplete shutdown."""
+        if not telemetry.close(timeout=timeout):
+            raise TimeoutError(f"Telemetry did not shut down within {timeout} seconds.")
+
+    @staticmethod
+    def _cleanup(
+        callbacks: list[Callable[[], object]], *, primary: BaseException | None = None
+    ) -> None:
+        """Run owned cleanup in reverse order without obscuring a primary failure."""
+        cleanup_errors = []
+        while callbacks:
+            callback = callbacks.pop()
+            try:
+                callback()
+            except BaseException as error:  # noqa: BLE001 - cleanup must survive cancellation
+                cleanup_errors.append(error)
+        if primary is not None:
+            for error in cleanup_errors:
+                primary.add_note(f"Runtime rollback also failed: {type(error).__name__}: {error}")
+            return
+        if cleanup_errors:
+            first = cleanup_errors[0]
+            for error in cleanup_errors[1:]:
+                first.add_note(
+                    f"Additional runtime cleanup failed: {type(error).__name__}: {error}"
+                )
+            raise first

@@ -1,5 +1,8 @@
 """Verify application runtime composition and shutdown."""
 
+import gc
+import logging
+import warnings
 from unittest.mock import Mock, call
 
 import pytest
@@ -8,6 +11,7 @@ import loop.application.runtime as runtime_module
 from loop.application import ApplicationPaths
 from loop.application.runtime import ApplicationRuntime
 from loop.configuration import ApplicationSettings
+from loop.telemetry import SQLiteTelemetryAdapter, Telemetry
 from loop.workspace import Workspace
 
 
@@ -41,8 +45,16 @@ def dependencies(monkeypatch):
     active_loop.command_manager = Mock()
     loop.create_default.return_value = active_loop
     result["Loop"] = loop
-    for name in ("configure_operational_logging", "set_telemetry", "telemetry_activity"):
+    for name in (
+        "configure_operational_logging",
+        "get_telemetry",
+        "set_telemetry",
+        "telemetry_activity",
+    ):
         result[name] = Mock()
+    active_telemetry = {"value": None}
+    result["get_telemetry"].side_effect = lambda: active_telemetry["value"]
+    result["set_telemetry"].side_effect = lambda value: active_telemetry.__setitem__("value", value)
     for name, replacement in result.items():
         monkeypatch.setattr(runtime_module, name, replacement)
     return result
@@ -179,3 +191,225 @@ def test_failed_create_without_logging_or_telemetry_owners_is_safe(dependencies,
         ApplicationRuntime.create(
             workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
         )
+
+
+def test_backend_failure_rolls_back_only_owned_logging(dependencies, assembled):
+    """A backend failure removes and closes the handler acquired for the attempt."""
+    workspace, paths, workspace_paths, settings = assembled
+    handler = dependencies["configure_operational_logging"].return_value
+    dependencies["OpenAIBackend"].side_effect = RuntimeError("backend failed")
+
+    with pytest.raises(RuntimeError, match="backend failed"):
+        ApplicationRuntime.create(
+            workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+        )
+
+    handler.close.assert_called_once_with()
+    dependencies["set_telemetry"].assert_not_called()
+
+
+def test_backend_failure_restores_owned_root_logging_state(dependencies, assembled):
+    """Rollback removes the installed handler and restores the prior root level."""
+    workspace, paths, workspace_paths, settings = assembled
+    root = logging.getLogger()
+    previous_level = root.level
+    installed_level = logging.ERROR if previous_level != logging.ERROR else logging.DEBUG
+    handler = Mock(spec=logging.Handler)
+
+    def install_logging(*args, **kwargs):
+        root.addHandler(handler)
+        root.setLevel(installed_level)
+        return handler
+
+    dependencies["configure_operational_logging"].side_effect = install_logging
+    dependencies["OpenAIBackend"].side_effect = RuntimeError("backend failed")
+
+    try:
+        with pytest.raises(RuntimeError, match="backend failed"):
+            ApplicationRuntime.create(
+                workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+            )
+
+        assert handler not in root.handlers
+        assert root.level == previous_level
+        handler.close.assert_called_once_with()
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
+
+
+def test_command_failure_closes_all_acquired_resources(dependencies, assembled):
+    """Command-registration failure closes sessions, telemetry, backend, and logging."""
+    workspace, paths, workspace_paths, settings = assembled
+    active_loop = dependencies["Loop"].create_default.return_value
+    active_loop.command_manager.register_all.side_effect = RuntimeError("commands failed")
+
+    with pytest.raises(RuntimeError, match="commands failed"):
+        ApplicationRuntime.create(
+            workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+        )
+
+    dependencies["SQLiteSessionStore"].return_value.close.assert_called_once_with()
+    dependencies["Telemetry"].return_value.close.assert_called_once_with(
+        timeout=settings.telemetry.shutdown_timeout
+    )
+    dependencies["OpenAIBackend"].return_value.close.assert_called_once_with()
+    dependencies["configure_operational_logging"].return_value.close.assert_called_once_with()
+    dependencies["set_telemetry"].assert_not_called()
+
+
+def test_late_startup_failure_unpublishes_before_rollback(dependencies, assembled):
+    """A failure after publication restores the facade and shuts telemetry down."""
+    workspace, paths, workspace_paths, settings = assembled
+    prior = Mock()
+    dependencies["set_telemetry"](prior)
+    dependencies["set_telemetry"].reset_mock()
+    dependencies["telemetry_activity"].side_effect = RuntimeError("start event failed")
+
+    with pytest.raises(RuntimeError, match="start event failed"):
+        ApplicationRuntime.create(
+            workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+        )
+
+    assert dependencies["set_telemetry"].call_args_list == [
+        call(dependencies["Telemetry"].return_value),
+        call(prior),
+    ]
+    dependencies["Telemetry"].return_value.close.assert_called_once_with(
+        timeout=settings.telemetry.shutdown_timeout
+    )
+
+
+def test_runtime_restores_prior_telemetry_owner(dependencies, assembled):
+    """Shutdown restores a pre-existing facade without overwriting a later owner."""
+    workspace, paths, workspace_paths, settings = assembled
+    prior = Mock()
+    later = Mock()
+    dependencies["set_telemetry"](prior)
+
+    runtime = ApplicationRuntime.create(
+        workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+    )
+    runtime.close()
+    assert dependencies["get_telemetry"]() is prior
+
+    dependencies["set_telemetry"](prior)
+    runtime = ApplicationRuntime.create(
+        workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+    )
+    dependencies["set_telemetry"](later)
+    runtime.close()
+    assert dependencies["get_telemetry"]() is later
+
+
+def test_publication_follows_complete_command_registration(dependencies, assembled):
+    """Telemetry becomes global only after every command group is registered."""
+    workspace, paths, workspace_paths, settings = assembled
+    events = []
+    dependencies["Loop"].create_default.return_value.command_manager.register_all.side_effect = (
+        lambda commands: events.append(("register", commands))
+    )
+    dependencies["set_telemetry"].side_effect = lambda value: events.append(("publish", value))
+
+    runtime = ApplicationRuntime.create(
+        workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+    )
+
+    assert [name for name, _value in events] == ["register", "register", "register", "publish"]
+    runtime.close()
+
+
+def test_close_is_idempotent_and_context_exit_closes_resources():
+    """Explicit and context-managed shutdown close each owned resource exactly once."""
+    telemetry = Mock()
+    handler = Mock(spec=logging.Handler)
+
+    with ApplicationRuntime(Mock(), telemetry, 1.0, logging_handler=handler) as runtime:
+        assert runtime is not None
+    runtime.close()
+
+    telemetry.close.assert_called_once_with(timeout=1.0)
+    handler.close.assert_called_once_with()
+
+
+def test_close_reports_telemetry_shutdown_timeout():
+    """Runtime shutdown exposes telemetry flush or adapter failure to its caller."""
+    telemetry = Mock()
+    telemetry.close.return_value = False
+    runtime = ApplicationRuntime(Mock(), telemetry, 1.0)
+
+    with pytest.raises(TimeoutError, match="1.0 seconds"):
+        runtime.close()
+
+    runtime.close()
+
+
+def test_close_cleans_up_when_shutdown_activity_fails(dependencies):
+    """A stopped-event failure remains primary while owned resources still close."""
+    telemetry = Mock()
+    dependencies["telemetry_activity"].side_effect = RuntimeError("event failed")
+    runtime = ApplicationRuntime(Mock(), telemetry, 1.0)
+
+    with pytest.raises(RuntimeError, match="event failed"):
+        runtime.close()
+
+    telemetry.close.assert_called_once_with(timeout=1.0)
+
+
+def test_runtime_accepts_resources_without_close_contract(dependencies, assembled):
+    """Composition tracks only resources that advertise deterministic cleanup."""
+    workspace, paths, workspace_paths, settings = assembled
+    dependencies["SQLiteTelemetryAdapter"].return_value = object()
+    dependencies["SQLiteSessionStore"].return_value = object()
+
+    runtime = ApplicationRuntime.create(
+        workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+    )
+    runtime.close()
+
+    dependencies["Telemetry"].return_value.close.assert_called_once_with(
+        timeout=settings.telemetry.shutdown_timeout
+    )
+
+
+def test_rollback_preserves_primary_error_when_cleanup_fails(dependencies, assembled):
+    """Secondary close failures annotate rather than replace the startup error."""
+    workspace, paths, workspace_paths, settings = assembled
+    dependencies["Loop"].create_default.side_effect = RuntimeError("startup failed")
+    dependencies["Telemetry"].return_value.close.side_effect = OSError("close failed")
+
+    with pytest.raises(RuntimeError, match="startup failed") as raised:
+        ApplicationRuntime.create(
+            workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+        )
+
+    assert raised.value.__notes__ == ["Runtime rollback also failed: OSError: close failed"]
+
+
+def test_close_reports_first_cleanup_error_and_notes_additional_failures():
+    """Normal shutdown attempts every callback and reports all cleanup failures."""
+    first = Mock(side_effect=OSError("first"))
+    second = Mock(side_effect=RuntimeError("second"))
+    runtime = ApplicationRuntime(Mock(), Mock(), 1.0, cleanup_callbacks=[second, first])
+
+    with pytest.raises(OSError, match="first") as raised:
+        runtime.close()
+
+    assert raised.value.__notes__ == ["Additional runtime cleanup failed: RuntimeError: second"]
+    first.assert_called_once_with()
+    second.assert_called_once_with()
+
+
+def test_context_close_releases_real_sqlite_connection_without_resource_warning(tmp_path):
+    """Context shutdown explicitly closes the runtime-owned SQLite telemetry connection."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        adapter = SQLiteTelemetryAdapter(tmp_path / "telemetry.sqlite3", workspace_id="workspace")
+        telemetry = Telemetry(adapter, workspace_id="workspace")
+        with ApplicationRuntime(Mock(), telemetry, 1.0):
+            telemetry.activity("runtime.test")
+        del telemetry
+        del adapter
+        gc.collect()
+
+    assert not [warning for warning in caught if warning.category is ResourceWarning]

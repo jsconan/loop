@@ -110,6 +110,34 @@ def test_configure_operational_logging_falls_back_when_file_setup_fails(monkeypa
     assert "private" not in caplog.text
 
 
+def test_configure_operational_logging_closes_partially_installed_handler(tmp_path, monkeypatch):
+    """A failure after handler creation removes and closes only that handler."""
+    handler = Mock()
+    monkeypatch.setattr(logging_module, "SafeRotatingFileHandler", Mock(return_value=handler))
+    root = logging.getLogger()
+
+    result = configure_operational_logging(tmp_path / "loop.log", level="invalid")
+
+    assert result is None
+    assert handler not in root.handlers
+    handler.close.assert_called_once_with()
+
+
+def test_configure_operational_logging_contains_partial_cleanup_failure(
+    tmp_path, monkeypatch, caplog
+):
+    """A partial handler close failure is reported without escaping logging setup."""
+    handler = Mock()
+    handler.close.side_effect = OSError("close failed")
+    monkeypatch.setattr(logging_module, "SafeRotatingFileHandler", Mock(return_value=handler))
+
+    with caplog.at_level(logging.CRITICAL):
+        result = configure_operational_logging(tmp_path / "loop.log", level="invalid")
+
+    assert result is None
+    assert "Operational logging cleanup failed" in caplog.text
+
+
 def test_handler_failures_use_content_free_stderr_fallback(tmp_path, capsys):
     """A broken operational file handler reports failure without exposing its log record."""
     handler = logging_module.SafeRotatingFileHandler(tmp_path / "loop.log")

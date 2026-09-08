@@ -195,6 +195,8 @@ def configure_operational_logging(
     resolved_backup_count = (
         backup_count if backup_count is not None else constants.DEFAULT_OPERATIONAL_LOG_BACKUPS
     )
+    handler = None
+    root = logging.getLogger()
     try:
         handler = SafeRotatingFileHandler(
             destination,
@@ -205,11 +207,19 @@ def configure_operational_logging(
         if workspace_id is not None:
             handler.addFilter(WorkspaceFilter(workspace_id))
         handler.setFormatter(SafeOperationalFormatter())
-        root = logging.getLogger()
         root.addHandler(handler)
         root.setLevel(level)
         return handler
     except (OSError, ValueError):
+        if handler is not None:
+            root.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:  # noqa: BLE001 - logging setup must retain its fallback
+                logging.getLogger(__name__).critical(
+                    "Operational logging cleanup failed",
+                    extra={"error.type": "logging.cleanup_failed"},
+                )
         logging.getLogger(__name__).critical(
             "Operational logging initialization failed",
             extra={"error.type": "logging.initialization_failed"},
