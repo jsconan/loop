@@ -12,6 +12,9 @@ from ..telemetry import SQLiteTelemetryAdapter, import_legacy_operational_log
 from ..workspace import Workspace
 from .paths import ApplicationPaths, WorkspacePaths
 
+_MIGRATION_MARKER = ".central-storage-v1"
+_LEGACY_PERMISSIONS_AUDIT = "permissions-audit.jsonl"
+
 
 class ApplicationMigration:
     """Import legacy artifacts for one initialized workspace.
@@ -51,10 +54,21 @@ class ApplicationMigration:
         self._busy_timeout_ms = busy_timeout_ms
 
     def run(self) -> None:
-        """Import supported legacy files without overwriting centralized files."""
+        """Import legacy files once and mark the source after every import succeeds."""
+        sources = (
+            self._legacy_root / constants.SESSION_DATABASE_FILENAME,
+            self._legacy_root / constants.PERMISSIONS_FILENAME,
+            self._legacy_root / constants.TELEMETRY_DATABASE_FILENAME,
+            self._legacy_root / _LEGACY_PERMISSIONS_AUDIT,
+            self._legacy_root / constants.OPERATIONAL_LOG_FILENAME,
+        )
+        marker = self._legacy_root / _MIGRATION_MARKER
+        if marker.is_file() or not any(source.is_file() for source in sources):
+            return
+
         SQLiteSessionStore(
             self._workspace_paths.sessions, workspace_id=self._workspace.id
-        ).import_legacy(self._legacy_root / constants.SESSION_DATABASE_FILENAME)
+        ).import_legacy(sources[0])
         self._copy_policy()
         telemetry_source = self._legacy_root / constants.TELEMETRY_DATABASE_FILENAME
         if telemetry_source.is_file():
@@ -68,17 +82,21 @@ class ApplicationMigration:
                 telemetry.flush()
             finally:
                 telemetry.close()
+        audit_source = self._legacy_root / _LEGACY_PERMISSIONS_AUDIT
         SQLitePermissionAudit(
             self._application_paths.permissions_audit,
             busy_timeout_ms=self._busy_timeout_ms,
-        ).import_legacy_jsonl(
-            self._legacy_root / "permissions-audit.jsonl",
-            workspace_id=self._workspace.id,
-        )
+        ).import_legacy_jsonl(audit_source, workspace_id=self._workspace.id)
+        log_source = self._legacy_root / constants.OPERATIONAL_LOG_FILENAME
         import_legacy_operational_log(
-            self._legacy_root / constants.OPERATIONAL_LOG_FILENAME,
+            log_source,
             self._application_paths.operational_log,
         )
+        try:
+            marker.touch(mode=constants.PRIVATE_FILE_MODE, exist_ok=True)
+            marker.chmod(constants.PRIVATE_FILE_MODE)
+        except OSError:
+            pass
 
     def _copy_policy(self) -> None:
         """Copy the opaque legacy permission policy when no central policy exists."""

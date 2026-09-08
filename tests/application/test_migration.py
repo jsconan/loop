@@ -67,13 +67,17 @@ def test_migration_coordinates_owned_importers_and_copies_policy(tmp_path) -> No
             "SELECT record_id, workspace_id FROM permission_audit_records"
         ).fetchall() == [("audit", "id")]
     assert workspace_paths.permissions.read_text(encoding="utf-8") == "version: 2\n"
-    assert paths.operational_log.read_text(encoding="utf-8") == '{"event.name":"legacy"}\n'
+    imported_log = json.loads(paths.operational_log.read_text(encoding="utf-8"))
+    assert imported_log["event.name"] == "legacy"
+    assert imported_log["migration_id"]
     assert all(path.exists() for path in legacy.iterdir())
-    assert not (paths.data_root / "application.db").exists()
+    marker = legacy / ".central-storage-v1"
+    assert marker.read_bytes() == b""
+    assert marker.stat().st_mode & 0o777 == 0o600
 
 
-def test_migration_preserves_existing_central_files(tmp_path) -> None:
-    """Opaque files already owned by central storage are never overwritten."""
+def test_migration_preserves_policy_and_appends_to_existing_central_log(tmp_path) -> None:
+    """Opaque policies remain untouched while every workspace log is imported once."""
     project = tmp_path / "project"
     legacy = project / ".loop"
     legacy.mkdir(parents=True)
@@ -90,7 +94,28 @@ def test_migration_preserves_existing_central_files(tmp_path) -> None:
     ApplicationMigration(workspace, paths, workspace_paths).run()
 
     assert workspace_paths.permissions.read_text(encoding="utf-8") == "central\n"
-    assert paths.operational_log.read_text(encoding="utf-8") == "central\n"
+    lines = paths.operational_log.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "central"
+    assert json.loads(lines[1])["message"] == "legacy"
+
+
+def test_migration_ignores_obsolete_application_database(tmp_path) -> None:
+    """An obsolete migration database cannot prevent source-local migration."""
+    project = tmp_path / "project"
+    legacy = project / ".loop"
+    legacy.mkdir(parents=True)
+    (legacy / "permissions.yaml").write_text("legacy\n", encoding="utf-8")
+    workspace = initialized_workspace(project)
+    paths = application_paths(tmp_path)
+    paths.data_root.mkdir(parents=True)
+    obsolete = paths.data_root / "application.db"
+    with closing(sqlite3.connect(obsolete)) as connection, connection:
+        connection.execute("CREATE TABLE migrations(kind TEXT NOT NULL)")
+
+    ApplicationMigration(workspace, paths, paths.for_workspace("id", project)).run()
+
+    assert paths.for_workspace("id", project).permissions.read_text(encoding="utf-8") == "legacy\n"
+    assert (legacy / ".central-storage-v1").is_file()
 
 
 def test_migration_requires_identity_and_positive_timeout(tmp_path) -> None:
@@ -107,3 +132,56 @@ def test_migration_requires_identity_and_positive_timeout(tmp_path) -> None:
             paths.for_workspace("id", tmp_path),
             busy_timeout_ms=0,
         )
+
+
+def test_migration_marks_only_a_complete_import_and_retries_after_failure(tmp_path) -> None:
+    """A failed import remains unmarked and retries after its source is corrected."""
+    project = tmp_path / "project"
+    legacy = project / ".loop"
+    legacy.mkdir(parents=True)
+    audit = legacy / "permissions-audit.jsonl"
+    audit.write_text("malformed\n", encoding="utf-8")
+    workspace = initialized_workspace(project)
+    paths = application_paths(tmp_path)
+    migration = ApplicationMigration(workspace, paths, paths.for_workspace("id", project))
+
+    with pytest.raises(ValueError, match="Malformed"):
+        migration.run()
+    marker = legacy / ".central-storage-v1"
+    assert not marker.exists()
+    audit.write_text('{"record_id":"fixed"}\n', encoding="utf-8")
+    migration.run()
+    assert marker.is_file()
+
+
+def test_migration_skips_absent_sources_completed_directories_and_marker_failures(
+    tmp_path, monkeypatch
+) -> None:
+    """Migration needs no state and does not let an unwritable marker block imported data."""
+    project = tmp_path / "project"
+    legacy = project / ".loop"
+    legacy.mkdir(parents=True)
+    workspace = initialized_workspace(project)
+    paths = application_paths(tmp_path)
+    migration = ApplicationMigration(workspace, paths, paths.for_workspace("id", project))
+
+    migration.run()
+    assert not (legacy / ".central-storage-v1").exists()
+    (legacy / ".central-storage-v1").touch()
+    (legacy / "permissions.yaml").write_text("legacy\n", encoding="utf-8")
+    migration.run()
+    assert not paths.for_workspace("id", project).permissions.exists()
+
+    (legacy / ".central-storage-v1").unlink()
+    marker = legacy / ".central-storage-v1"
+    chmod = type(marker).chmod
+
+    def reject_marker_chmod(path, mode, *, follow_symlinks=True):
+        """Reject only the source-local marker permission update."""
+        if path == marker:
+            raise PermissionError("read only")
+        return chmod(path, mode, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr("loop.application.migration.Path.touch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("loop.application.migration.Path.chmod", reject_marker_chmod)
+    migration.run()
