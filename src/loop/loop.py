@@ -30,7 +30,7 @@ from .session import (
     SessionNameGenerator,
 )
 from .telemetry import telemetry_activity
-from .tooling import ToolCommands, ToolRegistry, ToolRuntimeSettings
+from .tooling import ToolCommands, ToolRegistry
 from .utils import PathHolder, PathReference, find_project_root
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,6 +46,8 @@ class Loop:
         session_name_generator (SessionNameGenerator): Session naming service.
         mention_manager (MentionManager): Mention resolution service.
         working_directory (PathReference): Current workspace-directory reference.
+        owns_session_name_generator (bool): Whether the naming service is a backend-dependent
+            default owned by this loop. Defaults to ``False`` for explicitly assembled loops.
 
     """
 
@@ -60,6 +62,7 @@ class Loop:
     _mention_manager: MentionManager
     _agent: Agent
     _agent_runner: AgentRunner
+    _owns_session_name_generator: bool
 
     def __init__(
         self,
@@ -70,6 +73,7 @@ class Loop:
         session_name_generator: SessionNameGenerator,
         mention_manager: MentionManager,
         working_directory: Path | PathReference,
+        owns_session_name_generator: bool = False,
     ) -> None:
         self._agent_runner = agent_runner
         self._agent = agent_runner.agent
@@ -80,6 +84,7 @@ class Loop:
         self._command_manager = command_manager
         self._completion_manager = completion_manager
         self._session_name_generator = session_name_generator
+        self._owns_session_name_generator = owns_session_name_generator
         self._mention_manager = mention_manager
         self._instructions_manager = agent_runner.instructions_manager
         self._permission_manager = agent_runner.permission_manager
@@ -149,6 +154,7 @@ class Loop:
                 session=session,
             )
         configured_interaction = interaction or configured_sessions.interaction
+        owns_name_generator = session_name_generator is None
         configured_name_generator = session_name_generator or BackendSessionNameGenerator(backend)
 
         restored_directory = configured_sessions.session.instruction_working_directory
@@ -219,7 +225,7 @@ class Loop:
             SessionCommands(configured_sessions, configured_name_generator),
             PermissionCommands(configured_permissions),
             SkillCommands(configured_instructions),
-            ToolCommands(configured_agent.tools, configured_instructions),
+            ToolCommands(configured_tools, configured_instructions),
             ModelCommands(configured_selection),
             CompactionCommands(configured_compaction),
         )
@@ -249,6 +255,7 @@ class Loop:
             session_name_generator=configured_name_generator,
             mention_manager=configured_mentions,
             working_directory=directory_reference,
+            owns_session_name_generator=owns_name_generator,
         )
 
     @property
@@ -289,12 +296,12 @@ class Loop:
 
     @property
     def tool_registry(self) -> ToolRegistry:
-        """Return the tools active for this conversation.
+        """Return the registry backing the active agent's live tool view.
 
         Returns:
-            ToolRegistry: Agent-scoped tool declarations and implementations.
+            ToolRegistry: Single owner of the agent's declarations and execution dependencies.
         """
-        return self._agent.tools
+        return self._agent.tools.registry
 
     def apply_runtime_settings(self, path: str, settings: ApplicationSettings) -> str:
         """Apply a supported live setting to the active loop.
@@ -319,7 +326,7 @@ class Loop:
         elif path == "loop.compaction_threshold":
             self._compaction.threshold = settings.loop.compaction_threshold
         elif path == "web.user_agent":
-            self._agent.tools.settings = ToolRuntimeSettings(user_agent=settings.web.user_agent)
+            self.tool_registry.settings.user_agent = settings.web.user_agent
         elif path == "loop.model":
             self._model_selection.restore(settings.loop.model)
         else:
@@ -336,6 +343,10 @@ class Loop:
         self._agent_runner.backend = backend
         self._model_selection.backend = backend
         self._compaction.backend = backend
+        if self._owns_session_name_generator and isinstance(
+            self._session_name_generator, BackendSessionNameGenerator
+        ):
+            self._session_name_generator.backend = backend
         self._model_selection.restore(self._model_selection.selected)
 
     @property

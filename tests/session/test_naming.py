@@ -2,6 +2,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -13,6 +14,7 @@ from loop import (
     normalize_session_name,
     validate_session_source,
 )
+from loop.session import GeneratedSessionName
 
 
 def test_initial_name_normalizes_whitespace_and_bounds_complete_words():
@@ -52,6 +54,25 @@ def test_backend_generator_requests_and_reads_structured_output():
     assert request["model"] == "model-a"
     assert request["output_format"].model is not None
     assert request["output_format"].schema["required"] == ["title"]
+
+
+def test_backend_generator_uses_its_replacement_backend():
+    """Replacing the backend routes every subsequent title request to the replacement."""
+    original = SimpleNamespace(get_response=Mock())
+    replacement = SimpleNamespace(
+        get_response=Mock(
+            return_value=[
+                ResponseCompleted(structured_output=GeneratedSessionName(title="Replacement title"))
+            ]
+        )
+    )
+    generator = BackendSessionNameGenerator(original)
+
+    generator.backend = replacement
+
+    assert generator.backend is replacement
+    assert generator.generate("question", "answer", None) == "Replacement title"
+    original.get_response.assert_not_called()
 
 
 def test_backend_generator_returns_none_without_structured_output():

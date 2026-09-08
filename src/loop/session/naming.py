@@ -101,6 +101,24 @@ class BackendSessionNameGenerator:
     def __init__(self, backend: Backend) -> None:
         self._backend = backend
 
+    @property
+    def backend(self) -> Backend:
+        """Return the backend used for session-name generation.
+
+        Returns:
+            Backend: Active session-name backend.
+        """
+        return self._backend
+
+    @backend.setter
+    def backend(self, backend: Backend) -> None:
+        """Replace the backend used for subsequent session-name requests.
+
+        Args:
+            backend (Backend): Fully configured replacement backend.
+        """
+        self._backend = backend
+
     def generate(self, user_message: str, assistant_message: str, model: str | None) -> str | None:
         """Generate a bounded name without adding content to the session.
 

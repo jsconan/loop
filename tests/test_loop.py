@@ -49,6 +49,7 @@ from loop import (
 )
 from loop.configuration import ApplicationSettings
 from loop.permissions import PermissionLoadFailure
+from loop.session import GeneratedSessionName
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.utils import PathHolder
 
@@ -121,6 +122,61 @@ def test_loop_replaces_shared_backend(tmp_path):
     loop.replace_backend(replacement)
 
     assert loop.backend is replacement
+    assert loop.agent_runner.backend is replacement
+    assert loop.agent_runner.model_selection.backend is replacement
+    assert loop.agent_runner.compaction.backend is replacement
+
+
+def test_loop_replaces_the_default_session_name_backend(tmp_path):
+    """Default title generation sends conversation excerpts only to the replacement backend."""
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", False]
+    old_backend = loop_backend(get_response=Mock())
+    replacement = loop_backend(
+        get_response=Mock(
+            side_effect=[
+                [ResponseCompleted(items=(Message(role="assistant", content="answer"),))],
+                [ResponseCompleted(structured_output=GeneratedSessionName(title="New backend"))],
+            ]
+        )
+    )
+    loop = Loop.create_default(
+        backend=old_backend,
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+
+    loop.replace_backend(replacement)
+    loop.run()
+
+    old_backend.get_response.assert_not_called()
+    assert replacement.get_response.call_count == 2
+    assert loop.session.name == "New backend"
+
+
+def test_loop_preserves_an_injected_name_generator_during_backend_replacement(tmp_path):
+    """Backend replacement never replaces or reconfigures an injected naming strategy."""
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["hello", False]
+    generator = Mock()
+    generator.generate.return_value = "Custom title"
+    replacement = loop_backend(
+        get_response=Mock(
+            return_value=[ResponseCompleted(items=(Message(role="assistant", content="answer"),))]
+        )
+    )
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        session_name_generator=generator,
+        working_directory=tmp_path,
+    )
+
+    loop.replace_backend(replacement)
+    loop.run()
+
+    generator.generate.assert_called_once_with("hello", "answer", "default-model")
+    assert loop.session.name == "Custom title"
 
 
 def test_loop_consumes_workspace_owned_path_reference(tmp_path):
@@ -1294,10 +1350,52 @@ def test_shared_backend_receives_each_loops_agent_scoped_tools(tmp_path):
 
     assert first.tool_registry is first_registry
     assert second.tool_registry is second_registry
+    assert first.tool_registry is first.agent.tools.registry
+    assert second.tool_registry is second.agent.tools.registry
+    assert first.agent.tools is not first.tool_registry
+    assert second.agent.tools is not second.tool_registry
     assert [request.kwargs["tools"][0].name for request in backend.get_response.call_args_list] == [
         "first_tool",
         "second_tool",
     ]
+
+
+def test_reused_tool_registry_keeps_agent_views_synchronized(tmp_path):
+    """Agents sharing a registry observe its live catalog without owning runtime state."""
+    declarations = ToolRegistry()
+    first_interaction = output_interaction()
+    second_interaction = output_interaction()
+    first_permissions = PermissionManager(tmp_path / "first", interaction=first_interaction)
+    second_permissions = PermissionManager(tmp_path / "second", interaction=second_interaction)
+
+    first = Loop.create_default(
+        backend=loop_backend(),
+        tool_registry=declarations,
+        interaction=first_interaction,
+        permission_manager=first_permissions,
+        working_directory=tmp_path,
+    )
+    second = Loop.create_default(
+        backend=loop_backend(),
+        tool_registry=declarations,
+        interaction=second_interaction,
+        permission_manager=second_permissions,
+        working_directory=tmp_path,
+    )
+
+    @tool
+    def inspect() -> str:
+        """Inspect the current state."""
+        return "ready"
+
+    declarations.register(inspect)
+
+    assert first.tool_registry is second.tool_registry is declarations
+    assert first.tool_registry is first.agent.tools.registry
+    assert second.tool_registry is second.agent.tools.registry
+    assert first.agent.tools.names == second.agent.tools.names == ["inspect"]
+    output, _ = first.agent.tools.call_with_timing("inspect", "{}")
+    assert json.loads(output) == {"ok": True, "result": "ready"}
 
 
 def test_loop_aligns_injected_session_capacity_with_backend(tmp_path):
