@@ -146,6 +146,14 @@ class ApplicationRuntime:
                 workspace_id=workspace.id,
             )
             cls._track_close(session_store, cleanup_callbacks)
+            permission_manager = PermissionManager(
+                workspace.root,
+                configuration_path=workspace_paths.permissions,
+                audit_path=paths.permissions_audit,
+                workspace_id=workspace.id,
+                interaction=interaction,
+            )
+            cls._track_close(permission_manager, cleanup_callbacks)
             loop = Loop.create_default(
                 backend,
                 interaction=interaction,
@@ -159,13 +167,7 @@ class ApplicationRuntime:
                     workspace_id=workspace.id,
                     workspace_root=workspace.root,
                 ),
-                permission_manager=PermissionManager(
-                    workspace.root,
-                    configuration_path=workspace_paths.permissions,
-                    audit_path=paths.permissions_audit,
-                    workspace_id=workspace.id,
-                    interaction=interaction,
-                ),
+                permission_manager=permission_manager,
                 session_manager=SessionManager(
                     interaction=interaction,
                     session_store=session_store,

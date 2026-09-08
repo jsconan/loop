@@ -165,6 +165,10 @@ class PermissionManager:
             raise ValueError("Permission preset identifiers must be unique.")
         self._presets = {preset.metadata.id: preset for preset in catalog}
 
+    def close(self) -> None:
+        """Release the manager-owned temporary directory."""
+        self._temporary_directory.cleanup()
+
     @property
     def configuration(self) -> PermissionConfiguration:
         """Return the persisted workspace policy.
