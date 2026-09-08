@@ -1,7 +1,7 @@
 """Adapt OpenAI-compatible APIs to conversation response events."""
 
 from base64 import b64encode
-from collections.abc import AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from json import dumps
@@ -189,7 +189,11 @@ class OpenAIBackend(Backend):
         self._reasoning_effort = reasoning_effort
         self._hyperparameter_policy = hyperparameter_policy
         self._unsupported_hyperparameters = {}
-        self._model_input_policy = ModelInputPolicy((api_key,) if api_key else ())
+        registered_secrets = (api_key,) if api_key and api_key != constants.DEFAULT_API_KEY else ()
+        self._model_input_policy = ModelInputPolicy(
+            registered_secrets,
+            reporter=self._report_model_input_redactions,
+        )
 
     @property
     def context_window(self) -> int | None:
@@ -294,6 +298,16 @@ class OpenAIBackend(Backend):
             stream=prepared.get("stream"),
         )
         return prepared
+
+    @staticmethod
+    def _report_model_input_redactions(counts: Mapping[str, int]) -> None:
+        """Record content-free model-input redaction counts by detector."""
+        for detector, count in counts.items():
+            telemetry_activity(
+                "gen_ai.input_redacted",
+                detector=detector,
+                count=count,
+            )
 
     @classmethod
     def _restore_opaque_reasoning_state(cls, original: object, prepared: object) -> None:

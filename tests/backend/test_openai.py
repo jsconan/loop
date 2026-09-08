@@ -957,14 +957,40 @@ def test_model_request_trace_matches_policy_prepared_sdk_arguments_exactly():
         set_telemetry(None)
 
     submitted = sdk.responses.create.call_args.kwargs
-    traced = thaw(adapter.records[0].payload)
+    request_record = next(
+        record for record in adapter.records if record.event_name == "gen_ai.request"
+    )
+    traced = thaw(request_record.payload)
     assert submitted == traced
     assert submitted["input"] == "contains <redacted:secret>"
     assert "registered-secret" not in repr(adapter.records)
     assert [record.event_name for record in adapter.records] == [
+        "gen_ai.input_redacted",
         "gen_ai.request",
         "gen_ai.response",
     ]
+    assert dict(adapter.records[0].attributes) == {
+        "detector": "registered_exact",
+        "count": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("api_key", "content"),
+    [
+        ("test", "Reviewed 6 test files and the test updates."),
+        ("local-api-key", "Document the local-api-key placeholder."),
+    ],
+)
+def test_weak_and_builtin_credentials_do_not_change_ordinary_model_text(api_key, content):
+    """Weak and built-in placeholder credentials preserve ordinary model-visible text."""
+    sdk = Mock()
+    sdk.responses.create.return_value = sdk_completion_event().response
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        list(OpenAIBackend(default_model="model", api_key=api_key).get_response(content))
+
+    assert sdk.responses.create.call_args.kwargs["input"] == content
 
 
 def test_native_text_attachment_is_redacted_before_encoding_and_traced_exactly():
@@ -1001,7 +1027,10 @@ def test_native_text_attachment_is_redacted_before_encoding_and_traced_exactly()
         set_telemetry(None)
 
     submitted = sdk.responses.create.call_args.kwargs
-    traced = thaw(adapter.records[0].payload)
+    request_record = next(
+        record for record in adapter.records if record.event_name == "gen_ai.request"
+    )
+    traced = thaw(request_record.payload)
     message = submitted["input"][0]
     manifest = message["content"][1]["text"]
     data_url = message["content"][2]["file_data"]
@@ -1014,6 +1043,15 @@ def test_native_text_attachment_is_redacted_before_encoding_and_traced_exactly()
     assert f'"included_bytes":{len(sanitized.encode())}' in manifest
     assert secret not in repr(submitted)
     assert secret not in repr(adapter.records)
+    redactions = [
+        dict(record.attributes)
+        for record in adapter.records
+        if record.event_name == "gen_ai.input_redacted"
+    ]
+    assert redactions == [
+        {"detector": "registered_exact", "count": 1},
+        {"detector": "registered_exact", "count": 1},
+    ]
 
 
 def test_sync_response_requests_and_validates_pydantic_structured_output():
