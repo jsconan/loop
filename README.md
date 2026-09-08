@@ -703,8 +703,10 @@ uv sync
 Run the test suite and linters:
 
 ```bash
-uv run pytest
+make test
 uv run ruff check .
+uv run ruff format --check .
+git diff --check
 uv run pylint src
 ```
 

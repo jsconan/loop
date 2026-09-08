@@ -67,7 +67,7 @@ Run the affected suite independently first:
 Then run the complete suite with strict coverage:
 
 ```shell
-.venv/bin/pytest --cov=loop --cov-report=term-missing --cov-fail-under=100
+.venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100
 ```
 
 After changing tests, run:
