@@ -1,5 +1,6 @@
 """Verify durable workspace identity repository behavior."""
 
+import json
 import shutil
 import sqlite3
 from contextlib import closing
@@ -9,6 +10,7 @@ from uuid import UUID
 
 import pytest
 
+from loop import Session, SQLiteSessionStore
 from loop.workspace import Workspace, WorkspaceRepository
 
 
@@ -214,9 +216,16 @@ def test_repository_attach_forget_rekey_and_conflicts(tmp_path: Path) -> None:
     assert not store.forget(first.id)
     attached = store.attach(first_path, first.id)
     assert attached.id == first.id
+    data = tmp_path / "app" / "workspaces" / first.id
+    session = Session(workspace_id=first.id)
+    SQLiteSessionStore(data / "sessions.db", workspace_id=first.id).save(session)
+    (data / "permissions.yaml").write_text("version: 2\n", encoding="utf-8")
     rekeyed = store.rekey(first_path)
     assert rekeyed.id != first.id
     assert store.list_by_path(first_path).id == rekeyed.id
+    copied = tmp_path / "app" / "workspaces" / rekeyed.id
+    assert SQLiteSessionStore(copied / "sessions.db", workspace_id=rekeyed.id).load(session.id)
+    assert (copied / "permissions.yaml").read_text() == "version: 2\n"
     with pytest.raises(FileNotFoundError):
         store.rekey(missing)
 
@@ -278,6 +287,9 @@ def test_repository_rolls_back_failed_rekey_transaction(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
     workspace = store.initialize(Workspace.discover(project))
+    data = tmp_path / "app" / "workspaces" / workspace.id
+    data.mkdir(parents=True)
+    (data / "preserved").touch()
     catalog = tmp_path / "app" / "workspaces.db"
     with closing(sqlite3.connect(catalog)) as connection, connection:
         connection.execute(
@@ -287,6 +299,78 @@ def test_repository_rolls_back_failed_rekey_transaction(tmp_path: Path) -> None:
     with pytest.raises(sqlite3.IntegrityError, match="blocked"):
         store.rekey(project)
     assert store.list_by_path(project).id == workspace.id
+    assert [path.name for path in data.parent.iterdir()] == [workspace.id]
+
+
+def test_repository_rekey_rejects_destination_conflicts_and_malformed_sessions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Rekey recovery removes failed copies and never overwrites an existing UUID directory."""
+    store = repository(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    workspace = store.initialize(Workspace.discover(project))
+    data_root = tmp_path / "app" / "workspaces"
+    old_data = data_root / workspace.id
+    old_data.mkdir(parents=True)
+    with closing(sqlite3.connect(old_data / "sessions.db")) as connection, connection:
+        connection.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, session TEXT NOT NULL)")
+        connection.execute("INSERT INTO sessions VALUES ('bad','not-json')")
+    with pytest.raises(json.JSONDecodeError):
+        store.rekey(project)
+    assert {path.name for path in data_root.iterdir()} == {workspace.id}
+
+    monkeypatch.setattr("loop.workspace.repository.uuid4", lambda: "fixed")
+    (data_root / "fixed").mkdir()
+    with pytest.raises(FileExistsError, match="already exists"):
+        store.rekey(project)
+
+
+def test_repository_rekey_handles_absent_data_non_session_databases_and_catalog_failure(
+    tmp_path: Path,
+) -> None:
+    """Rekey supports empty storage, opaque databases, and cleanup-free catalog rollback."""
+    empty_store = repository(tmp_path / "empty")
+    empty_project = tmp_path / "empty-project"
+    empty_project.mkdir()
+    empty_workspace = empty_store.initialize(Workspace.discover(empty_project))
+    assert empty_store.rekey(empty_project).id != empty_workspace.id
+
+    store = repository(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    workspace = store.initialize(Workspace.discover(project))
+    data = tmp_path / "app" / "workspaces" / workspace.id
+    data.mkdir(parents=True)
+    with closing(sqlite3.connect(data / "sessions.db")) as connection, connection:
+        connection.execute("CREATE TABLE unrelated(value TEXT)")
+    assert store.rekey(project).id != workspace.id
+
+    failed_store = repository(tmp_path / "failed")
+    failed_project = tmp_path / "failed-project"
+    failed_project.mkdir()
+    failed = failed_store.initialize(Workspace.discover(failed_project))
+    catalog = tmp_path / "failed" / "app" / "workspaces.db"
+    with closing(sqlite3.connect(catalog)) as connection, connection:
+        connection.execute(
+            "CREATE TRIGGER reject_empty_rekey BEFORE INSERT ON workspaces "
+            "BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="blocked"):
+        failed_store.rekey(failed_project)
+    assert failed_store.list_by_path(failed_project).id == failed.id
+
+
+def test_repository_rediscovery_after_forget_creates_a_new_active_identity(tmp_path: Path) -> None:
+    """An inactive location does not silently resurrect its forgotten identity."""
+    store = repository(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    original = store.initialize(Workspace.discover(project))
+    assert store.forget(project)
+    replacement = store.initialize(Workspace.discover(project))
+    assert replacement.id != original.id
+    assert store.list_by_path(project).id == replacement.id
 
 
 def test_repository_relocates_legacy_identity_when_locators_are_unavailable(

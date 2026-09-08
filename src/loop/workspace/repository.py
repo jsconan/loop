@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import sqlite3
 import sys
 import time
@@ -19,12 +21,24 @@ class WorkspaceRepository:
 
     Args:
         catalog (Path | str): Immutable application workspace-catalog path.
+        workspace_data_root (Path | str | None): UUID-scoped data root. Defaults to the
+            ``workspaces`` directory beside the catalog.
     """
 
     _catalog: Path
+    _workspace_data_root: Path
 
-    def __init__(self, catalog: Path | str) -> None:
+    def __init__(
+        self,
+        catalog: Path | str,
+        workspace_data_root: Path | str | None = None,
+    ) -> None:
         self._catalog = Path(catalog).resolve()
+        self._workspace_data_root = (
+            Path(workspace_data_root).resolve()
+            if workspace_data_root is not None
+            else self._catalog.parent / "workspaces"
+        )
 
     def initialize(
         self,
@@ -58,7 +72,8 @@ class WorkspaceRepository:
             row = connection.execute(
                 "SELECT w.workspace_id, w.name, w.name_source, w.created_at_ns, w.updated_at_ns "
                 "FROM workspaces AS w JOIN workspace_locations AS l "
-                "ON l.workspace_id = w.workspace_id WHERE l.canonical_path = ?",
+                "ON l.workspace_id = w.workspace_id "
+                "WHERE l.canonical_path = ? AND l.status = 'active'",
                 (str(workspace.root),),
             ).fetchone()
             relocated = False
@@ -114,7 +129,11 @@ class WorkspaceRepository:
                         "INSERT INTO workspace_locations("
                         "location_id, workspace_id, canonical_path, first_seen_at_ns, "
                         "last_seen_at_ns, status, locator_kind, locator) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(canonical_path) DO UPDATE SET "
+                        "workspace_id=excluded.workspace_id,locator_kind=excluded.locator_kind,"
+                        "locator=excluded.locator,first_seen_at_ns=excluded.first_seen_at_ns,"
+                        "last_seen_at_ns=excluded.last_seen_at_ns,status='active'",
                         (
                             str(uuid4()),
                             row[0],
@@ -350,31 +369,46 @@ class WorkspaceRepository:
         workspace_id = str(uuid4())
         name = root.name or "Untitled workspace"
         source: WorkspaceNameSource = "directory" if root.name else "default"
-        with closing(self._connect(constants.DEFAULT_STORAGE_SQLITE_BUSY_TIMEOUT_MS)) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                connection.execute(
-                    "INSERT INTO workspaces("
-                    "workspace_id,name,name_source,created_at_ns,updated_at_ns) "
-                    "VALUES (?,?,?,?,?)",
-                    (workspace_id, name, source, now, now),
-                )
-                cursor = connection.execute(
-                    "UPDATE workspace_locations SET workspace_id=?,locator_kind=?,locator=?,"
-                    "last_seen_at_ns=?,status='active' WHERE canonical_path=?",
-                    (workspace_id, kind, locator, now, str(root)),
-                )
-                if cursor.rowcount == 0:
+        previous = self.list_by_path(root)
+        if previous is None:
+            legacy = self._legacy_identity(root)
+            previous_id = legacy[0] if legacy is not None else None
+        else:
+            previous_id = previous.id
+        copied_data = self._copy_rekey_data(previous_id, workspace_id)
+        try:
+            with closing(
+                self._connect(constants.DEFAULT_STORAGE_SQLITE_BUSY_TIMEOUT_MS)
+            ) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
                     connection.execute(
-                        "INSERT INTO workspace_locations(location_id,workspace_id,canonical_path,"
-                        "locator_kind,locator,first_seen_at_ns,last_seen_at_ns,status) "
-                        "VALUES (?,?,?,?,?,?,?,'active')",
-                        (str(uuid4()), workspace_id, str(root), kind, locator, now, now),
+                        "INSERT INTO workspaces("
+                        "workspace_id,name,name_source,created_at_ns,updated_at_ns) "
+                        "VALUES (?,?,?,?,?)",
+                        (workspace_id, name, source, now, now),
                     )
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+                    cursor = connection.execute(
+                        "UPDATE workspace_locations SET workspace_id=?,locator_kind=?,locator=?,"
+                        "last_seen_at_ns=?,status='active' WHERE canonical_path=?",
+                        (workspace_id, kind, locator, now, str(root)),
+                    )
+                    if cursor.rowcount == 0:
+                        connection.execute(
+                            "INSERT INTO workspace_locations("
+                            "location_id,workspace_id,canonical_path,"
+                            "locator_kind,locator,first_seen_at_ns,last_seen_at_ns,status) "
+                            "VALUES (?,?,?,?,?,?,?,'active')",
+                            (str(uuid4()), workspace_id, str(root), kind, locator, now, now),
+                        )
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+        except BaseException:
+            if copied_data is not None:
+                shutil.rmtree(copied_data)
+            raise
         return Workspace(root, root, workspace_id, name, source, now, now)
 
     def list_by_path(self, path: Path | str) -> Workspace | None:
@@ -424,12 +458,58 @@ class WorkspaceRepository:
             stat = path.stat()
         except OSError:
             return None, None
-        kind = (
-            "windows_file"
-            if sys.platform == "win32"
-            else ("macos_resource" if sys.platform == "darwin" else "posix_inode")
-        )
+        kind = "windows_volume_file" if sys.platform == "win32" else "posix_inode"
         return kind, f"{stat.st_dev}:{stat.st_ino}".encode("ascii")
+
+    def _copy_rekey_data(self, previous_id: str | None, workspace_id: str) -> Path | None:
+        """Copy UUID-scoped data and rewrite embedded session ownership."""
+        if previous_id is None:
+            return None
+        source = self._workspace_data_root / previous_id
+        if not source.is_dir():
+            return None
+        destination = self._workspace_data_root / workspace_id
+        temporary = destination.with_name(f".{workspace_id}.rekey.tmp")
+        if destination.exists() or temporary.exists():
+            raise FileExistsError(f"Rekey destination already exists: {destination}")
+        shutil.copytree(source, temporary)
+        try:
+            sessions = temporary / constants.SESSION_DATABASE_FILENAME
+            source_sessions = source / constants.SESSION_DATABASE_FILENAME
+            if source_sessions.is_file():
+                sessions.unlink(missing_ok=True)
+                sessions.with_name(f"{sessions.name}-wal").unlink(missing_ok=True)
+                sessions.with_name(f"{sessions.name}-shm").unlink(missing_ok=True)
+                with (
+                    closing(sqlite3.connect(source_sessions)) as source_connection,
+                    closing(sqlite3.connect(sessions)) as destination_connection,
+                ):
+                    source_connection.backup(destination_connection)
+                with (  # pylint: disable=confusing-with-statement
+                    closing(sqlite3.connect(sessions)) as connection,
+                    connection,
+                ):
+                    tables = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        )
+                    }
+                    if "sessions" in tables:
+                        for session_id, payload in connection.execute(
+                            "SELECT id, session FROM sessions"
+                        ).fetchall():
+                            value = json.loads(payload)
+                            value["workspace_id"] = workspace_id
+                            connection.execute(
+                                "UPDATE sessions SET session=? WHERE id=?",
+                                (json.dumps(value, separators=(",", ":")), session_id),
+                            )
+            temporary.replace(destination)
+            return destination
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
 
     @staticmethod
     def _refresh_directory_name(

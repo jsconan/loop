@@ -132,3 +132,23 @@ def test_main_closes_active_runtime_before_rebuilding_for_workspace_switch(monke
     first.close.assert_called_once_with()
     assert runtime_factory.call_args_list[1].args[0] is target
     second.close.assert_called_once_with()
+
+
+def test_main_restores_previous_runtime_when_switch_rebuild_fails(monkeypatch):
+    """A failed target composition rebuilds and continues the previous workspace."""
+    target = Workspace(Path("/target"), Path("/target"), "target", "target", "directory", 2, 2)
+    first = Mock()
+    first.run.side_effect = WorkspaceSwitchRequested(target)
+    restored = Mock()
+    runtime_factory = Mock(side_effect=[first, RuntimeError("target failed"), restored])
+    interaction = Mock()
+    monkeypatch.setattr(main, "ConsoleInteraction", Mock(return_value=interaction))
+    monkeypatch.setattr(main, "ApplicationRuntime", Mock(create=runtime_factory))
+    monkeypatch.setattr(main, "register_shutdown_signals", Mock())
+
+    main.main()
+
+    assert runtime_factory.call_args_list[1].args[0] is target
+    assert runtime_factory.call_args_list[2].args[0].id == "id"
+    assert "restored workspace id" in interaction.warning.call_args.args[0]
+    restored.close.assert_called_once_with()

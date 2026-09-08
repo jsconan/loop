@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -16,13 +17,27 @@ class WorkspaceSwitchRequested(Exception):
 
     Args:
         workspace (Workspace): Initialized target workspace.
+        on_complete (Callable[[], None] | None): Callback releasing the switch lifecycle token.
     """
 
     workspace: Workspace
+    _on_complete: Callable[[], None] | None
 
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        on_complete: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__(f"Switch to workspace {workspace.id}")
         self.workspace = workspace
+        self._on_complete = on_complete
+
+    def complete(self) -> None:
+        """Release the owned switch lifecycle token exactly once."""
+        callback = self._on_complete
+        self._on_complete = None
+        if callable(callback):
+            callback()
 
 
 @dataclass(slots=True)

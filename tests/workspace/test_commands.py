@@ -65,6 +65,8 @@ def test_workspace_commands_reject_invalid_names_and_arguments(commands):
         commands.workspace(context, "show", "unused")
     with pytest.raises(CommandArgumentError, match="non-empty"):
         commands.workspace(context, "rename", " ")
+    with pytest.raises(CommandArgumentError, match="Only attach"):
+        commands.workspace(context, "rename", "name", "identity")
 
 
 def test_workspace_commands_require_initialized_identity(tmp_path):
@@ -95,6 +97,24 @@ def test_workspace_lifecycle_commands_confirm_mutations_and_report_conflicts(com
         commands.workspace(context, "forget", str(tmp_path / "missing"))
 
 
+def test_workspace_attach_forwards_an_explicit_existing_identity(tmp_path):
+    """The command surface can explicitly associate a path with a chosen identity."""
+    workspace = Workspace(tmp_path, tmp_path, "active", "active", "directory", 1, 1)
+    repository = Mock()
+    repository.attach.return_value = workspace
+    _commands = WorkspaceCommands(workspace, repository)
+
+    interaction = Mock()
+    interaction.confirm.side_effect = [False, True]
+    context = CommandContext("workspace", interaction)
+
+    _commands.workspace(context, "attach", str(tmp_path), "chosen")
+    repository.attach.assert_not_called()
+    _commands.workspace(context, "attach", str(tmp_path), "chosen")
+
+    repository.attach.assert_called_once_with(str(tmp_path), "chosen")
+
+
 def test_workspace_switch_resolves_target_before_signalling_rebuild(commands, tmp_path):
     """Switch requests carry a resolved identity and reject unknown targets."""
     target = tmp_path / "target"
@@ -102,5 +122,9 @@ def test_workspace_switch_resolves_target_before_signalling_rebuild(commands, tm
     with pytest.raises(WorkspaceSwitchRequested) as request:
         commands.workspace(CommandContext("workspace", Mock()), "switch", str(target))
     assert request.value.workspace.root == target
+    with pytest.raises(CommandArgumentError, match="already in progress"):
+        commands.workspace(CommandContext("workspace", Mock()), "switch", str(target))
+    request.value.complete()
+    request.value.complete()
     with pytest.raises(ValueError, match="Unknown"):
         commands.workspace(CommandContext("workspace", Mock()), "switch", "missing-id")

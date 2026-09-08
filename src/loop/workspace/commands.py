@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Annotated, Literal
 
 from pydantic import Field
@@ -22,12 +23,14 @@ class WorkspaceCommands:
 
     _workspace: Workspace
     _repository: WorkspaceRepository
+    _switch_lock: threading.Lock
 
     def __init__(self, workspace: Workspace, repository: WorkspaceRepository) -> None:
         if workspace.id is None:
             raise ValueError("Workspace commands require an initialized workspace.")
         self._workspace = workspace
         self._repository = repository
+        self._switch_lock = threading.Lock()
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return the workspace command registration.
@@ -68,6 +71,7 @@ class WorkspaceCommands:
             ),
         )
 
+    # pylint: disable-next=too-many-branches
     def workspace(
         self,
         context: CommandContext,
@@ -78,10 +82,15 @@ class WorkspaceCommands:
         name: Annotated[
             str | None, Field(description="Name, path, or workspace identifier for the operation.")
         ] = None,
+        workspace_id: Annotated[
+            str | None, Field(description="Existing identity to associate during attach.")
+        ] = None,
     ) -> None:
         """List registered workspaces, show the active workspace, or rename it."""
-        if action in {"list", "show"} and name is not None:
+        if action in {"list", "show"} and (name is not None or workspace_id is not None):
             raise CommandArgumentError(f"The {action} operation does not accept a name.")
+        if action != "attach" and workspace_id is not None:
+            raise CommandArgumentError("Only attach accepts an existing workspace identity.")
         if action == "rename":
             if name is None or not name.strip():
                 raise CommandArgumentError("The rename operation requires a non-empty name.")
@@ -93,9 +102,23 @@ class WorkspaceCommands:
                 raise CommandArgumentError(f"The {action} operation requires a path or identity.")
             value = name.strip()
             if action == "switch":
-                raise WorkspaceSwitchRequested(self._repository.resolve(value))
+                if not self._switch_lock.acquire(  # pylint: disable=consider-using-with
+                    blocking=False
+                ):
+                    raise CommandArgumentError("A workspace switch is already in progress.")
+                try:
+                    target = self._repository.resolve(value)
+                except BaseException:
+                    self._switch_lock.release()
+                    raise
+                raise WorkspaceSwitchRequested(target, self._switch_lock.release)
             if action == "attach":
-                attached = self._repository.attach(value)
+                if workspace_id is not None and not context.interaction.confirm(
+                    f"Associate {value} with workspace {workspace_id}?", default=False
+                ):
+                    context.interaction.info("Workspace attach cancelled.")
+                    return
+                attached = self._repository.attach(value, workspace_id)
                 context.interaction.info(f"Attached workspace {attached.id} at {attached.root}.")
                 return
             if not context.interaction.confirm(

@@ -20,7 +20,7 @@ from .workspace import (
 _LOGGER = logging.getLogger(__name__)
 
 
-def main() -> None:
+def main() -> None:  # pylint: disable=too-many-branches
     """Run an interactive conversation with an LLM backend."""
     interaction = None
     runtime = None
@@ -33,34 +33,27 @@ def main() -> None:
         register_shutdown_signals()
         interaction.info("Hello from loop!")
         while True:
-            workspace_paths = paths.for_workspace(workspace.id, workspace.root)
-            configuration = ConfigurationManager(
-                paths.user_configuration,
-                workspace_paths.configuration,
-            )
-            configuration.initialize()
-            settings = configuration.load()
-            ApplicationMigration(
-                workspace,
-                paths,
-                workspace_paths,
-                busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
-            ).run()
-            runtime = ApplicationRuntime.create(
-                workspace,
-                paths,
-                workspace_paths,
-                settings,
-                configuration,
-                repository,
-                interaction,
-            )
+            if runtime is None:
+                runtime = _build_runtime(workspace, paths, repository, interaction)
             try:
                 runtime.run()
             except WorkspaceSwitchRequested as request:
-                runtime.close()
-                runtime = None
-                workspace = request.workspace
+                previous = workspace
+                try:
+                    runtime.close()
+                    runtime = None
+                    workspace = request.workspace
+                    try:
+                        runtime = _build_runtime(workspace, paths, repository, interaction)
+                    except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
+                        workspace = previous
+                        interaction.warning(
+                            f"Workspace switch failed ({type(error).__name__}); restored "
+                            f"workspace {previous.id}."
+                        )
+                        runtime = _build_runtime(workspace, paths, repository, interaction)
+                finally:
+                    request.complete()
                 continue
             break
     except (EOFError, KeyboardInterrupt, ShutdownRequested):
@@ -84,6 +77,34 @@ def main() -> None:
             runtime.close()
         else:
             set_telemetry(None)
+
+
+def _build_runtime(
+    workspace: Workspace,
+    paths: ApplicationPaths,
+    repository: WorkspaceRepository,
+    interaction: ConsoleInteraction,
+) -> ApplicationRuntime:
+    """Build every workspace-owned service for one resolved identity."""
+    workspace_paths = paths.for_workspace(workspace.id, workspace.root)
+    configuration = ConfigurationManager(paths.user_configuration, workspace_paths.configuration)
+    configuration.initialize()
+    settings = configuration.load()
+    ApplicationMigration(
+        workspace,
+        paths,
+        workspace_paths,
+        busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
+    ).run()
+    return ApplicationRuntime.create(
+        workspace,
+        paths,
+        workspace_paths,
+        settings,
+        configuration,
+        repository,
+        interaction,
+    )
 
 
 if __name__ == "__main__":
