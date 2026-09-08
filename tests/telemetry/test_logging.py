@@ -22,12 +22,21 @@ def test_legacy_log_import_is_streaming_idempotent_and_normalizes_records(tmp_pa
     destination.write_text("not-json\n{}\n", encoding="utf-8")
     (destination.parent / "loop.log.1").write_text('{"migration_id":"known"}\n', encoding="utf-8")
 
-    assert import_legacy_operational_log(source, destination) == 3
-    assert import_legacy_operational_log(source, destination) == 0
+    assert import_legacy_operational_log(source, destination, workspace_id="workspace") == 3
+    moved = tmp_path / "moved.log"
+    source.rename(moved)
+    assert import_legacy_operational_log(moved, destination, workspace_id="workspace") == 0
     values = [json.loads(line) for line in destination.read_text().splitlines()[2:]]
     assert values[0]["event.name"] == "one"
+    assert values[0]["workspace_id"] == "workspace"
     assert values[1]["message"] == "scalar"
     assert values[2]["message"] == "malformed"
+
+    fallback_source = tmp_path / "unowned.log"
+    fallback_destination = tmp_path / "fallback" / "loop.log"
+    fallback_source.write_text("legacy\n", encoding="utf-8")
+    assert import_legacy_operational_log(fallback_source, fallback_destination) == 1
+    assert import_legacy_operational_log(fallback_source, fallback_destination) == 0
 
 
 def test_safe_formatter_excludes_exception_contents_and_normalizes_fields():

@@ -14,12 +14,18 @@ from .. import constants
 from ..utils import PrivateRotatingTextFile, sha256_digest
 
 
-def import_legacy_operational_log(source: Path | str, destination: Path | str) -> int:
+def import_legacy_operational_log(
+    source: Path | str,
+    destination: Path | str,
+    *,
+    workspace_id: str | None = None,
+) -> int:
     """Idempotently append legacy operational records to the central log.
 
     Args:
         source (Path | str): Legacy operational log path.
         destination (Path | str): Central operational log path.
+        workspace_id (str | None): Stable workspace identity assigned to imported records.
 
     Returns:
         int: Number of newly imported records.
@@ -49,7 +55,8 @@ def import_legacy_operational_log(source: Path | str, destination: Path | str) -
             target.open("a", encoding="utf-8") as output,
         ):
             for line_number, line in enumerate(input_file, 1):
-                migration_id = sha256_digest(f"{legacy}:{line_number}:{line}")
+                source_identity = workspace_id or str(legacy)
+                migration_id = sha256_digest(f"{source_identity}:{line_number}:{line}")
                 if migration_id in known:
                     continue
                 try:
@@ -59,6 +66,8 @@ def import_legacy_operational_log(source: Path | str, destination: Path | str) -
                 if not isinstance(value, dict):
                     value = {"message": value, "level": "UNKNOWN"}
                 value["migration_id"] = migration_id
+                if workspace_id is not None:
+                    value["workspace_id"] = workspace_id
                 output.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
                 imported += 1
         target.chmod(constants.PRIVATE_FILE_MODE)

@@ -91,6 +91,7 @@ class ApplicationMigration:
         import_legacy_operational_log(
             log_source,
             self._application_paths.operational_log,
+            workspace_id=self._workspace.id,
         )
         try:
             marker.touch(mode=constants.PRIVATE_FILE_MODE, exist_ok=True)

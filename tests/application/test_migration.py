@@ -70,6 +70,7 @@ def test_migration_coordinates_owned_importers_and_copies_policy(tmp_path) -> No
     imported_log = json.loads(paths.operational_log.read_text(encoding="utf-8"))
     assert imported_log["event.name"] == "legacy"
     assert imported_log["migration_id"]
+    assert imported_log["workspace_id"] == "id"
     assert all(path.exists() for path in legacy.iterdir())
     marker = legacy / ".central-storage-v1"
     assert marker.read_bytes() == b""
