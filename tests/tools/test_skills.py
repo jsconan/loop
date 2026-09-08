@@ -16,7 +16,7 @@ from loop import (
     ToolRegistry,
 )
 
-tool_registry = ToolRegistry(BUILTIN_TOOLS)
+tool_registry: ToolRegistry
 
 
 def decoded(output: str):

@@ -27,7 +27,7 @@ from loop.tools.system import run_command as run_command_tool
 
 # pylint: disable=unused-argument, redefined-outer-name
 
-tool_registry = ToolRegistry(BUILTIN_TOOLS)
+tool_registry: ToolRegistry
 
 
 @pytest.fixture(autouse=True)

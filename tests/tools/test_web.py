@@ -23,7 +23,7 @@ from loop.tools import web as web_module
 from loop.utils import cached_path as resolve_cached_path
 from loop.utils import encode_content_cursor
 
-tool_registry = ToolRegistry(BUILTIN_TOOLS)
+tool_registry: ToolRegistry
 
 
 @pytest.fixture(autouse=True)

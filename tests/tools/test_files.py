@@ -25,7 +25,7 @@ from loop.tools.files import edit_text_file as edit_text_file_tool
 from loop.tools.files import list_folder as list_folder_tool
 from loop.tools.files import write_text_file as write_text_file_tool
 
-tool_registry = ToolRegistry(BUILTIN_TOOLS)
+tool_registry: ToolRegistry
 
 
 def dispatched_value(output: str):
