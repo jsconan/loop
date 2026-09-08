@@ -10,6 +10,7 @@ __all__ = [
     "ToolRegistration",
     "ToolRegistrationError",
     "ToolRegistry",
+    "ToolRegistryView",
     "ToolRuntimeSettings",
     "ToolStatus",
     "get_tool_arguments_model",
@@ -33,7 +34,7 @@ from .models import (
     ToolStatus,
 )
 from .tool import Tool, ToolRegistration, tool
-from .tool_registry import ToolRegistry
+from .tool_registry import ToolRegistry, ToolRegistryView
 from .utils import (
     get_tool_arguments_model,
     get_tool_description,

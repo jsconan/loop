@@ -1,5 +1,7 @@
 """Register and dispatch typed functions exposed to an LLM."""
 
+from __future__ import annotations
+
 import logging
 from collections.abc import Callable, Iterable
 from time import perf_counter
@@ -140,6 +142,15 @@ class ToolRegistry:
             list[Tool]: Registered tools.
         """
         return sorted(self._tools.values(), key=lambda tool: tool.name.casefold())
+
+    def view(self) -> ToolRegistryView:
+        """Return a live agent-facing view of this registry.
+
+        Returns:
+            ToolRegistryView: Restricted facade backed by this registry's current catalog and
+                execution path.
+        """
+        return ToolRegistryView(self)
 
     @property
     def names(self) -> list[str]:
@@ -693,4 +704,96 @@ class ToolRegistry:
                 authorize_additional if permission_manager is not None else None
             ),
             settings=self._settings,
+        )
+
+
+class ToolRegistryView:
+    """Expose one live tool registry to an agent without duplicating its state.
+
+    Args:
+        registry (ToolRegistry): Registry owning declarations and runtime execution dependencies.
+    """
+
+    _registry: ToolRegistry
+
+    def __init__(self, registry: ToolRegistry) -> None:
+        self._registry = registry
+
+    @property
+    def registry(self) -> ToolRegistry:
+        """Return the single registry backing this live view.
+
+        Returns:
+            ToolRegistry: Registry owning the tool catalog and execution dependencies.
+        """
+        return self._registry
+
+    @property
+    def tools(self) -> list[Tool]:
+        """Return the registry's currently registered tools.
+
+        Returns:
+            list[Tool]: Registered tools sorted by name.
+        """
+        return self._registry.tools
+
+    @property
+    def names(self) -> list[str]:
+        """Return the registry's current tool names.
+
+        Returns:
+            list[str]: Registered tool names sorted alphabetically.
+        """
+        return self._registry.names
+
+    @property
+    def registration_problems(self) -> tuple[Problem, ...]:
+        """Return current diagnostics from skipped registrations.
+
+        Returns:
+            tuple[Problem, ...]: Registration problems in discovery order.
+        """
+        return self._registry.registration_problems
+
+    def definitions(self) -> list[ToolDefinition]:
+        """Return definitions for the registry's current tools.
+
+        Returns:
+            list[ToolDefinition]: Function-tool definitions in registration order.
+        """
+        return self._registry.definitions()
+
+    def call_with_timing(
+        self,
+        name: str,
+        arguments: str,
+        *,
+        interaction: Interaction | None = None,
+        instructions_manager: InstructionsManager | None = None,
+        permission_manager: PermissionManager | None = None,
+        call_id: str | None = None,
+        execution_started: Callable[[], None] | None = None,
+    ) -> tuple[str, float]:
+        """Dispatch through the owning registry and measure tool execution.
+
+        Args:
+            name (str): Registered tool name.
+            arguments (str): JSON-encoded arguments supplied by the model.
+            interaction (Interaction | None): Interaction for this invocation.
+            instructions_manager (InstructionsManager | None): Active instruction manager.
+            permission_manager (PermissionManager | None): Invocation permission policy.
+            call_id (str | None): Stable model request identifier.
+            execution_started (Callable[[], None] | None): Callback run before tool execution.
+
+        Returns:
+            tuple[str, float]: Serialized result and tool-function duration in seconds.
+        """
+        return self._registry.call_with_timing(
+            name,
+            arguments,
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+            permission_manager=permission_manager,
+            call_id=call_id,
+            execution_started=execution_started,
         )

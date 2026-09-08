@@ -29,6 +29,7 @@ from loop.tooling import (
     ToolRegistration,
     ToolRegistrationError,
     ToolRegistry,
+    ToolRegistryView,
     ToolRuntimeSettings,
     ToolStatus,
 )
@@ -494,6 +495,62 @@ def test_definitions_preserve_registration_order():
 
     assert [definition.name for definition in registry.definitions()] == ["calculate", "second"]
     assert registry.names == ["calculate", "second"]
+
+
+def test_registry_view_exposes_the_live_registry_catalog():
+    """A registry view reflects later registrations and preserves the owning registry identity."""
+    registry = ToolRegistry()
+    view = registry.view()
+
+    assert isinstance(view, ToolRegistryView)
+    assert view.registry is registry
+    assert view.tools == []
+    assert view.names == []
+    assert view.registration_problems == ()
+
+    register(registry)
+
+    assert [tool.name for tool in view.tools] == ["calculate"]
+    assert view.names == ["calculate"]
+    assert view.registration_problems == ()
+
+
+def test_registry_view_forwards_definitions_and_timed_calls():
+    """A registry view forwards definitions and every timed-call option to its registry."""
+    registry = Mock(spec=ToolRegistry)
+    definitions = [Mock()]
+    timed_result = ("result", 1.5)
+    registry.definitions.return_value = definitions
+    registry.call_with_timing.return_value = timed_result
+    view = ToolRegistryView(registry)
+    execution_started = Mock()
+    interaction = Mock(spec=Interaction)
+    instructions_manager = Mock(spec=InstructionsManager)
+    permission_manager = Mock(spec=PermissionManager)
+
+    assert view.definitions() is definitions
+    assert (
+        view.call_with_timing(
+            "calculate",
+            '{"number": 3}',
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+            permission_manager=permission_manager,
+            call_id="call-123",
+            execution_started=execution_started,
+        )
+        == timed_result
+    )
+    registry.definitions.assert_called_once_with()
+    registry.call_with_timing.assert_called_once_with(
+        "calculate",
+        '{"number": 3}',
+        interaction=interaction,
+        instructions_manager=instructions_manager,
+        permission_manager=permission_manager,
+        call_id="call-123",
+        execution_started=execution_started,
+    )
 
 
 def test_interaction_property_can_be_replaced_and_cleared():

@@ -2,7 +2,7 @@
 
 import pytest
 
-from loop import Agent, AgentIdentity, AgentInstructions, ToolRegistry
+from loop import Agent, AgentIdentity, AgentInstructions, ToolRegistry, tool
 
 
 def test_agent_instructions_load_render_and_digest_the_bundled_contract():
@@ -47,8 +47,27 @@ def test_agent_exposes_its_identity_instructions_and_tools():
     assert agent.name == "Reviewer"
     assert agent.identity.description == "Reviews code."
     assert agent.instructions is instructions
-    assert agent.tools is tools
+    assert agent.tools is not tools
+    assert agent.tools.names == tools.names
     assert "Review carefully." in agent.render()
+
+
+def test_agent_tool_view_tracks_its_owning_registry():
+    """Agent tool declarations stay synchronized with their live owning registry."""
+    registry = ToolRegistry()
+    agent = Agent("Assistant", tools=registry)
+
+    @tool
+    def inspect() -> str:
+        """Inspect the current state."""
+        return "ready"
+
+    registry.register(inspect)
+
+    assert agent.tools.names == ["inspect"]
+    assert [registered.name for registered in agent.tools.tools] == ["inspect"]
+    assert [definition.name for definition in agent.tools.definitions()] == ["inspect"]
+    assert agent.tools.registration_problems == ()
 
 
 def test_agent_renders_only_explicit_identity_placeholders():

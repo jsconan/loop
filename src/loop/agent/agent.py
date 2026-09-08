@@ -7,7 +7,7 @@ from html import escape
 from importlib.resources import files
 
 from ..constants import DEFAULT_AGENT_INSTRUCTIONS_SOURCE, DEFAULT_AGENT_INSTRUCTIONS_VERSION
-from ..tooling import ToolRegistry
+from ..tooling import ToolRegistry, ToolRegistryView
 from ..utils import sha256_digest
 
 
@@ -117,16 +117,19 @@ class Agent:
         identity (AgentIdentity | str): Agent identity or a non-empty shorthand name.
         instructions (AgentInstructions): Intrinsic model-facing behavior. Defaults to Loop's
             bundled instructions.
-        tools (ToolRegistry): Tools exposed to the model. Defaults to an empty registry.
+        tools (ToolRegistry | ToolRegistryView): Live view of the tools exposed to the model, or
+            the owning registry from which to create that view. Defaults to an empty registry.
     """
 
     identity: AgentIdentity | str
     instructions: AgentInstructions = field(default_factory=AgentInstructions.default)
-    tools: ToolRegistry = field(default_factory=ToolRegistry)
+    tools: ToolRegistry | ToolRegistryView = field(default_factory=ToolRegistry)
 
     def __post_init__(self) -> None:
         if isinstance(self.identity, str):
             object.__setattr__(self, "identity", AgentIdentity(self.identity))
+        if isinstance(self.tools, ToolRegistry):
+            object.__setattr__(self, "tools", self.tools.view())
 
     @property
     def name(self) -> str:
