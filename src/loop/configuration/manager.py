@@ -28,6 +28,7 @@ _ENVIRONMENT_FIELDS = {
     "OPENAI_REASONING_EFFORT": ("backend", "reasoning_effort"),
     "OPENAI_HYPERPARAMETER_POLICY": ("backend", "hyperparameter_policy"),
     "USER_AGENT": ("web", "user_agent"),
+    "LOOP_COMMAND_TIMEOUT": ("tools", "command_timeout"),
     "LOOP_AGENT_NAME": ("loop", "agent_name"),
     "LOOP_MODEL": ("loop", "model"),
     "LOOP_STREAM": ("loop", "stream"),

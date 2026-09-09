@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ..constants import DEFAULT_USER_AGENT
+from ..constants import DEFAULT_COMMAND_TIMEOUT, DEFAULT_USER_AGENT
 from ..models import StrEnum
 
 
@@ -43,6 +43,8 @@ class ToolRuntimeSettings:
 
     Args:
         user_agent (str): HTTP user-agent used by web-content tools.
+        command_timeout (float): Complete subprocess lifecycle limit used by command tools.
     """
 
     user_agent: str = DEFAULT_USER_AGENT
+    command_timeout: float = DEFAULT_COMMAND_TIMEOUT

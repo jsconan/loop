@@ -104,7 +104,7 @@ def _cleanup_process(
     _join_readers(readers, deadline)
 
 
-def _timeout_error(timeout: int = constants.COMMAND_TIMEOUT_SECONDS) -> Problem:
+def _timeout_error(timeout: float) -> Problem:
     """Return a standardized timeout error problem."""
     return Problem(
         code="process.timeout",
@@ -156,8 +156,9 @@ def run_command(
     """Run a shell-free process and return its output."""
     process = None
     started_readers = []
-    deadline = time.monotonic() + constants.COMMAND_TIMEOUT_SECONDS
-    cleanup_reserve = min(_CLEANUP_RESERVE_SECONDS, constants.COMMAND_TIMEOUT_SECONDS / 2)
+    timeout = context.settings.command_timeout
+    deadline = time.monotonic() + timeout
+    cleanup_reserve = min(_CLEANUP_RESERVE_SECONDS, timeout / 2)
     execution_deadline = deadline - cleanup_reserve
     try:
         operation = context.operations[0] if context.operations else None
@@ -211,10 +212,10 @@ def run_command(
             )
         except subprocess.TimeoutExpired:
             _cleanup_process(process, started_readers, deadline)
-            return _timeout_error(constants.COMMAND_TIMEOUT_SECONDS)
+            return _timeout_error(timeout)
         if not _join_readers(started_readers, execution_deadline):
             _cleanup_process(process, started_readers, deadline)
-            return _timeout_error(constants.COMMAND_TIMEOUT_SECONDS)
+            return _timeout_error(timeout)
         if reader_error := next((error for error in reader_errors if error is not None), None):
             raise reader_error
 

@@ -80,6 +80,7 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     loop_kwargs = dependencies["Loop"].create_default.call_args.kwargs
     tool_kwargs = dependencies["create_default_tool_registry"].call_args.kwargs
     assert tool_kwargs["settings"].user_agent == settings.web.user_agent
+    assert tool_kwargs["settings"].command_timeout == settings.tools.command_timeout
     assert loop_kwargs["working_directory"] is workspace.working_directory
     assert loop_kwargs["stream"] is settings.loop.stream
     assert loop_kwargs["compaction_threshold"] == settings.loop.compaction_threshold

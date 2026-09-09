@@ -327,6 +327,8 @@ class Loop:
             self._compaction.threshold = settings.loop.compaction_threshold
         elif path == "web.user_agent":
             self.tool_registry.settings.user_agent = settings.web.user_agent
+        elif path == "tools.command_timeout":
+            self.tool_registry.settings.command_timeout = settings.tools.command_timeout
         elif path == "loop.model":
             self._model_selection.restore(settings.loop.model)
         else:

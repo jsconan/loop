@@ -9,6 +9,7 @@ __all__ = [
     "LoggingSettings",
     "LoopSettings",
     "TelemetrySettings",
+    "ToolSettings",
     "WebSettings",
 ]
 
@@ -21,5 +22,6 @@ from .models import (
     LoggingSettings,
     LoopSettings,
     TelemetrySettings,
+    ToolSettings,
     WebSettings,
 )

@@ -159,7 +159,10 @@ class ApplicationRuntime:
                 interaction=interaction,
                 tool_registry=create_default_tool_registry(
                     interaction=interaction,
-                    settings=ToolRuntimeSettings(user_agent=settings.web.user_agent),
+                    settings=ToolRuntimeSettings(
+                        user_agent=settings.web.user_agent,
+                        command_timeout=settings.tools.command_timeout,
+                    ),
                 ),
                 working_directory=workspace.working_directory,
                 instructions_manager=InstructionsManager.discover(

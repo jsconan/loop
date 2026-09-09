@@ -142,6 +142,8 @@ def test_initialize_creates_private_commented_defaults(tmp_path):
     assert "# Loop workspace configuration" in content
     assert 'api_key = "local-api-key"' in content
     assert "# context_window = <unset>" in content
+    assert "[tools]" in content
+    assert "command_timeout = 30.0" in content
     assert path.stat().st_mode & 0o777 == 0o600
     assert manager.load().backend.api_key.get_secret_value() == "local-api-key"
 
@@ -168,6 +170,7 @@ def test_environment_overrides_persisted_values(tmp_path):
     settings = manager.load(
         {
             "DEFAULT_MODEL": "environment-model",
+            "LOOP_COMMAND_TIMEOUT": "0.25",
             "OPENAI_TEMPERATURE": "0.7",
             "OPENAI_REASONING_EFFORT": "low",
             "OPENAI_HYPERPARAMETER_POLICY": "fallback",
@@ -175,9 +178,22 @@ def test_environment_overrides_persisted_values(tmp_path):
     )
 
     assert settings.backend.default_model == "environment-model"
+    assert settings.tools.command_timeout == 0.25
     assert settings.backend.temperature == 0.7
     assert settings.backend.reasoning_effort == "low"
     assert settings.backend.hyperparameter_policy == "fallback"
+
+
+def test_command_timeout_requires_a_positive_duration(tmp_path):
+    """Configuration rejects a command lifecycle timeout that cannot make progress."""
+    manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    manager.initialize()
+    manager.load()
+
+    with pytest.raises(ValidationError):
+        manager.set_session("tools.command_timeout", 0)
+
+    assert manager.effective.tools.command_timeout == 30.0
 
 
 def test_set_preserves_existing_comments(tmp_path):

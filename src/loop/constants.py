@@ -91,7 +91,7 @@ TABULAR_MAX_WIDTH = 120
 COLUMNS_THRESHOLD = 9
 
 # Command execution timeout in seconds
-COMMAND_TIMEOUT_SECONDS = 30
+DEFAULT_COMMAND_TIMEOUT = 30.0
 
 # Error handling and recovery
 DEFAULT_MAX_RETRIES = 2

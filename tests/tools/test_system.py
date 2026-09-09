@@ -234,7 +234,7 @@ def test_run_command_completes_a_normal_process_within_its_lifecycle_timeout(
     monkeypatch, authorized
 ):
     """A short real command completes normally under the shared lifecycle deadline."""
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.5)
+    tool_registry.settings.command_timeout = 0.5
 
     assert run_command(python_command("print('complete')")) == "complete"
 
@@ -276,7 +276,7 @@ def test_run_command_caps_each_output_stream_while_draining_it(monkeypatch, conf
 
 def test_run_command_drains_large_stdout_and_stderr_without_deadlocking(monkeypatch, authorized):
     """Concurrent readers drain both full pipes while retaining their independent caps."""
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 3)
+    tool_registry.settings.command_timeout = 3
     script = (
         "import os,sys;"
         f"os.write(1,b'x'*{MAX_OUTPUT_CHARS + 8192});"
@@ -296,7 +296,7 @@ def test_run_command_drains_large_stdout_and_stderr_without_deadlocking(monkeypa
 
 def test_run_command_replaces_undecodable_output(monkeypatch, authorized):
     """Invalid UTF-8 output is represented with replacement characters instead of failing."""
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.5)
+    tool_registry.settings.command_timeout = 0.5
 
     assert run_command(python_command("import os; os.write(1, b'ok\\xff')")) == "ok�"
 
@@ -351,7 +351,7 @@ def test_run_command_kills_a_posix_process_group_after_timeout(monkeypatch, conf
     killpg = MagicMock()
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", killpg)
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
+    tool_registry.settings.command_timeout = 0.01
 
     assert problem(run_command("sleep 60"))["code"] == "process.timeout"
     assert len(process.wait.call_args_list) >= 2
@@ -365,7 +365,7 @@ def test_run_command_bounds_reaping_after_timeout(monkeypatch, confirmed):
     process.wait.side_effect = subprocess.TimeoutExpired("sleep", 30)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock())
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
+    tool_registry.settings.command_timeout = 0.01
 
     assert problem(run_command("sleep 60"))["code"] == "process.timeout"
     assert process.wait.call_count >= 2
@@ -394,7 +394,7 @@ def test_run_command_interrupts_pipe_descriptors_held_by_stuck_readers(monkeypat
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock())
     monkeypatch.setattr("loop.tools.system.os.close", close_descriptor)
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
+    tool_registry.settings.command_timeout = 0.01
 
     assert problem(run_command("sleep 60"))["code"] == "process.timeout"
     assert call(10) in close_descriptor.call_args_list
@@ -404,12 +404,13 @@ def test_run_command_interrupts_pipe_descriptors_held_by_stuck_readers(monkeypat
 
 def test_run_command_times_out_a_long_running_direct_child(monkeypatch, authorized):
     """The lifecycle deadline terminates a direct child that does not exit in time."""
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.2)
+    tool_registry.settings.command_timeout = 0.2
     started = time.monotonic()
 
     failure = problem(run_command(python_command("import time; time.sleep(30)")))
 
     assert failure["code"] == "process.timeout"
+    assert failure["detail"] == "Command did not complete within 0.2 seconds."
     assert time.monotonic() - started < 0.5
 
 
@@ -418,7 +419,7 @@ def test_run_command_times_out_and_cleans_a_descendant_holding_output_pipes(
     monkeypatch, tmp_path, authorized
 ):
     """An exited leader cannot let a pipe-owning descendant outlive the lifecycle deadline."""
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.3)
+    tool_registry.settings.command_timeout = 0.3
     pid_path = tmp_path / "descendant.pid"
     script = (
         "import pathlib,subprocess,sys;"
@@ -442,7 +443,7 @@ def test_run_command_times_out_and_cleans_a_descendant_holding_output_pipes(
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group behavior")
 def test_run_command_cleanup_does_not_terminate_an_unrelated_process(monkeypatch, authorized):
     """Timeout cleanup remains scoped to the isolated command process group."""
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.2)
+    tool_registry.settings.command_timeout = 0.2
     unrelated = subprocess.Popen(  # pylint: disable=consider-using-with
         [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
     )
@@ -463,7 +464,7 @@ def test_run_command_ignores_a_process_that_disappears_during_posix_cleanup(monk
     process.poll.return_value = 0
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock(side_effect=ProcessLookupError))
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
+    tool_registry.settings.command_timeout = 0.01
 
     assert problem(run_command("sleep 60"))["code"] == "process.timeout"
 
@@ -475,7 +476,7 @@ def test_run_command_kills_only_the_process_on_non_posix_systems(monkeypatch, co
     process.poll.return_value = 0
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", MagicMock(return_value=process))
     monkeypatch.setattr("loop.utils.process.os.name", "nt")
-    monkeypatch.setattr("loop.tools.system.constants.COMMAND_TIMEOUT_SECONDS", 0.01)
+    tool_registry.settings.command_timeout = 0.01
 
     assert problem(run_command("sleep 60"))["code"] == "process.timeout"
     process.kill.assert_called_once_with()

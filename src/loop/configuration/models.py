@@ -56,6 +56,14 @@ class WebSettings(BaseModel):
     user_agent: str = constants.DEFAULT_USER_AGENT
 
 
+class ToolSettings(BaseModel):
+    """Configure built-in tool execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    command_timeout: float = Field(default=constants.DEFAULT_COMMAND_TIMEOUT, gt=0)
+
+
 class LoggingSettings(BaseModel):
     """Configure operational logging."""
 
@@ -91,6 +99,7 @@ class ApplicationSettings(BaseSettings):
     backend: BackendSettings = BackendSettings()
     loop: LoopSettings = LoopSettings()
     web: WebSettings = WebSettings()
+    tools: ToolSettings = ToolSettings()
     logging: LoggingSettings = LoggingSettings()
     telemetry: TelemetrySettings = TelemetrySettings()
 

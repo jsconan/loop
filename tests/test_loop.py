@@ -225,6 +225,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
                 "model": "configured",
             },
             "web": {"user_agent": "updated"},
+            "tools": {"command_timeout": 0.25},
         }
     )
 
@@ -236,6 +237,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
         "loop.compaction_threshold",
         "loop.model",
         "web.user_agent",
+        "tools.command_timeout",
     ):
         assert loop.apply_runtime_settings(path, settings) == "applied now"
     assert loop.apply_runtime_settings("telemetry.batch_size", settings) == (
@@ -246,6 +248,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     assert loop.agent_runner.prompt_on_recoverable_error is False
     assert loop.model == "configured"
     assert loop.tool_registry.settings.user_agent == "updated"
+    assert loop.tool_registry.settings.command_timeout == 0.25
 
 
 def test_loop_accepts_an_explicitly_assembled_runtime(tmp_path):
