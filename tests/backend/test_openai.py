@@ -607,6 +607,130 @@ def test_models_are_listed_asynchronously_from_the_backend():
 
 
 @pytest.mark.parametrize(
+    ("metadata", "supported_hyperparameters"),
+    [
+        ({"supported_parameters": ["temperature"]}, ("temperature",)),
+        ({"capabilities": {"reasoning_effort": True}}, ("reasoning",)),
+        ({"supported_hyperparameters": ["other"]}, ()),
+        ({}, None),
+    ],
+)
+def test_model_listing_exposes_explicit_compatible_hyperparameter_metadata(
+    metadata, supported_hyperparameters
+):
+    """Compatible model metadata exposes only explicit supported request controls."""
+    sdk = Mock()
+    sdk.models.list.return_value = iter([SimpleNamespace(id="model", model_extra=metadata)])
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        models = OpenAIBackend().get_models()
+
+    assert models == [ModelInfo(id="model", supported_hyperparameters=supported_hyperparameters)]
+
+
+def test_declared_model_hyperparameters_avoid_an_unsupported_initial_request():
+    """Fallback requests omit controls absent from provider model metadata before generation."""
+    sdk = Mock()
+    sdk.models.list.return_value = iter(
+        [SimpleNamespace(id="model", model_extra={"supported_parameters": ["temperature"]})]
+    )
+    sdk.responses.create.return_value = [sdk_completion_event(total_tokens=None)]
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        events = list(
+            OpenAIBackend(default_model="model").get_response(
+                "hello",
+                stream=True,
+                hyperparameters=GenerationHyperparameters(
+                    temperature=0.2, reasoning_effort="medium"
+                ),
+            )
+        )
+
+    assert isinstance(events[-1], ResponseCompleted)
+    request = sdk.responses.create.call_args.kwargs
+    assert request["temperature"] == 0.2
+    assert "reasoning" not in request
+    sdk.models.list.assert_called_once_with(timeout=2.0)
+
+
+def test_hyperparameter_discovery_keeps_all_controls_when_metadata_is_unspecified():
+    """Fallback preserves requested controls when model metadata declares no support list."""
+    sdk = Mock()
+    sdk.models.list.return_value = iter([SimpleNamespace(id="model", model_extra=None)])
+    sdk.responses.create.side_effect = [
+        [sdk_completion_event(total_tokens=None)],
+        [sdk_completion_event(total_tokens=None)],
+    ]
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        backend = OpenAIBackend(default_model="model")
+        for prompt in ("first", "second"):
+            events = list(
+                backend.get_response(
+                    prompt,
+                    stream=True,
+                    hyperparameters=GenerationHyperparameters(
+                        temperature=0.2, reasoning_effort="medium"
+                    ),
+                )
+            )
+            assert isinstance(events[-1], ResponseCompleted)
+
+    assert sdk.models.list.call_count == 1
+    for call in sdk.responses.create.call_args_list:
+        assert call.kwargs["temperature"] == 0.2
+        assert call.kwargs["reasoning"] == {"effort": "medium"}
+
+
+def test_async_declared_model_hyperparameters_avoid_an_unsupported_initial_request():
+    """Asynchronous fallback requests apply explicit model metadata before generation."""
+    sdk = Mock()
+    sdk.models.list = AsyncMock(
+        return_value=iter(
+            [SimpleNamespace(id="model", model_extra={"capabilities": {"temperature": True}})]
+        )
+    )
+    sdk.responses.create = AsyncMock(
+        side_effect=[
+            AsyncEvents([sdk_completion_event(total_tokens=None)]),
+            AsyncEvents([sdk_completion_event(total_tokens=None)]),
+        ]
+    )
+    backend = OpenAIBackend(default_model="model")
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        events = asyncio.run(
+            collect_events(
+                backend.get_response_async(
+                    "hello",
+                    stream=True,
+                    hyperparameters=GenerationHyperparameters(
+                        temperature=0.2, reasoning_effort="medium"
+                    ),
+                )
+            )
+        )
+        asyncio.run(
+            collect_events(
+                backend.get_response_async(
+                    "again",
+                    stream=True,
+                    hyperparameters=GenerationHyperparameters(
+                        temperature=0.2, reasoning_effort="medium"
+                    ),
+                )
+            )
+        )
+
+    assert isinstance(events[-1], ResponseCompleted)
+    request = sdk.responses.create.await_args.kwargs
+    assert request["temperature"] == 0.2
+    assert "reasoning" not in request
+    sdk.models.list.assert_awaited_once_with(timeout=2.0)
+
+
+@pytest.mark.parametrize(
     ("status_code", "error_type"),
     [
         (400, BackendBadRequestError),
@@ -1485,6 +1609,7 @@ def test_async_generation_hyperparameter_fallback_retries_without_rejected_contr
     sdk.responses.create = AsyncMock(
         side_effect=[rejected, AsyncEvents([sdk_completion_event(total_tokens=None)])]
     )
+    sdk.models.list = AsyncMock(return_value=iter([SimpleNamespace(id="model", model_extra=None)]))
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
         assert isinstance(
@@ -1503,6 +1628,28 @@ def test_async_generation_hyperparameter_fallback_retries_without_rejected_contr
     first, retried = [call.kwargs for call in sdk.responses.create.await_args_list]
     assert first["temperature"] == 0.2
     assert "temperature" not in retried
+
+
+def test_async_hyperparameter_discovery_failure_preserves_the_generation_request():
+    """An unavailable compatible model catalog does not block asynchronous generation."""
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(
+        return_value=AsyncEvents([sdk_completion_event(total_tokens=None)])
+    )
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        events = asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async(
+                    "hello",
+                    stream=True,
+                    hyperparameters=GenerationHyperparameters(temperature=0.2),
+                )
+            )
+        )
+
+    assert isinstance(events[-1], ResponseCompleted)
+    assert sdk.responses.create.await_args.kwargs["temperature"] == 0.2
 
 
 def test_async_response_forwards_and_validates_structured_output():

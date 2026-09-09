@@ -524,8 +524,11 @@ request, so multiple agents can share one backend while using different controls
 caches any parameter a selected model explicitly rejects as unsupported. The default
 `hyperparameter_policy = "fallback"` retries that request without only the rejected parameter;
 use `"strict"` to preserve the provider error instead. This keeps OpenAI-compatible backends
-usable when their supported controls differ by model. Configure one sampling control at a time:
-the OpenAI API recommends changing `temperature` or `top_p`, but not both.
+usable when their supported controls differ by model. Before a fallback request, Loop inspects
+explicit compatible-provider model metadata (`supported_parameters`, `supported_hyperparameters`,
+or `capabilities`) and omits controls the selected model declares unsupported. Providers that do
+not expose this metadata continue through the reactive fallback. Configure one sampling control
+at a time: the OpenAI API recommends changing `temperature` or `top_p`, but not both.
 
 Transient connection, timeout, conflict, rate-limit, and server failures use the OpenAI SDK's
 bounded exponential-backoff retries. When those attempts are exhausted, the interactive loop

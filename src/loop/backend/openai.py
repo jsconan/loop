@@ -56,6 +56,7 @@ from ..models import (
     ContextReference,
     ConversationItem,
     FileInputMode,
+    Hyperparameter,
     HyperparameterPolicy,
     Message,
     ModelContextItem,
@@ -134,6 +135,8 @@ class OpenAIBackend(Backend):
     _max_retries: int
     _hyperparameter_policy: HyperparameterPolicy
     _unsupported_hyperparameters: dict[str, set[str]]
+    _declared_hyperparameters: dict[str, frozenset[str]]
+    _hyperparameter_discovery_attempted: set[str]
     _model_input_policy: ModelInputPolicy
 
     def __init__(
@@ -177,6 +180,8 @@ class OpenAIBackend(Backend):
             raise ValueError("Hyperparameter policy must be 'fallback' or 'strict'.")
         self._hyperparameter_policy = hyperparameter_policy
         self._unsupported_hyperparameters = {}
+        self._declared_hyperparameters = {}
+        self._hyperparameter_discovery_attempted = set()
         registered_secrets = (api_key,) if api_key and api_key != constants.DEFAULT_API_KEY else ()
         self._model_input_policy = ModelInputPolicy(
             registered_secrets,
@@ -329,6 +334,80 @@ class OpenAIBackend(Backend):
             parameters["reasoning"] = {"effort": hyperparameters.reasoning_effort}
         return parameters
 
+    @staticmethod
+    def _requested_hyperparameters(
+        hyperparameters: GenerationHyperparameters | None,
+    ) -> tuple[str, ...]:
+        """Return the names of explicitly requested hyperparameters."""
+        if hyperparameters is None:
+            return ()
+        return tuple(
+            name
+            for name, value in (
+                ("temperature", hyperparameters.temperature),
+                ("reasoning", hyperparameters.reasoning_effort),
+            )
+            if value is not None
+        )
+
+    def _discover_hyperparameters(
+        self, model: str, hyperparameters: GenerationHyperparameters | None
+    ) -> None:
+        """Discover and cache explicitly declared model hyperparameter support."""
+        requested = self._requested_hyperparameters(hyperparameters)
+        if not requested or self._hyperparameter_policy != "fallback":
+            return
+        if model not in self._hyperparameter_discovery_attempted:
+            try:
+                self.get_models()
+            except (BackendError, TypeError):
+                return
+            self._hyperparameter_discovery_attempted.add(model)
+        declared = self._declared_hyperparameters.get(model)
+        if declared is None:
+            return
+        unsupported = self._unsupported_hyperparameters.setdefault(model, set())
+        for parameter in requested:
+            if parameter in declared or parameter in unsupported:
+                continue
+            unsupported.add(parameter)
+            telemetry_activity(
+                "gen_ai.hyperparameter_unsupported",
+                severity="info",
+                model=model,
+                hyperparameter=parameter,
+                discovery="metadata",
+            )
+
+    async def _discover_hyperparameters_async(
+        self, model: str, hyperparameters: GenerationHyperparameters | None
+    ) -> None:
+        """Asynchronously discover and cache explicitly declared hyperparameter support."""
+        requested = self._requested_hyperparameters(hyperparameters)
+        if not requested or self._hyperparameter_policy != "fallback":
+            return
+        if model not in self._hyperparameter_discovery_attempted:
+            try:
+                await self.get_models_async()
+            except (BackendError, TypeError):
+                return
+            self._hyperparameter_discovery_attempted.add(model)
+        declared = self._declared_hyperparameters.get(model)
+        if declared is None:
+            return
+        unsupported = self._unsupported_hyperparameters.setdefault(model, set())
+        for parameter in requested:
+            if parameter in declared or parameter in unsupported:
+                continue
+            unsupported.add(parameter)
+            telemetry_activity(
+                "gen_ai.hyperparameter_unsupported",
+                severity="info",
+                model=model,
+                hyperparameter=parameter,
+                discovery="metadata",
+            )
+
     def _create_response(self, request: dict[str, object], model: str) -> Any:
         """Create a response, retrying only explicit unsupported-hyperparameter rejections."""
         effective_request = dict(request)
@@ -418,7 +497,9 @@ class OpenAIBackend(Backend):
         """
         try:
             models = self._get_client().models.list(timeout=2.0)
-            return [self._model_info(model) for model in models]
+            model_info = [self._model_info(model) for model in models]
+            self._remember_declared_hyperparameters(model_info)
+            return model_info
         except OpenAIError as error:
             raise self._translated_error(error, "list_models") from error
 
@@ -433,7 +514,9 @@ class OpenAIBackend(Backend):
         """
         try:
             models = await self._get_async_client().models.list(timeout=2.0)
-            return [self._model_info(model) for model in models]
+            model_info = [self._model_info(model) for model in models]
+            self._remember_declared_hyperparameters(model_info)
+            return model_info
         except OpenAIError as error:
             raise self._translated_error(error, "list_models") from error
 
@@ -498,6 +581,7 @@ class OpenAIBackend(Backend):
     ) -> Iterator[ResponseEvent]:
         """Yield response events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
+        self._discover_hyperparameters(selected_model, hyperparameters)
         serialized_input = self._serialize_input(input)
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
@@ -653,6 +737,7 @@ class OpenAIBackend(Backend):
     ) -> AsyncIterator[ResponseEvent]:
         """Asynchronously yield events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
+        await self._discover_hyperparameters_async(selected_model, hyperparameters)
         serialized_input = self._serialize_input(input)
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
@@ -878,6 +963,14 @@ class OpenAIBackend(Backend):
             return model.context_window
         return None
 
+    def _remember_declared_hyperparameters(self, models: Iterable[ModelInfo]) -> None:
+        """Cache explicit compatible-provider hyperparameter declarations by model."""
+        for model in models:
+            if model.supported_hyperparameters is not None:
+                self._declared_hyperparameters[model.id] = frozenset(
+                    model.supported_hyperparameters
+                )
+
     @staticmethod
     def _model_info(model: OpenAIModel) -> ModelInfo:
         """Translate OpenAI model metadata into a model description."""
@@ -886,7 +979,35 @@ class OpenAIBackend(Backend):
             context_window = int(context_window) if context_window is not None else None
         except (TypeError, ValueError):
             context_window = None
-        return ModelInfo(id=model.id, context_window=context_window)
+        extra = model.model_extra or {}
+        supported_hyperparameters = OpenAIBackend._declared_hyperparameters_from_extra(extra)
+        return ModelInfo(
+            id=model.id,
+            context_window=context_window,
+            supported_hyperparameters=supported_hyperparameters,
+        )
+
+    @staticmethod
+    def _declared_hyperparameters_from_extra(
+        extra: Mapping[str, object],
+    ) -> tuple[Hyperparameter, ...] | None:
+        """Extract explicit compatible-provider control declarations from model metadata."""
+        declared = extra.get("supported_hyperparameters", extra.get("supported_parameters"))
+        if declared is None:
+            declared = extra.get("capabilities")
+        if isinstance(declared, Mapping):
+            names = (name for name, enabled in declared.items() if enabled)
+        elif isinstance(declared, (list, tuple, set, frozenset)):
+            names = iter(declared)
+        else:
+            return None
+        supported = set()
+        for name in names:
+            if name == "temperature":
+                supported.add("temperature")
+            elif name in ("reasoning", "reasoning_effort"):
+                supported.add("reasoning")
+        return tuple(name for name in ("temperature", "reasoning") if name in supported)
 
     def compact(
         self,

@@ -22,6 +22,7 @@ type FileInputMode = Literal["text", "native"]
 type StructuredOutputMode = Literal["auto", "native", "prompt"]
 type StructuredOutputTransport = Literal["native", "prompt"]
 type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+type Hyperparameter = Literal["temperature", "reasoning"]
 type HyperparameterPolicy = Literal["fallback", "strict"]
 type ContextReferenceKind = Literal["file", "directory"]
 type MessageRole = Literal["user", "assistant"]
@@ -571,10 +572,14 @@ class ModelInfo(BaseModel):
     Args:
         id (str): Model identifier.
         context_window (int | None): Maximum context size when reported.
+        supported_hyperparameters (tuple[Hyperparameter, ...] | None):
+            Explicitly declared request controls, or ``None`` when the provider does not report
+            them.
     """
 
     id: str
     context_window: int | None = None
+    supported_hyperparameters: tuple[Hyperparameter, ...] | None = None
 
 
 class ModelAssignment(BaseModel):
