@@ -141,8 +141,11 @@ silently retries a call whose external outcome is unknown. For an uncertain call
 explicit retry records a model-visible interrupted result so the model can reconcile safely.
 
 Use `/sessions` to show names, stable IDs, update times, and message counts in a table. Use
-`/resume` with name-based completion to select a session; a captured name-to-ID resolver keeps its
-stable ID internal. `/new` starts a fresh unpersisted session, and `/rename` assigns a name that
+`/session`, or `/sessions show`, to display the current session's identity, model, context
+occupancy, conversation and compaction counts, recovery state, instruction state, and persistence
+status. `/session rename [name]` is an alias for `/rename [name]`. Use `/resume` with name-based
+completion to select a session; a captured name-to-ID resolver keeps its stable ID internal. `/new`
+starts a fresh unpersisted session, and `/rename` assigns a name that
 automatic generation will not overwrite. Use `/use` to load a skill for subsequent model requests,
 `/tools` to list available tools, `/skills` to inspect active and discoverable skills, and
 `/call` to invoke a tool directly by name, and `/check` to verify backend and model availability.

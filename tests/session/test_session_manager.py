@@ -593,6 +593,23 @@ def test_manager_generates_names_regardless_of_the_current_name_source():
     ]
 
 
+def test_manager_renames_persisted_sessions_without_switching_the_active_session():
+    """Renaming stored sessions preserves the active session unless it is the target."""
+    store = MemorySessionStore()
+    active = Session(name="Active", name_source="user")
+    stored = Session(name="Stored", name_source="user")
+    store.save(active)
+    stored_id = store.save(stored)
+    manager = SessionManager(session=active, session_store=store)
+
+    manager.rename_persisted_session(stored_id, "Renamed stored")
+    manager.rename_persisted_session(active.id, "Renamed active")
+
+    assert manager.session is active
+    assert manager.session.name == "Renamed active"
+    assert store.load(stored_id).name == "Renamed stored"
+
+
 def test_manager_reports_name_generation_failures(monkeypatch):
     """Name generation reports a retryable problem and preserves the current name on failure."""
     interaction = Mock(spec=Interaction)

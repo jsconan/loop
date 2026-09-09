@@ -576,6 +576,26 @@ class SessionManager:
         """
         self._commit(lambda session: session.rename(name))
 
+    def rename_persisted_session(self, session_id: str, name: str) -> None:
+        """Assign and persist a user-controlled name to one stored session.
+
+        Args:
+            session_id (str): Identifier of the persisted session to rename.
+            name (str): New non-empty session name.
+
+        Raises:
+            SessionNotFoundError: If the requested session does not exist.
+            SessionRevisionConflictError: If the stored session changes before it is saved.
+            SessionWorkspaceMismatchError: If the session belongs to another workspace.
+            ValueError: If the name is empty after normalization.
+        """
+        if session_id == self._session.id:
+            self.rename_session(name)
+            return
+        session = self._session_store.load(session_id)
+        session.rename(name)
+        self._session_store.save(session)
+
     def generate_session_name(
         self,
         generator: SessionNameGenerator,
