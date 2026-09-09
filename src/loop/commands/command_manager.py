@@ -200,7 +200,7 @@ class CommandManager:
             return False
 
         parts = user_input[1:].split(maxsplit=1)
-        name = parts[0]
+        name = parts[0] if parts else ""
         arguments = parts[1] if len(parts) == 2 else ""
         self.call(name, arguments.strip(), interaction=interaction)
         return True

@@ -265,7 +265,7 @@ def test_handle_user_command_deserializes_arguments_and_injects_context():
 
 
 def test_handle_user_command_reports_invalid_and_unknown_commands():
-    """Invalid arguments and unknown slash commands are consumed and reported."""
+    """Invalid arguments and unknown slash commands, including a bare slash, are reported."""
     interaction = Mock(spec=Interaction)
     manager = CommandManager(interaction=interaction)
 
@@ -283,6 +283,10 @@ def test_handle_user_command_reports_invalid_and_unknown_commands():
     assert manager.handle_user_command("/missing argument") is True
     assert interaction.report.call_args.args[0].detail == (
         "Unknown command '/missing'. Type /help for available commands."
+    )
+    assert manager.handle_user_command("/") is True
+    assert interaction.report.call_args.args[0].detail == (
+        "Unknown command '/'. Type /help for available commands."
     )
 
 
