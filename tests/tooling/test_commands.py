@@ -7,7 +7,7 @@ from loop.tooling import ToolCommands
 
 
 def test_tools_command_displays_registered_tools_and_reports_empty_catalogs():
-    """Tool discovery renders catalogs while invocation still requires a tool name."""
+    """Bare tool discovery renders catalogs and reports empty catalogs."""
     interaction = Mock(spec=Interaction)
     registry = Mock()
     registry.tools = [
@@ -22,12 +22,12 @@ def test_tools_command_displays_registered_tools_and_reports_empty_catalogs():
     registry.tools = []
     manager.call("tools")
     assert interaction.info.call_args.args[0] == "No tools registered."
-    manager.call("call")
-    assert "Field required" in interaction.report.call_args.args[0].detail
+    manager.call("tools", "call")
+    assert "requires a tool name" in interaction.report.call_args.args[0].detail
 
 
-def test_call_command_forwards_tokens_and_runtime_context():
-    """Tool invocation forwards parsed remainder tokens and active instruction state."""
+def test_tools_call_and_shortcut_forward_tokens_and_runtime_context():
+    """Tool invocation forms forward parsed tokens and active instruction state."""
     interaction = Mock(spec=Interaction)
     registry = Mock()
     arguments_model = Mock()
@@ -44,7 +44,7 @@ def test_call_command_forwards_tokens_and_runtime_context():
     provider = ToolCommands(registry, instructions)
     manager.register_provider(provider)
 
-    manager.call("call", 'calculate number=21 label="two words"')
+    manager.call("tools", 'call calculate number=21 label="two words"')
     manager.call("call", "ping")
 
     assert registry.command.call_args_list[0].args == (
@@ -57,14 +57,16 @@ def test_call_command_forwards_tokens_and_runtime_context():
     }
     assert registry.command.call_args_list[1].args == ("ping", ())
     interaction.tool_result.assert_called_with("42", ToolExecutionResult("42").presentation)
-    assert manager.commands[-1].completion.schema_provider is None
-    assert manager.commands[-1].completion.next.schema_provider == "tool_arguments"
+    tools_command, call_command = manager.commands[-2:]
+    assert tools_command.completion.children["call"].next.schema_provider == "tool_arguments"
+    assert call_command.completion.next.schema_provider == "tool_arguments"
     values, schemas = provider.get_completion_providers()
     assert [(value.value, value.description) for value in values.provider()] == [
         ("ping", "Ping a service")
     ]
     assert schemas.provider(()) is None
     assert schemas.provider(("ping",)) is arguments_model
+    assert schemas.provider(("call", "ping")) is arguments_model
 
 
 def test_call_command_forwards_quoted_run_command_text_without_tool_specific_rewriting():

@@ -1,10 +1,10 @@
 """Expose registered tools through user commands."""
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field
 
-from ..commands import CommandContext, CommandRegistration, CommandRemainder
+from ..commands import CommandArgumentError, CommandContext, CommandRegistration, CommandRemainder
 from ..completion import (
     CommandCompletion,
     CompletionProviderRegistration,
@@ -38,7 +38,19 @@ class ToolCommands:
             tuple[CommandRegistration, ...]: Tool discovery and invocation commands.
         """
         return (
-            CommandRegistration(self.tools, name="tools"),
+            CommandRegistration(
+                self.tools,
+                name="tools",
+                completion=CommandCompletion(
+                    values=(CompletionValue("call", "Call a registered tool."),),
+                    children={
+                        "call": CommandCompletion(
+                            provider="tools",
+                            next=CommandCompletion(schema_provider="tool_arguments"),
+                        )
+                    },
+                ),
+            ),
             CommandRegistration(
                 self.call,
                 name="call",
@@ -75,13 +87,44 @@ class ToolCommands:
             (
                 tool.arguments_model
                 for tool in self._tool_registry.tools
-                if tokens and tool.name == tokens[0]
+                if tokens and tool.name == tokens[-1]
             ),
             None,
         )
 
-    def tools(self, context: CommandContext) -> None:
-        """List all registered tools with their descriptions."""
+    def tools(
+        self,
+        context: CommandContext,
+        action: Annotated[
+            Literal["call"] | None,
+            Field(description="Optional tooling action. Use 'call' to invoke a tool."),
+        ] = None,
+        name: Annotated[
+            str | None,
+            Field(description="Exact registered tool name required by the call action."),
+        ] = None,
+        arguments: Annotated[
+            tuple[str, ...],
+            CommandRemainder(),
+            Field(description="Command-like positional and name=value tool arguments."),
+        ] = (),
+    ) -> None:
+        """List registered tools or call one through the ``call`` action.
+
+        Args:
+            context (CommandContext): Interaction services for the command.
+            action (Literal["call"] | None): Optional action. Omit it to list tools.
+            name (str | None): Registered tool name required by the ``call`` action.
+            arguments (tuple[str, ...]): Remaining positional and named tool arguments.
+
+        Raises:
+            CommandArgumentError: If the ``call`` action omits its required tool name.
+        """
+        if action == "call":
+            if name is None:
+                raise CommandArgumentError("The '/tools call' action requires a tool name.")
+            self._call_tool(context, name, arguments)
+            return
         tools = self._tool_registry.tools
         if not tools:
             context.interaction.info("No tools registered.")
@@ -99,6 +142,15 @@ class ToolCommands:
         ] = (),
     ) -> None:
         """Call a registered tool with command-like arguments."""
+        self._call_tool(context, name, arguments)
+
+    def _call_tool(
+        self,
+        context: CommandContext,
+        name: str,
+        arguments: tuple[str, ...],
+    ) -> None:
+        """Execute one explicitly requested tool and present its result."""
         result = self._tool_registry.command(
             name,
             arguments,

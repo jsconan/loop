@@ -147,8 +147,9 @@ status. `/session rename [name]` is an alias for `/rename [name]`. Use `/resume`
 completion to select a session; a captured name-to-ID resolver keeps its stable ID internal. `/new`
 starts a fresh unpersisted session, and `/rename` assigns a name that
 automatic generation will not overwrite. Use `/use` to load a skill for subsequent model requests,
-`/tools` to list available tools, `/skills` to inspect active and discoverable skills, and
-`/call` to invoke a tool directly by name, and `/check` to verify backend and model availability.
+`/tools` to list available tools or `/tools call <tool> [arguments]` to invoke one, `/skills` to
+inspect active and discoverable skills, `/call <tool> [arguments]` as a direct invocation shortcut,
+and `/check` to verify backend and model availability.
 The usual `/help`, `/exit`, and `/quit` commands remain
 available.
 
