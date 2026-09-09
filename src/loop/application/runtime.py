@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from types import TracebackType
 from typing import Self
 
@@ -199,7 +199,11 @@ class ApplicationRuntime:
                 cleanup_callbacks=cleanup_callbacks,
             )
             loop.command_manager.register_all(
-                ConfigurationCommands(configuration, runtime.apply_configuration).get_commands()
+                ConfigurationCommands(
+                    configuration,
+                    runtime.apply_configuration,
+                    runtime.apply_configuration_changes,
+                ).get_commands()
             )
             loop.command_manager.register_all(
                 ApplicationCommands(paths, workspace_paths, workspace.id).get_commands()
@@ -245,6 +249,31 @@ class ApplicationRuntime:
             self._loop.replace_backend(self._create_backend(settings))
             return "applied now"
         return self._loop.apply_runtime_settings(path, settings)
+
+    def apply_configuration_changes(
+        self, paths: tuple[str, ...], settings: ApplicationSettings
+    ) -> Mapping[str, str]:
+        """Apply a set of changed configuration paths from one reload transaction.
+
+        Args:
+            paths (tuple[str, ...]): Effective configuration paths changed by the reload.
+            settings (ApplicationSettings): Newly validated effective configuration.
+
+        Returns:
+            Mapping[str, str]: Per-path statuses describing whether each change was applied now.
+        """
+        statuses = {}
+        if any(path.startswith("backend.") for path in paths):
+            self._loop.replace_backend(self._create_backend(settings))
+            statuses.update({path: "applied now" for path in paths if path.startswith("backend.")})
+        statuses.update(
+            {
+                path: self._loop.apply_runtime_settings(path, settings)
+                for path in paths
+                if not path.startswith("backend.")
+            }
+        )
+        return statuses
 
     @staticmethod
     def _create_backend(settings: ApplicationSettings) -> OpenAIBackend:

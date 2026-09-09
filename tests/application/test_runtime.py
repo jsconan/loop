@@ -156,6 +156,39 @@ def test_apply_configuration_routes_aggregate_domain_and_scalar_changes(dependen
     assert active_loop.apply_runtime_settings.call_count == 4
 
 
+def test_apply_configuration_changes_replaces_the_backend_once(dependencies):
+    """Reload batches backend changes while retaining per-path runtime statuses."""
+    active_loop = Mock()
+    active_loop.apply_runtime_settings.return_value = "applied now"
+    runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
+
+    statuses = runtime.apply_configuration_changes(
+        ("backend.base_url", "backend.default_model", "loop.debug"), ApplicationSettings()
+    )
+
+    assert statuses == {
+        "backend.base_url": "applied now",
+        "backend.default_model": "applied now",
+        "loop.debug": "applied now",
+    }
+    active_loop.replace_backend.assert_called_once_with(dependencies["OpenAIBackend"].return_value)
+    active_loop.apply_runtime_settings.assert_called_once_with("loop.debug", ApplicationSettings())
+
+
+def test_apply_configuration_changes_skips_backend_replacement_without_backend_changes(
+    dependencies,
+):
+    """Reload applies scalar-only changes without reconstructing the backend."""
+    active_loop = Mock()
+    active_loop.apply_runtime_settings.return_value = "applied now"
+    runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
+
+    statuses = runtime.apply_configuration_changes(("loop.debug",), ApplicationSettings())
+
+    assert statuses == {"loop.debug": "applied now"}
+    active_loop.replace_backend.assert_not_called()
+
+
 @pytest.mark.parametrize("after_telemetry", [False, True])
 def test_create_closes_only_successfully_created_telemetry(
     dependencies, assembled, after_telemetry

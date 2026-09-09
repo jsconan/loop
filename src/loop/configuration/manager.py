@@ -108,12 +108,20 @@ class ConfigurationManager:
         Returns:
             ApplicationSettings: Immutable settings resolved from environment, TOML, and defaults.
         """
-        self._document = self._read_document()
-        self._workspace_document = self._read_workspace_document()
         if environment is None:
             environment = os.environ
-        self._environment = dict(environment)
-        return self._resolve()
+        candidate_environment = dict(environment)
+        candidate_document = self._read_document()
+        candidate_workspace_document = self._read_workspace_document()
+        effective, sources = self._resolved(
+            candidate_document, candidate_workspace_document, candidate_environment
+        )
+        self._document = candidate_document
+        self._workspace_document = candidate_workspace_document
+        self._environment = candidate_environment
+        self._effective = effective
+        self._sources = sources
+        return effective
 
     @property
     def effective(self) -> ApplicationSettings:
@@ -133,12 +141,13 @@ class ConfigurationManager:
         """Reload the document and return a new validated settings snapshot.
 
         Args:
-            environment (Mapping[str, str] | None): Environment override source.
+            environment (Mapping[str, str] | None): Replacement environment override source. When
+                omitted, retains the environment captured by the previous load.
 
         Returns:
             ApplicationSettings: Fresh effective settings.
         """
-        return self.load(environment)
+        return self.load(self._environment if environment is None else environment)
 
     @property
     def entries(self) -> tuple[ConfigurationEntry, ...]:
@@ -466,17 +475,27 @@ class ConfigurationManager:
         path.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
         return FileLock(path.with_name(f".{path.name}.lock"), mode=constants.PRIVATE_FILE_MODE)
 
-    def _plain_document_values(self) -> dict[str, Any]:
-        """Return ordinary Python values from a TOML document."""
-        return self._document.unwrap()
-
     def _resolve(self) -> ApplicationSettings:
         """Resolve configured, environment, and session values into one snapshot."""
-        values = self._plain_document_values()
-        self._sources = self._configured_sources(
+        effective, sources = self._resolved(
+            self._document, self._workspace_document, self._environment
+        )
+        self._effective = effective
+        self._sources = sources
+        return effective
+
+    def _resolved(
+        self,
+        document: tomlkit.TOMLDocument,
+        workspace_document: tomlkit.TOMLDocument,
+        environment: Mapping[str, str],
+    ) -> tuple[ApplicationSettings, dict[str, str]]:
+        """Return an effective snapshot and provenance without changing manager state."""
+        values = document.unwrap()
+        sources = self._configured_sources(
             values, "user" if self._workspace_path is not None else "workspace"
         )
-        workspace_values = self._workspace_document.unwrap()
+        workspace_values = workspace_document.unwrap()
         for section, table in workspace_values.items():
             if section == "config_version":
                 continue
@@ -484,18 +503,17 @@ class ConfigurationManager:
                 values.setdefault(section, {}).update(table)
             else:
                 values[section] = table
-        self._sources.update(self._configured_sources(workspace_values, "workspace"))
+        sources.update(self._configured_sources(workspace_values, "workspace"))
         for variable, (section, field) in _ENVIRONMENT_FIELDS.items():
-            value = self._environment.get(variable)
+            value = environment.get(variable)
             if value is not None:
                 values.setdefault(section, {})[field] = value
-                self._sources[f"{section}.{field}"] = "environment"
+                sources[f"{section}.{field}"] = "environment"
         for path, value in self._session_values.items():
             section, field = self._split_path(path)
             values.setdefault(section, {})[field] = value
-            self._sources[path] = "session"
-        self._effective = ApplicationSettings.model_validate(values)
-        return self._effective
+            sources[path] = "session"
+        return ApplicationSettings.model_validate(values), sources
 
     def _validate_candidate(self) -> None:
         """Validate the current file and retained higher-precedence values."""

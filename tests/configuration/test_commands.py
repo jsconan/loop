@@ -96,6 +96,92 @@ def test_config_set_applies_a_file_override(tmp_path):
     assert apply.called
 
 
+def test_config_reload_applies_effective_user_and_workspace_changes(tmp_path):
+    """Reload applies only changed effective paths after rereading both durable scopes."""
+    user_path = tmp_path / "config.toml"
+    workspace_path = tmp_path / ".loop" / "config.toml"
+    configuration = ConfigurationManager(user_path, workspace_path)
+    configuration.initialize()
+    configuration.load()
+    user_path.write_text("[loop]\nstream = false\n", encoding="utf-8")
+    workspace_path.parent.mkdir()
+    workspace_path.write_text("[loop]\ndebug = true\n", encoding="utf-8")
+    apply = Mock(return_value="applied now")
+    interaction = Mock()
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
+    )
+
+    manager.call("config", "reload")
+
+    assert configuration.effective.loop.debug is True
+    assert configuration.effective.loop.stream is False
+    assert apply.call_args_list == [
+        call("loop.stream", configuration.effective),
+        call("loop.debug", configuration.effective),
+    ]
+    interaction.info.assert_called_once_with(
+        "Configuration reloaded: applied now: loop.stream, loop.debug."
+    )
+
+
+def test_config_reload_delegates_multiple_changes_to_the_batch_applicator(tmp_path):
+    """Reload uses the runtime batch applicator when one is supplied."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load()
+    configuration.path.write_text("[loop]\ndebug = true\n", encoding="utf-8")
+    apply = Mock()
+    apply_many = Mock(return_value={"loop.debug": "applied now"})
+    interaction = Mock()
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply, apply_many),),
+        interaction=interaction,
+    )
+
+    manager.call("config", "reload")
+
+    apply.assert_not_called()
+    apply_many.assert_called_once_with(("loop.debug",), configuration.effective)
+
+
+def test_config_reload_reports_no_effective_change(tmp_path):
+    """Reload reports success without applying settings when disk inputs resolve identically."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load()
+    apply = Mock()
+    interaction = Mock()
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
+    )
+
+    manager.call("config", "reload")
+
+    apply.assert_not_called()
+    interaction.info.assert_called_once_with("Configuration reloaded: no effective changes.")
+
+
+def test_config_reload_rejects_arguments_and_invalid_disk_content(tmp_path):
+    """Reload rejects arguments and reports an invalid external file without applying it."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load()
+    interaction = Mock()
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
+    )
+
+    manager.call("config", "reload loop.debug")
+    configuration.path.write_text('[loop]\ndebug = "invalid"\n', encoding="utf-8")
+    manager.call("config", "reload")
+
+    assert interaction.report.call_count == 2
+    assert "does not accept arguments" in interaction.report.call_args_list[0].args[0].detail
+    assert "loop.debug" in interaction.report.call_args_list[1].args[0].detail
+    assert configuration.effective.loop.debug is False
+
+
 def test_config_secret_prompts_before_selecting_scope_and_applies_value(tmp_path):
     """The secret form reads masked input before selecting its destination scope."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")

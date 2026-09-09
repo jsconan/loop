@@ -252,6 +252,42 @@ def test_manager_exposes_effective_values_sources_and_reload(tmp_path):
     )
 
 
+def test_reload_reads_user_and_workspace_files_without_discarding_session_overrides(tmp_path):
+    """Reload resolves external user and workspace edits beneath session precedence."""
+    user_path = tmp_path / "config.toml"
+    workspace_path = tmp_path / ".loop" / "config.toml"
+    manager = ConfigurationManager(user_path, workspace_path)
+    manager.initialize()
+    manager.load()
+    manager.set_session("loop.debug", True)
+    user_path.write_text("[loop]\nstream = false\n", encoding="utf-8")
+    workspace_path.parent.mkdir()
+    workspace_path.write_text("[loop]\ntemperature = 0.4\n", encoding="utf-8")
+
+    settings = manager.reload()
+
+    assert settings.loop.debug is True
+    assert settings.loop.stream is False
+    assert settings.loop.temperature == 0.4
+    assert manager.source_for("loop.debug") == "session"
+    assert manager.source_for("loop.stream") == "user"
+    assert manager.source_for("loop.temperature") == "workspace"
+
+
+def test_reload_keeps_the_prior_snapshot_when_external_configuration_is_invalid(tmp_path):
+    """A failed disk reload leaves the last valid documents and effective settings available."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.initialize()
+    manager.load()
+    manager.path.write_text('[loop]\ndebug = "invalid"\n', encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        manager.reload()
+
+    assert manager.effective.loop.debug is False
+    assert manager.source_for("loop.debug") == "workspace"
+
+
 @pytest.mark.parametrize("path", ["backend", "backend.default_model.extra"])
 def test_manager_rejects_malformed_configuration_paths(tmp_path, path):
     """Public configuration access requires exactly one section and field."""

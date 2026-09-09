@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Annotated, Literal
 
 from pydantic import Field, ValidationError
@@ -19,18 +19,25 @@ class ConfigurationCommands:
         configuration (ConfigurationManager): Configuration owner for the active application.
         apply (Callable[[str, ApplicationSettings], str]): Applies a validated effective setting
             snapshot and returns its user-facing effect status.
+        apply_many (Callable[[tuple[str, ...], ApplicationSettings], Mapping[str, str]] | None):
+            Applies multiple changed settings as one reload operation. Defaults to applying each
+            setting separately.
     """
 
     _configuration: ConfigurationManager
     _apply: Callable[[str, ApplicationSettings], str]
+    _apply_many: Callable[[tuple[str, ...], ApplicationSettings], Mapping[str, str]] | None
 
     def __init__(
         self,
         configuration: ConfigurationManager,
         apply: Callable[[str, ApplicationSettings], str],
+        apply_many: Callable[[tuple[str, ...], ApplicationSettings], Mapping[str, str]]
+        | None = None,
     ) -> None:
         self._configuration = configuration
         self._apply = apply
+        self._apply_many = apply_many
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return the configuration command registration.
@@ -69,6 +76,7 @@ class ConfigurationCommands:
                         CompletionValue("set", "Update one configuration entry."),
                         CompletionValue("secret", "Update one secret configuration entry."),
                         CompletionValue("reset", "Reset one entry or every entry."),
+                        CompletionValue("reload", "Reload configuration files from disk."),
                     ),
                     children={
                         "get": entry_completion,
@@ -106,7 +114,7 @@ class ConfigurationCommands:
         self,
         context: CommandContext,
         action: Annotated[
-            Literal["get", "set", "secret", "reset"] | None,
+            Literal["get", "set", "secret", "reset", "reload"] | None,
             Field(description="Operation to perform, or omit to display all settings."),
         ] = None,
         path: Annotated[
@@ -122,7 +130,7 @@ class ConfigurationCommands:
             Field(description="Override scope, or omit it to choose interactively."),
         ] = None,
     ) -> None:
-        """Show, update, or reset the application configuration."""
+        """Show, update, reset, or reload the application configuration."""
         if action is None:
             self._show(context, None)
             return
@@ -130,6 +138,11 @@ class ConfigurationCommands:
             if path is None:
                 raise CommandArgumentError("The get operation requires a setting path.")
             self._show(context, path)
+            return
+        if action == "reload":
+            if path is not None or value is not None or scope is not None:
+                raise CommandArgumentError("The reload operation does not accept arguments.")
+            self._reload(context)
             return
         if action == "secret":
             self._set_secret(context, path, value, scope)
@@ -214,6 +227,45 @@ class ConfigurationCommands:
         statuses = {self._apply(path, settings) for path in paths}
         detail = ", ".join(sorted(statuses)) if statuses else "no overrides existed"
         context.interaction.info(f"Reset all configuration entries for {scope}: {detail}.")
+
+    def _reload(self, context: CommandContext) -> None:
+        """Reload disk configuration and apply only effective changes."""
+        previous = self._configuration.effective
+        try:
+            settings = self._configuration.reload()
+        except (OSError, ValueError, ValidationError) as error:
+            raise CommandArgumentError(str(error)) from error
+        paths = self._changed_paths(previous, settings)
+        if not paths:
+            context.interaction.info("Configuration reloaded: no effective changes.")
+            return
+        statuses = (
+            self._apply_many(paths, settings)
+            if self._apply_many is not None
+            else {path: self._apply(path, settings) for path in paths}
+        )
+        grouped = {}
+        for path in paths:
+            grouped.setdefault(statuses[path], []).append(path)
+        detail = "; ".join(f"{status}: {', '.join(paths)}" for status, paths in grouped.items())
+        context.interaction.info(f"Configuration reloaded: {detail}.")
+
+    @staticmethod
+    def _changed_paths(
+        previous: ApplicationSettings,
+        current: ApplicationSettings,
+    ) -> tuple[str, ...]:
+        """Return effective paths whose values differ between two snapshots."""
+        paths = []
+        for section_name, section in ApplicationSettings.model_fields.items():
+            if section_name == "config_version":
+                continue
+            for field_name in section.annotation.model_fields:
+                if getattr(getattr(previous, section_name), field_name) != getattr(
+                    getattr(current, section_name), field_name
+                ):
+                    paths.append(f"{section_name}.{field_name}")
+        return tuple(paths)
 
     def _show(self, context: CommandContext, path: str | None) -> None:
         """Render one or all effective settings without exposing secrets."""
