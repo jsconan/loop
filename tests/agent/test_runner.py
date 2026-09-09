@@ -117,6 +117,16 @@ def test_runner_reconfigures_subsequent_runs():
         runner.max_turns = -1
 
 
+def test_runner_replaces_agent():
+    """Assigning a replacement agent makes it available through the public property."""
+    runner, _, _ = agent_runner(responses=[])
+    replacement = Agent("Replacement", tools=Mock())
+
+    runner.agent = replacement
+
+    assert runner.agent is replacement
+
+
 def test_runner_records_run_and_tool_execution_traces():
     """Configured telemetry covers run boundaries and exact tool requests and responses."""
     response = Response(

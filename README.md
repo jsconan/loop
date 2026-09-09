@@ -409,6 +409,8 @@ hyperparameter_policy = "fallback"
 
 [loop]
 agent_name = "Loop"
+# temperature = <unset>
+# reasoning_effort = <unset>
 stream = true
 debug = false
 compaction_threshold = 0.8
@@ -448,11 +450,11 @@ Configuration-path completion prevents users from having to memorize setting nam
 
 ```text
 /config
-/config get backend.temperature
-/config set backend.temperature 0.7 scope=session
+/config get loop.temperature
+/config set loop.temperature 0.7 scope=session
 /config set loop.stream false scope=workspace
 /config secret backend.api_key
-/config reset backend.temperature scope=workspace
+/config reset loop.temperature scope=workspace
 /config reset  # prompts for scope and confirmation
 ```
 
@@ -494,8 +496,8 @@ The `loop` command accepts environment overrides for automation:
 | API key                     | `OPENAI_API_KEY`                        | `local-api-key`                |
 | Context window              | `CONTEXT_WINDOW`                        | unset                          |
 | Automatic retries           | `OPENAI_MAX_RETRIES`                    | `2`                            |
-| Temperature                 | `OPENAI_TEMPERATURE`                    | unset                          |
-| Reasoning effort            | `OPENAI_REASONING_EFFORT`               | unset                          |
+| Temperature                 | `LOOP_TEMPERATURE`                      | unset                          |
+| Reasoning effort            | `LOOP_REASONING_EFFORT`                 | unset                          |
 | Hyperparameter policy       | `OPENAI_HYPERPARAMETER_POLICY`          | `fallback`                     |
 | Web user agent              | `USER_AGENT`                            | browser-like user agent        |
 | Loop agent name             | `LOOP_AGENT_NAME`                       | `Loop`                         |
@@ -517,8 +519,9 @@ The `loop` command accepts environment overrides for automation:
 `OpenAIBackend` itself does not read environment variables or provide deployment defaults. Library
 callers configure it explicitly, and credentials remain private backend state.
 
-`temperature` and `reasoning_effort` are optional generation controls. Loop sends them when set,
-then caches any parameter a selected model explicitly rejects as unsupported. The default
+`temperature` and `reasoning_effort` are optional agent hyperparameters. Loop sends them with each
+request, so multiple agents can share one backend while using different controls. The backend
+caches any parameter a selected model explicitly rejects as unsupported. The default
 `hyperparameter_policy = "fallback"` retries that request without only the rejected parameter;
 use `"strict"` to preserve the provider error instead. This keeps OpenAI-compatible backends
 usable when their supported controls differ by model. Configure one sampling control at a time:

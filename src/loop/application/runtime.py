@@ -178,6 +178,8 @@ class ApplicationRuntime:
                 ),
                 agent_name=settings.loop.agent_name,
                 model=settings.loop.model,
+                temperature=settings.loop.temperature,
+                reasoning_effort=settings.loop.reasoning_effort,
                 on_model_select=(
                     None
                     if configuration.source_for("loop.model") == "environment"
@@ -256,8 +258,6 @@ class ApplicationRuntime:
             structured_output_mode=settings.backend.structured_output_mode,
             structured_output_max_retries=settings.backend.structured_output_max_retries,
             max_retries=settings.backend.max_retries,
-            temperature=settings.backend.temperature,
-            reasoning_effort=settings.backend.reasoning_effort,
             hyperparameter_policy=settings.backend.hyperparameter_policy,
         )
 

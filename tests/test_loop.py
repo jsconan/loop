@@ -22,6 +22,7 @@ from loop import (
     CompactionContextItem,
     CompactionResult,
     ContextReference,
+    GenerationHyperparameters,
     InstructionsManager,
     Interaction,
     Loop,
@@ -223,6 +224,8 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
                 "prompt_on_recoverable_error": False,
                 "compaction_threshold": 0.7,
                 "model": "configured",
+                "temperature": 0.2,
+                "reasoning_effort": "medium",
             },
             "web": {"user_agent": "updated"},
             "tools": {"command_timeout": 0.25},
@@ -236,6 +239,8 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
         "loop.prompt_on_recoverable_error",
         "loop.compaction_threshold",
         "loop.model",
+        "loop.temperature",
+        "loop.reasoning_effort",
         "web.user_agent",
         "tools.command_timeout",
     ):
@@ -247,6 +252,8 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     assert loop.agent_runner.max_turns == 7
     assert loop.agent_runner.prompt_on_recoverable_error is False
     assert loop.model == "configured"
+    assert loop.agent.hyperparameters.temperature == 0.2
+    assert loop.agent.hyperparameters.reasoning_effort == "medium"
     assert loop.tool_registry.settings.user_agent == "updated"
     assert loop.tool_registry.settings.command_timeout == 0.25
 
@@ -1068,6 +1075,7 @@ def test_loops_share_local_conversation_context(tmp_path):
         instructions=second.instructions,
         stream=True,
         model="served-model",
+        hyperparameters=GenerationHyperparameters(),
         tools=[],
     )
 

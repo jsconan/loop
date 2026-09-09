@@ -29,8 +29,6 @@ class BackendSettings(BaseModel):
     structured_output_max_retries: int = Field(
         default=constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES, ge=0
     )
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    reasoning_effort: ReasoningEffort | None = None
     hyperparameter_policy: HyperparameterPolicy = constants.DEFAULT_HYPERPARAMETER_POLICY
 
 
@@ -41,6 +39,8 @@ class LoopSettings(BaseModel):
 
     agent_name: str = constants.DEFAULT_AGENT_NAME
     model: str | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    reasoning_effort: ReasoningEffort | None = None
     stream: bool = True
     debug: bool = False
     compaction_threshold: float = Field(default=constants.DEFAULT_COMPACTION_THRESHOLD, gt=0, le=1)

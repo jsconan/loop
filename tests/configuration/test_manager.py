@@ -115,11 +115,11 @@ def test_invalid_session_value_is_rolled_back(tmp_path):
     manager.load()
 
     with pytest.raises(ValidationError):
-        manager.set_session("backend.temperature", 3)
+        manager.set_session("loop.temperature", 3)
 
-    assert manager.effective.backend.temperature is None
+    assert manager.effective.loop.temperature is None
     with pytest.raises(ValueError, match="No session override"):
-        manager.unset_session("backend.temperature")
+        manager.unset_session("loop.temperature")
 
 
 def test_reset_rejects_unknown_default_field(tmp_path):
@@ -163,24 +163,24 @@ def test_environment_overrides_persisted_values(tmp_path):
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.set("backend.default_model", "file-model", scope="user")
-    manager.set("backend.temperature", 0.2, scope="user")
-    manager.set("backend.reasoning_effort", "high", scope="user")
+    manager.set("loop.temperature", 0.2, scope="user")
+    manager.set("loop.reasoning_effort", "high", scope="user")
     manager.set("backend.hyperparameter_policy", "strict", scope="user")
 
     settings = manager.load(
         {
             "DEFAULT_MODEL": "environment-model",
             "LOOP_COMMAND_TIMEOUT": "0.25",
-            "OPENAI_TEMPERATURE": "0.7",
-            "OPENAI_REASONING_EFFORT": "low",
+            "LOOP_TEMPERATURE": "0.7",
+            "LOOP_REASONING_EFFORT": "low",
             "OPENAI_HYPERPARAMETER_POLICY": "fallback",
         }
     )
 
     assert settings.backend.default_model == "environment-model"
     assert settings.tools.command_timeout == 0.25
-    assert settings.backend.temperature == 0.7
-    assert settings.backend.reasoning_effort == "low"
+    assert settings.loop.temperature == 0.7
+    assert settings.loop.reasoning_effort == "low"
     assert settings.backend.hyperparameter_policy == "fallback"
 
 
@@ -275,7 +275,7 @@ def test_manager_rejects_unknown_fields_and_invalid_values(tmp_path):
     with pytest.raises(ValidationError):
         manager.set("backend.max_retries", -1)
     with pytest.raises(ValidationError):
-        manager.set("backend.temperature", 3)
+        manager.set("loop.temperature", 3)
 
 
 def test_invalid_workspace_edit_restores_the_previous_document(tmp_path):
@@ -286,9 +286,9 @@ def test_invalid_workspace_edit_restores_the_previous_document(tmp_path):
     manager.load()
 
     with pytest.raises(ValidationError):
-        manager.set("backend.temperature", 3, scope="workspace")
+        manager.set("loop.temperature", 3, scope="workspace")
 
-    assert manager.effective.backend.temperature is None
+    assert manager.effective.loop.temperature is None
     assert not workspace_path.exists()
 
 

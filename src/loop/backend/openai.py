@@ -63,7 +63,6 @@ from ..models import (
     Reasoning,
     ReasoningCompleted,
     ReasoningDelta,
-    ReasoningEffort,
     ResponseCompleted,
     ResponseEvent,
     ResponseMetadata,
@@ -79,7 +78,7 @@ from ..models import (
 )
 from ..telemetry import ModelInputPolicy, telemetry_activity, telemetry_trace_event
 from ..utils import payload_digest
-from .backend import Backend
+from .backend import Backend, GenerationHyperparameters
 from .errors import (
     BackendAuthenticationError,
     BackendBadRequestError,
@@ -117,9 +116,6 @@ class OpenAIBackend(Backend):
         structured_output_max_retries (int): Number of corrective generations after a structured
             response fails local validation.
         max_retries (int): Number of automatic SDK retries for transient request failures.
-        temperature (float | None): Sampling temperature, or ``None`` to use the provider default.
-        reasoning_effort (ReasoningEffort | None): Requested reasoning effort, or ``None`` to use
-            the provider default.
         hyperparameter_policy (HyperparameterPolicy): Whether to retry without a
             hyperparameter explicitly rejected as unsupported, or preserve that rejection.
 
@@ -136,8 +132,6 @@ class OpenAIBackend(Backend):
     _structured_output_max_retries: int
     _prompt_structured_models: set[str]
     _max_retries: int
-    _temperature: float | None
-    _reasoning_effort: ReasoningEffort | None
     _hyperparameter_policy: HyperparameterPolicy
     _unsupported_hyperparameters: dict[str, set[str]]
     _model_input_policy: ModelInputPolicy
@@ -153,8 +147,6 @@ class OpenAIBackend(Backend):
         structured_output_mode: StructuredOutputMode = (constants.DEFAULT_STRUCTURED_OUTPUT_MODE),
         structured_output_max_retries: int = constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES,
         max_retries: int = constants.DEFAULT_MAX_RETRIES,
-        temperature: float | None = None,
-        reasoning_effort: ReasoningEffort | None = None,
         hyperparameter_policy: HyperparameterPolicy = (constants.DEFAULT_HYPERPARAMETER_POLICY),
     ) -> None:
         super().__init__(
@@ -181,12 +173,8 @@ class OpenAIBackend(Backend):
         self._structured_output_max_retries = structured_output_max_retries
         self._prompt_structured_models = set()
         self._max_retries = max_retries
-        if temperature is not None and (isinstance(temperature, bool) or not 0 <= temperature <= 2):
-            raise ValueError("Temperature must be between 0 and 2.")
         if hyperparameter_policy not in ("fallback", "strict"):
             raise ValueError("Hyperparameter policy must be 'fallback' or 'strict'.")
-        self._temperature = temperature
-        self._reasoning_effort = reasoning_effort
         self._hyperparameter_policy = hyperparameter_policy
         self._unsupported_hyperparameters = {}
         registered_secrets = (api_key,) if api_key and api_key != constants.DEFAULT_API_KEY else ()
@@ -321,14 +309,24 @@ class OpenAIBackend(Backend):
                 if field in original_item:
                     prepared_item[field] = original_item[field]
 
-    def _generation_request_parameters(self, model: str) -> dict[str, object]:
-        """Return configured generation parameters supported by the selected model."""
+    def _hyperparameter_request_parameters(
+        self, model: str, hyperparameters: GenerationHyperparameters | None
+    ) -> dict[str, object]:
+        """Return request hyperparameters supported by the selected model."""
         unsupported = self._unsupported_hyperparameters.get(model, set())
         parameters = {}
-        if self._temperature is not None and "temperature" not in unsupported:
-            parameters["temperature"] = self._temperature
-        if self._reasoning_effort is not None and "reasoning" not in unsupported:
-            parameters["reasoning"] = {"effort": self._reasoning_effort}
+        if (
+            hyperparameters is not None
+            and hyperparameters.temperature is not None
+            and "temperature" not in unsupported
+        ):
+            parameters["temperature"] = hyperparameters.temperature
+        if (
+            hyperparameters is not None
+            and hyperparameters.reasoning_effort is not None
+            and "reasoning" not in unsupported
+        ):
+            parameters["reasoning"] = {"effort": hyperparameters.reasoning_effort}
         return parameters
 
     def _create_response(self, request: dict[str, object], model: str) -> Any:
@@ -446,6 +444,7 @@ class OpenAIBackend(Backend):
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
+        hyperparameters: GenerationHyperparameters | None = None,
         output_format: StructuredOutputFormat | None = None,
         tools: Iterable[ToolDefinition] = (),
     ) -> Iterator[ResponseEvent]:
@@ -456,6 +455,8 @@ class OpenAIBackend(Backend):
             instructions (str | None): System or developer instructions to apply to the request.
             stream (bool): Whether to return a streaming response.
             model (str | None): Model identifier to use instead of the default model.
+            hyperparameters (GenerationHyperparameters | None): Optional model controls for this
+                request.
             output_format (StructuredOutputFormat | None): Optional structured output contract.
             tools (Iterable[ToolDefinition]): Tool definitions available for this request.
 
@@ -472,7 +473,7 @@ class OpenAIBackend(Backend):
         response_started = False
         try:
             for event in self._get_response(
-                input, instructions, stream, model, output_format, tuple(tools)
+                input, instructions, stream, model, hyperparameters, output_format, tuple(tools)
             ):
                 response_started = True
                 yield event
@@ -491,6 +492,7 @@ class OpenAIBackend(Backend):
         instructions: str | None,
         stream: bool,
         model: str | None,
+        hyperparameters: GenerationHyperparameters | None,
         output_format: StructuredOutputFormat | None,
         tools: tuple[ToolDefinition, ...],
     ) -> Iterator[ResponseEvent]:
@@ -507,7 +509,7 @@ class OpenAIBackend(Backend):
                 "stream": stream,
                 "stream_options": {"include_usage": True},
                 "tools": serialized_tools,
-                **self._generation_request_parameters(selected_model),
+                **self._hyperparameter_request_parameters(selected_model, hyperparameters),
             }
             response = self._create_response(request, selected_model)
             if stream:
@@ -546,7 +548,7 @@ class OpenAIBackend(Backend):
                     "stream": stream,
                     "stream_options": {"include_usage": True},
                     "tools": serialized_tools,
-                    **self._generation_request_parameters(selected_model),
+                    **self._hyperparameter_request_parameters(selected_model, hyperparameters),
                     **self._structured_output_request(output_format, mode),
                 }
                 response = self._create_response(request, selected_model)
@@ -561,7 +563,7 @@ class OpenAIBackend(Backend):
                     "stream": stream,
                     "stream_options": {"include_usage": True},
                     "tools": serialized_tools,
-                    **self._generation_request_parameters(selected_model),
+                    **self._hyperparameter_request_parameters(selected_model, hyperparameters),
                 }
                 response = self._create_response(request, selected_model)
             if not stream:
@@ -597,6 +599,7 @@ class OpenAIBackend(Backend):
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
+        hyperparameters: GenerationHyperparameters | None = None,
         output_format: StructuredOutputFormat | None = None,
         tools: Iterable[ToolDefinition] = (),
     ) -> AsyncIterator[ResponseEvent]:
@@ -607,6 +610,8 @@ class OpenAIBackend(Backend):
             instructions (str | None): System or developer instructions to apply to the request.
             stream (bool): Whether to return a streaming response.
             model (str | None): Model identifier to use instead of the default model.
+            hyperparameters (GenerationHyperparameters | None): Optional model controls for this
+                request.
             output_format (StructuredOutputFormat | None): Optional structured output contract.
             tools (Iterable[ToolDefinition]): Tool definitions available for this request.
 
@@ -623,7 +628,7 @@ class OpenAIBackend(Backend):
         response_started = False
         try:
             async for event in self._get_response_async(
-                input, instructions, stream, model, output_format, tuple(tools)
+                input, instructions, stream, model, hyperparameters, output_format, tuple(tools)
             ):
                 response_started = True
                 yield event
@@ -642,6 +647,7 @@ class OpenAIBackend(Backend):
         instructions: str | None,
         stream: bool,
         model: str | None,
+        hyperparameters: GenerationHyperparameters | None,
         output_format: StructuredOutputFormat | None,
         tools: tuple[ToolDefinition, ...],
     ) -> AsyncIterator[ResponseEvent]:
@@ -658,7 +664,7 @@ class OpenAIBackend(Backend):
                 "stream": stream,
                 "stream_options": {"include_usage": True},
                 "tools": serialized_tools,
-                **self._generation_request_parameters(selected_model),
+                **self._hyperparameter_request_parameters(selected_model, hyperparameters),
             }
             response = await self._create_response_async(request, selected_model)
             if not stream:
@@ -699,7 +705,7 @@ class OpenAIBackend(Backend):
                     "stream": stream,
                     "stream_options": {"include_usage": True},
                     "tools": serialized_tools,
-                    **self._generation_request_parameters(selected_model),
+                    **self._hyperparameter_request_parameters(selected_model, hyperparameters),
                     **self._structured_output_request(output_format, mode),
                 }
                 response = await self._create_response_async(request, selected_model)
@@ -714,7 +720,7 @@ class OpenAIBackend(Backend):
                     "stream": stream,
                     "stream_options": {"include_usage": True},
                     "tools": serialized_tools,
-                    **self._generation_request_parameters(selected_model),
+                    **self._hyperparameter_request_parameters(selected_model, hyperparameters),
                 }
                 response = await self._create_response_async(request, selected_model)
             if not stream:

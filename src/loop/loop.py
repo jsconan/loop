@@ -7,7 +7,7 @@ from typing import Self
 
 from . import constants
 from .agent import Agent, AgentRunner, AgentRunResult
-from .backend import Backend
+from .backend import Backend, GenerationHyperparameters
 from .commands import CommandManager
 from .compaction import CompactionCommands, ContextCompaction
 from .completion import (
@@ -20,7 +20,7 @@ from .instructions import InstructionsManager, RuntimeEnvironment, SkillCommands
 from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
 from .model_selection import ModelCommands, ModelSelection
-from .models import ConversationItem
+from .models import ConversationItem, ReasoningEffort
 from .permissions import PermissionCommands, PermissionManager
 from .session import (
     BackendSessionNameGenerator,
@@ -98,6 +98,8 @@ class Loop:
         *,
         agent_name: str = "Loop",
         model: str | None = None,
+        temperature: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         on_model_select: Callable[[str], None] | None = None,
         instructions_manager: InstructionsManager | None = None,
         interaction: Interaction | None = None,
@@ -121,6 +123,9 @@ class Loop:
             backend (Backend): Backend used to request model responses.
             agent_name (str): Human-readable identity. Defaults to ``"Loop"``.
             model (str | None): Explicit model, or ``None`` for the backend default.
+            temperature (float | None): Sampling temperature for this agent's model requests.
+            reasoning_effort (ReasoningEffort | None): Reasoning effort for this agent's model
+                requests.
             on_model_select (Callable[[str], None] | None): Durable preference writer invoked
                 before an explicit model selection takes effect. Defaults to no durable writer.
             instructions_manager (InstructionsManager | None): Injected contextual instruction
@@ -187,7 +192,14 @@ class Loop:
             interaction=configured_interaction,
             permission_manager=configured_permissions,
         )
-        configured_agent = Agent(agent_name, tools=configured_tools)
+        configured_agent = Agent(
+            agent_name,
+            tools=configured_tools,
+            hyperparameters=GenerationHyperparameters(
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+            ),
+        )
         configured_instructions.prepare(configured_agent)
         configured_selection = ModelSelection(
             backend,
@@ -331,6 +343,13 @@ class Loop:
             self.tool_registry.settings.command_timeout = settings.tools.command_timeout
         elif path == "loop.model":
             self._model_selection.restore(settings.loop.model)
+        elif path == "loop.temperature":
+            self._agent_runner.agent.hyperparameters.temperature = settings.loop.temperature
+
+        elif path == "loop.reasoning_effort":
+            self._agent_runner.agent.hyperparameters.reasoning_effort = (
+                settings.loop.reasoning_effort
+            )
         else:
             return "saved; restart required"
         return "applied now"

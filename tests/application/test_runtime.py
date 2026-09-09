@@ -63,6 +63,13 @@ def dependencies(monkeypatch):
 def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     """One settings snapshot and reference graph configures every runtime component."""
     workspace, paths, workspace_paths, settings = assembled
+    settings = settings.model_copy(
+        update={
+            "loop": settings.loop.model_copy(
+                update={"temperature": 0.2, "reasoning_effort": "medium"}
+            )
+        }
+    )
     configuration = Mock()
     repository = Mock()
     interaction = Mock()
@@ -83,6 +90,8 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     assert tool_kwargs["settings"].command_timeout == settings.tools.command_timeout
     assert loop_kwargs["working_directory"] is workspace.working_directory
     assert loop_kwargs["stream"] is settings.loop.stream
+    assert loop_kwargs["temperature"] == 0.2
+    assert loop_kwargs["reasoning_effort"] == "medium"
     assert loop_kwargs["compaction_threshold"] == settings.loop.compaction_threshold
     loop_kwargs["on_model_select"]("selected")
     configuration.set.assert_called_once_with("loop.model", "selected")
@@ -135,7 +144,8 @@ def test_apply_configuration_routes_aggregate_domain_and_scalar_changes(dependen
     )
     runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
 
-    assert runtime.apply_configuration("backend.temperature", settings) == "applied now"
+    assert runtime.apply_configuration("backend.default_model", settings) == "applied now"
+    assert runtime.apply_configuration("loop.temperature", settings) == "applied now"
     assert runtime.apply_configuration("loop.model", settings) == "applied now"
     assert runtime.apply_configuration("loop.debug", settings) == "applied now"
     assert (
@@ -143,7 +153,7 @@ def test_apply_configuration_routes_aggregate_domain_and_scalar_changes(dependen
     )
 
     active_loop.replace_backend.assert_called_once_with(dependencies["OpenAIBackend"].return_value)
-    assert active_loop.apply_runtime_settings.call_count == 3
+    assert active_loop.apply_runtime_settings.call_count == 4
 
 
 @pytest.mark.parametrize("after_telemetry", [False, True])

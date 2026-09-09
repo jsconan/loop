@@ -111,7 +111,7 @@ class ConfigurationCommands:
         ] = None,
         path: Annotated[
             str | None,
-            Field(description="Setting path such as backend.temperature."),
+            Field(description="Setting path such as loop.temperature."),
         ] = None,
         value: Annotated[
             str | None,

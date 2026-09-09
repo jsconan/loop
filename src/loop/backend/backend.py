@@ -3,6 +3,7 @@
 import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass
 
 from ..models import (
     CompactionContextItem,
@@ -11,11 +12,38 @@ from ..models import (
     Message,
     ModelContextItem,
     ModelInfo,
+    ReasoningEffort,
     ResponseCompleted,
     ResponseEvent,
     StructuredOutputFormat,
     ToolDefinition,
 )
+
+
+@dataclass(slots=True)
+class GenerationHyperparameters:
+    """Describe provider-neutral hyperparameters for one model request.
+
+    Args:
+        temperature (float | None): Sampling temperature from 0 through 2, or ``None`` to use
+            the provider default.
+        reasoning_effort (ReasoningEffort | None): Requested reasoning effort, or ``None`` to use
+            the provider default.
+
+    Raises:
+        ValueError: If temperature is not a number from 0 through 2.
+    """
+
+    temperature: float | None = None
+    reasoning_effort: ReasoningEffort | None = None
+
+    def __post_init__(self) -> None:
+        if self.temperature is not None and (
+            isinstance(self.temperature, bool)
+            or not isinstance(self.temperature, (int, float))
+            or not 0 <= self.temperature <= 2
+        ):
+            raise ValueError("Temperature must be a number between 0 and 2.")
 
 
 class Backend(ABC):
@@ -102,6 +130,7 @@ class Backend(ABC):
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
+        hyperparameters: GenerationHyperparameters | None = None,
         output_format: StructuredOutputFormat | None = None,
         tools: Iterable[ToolDefinition] = (),
     ) -> Iterable[ResponseEvent]:
@@ -112,6 +141,8 @@ class Backend(ABC):
             instructions (str | None): System or developer instructions for the request.
             stream (bool): Whether events should be produced incrementally.
             model (str | None): Model identifier to use instead of the default model.
+            hyperparameters (GenerationHyperparameters | None): Optional model controls for this
+                request.
             output_format (StructuredOutputFormat | None): Optional structured output contract.
             tools (Iterable[ToolDefinition]): Tool definitions available for this request.
 
@@ -131,6 +162,7 @@ class Backend(ABC):
         instructions: str | None = None,
         stream: bool = False,
         model: str | None = None,
+        hyperparameters: GenerationHyperparameters | None = None,
         output_format: StructuredOutputFormat | None = None,
         tools: Iterable[ToolDefinition] = (),
     ) -> AsyncIterator[ResponseEvent]:
@@ -141,6 +173,8 @@ class Backend(ABC):
             instructions (str | None): System or developer instructions for the request.
             stream (bool): Whether events should be produced incrementally.
             model (str | None): Model identifier to use instead of the default model.
+            hyperparameters (GenerationHyperparameters | None): Optional model controls for this
+                request.
             output_format (StructuredOutputFormat | None): Optional structured output contract.
             tools (Iterable[ToolDefinition]): Tool definitions available for this request.
 

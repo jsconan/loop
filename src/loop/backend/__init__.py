@@ -14,10 +14,11 @@ __all__ = [
     "BackendServerError",
     "BackendStatusError",
     "BackendTimeoutError",
+    "GenerationHyperparameters",
     "OpenAIBackend",
 ]
 
-from .backend import Backend
+from .backend import Backend, GenerationHyperparameters
 from .errors import (
     BackendAuthenticationError,
     BackendBadRequestError,

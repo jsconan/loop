@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from html import escape
 from importlib.resources import files
 
+from ..backend import GenerationHyperparameters
 from ..constants import DEFAULT_AGENT_INSTRUCTIONS_SOURCE, DEFAULT_AGENT_INSTRUCTIONS_VERSION
 from ..tooling import ToolRegistry, ToolRegistryView
 from ..utils import sha256_digest
@@ -119,11 +120,14 @@ class Agent:
             bundled instructions.
         tools (ToolRegistry | ToolRegistryView): Live view of the tools exposed to the model, or
             the owning registry from which to create that view. Defaults to an empty registry.
+        hyperparameters (GenerationHyperparameters): Per-request model controls used by this
+            agent. Defaults to provider defaults.
     """
 
     identity: AgentIdentity | str
     instructions: AgentInstructions = field(default_factory=AgentInstructions.default)
     tools: ToolRegistry | ToolRegistryView = field(default_factory=ToolRegistry)
+    hyperparameters: GenerationHyperparameters = field(default_factory=GenerationHyperparameters)
 
     def __post_init__(self) -> None:
         if isinstance(self.identity, str):

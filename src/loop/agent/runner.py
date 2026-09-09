@@ -116,6 +116,15 @@ class AgentRunner:
         """
         return self._agent
 
+    @agent.setter
+    def agent(self, agent: Agent) -> None:
+        """Replace the agent definition used for subsequent model requests.
+
+        Args:
+            agent (Agent): Fully configured replacement agent.
+        """
+        self._agent = agent
+
     @property
     def backend(self) -> Backend:
         """Return the backend used to produce model responses.
@@ -537,6 +546,7 @@ class AgentRunner:
             instructions=snapshot.content,
             stream=self._stream,
             model=selected_model,
+            hyperparameters=self._agent.hyperparameters,
             tools=self._agent.tools.definitions(),
         )
 

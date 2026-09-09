@@ -64,6 +64,7 @@ __all__ = [
     "FileInputMode",
     "FileKind",
     "FileTarget",
+    "GenerationHyperparameters",
     "HyperparameterPolicy",
     "InstructionSection",
     "InstructionSnapshot",
@@ -228,6 +229,7 @@ from .backend import (
     BackendServerError,
     BackendStatusError,
     BackendTimeoutError,
+    GenerationHyperparameters,
     OpenAIBackend,
 )
 from .commands import (

@@ -48,6 +48,7 @@ from loop import (
     CompactionContextItem,
     CompactionResult,
     ContextReference,
+    GenerationHyperparameters,
     Message,
     ModelInfo,
     OpenAIBackend,
@@ -239,7 +240,7 @@ def test_configuration_rejects_invalid_structured_output_policy():
             OpenAIBackend(max_retries=value)
     for value in (-0.1, 2.1, True):
         with pytest.raises(ValueError, match="Temperature"):
-            OpenAIBackend(temperature=value)
+            GenerationHyperparameters(temperature=value)
     with pytest.raises(ValueError, match="policy"):
         OpenAIBackend(hyperparameter_policy="ignore")
 
@@ -258,15 +259,18 @@ def test_generation_hyperparameter_fallback_removes_only_rejected_parameter_and_
         [sdk_completion_event(total_tokens=None)],
         [sdk_completion_event(total_tokens=None)],
     ]
-    backend = OpenAIBackend(
-        default_model="model",
-        temperature=0.2,
-        reasoning_effort="medium",
-    )
+    backend = OpenAIBackend(default_model="model")
+    hyperparameters = GenerationHyperparameters(temperature=0.2, reasoning_effort="medium")
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
-        assert isinstance(list(backend.get_response("first", stream=True))[-1], ResponseCompleted)
-        assert isinstance(list(backend.get_response("second", stream=True))[-1], ResponseCompleted)
+        assert isinstance(
+            list(backend.get_response("first", stream=True, hyperparameters=hyperparameters))[-1],
+            ResponseCompleted,
+        )
+        assert isinstance(
+            list(backend.get_response("second", stream=True, hyperparameters=hyperparameters))[-1],
+            ResponseCompleted,
+        )
 
     first, retried, cached = [call.kwargs for call in sdk.responses.create.call_args_list]
     assert first["temperature"] == 0.2
@@ -275,6 +279,36 @@ def test_generation_hyperparameter_fallback_removes_only_rejected_parameter_and_
     assert retried["reasoning"] == {"effort": "medium"}
     assert "temperature" not in cached
     assert cached["reasoning"] == {"effort": "medium"}
+
+
+def test_generation_parameters_are_isolated_between_requests_on_one_backend():
+    """One shared backend forwards each request's independent generation controls."""
+    sdk = Mock()
+    sdk.responses.create.side_effect = [
+        [sdk_completion_event(total_tokens=None)],
+        [sdk_completion_event(total_tokens=None)],
+    ]
+    backend = OpenAIBackend(default_model="model")
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        list(
+            backend.get_response(
+                "first", stream=True, hyperparameters=GenerationHyperparameters(temperature=0.2)
+            )
+        )
+        list(
+            backend.get_response(
+                "second",
+                stream=True,
+                hyperparameters=GenerationHyperparameters(reasoning_effort="medium"),
+            )
+        )
+
+    first, second = [call.kwargs for call in sdk.responses.create.call_args_list]
+    assert first["temperature"] == 0.2
+    assert "reasoning" not in first
+    assert second["reasoning"] == {"effort": "medium"}
+    assert "temperature" not in second
 
 
 def test_generation_hyperparameter_fallback_preserves_temperature_after_reasoning_rejection():
@@ -291,9 +325,13 @@ def test_generation_hyperparameter_fallback_preserves_temperature_after_reasonin
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
         assert isinstance(
             list(
-                OpenAIBackend(
-                    default_model="model", temperature=0.2, reasoning_effort="medium"
-                ).get_response("hello", stream=True)
+                OpenAIBackend(default_model="model").get_response(
+                    "hello",
+                    stream=True,
+                    hyperparameters=GenerationHyperparameters(
+                        temperature=0.2, reasoning_effort="medium"
+                    ),
+                )
             )[-1],
             ResponseCompleted,
         )
@@ -318,9 +356,9 @@ def test_strict_hyperparameter_policy_preserves_provider_rejection():
         pytest.raises(BackendBadRequestError),
     ):
         list(
-            OpenAIBackend(
-                default_model="model", temperature=0.2, hyperparameter_policy="strict"
-            ).get_response("hello")
+            OpenAIBackend(default_model="model", hyperparameter_policy="strict").get_response(
+                "hello", hyperparameters=GenerationHyperparameters(temperature=0.2)
+            )
         )
 
     sdk.responses.create.assert_called_once()
@@ -1452,8 +1490,10 @@ def test_async_generation_hyperparameter_fallback_retries_without_rejected_contr
         assert isinstance(
             asyncio.run(
                 collect_events(
-                    OpenAIBackend(default_model="model", temperature=0.2).get_response_async(
-                        "hello", stream=True
+                    OpenAIBackend(default_model="model").get_response_async(
+                        "hello",
+                        stream=True,
+                        hyperparameters=GenerationHyperparameters(temperature=0.2),
                     )
                 )
             )[-1],
