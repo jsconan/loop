@@ -438,9 +438,7 @@ class PermissionManager:
             ApprovalChoice.SESSION: "S",
         }
         if self._configuration_path is not None:
-            choices[ApprovalChoice.WORKSPACE] = (
-                "Allow in this workspace (save to .loop/permissions.yaml)"
-            )
+            choices[ApprovalChoice.WORKSPACE] = "Allow in this workspace"
             index[ApprovalChoice.WORKSPACE] = "W"
         active_interaction = interaction if interaction is not None else self._interaction
         selected = active_interaction.prompt(
