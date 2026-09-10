@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import stat
 from contextlib import closing
 from datetime import UTC, datetime
 
@@ -21,6 +22,20 @@ from loop import (
     ToolResult,
 )
 from loop.utils import PathHolder
+
+
+def test_sqlite_store_repairs_private_database_permissions(tmp_path):
+    """Session storage and its containing directory remain accessible only to the owner."""
+    parent = tmp_path / "sessions"
+    parent.mkdir(mode=0o755)
+    path = parent / "sessions.db"
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    store.save(Session())
+    path.chmod(0o644)
+
+    assert store.list()
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_store_snapshots_its_database_path(tmp_path):

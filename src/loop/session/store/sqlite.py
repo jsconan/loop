@@ -51,6 +51,7 @@ class SQLiteSessionStore:
         if not legacy.is_file() or self.path.exists():
             return False
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.chmod(0o700)
         temporary = self.path.with_name(f".{self.path.name}.migration.tmp")
         try:
             with (
@@ -60,6 +61,7 @@ class SQLiteSessionStore:
                 source_connection.backup(destination_connection)
             temporary.chmod(0o600)
             temporary.replace(self.path)
+            self._enforce_private_modes()
         finally:
             temporary.unlink(missing_ok=True)
         return True
@@ -90,6 +92,7 @@ class SQLiteSessionStore:
             session.workspace_id = self._workspace_id
         self._validate_workspace(session)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.parent.chmod(0o700)
         if session.name is None:
             session.name = initial_session_name()
             session.name_source = SESSION_NAME_SOURCE_INITIAL
@@ -97,7 +100,8 @@ class SQLiteSessionStore:
         now = utc_now().isoformat()
         payload = session.serialize()
         new_revision = session.revision + 1
-        with closing(sqlite3.connect(self._path)) as connection:  # noqa: SIM117
+        with closing(sqlite3.connect(self._path)) as connection:
+            self._enforce_private_modes()
             with connection:
                 self._create_schema(connection)
                 if session.revision == 0:
@@ -159,6 +163,7 @@ class SQLiteSessionStore:
                             session.revision,
                             current_revision if current_revision is not None else 0,
                         )
+        self._enforce_private_modes()
         session.revision = new_revision
         return session.id
 
@@ -181,6 +186,7 @@ class SQLiteSessionStore:
         if not self._path.is_file():
             raise SessionNotFoundError(f"Session '{session_id}' was not found.")
 
+        self._enforce_private_modes()
         with closing(sqlite3.connect(self._path)) as connection:
             self._create_schema(connection)
             with closing(
@@ -237,6 +243,7 @@ class SQLiteSessionStore:
         """
         if not self._path.is_file():
             return []
+        self._enforce_private_modes()
         with closing(sqlite3.connect(self._path)) as connection:
             self._create_schema(connection)
             with closing(
@@ -258,6 +265,18 @@ class SQLiteSessionStore:
             )
             for row in rows
         ]
+
+    def _enforce_private_modes(self) -> None:
+        """Repair the database directory and every SQLite sidecar to owner-only access."""
+        self._path.parent.chmod(0o700)
+        for path in (
+            self._path,
+            self._path.with_name(f"{self._path.name}-wal"),
+            self._path.with_name(f"{self._path.name}-shm"),
+            self._path.with_name(f"{self._path.name}-journal"),
+        ):
+            if path.exists():
+                path.chmod(0o600)
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
