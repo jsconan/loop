@@ -89,6 +89,24 @@ def initial_session_name(message: str = "") -> str:
     )
 
 
+class LocalSessionNameGenerator:
+    """Generate deterministic session titles."""
+
+    def generate(self, user_message: str, assistant_message: str, model: str | None) -> str:
+        """Derive a local title from the user's first message.
+
+        Args:
+            user_message (str): First user message.
+            assistant_message (str): Unused answer, accepted for the naming contract.
+            model (str | None): Unused model, accepted for the naming contract.
+
+        Returns:
+            str: Bounded deterministic session name.
+        """
+        del assistant_message, model
+        return initial_session_name(user_message)
+
+
 class BackendSessionNameGenerator:
     """Generate session names with an existing conversation backend.
 

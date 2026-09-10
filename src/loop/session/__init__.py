@@ -11,6 +11,7 @@ __all__ = [
     "ConversationItemEvent",
     "GeneratedSessionName",
     "InstructionSnapshot",
+    "LocalSessionNameGenerator",
     "MemorySessionStore",
     "PendingToolCall",
     "PermissionEvent",
@@ -74,6 +75,7 @@ from .models import (
 )
 from .naming import (
     BackendSessionNameGenerator,
+    LocalSessionNameGenerator,
     initial_session_name,
     normalize_session_name,
     validate_session_source,

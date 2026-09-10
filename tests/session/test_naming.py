@@ -14,7 +14,7 @@ from loop import (
     normalize_session_name,
     validate_session_source,
 )
-from loop.session import GeneratedSessionName
+from loop.session import GeneratedSessionName, LocalSessionNameGenerator
 
 
 def test_initial_name_normalizes_whitespace_and_bounds_complete_words():
@@ -130,3 +130,9 @@ def test_validate_session_source_allows_valid_source_even_with_flag():
     """A valid source remains accepted when allow_none=True is set."""
     for source in ("initial", "generated", "user"):
         validate_session_source(source, allow_none=True)
+
+
+def test_local_naming_is_an_optional_strategy_without_model_requests():
+    """The optional deterministic strategy conforms without replacing backend naming."""
+
+    assert LocalSessionNameGenerator().generate("Fix the bug", "answer", "model") == "Fix the bug"
