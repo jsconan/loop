@@ -24,6 +24,7 @@ from loop import (
 )
 from loop.constants import MAX_OUTPUT_CHARS
 from loop.tools.system import run_command as run_command_tool
+from loop.utils import cached_path
 
 # pylint: disable=unused-argument, redefined-outer-name
 
@@ -135,15 +136,16 @@ def test_run_command_requires_an_affirmative_confirmation(monkeypatch):
     popen.assert_not_called()
 
 
-def test_run_command_returns_stripped_stdout_and_passes_safe_process_options(
-    monkeypatch, confirmed
-):
-    """A successful command returns stdout and configures all process pipes."""
-    process = make_process(stdout=("hello world\n", ""))
+def test_run_command_preserves_both_streams_and_passes_safe_process_options(monkeypatch, confirmed):
+    """A successful command preserves stdout whitespace and useful stderr warnings."""
+    process = make_process(stdout=("hello world\n", ""), stderr=("warning\n", ""))
     popen = MagicMock(return_value=process)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", popen)
 
-    assert run_command("echo hello") == "hello world"
+    result = run_command("echo hello")
+    assert result["stdout"]["content"] == "hello world\n"
+    assert result["stderr"]["content"] == "warning\n"
+    assert result["stdout"]["capture_complete"] is True
     popen.assert_called_once()
     args, kwargs = popen.call_args
     assert args == (["echo", "hello"],)
@@ -200,7 +202,7 @@ def test_run_command_preserves_quoted_or_escaped_shell_characters_as_argument_da
     popen = MagicMock(return_value=process)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", popen)
 
-    assert run_command(command) == ""
+    assert run_command(command)["stdout"]["content"] == ""
 
     assert popen.call_args.args == (argv,)
 
@@ -226,7 +228,7 @@ def test_successful_run_command_invalidates_instruction_scope(monkeypatch, tmp_p
         instructions_manager=manager,
     )
 
-    assert json.loads(result) == {"ok": True, "result": "ok"}
+    assert json.loads(result)["result"]["stdout"]["content"] == "ok"
     manager.invalidate.assert_called_once_with(None)
 
 
@@ -236,7 +238,7 @@ def test_run_command_completes_a_normal_process_within_its_lifecycle_timeout(
     """A short real command completes normally under the shared lifecycle deadline."""
     tool_registry.settings.command_timeout = 0.5
 
-    assert run_command(python_command("print('complete')")) == "complete"
+    assert run_command(python_command("print('complete')"))["stdout"]["content"] == "complete\n"
 
 
 def test_run_command_reports_exit_code_stdout_and_stderr(monkeypatch, confirmed):
@@ -248,11 +250,9 @@ def test_run_command_reports_exit_code_stdout_and_stderr(monkeypatch, confirmed)
 
     failure = problem(run_command("missing"))
     assert failure["code"] == "process.nonzero_exit"
-    assert failure["metadata"] == {
-        "exit_code": 127,
-        "stdout": "some output",
-        "stderr": "command not found",
-    }
+    assert failure["metadata"]["exit_code"] == 127
+    assert failure["metadata"]["stdout"]["content"] == "some output\n"
+    assert failure["metadata"]["stderr"]["content"] == "command not found\n"
 
 
 def test_run_command_caps_each_output_stream_while_draining_it(monkeypatch, confirmed):
@@ -268,8 +268,15 @@ def test_run_command_caps_each_output_stream_while_draining_it(monkeypatch, conf
 
     failure = problem(result)
     assert failure["code"] == "process.nonzero_exit"
-    assert failure["metadata"]["stdout"] == "x" * MAX_OUTPUT_CHARS
-    assert failure["metadata"]["stderr"] == "y" * MAX_OUTPUT_CHARS
+    assert failure["metadata"]["stdout"]["captured_bytes"] == MAX_OUTPUT_CHARS
+    assert failure["metadata"]["stdout"]["discarded_characters"] == 9
+    assert (
+        cached_path(failure["metadata"]["stdout"]["handle"])[0].read_text()
+        == "x" * MAX_OUTPUT_CHARS
+    )
+    assert failure["metadata"]["stdout"]["next_cursor"]
+    assert failure["metadata"]["stderr"]["captured_bytes"] == MAX_OUTPUT_CHARS
+    assert failure["metadata"]["stderr"]["discarded_characters"] == 15
     assert process.stdout.read.call_count == 3
     assert process.stderr.read.call_count == 3
 
@@ -287,18 +294,21 @@ def test_run_command_drains_large_stdout_and_stderr_without_deadlocking(monkeypa
     failure = problem(run_command(python_command(script)))
 
     assert failure["code"] == "process.nonzero_exit"
-    assert failure["metadata"] == {
-        "exit_code": 7,
-        "stdout": "x" * MAX_OUTPUT_CHARS,
-        "stderr": "y" * MAX_OUTPUT_CHARS,
-    }
+    assert failure["metadata"]["exit_code"] == 7
+    for stream in ("stdout", "stderr"):
+        assert failure["metadata"][stream]["captured_bytes"] == MAX_OUTPUT_CHARS
+        assert failure["metadata"][stream]["discarded_characters"] == 8192
+        assert failure["metadata"][stream]["truncated"] is True
 
 
 def test_run_command_replaces_undecodable_output(monkeypatch, authorized):
     """Invalid UTF-8 output is represented with replacement characters instead of failing."""
     tool_registry.settings.command_timeout = 0.5
 
-    assert run_command(python_command("import os; os.write(1, b'ok\\xff')")) == "ok�"
+    assert (
+        run_command(python_command("import os; os.write(1, b'ok\\xff')"))["stdout"]["content"]
+        == "ok�"
+    )
 
 
 def test_run_command_surfaces_reader_failures(monkeypatch, confirmed):
@@ -407,10 +417,13 @@ def test_run_command_times_out_a_long_running_direct_child(monkeypatch, authoriz
     tool_registry.settings.command_timeout = 0.2
     started = time.monotonic()
 
-    failure = problem(run_command(python_command("import time; time.sleep(30)")))
+    failure = problem(
+        run_command(python_command("import time; print('partial', flush=True); time.sleep(30)"))
+    )
 
     assert failure["code"] == "process.timeout"
     assert failure["detail"] == "Command did not complete within 0.2 seconds."
+    assert failure["metadata"]["stdout"]["content"] == "partial\n"
     assert time.monotonic() - started < 0.5
 
 

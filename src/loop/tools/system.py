@@ -13,7 +13,13 @@ from .. import constants
 from ..errors import Problem, log_problem
 from ..permissions import Action, Operation, OperationPlan, ProcessBoundary, ProcessTarget
 from ..tooling import ToolContext, tool
-from ..utils import kill_process_group, parse_command_line, read_bounded_stream
+from ..utils import (
+    encode_content_cursor,
+    kill_process_group,
+    parse_command_line,
+    read_bounded_stream,
+    store_content,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _CLEANUP_RESERVE_SECONDS = 0.1
@@ -31,10 +37,11 @@ def _read_stream(
     errors: list[Exception | None],
     index: int,
     changed: threading.Event,
+    discarded: list[int | None],
 ) -> None:
     """Capture a bounded stream and retain a reader failure for the calling thread."""
     try:
-        read_bounded_stream(stream, chunks, constants.MAX_OUTPUT_CHARS)
+        discarded[index] = read_bounded_stream(stream, chunks, constants.MAX_OUTPUT_CHARS)
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         errors[index] = exc
     finally:
@@ -104,7 +111,7 @@ def _cleanup_process(
     _join_readers(readers, deadline)
 
 
-def _timeout_error(timeout: float) -> Problem:
+def _timeout_error(timeout: float, output: dict) -> Problem:
     """Return a standardized timeout error problem."""
     return Problem(
         code="process.timeout",
@@ -112,7 +119,40 @@ def _timeout_error(timeout: float) -> Problem:
         detail=(f"Command did not complete within {timeout} seconds."),
         retryable=True,
         operation="run_command",
+        metadata=output,
     )
+
+
+def _stream_output(chunks: list[str], discarded: int | None, source: str) -> dict:
+    """Return a recoverable preview and explicit capture-loss status for one stream."""
+    encoded = "".join(chunks).encode("utf-8")
+    preview = encoded[: constants.MAX_TOOL_CONTENT_BYTES // 2].decode("utf-8", errors="ignore")
+    included = len(preview.encode("utf-8"))
+    result = {
+        "content": preview,
+        "captured_bytes": len(encoded),
+        "included_bytes": included,
+        "truncated": included < len(encoded) or discarded != 0,
+        "capture_complete": discarded == 0,
+        "discarded_characters": discarded,
+    }
+    if included < len(encoded):
+        handle = store_content(encoded, source)
+        result.update(
+            handle=handle,
+            next_cursor=encode_content_cursor(handle, included),
+            continuation="Use read_cached_content with this handle and cursor.",
+        )
+    return result
+
+
+def _process_output(returncode: int | None, chunks: list[list[str]], discarded: list) -> dict:
+    """Preserve exit status and both streams without hiding incomplete capture."""
+    return {
+        "exit_code": returncode,
+        "stdout": _stream_output(chunks[0], discarded[0], "command stdout"),
+        "stderr": _stream_output(chunks[1], discarded[1], "command stderr"),
+    }
 
 
 def _command_plan(arguments: dict[str, object]) -> OperationPlan:
@@ -152,8 +192,8 @@ def run_command(
         str,
         Field(description="Working directory for the process."),
     ] = ".",
-) -> str | Problem:
-    """Run a shell-free process and return its output."""
+) -> dict | Problem:
+    """Run a shell-free process and return exit status and recoverable stdout/stderr previews."""
     process = None
     started_readers = []
     timeout = context.settings.command_timeout
@@ -188,17 +228,18 @@ def run_command(
             raise RuntimeError("Command process did not expose its output streams.")
         stdout_chunks = []
         stderr_chunks = []
-        reader_errors: list[Exception | None] = [None, None]
+        reader_errors = [None, None]
         reader_changed = threading.Event()
+        discarded = [None, None]
         readers = [
             threading.Thread(
                 target=_read_stream,
-                args=(process.stdout, stdout_chunks, reader_errors, 0, reader_changed),
+                args=(process.stdout, stdout_chunks, reader_errors, 0, reader_changed, discarded),
                 daemon=True,
             ),
             threading.Thread(
                 target=_read_stream,
-                args=(process.stderr, stderr_chunks, reader_errors, 1, reader_changed),
+                args=(process.stderr, stderr_chunks, reader_errors, 1, reader_changed, discarded),
                 daemon=True,
             ),
         ]
@@ -212,23 +253,26 @@ def run_command(
             )
         except subprocess.TimeoutExpired:
             _cleanup_process(process, started_readers, deadline)
-            return _timeout_error(timeout)
+            return _timeout_error(
+                timeout, _process_output(None, [stdout_chunks, stderr_chunks], discarded)
+            )
         if not _join_readers(started_readers, execution_deadline):
             _cleanup_process(process, started_readers, deadline)
-            return _timeout_error(timeout)
+            return _timeout_error(
+                timeout, _process_output(returncode, [stdout_chunks, stderr_chunks], discarded)
+            )
         if reader_error := next((error for error in reader_errors if error is not None), None):
             raise reader_error
 
         _close_process_streams(process)
-        output = "".join(stdout_chunks).strip()
-        error_msg = "".join(stderr_chunks).strip()
+        output = _process_output(returncode, [stdout_chunks, stderr_chunks], discarded)
         if returncode != 0:
             return Problem(
                 code="process.nonzero_exit",
                 title="Command failed",
                 detail=f"Command exited with code {returncode}.",
                 operation="run_command",
-                metadata={"exit_code": returncode, "stdout": output, "stderr": error_msg},
+                metadata=output,
             )
         # Commands may create, remove, or edit instruction files. Their exact effects are
         # intentionally not inferred from arbitrary command text; a successful command
