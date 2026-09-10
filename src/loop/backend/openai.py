@@ -67,6 +67,7 @@ from ..models import (
     ResponseCompleted,
     ResponseEvent,
     ResponseMetadata,
+    RetentionPolicy,
     StructuredOutputFormat,
     StructuredOutputMode,
     StructuredOutputTransport,
@@ -119,6 +120,8 @@ class OpenAIBackend(Backend):
         max_retries (int): Number of automatic SDK retries for transient request failures.
         hyperparameter_policy (HyperparameterPolicy): Whether to retry without a
             hyperparameter explicitly rejected as unsupported, or preserve that rejection.
+        retention_policy (RetentionPolicy | None): Provider retention capability. Defaults to
+            requiring ``store=False`` for OpenAI and provider-managed retention for custom URLs.
 
     Raises:
         ValueError: If a configured value is invalid.
@@ -134,6 +137,7 @@ class OpenAIBackend(Backend):
     _prompt_structured_models: set[str]
     _max_retries: int
     _hyperparameter_policy: HyperparameterPolicy
+    _retention_policy: RetentionPolicy
     _unsupported_hyperparameters: dict[str, set[str]]
     _declared_hyperparameters: dict[str, frozenset[str]]
     _hyperparameter_discovery_attempted: set[str]
@@ -151,6 +155,7 @@ class OpenAIBackend(Backend):
         structured_output_max_retries: int = constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES,
         max_retries: int = constants.DEFAULT_MAX_RETRIES,
         hyperparameter_policy: HyperparameterPolicy = (constants.DEFAULT_HYPERPARAMETER_POLICY),
+        retention_policy: RetentionPolicy | None = None,
     ) -> None:
         super().__init__(
             base_url=base_url,
@@ -179,6 +184,14 @@ class OpenAIBackend(Backend):
         if hyperparameter_policy not in ("fallback", "strict"):
             raise ValueError("Hyperparameter policy must be 'fallback' or 'strict'.")
         self._hyperparameter_policy = hyperparameter_policy
+        if retention_policy is None:
+            retention_policy = "required_false" if base_url is None else "provider_managed"
+        if retention_policy not in ("required_false", "supported_false", "provider_managed"):
+            raise ValueError(
+                "Retention policy must be 'required_false', 'supported_false', or "
+                "'provider_managed'."
+            )
+        self._retention_policy = retention_policy
         self._unsupported_hyperparameters = {}
         self._declared_hyperparameters = {}
         self._hyperparameter_discovery_attempted = set()
@@ -410,13 +423,14 @@ class OpenAIBackend(Backend):
 
     def _create_response(self, request: dict[str, object], model: str) -> Any:
         """Create a response, retrying only explicit unsupported-hyperparameter rejections."""
-        effective_request = dict(request)
+        effective_request = self._retention_request(request)
         while True:
             try:
                 return self._get_client().responses.create(
                     **self._prepared_request(**effective_request)
                 )
             except APIStatusError as error:
+                self._raise_retention_error(error)
                 parameter = self._unsupported_hyperparameter(error, model, effective_request)
                 if parameter is None:
                     raise
@@ -424,17 +438,40 @@ class OpenAIBackend(Backend):
 
     async def _create_response_async(self, request: dict[str, object], model: str) -> Any:
         """Asynchronously create a response with the synchronous fallback policy."""
-        effective_request = dict(request)
+        effective_request = self._retention_request(request)
         while True:
             try:
                 return await self._get_async_client().responses.create(
                     **self._prepared_request(**effective_request)
                 )
             except APIStatusError as error:
+                self._raise_retention_error(error)
                 parameter = self._unsupported_hyperparameter(error, model, effective_request)
                 if parameter is None:
                     raise
                 effective_request.pop(parameter)
+
+    def _retention_request(self, request: dict[str, object]) -> dict[str, object]:
+        """Apply the explicitly configured provider retention capability."""
+        if self._retention_policy == "provider_managed":
+            return dict(request)
+        return {**request, "store": False}
+
+    def _raise_retention_error(self, error: APIStatusError) -> None:
+        """Fail clearly when a no-storage requirement is rejected by the provider."""
+        if self._retention_policy != "required_false" or error.status_code not in (400, 422):
+            return
+        body_message = error.body.get("message") if isinstance(error.body, dict) else None
+        if "store" not in f"{error} {body_message or ''}".lower():
+            return
+        raise BackendBadRequestError(
+            "The provider rejected store=False, but the configured retention policy requires "
+            "no application-state storage.",
+            provider="openai",
+            operation="retention_policy",
+            status_code=error.status_code,
+            details=error.body,
+        ) from error
 
     def _unsupported_hyperparameter(
         self,

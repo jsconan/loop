@@ -9,7 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings
 
 from .. import constants
-from ..models import FileInputMode, HyperparameterPolicy, ReasoningEffort, StructuredOutputMode
+from ..models import (
+    FileInputMode,
+    HyperparameterPolicy,
+    ReasoningEffort,
+    RetentionPolicy,
+    StructuredOutputMode,
+)
 
 CONFIGURATION_VERSION = 1
 
@@ -30,6 +36,7 @@ class BackendSettings(BaseModel):
         default=constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES, ge=0
     )
     hyperparameter_policy: HyperparameterPolicy = constants.DEFAULT_HYPERPARAMETER_POLICY
+    retention_policy: RetentionPolicy | None = constants.DEFAULT_RETENTION_POLICY
 
 
 class LoopSettings(BaseModel):

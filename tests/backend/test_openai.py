@@ -243,6 +243,57 @@ def test_configuration_rejects_invalid_structured_output_policy():
             GenerationHyperparameters(temperature=value)
     with pytest.raises(ValueError, match="policy"):
         OpenAIBackend(hyperparameter_policy="ignore")
+    with pytest.raises(ValueError, match="Retention policy"):
+        OpenAIBackend(retention_policy="unknown")
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({}, False),
+        ({"base_url": "https://compatible.test/v1"}, None),
+        (
+            {
+                "base_url": "https://compatible.test/v1",
+                "retention_policy": "supported_false",
+            },
+            False,
+        ),
+    ],
+)
+def test_retention_policy_matches_explicit_provider_capability(options, expected):
+    """Official and capable providers disable storage while provider-managed servers omit it."""
+    sdk = Mock()
+    sdk.responses.create.return_value = sdk_response(
+        output=[], output_text="done", usage=None, model="model"
+    )
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        list(OpenAIBackend(default_model="model", **options).get_response("hello"))
+    request = sdk.responses.create.call_args.kwargs
+    assert request.get("store") is expected
+
+
+@pytest.mark.parametrize("policy", ["required_false", "supported_false"])
+def test_retention_rejection_respects_required_privacy_policy(policy):
+    """A required no-storage rejection is explicit while other policies retain normal errors."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "bad request",
+        response=httpx.Response(400, request=request),
+        body={"message": "unsupported parameter: store"},
+    )
+    sdk = Mock()
+    sdk.responses.create.side_effect = rejected
+    backend = OpenAIBackend(default_model="model", retention_policy=policy)
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendBadRequestError) as caught,
+    ):
+        list(backend.get_response("hello"))
+    assert caught.value.operation == "create_response"
+    assert ("requires no application-state storage" in str(caught.value)) is (
+        policy == "required_false"
+    )
 
 
 def test_generation_hyperparameter_fallback_removes_only_rejected_parameter_and_caches_model():
@@ -1084,6 +1135,7 @@ def test_sync_response_forwards_schema_streaming_and_model_selection():
 
     assert result == [ResponseCompleted(model="served-model")]
     sdk.responses.create.assert_called_once_with(
+        store=False,
         model="override",
         input="hello",
         instructions="Follow the project rules.",
@@ -1588,6 +1640,7 @@ def test_async_response_uses_default_model():
 
     assert result == [ResponseCompleted(model="served-model")]
     sdk.responses.create.assert_awaited_once_with(
+        store=False,
         model="default",
         input=[{"role": "user", "content": "hi"}],
         instructions=None,

@@ -24,6 +24,7 @@ type StructuredOutputTransport = Literal["native", "prompt"]
 type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 type Hyperparameter = Literal["temperature", "reasoning"]
 type HyperparameterPolicy = Literal["fallback", "strict"]
+type RetentionPolicy = Literal["required_false", "supported_false", "provider_managed"]
 type ContextReferenceKind = Literal["file", "directory"]
 type MessageRole = Literal["user", "assistant"]
 

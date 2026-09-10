@@ -288,6 +288,7 @@ class ApplicationRuntime:
             structured_output_max_retries=settings.backend.structured_output_max_retries,
             max_retries=settings.backend.max_retries,
             hyperparameter_policy=settings.backend.hyperparameter_policy,
+            retention_policy=settings.backend.retention_policy,
         )
 
     def stop(self) -> None:
