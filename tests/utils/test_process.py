@@ -50,9 +50,10 @@ def test_read_bounded_stream_drains_every_chunk_but_retains_the_configured_limit
     stream.read.side_effect = ["abcd", "efgh", "ignored", ""]
     chunks = []
 
-    read_bounded_stream(stream, chunks, 6)
+    discarded = read_bounded_stream(stream, chunks, 6)
 
     assert chunks == ["abcd", "ef"]
+    assert discarded == 9
     assert stream.read.call_count == 4
     stream.read.assert_called_with(8192)
 
@@ -63,10 +64,23 @@ def test_read_bounded_stream_can_drain_without_retaining_output():
     stream.read.side_effect = ["content", ""]
     chunks = []
 
-    read_bounded_stream(stream, chunks, 0)
+    discarded = read_bounded_stream(stream, chunks, 0)
 
     assert chunks == []
+    assert discarded == 7
     assert stream.read.call_count == 2
+
+
+def test_read_bounded_stream_reports_no_discarded_characters_within_limit():
+    """A stream shorter than the output budget reports no discarded characters."""
+    stream = MagicMock()
+    stream.read.side_effect = ["content", ""]
+    chunks = []
+
+    discarded = read_bounded_stream(stream, chunks, len("content"))
+
+    assert chunks == ["content"]
+    assert discarded == 0
 
 
 def test_kill_process_group_terminates_the_complete_posix_group(monkeypatch):

@@ -5,6 +5,8 @@ import signal
 import subprocess
 from typing import Protocol
 
+from .. import constants
+
 
 class TextStream(Protocol):
     """Represent a synchronously readable text stream."""
@@ -82,19 +84,25 @@ def parse_command_line(command: str) -> tuple[str, ...]:  # pylint: disable=too-
     return tuple(argv)
 
 
-def read_bounded_stream(stream: TextStream, chunks: list[str], maximum: int) -> None:
+def read_bounded_stream(stream: TextStream, chunks: list[str], maximum: int) -> int:
     """Drain a text stream while retaining no more than the requested character limit.
 
     Args:
         stream (TextStream): Stream drained until its ``read`` method returns an empty string.
         chunks (list[str]): Destination receiving retained text chunks.
         maximum (int): Maximum total characters retained in ``chunks``.
+
+    Returns:
+        int: Number of characters discarded after the capture limit.
     """
     remaining = maximum
-    while chunk := stream.read(8192):
+    discarded = 0
+    while chunk := stream.read(constants.DEFAULT_STREAM_CHUNK_SIZE):
+        discarded += max(0, len(chunk) - remaining)
         if remaining:
             chunks.append(chunk[:remaining])
             remaining -= len(chunk[:remaining])
+    return discarded
 
 
 def kill_process_group(process: subprocess.Popen[str]) -> None:

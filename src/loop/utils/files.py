@@ -4,10 +4,11 @@ import stat
 import tempfile
 from pathlib import Path
 
+from .. import constants
 from .hashing import sha256_digest
 
 
-def is_binary_file(path: Path, probe_bytes: int = 8192) -> bool:
+def is_binary_file(path: Path, probe_bytes: int = constants.DEFAULT_STREAM_CHUNK_SIZE) -> bool:
     """Return whether a file begins with a binary NUL-byte marker.
 
     Args:
