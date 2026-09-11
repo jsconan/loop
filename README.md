@@ -123,6 +123,26 @@ After the first completed answer, a separate structured-output request generates
 descriptive name without adding the title request to conversation history. A failed title request
 leaves the provisional name intact.
 
+Model-assisted naming remains the default; library callers may explicitly choose
+`LocalSessionNameGenerator` when deterministic local titles are preferred.
+
+The OpenAI backend irreversibly replaces detected credentials before sending semantic text,
+including UTF-8 attachments before encoding and remote token-counting requests. Model output and
+tool arguments can never expand a replacement back to plaintext. Detection is heuristic, not a
+guarantee that all confidential text, PII, or encoded secrets are removed. Required protocol and
+schema identifiers remain intact. Official OpenAI requests require `store=False`; custom compatible
+servers default to provider-managed retention and can explicitly declare `supported_false` or
+`required_false`. This transport setting is not a guarantee about provider-wide retention.
+
+Runtime instructions specify `.` for the current workspace directory, `scratch:/` for the
+permitted temporary directory, and `skill:<name>/` for active skill resources. File tools and terminal
+commands use standard workspace-relative paths (e.g. `src/main.py`), while logical prefixes like
+`workspace:/` and `scratch:/` remain supported for backward-compatible resolution. Result path
+metadata uses clean relative paths. Arbitrary command text, source code, and output are not rewritten.
+Command results retain exit status and both stdout/stderr previews, including partial timeout
+output. Continuation handles recover the captured remainder; output beyond the capture cap is
+explicitly marked as lost.
+
 Each session also owns an ordered event timeline for faithful replay. It records conversation-item
 placement, tool-execution boundaries, compactions, permission decisions, and completed-run
 statistics. Run statistics include
@@ -194,9 +214,10 @@ files applicable to the current working directory, from the project root through
 Project sources are appended after the base policy from least to most specific, followed by runtime
 context, the skill catalog, and active skills. Files may optionally begin with YAML frontmatter
 delimited by `---`; its metadata is validated and excluded from the instruction body, with malformed
-frontmatter reported in `manage_skills` diagnostics. The 32 KiB project-instruction limit emits a
-visible truncation marker when space permits. Context diagnostics report source digests, paths, and
-exact included and omitted sizes; prepared snapshots additionally expose agent-section provenance.
+frontmatter reported in `manage_skills` diagnostics. Applicable project instructions are included
+in full within the configured aggregate instruction budget; overflow is reported before generation
+instead of silently removing rules. Context diagnostics report source digests, paths, and sizes;
+prepared snapshots additionally expose agent-section provenance.
 Successful local file reads, directory listings, and writes update the active instruction scope
 before the next model request.
 
@@ -670,8 +691,9 @@ not prevent an explicitly requested file from being read or changed.
 case control, inclusive Git-style globs, neighboring lines, and a global result limit. Folder
 searches reuse Loop's ignore traversal before passing explicit visible files to ripgrep, skip
 binary files and symbolic links, and return paths relative to the requested folder.
-Loop does not bundle ripgrep: `rg` must be installed separately and available on `PATH`. When it
-is unavailable, searches return a structured `filesystem.search_unavailable` problem.
+The base installation does not include ripgrep. Install the optional `tools` extra
+(`uv sync --extra tools`), or install `rg` separately and make it available on `PATH`. When it is
+unavailable, searches return a structured `filesystem.search_unavailable` problem.
 
 These tools operate with the permissions of the process running `loop`. Filesystem access is
 authorized but not OS-sandboxed; approved commands use an exact argument vector and never invoke
