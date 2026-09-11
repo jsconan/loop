@@ -195,17 +195,14 @@ def test_prepared_sections_capture_relocatable_workspace_and_external_provenance
     )
 
 
-def test_manager_reports_truncated_project_instruction_sources(tmp_path):
-    """Discovery exposes bounded source sizes and a persistent truncation diagnostic."""
+def test_manager_preserves_complete_sources_within_the_configured_budget(tmp_path):
+    """The aggregate budget permits complete instructions beyond the old preview limit."""
     (tmp_path / "AGENTS.md").write_text("x" * 33_000, encoding="utf-8")
 
     manager = configured_discovered(tmp_path, max_bytes=40_000)
-    context = manager.list_skills()["instruction_context"]
-
-    assert context["diagnostics"] == [
-        "Agent instructions truncated at 32768 bytes; 288 source byte(s) omitted."
-    ]
-    assert context["sources"][0]["size_bytes"] == 33_000
+    assert "x" * 33_000 in manager.instructions
+    with pytest.raises(ValueError, match="no instructions were truncated"):
+        configured_discovered(tmp_path, max_bytes=32_000)
 
 
 def test_discovery_refresh_preserves_an_explicit_skill_manager(tmp_path):

@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+class ModelSelectionError(ValueError):
+    """Identify a model-selection failure at the request-preparation boundary."""
+
+
 class ModelSelection:
     """Own model selection and durable last-used assignment reconciliation.
 
@@ -91,11 +95,11 @@ class ModelSelection:
             str: Model identifier to use for backend operations.
 
         Raises:
-            ValueError: If neither this selection nor the backend provides a model.
+            ModelSelectionError: If neither this selection nor the backend provides a model.
         """
         model = self._selected or self._backend.default_model
         if not model:
-            raise ValueError("No model was selected and the backend has no default model.")
+            raise ModelSelectionError("No model was selected and the backend has no default model.")
         return model
 
     @property
@@ -106,7 +110,7 @@ class ModelSelection:
             ModelAssignment: Exact model and known context capacity for the operation.
 
         Raises:
-            ValueError: If neither this selection nor the backend provides a model.
+            ModelSelectionError: If neither this selection nor the backend provides a model.
         """
         return self._get_assignment(self.effective)
 
@@ -195,7 +199,7 @@ class ModelSelection:
             ModelAssignment: Persisted assignment.
 
         Raises:
-            ValueError: If no effective model is configured.
+            ModelSelectionError: If no effective model is configured.
         """
         assignment = assignment or self.assignment
         self._session_manager.assignment = assignment
@@ -205,7 +209,7 @@ class ModelSelection:
         """Persist the effective model and its normalized context window in the active session.
 
         Raises:
-            ValueError: If neither the selection nor backend defines a model.
+            ModelSelectionError: If neither the selection nor backend defines a model.
         """
         self._session_manager.assignment = self.assignment
 

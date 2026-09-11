@@ -11,7 +11,7 @@ from ..commands import CommandContext, CommandRegistration
 from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
 from ..errors import Problem, log_problem
 from ..models import ModelInfo
-from .selection import ModelSelection
+from .selection import ModelSelection, ModelSelectionError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ class ModelCommands:
             return
         try:
             model = self._model_selection.effective
-        except ValueError:
+        except ModelSelectionError:
             context.interaction.warning("Backend is available, but no model is selected.")
             self._model_selection.select_fallback(context.interaction)
             return

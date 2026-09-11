@@ -8,7 +8,11 @@ import yaml
 
 from .. import constants
 from ..utils import find_project_root, is_path_ignored
-from .models import AgentInstructionsSource, LoadedAgentInstructions
+from .models import (
+    AgentInstructionsSource,
+    InstructionBudgetExceededError,
+    LoadedAgentInstructions,
+)
 
 
 def get_skill_directories(
@@ -176,12 +180,12 @@ def load_agents_instructions(
     agents_filenames: Iterable[str] = (constants.DEFAULT_AGENTS_FILENAME,),
     max_bytes: int = constants.MAX_AGENTS_BYTES,
 ) -> LoadedAgentInstructions:
-    """Load project instructions with source and truncation diagnostics.
+    """Load complete applicable project instructions or reject instruction overflow.
 
     Args:
         working_directory (Path | str): Directory whose instruction scope should be loaded.
         agents_filenames (Iterable[str]): Candidate names in precedence order.
-        max_bytes (int): Maximum source-content bytes included before a truncation marker.
+        max_bytes (int): Maximum UTF-8 bytes for the complete applicable instruction chain.
 
     Returns:
         LoadedAgentInstructions: Bounded content and per-source provenance.
@@ -189,6 +193,7 @@ def load_agents_instructions(
     Raises:
         OSError: An applicable instruction file cannot be read.
         UnicodeError: An applicable instruction file is not valid UTF-8.
+        InstructionBudgetExceededError: Applicable instructions exceed the byte limit.
     """
     discovered = []
     diagnostics = []
@@ -211,61 +216,32 @@ def load_agents_instructions(
             content=None,
             sources=(),
             max_bytes=max_bytes,
-            truncated=False,
             diagnostics=tuple(diagnostics),
         )
 
-    complete_size = len("\n\n".join(content for _, content in discovered).encode("utf-8"))
-    marker_size = len(constants.TRUNCATION_MARKER.encode("utf-8"))
-    marker = constants.TRUNCATION_MARKER if marker_size <= max_bytes < complete_size else ""
-    remaining = max_bytes - len(marker.encode("utf-8"))
-    included = []
-    sources = []
-    truncated = False
-    for index, (path, content) in enumerate(discovered):
-        separator = "\n\n" if included else ""
-        separator_size = len(separator.encode("utf-8"))
-        encoded = content.encode("utf-8")
-        available = max(remaining - separator_size, 0)
-        included_content = encoded[:available].decode("utf-8", errors="ignore")
-        included_bytes = len(included_content.encode("utf-8"))
-        source_truncated = included_bytes < len(encoded)
-        if included_content:
-            included.append(f"{separator}{included_content}")
-        remaining -= separator_size + included_bytes
-        truncated = truncated or source_truncated
-        sources.append(
-            AgentInstructionsSource(
-                path=path,
-                size_bytes=len(encoded),
-                included_bytes=included_bytes,
-                truncated=source_truncated,
-                content=included_content,
-            )
+    content = "\n\n".join(content for _, content in discovered)
+    if len(content.encode("utf-8")) > max_bytes:
+        sources = ", ".join(
+            f"'{path}' ({len(body.encode('utf-8'))} bytes)" for path, body in discovered
         )
-        if remaining <= 0:
-            for omitted_path, omitted_content in discovered[index + 1 :]:
-                omitted_size = len(omitted_content.encode("utf-8"))
-                sources.append(
-                    AgentInstructionsSource(
-                        path=omitted_path,
-                        size_bytes=omitted_size,
-                        included_bytes=0,
-                        truncated=True,
-                        content="",
-                    )
-                )
-            truncated = truncated or index + 1 < len(discovered)
-            break
-
-    content = "".join(included) or None
-    if truncated and marker:
-        content = f"{content or ''}{marker}"
+        raise InstructionBudgetExceededError(
+            f"Applicable AGENTS instructions exceed the {max_bytes}-byte limit. "
+            f"Sources: {sources}. Shorten the instruction sources or raise the configured limit "
+            "for the selected model; no instructions were truncated."
+        )
     return LoadedAgentInstructions(
         content=content,
-        sources=tuple(sources),
+        sources=tuple(
+            AgentInstructionsSource(
+                path=path,
+                content=body,
+                size_bytes=len(body.encode("utf-8")),
+                included_bytes=len(body.encode("utf-8")),
+                truncated=False,
+            )
+            for path, body in discovered
+        ),
         max_bytes=max_bytes,
-        truncated=truncated,
         diagnostics=tuple(diagnostics),
     )
 

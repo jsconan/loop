@@ -11,9 +11,9 @@ from .. import constants
 from ..backend import Backend, BackendError, BackendNotFoundError
 from ..compaction import ContextCompaction
 from ..errors import Problem, log_problem
-from ..instructions import InstructionsManager
+from ..instructions import InstructionBudgetExceededError, InstructionsManager
 from ..interaction import Interaction
-from ..model_selection import ModelSelection
+from ..model_selection import ModelSelection, ModelSelectionError
 from ..models import (
     AgentRunStopReason,
     Message,
@@ -623,6 +623,21 @@ class AgentRunner:
                 self._interaction.warning("The selected model is not available.")
                 if not self._model_selection.select_fallback(self._interaction):
                     return None
+            except (InstructionBudgetExceededError, ModelSelectionError) as error:
+                problem = Problem.from_exception(
+                    error,
+                    code="agent.query_failed",
+                    title="Could not prepare the request",
+                    detail=(
+                        "The request could not be prepared, for example because no model is "
+                        "selected or applicable instructions exceed the configured budget. "
+                        "Fix the underlying condition before sending another message."
+                    ),
+                    operation="query",
+                )
+                log_problem(_LOGGER, problem, error)
+                self._interaction.report(problem)
+                return None
             except BackendError as error:
                 self._report_backend_error(error)
                 if not error.recoverable or not self._prompt_on_recoverable_error:

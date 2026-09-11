@@ -5,7 +5,14 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import BackendConnectionError, ModelInfo, ModelSelection, Session, SessionManager
+from loop import (
+    BackendConnectionError,
+    ModelInfo,
+    ModelSelection,
+    ModelSelectionError,
+    Session,
+    SessionManager,
+)
 
 
 def backend(**attributes):
@@ -45,9 +52,9 @@ def test_selection_restores_last_used_model_without_a_backend_fallback():
     assert session_manager.context_window == 8192
 
     empty = ModelSelection(backend(default_model=None), SessionManager())
-    with pytest.raises(ValueError, match="No model was selected"):
+    with pytest.raises(ModelSelectionError, match="No model was selected"):
         _ = empty.effective
-    with pytest.raises(ValueError, match="No model was selected"):
+    with pytest.raises(ModelSelectionError, match="No model was selected"):
         empty.record_assignment()
 
 

@@ -71,7 +71,6 @@ DEFAULT_AGENT_INSTRUCTIONS_VERSION = "1"
 DEFAULT_SKILL_FILENAME = "SKILL.md"
 DEFAULT_SKILLS_DIRECTORY = Path(".agents/skills")
 RESOURCE_DIRECTORIES = ("references", "scripts", "assets")
-TRUNCATION_MARKER = "\n\n[AGENTS.md truncated: instruction byte limit reached.]"
 
 # Constants for content size limits
 MAX_AGENTS_BYTES = 32 * 1024

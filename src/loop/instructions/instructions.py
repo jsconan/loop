@@ -14,6 +14,7 @@ from ..utils import PathAliases, sha256_digest
 from .models import (
     AgentInstructionsSource,
     CapturedInstruction,
+    InstructionBudgetExceededError,
     InstructionContext,
     InstructionSection,
     InstructionSectionSummary,
@@ -149,7 +150,7 @@ class InstructionsManager:
             ValueError: The configured limit is invalid or initial instructions exceed it.
         """
         directory = Path(working_directory).resolve()
-        loaded = load_agents_instructions(directory, agents_filenames)
+        loaded = load_agents_instructions(directory, agents_filenames, max_bytes=max_bytes)
         manager = cls(
             project_instructions=loaded.content,
             skill_manager=skill_manager or SkillManager.discover(directory),
@@ -384,7 +385,8 @@ class InstructionsManager:
         Raises:
             OSError: An applicable project instruction cannot be read.
             UnicodeError: An applicable project instruction is not valid UTF-8.
-            ValueError: If the prepared document exceeds the configured instruction limit.
+            InstructionBudgetExceededError: If the prepared document exceeds the configured
+                instruction limit.
         """
         with self._lock:
             state = (
@@ -416,7 +418,9 @@ class InstructionsManager:
                     self._project_sources,
                     self._refresh_changes,
                 ) = state
-                raise ValueError("Prepared instructions exceed the configured instruction limit.")
+                raise InstructionBudgetExceededError(
+                    "Prepared instructions exceed the configured instruction limit."
+                )
             return self._snapshot(agent, instructions)
 
     def _refresh_context(self) -> bool:
@@ -453,12 +457,15 @@ class InstructionsManager:
             PreparedInstructions: Current document and provenance.
 
         Raises:
-            ValueError: If the composed document exceeds the configured instruction limit.
+            InstructionBudgetExceededError: If the composed document exceeds the configured
+                instruction limit.
         """
         with self._lock:
             instructions = self._build_instructions(agent)
             if self._encoded_size(instructions) > self._max_bytes:
-                raise ValueError("Prepared instructions exceed the configured instruction limit.")
+                raise InstructionBudgetExceededError(
+                    "Prepared instructions exceed the configured instruction limit."
+                )
             return self._snapshot(agent, instructions)
 
     def _snapshot(self, agent: Agent, instructions: str) -> PreparedInstructions:
@@ -583,7 +590,11 @@ class InstructionsManager:
         previous_target = self._signature[0] if self._signature else None
         previous_instructions = self._context_instructions
         active = self._skill_manager.active_identities
-        loaded = load_agents_instructions(working_directory, self._agents_filenames)
+        loaded = load_agents_instructions(
+            working_directory,
+            agents_filenames=self._agents_filenames,
+            max_bytes=self._max_bytes,
+        )
         project_instructions = loaded.content
         refresh_changes = self._describe_refresh(working_directory, loaded)
         if not self._skill_discovery_enabled:
@@ -790,15 +801,7 @@ class InstructionsManager:
     @staticmethod
     def _load_diagnostics(loaded: LoadedAgentInstructions) -> list[str]:
         """Return diagnostics produced while loading project instructions."""
-        diagnostics = list(loaded.diagnostics)
-        if not loaded.truncated:
-            return diagnostics
-        omitted = sum(source.size_bytes - source.included_bytes for source in loaded.sources)
-        diagnostics.append(
-            f"Agent instructions truncated at {loaded.max_bytes} bytes; "
-            f"{omitted} source byte(s) omitted."
-        )
-        return diagnostics
+        return list(loaded.diagnostics)
 
     def _describe_refresh(
         self, working_directory: Path, loaded: LoadedAgentInstructions

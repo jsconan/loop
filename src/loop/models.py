@@ -405,7 +405,8 @@ class ContextReference(BaseModel):
     Args:
         kind (ContextReferenceKind): Referenced filesystem object kind.
         path (str): User-facing project-relative path.
-        content (str): Bounded content captured when the turn was submitted.
+        content (str): Bounded decoded UTF-8 text captured when the turn was submitted. Binary
+            media is not represented by this contract, regardless of the filename suffix.
         size_bytes (int): Complete source size in bytes.
         included_bytes (int): Number of content bytes included in the snapshot.
         truncated (bool): Whether content was omitted from the snapshot.

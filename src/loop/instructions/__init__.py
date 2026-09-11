@@ -3,6 +3,7 @@
 __all__ = [
     "AgentInstructionsSource",
     "CapturedInstruction",
+    "InstructionBudgetExceededError",
     "InstructionSection",
     "InstructionsManager",
     "LiveInstructionSource",
@@ -25,6 +26,7 @@ from .instructions import InstructionsManager
 from .models import (
     AgentInstructionsSource,
     CapturedInstruction,
+    InstructionBudgetExceededError,
     InstructionSection,
     LiveInstructionSource,
     LoadedAgentInstructions,

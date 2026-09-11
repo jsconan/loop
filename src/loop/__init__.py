@@ -67,6 +67,7 @@ __all__ = [
     "GenerationHyperparameters",
     "Hyperparameter",
     "HyperparameterPolicy",
+    "InstructionBudgetExceededError",
     "InstructionSection",
     "InstructionSnapshot",
     "InstructionsManager",
@@ -83,6 +84,7 @@ __all__ = [
     "ModelCallMetrics",
     "ModelInfo",
     "ModelSelection",
+    "ModelSelectionError",
     "NetworkTarget",
     "Omit",
     "OpenAIBackend",
@@ -265,6 +267,7 @@ from .constants import OMIT, Omit
 from .errors import Problem, ProblemException, log_problem
 from .instructions import (
     AgentInstructionsSource,
+    InstructionBudgetExceededError,
     InstructionSection,
     InstructionsManager,
     LoadedAgentInstructions,
@@ -281,7 +284,7 @@ from .mentions import (
     ProjectPathMentionHandler,
     SkillMentionHandler,
 )
-from .model_selection import ModelSelection
+from .model_selection import ModelSelection, ModelSelectionError
 from .models import (
     AnswerCompleted,
     AnswerDelta,

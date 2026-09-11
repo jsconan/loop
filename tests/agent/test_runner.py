@@ -25,11 +25,13 @@ from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.utils import PathHolder
 
 
-def agent_runner(*, responses, max_turns=25, backend=None, options=None):
+def agent_runner(
+    *, responses=None, max_turns=25, backend=None, options=None, instructions_manager=None
+):
     """Build a runner with isolated execution collaborators."""
     backend = backend or Mock()
     agent = Agent("Assistant", tools=Mock())
-    instructions = InstructionsManager()
+    instructions = instructions_manager or InstructionsManager()
     session_manager = Mock()
     session_manager.messages = []
     session_manager.session = Session()
@@ -59,7 +61,8 @@ def agent_runner(*, responses, max_turns=25, backend=None, options=None):
         max_turns=options["max_turns"],
         prompt_on_recoverable_error=options["prompt"],
     )
-    runner.query = Mock(side_effect=responses)
+    if responses is not None:
+        runner.query = Mock(side_effect=responses)
     return runner, session_manager, interaction
 
 
@@ -300,6 +303,32 @@ def test_runner_cancels_when_response_recovery_is_exhausted():
     assert result.stop_reason == "cancelled"
     sessions.add_response.assert_not_called()
     sessions.record_run.assert_called_once()
+
+
+def test_runner_reports_and_cancels_on_a_request_preparation_failure():
+    """A request that cannot be prepared, such as an oversized instruction chain, is reported."""
+    runner, sessions, interaction = agent_runner(
+        instructions_manager=InstructionsManager(project_instructions="required", max_bytes=1)
+    )
+
+    result = runner.run()
+
+    assert result.final_response is None
+    assert result.stop_reason == "cancelled"
+    sessions.add_response.assert_not_called()
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "agent.query_failed"
+    assert "instructions exceed the configured budget" in problem.detail
+
+
+def test_runner_does_not_reclassify_an_unexpected_value_error():
+    """A ValueError outside known preparation boundaries remains visible to the caller."""
+    runner, _, interaction = agent_runner(responses=[ValueError("malformed response")])
+
+    with pytest.raises(ValueError, match="malformed response"):
+        runner.run()
+
+    interaction.report.assert_not_called()
 
 
 def test_runner_counts_a_retried_model_request_as_one_completed_turn():

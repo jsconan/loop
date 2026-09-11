@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from loop.instructions import (
+    InstructionBudgetExceededError,
     build_instructions,
     get_agents_files,
     get_skill_directories,
@@ -187,62 +188,35 @@ def test_load_agents_instructions_returns_none_without_guidance(tmp_path):
     assert load_agents_instructions(tmp_path).content is None
 
 
-def test_load_agents_instructions_uses_a_32_kibibyte_default_limit(tmp_path):
-    """The default limit truncates oversized instructions without invalid UTF-8."""
+def test_load_agents_instructions_rejects_default_budget_overflow(tmp_path):
+    """Required instructions fail atomically instead of losing a UTF-8 suffix."""
     (tmp_path / "AGENTS.md").write_text("a" * 32767 + "€", encoding="utf-8")
-
-    instructions = load_agents_instructions(tmp_path).content
-
-    assert instructions is not None
-    assert instructions.startswith("a")
-    assert instructions.endswith("[AGENTS.md truncated: instruction byte limit reached.]")
-    assert len(instructions.encode("utf-8")) <= 32 * 1024
+    with pytest.raises(InstructionBudgetExceededError, match="no instructions were truncated"):
+        load_agents_instructions(tmp_path)
 
 
-def test_load_agents_instructions_accepts_a_custom_byte_limit(tmp_path):
-    """Callers can override the maximum encoded instruction size."""
+def test_load_agents_instructions_accepts_exact_custom_budget(tmp_path):
+    """Complete instruction provenance survives an exact byte budget."""
     (tmp_path / "AGENTS.md").write_text("abc€", encoding="utf-8")
-
-    instructions = load_agents_instructions(tmp_path, max_bytes=4).content
-
-    assert instructions == "abc"
-
-
-def test_load_agents_instructions_exposes_source_provenance_and_truncation(tmp_path):
-    """Structured loading reports exact source sizes and omitted content."""
-    (tmp_path / "AGENTS.md").write_text("abc€", encoding="utf-8")
-
-    loaded = load_agents_instructions(tmp_path, max_bytes=4)
-
-    assert loaded.truncated is True
-    assert loaded.max_bytes == 4
-    assert loaded.sources[0].path == (tmp_path / "AGENTS.md").resolve()
-    assert loaded.sources[0].size_bytes == 6
-    assert loaded.sources[0].included_bytes == 3
-    assert loaded.sources[0].truncated is True
+    loaded = load_agents_instructions(tmp_path, max_bytes=6)
+    assert loaded.content == "abc€"
+    assert loaded.sources[0].included_bytes == loaded.sources[0].size_bytes == 6
+    with pytest.raises(InstructionBudgetExceededError, match="exceed"):
+        load_agents_instructions(tmp_path, max_bytes=4)
 
 
-def test_load_agents_instructions_records_fully_omitted_sources_and_content(tmp_path):
-    """A consumed budget records later files and unrepresentable characters as omitted."""
-    project = tmp_path / "project"
-    nested = project / "nested"
-    nested.mkdir(parents=True)
-    (project / ".git").mkdir()
-    (project / "AGENTS.md").write_text("abcd", encoding="utf-8")
-    (nested / "AGENTS.md").write_text("€", encoding="utf-8")
-
-    loaded = load_agents_instructions(nested, max_bytes=4)
-
-    assert loaded.content == "abcd"
-    assert [source.included_bytes for source in loaded.sources] == [4, 0]
-    assert loaded.truncated is True
-
-    isolated = tmp_path / "isolated"
-    isolated.mkdir()
-    (isolated / "AGENTS.md").write_text("€", encoding="utf-8")
-    tiny = load_agents_instructions(isolated, max_bytes=1)
-    assert tiny.content is None
-    assert tiny.sources[0].included_bytes == 0
+def test_load_agents_instructions_never_omits_child_rules(tmp_path):
+    """A parent cannot silently consume the budget reserved for the complete chain."""
+    (tmp_path / ".git").mkdir()
+    nested = tmp_path / "src"
+    nested.mkdir()
+    (tmp_path / "AGENTS.md").write_text("abcd")
+    (nested / "AGENTS.md").write_text("€")
+    with pytest.raises(InstructionBudgetExceededError, match="exceed"):
+        load_agents_instructions(nested, max_bytes=4)
+    loaded = load_agents_instructions(nested, max_bytes=9)
+    assert loaded.content == "abcd\n\n€"
+    assert [source.included_bytes for source in loaded.sources] == [4, 3]
 
 
 def test_load_agents_instructions_accepts_custom_filenames(tmp_path):
