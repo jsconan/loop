@@ -542,6 +542,16 @@ class Loop:
                 self._interaction.report(problem)
                 continue
             with self._session_manager.next_message_span():
+                for reference in context:
+                    included = reference.included_bytes
+                    size = reference.size_bytes
+                    if included < size:
+                        self._interaction.info(
+                            f"Attached {reference.path}: {included} of {size} bytes"
+                            "; additional content stays local until read."
+                        )
+                    else:
+                        self._interaction.info(f"Attached {reference.path}: {included} bytes.")
                 telemetry_activity("message.accepted", component="session_manager")
                 self._session_manager.add_user_message(user_input, context=context)
                 result = self._agent_runner.run()

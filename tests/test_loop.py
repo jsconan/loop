@@ -708,6 +708,50 @@ def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(t
     )
     assert "Follow review instructions." in backend.get_response.call_args.kwargs["instructions"]
     assert loop.session.active_skills == [("review", str(location))]
+    assert interaction.info.call_args_list[0] == call("Attached my app.py: 15 bytes.")
+
+
+def test_run_reports_each_attached_reference_and_local_remainder(tmp_path):
+    """Every attached reference reports its included bytes and any local remainder."""
+    backend = Mock(default_model="model")
+    backend.get_context_window.return_value = None
+    backend.get_response.return_value = [ResponseCompleted()]
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["Review the attached files", False]
+    references = (
+        ContextReference(
+            kind="file",
+            path="complete.py",
+            content="pass\n",
+            size_bytes=5,
+            included_bytes=5,
+            truncated=False,
+        ),
+        ContextReference(
+            kind="file",
+            path="large.py",
+            content="pass\n",
+            size_bytes=100,
+            included_bytes=5,
+            truncated=True,
+        ),
+    )
+    mentions = Mock()
+    mentions.resolve.return_value = references
+    mentions.completion_adapters = ()
+    loop = Loop.create_default(
+        backend=backend,
+        interaction=interaction,
+        mention_manager=mentions,
+        working_directory=tmp_path,
+    )
+
+    loop.run()
+
+    assert [call.args[0] for call in interaction.info.call_args_list[:2]] == [
+        "Attached complete.py: 5 bytes.",
+        "Attached large.py: 5 of 100 bytes; additional content stays local until read.",
+    ]
 
 
 def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
