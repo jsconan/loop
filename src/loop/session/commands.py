@@ -196,9 +196,9 @@ class SessionCommands:
         context.interaction.info(f"Renamed session '{session_id}'.")
 
     def _list_sessions(self, context: CommandContext) -> None:
-        """Display persisted sessions in store order."""
+        """Display persisted sessions from oldest to newest."""
         context.interaction.table(
-            self._session_manager.store.list(),
+            reversed(self._session_manager.store.list()),
             title="Persisted sessions:",
             columns=("name", "updated_at", "message_count"),
         )

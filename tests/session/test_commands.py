@@ -20,11 +20,13 @@ def test_session_commands_list_resume_rename_and_reset_sessions():
     first = Session(name="First topic", name_source="user", model="served-model", tokens=1234)
     first.add_message(Message(role="user", content="Prior question"))
     first_id = store.save(first)
+    store.save(Session(name="Second topic", name_source="user"))
     sessions = SessionManager(session_store=store)
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(sessions, Mock()))
 
     manager.call("sessions")
+    listed = interaction.table.call_args.args[0]
     manager.call("resume", first_id)
     manager.call("rename", '"Renamed topic"')
     manager.call("new")
@@ -34,6 +36,7 @@ def test_session_commands_list_resume_rename_and_reset_sessions():
         "updated_at",
         "message_count",
     )
+    assert [session.name for session in listed] == ["First topic", "Second topic"]
     interaction.user.assert_called_once_with("Prior question")
     assert store.load(first_id).name == "Renamed topic"
     # Model is preserved across new session, but other state is reset
