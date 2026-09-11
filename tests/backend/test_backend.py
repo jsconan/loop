@@ -4,7 +4,15 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import Backend, CompactionContextItem, Message, OpenAIBackend, ResponseCompleted, Usage
+from loop import (
+    Backend,
+    CompactionContextItem,
+    ContextReference,
+    Message,
+    OpenAIBackend,
+    ResponseCompleted,
+    Usage,
+)
 
 
 def test_openai_adapter_satisfies_the_complete_backend_contract():
@@ -56,3 +64,28 @@ def test_default_backend_compaction_requires_a_textual_completion(events):
     backend.get_response = Mock(return_value=events)
 
     assert Backend.compact(backend, [], instructions=None, model="model") is None
+
+
+def test_portable_compaction_does_not_expand_local_attachment_snapshots():
+    """Fallback compaction retains only the same visible preview as ordinary generation."""
+
+    backend = OpenAIBackend()
+    backend.get_response = Mock(return_value=[])
+    reference = ContextReference(
+        kind="file",
+        path="notes.txt",
+        content="preview",
+        size_bytes=40,
+        included_bytes=7,
+        truncated=True,
+        snapshot_content="private-tail",
+    )
+    Backend.compact(
+        backend,
+        [Message(role="user", content="task", context=(reference,))],
+        instructions="rules",
+        model="model",
+    )
+    history = backend.get_response.call_args.args[0][0].context[0].content
+    assert "preview" in history and "private-tail" not in history
+    assert "snapshot_content" not in history

@@ -337,7 +337,6 @@ class PermissionManager:
         policy = self.evaluate(operations)
         active_interaction = interaction if interaction is not None else self._interaction
         prompt = None
-        prompted = False
         decision = policy.decision
         reason = policy.reason
         source = "policy"
@@ -349,7 +348,6 @@ class PermissionManager:
                 reason = "Approval is required but no interactive user is available."
                 source = "headless"
             else:
-                prompted = True
                 prompt = self._prompt(operations)
                 selected = self.request_permission(
                     prompt,
@@ -386,7 +384,7 @@ class PermissionManager:
             operations=operations,
             policy=policy,
             decision=decision,
-            prompted=prompted,
+            prompted=prompt is not None,
             prompt=prompt,
             reason=reason,
             source=source,

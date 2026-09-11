@@ -1,6 +1,7 @@
 """Tests for the OpenAI-compatible backend adapter."""
 
 import asyncio
+import json
 from base64 import b64decode
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -61,6 +62,7 @@ from loop import (
     StructuredOutputValidationError,
     ToolCall,
     ToolCallCompleted,
+    ToolDefinition,
     ToolResult,
     Usage,
 )
@@ -1177,6 +1179,7 @@ def test_model_request_trace_matches_policy_prepared_sdk_arguments_exactly():
     traced = thaw(request_record.payload)
     assert submitted == traced
     assert submitted["input"] == "contains <redacted:secret>"
+    assert submitted["input"].endswith(">")
     assert "registered-secret" not in repr(adapter.records)
     assert [record.event_name for record in adapter.records] == [
         "gen_ai.input_redacted",
@@ -1248,11 +1251,12 @@ def test_native_text_attachment_is_redacted_before_encoding_and_traced_exactly()
     message = submitted["input"][0]
     manifest = message["content"][1]["text"]
     data_url = message["content"][2]["file_data"]
-    decoded = b64decode(data_url.partition(",")[2]).decode()
-    sanitized = "before <redacted:secret> after"
+    sanitized = b64decode(data_url.partition(",")[2]).decode()
+    assert sanitized == "before <redacted:secret> after"
     assert submitted == traced
-    assert message["content"][0]["text"] == "also <redacted:secret>"
-    assert decoded == sanitized
+    assert message["content"][0]["text"] == "also " + sanitized.removeprefix(
+        "before "
+    ).removesuffix(" after")
     assert f'"size_bytes":{len(sanitized.encode())}' in manifest
     assert f'"included_bytes":{len(sanitized.encode())}' in manifest
     assert secret not in repr(submitted)
@@ -2863,3 +2867,262 @@ def test_async_streaming_yields_before_the_provider_stream_completes():
 
     assert first == AnswerDelta(text="first")
     assert provider_events.yielded == 1
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_sql_secrets_are_irreversible_in_model_output(asynchronous):
+    """Semantic credentials stay redacted when a model echoes their replacement marker."""
+    secret = 'fixture-registered-"secret'
+    backend = OpenAIBackend(default_model="model", api_key=secret, file_input_mode="native")
+    sdk = Mock()
+    requests = []
+
+    def respond(**request):
+        """Echo only the reference visible to the provider."""
+        requests.append(request)
+        reference = "<redacted:secret>"
+        tool = ResponseFunctionToolCall(
+            type="function_call",
+            id="fc",
+            call_id="call",
+            name="demo",
+            arguments=json.dumps({"password": reference}),
+        )
+        return sdk_response(
+            output=[sdk_output_message(reference), tool],
+            output_text=reference,
+            usage=None,
+            model="model",
+        )
+
+    sdk.responses.create = (
+        AsyncMock(side_effect=respond) if asynchronous else Mock(side_effect=respond)
+    )
+    reference = ContextReference(
+        kind="file",
+        path="fixture.sql",
+        content=secret,
+        size_bytes=len(secret),
+        included_bytes=len(secret),
+        truncated=False,
+        snapshot_content="LOCAL_ONLY",
+    )
+    with patch(
+        "loop.backend.openai.AsyncOpenAI" if asynchronous else "loop.backend.openai.OpenAI",
+        return_value=sdk,
+    ):
+        if asynchronous:
+            events = asyncio.run(
+                collect_events(
+                    backend.get_response_async(
+                        [Message(role="user", content=secret, context=(reference,))]
+                    )
+                )
+            )
+        else:
+            events = list(
+                backend.get_response([Message(role="user", content=secret, context=(reference,))])
+            )
+    request = requests[0]
+    decoded = b64decode(request["input"][0]["content"][2]["file_data"].partition(",")[2]).decode()
+    assert decoded == "<redacted:secret>"
+    assert secret not in str(request) and "LOCAL_ONLY" not in str(request)
+    assert request["store"] is False
+    assert events[-1].answer == "<redacted:secret>"
+    tool = next(item for item in events[-1].items if isinstance(item, ToolCall))
+    assert json.loads(tool.arguments) == {"password": "<redacted:secret>"}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_remote_tokenization_uses_the_same_secret_policy(asynchronous):
+    """Remote counting receives prepared text and no secret mapping or transport credential body."""
+    backend = OpenAIBackend(
+        default_model="model", base_url="https://provider.test/v1", api_key="fixture-secret-value"
+    )
+    response = Mock()
+    response.json.return_value = {"count": 3}
+    if asynchronous:
+        client = Mock()
+        client.post = AsyncMock(return_value=response)
+        context = AsyncMock()
+        context.__aenter__.return_value = client
+        with patch("loop.backend.openai.httpx.AsyncClient", return_value=context):
+            assert asyncio.run(backend.count_tokens_async("fixture-secret-value")) == 3
+        sent = client.post.call_args.kwargs["json"]
+    else:
+        with patch("loop.backend.openai.httpx.post", return_value=response) as post:
+            assert backend.count_tokens("fixture-secret-value") == 3
+        sent = post.call_args.kwargs["json"]
+    assert "fixture-secret-value" not in str(sent)
+    assert sent["prompt"] == "<redacted:secret>"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_streamed_secret_markers_remain_irreversible(asynchronous):
+    """The rendered stream and final answer never expand a model-selected secret marker."""
+    backend = OpenAIBackend(default_model="model", api_key="fixture-secret-value")
+    sdk = Mock()
+
+    def stream(**request):
+        """Return a reference split into several provider text events."""
+        reference = "<redacted:secret>"
+        fragments = ["before " + reference[:3], reference[3:18], reference[18:] + " after"]
+        events = [
+            ResponseTextDeltaEvent(
+                type="response.output_text.delta",
+                sequence_number=i,
+                item_id="m",
+                output_index=0,
+                content_index=0,
+                delta=value,
+                logprobs=[],
+            )
+            for i, value in enumerate(fragments)
+        ]
+        events.append(
+            sdk_completion_event(output=[sdk_output_message("before " + reference + " after")])
+        )
+        return AsyncEvents(events) if asynchronous else iter(events)
+
+    sdk.responses.create = (
+        AsyncMock(side_effect=stream) if asynchronous else Mock(side_effect=stream)
+    )
+    with patch(
+        "loop.backend.openai.AsyncOpenAI" if asynchronous else "loop.backend.openai.OpenAI",
+        return_value=sdk,
+    ):
+        events = (
+            asyncio.run(
+                collect_events(backend.get_response_async("fixture-secret-value", stream=True))
+            )
+            if asynchronous
+            else list(backend.get_response("fixture-secret-value", stream=True))
+        )
+    assert (
+        "".join(event.text for event in events if isinstance(event, AnswerDelta))
+        == "before <redacted:secret> after"
+    )
+    assert events[-1].answer == "before <redacted:secret> after"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_structured_secret_stream_keeps_irreversible_marker(asynchronous):
+    """Structured output validation receives the irreversible model-visible marker."""
+    secret = 'fixture-secret-"quoted\\value'
+    backend = OpenAIBackend(default_model="model", api_key=secret)
+    sdk = Mock()
+
+    def stream(**request):
+        """Return split JSON containing the model-visible reference."""
+        text = json.dumps({"name": "<redacted:secret>", "age": 36})
+        events = [
+            ResponseTextDeltaEvent(
+                type="response.output_text.delta",
+                sequence_number=i,
+                item_id="m",
+                output_index=0,
+                content_index=0,
+                delta=fragment,
+                logprobs=[],
+            )
+            for i, fragment in enumerate((text[:25], text[25:]))
+        ]
+        events.append(sdk_completion_event(output=[sdk_output_message(text)]))
+        return AsyncEvents(events) if asynchronous else iter(events)
+
+    sdk.responses.create = (
+        AsyncMock(side_effect=stream) if asynchronous else Mock(side_effect=stream)
+    )
+    with patch(
+        "loop.backend.openai.AsyncOpenAI" if asynchronous else "loop.backend.openai.OpenAI",
+        return_value=sdk,
+    ):
+        kwargs = {"stream": True, "output_format": StructuredOutputFormat.from_model(Person)}
+        events = (
+            asyncio.run(collect_events(backend.get_response_async(secret, **kwargs)))
+            if asynchronous
+            else list(backend.get_response(secret, **kwargs))
+        )
+    assert json.loads(
+        "".join(event.text for event in events if isinstance(event, AnswerDelta))
+    ) == {"name": "<redacted:secret>", "age": 36}
+    assert events[-1].structured_output == Person(name="<redacted:secret>", age=36)
+
+
+def test_protocol_and_schema_identifiers_survive_content_redaction():
+    """Schema identifiers stay intact while annotations and instance values are protected."""
+    secret = "fixture-secret-value"
+    schema = {
+        "type": "object",
+        "properties": {
+            "description": {"type": "string", "description": secret},
+            "credential_property": {
+                "type": "string",
+                "enum": [secret],
+                "const": secret,
+                "default": secret,
+                "examples": [secret],
+            },
+        },
+        "required": ["credential_property"],
+        "additionalProperties": False,
+    }
+    backend = OpenAIBackend(default_model="model", api_key=secret)
+    sdk = Mock()
+    sdk.responses.create.return_value = sdk_response(
+        output=[], output_text="done", usage=None, model="model"
+    )
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    definition = ToolDefinition(name="demo", description=secret, parameters=schema)
+    try:
+        with patch("loop.backend.openai.OpenAI", return_value=sdk):
+            list(backend.get_response("hello", tools=(definition,)))
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+    request = sdk.responses.create.call_args.kwargs
+    traced = thaw(
+        next(record for record in adapter.records if record.event_name == "gen_ai.request").payload
+    )
+    assert request == traced
+    assert secret not in repr(request)
+    assert secret not in repr(adapter.records)
+    assert request["model"] == "model"
+    tool = request["tools"][0]
+    assert tool["name"] == "demo"
+    assert tool["description"] == "<redacted:secret>"
+    assert tool["parameters"]["required"] == ["credential_property"]
+    assert tool["parameters"]["properties"]["description"]["type"] == "string"
+    assert tool["parameters"]["properties"]["description"]["description"] == "<redacted:secret>"
+    values = tool["parameters"]["properties"]["credential_property"]
+    assert values["enum"] == ["<redacted:secret>"]
+    assert values["const"] == "<redacted:secret>"
+    assert values["default"] == "<redacted:secret>"
+    assert values["examples"] == ["<redacted:secret>"]
+
+
+def test_encoded_attachment_bytes_are_not_rescanned_as_semantic_text():
+    """Coincidental credential-like bytes in base64 cannot corrupt an already prepared file."""
+    content = "xxx" * 30
+    secret = "eHh4" * 5
+    backend = OpenAIBackend(default_model="model", api_key=secret, file_input_mode="native")
+    sdk = Mock()
+    sdk.responses.create.return_value = sdk_response(
+        output=[], output_text="done", usage=None, model="model"
+    )
+    reference = ContextReference(
+        kind="file",
+        path="fixture.txt",
+        content=content,
+        size_bytes=len(content),
+        included_bytes=len(content),
+        truncated=False,
+    )
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        list(backend.get_response([Message(role="user", content="read", context=(reference,))]))
+    encoded = sdk.responses.create.call_args.kwargs["input"][0]["content"][2][
+        "file_data"
+    ].partition(",")[2]
+    assert b64decode(encoded).decode() == content

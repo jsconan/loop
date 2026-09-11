@@ -16,6 +16,8 @@ __all__ = [
     "BackendTimeoutError",
     "GenerationHyperparameters",
     "OpenAIBackend",
+    "project_context",
+    "project_portable_context",
 ]
 
 from .backend import Backend, GenerationHyperparameters
@@ -34,3 +36,4 @@ from .errors import (
     BackendTimeoutError,
 )
 from .openai import OpenAIBackend
+from .utils import project_context, project_portable_context

@@ -7,6 +7,7 @@ import pytest
 
 from loop import (
     Agent,
+    Backend,
     CompactionContextItem,
     CompactionResult,
     InstructionsManager,
@@ -37,7 +38,8 @@ def compaction_feature(
 ):
     """Build context compaction with isolated collaborators."""
     manager = SessionManager(session=session)
-    backend = SimpleNamespace(
+    backend = Mock(
+        spec=Backend,
         compact=compact or Mock(),
         default_model="model",
         get_context_window=Mock(return_value=100),

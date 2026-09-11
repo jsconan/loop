@@ -2,6 +2,7 @@
 
 from base64 import b64encode
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
+from copy import deepcopy
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from json import dumps
@@ -95,6 +96,7 @@ from .errors import (
     BackendStatusError,
     BackendTimeoutError,
 )
+from .utils import project_context
 
 _ReasoningChannel = Literal["content", "summary"]
 
@@ -141,6 +143,12 @@ class OpenAIBackend(Backend):
     _unsupported_hyperparameters: dict[str, set[str]]
     _declared_hyperparameters: dict[str, frozenset[str]]
     _hyperparameter_discovery_attempted: set[str]
+    _schema_annotation_keys = frozenset(
+        {"description", "title", "$comment", "default", "const", "enum", "examples"}
+    )
+    _schema_named_subschema_keys = frozenset(
+        {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+    )
     _model_input_policy: ModelInputPolicy
 
     def __init__(
@@ -294,8 +302,35 @@ class OpenAIBackend(Backend):
 
     def _prepared_request(self, **values: object) -> dict[str, object]:
         """Return and trace the exact policy-prepared provider request."""
-        prepared = self._model_input_policy.apply(values)
-        self._restore_opaque_reasoning_state(values.get("input"), prepared.get("input"))
+        prepared = deepcopy(values)
+        for key in ("instructions", "prompt"):
+            if key in prepared:
+                prepared[key] = self._model_input_policy.apply(prepared[key])
+        if "input" in prepared:
+            prepared["input"] = self._prepared_input(prepared["input"])
+        if "tools" in prepared:
+            prepared["tools"] = [
+                {
+                    **definition,
+                    "description": self._model_input_policy.apply(definition["description"]),
+                    "parameters": self._prepared_schema(definition["parameters"]),
+                }
+                for definition in prepared["tools"]
+            ]
+        if "text" in prepared:
+            format_spec = prepared["text"]["format"]
+            prepared["text"] = {
+                **prepared["text"],
+                "format": {
+                    **format_spec,
+                    "schema": self._prepared_schema(format_spec["schema"]),
+                    **(
+                        {"description": self._model_input_policy.apply(format_spec["description"])}
+                        if "description" in format_spec
+                        else {}
+                    ),
+                },
+            }
         telemetry_trace_event(
             "gen_ai.request",
             payload=prepared,
@@ -304,6 +339,24 @@ class OpenAIBackend(Backend):
             stream=prepared.get("stream"),
         )
         return prepared
+
+    def _prepared_schema(self, value: object) -> object:
+        """Filter schema annotations and instance values while retaining structural identifiers."""
+        if isinstance(value, dict):
+            prepared = {}
+            for key, item in value.items():
+                if key in self._schema_annotation_keys:
+                    prepared[key] = self._model_input_policy.apply(item)
+                elif key in self._schema_named_subschema_keys:
+                    prepared[key] = {
+                        name: self._prepared_schema(schema) for name, schema in item.items()
+                    }
+                else:
+                    prepared[key] = self._prepared_schema(item)
+            return prepared
+        if isinstance(value, list):
+            return [self._prepared_schema(item) for item in value]
+        return value
 
     @staticmethod
     def _report_model_input_redactions(counts: Mapping[str, int]) -> None:
@@ -315,17 +368,28 @@ class OpenAIBackend(Backend):
                 count=count,
             )
 
-    @classmethod
-    def _restore_opaque_reasoning_state(cls, original: object, prepared: object) -> None:
-        """Restore provider-owned reasoning fields after semantic text policy is applied."""
-        if not isinstance(original, list) or not isinstance(prepared, list):
-            return
-        for original_item, prepared_item in zip(original, prepared, strict=True):
-            if original_item.get("type") != "reasoning":
-                continue
-            for field in ("encrypted_content", "id"):
-                if field in original_item:
-                    prepared_item[field] = original_item[field]
+    def _prepared_input(self, value: str | list[dict]) -> str | list[dict]:
+        """Return a copied input with semantic fields filtered and protocol data unchanged."""
+        if isinstance(value, str):
+            return self._model_input_policy.apply(value)
+        prepared = deepcopy(value)
+        for item in prepared:
+            for field in ("content", "summary", "arguments", "output"):
+                if field not in item:
+                    continue
+                content = item[field]
+                if field in ("content", "summary") and isinstance(content, list):
+                    for part in content:
+                        part.update(
+                            {
+                                key: self._model_input_policy.apply(part[key])
+                                for key in ("text", "filename")
+                                if key in part
+                            }
+                        )
+                else:
+                    item[field] = self._model_input_policy.apply(content)
+        return prepared
 
     def _hyperparameter_request_parameters(
         self, model: str, hyperparameters: GenerationHyperparameters | None
@@ -593,7 +657,13 @@ class OpenAIBackend(Backend):
         response_started = False
         try:
             for event in self._get_response(
-                input, instructions, stream, model, hyperparameters, output_format, tuple(tools)
+                input,
+                instructions,
+                stream,
+                model,
+                hyperparameters,
+                output_format,
+                tuple(tools),
             ):
                 response_started = True
                 yield event
@@ -619,9 +689,9 @@ class OpenAIBackend(Backend):
         """Yield response events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
         self._discover_hyperparameters(selected_model, hyperparameters)
-        serialized_input = self._serialize_input(input)
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
+        serialized_input = self._serialize_input(input)
         if output_format is None:
             request = {
                 "model": selected_model,
@@ -749,7 +819,13 @@ class OpenAIBackend(Backend):
         response_started = False
         try:
             async for event in self._get_response_async(
-                input, instructions, stream, model, hyperparameters, output_format, tuple(tools)
+                input,
+                instructions,
+                stream,
+                model,
+                hyperparameters,
+                output_format,
+                tuple(tools),
             ):
                 response_started = True
                 yield event
@@ -775,9 +851,9 @@ class OpenAIBackend(Backend):
         """Asynchronously yield events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
         await self._discover_hyperparameters_async(selected_model, hyperparameters)
-        serialized_input = self._serialize_input(input)
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
+        serialized_input = self._serialize_input(input)
         if output_format is None:
             request = {
                 "model": selected_model,
@@ -943,11 +1019,11 @@ class OpenAIBackend(Backend):
         try:
             response = httpx.post(
                 f"{base_url}/tokenize",
-                json={
-                    "model": selected_model,
-                    "prompt": prompt,
-                    "add_special_tokens": False,
-                },
+                json=self._prepared_request(
+                    model=selected_model,
+                    prompt=prompt,
+                    add_special_tokens=False,
+                ),
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 timeout=2.0,
             )
@@ -978,11 +1054,11 @@ class OpenAIBackend(Backend):
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{base_url}/tokenize",
-                    json={
-                        "model": selected_model,
-                        "prompt": prompt,
-                        "add_special_tokens": False,
-                    },
+                    json=self._prepared_request(
+                        model=selected_model,
+                        prompt=prompt,
+                        add_special_tokens=False,
+                    ),
                     headers={"Authorization": f"Bearer {self._api_key}"},
                     timeout=2.0,
                 )
@@ -1156,9 +1232,6 @@ class OpenAIBackend(Backend):
 
     def _prepared_reference(self, reference: ContextReference) -> ContextReference:
         """Apply model-input policy to one semantic text snapshot before transport encoding."""
-        media_type = guess_type(reference.path)[0] or "text/plain"
-        if reference.kind != "directory" and not self._textual_media_type(media_type):
-            return reference
         sanitized = self._model_input_policy.apply(reference.content)
         if not isinstance(sanitized, str) or sanitized == reference.content:
             return reference
@@ -1173,22 +1246,6 @@ class OpenAIBackend(Backend):
         )
 
     @staticmethod
-    def _textual_media_type(media_type: str) -> bool:
-        """Return whether a MIME type represents text safe for semantic string policy."""
-        return (
-            media_type.startswith("text/")
-            or media_type
-            in {
-                "application/json",
-                "application/ld+json",
-                "application/javascript",
-                "application/xml",
-                "application/x-yaml",
-            }
-            or media_type.endswith(("+json", "+xml", "+yaml"))
-        )
-
-    @staticmethod
     def _data_url(media_type: str, content: str) -> str:
         """Encode snapshot content as a MIME-qualified data URL."""
         encoded = b64encode(content.encode("utf-8")).decode("ascii")
@@ -1196,6 +1253,8 @@ class OpenAIBackend(Backend):
 
     def _serialize_item(self, item: ModelContextItem) -> OpenAIInputItemParam:
         """Translate one conversation item into an OpenAI-compatible request item."""
+        projected = project_context(item)
+        item = type(item).model_validate(projected)
         if isinstance(item, CompactionContextItem):
             return self._serialize_compaction_item(item)
         if isinstance(item, Message):
@@ -1204,9 +1263,7 @@ class OpenAIBackend(Backend):
             return self._serialize_reasoning_item(item)
         if isinstance(item, ToolCall):
             return self._serialize_tool_call_item(item)
-        if isinstance(item, ToolResult):
-            return self._serialize_tool_result_item(item)
-        raise TypeError(f"Unsupported conversation item: {type(item)}")
+        return self._serialize_tool_result_item(item)
 
     def _serialize_message_item(self, item: Message) -> OpenAIInputItemParam:
         """Translate one conversation message and its explicit context."""

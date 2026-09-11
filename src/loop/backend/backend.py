@@ -18,6 +18,7 @@ from ..models import (
     StructuredOutputFormat,
     ToolDefinition,
 )
+from .utils import project_portable_context
 
 
 @dataclass(slots=True)
@@ -211,11 +212,9 @@ class Backend(ABC):
             {
                 "effective_instructions": instructions,
                 "items": [
-                    {
-                        "type": type(item).__name__,
-                        "data": item.model_dump(mode="json"),
-                    }
+                    {"type": type(item).__name__, "data": projected}
                     for item in input
+                    if (projected := project_portable_context(item)) is not None
                 ],
             },
             ensure_ascii=False,

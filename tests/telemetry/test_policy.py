@@ -76,6 +76,11 @@ def test_model_input_policy_ignores_redaction_reporting_failures():
     reporter.assert_called_once()
 
 
+def test_model_input_policy_preserves_low_confidence_business_tokens():
+    """A sensitive-looking key alone does not classify a short pagination token as a credential."""
+    assert ModelInputPolicy().apply({"token": "page-2"}) == {"token": "page-2"}
+
+
 @pytest.mark.parametrize("secret", ["test", "key", "dummy", "local-api-key"])
 def test_model_input_policy_preserves_weak_secrets_in_ordinary_text(secret):
     """Weak credentials never corrupt common prose or repository paths."""
