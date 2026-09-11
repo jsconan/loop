@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Iterable
 from time import perf_counter
@@ -387,7 +388,11 @@ class ToolRegistry:
             return error, 0
         active_permissions = permission_manager or self._permission_manager
         plan, planning_error = self._authorized_plan(
-            tool, validated, interaction, active_permissions
+            tool,
+            validated,
+            interaction,
+            active_permissions,
+            instructions_manager,
         )
         if planning_error is not None:
             return planning_error, 0
@@ -404,7 +409,7 @@ class ToolRegistry:
             execution_started()
         started = perf_counter()
         output = tool.call(plan.arguments, context)
-        return output, perf_counter() - started
+        return self._model_result(output, instructions_manager, tool), perf_counter() - started
 
     async def call_async(
         self,
@@ -489,7 +494,11 @@ class ToolRegistry:
             return error, 0
         active_permissions = permission_manager or self._permission_manager
         plan, planning_error = self._authorized_plan(
-            tool, validated, interaction, active_permissions
+            tool,
+            validated,
+            interaction,
+            active_permissions,
+            instructions_manager,
         )
         if planning_error is not None:
             return planning_error, 0
@@ -506,7 +515,7 @@ class ToolRegistry:
             execution_started()
         started = perf_counter()
         output = await tool.call_async(plan.arguments, context)
-        return output, perf_counter() - started
+        return self._model_result(output, instructions_manager, tool), perf_counter() - started
 
     def command(
         self,
@@ -570,15 +579,39 @@ class ToolRegistry:
         )
         return tool.execute(plan.arguments, context)
 
+    @staticmethod
+    def _model_result(
+        output: str,
+        instructions_manager: InstructionsManager | None,
+        tool: Tool,
+    ) -> str:
+        """Minimize structured result paths only on the model invocation route."""
+        if instructions_manager is None or not tool.result_path_fields:
+            return output
+        try:
+            value = json.loads(output)
+        except (json.JSONDecodeError, TypeError):
+            return output
+        prepared = instructions_manager.path_aliases.metadata(value, tool.result_path_fields)
+        return output if value == prepared else json.dumps(prepared, ensure_ascii=False)
+
     def _authorized_plan(
         self,
         tool: Tool,
         arguments: dict[str, object],
         interaction: Interaction | None,
         permission_manager: PermissionManager,
+        instructions_manager: InstructionsManager | None = None,
     ) -> tuple[OperationPlan | None, str | None]:
         """Resolve and authorize every phase of one operation plan."""
         try:
+            if instructions_manager is not None:
+                arguments = {
+                    name: instructions_manager.path_aliases.resolve(value)
+                    if "loop:path" in tool.arguments_model.model_fields[name].metadata
+                    else value
+                    for name, value in arguments.items()
+                }
             plan = tool.plan(arguments)
             prerequisites = ()
             while True:

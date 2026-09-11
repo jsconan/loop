@@ -100,7 +100,8 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.interaction is interaction
     assert loop.working_directory == tmp_path.resolve()
     assert loop.instructions is not None
-    assert str(loop.permission_manager.temporary_directory) in loop.instructions
+    assert str(loop.permission_manager.temporary_directory) not in loop.instructions
+    assert "scratch:/" in loop.instructions
     assert loop.instructions_manager is not None
     assert loop.permission_manager.configuration_path == tmp_path / ".loop" / "permissions.yaml"
     assert loop.tool_registry.names == []
@@ -1309,7 +1310,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     assert loop.working_directory == second.resolve()
     instructions = backend.get_response.call_args.kwargs["instructions"]
     assert instructions.index("</agent_instructions>") < instructions.index("Second rules.")
-    assert f"working_directory: {second.resolve()}" in instructions
+    assert "working_directory: ." in instructions
 
 
 def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):

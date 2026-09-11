@@ -25,6 +25,7 @@ from .. import constants
 from ..errors import Problem, log_problem
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import (
+    PathAliases,
     ShutdownRequested,
     canonical_path,
     local_now,
@@ -1493,21 +1494,45 @@ class PermissionManager:
         return "\n".join(lines)
 
     def _display_resource(self, operation: Operation) -> str | None:
-        if (
-            operation.resource is None
-            or self._workspace_root is None
-            or not isinstance(operation.target, FileTarget)
-        ):
+        """Return a workspace-friendly display name for the operation target.
+
+        File paths are shown relative to the workspace root. Process targets include
+        their working directory and quote argument boundaries after normalizing
+        absolute paths through ``PathAliases``.
+
+        Args:
+            operation (Operation): The operation whose target should be displayed.
+
+        Returns:
+            str | None: Cleaned display string, or the raw resource when no
+                workspace is configured or the target is not a file or process.
+        """
+        if operation.resource is None or self._workspace_root is None:
             return operation.resource
-        try:
-            relative = Path(operation.target.path).relative_to(self._workspace_root)
-            return (
-                f"workspace root: {self._workspace_root}"
-                if relative == Path(".")
-                else str(relative)
+        if isinstance(operation.target, FileTarget):
+            try:
+                relative = Path(operation.target.path).relative_to(self._workspace_root)
+                return (
+                    f"workspace root: {self._workspace_root}"
+                    if relative == Path(".")
+                    else str(relative)
+                )
+            except ValueError:
+                return operation.resource
+        if isinstance(operation.target, ProcessTarget):
+            aliases = PathAliases(
+                {
+                    PathAliases.WORKSPACE_PREFIX: self._workspace_root,
+                    PathAliases.SCRATCH_PREFIX: self._temporary_path,
+                }
             )
-        except ValueError:
-            return operation.resource
+            cleaned_argv = tuple(
+                aliases.display(arg) if Path(arg).is_absolute() else arg
+                for arg in operation.target.argv
+            )
+            cwd = aliases.display(operation.target.cwd)
+            return f"{shlex.join(cleaned_argv)} (cwd: {cwd})"
+        return operation.resource
 
     def _audit(self, result: AuthorizationResult) -> None:
         """Append one independently durable, timestamped permission decision."""

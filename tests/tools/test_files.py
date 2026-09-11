@@ -16,6 +16,7 @@ from loop import (
     InstructionsManager,
     Operation,
     PermissionManager,
+    RuntimeEnvironment,
     ToolRegistry,
 )
 from loop.tooling import ToolContext
@@ -262,12 +263,13 @@ def test_list_folder_reports_failures(tmp_path):
 
 
 def test_file_navigation_reports_successful_instruction_context_changes(tmp_path, monkeypatch):
-    """Registered folder and file tools report only successful navigation to their manager."""
+    """File navigation changes instruction scope without changing the runtime path root."""
     nested = tmp_path / "nested"
     nested.mkdir()
     target = nested / "file.txt"
     target.write_text("content", encoding="utf-8")
     manager = InstructionsManager.discover(tmp_path)
+    manager.set_runtime_environment(RuntimeEnvironment(tmp_path, tmp_path / "scratch"))
     interaction = ConsoleInteraction()
 
     tool_registry.call(
@@ -277,6 +279,7 @@ def test_file_navigation_reports_successful_instruction_context_changes(tmp_path
         instructions_manager=manager,
     )
     assert manager.working_directory == nested.resolve()
+    assert manager.path_aliases.resolve(".") == str(tmp_path.resolve())
 
     written = nested / "written.txt"
     tool_registry.call(

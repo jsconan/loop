@@ -19,9 +19,14 @@ from loop import (
     PermissionManager,
     Problem,
     ProblemException,
+    RuntimeEnvironment,
     SessionTarget,
+    Tool,
     ToolResultPresentation,
     ToolResultPresentationSpec,
+    delete_path,
+    read_text_file,
+    run_command,
 )
 from loop.instructions import InstructionsManager
 from loop.interaction import Interaction
@@ -528,6 +533,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
     execution_started = Mock()
     interaction = Mock(spec=Interaction)
     instructions_manager = Mock(spec=InstructionsManager)
+    instructions_manager.path_aliases.metadata.side_effect = lambda value: value
     permission_manager = Mock(spec=PermissionManager)
 
     assert view.definitions() is definitions
@@ -640,6 +646,7 @@ def test_call_routes_arguments_and_runtime_context():
     registry.register(calculate)
     runtime = Mock(spec=Interaction)
     manager = Mock(spec=InstructionsManager)
+    manager.path_aliases.metadata.side_effect = lambda value: value
     execution_started = Mock()
 
     assert (
@@ -1063,3 +1070,85 @@ def test_call_with_timing_async_returns_zero_before_invocation(name, arguments, 
     assert error in output
     assert duration == 0
     clock.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_logical_file_paths_resolve_before_authorization_and_return_logical_metadata(
+    tmp_path, asynchronous
+):
+    """Aliases preserve file access while approvals receive the actual execution target."""
+    path = tmp_path / "é notes.txt"
+    path.write_text("useful content", encoding="utf-8")
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+    permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
+    registry = ToolRegistry([read_text_file], permission_manager=permissions)
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    kwargs = {"instructions_manager": instructions}
+    args = json.dumps({"path": "workspace:/é notes.txt"})
+    output, _ = (
+        asyncio.run(registry.call_with_timing_async("read_text_file", args, **kwargs))
+        if asynchronous
+        else registry.call_with_timing("read_text_file", args, **kwargs)
+    )
+    result = result_value(output)
+    assert result["content"] == "useful content"
+    assert result["path"] == "é notes.txt"
+    assert str(path) in str(permissions.authorize.call_args.args[0])
+
+
+def test_observed_file_scope_does_not_change_command_working_directory(tmp_path):
+    """A file observation cannot change the cwd used by a later process."""
+    nested = tmp_path / "src" / "loop"
+    nested.mkdir(parents=True)
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    instructions.observe_path(nested, directory=True)
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+    permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
+    registry = ToolRegistry([run_command], permission_manager=permissions)
+
+    output = registry.call(
+        "run_command",
+        json.dumps({"command": "pwd", "cwd": "."}),
+        instructions_manager=instructions,
+    )
+
+    assert result_value(output)["stdout"]["content"].strip() == str(tmp_path)
+    assert "cwd='" + str(tmp_path) + "'" in str(permissions.authorize.call_args.args[0])
+
+
+def test_delete_path_accepts_a_logical_workspace_path(tmp_path):
+    """Deletion resolves its declared path alias before planning and execution."""
+    target = tmp_path / "obsolete.txt"
+    target.write_text("obsolete", encoding="utf-8")
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    registry = ToolRegistry([delete_path], permission_manager=PermissionManager(tmp_path))
+
+    output = registry.call(
+        "delete_path",
+        json.dumps({"path": "workspace:/obsolete.txt"}),
+        interaction=Mock(spec=Interaction, prompt=Mock(return_value=ApprovalChoice.ONCE)),
+        instructions_manager=instructions,
+    )
+
+    assert result_value(output) == f"Successfully deleted path '{target}'."
+    assert not target.exists()
+
+
+def test_model_result_returns_non_json_output_unchanged(tmp_path):
+    """Non-JSON plain text tool results return unchanged without raising decode errors."""
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    raw_output = "Plain text output with path /tmp/dir {"
+    output = ToolRegistry._model_result(
+        raw_output, instructions, Tool(lambda: None, result_path_fields=(("result", "path"),))
+    )
+    assert output == raw_output

@@ -1,12 +1,109 @@
 """Provide repository-aware path discovery and traversal utilities."""
 
-from collections.abc import Iterable, Iterator, Sequence
+import os
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 
 from pathspec import GitIgnoreSpec
 
 from .. import constants
 from .models import IgnoreRule, IgnoreRules
+
+
+class PathAliases:
+    """Translate declared local path fields without rewriting execution content.
+
+    Args:
+        roots (Mapping[str, Path]): Stable logical prefixes mapped to authorized local roots.
+            Aliases identify locations; they never grant permission to access them.
+    """
+
+    WORKSPACE_PREFIX = "workspace:/"
+    SCRATCH_PREFIX = "scratch:/"
+    SKILL_PREFIX = "skill:"
+
+    _roots: dict[str, Path]
+
+    def __init__(self, roots: Mapping[str, Path]) -> None:
+        self._roots = {prefix: root.absolute() for prefix, root in roots.items()}
+
+    def resolve(self, value: str) -> str:
+        """Resolve a logical path before normal operation planning and authorization.
+
+        Args:
+            value (str): A declared path argument, logical or native.
+
+        Returns:
+            str: Native lexical path, preserving leaf symlinks for mutation planners.
+
+        Raises:
+            ValueError: If a logical path escapes its root or uses an unavailable alias.
+        """
+        for prefix, root in self._roots.items():
+            if value.startswith(prefix):
+                suffix = value[len(prefix) :]
+                candidate = Path(os.path.abspath(root / suffix))
+                if not candidate.is_relative_to(root):
+                    raise ValueError("Logical path escapes its root.")
+                return str(candidate)
+
+        if value.startswith((self.WORKSPACE_PREFIX, self.SCRATCH_PREFIX, self.SKILL_PREFIX)):
+            raise ValueError("Logical path root is unavailable.")
+
+        if not Path(value).is_absolute() and self.WORKSPACE_PREFIX in self._roots:
+            root = self._roots[self.WORKSPACE_PREFIX]
+            candidate = Path(os.path.abspath(root / value))
+            if not candidate.is_relative_to(root):
+                raise ValueError("Relative path escapes workspace root.")
+            return str(candidate)
+
+        return value
+
+    def display(self, value: str) -> str:
+        """Return a stable logical name for one native metadata path.
+
+        Args:
+            value (str): Native path metadata; relative or unmatched paths remain unchanged.
+
+        Returns:
+            str: Logical path when a declared root contains the value.
+        """
+        path = Path(value)
+        for prefix, root in sorted(
+            self._roots.items(), key=lambda pair: len(str(pair[1])), reverse=True
+        ):
+            if path.is_relative_to(root):
+                relative = path.relative_to(root).as_posix()
+                if prefix == self.WORKSPACE_PREFIX:
+                    return relative
+                return prefix + ("" if relative == "." else relative)
+        return value
+
+    def metadata(self, value: object, fields: tuple[tuple[str, ...], ...]) -> object:
+        """Minimize only tool-declared local path fields in structured results.
+
+        Args:
+            value (object): Parsed tool result or reference metadata.
+            fields (tuple[tuple[str, ...], ...]): Declared key paths; ``"*"`` selects list items.
+
+        Returns:
+            object: Copy with declared metadata path values represented logically.
+        """
+
+        def rewrite(item: object, path: tuple[str, ...]) -> object:
+            if not path:
+                return self.display(item) if isinstance(item, str) else item
+            head, *tail = path
+            if head == "*" and isinstance(item, list):
+                return [rewrite(child, tuple(tail)) for child in item]
+            if isinstance(item, dict) and head in item:
+                return {**item, head: rewrite(item[head], tuple(tail))}
+            return item
+
+        prepared = value
+        for field in fields:
+            prepared = rewrite(prepared, field)
+        return prepared
 
 
 def canonical_path(path: Path | str) -> str:

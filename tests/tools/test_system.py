@@ -218,6 +218,8 @@ def test_run_command_fails_closed_without_an_authorized_process_target():
 def test_successful_run_command_invalidates_instruction_scope(monkeypatch, tmp_path, confirmed):
     """Successful shell operations request a conservative instruction refresh."""
     manager = MagicMock()
+    manager.path_aliases.resolve.side_effect = lambda value: value
+    manager.path_aliases.metadata.side_effect = lambda value: value
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", subprocess.Popen)
 

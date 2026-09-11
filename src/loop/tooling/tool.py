@@ -53,6 +53,8 @@ class Tool:
             registration, or ``None`` for a passive declaration.
         result_presentation (ToolResultPresentationDeclaration): Fixed presentation or selector
             applied to each successful raw result.
+        result_path_fields (tuple[tuple[str, ...], ...]): Structured result fields containing local
+            paths that may be displayed through logical aliases.
         preflight (ToolPreflight | None): Optional readiness check run before registration.
         required (bool): Whether a user must explicitly choose to continue when the tool is
             broken. Without an interaction, a broken required tool raises ``ToolRegistrationError``.
@@ -65,6 +67,7 @@ class Tool:
     operation_planner: OperationPlanner | None = None
     arguments_model: type[BaseModel] | None = None
     result_presentation: ToolResultPresentationDeclaration = RAW_TOOL_RESULT_PRESENTATION
+    result_path_fields: tuple[tuple[str, ...], ...] = ()
     preflight: ToolPreflight | None = None
     required: bool = False
 
@@ -76,6 +79,7 @@ class Tool:
         actions: Iterable[Action] | None = None,
         operation_planner: OperationPlanner | None | Omit = OMIT,
         result_presentation: ToolResultPresentationDeclaration | Omit = OMIT,
+        result_path_fields: tuple[tuple[str, ...], ...] | None = None,
         preflight: ToolPreflight | None | Omit = OMIT,
         required: bool | Omit = OMIT,
     ) -> Tool:
@@ -91,6 +95,8 @@ class Tool:
                 Omit it to inherit; pass ``None`` to remove one.
             result_presentation (ToolResultPresentationDeclaration | Omit): Container-specific
                 presentation declaration. Omit it to inherit.
+            result_path_fields (tuple[tuple[str, ...], ...] | None): Declared result path fields,
+                or ``None`` to inherit.
             preflight (ToolPreflight | None | Omit): Container-specific readiness check. Omit it
                 to inherit; pass ``None`` to remove one.
             required (bool | Omit): Whether the tool must be available for the container to be
@@ -112,6 +118,9 @@ class Tool:
                 self.result_presentation
                 if isinstance(result_presentation, Omit)
                 else result_presentation
+            ),
+            result_path_fields=(
+                self.result_path_fields if result_path_fields is None else tuple(result_path_fields)
             ),
             preflight=self.preflight if isinstance(preflight, Omit) else preflight,
             required=self.required if isinstance(required, Omit) else required,
@@ -417,6 +426,7 @@ def tool[ToolFunction: Callable[..., Any]](
     actions: Iterable[Action] | None = None,
     operation_planner: OperationPlanner | None = None,
     result_presentation: ToolResultPresentationDeclaration = RAW_TOOL_RESULT_PRESENTATION,
+    result_path_fields: tuple[tuple[str, ...], ...] = (),
     preflight: ToolPreflight | None = None,
     required: bool = False,
 ) -> Callable[[ToolFunction], ToolFunction]: ...
@@ -431,6 +441,7 @@ def tool[ToolFunction: Callable[..., Any]](
     actions: Iterable[Action] | None = None,
     operation_planner: OperationPlanner | None = None,
     result_presentation: ToolResultPresentationDeclaration = RAW_TOOL_RESULT_PRESENTATION,
+    result_path_fields: tuple[tuple[str, ...], ...] = (),
     preflight: ToolPreflight | None = None,
     required: bool = False,
 ) -> ToolFunction | Callable[[ToolFunction], ToolFunction]:
@@ -447,6 +458,8 @@ def tool[ToolFunction: Callable[..., Any]](
             arguments and typed operations.
         result_presentation (ToolResultPresentationDeclaration): Fixed presentation or selector
             applied to each successful raw result.
+        result_path_fields (tuple[tuple[str, ...], ...]): Structured result fields containing
+            local paths eligible for logical display aliases.
         preflight (ToolPreflight | None): Optional readiness check run before registration.
         required (bool): Whether a user must explicitly choose to continue when the tool is
             broken. Without an interaction, a broken required tool raises ``ToolRegistrationError``.
@@ -468,6 +481,7 @@ def tool[ToolFunction: Callable[..., Any]](
                 actions=frozenset(() if actions is None else actions),
                 operation_planner=operation_planner,
                 result_presentation=result_presentation,
+                result_path_fields=result_path_fields,
                 preflight=preflight,
                 required=required,
             ),

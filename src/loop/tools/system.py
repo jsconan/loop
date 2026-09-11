@@ -190,6 +190,7 @@ def run_command(
     ],
     cwd: Annotated[
         str,
+        "loop:path",
         Field(description="Working directory for the process."),
     ] = ".",
 ) -> dict | Problem:

@@ -448,7 +448,7 @@ class Loop:
         if not directory.is_dir():
             raise NotADirectoryError(f"Working directory '{directory}' does not exist.")
         self._working_directory.set(directory)
-        self._instructions_manager.observe_path(directory, directory=True)
+        self._instructions_manager.set_working_directory(directory)
 
     @property
     def debug(self) -> bool:

@@ -107,15 +107,20 @@ def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
 
     manager.set_runtime_environment(environment)
 
-    assert str(tmp_path) in prepared(manager)
+    assert str(tmp_path) not in prepared(manager)
+    assert "working_directory: ." in prepared(manager)
     assert manager.generation == generation
     manager.set_runtime_environment(RuntimeEnvironment(tmp_path, tmp_path / ("x" * 900)))
-    with pytest.raises(ValueError, match="Prepared instructions exceed"):
-        prepared(manager)
+    assert "scratch:/" in prepared(manager)
 
 
-def test_runtime_environment_tracks_the_observed_instruction_directory(tmp_path):
-    """Runtime workspace guidance stays aligned with the active instruction scope."""
+def test_path_aliases_are_passive_without_a_runtime_environment():
+    """A static instruction manager leaves ordinary relative paths unchanged."""
+    assert configured_manager().path_aliases.resolve("relative.txt") == "relative.txt"
+
+
+def test_runtime_environment_is_independent_from_observed_instruction_directory(tmp_path):
+    """Path observations change instruction scope without changing the runtime directory."""
     initial = tmp_path / "initial"
     observed = tmp_path / "observed"
     initial.mkdir()
@@ -128,9 +133,15 @@ def test_runtime_environment_tracks_the_observed_instruction_directory(tmp_path)
     manager.observe_path(observed, directory=True)
     manager.prepare(TEST_AGENT)
 
-    assert f"working_directory: {observed.resolve()}" in prepared(manager)
+    assert "working_directory: ." in prepared(manager)
+    assert manager.working_directory == observed.resolve()
+    assert manager.path_aliases.resolve(".") == str(initial.resolve())
     sections = manager.list_skills()["instruction_context"]["sections"]
     assert [section["kind"] for section in sections] == ["runtime_environment"]
+
+    manager.set_working_directory(observed)
+
+    assert manager.path_aliases.resolve(".") == str(observed.resolve())
 
 
 def test_manager_discovers_project_instructions_and_skills(tmp_path):

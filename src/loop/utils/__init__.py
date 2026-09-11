@@ -9,6 +9,7 @@ __all__ = [
     "IgnoreRule",
     "IgnoreRules",
     "IntValueHolder",
+    "PathAliases",
     "PathHolder",
     "PathInput",
     "PathReference",
@@ -87,6 +88,7 @@ from .models import (
 )
 from .normalization import normalized_key, safe_scalar
 from .path import (
+    PathAliases,
     canonical_path,
     filter_paths_by_globs,
     find_project_root,

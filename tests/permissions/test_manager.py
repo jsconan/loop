@@ -1357,3 +1357,100 @@ def test_approval_prompt_renders_session_targets_without_workspace():
 
     assert result.prompt is not None
     assert "config" in result.prompt
+
+
+def test_process_target_display_resolves_relative_paths_to_workspace_root(tmp_path):
+    """Process target argv is normalized through workspace-relative path aliases."""
+    sub = tmp_path / "src" / "loop"
+    sub.mkdir(parents=True)
+    readme = tmp_path / "README.md"
+    readme.touch()
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    manager = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        configuration=PermissionConfiguration(
+            limits=PolicyLimits(allow_host_processes=True),
+        ),
+    )
+    target = ProcessTarget(
+        argv=("cat", str(readme)),
+        cwd=str(sub),
+        boundary=ProcessBoundary.HOST,
+    )
+    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
+
+    prompt = interaction.prompt.call_args.args[0]
+    assert "cat README.md" in prompt
+    assert "(cwd: src/loop)" in prompt
+    assert "../" not in prompt
+
+
+def test_process_target_display_preserves_workspace_relative_argv(tmp_path):
+    """Relative argv that stays within workspace passes through cleanly."""
+    target = ProcessTarget(
+        argv=("cat", "README.md"),
+        cwd=str(tmp_path),
+        boundary=ProcessBoundary.HOST,
+    )
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    manager = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        configuration=PermissionConfiguration(
+            limits=PolicyLimits(allow_host_processes=True),
+        ),
+    )
+
+    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
+
+    assert "cat README.md (cwd: .)" in interaction.prompt.call_args.args[0]
+
+
+def test_process_target_display_preserves_argument_boundaries(tmp_path):
+    """Process prompts quote arguments so distinct argv remain visibly distinct."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    manager = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        configuration=PermissionConfiguration(
+            limits=PolicyLimits(allow_host_processes=True),
+        ),
+    )
+    target = ProcessTarget(
+        argv=("tool", "a b"),
+        cwd=str(tmp_path),
+        boundary=ProcessBoundary.HOST,
+    )
+
+    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
+
+    assert "tool 'a b' (cwd: .)" in interaction.prompt.call_args.args[0]
+
+
+def test_process_target_display_handles_scratch_paths(tmp_path):
+    """Scratch directory paths are prefixed with the scratch alias."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    manager = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        configuration=PermissionConfiguration(
+            limits=PolicyLimits(allow_host_processes=True),
+        ),
+    )
+    scratch_file = manager.temporary_directory / "output.log"
+    scratch_file.parent.mkdir(exist_ok=True)
+    target = ProcessTarget(
+        argv=("cat", str(scratch_file)),
+        cwd=str(tmp_path),
+        boundary=ProcessBoundary.HOST,
+    )
+
+    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
+
+    prompt = interaction.prompt.call_args.args[0]
+    assert "scratch:/output.log" in prompt

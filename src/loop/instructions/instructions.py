@@ -10,7 +10,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Self
 
 from .. import constants
-from ..utils import sha256_digest
+from ..utils import PathAliases, sha256_digest
 from .models import (
     AgentInstructionsSource,
     CapturedInstruction,
@@ -234,6 +234,23 @@ class InstructionsManager:
             self._context_instructions = self._build_instructions()
             self._generation += 1
 
+    @property
+    def path_aliases(self) -> PathAliases:
+        """Return current logical roots for metadata and declared tool path arguments.
+
+        Returns:
+            PathAliases: Workspace, scratch and active-skill roots reconstructed from local state.
+        """
+        roots = {}
+        if self._runtime_environment is not None:
+            roots[PathAliases.WORKSPACE_PREFIX] = self._runtime_environment.working_directory
+            roots[PathAliases.SCRATCH_PREFIX] = self._runtime_environment.temporary_directory
+        roots.update(
+            (f"skill:{skill.name}/", skill.location.parent)
+            for skill in self._skill_manager.activated_skills
+        )
+        return PathAliases(roots)
+
     def list_skills(self) -> ManagedSkillListResult:
         """Return available skills and activation diagnostics.
 
@@ -315,11 +332,29 @@ class InstructionsManager:
         with self._lock:
             if self._working_directory != target:
                 self._working_directory = target
-                if self._runtime_environment is not None:
-                    self._runtime_environment = replace(
-                        self._runtime_environment, working_directory=target
-                    )
                 self._dirty = True
+
+    def set_working_directory(self, path: Path | str) -> None:
+        """Set the explicit runtime directory and matching instruction scope.
+
+        Args:
+            path (Path | str): Directory explicitly selected as the current working directory.
+        """
+        target = Path(path).resolve()
+        with self._lock:
+            if self._working_directory != target:
+                self._working_directory = target
+                self._dirty = True
+            if (
+                self._runtime_environment is not None
+                and self._runtime_environment.working_directory != target
+            ):
+                self._runtime_environment = replace(
+                    self._runtime_environment,
+                    working_directory=target,
+                )
+                self._context_instructions = self._build_instructions()
+                self._generation += 1
 
     def invalidate(self, path: Path | str | None = None) -> None:
         """Mark discovered instructions stale when an applicable source may have changed.

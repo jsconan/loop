@@ -1,6 +1,54 @@
 """Tests for path discovery helpers."""
 
-from loop.utils import canonical_path, filter_paths_by_globs, find_project_root, is_path_ignored
+import pytest
+
+from loop.utils import (
+    PathAliases,
+    canonical_path,
+    filter_paths_by_globs,
+    find_project_root,
+    is_path_ignored,
+    iter_visible_paths,
+)
+
+
+def test_path_aliases_preserve_identity_and_content_without_granting_authority(tmp_path):
+    """Logical paths preserve distinct roots, spaces and symlink identity before authorization."""
+    scratch = tmp_path / "temporary"
+    scratch.mkdir()
+    aliases = PathAliases({"workspace:/": tmp_path, "scratch:/": scratch})
+    assert aliases.resolve("workspace:/a b/é.txt") == str(tmp_path / "a b/é.txt")
+    assert aliases.resolve("notes.txt") == str(tmp_path / "notes.txt")
+    assert aliases.resolve(str(tmp_path / "absolute")) == str(tmp_path / "absolute")
+    assert aliases.display(str(tmp_path)) == "."
+    assert aliases.display(str(tmp_path / "notes.txt")) == "notes.txt"
+    assert aliases.display(str(scratch / "notes.txt")) == "scratch:/notes.txt"
+    assert aliases.display("notes.txt") == "notes.txt"
+    assert PathAliases({}).resolve("relative") == "relative"
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path.parent, target_is_directory=True)
+    assert aliases.resolve("workspace:/link") == str(link)
+    assert aliases.metadata(
+        {"rows": [{"path": str(scratch / "notes.txt")}], "content": str(tmp_path)},
+        (("rows", "*", "path"),),
+    ) == {"rows": [{"path": "scratch:/notes.txt"}], "content": str(tmp_path)}
+    for value in ("workspace:/../escape", "workspace://outside", "skill:missing/file", "../escape"):
+        with pytest.raises(ValueError):
+            aliases.resolve(value)
+
+    assert aliases.metadata({"other": "value"}, (("missing",),)) == {"other": "value"}
+    assert aliases.metadata({"items": "not-a-list"}, (("items", "*", "path"),)) == {
+        "items": "not-a-list"
+    }
+    assert aliases.metadata({"path": 42}, (("path",),)) == {"path": 42}
+
+
+def test_logical_paths_reconstruct_after_workspace_relocation(tmp_path):
+    """A stable alias addresses the equivalent file after a local root is relocated."""
+    original = PathAliases({"workspace:/": tmp_path / "old"})
+    moved = PathAliases({"workspace:/": tmp_path / "new"})
+    alias = original.display(str(tmp_path / "old" / "notes.txt"))
+    assert moved.resolve(alias) == str(tmp_path / "new" / "notes.txt")
 
 
 def test_canonical_path_handles_existing_and_missing_targets(tmp_path):
@@ -10,6 +58,12 @@ def test_canonical_path_handles_existing_and_missing_targets(tmp_path):
 
     assert canonical_path(existing) == str(existing)
     assert canonical_path(tmp_path / "missing.txt") == str(tmp_path / "missing.txt")
+
+    target = tmp_path / "target.txt"
+    target.write_text("target", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+    assert canonical_path(link) == str(target)
 
 
 def test_filter_paths_by_globs_selects_git_style_relative_patterns(tmp_path):
@@ -107,3 +161,47 @@ def test_is_path_ignored_always_excludes_the_application_directory(tmp_path):
 
     assert is_path_ignored(app_directory)
     assert not is_path_ignored(ordinary)
+
+
+def test_is_path_ignored_falls_back_to_path_parent_and_rejects_outside_root(tmp_path):
+    """Ignore checks work outside repositories and enforce an explicit root boundary."""
+    ignored = tmp_path / "ignored.txt"
+    ignored.touch()
+    (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    assert is_path_ignored(ignored)
+
+    with pytest.raises(ValueError):
+        is_path_ignored(tmp_path.parent / "outside.txt", root=tmp_path)
+
+
+def test_iter_visible_paths_prunes_rules_recurses_and_does_not_follow_symlinks(tmp_path):
+    """Traversal yields visible entries, prunes ignored folders, and lists symlink folders only."""
+    (tmp_path / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    visible = tmp_path / "visible"
+    visible.mkdir()
+    (visible / "child.txt").touch()
+    ignored = tmp_path / "ignored"
+    ignored.mkdir()
+    (ignored / "hidden.txt").touch()
+    link = tmp_path / "linked"
+    link.symlink_to(visible, target_is_directory=True)
+
+    assert set(iter_visible_paths(tmp_path)) == {tmp_path / ".gitignore", visible, link}
+    paths = set(iter_visible_paths(tmp_path, recursive=True))
+    assert visible in paths and visible / "child.txt" in paths and link in paths
+    assert ignored not in paths and ignored / "hidden.txt" not in paths
+    assert link / "child.txt" not in paths
+
+
+def test_iter_visible_paths_loads_rules_between_project_root_and_folder(tmp_path):
+    """Traversal includes ignore files inherited by a nested starting folder."""
+    (tmp_path / ".git").mkdir()
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / ".gitignore").write_text("hidden.txt\n", encoding="utf-8")
+    hidden = nested / "hidden.txt"
+    visible = nested / "visible.txt"
+    hidden.touch()
+    visible.touch()
+
+    assert set(iter_visible_paths(nested)) == {nested / ".gitignore", visible}

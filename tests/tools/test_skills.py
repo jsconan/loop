@@ -111,6 +111,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
         "name": "example",
         "status": "activated",
         "instructions_updated": True,
+        "skill_root": "skill:example/",
     }
     assert resources == {
         "name": "example",

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
 from ..errors import Problem
-from ..utils.hashing import sha256_digest
+from ..utils import PathAliases, sha256_digest
 
 
 @dataclass(frozen=True)
@@ -254,8 +254,11 @@ class RuntimeEnvironment:
         """
         return (
             "<runtime_environment>\n"
-            f"working_directory: {self.working_directory}\n"
-            f"temporary_directory: {self.temporary_directory}\n"
+            "working_directory: .\n"
+            f"temporary_directory: {PathAliases.SCRATCH_PREFIX}\n"
+            "File paths are relative to the workspace root directory ('.').\n"
+            "Use workspace-relative paths (e.g. 'src/main.py') "
+            "for file tools and terminal commands.\n"
             "Use temporary_directory only for scratch files; its contents are ephemeral.\n"
             "</runtime_environment>"
         )

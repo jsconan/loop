@@ -570,7 +570,9 @@ def _matches_manifest(path: Path, target: FileTarget) -> bool:
 )
 def list_folder(
     context: ToolContext,
-    path: Annotated[str, Field(description="Path to the folder whose entries should be listed.")],
+    path: Annotated[
+        str, "loop:path", Field(description="Path to the folder whose entries should be listed.")
+    ],
     entry_type: Annotated[
         Literal["files", "folders", "all"],
         Field(description="Type of entries to list."),
@@ -620,10 +622,11 @@ def list_folder(
     actions={Action.FILESYSTEM_READ},
     operation_planner=_file_plan(Action.FILESYSTEM_READ),
     result_presentation=ToolResultPresentationSpec(kind=ToolResultPresentation.TEXT),
+    result_path_fields=(("result", "path"),),
 )
 def read_text_file(
     context: ToolContext,
-    path: Annotated[str, Field(description="Path to the text file to read.")],
+    path: Annotated[str, "loop:path", Field(description="Path to the text file to read.")],
     start_line: Annotated[
         int,
         Field(description="One-based starting line.", ge=1),
@@ -683,10 +686,13 @@ def read_text_file(
     actions={Action.FILESYSTEM_READ},
     operation_planner=_file_plan(Action.FILESYSTEM_READ),
     preflight=_check_text_search,
+    result_path_fields=(("result", "matches", "*", "path"),),
 )
 def search_text(
     context: ToolContext,
-    path: Annotated[str, Field(description="Path to a text file or folder to search.")],
+    path: Annotated[
+        str, "loop:path", Field(description="Path to a text file or folder to search.")
+    ],
     query: Annotated[
         str,
         Field(description="Non-empty literal text or regular expression to find.", min_length=1),
@@ -792,7 +798,7 @@ def search_text(
 )
 def write_text_file(
     context: ToolContext,
-    path: Annotated[str, Field(description="Path to the text file to write.")],
+    path: Annotated[str, "loop:path", Field(description="Path to the text file to write.")],
     content: Annotated[str, Field(description="Content to write to the file.")],
 ) -> str | Problem:
     """Write content to a file on the local disk."""
@@ -832,7 +838,9 @@ def write_text_file(
 )
 def edit_text_file(
     context: ToolContext,
-    path: Annotated[str, Field(description="Path to the existing UTF-8 text file to edit.")],
+    path: Annotated[
+        str, "loop:path", Field(description="Path to the existing UTF-8 text file to edit.")
+    ],
     old_content: Annotated[
         str,
         Field(description="Exact, non-empty existing content that uniquely anchors the edit."),
@@ -895,6 +903,7 @@ def delete_path(
     context: ToolContext,
     path: Annotated[
         str,
+        "loop:path",
         Field(description="Path to the file, symbolic link, or folder to permanently delete."),
     ],
 ) -> str | Problem:
