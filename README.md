@@ -445,6 +445,9 @@ max_agent_turns = 25
 [web]
 user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
 
+[tools]
+command_timeout = 30.0
+
 [logging]
 level = "INFO"
 max_bytes = 5242880
@@ -536,6 +539,7 @@ The `loop` command accepts environment overrides for automation:
 | Reasoning effort            | `LOOP_REASONING_EFFORT`                 | unset                          |
 | Hyperparameter policy       | `OPENAI_HYPERPARAMETER_POLICY`          | `fallback`                     |
 | Web user agent              | `USER_AGENT`                            | browser-like user agent        |
+| Command timeout             | `LOOP_COMMAND_TIMEOUT`                  | `30.0`                         |
 | Loop agent name             | `LOOP_AGENT_NAME`                       | `Loop`                         |
 | Loop model                  | `LOOP_MODEL`                            | unset                          |
 | Stream responses            | `LOOP_STREAM`                           | `true`                         |
@@ -756,21 +760,27 @@ uv run pylint src
 The package uses a `src` layout. Its main components are:
 
 ```text
-src/loop/backend/     Backend contract and OpenAI-compatible adapter
-src/loop/application/ Application composition, immutable storage paths, and commands
-src/loop/commands/    User-command definitions and dispatch
-src/loop/completion/  Declarative completion models, adapters, and aggregation
-src/loop/constants.py Shared application constants
-src/loop/interaction/ User interaction interfaces
-src/loop/loop.py      Interactive conversation loop and streaming configuration
-src/loop/mentions/    User-mention resolution
+src/loop/agent/         Agent identity, instructions, and execution
+src/loop/application/   Application composition, immutable storage paths, and commands
+src/loop/backend/       Backend contract and OpenAI-compatible adapter
+src/loop/commands/      User-command definitions and dispatch
+src/loop/compaction/    Context compaction
+src/loop/completion/    Declarative completion models, adapters, and aggregation
+src/loop/configuration/ Configuration management, models, and commands
+src/loop/constants.py   Shared application constants
+src/loop/errors.py      Application-wide problem reporting
+src/loop/interaction/   User interaction interfaces
+src/loop/loop.py        Interactive conversation loop and streaming configuration
+src/loop/main.py        Application entry point and composition root
+src/loop/mentions/      User-mention resolution
 src/loop/model_selection/ Active model selection and model commands
-src/loop/models.py    Conversation and response models
-src/loop/permissions/ Permission capabilities, requests, and policy management
-src/loop/session/     Session persistence contracts and implementations
-src/loop/instructions/ Base agent policy, Agent Skills, catalog, and instruction management
-src/loop/tooling/     Tool context, registration, definitions, and dispatch
-src/loop/tools/       Built-in tool implementations
-src/loop/utils/       Common utilities
-src/loop/workspace/   Workspace discovery, identity, catalog, and commands
+src/loop/models.py      Conversation and response models
+src/loop/permissions/   Permission capabilities, requests, and policy management
+src/loop/session/       Session persistence contracts and implementations
+src/loop/telemetry/     Telemetry and operational logging
+src/loop/instructions/  Base agent policy, Agent Skills, catalog, and instruction management
+src/loop/tooling/       Tool context, registration, definitions, and dispatch
+src/loop/tools/         Built-in tool implementations
+src/loop/utils/         Common utilities
+src/loop/workspace/     Workspace discovery, identity, catalog, and commands
 ```
