@@ -23,6 +23,8 @@ __all__ = [
     "ValueHolder",
     "ValueReference",
     "as_utc",
+    "base64_decode",
+    "base64_encode",
     "bound_tool_result",
     "cached_metadata",
     "cached_path",
@@ -30,6 +32,9 @@ __all__ = [
     "callable_name",
     "canonical_path",
     "choice_items",
+    "content_digest",
+    "content_identity",
+    "data_url",
     "decode_content_cursor",
     "encode_content_cursor",
     "filter_paths_by_globs",
@@ -37,6 +42,7 @@ __all__ = [
     "format_content_diff",
     "format_content_preview",
     "format_tool_call_arguments",
+    "get_binary",
     "is_binary_file",
     "is_path_ignored",
     "iter_visible_paths",
@@ -53,24 +59,33 @@ __all__ = [
     "safe_scalar",
     "search_text_paths",
     "sha256_digest",
+    "snippet",
     "store_content",
     "store_text_stream",
     "utc_now",
+    "validate_content_handle",
     "write_text_atomically",
 ]
 
 
 from .callables import callable_hints, callable_name
 from .content import (
+    base64_decode,
+    base64_encode,
     bound_tool_result,
     cached_metadata,
     cached_path,
+    content_digest,
+    content_identity,
+    data_url,
     decode_content_cursor,
     encode_content_cursor,
+    get_binary,
     read_bounded_text,
     register_cached_metadata,
     store_content,
     store_text_stream,
+    validate_content_handle,
 )
 from .dates import as_utc, local_now, utc_now
 from .files import is_binary_file, write_text_atomically
@@ -104,6 +119,7 @@ from .text import (
     format_content_diff,
     format_content_preview,
     format_tool_call_arguments,
+    snippet,
 )
 from .value_holder import (
     BoolValueHolder,

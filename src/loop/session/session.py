@@ -4,6 +4,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from mimetypes import guess_type
 from typing import Self
 from uuid import uuid7
 
@@ -19,7 +20,14 @@ from ..models import (
     ToolCall,
     ToolResult,
 )
-from ..utils import utc_now
+from ..utils import (
+    content_digest,
+    content_identity,
+    encode_content_cursor,
+    get_binary,
+    utc_now,
+    validate_content_handle,
+)
 from .models import (
     SESSION_NAME_SOURCE_INITIAL,
     SESSION_NAME_SOURCE_USER,
@@ -27,11 +35,13 @@ from .models import (
     CompactionEvent,
     ConversationItemEvent,
     PendingToolCall,
+    ReferenceArtifact,
     RunCompletedEvent,
     SerializedMessage,
     SerializedSession,
     SessionEvent,
     SessionNameSource,
+    SessionPersistenceSnapshot,
     SessionRecoveryState,
     ToolExecutionCompletedEvent,
     ToolExecutionStartedEvent,
@@ -39,7 +49,7 @@ from .models import (
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 11
+_SCHEMA_VERSION = 12
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -363,8 +373,28 @@ class Session:
 
         Raises:
             UnsupportedConversationItemError: If a conversation item type is not supported.
+            ValueError: If transient reference content conflicts with its durable identity.
         """
+        return self.persistence_snapshot().payload
+
+    def persistence_snapshot(self) -> SessionPersistenceSnapshot:
+        """Project the session payload and immutable artifacts for one atomic save.
+
+        Returns:
+            SessionPersistenceSnapshot: JSON payload and deduplicated reference artifacts.
+
+        Raises:
+            UnsupportedConversationItemError: If a conversation item type is not supported.
+            ValueError: If reference occurrence metadata or transient content conflicts with its
+                durable identity.
+        """
+        try:
+            self._validate_reference_metadata(self.messages)
+        except TypeError as error:
+            raise ValueError(str(error)) from error
+
         messages = []
+        artifacts = {}
         for message in self.messages:
             item_type = type(message)
             if item_type not in _TYPE_NAMES:
@@ -377,8 +407,23 @@ class Session:
                     data=message.model_dump(mode="json"),
                 )
             )
+            if not isinstance(message, Message):
+                continue
+            for reference in message.context:
+                if not reference.content and reference.size_bytes != 0:
+                    continue
+                content = get_binary(reference.content)
+                digest = content_digest(content)
+                if reference.version != digest or reference.size_bytes != len(content):
+                    raise ValueError(
+                        f"Referenced snapshot '{reference.path}' failed integrity validation."
+                    )
+                artifacts.setdefault(
+                    digest,
+                    ReferenceArtifact(handle=reference.handle, digest=digest, content=content),
+                )
 
-        return json.dumps(
+        payload = json.dumps(
             SerializedSession(
                 version=_SCHEMA_VERSION,
                 id=self.id,
@@ -396,6 +441,38 @@ class Session:
             ),
             separators=(",", ":"),
         )
+        return SessionPersistenceSnapshot(
+            payload=payload,
+            reference_artifacts=tuple(artifacts.values()),
+        )
+
+    @staticmethod
+    def requires_migration(value: str) -> bool:
+        """Return whether a serialized session needs normalization before use.
+
+        Args:
+            value (str): JSON representation of a session.
+
+        Returns:
+            bool: Whether the representation uses a supported legacy schema.
+
+        Raises:
+            ValueError: If the serialized session is invalid or uses an unsupported version.
+        """
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError("Invalid serialized session.") from error
+        if not isinstance(payload, dict):
+            raise ValueError(  # noqa: TRY004 - malformed snapshots share one public contract.
+                "Invalid serialized session."
+            )
+        version = payload.get("version")
+        if version == _SCHEMA_VERSION:
+            return False
+        if version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
+            return True
+        raise ValueError(f"Unsupported session version {version}.")
 
     @staticmethod
     def _validate_snapshot_metadata(
@@ -508,7 +585,15 @@ class Session:
 
         version = payload.get("version")
         legacy_reasoning = version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-        if version in {9, 10}:
+        if version in {4, 5, 6, 7, 8, 9, 10, 11}:
+            try:
+                payload = cls._externalize_legacy_references(payload)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("Invalid serialized session.") from error
+        if version == 11:
+            payload["version"] = _SCHEMA_VERSION
+            version = _SCHEMA_VERSION
+        elif version in {9, 10}:
             payload = dict(payload)
             if version == 9:
                 payload.pop("workspace_root", None)
@@ -561,6 +646,7 @@ class Session:
                 instruction_working_directory=instruction_working_directory,
                 active_skills=active_skills,
             )
+            cls._validate_reference_metadata(messages)
             cls._validate_timeline(messages, compactions, events)
 
         except (KeyError, TypeError, ValidationError) as error:
@@ -580,6 +666,106 @@ class Session:
             active_skills=[tuple(identity) for identity in active_skills],
             events=events,
         )
+
+    @staticmethod
+    def _validate_reference_metadata(
+        messages: Iterable[ConversationItem],
+    ) -> None:
+        """Reject reference occurrences whose metadata cannot describe their payload."""
+        handles = {}
+        for message in messages:
+            if not isinstance(message, Message):
+                continue
+            for reference in message.context:
+                if not 0 <= reference.included_bytes <= reference.size_bytes:
+                    raise TypeError("Invalid serialized reference included bytes.")
+                if reference.truncated != (reference.included_bytes < reference.size_bytes):
+                    raise TypeError("Invalid serialized reference truncation metadata.")
+                if reference.handle is None or reference.version is None:
+                    raise TypeError("Invalid serialized reference artifact identity.")
+                validate_content_handle(reference.handle)
+                existing = handles.setdefault(reference.handle, reference.version)
+                if existing != reference.version:
+                    raise TypeError("Invalid serialized reference artifact handle binding.")
+                expected_cursor = (
+                    encode_content_cursor(reference.handle, reference.included_bytes)
+                    if reference.truncated
+                    else None
+                )
+                if reference.next_cursor != expected_cursor:
+                    raise TypeError("Invalid serialized reference continuation cursor.")
+
+    @staticmethod
+    def _externalize_legacy_references(payload: dict) -> dict:
+        """Convert legacy inline snapshots into canonical contentless occurrences."""
+        value = dict(payload)
+        messages = value.get("messages")
+        if not isinstance(messages, list):
+            raise TypeError
+        normalized_messages = []
+        for item in messages:
+            if not isinstance(item, dict):
+                raise TypeError
+            copied_item = dict(item)
+            if copied_item.get("type") != "message":
+                normalized_messages.append(copied_item)
+                continue
+            data = copied_item.get("data")
+            if not isinstance(data, dict):
+                raise TypeError
+            copied_data = dict(data)
+            references = copied_data.get("context", [])
+            if not isinstance(references, list):
+                raise TypeError
+            normalized_references = []
+            for candidate in references:
+                if not isinstance(candidate, dict):
+                    raise TypeError
+                reference = dict(candidate)
+                preview = reference.pop("content")
+                complete = reference.pop("snapshot_content", None)
+                truncated = reference["truncated"]
+                size_bytes = reference["size_bytes"]
+                included_bytes = reference["included_bytes"]
+                path = reference["path"]
+                if not truncated and complete is None:
+                    complete = preview
+                if (
+                    not isinstance(preview, str)
+                    or not isinstance(complete, str)
+                    or not isinstance(truncated, bool)
+                    or not isinstance(path, str)
+                    or not isinstance(size_bytes, int)
+                    or isinstance(size_bytes, bool)
+                    or not isinstance(included_bytes, int)
+                    or isinstance(included_bytes, bool)
+                ):
+                    raise TypeError
+                encoded = complete.encode("utf-8")
+                preview_bytes = preview.encode("utf-8")
+                if (
+                    len(encoded) != size_bytes
+                    or len(preview_bytes) != included_bytes
+                    or not encoded.startswith(preview_bytes)
+                    or truncated != (included_bytes < size_bytes)
+                ):
+                    raise ValueError("Invalid shipped reference snapshot metadata.")
+                handle, digest = content_identity(encoded)
+                reference.update(
+                    content=complete,
+                    handle=handle,
+                    next_cursor=(
+                        encode_content_cursor(handle, included_bytes) if truncated else None
+                    ),
+                    version=digest,
+                    media_type=guess_type(path)[0] or "text/plain",
+                )
+                normalized_references.append(reference)
+            copied_data["context"] = normalized_references
+            copied_item["data"] = copied_data
+            normalized_messages.append(copied_item)
+        value["messages"] = normalized_messages
+        return value
 
     @staticmethod
     def _upcast_payload(payload: dict) -> dict:

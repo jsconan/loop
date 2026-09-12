@@ -78,7 +78,6 @@ def test_portable_compaction_does_not_expand_local_attachment_snapshots():
         size_bytes=40,
         included_bytes=7,
         truncated=True,
-        snapshot_content="private-tail",
     )
     Backend.compact(
         backend,
@@ -88,4 +87,3 @@ def test_portable_compaction_does_not_expand_local_attachment_snapshots():
     )
     history = backend.get_response.call_args.args[0][0].context[0].content
     assert "preview" in history and "private-tail" not in history
-    assert "snapshot_content" not in history

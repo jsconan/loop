@@ -6,16 +6,69 @@ import pytest
 
 from loop import constants
 from loop.utils.content import (
+    base64_decode,
+    base64_encode,
     bound_tool_result,
     cached_metadata,
     cached_path,
+    content_digest,
+    content_identity,
+    data_url,
     decode_content_cursor,
     encode_content_cursor,
+    get_binary,
     read_bounded_text,
     register_cached_metadata,
     store_content,
     store_text_stream,
 )
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [("hello €", "hello €".encode()), (b"\x00\xff", b"\x00\xff")],
+)
+def test_get_binary_encodes_text_and_preserves_binary_content(content, expected):
+    """Binary conversion UTF-8 encodes text and returns bytes unchanged."""
+    result = get_binary(content)
+
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("hello €", "aGVsbG8g4oKs"),
+        (b"\x00\xff", "AP8="),
+    ],
+)
+def test_base64_encode_encodes_text_and_binary_content(content, expected):
+    """Base64 strings encode UTF-8 or raw bytes correctly."""
+    assert base64_encode(content) == expected
+
+
+@pytest.mark.parametrize(
+    ("encoded", "expected", "binary"),
+    [
+        ("aGVsbG8g4oKs", "hello €", False),
+        ("AP8=", b"\x00\xff", True),
+    ],
+)
+def test_base64_decode_decodes_text_and_binary_content(encoded, expected, binary):
+    """Base64 strings decode back to UTF-8 or raw bytes correctly."""
+    assert base64_decode(encoded, binary=binary) == expected
+
+
+@pytest.mark.parametrize(
+    ("content", "media_type", "expected"),
+    [
+        ("hello €", "text/plain", "data:text/plain;base64,aGVsbG8g4oKs"),
+        (b"\x00\xff", "application/octet-stream", "data:application/octet-stream;base64,AP8="),
+    ],
+)
+def test_data_url_encodes_text_and_binary_content(content, media_type, expected):
+    """Data URLs retain the declared MIME type and base64-encode UTF-8 or raw bytes."""
+    assert data_url(content, media_type) == expected
 
 
 def test_content_cache_round_trips_bytes_and_strings():
@@ -31,6 +84,15 @@ def test_content_cache_round_trips_bytes_and_strings():
     assert cached_metadata(text_handle) == {"source": "text source", "reloadable": False}
     assert cached_path("missing") is None
     assert cached_metadata("missing") is None
+
+
+def test_content_identity_separates_random_capabilities_from_stable_digests():
+    """Each reference gets an unguessable handle while equal bytes retain one identity."""
+    first_handle, first_digest = content_identity("same")
+    second_handle, second_digest = content_identity("same")
+
+    assert first_handle != second_handle
+    assert first_digest == second_digest == content_digest("same")
 
 
 def test_cached_metadata_rejects_noncanonical_handles_and_invalid_values():

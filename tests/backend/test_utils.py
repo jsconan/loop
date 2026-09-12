@@ -25,14 +25,12 @@ def test_projection_excludes_local_snapshots_and_artifacts_without_losing_contin
         truncated=True,
         handle="handle",
         next_cursor="cursor",
-        snapshot_content="private-tail",
     )
     projected = project_context(Message(role="user", content="do the task", context=(reference,)))
     assert projected["content"] == "do the task"
     assert projected["context"][0]["content"] == "preview"
     assert projected["context"][0]["next_cursor"] == "cursor"
     assert "private-tail" not in str(projected)
-    assert "snapshot_content" not in str(projected)
     result = ToolResult(
         call_id="call",
         output="result",

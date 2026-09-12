@@ -9,6 +9,44 @@ from .. import constants
 from .models import ChoiceItem
 
 
+def snippet(text: str, language: str | None = None, preserve_fence: bool = True) -> str:
+    """Wrap text in a fenced code block, optionally specifying a language.
+
+    Args:
+        text (str): The text to wrap in a fenced code block.
+        language (str | None, optional): The language identifier for syntax highlighting.
+            Defaults to None.
+        preserve_fence (bool, optional): Whether to preserve the supplied text byte-for-byte
+            inside a safe outer fence. When false, an existing outer fence and surrounding line
+            breaks are normalized. Defaults to True.
+
+    Returns:
+        str: The text wrapped in a fenced code block.
+    """
+    if preserve_fence:
+        fence = "```"
+        while fence in text:
+            fence += "`"
+        return f"{fence}{language or ''}\n{text}\n{fence}"
+
+    text = text.strip("\n\r")
+    opening, separator, body = text.partition("\n")
+    opening = opening.strip()
+    opening_fence = opening[: len(opening) - len(opening.lstrip("`"))]
+    has_wrapping_fence = (
+        len(opening_fence) >= 3
+        and separator
+        and body.rstrip().split("\n")[-1].rstrip("\r") == opening_fence
+    )
+    if has_wrapping_fence:
+        text = body.rstrip()[: -len(opening_fence)]
+    text = text.rstrip()
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return f"{fence}{language or ''}\n{text}\n{fence}"
+
+
 def choice_items(
     values: Iterable[str | ChoiceItem] | Mapping[object, str],
     *,

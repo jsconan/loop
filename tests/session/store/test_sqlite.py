@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import pytest
 
 from loop import (
+    ContextReference,
     Message,
     Reasoning,
     RunCompletedEvent,
@@ -21,7 +22,7 @@ from loop import (
     ToolCall,
     ToolResult,
 )
-from loop.utils import PathHolder
+from loop.utils import PathHolder, content_identity
 
 
 def test_sqlite_store_repairs_private_database_permissions(tmp_path):
@@ -71,6 +72,222 @@ def test_store_stays_absent_until_save_and_reports_missing_sessions(tmp_path):
     with pytest.raises(SessionNotFoundError, match="missing"):
         store.load("missing")
     assert not (tmp_path / ".loop").exists()
+    assert store.collect_unreferenced() == 0
+
+
+def test_store_persists_content_addressed_references_across_instances(tmp_path):
+    """Immutable reference blobs survive process-local store replacement and deduplicate."""
+    path = tmp_path / "sessions.db"
+    first = SQLiteSessionStore(path, workspace_id="workspace")
+
+    assert first.load_reference("missing") is None
+
+    handle, digest = content_identity(b"content")
+    reference = ContextReference(
+        kind="file",
+        path="source.txt",
+        content="content",
+        size_bytes=7,
+        included_bytes=7,
+        truncated=False,
+        handle=handle,
+        version=digest,
+    )
+    session = Session(
+        workspace_id="workspace",
+        messages=[Message(role="user", content="review", context=(reference,))],
+    )
+    first.save(session)
+    restored = SQLiteSessionStore(path, workspace_id="workspace")
+
+    assert restored.load_reference(digest) == b"content"
+    assert restored.load_reference("missing") is None
+
+    with closing(sqlite3.connect(path)) as connection:
+        artifact_row = connection.execute(
+            "SELECT digest, handle, size_bytes FROM reference_artifacts"
+        ).fetchone()
+        link_row = connection.execute(
+            "SELECT session_id, digest FROM session_reference_artifacts"
+        ).fetchone()
+    assert artifact_row == (digest, handle, len(b"content"))
+    assert link_row == (session.id, digest)
+
+
+def test_store_persists_a_verified_unowned_reference(tmp_path):
+    """Reference seeding retains valid bytes without creating a session."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    content = b"content"
+    handle, digest = content_identity(content)
+
+    store.store_reference(content, handle=handle, digest=digest)
+
+    assert store.load_reference(digest) == content
+    assert store.list() == []
+    with pytest.raises(ValueError, match="integrity"):
+        store.store_reference(b"changed", handle=handle, digest=digest)
+
+
+def test_store_rejects_a_capability_reused_for_different_content(tmp_path):
+    """Reference capability collisions fail with the store's validation contract."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    handle, first_digest = content_identity(b"first")
+    _, second_digest = content_identity(b"second")
+    store.store_reference(b"first", handle=handle, digest=first_digest)
+
+    with pytest.raises(ValueError, match="integrity"):
+        store.store_reference(b"second", handle=handle, digest=second_digest)
+
+    assert store.load_reference(first_digest) == b"first"
+    assert store.load_reference(second_digest) is None
+
+
+def test_store_rolls_back_artifacts_and_collects_released_content(tmp_path):
+    """Artifact ownership shares session atomicity and supports explicit mark-and-sweep."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    session = Session(workspace_id="workspace")
+    store.save(session)
+    stale = store.load(session.id)
+    winner = store.load(session.id)
+    winner.add_message(Message(role="user", content="winner"))
+    store.save(winner)
+    handle, digest = content_identity(b"orphan")
+    orphan_reference = ContextReference(
+        kind="file",
+        path="orphan.txt",
+        content="orphan",
+        size_bytes=6,
+        included_bytes=6,
+        truncated=False,
+        handle=handle,
+        version=digest,
+    )
+    stale.messages.append(Message(role="user", content="review", context=(orphan_reference,)))
+    with pytest.raises(SessionRevisionConflictError):
+        store.save(stale)
+
+    assert store.load_reference(digest) is None
+
+    owned_handle, owned_digest = content_identity(b"owned")
+    reference = ContextReference(
+        kind="file",
+        path="owned.txt",
+        content="owned",
+        size_bytes=5,
+        included_bytes=5,
+        truncated=False,
+        handle=owned_handle,
+        version=owned_digest,
+    )
+    winner.add_message(Message(role="user", content="review", context=(reference,)))
+    store.save(winner)
+    assert store.collect_unreferenced() == 0
+    winner.messages[-1] = Message(role="user", content="review")
+    store.save(winner)
+    assert store.collect_unreferenced() == 1
+
+
+def test_store_rejects_invalid_and_unavailable_reference_artifacts(tmp_path):
+    """SQLite rolls back malformed staged bytes and dangling session ownership."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    handle, digest = content_identity(b"content")
+    with pytest.raises(ValueError, match="integrity"):
+        store.store_reference(b"content", handle="invalid", digest=digest)
+    invalid = ContextReference(
+        kind="file",
+        path="invalid.txt",
+        content="changed",
+        size_bytes=7,
+        included_bytes=7,
+        truncated=False,
+        handle=handle,
+        version=digest,
+    )
+    with pytest.raises(ValueError, match="integrity"):
+        store.save(
+            Session(
+                workspace_id="workspace",
+                messages=[Message(role="user", content="review", context=(invalid,))],
+            )
+        )
+
+    store.save(Session(workspace_id="workspace"))
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        connection.execute(
+            "INSERT INTO reference_artifacts VALUES (?, ?, ?, ?)",
+            (digest, handle, 7, b"changed"),
+        )
+    valid = ContextReference(
+        kind="file",
+        path="valid.txt",
+        content="content",
+        size_bytes=7,
+        included_bytes=7,
+        truncated=False,
+        handle=handle,
+        version=digest,
+    )
+    with pytest.raises(ValueError, match="integrity"):
+        store.save(
+            Session(
+                workspace_id="workspace",
+                messages=[Message(role="user", content="review", context=(valid,))],
+            )
+        )
+    corrupt_reference = ContextReference(
+        kind="file",
+        path="corrupt.txt",
+        size_bytes=7,
+        included_bytes=7,
+        truncated=False,
+        handle=handle,
+        version=digest,
+    )
+    corrupt_session = Session(
+        workspace_id="workspace",
+        messages=[Message(role="user", content="review", context=(corrupt_reference,))],
+    )
+    with pytest.raises(ValueError, match="integrity"):
+        store.save(corrupt_session)
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        connection.execute("DELETE FROM reference_artifacts")
+
+    reference = ContextReference(
+        kind="file",
+        path="missing.txt",
+        size_bytes=7,
+        included_bytes=7,
+        truncated=False,
+        handle=handle,
+        version=digest,
+    )
+    session = Session(
+        workspace_id="workspace",
+        messages=[Message(role="user", content="review", context=(reference,))],
+    )
+    with pytest.raises(ValueError, match="unavailable"):
+        store.save(session)
+
+    incomplete = Session(
+        workspace_id="workspace",
+        messages=[
+            Message(
+                role="user",
+                content="review",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="incomplete.txt",
+                        size_bytes=1,
+                        included_bytes=0,
+                        truncated=True,
+                    ),
+                ),
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="artifact identity"):
+        store.save(incomplete)
 
 
 def test_legacy_import_refuses_to_replace_an_existing_session_database(tmp_path):
@@ -283,10 +500,275 @@ def test_store_upgrades_path_owned_snapshots_once_on_load(tmp_path):
         stored = json.loads(
             connection.execute("SELECT session FROM sessions WHERE id = 'legacy'").fetchone()[0]
         )
-    assert stored["version"] == 11
+    assert stored["version"] == 12
     assert stored["workspace_id"] == "workspace"
     assert "workspace_root" not in stored
     assert restored.revision == 2
+
+
+@pytest.mark.parametrize("legacy_version", [4, 11])
+def test_store_migrates_legacy_references_atomically_on_load(tmp_path, legacy_version):
+    """Storage externalizes inline snapshots before returning a canonical session."""
+    path = tmp_path / "sessions.db"
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    session = Session(
+        workspace_id="workspace",
+        messages=[Message(role="user", content="review")],
+    )
+    store.save(session)
+    payload = json.loads(session.serialize())
+    payload["version"] = legacy_version
+    payload["messages"][0]["data"]["context"] = [
+        {
+            "kind": "file",
+            "path": "same.txt",
+            "content": "same",
+            "size_bytes": 4,
+            "included_bytes": 4,
+            "truncated": False,
+            "handle": None,
+            "next_cursor": None,
+            "snapshot_content": None,
+        },
+        {
+            "kind": "file",
+            "path": "copy.txt",
+            "content": "same",
+            "size_bytes": 4,
+            "included_bytes": 4,
+            "truncated": False,
+            "handle": None,
+            "next_cursor": None,
+            "snapshot_content": None,
+        },
+        {
+            "kind": "file",
+            "path": "large.txt",
+            "content": "pre",
+            "size_bytes": 7,
+            "included_bytes": 3,
+            "truncated": True,
+            "handle": "legacy-random-handle",
+            "next_cursor": "legacy-cursor",
+            "snapshot_content": "preview",
+        },
+    ]
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "UPDATE sessions SET session = ? WHERE id = ?",
+            (json.dumps(payload), session.id),
+        )
+
+    restored = store.load(session.id)
+    revision = restored.revision
+    references = restored.messages[0].context
+    _, same_digest = content_identity(b"same")
+    _, large_digest = content_identity(b"preview")
+
+    assert revision == 2
+    assert [reference.version for reference in references] == [
+        same_digest,
+        same_digest,
+        large_digest,
+    ]
+    assert all(reference.handle for reference in references)
+    assert references[0].handle != references[1].handle
+    assert [reference.content for reference in references] == ["same", "same", "preview"]
+    assert store.load_reference(same_digest) == b"same"
+    assert store.load_reference(large_digest) == b"preview"
+    assert store.load(session.id).revision == revision
+    with closing(sqlite3.connect(path)) as connection:
+        stored = json.loads(
+            connection.execute(
+                "SELECT session FROM sessions WHERE id = ?", (session.id,)
+            ).fetchone()[0]
+        )
+        artifact_count = connection.execute("SELECT COUNT(*) FROM reference_artifacts").fetchone()[
+            0
+        ]
+        link_count = connection.execute(
+            "SELECT COUNT(*) FROM session_reference_artifacts"
+        ).fetchone()[0]
+    assert stored["version"] == 12
+    assert "content" not in stored["messages"][0]["data"]["context"][0]
+    assert artifact_count == link_count == 2
+
+
+def test_store_rejects_incomplete_shipped_v11_snapshots_without_partial_migration(tmp_path):
+    """An unavailable shipped snapshot leaves its session and artifact tables unchanged."""
+    path = tmp_path / "sessions.db"
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    session = Session(
+        workspace_id="workspace",
+        messages=[Message(role="user", content="review")],
+    )
+    store.save(session)
+    payload = json.loads(session.serialize())
+    payload["version"] = 11
+    payload["messages"][0]["data"]["context"] = [
+        {
+            "kind": "file",
+            "path": "lost.txt",
+            "content": "pre",
+            "size_bytes": 7,
+            "included_bytes": 3,
+            "truncated": True,
+            "handle": "legacy-handle",
+            "next_cursor": "legacy-cursor",
+            "snapshot_content": None,
+        }
+    ]
+    serialized = json.dumps(payload)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("UPDATE sessions SET session = ? WHERE id = ?", (serialized, session.id))
+
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        store.load(session.id)
+
+    with closing(sqlite3.connect(path)) as connection:
+        stored, revision = connection.execute(
+            "SELECT session, revision FROM sessions WHERE id = ?", (session.id,)
+        ).fetchone()
+        artifact_count = connection.execute("SELECT COUNT(*) FROM reference_artifacts").fetchone()[
+            0
+        ]
+        link_count = connection.execute(
+            "SELECT COUNT(*) FROM session_reference_artifacts"
+        ).fetchone()[0]
+    assert stored == serialized
+    assert revision == 1
+    assert artifact_count == link_count == 0
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"included_bytes": 8},
+        {"truncated": True},
+        {"next_cursor": "malformed"},
+        {"handle": None},
+        {"handle": None, "version": None},
+        {"handle": None, "version": None, "next_cursor": "malformed"},
+    ],
+)
+def test_store_rejects_invalid_current_reference_metadata_without_mutation(tmp_path, updates):
+    """Current snapshots fail closed when an occurrence manifest is malformed."""
+    path = tmp_path / "sessions.db"
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    handle, digest = content_identity(b"content")
+    session = Session(
+        workspace_id="workspace",
+        messages=[
+            Message(
+                role="user",
+                content="review",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="source.txt",
+                        content="content",
+                        size_bytes=7,
+                        included_bytes=7,
+                        truncated=False,
+                        handle=handle,
+                        version=digest,
+                    ),
+                ),
+            )
+        ],
+    )
+    store.save(session)
+    payload = json.loads(session.serialize())
+    payload["messages"][0]["data"]["context"][0].update(updates)
+    serialized = json.dumps(payload)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("UPDATE sessions SET session = ? WHERE id = ?", (serialized, session.id))
+
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        store.load(session.id)
+
+    with closing(sqlite3.connect(path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT session FROM sessions WHERE id = ?", (session.id,)
+            ).fetchone()[0]
+            == serialized
+        )
+
+
+def test_store_rejects_invalid_shipped_v11_reference_shapes(tmp_path):
+    """Malformed shipped fields are rejected before any durable normalization occurs."""
+    path = tmp_path / "sessions.db"
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    session = Session(workspace_id="workspace", messages=[Message(role="user", content="x")])
+    store.save(session)
+    base = json.loads(session.serialize())
+    base["version"] = 11
+    valid_reference = {
+        "kind": "file",
+        "path": "file.txt",
+        "content": "text",
+        "size_bytes": 4,
+        "included_bytes": 4,
+        "truncated": False,
+        "handle": None,
+        "next_cursor": None,
+        "snapshot_content": None,
+    }
+    invalid_payloads = []
+    for messages in (None, [1]):
+        payload = json.loads(json.dumps(base))
+        payload["messages"] = messages
+        invalid_payloads.append(payload)
+    for context in (None, [{}]):
+        payload = json.loads(json.dumps(base))
+        payload["messages"][0]["data"]["context"] = context
+        invalid_payloads.append(payload)
+    for key, value in (
+        ("content", None),
+        ("truncated", "false"),
+        ("path", None),
+        ("size_bytes", 5),
+    ):
+        payload = json.loads(json.dumps(base))
+        reference = {**valid_reference, key: value}
+        if key == "truncated":
+            reference["snapshot_content"] = "text"
+        payload["messages"][0]["data"]["context"] = [reference]
+        invalid_payloads.append(payload)
+
+    for payload in invalid_payloads:
+        serialized = json.dumps(payload)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute(
+                "UPDATE sessions SET session = ? WHERE id = ?", (serialized, session.id)
+            )
+        with pytest.raises(ValueError):
+            store.load(session.id)
+        with closing(sqlite3.connect(path)) as connection:
+            assert (
+                connection.execute(
+                    "SELECT session FROM sessions WHERE id = ?", (session.id,)
+                ).fetchone()[0]
+                == serialized
+            )
+
+
+def test_store_rejects_foreign_shipped_v11_sessions(tmp_path):
+    """Session upcasting preserves workspace isolation at the storage boundary."""
+    path = tmp_path / "sessions.db"
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    session = Session(workspace_id="workspace", messages=[Message(role="user", content="x")])
+    store.save(session)
+    payload = json.loads(session.serialize())
+    payload["version"] = 11
+    payload["workspace_id"] = "another"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "UPDATE sessions SET session = ? WHERE id = ?", (json.dumps(payload), session.id)
+        )
+    with pytest.raises(SessionWorkspaceMismatchError, match="another"):
+        store.load(session.id)
 
 
 def test_store_rejects_a_concurrent_write_during_workspace_upgrade(tmp_path, monkeypatch):
@@ -308,7 +790,7 @@ def test_store_rejects_a_concurrent_write_during_workspace_upgrade(tmp_path, mon
 
         def execute(self, sql, parameters=()):
             """Inject one competing revision update at the migration boundary."""
-            if "UPDATE sessions SET session = ?, revision = revision + 1" in sql:
+            if "UPDATE sessions SET" in sql and "revision = ?" in sql:
                 with closing(connect(path)) as competing, competing:
                     competing.execute(
                         "UPDATE sessions SET revision = revision + 1 WHERE id = ?", (session.id,)

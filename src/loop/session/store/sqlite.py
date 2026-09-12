@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ...models import Message
-from ...utils import utc_now
+from ...utils import content_digest, utc_now, validate_content_handle
 from ..models import (
     SESSION_NAME_SOURCE_INITIAL,
     SessionInfo,
@@ -87,6 +87,7 @@ class SQLiteSessionStore:
         Raises:
             SessionRevisionConflictError: If the snapshot is based on a stale revision.
             SessionWorkspaceMismatchError: If the session belongs to another workspace.
+            ValueError: If an artifact is invalid or the session references missing content.
         """
         if session.workspace_id is None:
             session.workspace_id = self._workspace_id
@@ -98,12 +99,20 @@ class SQLiteSessionStore:
             session.name_source = SESSION_NAME_SOURCE_INITIAL
 
         now = utc_now().isoformat()
-        payload = session.serialize()
+        snapshot = session.persistence_snapshot()
         new_revision = session.revision + 1
         with closing(sqlite3.connect(self._path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
             self._enforce_private_modes()
             with connection:
                 self._create_schema(connection)
+                for artifact in snapshot.reference_artifacts:
+                    self._store_reference(
+                        connection,
+                        artifact.content,
+                        handle=artifact.handle,
+                        digest=artifact.digest,
+                    )
                 if session.revision == 0:
                     with closing(
                         connection.execute(
@@ -121,7 +130,7 @@ class SQLiteSessionStore:
                                 now,
                                 now,
                                 len(session.messages),
-                                payload,
+                                snapshot.payload,
                                 new_revision,
                             ),
                         )
@@ -148,7 +157,7 @@ class SQLiteSessionStore:
                                 session.name_source or SESSION_NAME_SOURCE_INITIAL,
                                 now,
                                 len(session.messages),
-                                payload,
+                                snapshot.payload,
                                 new_revision,
                                 session.id,
                                 session.revision,
@@ -163,9 +172,136 @@ class SQLiteSessionStore:
                             session.revision,
                             current_revision if current_revision is not None else 0,
                         )
+                references = set()
+                for message in session.messages:
+                    if not isinstance(message, Message):
+                        continue
+                    for reference in message.context:
+                        references.add((reference.version, reference.handle, reference.size_bytes))
+                digests = {version for version, _, _ in references}
+                for digest, handle, size_bytes in references:
+                    stored = connection.execute(
+                        "SELECT handle, size_bytes, content FROM reference_artifacts "
+                        "WHERE digest = ?",
+                        (digest,),
+                    ).fetchone()
+                    if stored is None:
+                        raise ValueError("Session references an unavailable artifact.")
+                    _, stored_size, stored_content = stored
+                    if stored_size != size_bytes or content_digest(stored_content) != digest:
+                        raise ValueError("Reference artifact failed integrity validation.")
+                connection.execute(
+                    "DELETE FROM session_reference_artifacts WHERE session_id = ?",
+                    (session.id,),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO session_reference_artifacts (session_id, digest)
+                    VALUES (?, ?)
+                    """,
+                    ((session.id, digest) for digest in digests),
+                )
         self._enforce_private_modes()
         session.revision = new_revision
         return session.id
+
+    def load_reference(self, digest: str) -> bytes | None:
+        """Load immutable referenced content when available.
+
+        Args:
+            digest (str): Algorithm-qualified full content digest.
+
+        Returns:
+            bytes | None: Complete immutable content, or ``None``.
+        """
+        if not self._path.is_file():
+            return None
+        self._enforce_private_modes()
+        with closing(sqlite3.connect(self._path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            self._create_schema(connection)
+            row = connection.execute(
+                "SELECT content FROM reference_artifacts WHERE digest = ?",
+                (digest,),
+            ).fetchone()
+        return bytes(row[0]) if row is not None else None
+
+    def store_reference(self, content: bytes, *, handle: str, digest: str) -> None:
+        """Persist one verified immutable reference without changing a session snapshot.
+
+        Args:
+            content (bytes): Complete immutable reference content.
+            handle (str): Opaque content-read capability associated with the reference.
+            digest (str): Algorithm-qualified digest of ``content``.
+
+        Raises:
+            ValueError: If the supplied identity does not match the content or conflicts with an
+                existing artifact.
+        """
+        try:
+            validate_content_handle(handle)
+        except ValueError as error:
+            raise ValueError("Reference artifact failed integrity validation.") from error
+        if content_digest(content) != digest:
+            raise ValueError("Reference artifact failed integrity validation.")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.parent.chmod(0o700)
+        with closing(sqlite3.connect(self._path)) as connection, connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            self._create_schema(connection)
+            self._store_reference(connection, content, handle=handle, digest=digest)
+        self._enforce_private_modes()
+
+    def collect_unreferenced(self) -> int:
+        """Delete artifacts not owned by any persisted session.
+
+        Returns:
+            int: Number of artifacts deleted.
+        """
+        if not self._path.is_file():
+            return 0
+        with closing(sqlite3.connect(self._path)) as connection, connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            self._create_schema(connection)
+            cursor = connection.execute(
+                """
+                DELETE FROM reference_artifacts
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM session_reference_artifacts
+                    WHERE session_reference_artifacts.digest = reference_artifacts.digest
+                )
+                """
+            )
+            deleted = cursor.rowcount
+        self._enforce_private_modes()
+        return deleted
+
+    @staticmethod
+    def _store_reference(
+        connection: sqlite3.Connection,
+        content: bytes,
+        *,
+        handle: str,
+        digest: str,
+    ) -> None:
+        """Insert one artifact and verify any pre-existing durable identity."""
+        try:
+            connection.execute(
+                """
+                INSERT INTO reference_artifacts (digest, handle, size_bytes, content)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(digest) DO NOTHING
+                """,
+                (digest, handle, len(content), content),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("Reference artifact failed integrity validation.") from error
+        stored = connection.execute(
+            "SELECT handle, size_bytes, content FROM reference_artifacts WHERE digest = ?",
+            (digest,),
+        ).fetchone()
+        if stored is None or stored[1:] != (len(content), content):
+            raise ValueError("Reference artifact failed integrity validation.")
 
     def load(self, session_id: str) -> Session:
         """Load a persisted session snapshot.
@@ -188,6 +324,7 @@ class SQLiteSessionStore:
 
         self._enforce_private_modes()
         with closing(sqlite3.connect(self._path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
             self._create_schema(connection)
             with closing(
                 connection.execute(
@@ -198,33 +335,18 @@ class SQLiteSessionStore:
                 row = cursor.fetchone()
             if row is None:
                 raise SessionNotFoundError(f"Session '{session_id}' was not found.")
+            needs_migration = Session.requires_migration(row[2])
             session = Session.deserialize(row[2])
             session.id = session_id
             session.name = row[0]
             session.name_source = row[1]
             session.revision = row[3]
-            if session.workspace_id is None:
-                session.workspace_id = self._workspace_id
-                with closing(
-                    connection.execute(
-                        """
-                        UPDATE sessions SET session = ?, revision = revision + 1
-                        WHERE id = ? AND revision = ?
-                        """,
-                        (session.serialize(), session_id, session.revision),
-                    )
-                ) as cursor:
-                    migrated = cursor.rowcount
-                if migrated != 1:
-                    current_revision = self._current_revision(connection, session_id)
-                    raise SessionRevisionConflictError(
-                        session_id,
-                        session.revision,
-                        current_revision if current_revision is not None else 0,
-                    )
-                connection.commit()
-                session.revision += 1
-            self._validate_workspace(session)
+        needs_workspace = session.workspace_id is None
+        if needs_workspace:
+            session.workspace_id = self._workspace_id
+        self._validate_workspace(session)
+        if needs_migration or needs_workspace:
+            self.save(session)
         return session
 
     def _validate_workspace(self, session: Session) -> None:
@@ -300,6 +422,37 @@ class SQLiteSessionStore:
             )
         ):
             pass
+        with closing(
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reference_artifacts (
+                    digest TEXT PRIMARY KEY,
+                    handle TEXT NOT NULL UNIQUE,
+                    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+                    content BLOB NOT NULL
+                )
+                """
+            )
+        ):
+            pass
+        with closing(
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_reference_artifacts (
+                    session_id TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    PRIMARY KEY (session_id, digest),
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                    FOREIGN KEY (digest) REFERENCES reference_artifacts(digest) ON DELETE RESTRICT
+                )
+                """
+            )
+        ):
+            pass
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS session_reference_artifacts_digest_idx "
+            "ON session_reference_artifacts(digest)"
+        )
         with closing(connection.execute("PRAGMA table_info(sessions)")) as cursor:
             columns = {row[1] for row in cursor.fetchall()}
         if "name" not in columns:

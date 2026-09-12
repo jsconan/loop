@@ -509,8 +509,19 @@ backend = OpenAIBackend(
 Referenced text files use native `input_file` parts when `base_url` is omitted for the official
 OpenAI endpoint. Setting a custom `base_url` defaults to portable `input_text` parts because many
 OpenAI-compatible servers do not implement `input_file`. Override either default explicitly with
-`file_input_mode="text"` or `file_input_mode="native"`. Both modes retain the reference metadata
-manifest.
+`file_input_mode="text"` or `file_input_mode="native"`.
+
+Project-path mentions are captured in a durable, content-addressed snapshot store. At most two
+small files are attached directly; larger or more numerous files contribute only metadata and an
+opaque handle that the model can inspect in bounded portions with `read_cached_content`. Mentioned
+directories receive bounded shallow overviews until the aggregate preview budget is exhausted, and
+retain any remainder behind the same lazy-read mechanism. Message history stores only occurrence metadata and the content handle, so
+snapshot bytes—including small-file previews—exist once in the artifact store. Active model
+context hydrates and verifies those bytes on demand; repeated mentions of the same immutable
+version retain their path and chronology without resending an already supplied payload. The
+manifest includes the content digest and detected media type. Shipped version 11 sessions are
+normalized transactionally on first load; incomplete historical snapshots are rejected without
+partially migrating the session.
 
 The `loop` command accepts environment overrides for automation:
 

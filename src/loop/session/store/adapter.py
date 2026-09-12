@@ -20,6 +20,7 @@ class SessionStore(Protocol):
 
         Raises:
             SessionRevisionConflictError: If the snapshot is based on a stale revision.
+            ValueError: If an artifact is invalid or the session references missing content.
         """
 
     def load(self, session_id: str) -> Session:
@@ -43,4 +44,34 @@ class SessionStore(Protocol):
 
         Returns:
             list[SessionInfo]: Lightweight persisted-session descriptions.
+        """
+
+    def load_reference(self, digest: str) -> bytes | None:
+        """Load immutable referenced content.
+
+        Args:
+            digest (str): Algorithm-qualified full content digest.
+
+        Returns:
+            bytes | None: Complete immutable content, or ``None`` when unavailable.
+        """
+
+    def store_reference(self, content: bytes, *, handle: str, digest: str) -> None:
+        """Persist one verified immutable reference without changing a session snapshot.
+
+        Args:
+            content (bytes): Complete immutable reference content.
+            handle (str): Opaque content-read capability associated with the reference.
+            digest (str): Algorithm-qualified digest of ``content``.
+
+        Raises:
+            ValueError: If the supplied identity does not match the content or conflicts with an
+                existing artifact.
+        """
+
+    def collect_unreferenced(self) -> int:
+        """Delete artifacts not owned by any persisted session.
+
+        Returns:
+            int: Number of artifacts deleted.
         """

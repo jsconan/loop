@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime
 from threading import Barrier, Event
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, call
+from unittest.mock import MagicMock, Mock, call, patch
 from uuid import uuid4
 
 import pytest
@@ -58,7 +58,14 @@ from loop.session import (
 )
 from loop.session import session_manager as session_manager_module
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
-from loop.utils import cached_metadata, cached_path, store_content
+from loop.utils import (
+    cached_metadata,
+    cached_path,
+    content_identity,
+    encode_content_cursor,
+    sha256_digest,
+    store_content,
+)
 
 
 def response_interaction() -> MagicMock:
@@ -66,6 +73,27 @@ def response_interaction() -> MagicMock:
     interaction = MagicMock(spec=Interaction)
     interaction.response_context.return_value = nullcontext()
     return interaction
+
+
+def persist_reference(store, content: bytes, path: str = "large.txt"):
+    """Persist one reference through the atomic session boundary."""
+    handle, version = content_identity(content)
+    reference = ContextReference(
+        kind="file",
+        path=path,
+        content=content.decode(),
+        size_bytes=len(content),
+        included_bytes=0,
+        truncated=True,
+        handle=handle,
+        next_cursor=encode_content_cursor(handle, 0),
+        version=version,
+        media_type="text/plain",
+    )
+    manager = SessionManager(session_store=store)
+    manager.add_user_message(f"Review @{path}", context=(reference,))
+    store_content(content, f"mentioned file {path}", handle=handle)
+    return manager.session, handle, version
 
 
 def test_manager_creates_default_services_and_an_empty_session():
@@ -94,6 +122,73 @@ def test_manager_uses_injected_services_and_session():
     assert manager.session is session
     assert manager.messages is session.messages
     assert manager.model == "model-a"
+
+
+def test_manager_seeds_references_from_a_supplied_in_memory_session():
+    """Managers persist transient reference bytes supplied by an active session."""
+    content = b"snapshot"
+    handle, version = content_identity(content)
+    session = Session(
+        messages=[
+            Message(
+                role="user",
+                content="Review @source.txt",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="source.txt",
+                        content=content.decode(),
+                        size_bytes=len(content),
+                        included_bytes=len(content),
+                        truncated=False,
+                        handle=handle,
+                        version=version,
+                    ),
+                ),
+            )
+        ]
+    )
+    store = MemorySessionStore()
+
+    manager = SessionManager(session=session, session_store=store)
+
+    assert manager.session is session
+    assert store.load_reference(version) == content
+    assert manager.model_context[0].context[0].content == content.decode()
+    assert session.revision == 0
+    assert store.list() == []
+
+
+def test_manager_rejects_corrupt_reference_bytes_from_a_supplied_session():
+    """Managers do not seed or save an in-memory session with mismatched reference bytes."""
+    handle, version = content_identity(b"expected")
+    session = Session(
+        messages=[
+            Message(
+                role="user",
+                content="Review @source.txt",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="source.txt",
+                        content="changed",
+                        size_bytes=len(b"changed"),
+                        included_bytes=len(b"changed"),
+                        truncated=False,
+                        handle=handle,
+                        version=version,
+                    ),
+                ),
+            )
+        ]
+    )
+    store = MemorySessionStore()
+
+    with pytest.raises(ValueError, match="integrity validation"):
+        SessionManager(session=session, session_store=store)
+
+    assert store.list() == []
+    assert store.load_reference(version) is None
 
 
 def test_manager_response_uses_terminal_text_and_an_interaction_override():
@@ -553,12 +648,103 @@ def test_manager_constructs_and_persists_complete_user_messages():
 
     manager.add_user_message("Review @app.py", context=iter([reference]))
 
+    _, version = content_identity("pass\n")
     assert manager.messages == [
-        Message(role="user", content="Review @app.py", context=(reference,))
+        Message(
+            role="user",
+            content="Review @app.py",
+            context=(
+                reference.model_copy(
+                    update={"handle": manager.messages[0].context[0].handle, "version": version}
+                ),
+            ),
+        )
     ]
     assert session.name == "Review @app.py"
     assert session.name_source == "initial"
-    store.save.assert_called_once_with(session)
+    store.save.assert_called_once()
+
+
+def test_manager_does_not_commit_when_reference_cache_activation_fails():
+    """A cache failure leaves both the active session and durable store unchanged."""
+    store = Mock(spec=SessionStore)
+    manager = SessionManager(session_store=store)
+    reference = ContextReference(
+        kind="file",
+        path="app.py",
+        content="pass\n",
+        size_bytes=5,
+        included_bytes=5,
+        truncated=False,
+    )
+
+    with (
+        patch("loop.session.session_manager.store_content", side_effect=OSError("cache failed")),
+        pytest.raises(OSError, match="cache failed"),
+    ):
+        manager.add_user_message("Review @app.py", context=(reference,))
+
+    assert manager.messages == []
+    store.save.assert_not_called()
+
+
+def test_manager_rejects_mismatched_reference_before_overwriting_its_cache():
+    """Rejected reference bytes leave an existing immutable cache entry untouched."""
+    trusted = b"trusted"
+    handle, version = content_identity(trusted)
+    store_content(trusted, "mentioned file source.txt", handle=handle)
+    store = Mock(spec=SessionStore)
+    manager = SessionManager(session_store=store)
+    reference = ContextReference(
+        kind="file",
+        path="source.txt",
+        content="changed",
+        size_bytes=len(trusted),
+        included_bytes=len(trusted),
+        truncated=False,
+        handle=handle,
+        version=version,
+    )
+
+    with pytest.raises(ValueError, match="integrity validation"):
+        manager.add_user_message("Review @source.txt", context=(reference,))
+
+    assert cached_path(handle)[0].read_bytes() == trusted
+    assert manager.messages == []
+    store.save.assert_not_called()
+
+
+def test_manager_rejects_a_handle_rebound_to_different_content_before_cache_activation():
+    """A duplicate capability cannot overwrite another reference's cached content."""
+    store = Mock(spec=SessionStore)
+    manager = SessionManager(session_store=store)
+    handle, first_version = content_identity("first")
+    _, second_version = content_identity("second")
+    first = ContextReference(
+        kind="file",
+        path="first.txt",
+        content="first",
+        size_bytes=5,
+        included_bytes=5,
+        truncated=False,
+        handle=handle,
+        version=first_version,
+    )
+    second = first.model_copy(
+        update={
+            "path": "second.txt",
+            "content": "second",
+            "size_bytes": 6,
+            "included_bytes": 6,
+            "version": second_version,
+        }
+    )
+
+    with pytest.raises(ValueError, match="reuses an artifact handle"):
+        manager.add_user_message("Review", context=(first, second))
+
+    assert manager.messages == []
+    store.save.assert_not_called()
 
 
 def test_manager_generates_names_regardless_of_the_current_name_source():
@@ -788,35 +974,461 @@ def test_manager_restores_artifact_metadata_from_a_loaded_session():
     }
 
 
-def test_manager_restores_immutable_mention_content_into_an_expired_cache():
-    """Loading a session makes a truncated attachment continuation readable again."""
-    handle = store_content("old", "old source")
+def test_manager_restores_digest_backed_mention_content_from_its_store():
+    """Loading repairs a missing cache file from its durable store artifact."""
+    store = MemorySessionStore()
+    session, handle, _version = persist_reference(store, b"snapshot")
     cached_path(handle)[0].unlink()
+
+    SessionManager(session=session, session_store=store).load_session(session)
+
+    assert cached_path(handle)[0].read_text(encoding="utf-8") == "snapshot"
+
+
+def test_manager_repairs_tampered_cached_mention_content_from_its_store():
+    """Loading replaces cached bytes that fail the reference integrity check."""
+    store = MemorySessionStore()
+    session, handle, _version = persist_reference(store, b"snapshot")
+    cached_path(handle)[0].write_bytes(b"tampered")
+
+    SessionManager(session=session, session_store=store).load_session(session)
+
+    assert cached_path(handle)[0].read_bytes() == b"snapshot"
+
+
+def test_manager_repairs_cached_mention_content_after_a_cache_read_failure():
+    """Loading repairs a durable reference when cache verification cannot read its file."""
+    store = MemorySessionStore()
+    session, handle, _version = persist_reference(store, b"snapshot")
+
+    with patch.object(type(cached_path(handle)[0]), "read_bytes", side_effect=OSError):
+        SessionManager(session=session, session_store=store).load_session(session)
+
+    assert cached_path(handle)[0].read_bytes() == b"snapshot"
+
+
+def test_manager_rejects_missing_durable_content_despite_a_valid_cache():
+    """Session activation requires durable content even when a matching cache file remains."""
+    content = b"snapshot"
+    handle, version = content_identity(content)
+    store_content(content, "mentioned file source.txt", handle=handle)
+    store = MagicMock(spec=SessionStore)
+    store.load_reference.return_value = None
     session = Session(
         messages=[
             Message(
                 role="user",
-                content="Review @large.txt",
+                content="Review @source.txt",
                 context=(
                     ContextReference(
                         kind="file",
-                        path="large.txt",
-                        content="snap",
-                        size_bytes=8,
-                        included_bytes=4,
+                        path="source.txt",
+                        size_bytes=len(content),
+                        included_bytes=0,
                         truncated=True,
                         handle=handle,
-                        next_cursor="cursor",
-                        snapshot_content="snapshot",
+                        next_cursor=encode_content_cursor(handle, 0),
+                        version=version,
                     ),
                 ),
             )
         ]
     )
 
-    SessionManager(session=session).load_session(session)
+    with pytest.raises(ValueError, match="unavailable"):
+        SessionManager(session_store=store).load_session(session)
 
-    assert cached_path(handle)[0].read_text(encoding="utf-8") == "snapshot"
+
+def test_manager_rejects_incomplete_artifact_identity_while_loading():
+    """Session activation refuses a reference without both durable identity fields."""
+    session = Session(
+        messages=[
+            Message(
+                role="user",
+                content="Review @source.txt",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="source.txt",
+                        size_bytes=0,
+                        included_bytes=0,
+                        truncated=False,
+                    ),
+                ),
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="incomplete artifact identity"):
+        SessionManager().load_session(session)
+
+
+def test_manager_stores_and_activates_content_addressed_references():
+    """Capturing a reference persists it and makes its immutable bytes immediately readable."""
+    store = MemorySessionStore()
+    _session, handle, version = persist_reference(store, b"snapshot", "source.txt")
+
+    assert version == f"sha256:{sha256_digest(b'snapshot')}"
+    assert handle and handle != version[7:39]
+    assert store.load_reference(version) == b"snapshot"
+    assert cached_path(handle)[0].read_bytes() == b"snapshot"
+
+
+def test_manager_does_not_save_current_sessions_while_loading():
+    """Loading current snapshots performs no migration save or version scan."""
+    session = Session()
+    store = Mock(spec=SessionStore)
+    store.load.return_value = session
+
+    SessionManager(session_store=store).load_session(session.id)
+
+    store.save.assert_not_called()
+
+
+def test_manager_persists_contentless_occurrences_and_hydrates_each_version_once():
+    """Messages store only artifact metadata while active context supplies one verified payload."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    content = b"shared snapshot"
+    handle, version = content_identity(content)
+    reference = ContextReference(
+        kind="file",
+        path="source.txt",
+        content=content.decode(),
+        size_bytes=len(content),
+        included_bytes=len(content),
+        truncated=False,
+        handle=handle,
+        version=version,
+        media_type="text/plain",
+    )
+
+    manager.add_user_message("Review @source.txt", context=(reference,))
+    manager.add_message(Reasoning(content="considering"))
+    manager.add_user_message("Revisit @source.txt", context=(reference,))
+
+    persisted = store.load(manager.session.id)
+    assert persisted.messages[0].context[0].content == ""
+    assert "shared snapshot" not in persisted.serialize()
+    first, reasoning, second = manager.model_context
+    assert first.context[0].content == "shared snapshot"
+    assert first.context[0].included_bytes == len(content)
+    assert first.context[0].reused is False
+    assert second.context[0].content == ""
+    assert second.context[0].included_bytes == len(content)
+    assert second.context[0].payload_start_bytes == len(content)
+    assert second.context[0].reused is True
+    assert reasoning == Reasoning(content="considering")
+
+
+def test_manager_model_context_rejects_content_without_artifact_identity():
+    """Hydration refuses a canonical occurrence without durable artifact identity."""
+    manager = SessionManager()
+    reference = ContextReference(
+        kind="file",
+        path="legacy.txt",
+        content="legacy",
+        size_bytes=6,
+        included_bytes=6,
+        truncated=False,
+        version="a" * 64,
+    )
+    manager.session.add_message(Message(role="user", content="Review", context=(reference,)))
+    with pytest.raises(ValueError, match="artifact handle"):
+        _ = manager.model_context
+
+
+def test_manager_hydrates_a_payload_after_an_earlier_metadata_only_occurrence():
+    """A lazy occurrence does not suppress a later requested payload of the same version."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    content = b"snapshot"
+    handle, version = content_identity(content)
+    lazy = ContextReference(
+        kind="file",
+        path="source.txt",
+        content=content.decode(),
+        size_bytes=len(content),
+        included_bytes=0,
+        truncated=True,
+        handle=handle,
+        next_cursor=encode_content_cursor(handle, 0),
+        version=version,
+    )
+    eager = lazy.model_copy(
+        update={"included_bytes": len(content), "truncated": False, "next_cursor": None}
+    )
+    manager.add_user_message("Note @source.txt", context=(lazy,))
+    manager.add_user_message("Read @source.txt", context=(eager,))
+
+    first, second = manager.model_context
+    assert first.context[0].content == ""
+    assert first.context[0].reused is False
+    assert second.context[0].content == "snapshot"
+    assert second.context[0].reused is False
+
+
+def test_manager_hydrates_only_the_unseen_suffix_of_an_overlapping_reference():
+    """A larger later prefix supplies only bytes not present in the earlier occurrence."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    content = b"abcdefgh"
+    handle, version = content_identity(content)
+    first = ContextReference(
+        kind="file",
+        path="source.txt",
+        content=content.decode(),
+        size_bytes=len(content),
+        included_bytes=4,
+        truncated=True,
+        handle=handle,
+        next_cursor=encode_content_cursor(handle, 4),
+        version=version,
+    )
+    second = first.model_copy(
+        update={
+            "included_bytes": len(content),
+            "truncated": False,
+            "next_cursor": None,
+        }
+    )
+    manager.add_user_message("Review @source.txt", context=(first,))
+    manager.add_user_message("Read more @source.txt", context=(second,))
+
+    first_message, second_message = manager.model_context
+    first_reference = first_message.context[0]
+    second_reference = second_message.context[0]
+    assert first_reference.content == "abcd"
+    assert first_reference.payload_start_bytes == 0
+    assert second_reference.content == "efgh"
+    assert second_reference.included_bytes == len(content)
+    assert second_reference.payload_start_bytes == 4
+    assert second_reference.reused is False
+
+
+def test_manager_normalizes_occurrence_cursors_and_rejects_invalid_metadata():
+    """Capture canonicalizes cursors and rejects bad identities, sizes, and UTF-8 boundaries."""
+    manager = SessionManager()
+    handle, version = content_identity("é")
+    base = ContextReference(
+        kind="file",
+        path="source.txt",
+        content="é",
+        size_bytes=2,
+        included_bytes=1,
+        truncated=True,
+        handle=handle,
+        next_cursor=encode_content_cursor(handle, 1),
+        version=version,
+    )
+    for reference, message in (
+        (base.model_copy(update={"version": None}), "provided together"),
+        (base.model_copy(update={"size_bytes": 3}), "size"),
+        (base.model_copy(update={"included_bytes": 3}), "included bytes"),
+        (base.model_copy(update={"truncated": False}), "truncation"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            manager.add_user_message("Review", context=(reference,))
+
+    manager.add_user_message("Review", context=(base,))
+    with pytest.raises(ValueError, match="UTF-8 boundary"):
+        _ = manager.model_context
+
+    normalized = SessionManager()
+    normalized.add_user_message("Review", context=(base.model_copy(update={"next_cursor": None}),))
+    assert normalized.messages[0].context[0].next_cursor == encode_content_cursor(handle, 1)
+
+
+def test_manager_hydrates_binary_reference_payloads_as_bytes():
+    """A non-text artifact preserves its exact bytes through active-context hydration."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    content = b"\xff"
+    handle, version = content_identity(content)
+    reference = ContextReference(
+        kind="file",
+        path="binary.bin",
+        content=content,
+        size_bytes=len(content),
+        included_bytes=len(content),
+        truncated=False,
+        handle=handle,
+        version=version,
+        media_type="application/octet-stream",
+    )
+
+    manager.add_user_message("Review @binary.bin", context=(reference,))
+
+    assert manager.model_context[0].context[0].content == content
+
+
+def test_manager_model_context_requires_a_complete_artifact_identity():
+    """Hydration rejects a handle without its corresponding digest."""
+    manager = SessionManager()
+    manager.session.add_message(
+        Message(
+            role="user",
+            content="Review",
+            context=(
+                ContextReference(
+                    kind="file",
+                    path="source.txt",
+                    size_bytes=0,
+                    included_bytes=0,
+                    truncated=False,
+                    handle=uuid4().hex,
+                ),
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="artifact identity"):
+        _ = manager.model_context
+
+
+def test_manager_rejects_noncapability_reference_handles():
+    """Hydration and capture reject malformed content-read capabilities."""
+    _, version = content_identity("source")
+    reference = ContextReference(
+        kind="file",
+        path="source.txt",
+        content="source",
+        size_bytes=6,
+        included_bytes=6,
+        truncated=False,
+        handle="invalid",
+        version=version,
+    )
+    manager = SessionManager()
+    manager.session.add_message(Message(role="user", content="Review", context=(reference,)))
+
+    with pytest.raises(ValueError, match="invalid artifact handle"):
+        _ = manager.model_context
+    with pytest.raises(ValueError, match="invalid artifact handle"):
+        manager.add_user_message("Review", context=(reference,))
+
+
+@pytest.mark.parametrize("failure", ["missing", "wrong-size"])
+def test_manager_model_context_rejects_unusable_artifacts(failure):
+    """Hydration fails closed when durable occurrence content is absent or inconsistent."""
+    content = b"snapshot"
+    handle, version = content_identity(content)
+    store = MagicMock(spec=SessionStore)
+    store.load_reference.return_value = None if failure == "missing" else content
+    manager = SessionManager(session_store=store)
+    manager.session.add_message(
+        Message(
+            role="user",
+            content="Review",
+            context=(
+                ContextReference(
+                    kind="file",
+                    path="source.txt",
+                    size_bytes=len(content) + (failure == "wrong-size"),
+                    included_bytes=len(content),
+                    truncated=False,
+                    handle=handle,
+                    version=version,
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="unavailable|integrity validation"):
+        _ = manager.model_context
+
+
+def test_manager_rejects_a_restored_reference_with_the_wrong_digest():
+    """Session loading refuses durable reference bytes that do not match their manifest."""
+    handle = "0123456789abcdef0123456789abcdef"
+    store = MagicMock(spec=SessionStore)
+    store.load_reference.return_value = b"tampered"
+    session = Session(
+        messages=[
+            Message(
+                role="user",
+                content="Review @source.txt",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="source.txt",
+                        content="",
+                        size_bytes=8,
+                        included_bytes=0,
+                        truncated=True,
+                        handle=handle,
+                        version=f"sha256:{'0' * 64}",
+                    ),
+                ),
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="integrity validation"):
+        SessionManager(session_store=store).load_session(session)
+
+
+def test_manager_preserves_the_active_session_when_reference_restoration_fails():
+    """A failed candidate load leaves the previously active session available."""
+    handle = "0123456789abcdef0123456789abcdef"
+    store = MagicMock(spec=SessionStore)
+    store.load_reference.return_value = b"tampered"
+    active = Session(messages=[Message(role="user", content="continue current work")])
+    candidate = Session(
+        messages=[
+            Message(
+                role="user",
+                content="Review @source.txt",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="source.txt",
+                        size_bytes=8,
+                        included_bytes=0,
+                        truncated=True,
+                        handle=handle,
+                        version=f"sha256:{'0' * 64}",
+                    ),
+                ),
+            )
+        ]
+    )
+    manager = SessionManager(session=active, session_store=store)
+
+    with pytest.raises(ValueError, match="integrity validation"):
+        manager.load_session(candidate)
+
+    assert manager.session is active
+    assert manager.messages == [Message(role="user", content="continue current work")]
+
+
+def test_manager_rejects_a_restored_reference_with_an_invalid_store_digest():
+    """Session loading verifies the durable digest, independent of the session manifest."""
+    handle = "0123456789abcdef0123456789abcdef"
+    content = b"snapshot"
+    store = MagicMock(spec=SessionStore)
+    store.load_reference.return_value = b"tampered"
+    session = Session(
+        messages=[
+            Message(
+                role="user",
+                content="Review @source.txt",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="source.txt",
+                        content="",
+                        size_bytes=len(content),
+                        included_bytes=0,
+                        truncated=True,
+                        handle=handle,
+                        version=f"sha256:{sha256_digest(content)}",
+                    ),
+                ),
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="integrity validation"):
+        SessionManager(session_store=store).load_session(session)
 
 
 def test_manager_ignores_unregistered_handles_in_tool_output():

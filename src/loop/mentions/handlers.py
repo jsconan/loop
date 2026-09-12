@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from mimetypes import guess_type
 
 from .. import constants
 from ..completion import (
@@ -16,10 +17,11 @@ from ..instructions.models import SkillOperationError
 from ..models import ContextReference, ContextReferenceKind
 from ..utils import (
     PathReference,
+    content_identity,
     encode_content_cursor,
+    get_binary,
     is_path_ignored,
     iter_visible_paths,
-    store_content,
 )
 
 
@@ -85,7 +87,7 @@ class MentionHandler(ABC):
 
 
 class ProjectPathMentionHandler(MentionHandler):
-    """Attach bounded snapshots for project path mentions.
+    """Attach small previews and lazy immutable snapshots for project path mentions.
 
     Args:
         working_directory (PathReference): Current project-directory reference.
@@ -196,12 +198,17 @@ class ProjectPathMentionHandler(MentionHandler):
                         )
                     encoded = path.read_bytes()
                     if b"\0" in encoded:
-                        raise ValueError("Content appears to be binary.")
-                    content = encoded.decode("utf-8")
+                        content = encoded
+                    else:
+                        try:
+                            content = encoded.decode("utf-8")
+                        except UnicodeDecodeError:
+                            content = encoded
                     kind = "file"
                 else:
                     raise ValueError(f"Mentioned path '{value}' is not a file or directory.")
-                if len(content.encode("utf-8")) > constants.MAX_FETCH_BYTES:
+                content_bytes = get_binary(content)
+                if len(content_bytes) > constants.MAX_FETCH_BYTES:
                     raise ValueError(
                         f"Mentioned path '{value}' exceeds the "
                         f"{constants.MAX_FETCH_BYTES}-byte snapshot limit."
@@ -212,56 +219,88 @@ class ProjectPathMentionHandler(MentionHandler):
                 raise
             resolved_paths.add(path)
             sources.append((kind, value, content))
-        allocations = self._allocate_preview_bytes(
-            tuple(len(content.encode("utf-8")) for _, _, content in sources)
-        )
-        return tuple(
-            self._reference(kind, value, content, allocation)
-            for (kind, value, content), allocation in zip(sources, allocations, strict=True)
-        )
+        include_file_previews = len(sources) <= 2
+        lazy_binary_sources = [
+            value
+            for kind, value, content in sources
+            if kind == "file"
+            and isinstance(content, bytes)
+            and (not include_file_previews or len(content) > constants.MAX_REFERENCE_PREVIEW_BYTES)
+        ]
+        if lazy_binary_sources:
+            if ignore_invalid:
+                lazy_binary_source_values = set(lazy_binary_sources)
+                sources = [
+                    source for source in sources if source[1] not in lazy_binary_source_values
+                ]
+                include_file_previews = len(sources) <= 2
+            else:
+                raise ValueError(
+                    "Mentioned binary paths must fit the eager attachment budget: "
+                    + ", ".join(repr(value) for value in lazy_binary_sources)
+                    + "."
+                )
+        remaining_preview_bytes = constants.MAX_REFERENCE_TOTAL_PREVIEW_BYTES
+        references = []
+        for kind, value, content in sources:
+            encoded_size = len(get_binary(content))
+            desired_preview_bytes = (
+                constants.MAX_REFERENCE_PREVIEW_BYTES
+                if kind == "directory"
+                else (
+                    encoded_size
+                    if include_file_previews
+                    and encoded_size <= constants.MAX_REFERENCE_PREVIEW_BYTES
+                    else 0
+                )
+            )
+            preview_bytes = min(desired_preview_bytes, remaining_preview_bytes)
+            reference = self._reference(
+                kind,
+                value,
+                content,
+                max_preview_bytes=preview_bytes,
+            )
+            references.append(reference)
+            remaining_preview_bytes -= reference.included_bytes
+        return tuple(references)
 
-    @staticmethod
-    def _allocate_preview_bytes(sizes: tuple[int, ...]) -> tuple[int, ...]:
-        """Allocate the attachment preview budget fairly while reclaiming unused shares."""
-        allocations = [0] * len(sizes)
-        remaining = constants.MAX_ATTACHMENT_CONTENT_BYTES
-        pending = set(range(len(sizes)))
-        while pending and remaining:
-            share = max(1, remaining // len(pending))
-            completed = {index for index in pending if sizes[index] <= share}
-            if not completed:
-                for index in pending:
-                    allocations[index] = share
-                break
-            for index in completed:
-                allocations[index] = sizes[index]
-                remaining -= sizes[index]
-            pending -= completed
-        return tuple(allocations)
-
-    @staticmethod
     def _reference(
+        self,
         kind: ContextReferenceKind,
         display_path: str,
-        content: str,
-        max_bytes: int,
+        content: str | bytes,
+        *,
+        max_preview_bytes: int,
     ) -> ContextReference:
-        """Build one bounded preview with a resumable immutable snapshot when truncated."""
-        encoded = content.encode("utf-8")
-        included = encoded[:max_bytes].decode("utf-8", errors="ignore")
-        included_bytes = len(included.encode("utf-8"))
+        """Build an eager binary attachment or a text preview with a lazy snapshot.
+
+        Binary resources must be fully included because the available continuation tool reads
+        UTF-8 text only. Callers enforce that policy before constructing this reference.
+        """
+        encoded = get_binary(content)
+        if isinstance(content, str):
+            included = encoded[:max_preview_bytes].decode("utf-8", errors="ignore")
+            included_bytes = len(included.encode("utf-8"))
+        else:
+            included_bytes = min(max_preview_bytes, len(encoded))
         truncated = included_bytes < len(encoded)
-        handle = store_content(encoded, f"mentioned {kind} {display_path}") if truncated else None
+        handle, version = content_identity(encoded)
+        media_type = guess_type(display_path)[0]
+        if isinstance(content, bytes) and (media_type is None or media_type.startswith("text/")):
+            media_type = "application/octet-stream"
         return ContextReference(
             kind=kind,
             path=display_path,
-            content=included,
+            content=content,
             size_bytes=len(encoded),
             included_bytes=included_bytes,
             truncated=truncated,
             handle=handle,
-            next_cursor=(encode_content_cursor(handle, included_bytes) if handle else None),
-            snapshot_content=content if handle else None,
+            next_cursor=(encode_content_cursor(handle, included_bytes) if truncated else None),
+            version=version,
+            media_type=media_type
+            or ("text/plain" if isinstance(content, str) else "application/octet-stream"),
         )
 
 

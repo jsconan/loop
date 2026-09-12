@@ -12,7 +12,90 @@ from loop.utils.text import (
     format_content_diff,
     format_content_preview,
     format_tool_call_arguments,
+    snippet,
 )
+
+
+def test_snippet_wraps_text_in_a_default_fenced_code_block():
+    """Snippet uses a Markdown code fence and preserves the wrapped text."""
+    assert snippet("print('hello')") == "```\nprint('hello')\n```"
+
+
+def test_snippet_includes_an_optional_language_identifier():
+    """Snippet places a provided language identifier after the opening fence."""
+    assert snippet("print('hello')", language="python") == "```python\nprint('hello')\n```"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\n\r\ncontent\r\n\n",
+        "first\n\nsecond",
+        "   ",
+    ],
+)
+def test_snippet_preserves_all_supplied_text_by_default(text):
+    """Snippet retains meaningful and boundary whitespace inside its envelope."""
+    assert snippet(text) == f"```\n{text}\n```"
+
+
+def test_snippet_preserves_existing_wrapping_backticks_by_default():
+    """Snippet retains an existing Markdown fence as literal referenced content."""
+    text = "\n```\ncontent\n```\n"
+    assert snippet(text) == f"````\n{text}\n````"
+
+
+def test_snippet_preserves_meaningful_boundary_backticks():
+    """Snippet removes only a complete outer fence, preserving content backticks."""
+    assert snippet("`value`") == "```\n`value`\n```"
+
+
+def test_snippet_preserves_an_existing_fence_language_marker():
+    """Snippet retains an existing fence language marker as literal content."""
+    text = "```python\nprint('hello')\n```"
+    assert snippet(text) == f"````\n{text}\n````"
+
+
+def test_snippet_replaces_existing_fence_when_preservation_is_disabled():
+    """Snippet normalizes an existing fence when preservation is disabled."""
+    assert (
+        snippet("```python\nprint('hello')\n```", preserve_fence=False)
+        == "```\nprint('hello')\n```"
+    )
+
+
+def test_snippet_preserves_code_when_fence_shape_is_not_complete():
+    """Snippet keeps content intact when an apparent opening fence has no matching close."""
+    text = "```\nv = 1\nprint(v + 1)"
+    assert snippet(text) == "````\n```\nv = 1\nprint(v + 1)\n````"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", ""),
+        ("   ", ""),
+        ("\r\ncontent\r\n", "content"),
+        ("```\r\ncontent\r\n```", "content"),
+        ("```\ncontent1\ncontent2\ncontent3\n```", "content1\ncontent2\ncontent3"),
+        ("```python\ncontent1\ncontent2\ncontent3\n```", "content1\ncontent2\ncontent3"),
+        ("```python\r\ncontent\r\n```", "content"),
+        ("```\ncontent\n```   ", "content"),
+        ("````\ncontent\n````", "content"),
+        ("```\ncontent", "```\ncontent"),
+        ("content\n```", "content\n```"),
+        ("`content`", "`content`"),
+    ],
+)
+def test_snippet_normalizes_supported_inputs_when_preservation_is_disabled(text, expected):
+    """Snippet normalizes wrappers without discarding content from malformed inputs."""
+    fence = "````" if "```" in expected else "```"
+    assert snippet(text, preserve_fence=False) == f"{fence}\n{expected}\n{fence}"
+
+
+def test_snippet_expands_the_fence_when_text_contains_it():
+    """Snippet expands its delimiter until it cannot prematurely close the block."""
+    assert snippet("before ``` after") == "````\nbefore ``` after\n````"
 
 
 def test_choice_items_normalizes_iterables_and_mappings():

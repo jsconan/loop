@@ -45,6 +45,7 @@ from loop import (
     ToolRegistry,
     ToolResult,
     Usage,
+    constants,
     manage_skills,
     tool,
 )
@@ -52,7 +53,7 @@ from loop.configuration import ApplicationSettings
 from loop.permissions import PermissionLoadFailure
 from loop.session import GeneratedSessionName
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
-from loop.utils import PathHolder
+from loop.utils import PathHolder, content_identity
 
 
 def function_call() -> ToolCall:
@@ -703,6 +704,9 @@ def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(t
                 size_bytes=15,
                 included_bytes=15,
                 truncated=False,
+                handle=message.context[0].handle,
+                version=content_identity("print('hello')\n")[1],
+                media_type="text/x-python",
             ),
         ),
     )
@@ -730,7 +734,7 @@ def test_run_reports_each_attached_reference_and_local_remainder(tmp_path):
         ContextReference(
             kind="file",
             path="large.py",
-            content="pass\n",
+            content="pass\n" + "x" * 95,
             size_bytes=100,
             included_bytes=5,
             truncated=True,
@@ -754,13 +758,56 @@ def test_run_reports_each_attached_reference_and_local_remainder(tmp_path):
     ]
 
 
-def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
-    """Mention resolution failures return to input without storing a partial user turn."""
+def test_default_loop_persists_lazy_mentions_through_the_session_store(tmp_path):
+    """Default mention wiring stores large snapshots outside serialized message content."""
+    content = "x" * (constants.MAX_REFERENCE_PREVIEW_BYTES + 1)
+    (tmp_path / "large.txt").write_text(content, encoding="utf-8")
+    backend = Mock(default_model="model")
+    backend.get_context_window.return_value = None
+    backend.get_response.return_value = [ResponseCompleted()]
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["Review @large.txt", False]
+    sessions = SessionManager(interaction=interaction)
+
+    Loop.create_default(
+        backend=backend,
+        interaction=interaction,
+        session_manager=sessions,
+        working_directory=tmp_path,
+    ).run()
+
+    reference = sessions.messages[0].context[0]
+    assert reference.content == content
+    assert reference.version == content_identity(content)[1]
+    assert sessions.store.load_reference(reference.version) == content.encode()
+
+
+def test_run_preserves_binary_mentions_and_queries_the_backend(tmp_path):
+    """Binary mentions reach the backend as immutable byte snapshots."""
     path = tmp_path / "binary.bin"
     path.write_bytes(b"bad\0data")
     backend = Mock(default_model="model")
-    interaction = MagicMock(spec=Interaction)
+    interaction = output_interaction()
     interaction.prompt.side_effect = ["Read @binary.bin", False]
+    backend.get_context_window.return_value = None
+    backend.get_response.return_value = [ResponseCompleted()]
+    loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
+
+    loop.run()
+
+    reference = loop.messages[0].context[0]
+    assert reference.content == b"bad\0data"
+    assert reference.media_type == "application/octet-stream"
+    backend.get_response.assert_called_once()
+
+
+def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
+    """Mention resolution failures return to input without storing a partial user turn."""
+    path = tmp_path / "too-large.bin"
+    path.write_bytes(b"x" * (constants.MAX_FETCH_BYTES + 1))
+    backend = Mock(default_model="model")
+    interaction = MagicMock(spec=Interaction)
+    interaction.prompt.side_effect = ["Read @too-large.bin", False]
     loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
 
     loop.run()
@@ -769,7 +816,7 @@ def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
     backend.get_response.assert_not_called()
     problem = interaction.report.call_args.args[0]
     assert problem.code == "mention.resolution_failed"
-    assert problem.detail == "Content appears to be binary."
+    assert "Mentioned path 'too-large.bin' exceeds" in problem.detail
 
 
 def test_run_retries_an_exhausted_recoverable_failure(tmp_path):

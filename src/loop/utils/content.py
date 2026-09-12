@@ -12,6 +12,7 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from .. import constants
+from .hashing import sha256_digest
 from .models import BoundedTextContent, CachedContentMetadata
 
 _CACHE = TemporaryDirectory(prefix=constants.TEMPORARY_CONTENT_DIRECTORY_PREFIX)
@@ -20,6 +21,61 @@ _SOURCES: dict[str, str] = {}
 _METADATA: dict[str, CachedContentMetadata] = {}
 _LOCK = RLock()
 _SCAN_CHUNK_BYTES = 8 * 1024
+
+
+def get_binary(content: str | bytes) -> bytes:
+    """Get the binary representation of the content.
+
+    Args:
+        content (str | bytes): The content to convert.
+
+    Returns:
+        bytes: The binary representation of the content.
+    """
+    if isinstance(content, str):
+        return content.encode("utf-8")
+    return content
+
+
+def base64_encode(content: str | bytes) -> str:
+    """Encode content as a base64 string.
+
+    Args:
+        content (str | bytes): The content to encode.
+
+    Returns:
+        str: Base64-encoded representation of the content.
+    """
+    content = get_binary(content)
+    return base64.b64encode(content).decode("ascii")
+
+
+def base64_decode(encoded: str, binary: bool = False) -> str | bytes:
+    """Decode a base64 string back into bytes.
+
+    Args:
+        encoded (str): Base64-encoded content.
+        binary (bool): If True, return raw bytes; otherwise, decode as UTF-8.
+
+    Returns:
+        str | bytes: The original content, either as UTF-8 decoded string or raw bytes.
+    """
+    decoded = base64.b64decode(encoded, validate=True)
+    return decoded if binary else decoded.decode("utf-8")
+
+
+def data_url(content: str | bytes, media_type: str) -> str:
+    """Encode content as a MIME-qualified data URL.
+
+    Args:
+        content (str | bytes): The content to encode.
+        media_type (str): The MIME type of the content.
+
+    Returns:
+        str: A data URL representing the encoded content.
+    """
+    encoded = base64_encode(content)
+    return f"data:{media_type};base64,{encoded}"
 
 
 def encode_content_cursor(handle: str, start_byte: int) -> str:
@@ -35,7 +91,7 @@ def encode_content_cursor(handle: str, start_byte: int) -> str:
     Raises:
         ValueError: If the handle or byte offset is invalid.
     """
-    _validate_handle(handle)
+    validate_content_handle(handle)
     if start_byte < 0:
         raise ValueError("Content cursor byte offset must be non-negative.")
     payload = json.dumps([1, handle, start_byte], separators=(",", ":")).encode()
@@ -73,8 +129,15 @@ def decode_content_cursor(cursor: str, handle: str) -> int:
     return start_byte
 
 
-def _validate_handle(handle: str) -> None:
-    """Validate one canonical UUID content handle."""
+def validate_content_handle(handle: str) -> None:
+    """Validate an opaque content-read capability.
+
+    Args:
+        handle (str): Capability supplied by a persisted reference or tool request.
+
+    Raises:
+        ValueError: If the capability is not a canonical random UUID.
+    """
     try:
         normalized = UUID(handle).hex
     except ValueError as exc:
@@ -94,7 +157,7 @@ def register_cached_metadata(handle: str, source: str, reloadable: bool) -> None
     Raises:
         ValueError: If the handle or metadata values are invalid.
     """
-    _validate_handle(handle)
+    validate_content_handle(handle)
     if not isinstance(source, str) or not isinstance(reloadable, bool):
         raise ValueError(  # noqa: TRY004 - cached metadata has one validation contract.
             "Invalid cached content metadata."
@@ -103,23 +166,51 @@ def register_cached_metadata(handle: str, source: str, reloadable: bool) -> None
         _METADATA[handle] = CachedContentMetadata(source=source, reloadable=reloadable)
 
 
-def store_content(content: bytes | str, source: str) -> str:
+def store_content(content: bytes | str, source: str, *, handle: str | None = None) -> str:
     """Store content outside conversation history and return an opaque handle.
 
     Args:
         content (bytes | str): Raw content to retain.
         source (str): Human-readable origin reported with later reads.
+        handle (str | None): Existing canonical handle to populate, or ``None`` to create one.
 
     Returns:
         str: Opaque process-local content handle.
     """
     encoded = content.encode("utf-8") if isinstance(content, str) else content
-    handle = uuid4().hex
+    if handle:
+        validate_content_handle(handle)
+    else:
+        handle = uuid4().hex
     with _LOCK:
         Path(_CACHE.name, handle).write_bytes(encoded)
         _SOURCES[handle] = source
         register_cached_metadata(handle, source, False)
     return handle
+
+
+def content_identity(content: bytes | str) -> tuple[str, str]:
+    """Return an opaque capability and complete digest for immutable content.
+
+    Args:
+        content (bytes | str): Immutable content to identify.
+
+    Returns:
+        tuple[str, str]: Unpredictable cache handle and algorithm-qualified SHA-256 identity.
+    """
+    return uuid4().hex, content_digest(content)
+
+
+def content_digest(content: bytes | str) -> str:
+    """Return the algorithm-qualified SHA-256 identity for immutable content.
+
+    Args:
+        content (bytes | str): Immutable content to identify.
+
+    Returns:
+        str: Algorithm-qualified SHA-256 artifact identity.
+    """
+    return f"sha256:{sha256_digest(content)}"
 
 
 def store_text_stream(
@@ -147,7 +238,7 @@ def store_text_stream(
     """
     handle = handle or uuid4().hex
     path = Path(_CACHE.name, handle)
-    _validate_handle(handle)
+    validate_content_handle(handle)
     size = 0
     decoder = getincrementaldecoder("utf-8")()
     try:
@@ -196,7 +287,7 @@ def cached_metadata(handle: str) -> CachedContentMetadata | None:
         CachedContentMetadata | None: Registered metadata, or ``None`` when unavailable.
     """
     try:
-        _validate_handle(handle)
+        validate_content_handle(handle)
     except ValueError:
         return None
     with _LOCK:
@@ -362,7 +453,7 @@ def read_bounded_text(
             if exc.end != len(encoded) or exc.reason != "unexpected end of data":
                 raise ValueError("Selected range is not valid UTF-8 text.") from exc
             omitted = len(encoded) - exc.start
-            encoded = encoded[: exc.start]
+            encoded = encoded[: exc.start]  # pylint: disable=invalid-slice-index
             end -= omitted
             content = encoded.decode("utf-8")
         more = end < size

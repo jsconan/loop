@@ -1,6 +1,5 @@
 """Discover and progressively load Agent Skills."""
 
-from base64 import b64encode
 from collections.abc import Iterable
 from html import escape
 from pathlib import Path
@@ -9,7 +8,7 @@ from typing import Self
 import yaml
 
 from .. import constants
-from ..utils import read_bounded_text, sha256_digest
+from ..utils import base64_encode, read_bounded_text, sha256_digest
 from .models import (
     Skill,
     SkillActivationResponse,
@@ -486,7 +485,7 @@ class SkillManager:
                 path=str(candidate.relative_to(root)),
                 size_bytes=size,
                 encoding="base64",
-                content=b64encode(content).decode("ascii"),
+                content=base64_encode(content),
                 start_byte=start_byte,
                 end_byte=end_byte,
                 included_bytes=len(content),

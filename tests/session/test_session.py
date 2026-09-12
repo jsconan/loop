@@ -32,6 +32,7 @@ from loop.session.models import (
     SESSION_NAME_SOURCE_USER,
     RunCompletedEvent,
 )
+from loop.utils import content_identity
 
 
 def function_call() -> ToolCall:
@@ -401,10 +402,11 @@ def test_session_serializes_and_deserializes_all_conversation_items():
                     ContextReference(
                         kind="file",
                         path="src/app.py",
-                        content="print('hello')\n",
                         size_bytes=15,
                         included_bytes=15,
                         truncated=False,
+                        handle="0123456789abcdef0123456789abcdef",
+                        version="a" * 64,
                     ),
                 ),
             ),
@@ -428,6 +430,178 @@ def test_session_serializes_and_deserializes_all_conversation_items():
     )
 
     assert Session.deserialize(session.serialize()) == session
+
+
+def test_session_externalizes_shipped_v11_inline_references():
+    """Deserializing v11 produces canonical occurrences and session-owned artifacts."""
+    payload = json.loads(Session(messages=[Message(role="user", content="review")]).serialize())
+    payload["version"] = 11
+    payload["messages"][0]["data"]["context"] = [
+        {
+            "kind": "file",
+            "path": "large.txt",
+            "content": "pre",
+            "size_bytes": 7,
+            "included_bytes": 3,
+            "truncated": True,
+            "handle": "legacy-random-handle",
+            "next_cursor": "legacy-cursor",
+            "snapshot_content": "preview",
+        }
+    ]
+
+    restored = Session.deserialize(json.dumps(payload))
+    reference = restored.messages[0].context[0]
+    _, version = content_identity(b"preview")
+
+    assert reference.content == "preview"
+    assert reference.handle and reference.handle != content_identity(b"preview")[0]
+    assert reference.version == version
+    assert reference.next_cursor is not None
+    assert reference.media_type == "text/plain"
+    assert restored.persistence_snapshot().reference_artifacts[0].content == b"preview"
+    assert json.loads(restored.serialize())["version"] == 12
+
+
+def test_session_persistence_snapshot_deduplicates_transient_reference_content():
+    """One projection owns contentless JSON and deduplicated immutable artifacts."""
+    handle, version = content_identity(b"snapshot")
+    reference = ContextReference(
+        kind="file",
+        path="source.txt",
+        content="snapshot",
+        size_bytes=8,
+        included_bytes=8,
+        truncated=False,
+        handle=handle,
+        version=version,
+    )
+    session = Session(
+        messages=[
+            Message(role="user", content="first", context=(reference,)),
+            Message(role="user", content="second", context=(reference,)),
+        ]
+    )
+
+    snapshot = session.persistence_snapshot()
+
+    assert len(snapshot.reference_artifacts) == 1
+    assert snapshot.reference_artifacts[0].content == b"snapshot"
+    assert "snapshot" not in snapshot.payload
+    assert [message.context[0].content for message in session.messages] == [
+        "snapshot",
+        "snapshot",
+    ]
+
+
+def test_session_persistence_snapshot_rejects_a_handle_bound_to_different_artifacts():
+    """A serialized session cannot bind one capability to different immutable content."""
+    handle, first_version = content_identity("first")
+    _, second_version = content_identity("second")
+    first = ContextReference(
+        kind="file",
+        path="first.txt",
+        content="first",
+        size_bytes=5,
+        included_bytes=5,
+        truncated=False,
+        handle=handle,
+        version=first_version,
+    )
+    second = first.model_copy(
+        update={
+            "path": "second.txt",
+            "content": "second",
+            "size_bytes": 6,
+            "included_bytes": 6,
+            "version": second_version,
+        }
+    )
+    session = Session(messages=[Message(role="user", content="review", context=(first, second))])
+
+    with pytest.raises(ValueError, match="handle binding"):
+        session.persistence_snapshot()
+
+
+def test_session_persistence_snapshot_retains_empty_reference_artifacts():
+    """An empty file remains a durable artifact rather than a missing reference."""
+    handle, version = content_identity(b"")
+    reference = ContextReference(
+        kind="file",
+        path="empty.txt",
+        size_bytes=0,
+        included_bytes=0,
+        truncated=False,
+        handle=handle,
+        version=version,
+    )
+
+    snapshot = Session(
+        messages=[Message(role="user", content="review", context=(reference,))]
+    ).persistence_snapshot()
+
+    assert snapshot.reference_artifacts[0].content == b""
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"included_bytes": 8},
+        {"truncated": True},
+        {"next_cursor": "malformed"},
+    ],
+)
+def test_session_rejects_invalid_reference_occurrences_before_serialization(updates):
+    """Malformed occurrence ranges, flags, and cursors cannot reach a session store."""
+    handle, version = content_identity(b"content")
+    reference = ContextReference(
+        kind="file",
+        path="source.txt",
+        content="content",
+        size_bytes=7,
+        included_bytes=7,
+        truncated=False,
+        handle=handle,
+        version=version,
+    ).model_copy(update=updates)
+    session = Session(messages=[Message(role="user", content="review", context=(reference,))])
+
+    with pytest.raises(ValueError, match="Invalid serialized reference"):
+        session.persistence_snapshot()
+
+
+def test_session_reports_whether_serialized_state_requires_migration():
+    """Schema inspection distinguishes current and supported legacy snapshots."""
+    current = Session().serialize()
+    legacy = json.loads(current)
+    legacy["version"] = 11
+
+    assert Session.requires_migration(current) is False
+    assert Session.requires_migration(json.dumps(legacy)) is True
+
+
+@pytest.mark.parametrize("value", ["not-json", "[]", '{"version":99}'])
+def test_session_rejects_invalid_versions_during_migration_inspection(value):
+    """Schema inspection shares deserialization's invalid-version contract."""
+    with pytest.raises(ValueError, match="Invalid serialized session|Unsupported session version"):
+        Session.requires_migration(value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("data", "invalid"), ("context", ["invalid"])],
+)
+def test_session_rejects_malformed_legacy_reference_items(field, value):
+    """Legacy migration rejects malformed message metadata and reference occurrences."""
+    payload = json.loads(Session(messages=[Message(role="user", content="review")]).serialize())
+    payload["version"] = 11
+    if field == "data":
+        payload["messages"][0]["data"] = value
+    else:
+        payload["messages"][0]["data"]["context"] = value
+
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        Session.deserialize(json.dumps(payload))
 
 
 def test_session_upcasts_legacy_collapsed_reasoning_as_display_only():

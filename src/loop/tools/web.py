@@ -268,7 +268,10 @@ def fetch_content(
 )
 def read_cached_content(
     context: ToolContext,
-    handle: Annotated[str, Field(description="Opaque handle returned by a bounded tool result.")],
+    handle: Annotated[
+        str,
+        Field(description="Opaque handle for cached content or a user-referenced resource."),
+    ],
     cursor: Annotated[
         str | None,
         Field(description="Opaque continuation cursor returned by a previous content result."),
@@ -292,7 +295,7 @@ def read_cached_content(
         ),
     ] = constants.MAX_TOOL_CONTENT_BYTES,
 ) -> CachedContentResult | Problem:
-    """Read a bounded, resumable portion of cached textual content."""
+    """Read a bounded, resumable portion of cached or explicitly referenced text."""
     try:
         resolved = cached_path(handle)
         if resolved is None:

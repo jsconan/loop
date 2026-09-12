@@ -77,6 +77,35 @@ class UnsupportedConversationItemError(ValueError):
     """Report an unsupported conversation item type in a serialized context."""
 
 
+@dataclass(frozen=True)
+class ReferenceArtifact:
+    """Describe immutable reference content extracted from one session snapshot.
+
+    Args:
+        handle (str): Short opaque handle used by bounded-content tools.
+        digest (str): Algorithm-qualified full content digest.
+        content (bytes): Complete immutable content.
+    """
+
+    handle: str
+    digest: str
+    content: bytes
+
+
+@dataclass(frozen=True)
+class SessionPersistenceSnapshot:
+    """Contain one atomic session persistence projection.
+
+    Args:
+        payload (str): Compact versioned JSON session representation.
+        reference_artifacts (tuple[ReferenceArtifact, ...]): Deduplicated immutable content that
+            must be committed with the payload.
+    """
+
+    payload: str
+    reference_artifacts: tuple[ReferenceArtifact, ...]
+
+
 class GeneratedSessionName(BaseModel):
     """Validate structured output from the auxiliary title request."""
 

@@ -39,6 +39,11 @@ def project_context(item: ModelContextItem) -> dict:
                     "truncated": ref.truncated,
                     "handle": ref.handle,
                     "next_cursor": ref.next_cursor,
+                    "version": ref.version,
+                    "media_type": ref.media_type,
+                    "payload_start_bytes": ref.payload_start_bytes,
+                    "reused": ref.reused,
+                    "payload_redacted": ref.payload_redacted,
                 }
                 for ref in item.context
             ],

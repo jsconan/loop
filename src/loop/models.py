@@ -405,26 +405,39 @@ class ContextReference(BaseModel):
     Args:
         kind (ContextReferenceKind): Referenced filesystem object kind.
         path (str): User-facing project-relative path.
-        content (str): Bounded decoded UTF-8 text captured when the turn was submitted. Binary
-            media is not represented by this contract, regardless of the filename suffix.
+        content (str | bytes): Transient bounded text or raw binary content hydrated for model
+            input. This field is excluded from durable message serialization.
         size_bytes (int): Complete source size in bytes.
         included_bytes (int): Number of content bytes included in the snapshot.
         truncated (bool): Whether content was omitted from the snapshot.
         handle (str | None): Opaque handle for reading an omitted immutable remainder.
         next_cursor (str | None): Opaque cursor at which the first continuation starts.
-        snapshot_content (str | None): Complete immutable content retained for cache restoration;
-            never sent to the model provider.
+        version (str | None): Algorithm-qualified SHA-256 identity of the immutable complete
+            content.
+        media_type (str | None): Best-effort MIME type for the referenced resource.
+        payload_start_bytes (int): Source-byte offset of transient ``content`` within the
+            occurrence's included prefix. This transient field is excluded from durable
+            serialization.
+        reused (bool): Whether an earlier active-context occurrence already supplied the same
+            immutable payload. This transient field is excluded from durable serialization.
+        payload_redacted (bool): Whether transient ``content`` is a sanitized transport
+            representation rather than byte-identical source content. This transient field is
+            excluded from durable serialization.
     """
 
     kind: ContextReferenceKind
     path: str
-    content: str
+    content: str | bytes = Field(default="", exclude=True)
     size_bytes: int
     included_bytes: int
     truncated: bool
     handle: str | None = None
     next_cursor: str | None = None
-    snapshot_content: str | None = None
+    version: str | None = None
+    media_type: str | None = None
+    payload_start_bytes: int = Field(default=0, exclude=True)
+    reused: bool = Field(default=False, exclude=True)
+    payload_redacted: bool = Field(default=False, exclude=True)
 
 
 class Message(ConversationItemModel):

@@ -11,7 +11,6 @@ from datetime import datetime
 from threading import Lock, get_ident
 from uuid import uuid7
 
-from .. import constants
 from ..backend.errors import BackendResponseError
 from ..errors import Problem, log_problem
 from ..instructions.models import CapturedInstruction
@@ -50,10 +49,15 @@ from ..utils import (
     bound_tool_result,
     cached_metadata,
     cached_path,
+    content_digest,
+    content_identity,
+    encode_content_cursor,
+    get_binary,
     register_cached_metadata,
     sha256_digest,
-    store_text_stream,
+    store_content,
     utc_now,
+    validate_content_handle,
 )
 from .models import (
     SESSION_NAME_SOURCE_GENERATED,
@@ -387,13 +391,77 @@ class SessionManager:
 
     @property
     def model_context(self) -> list[ModelContextItem]:
-        """Return context bounded by the latest compaction checkpoint.
+        """Return hydrated context bounded by the latest compaction checkpoint.
 
         Returns:
-            list[ModelContextItem]: Replacement context and subsequent history, or complete
-                history when the session has not been compacted.
+            list[ModelContextItem]: Replacement context and subsequent history with verified
+                reference payloads materialized once per immutable version.
+
+        Raises:
+            ValueError: If referenced content is missing, corrupt, or inconsistent with its
+                occurrence metadata.
         """
-        return self._session.model_context()
+        context = self._session.model_context()
+        if not any(isinstance(item, Message) and item.context for item in context):
+            return context
+        supplied_bytes = {}
+        hydrated = []
+        for item in context:
+            if not isinstance(item, Message) or not item.context:
+                hydrated.append(item)
+                continue
+            references = []
+            for reference in item.context:
+                if reference.handle is None:
+                    raise ValueError(
+                        f"Referenced snapshot '{reference.path}' has no artifact handle."
+                    )
+                if reference.version is None:
+                    raise ValueError(
+                        f"Referenced snapshot '{reference.path}' has no artifact identity."
+                    )
+                try:
+                    validate_content_handle(reference.handle)
+                except ValueError as error:
+                    raise ValueError(
+                        f"Referenced snapshot '{reference.path}' has an invalid artifact handle."
+                    ) from error
+                stored = self._session_store.load_reference(reference.version)
+                if stored is None:
+                    raise ValueError(f"Referenced snapshot '{reference.path}' is unavailable.")
+                digest = content_digest(stored)
+                content = stored
+                if digest != reference.version or reference.size_bytes != len(content):
+                    raise ValueError(
+                        f"Referenced snapshot '{reference.path}' failed integrity validation."
+                    )
+                previously_supplied = supplied_bytes.get(digest, 0)
+                payload_start = min(previously_supplied, reference.included_bytes)
+                reused = reference.included_bytes > 0 and (
+                    previously_supplied >= reference.included_bytes
+                )
+                supplied_bytes[digest] = max(previously_supplied, reference.included_bytes)
+                included = content[payload_start : reference.included_bytes]
+                try:
+                    hydrated_content = included.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    if reference.media_type and not reference.media_type.startswith("text/"):
+                        hydrated_content = included
+                    else:
+                        raise ValueError(
+                            f"Referenced snapshot '{reference.path}' has an invalid UTF-8 boundary."
+                        ) from error
+                references.append(
+                    reference.model_copy(
+                        update={
+                            "content": hydrated_content,
+                            "payload_start_bytes": payload_start,
+                            "reused": reused,
+                        }
+                    )
+                )
+            hydrated.append(item.model_copy(update={"context": tuple(references)}))
+        return hydrated
 
     @property
     def recovery_state(self) -> SessionRecoveryState | None:
@@ -520,7 +588,7 @@ class SessionManager:
             ValueError: If its persisted format is invalid or unsupported.
             SessionWorkspaceMismatchError: If the session belongs to another workspace.
         """
-        if isinstance(session, str):
+        if load_from_store := isinstance(session, str):
             session = self._session_store.load(session)
         if not isinstance(session, Session):
             raise ValueError("Invalid session type.")  # noqa: TRY004 - public API contract.
@@ -534,22 +602,59 @@ class SessionManager:
             )
         if session.workspace_id is None:
             session.workspace_id = self._workspace_id
-        self._session = session
+        cache_restorations = []
         for message in session.messages:
             if isinstance(message, Message):
                 for reference in message.context:
-                    cached = cached_path(reference.handle) if reference.handle is not None else None
-                    if (
-                        reference.handle is not None
-                        and reference.snapshot_content is not None
-                        and (cached is None or not cached[0].exists())
-                    ):
-                        store_text_stream(
-                            [reference.snapshot_content.encode("utf-8")],
-                            f"mentioned {reference.kind} {reference.path}",
-                            constants.MAX_FETCH_BYTES,
-                            handle=reference.handle,
+                    if reference.handle is None or reference.version is None:
+                        raise ValueError(
+                            f"Referenced snapshot '{reference.path}' has an incomplete "
+                            "artifact identity."
                         )
+                    stored = self._session_store.load_reference(reference.version)
+                    if (
+                        stored is None
+                        and not load_from_store
+                        and (reference.content or reference.size_bytes == 0)
+                    ):
+                        content = get_binary(reference.content)
+                        if (
+                            content_digest(content) != reference.version
+                            or len(content) != reference.size_bytes
+                        ):
+                            raise ValueError(
+                                f"Referenced snapshot '{reference.path}' failed integrity "
+                                "validation."
+                            )
+                        self._session_store.store_reference(
+                            content,
+                            handle=reference.handle,
+                            digest=reference.version,
+                        )
+                        stored = content
+                    if stored is None:
+                        raise ValueError(f"Referenced snapshot '{reference.path}' is unavailable.")
+                    digest = content_digest(stored)
+                    if digest != reference.version or len(stored) != reference.size_bytes:
+                        raise ValueError(
+                            f"Referenced snapshot '{reference.path}' failed integrity validation."
+                        )
+                    cached = cached_path(reference.handle)
+                    cache_valid = cached is not None and cached[0].is_file()
+                    if cache_valid:
+                        try:
+                            cache_valid = cached[0].read_bytes() == stored
+                        except OSError:
+                            cache_valid = False
+                    if not cache_valid:
+                        cache_restorations.append((reference, stored))
+        for reference, stored in cache_restorations:
+            store_content(
+                stored,
+                f"mentioned {reference.kind} {reference.path}",
+                handle=reference.handle,
+            )
+        for message in session.messages:
             if isinstance(message, ToolResult):
                 for artifact in message.artifacts:
                     register_cached_metadata(
@@ -557,6 +662,7 @@ class SessionManager:
                         artifact.source,
                         artifact.reloadable,
                     )
+        self._session = session
 
     def new_session(self) -> None:
         """Replace the active session with a fresh unpersisted session."""
@@ -679,8 +785,76 @@ class SessionManager:
             content (str): Submitted user-message text.
             context (Iterable[ContextReference]): Resolved context snapshots attached to the
                 message. Defaults to no explicit context.
+
+        Raises:
+            ValueError: If occurrence metadata is incomplete or inconsistent with its content.
         """
-        message = Message(role="user", content=content, context=tuple(context))
+        captured = []
+        for reference in context:
+            if (reference.handle is None) != (reference.version is None):
+                raise ValueError(
+                    "Reference handle and artifact identity must be provided together."
+                )
+            if reference.handle is None:
+                complete = get_binary(reference.content)
+                handle, version = content_identity(complete)
+                reference = reference.model_copy(update={"handle": handle, "version": version})
+            captured.append(reference)
+        captured = tuple(
+            reference.model_copy(
+                update={
+                    "next_cursor": (
+                        encode_content_cursor(reference.handle, reference.included_bytes)
+                        if reference.truncated
+                        else None
+                    )
+                }
+            )
+            for reference in captured
+        )
+        handle_versions = {
+            reference.handle: reference.version
+            for message in self._session.messages
+            if isinstance(message, Message)
+            for reference in message.context
+        }
+        for reference in captured:
+            try:
+                validate_content_handle(reference.handle)
+            except ValueError as error:
+                raise ValueError(
+                    f"Referenced snapshot '{reference.path}' has an invalid artifact handle."
+                ) from error
+            existing = handle_versions.setdefault(reference.handle, reference.version)
+            if existing != reference.version:
+                raise ValueError(
+                    f"Referenced snapshot '{reference.path}' reuses an artifact handle for "
+                    "different content."
+                )
+            complete = get_binary(reference.content)
+            if len(complete) != reference.size_bytes:
+                raise ValueError(
+                    f"Referenced snapshot '{reference.path}' size does not match its content."
+                )
+            if not 0 <= reference.included_bytes <= reference.size_bytes:
+                raise ValueError(
+                    f"Referenced snapshot '{reference.path}' has invalid included bytes."
+                )
+            if reference.truncated != (reference.included_bytes < reference.size_bytes):
+                raise ValueError(
+                    f"Referenced snapshot '{reference.path}' has inconsistent truncation metadata."
+                )
+            if content_digest(complete) != reference.version:
+                raise ValueError(
+                    f"Referenced snapshot '{reference.path}' failed integrity validation."
+                )
+        for reference in captured:
+            store_content(
+                reference.content,
+                f"mentioned {reference.kind} {reference.path}",
+                handle=reference.handle,
+            )
+        message = Message(role="user", content=content, context=captured)
 
         def apply(session: Session) -> None:
             if session.name is None:
