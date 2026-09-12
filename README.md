@@ -352,11 +352,12 @@ an injected registry receives its own empty registry; no registry state is share
 
 At startup, the loop discovers `SKILL.md` files under `.agents/skills` from the repository root
 through the working directory, followed by `~/.agents/skills`. Only each skill's YAML `name` and
-`description` are initially loaded and disclosed to the model. The complete Markdown instructions
-are read and cached only when the model calls `manage_skills` with the `activate` action. Activated
-skill identities persist with the session and are restored only while the same canonical
-definition remains available. The model can deactivate one or all skills when their instructions
-are no longer needed.
+`description` are initially loaded and disclosed to the model. Before task work, the agent compares
+the request with those descriptions and calls `activate_skill` for every match. The complete
+Markdown instructions are then read and cached for the following model turn. Activated skill
+identities persist with the session and are restored only while the same canonical definition
+remains available. The model can deactivate one or all skills when their instructions are no
+longer needed.
 
 Skill files under `references/`, `scripts/`, and `assets/` remain unloaded until requested through
 `manage_skills`. Resource paths are confined to the activated skill root. Text resources support
@@ -678,7 +679,8 @@ The default registry exposes these functions to the model:
 | `fetch_content`        | Streams authorized HTTP(S) text into a bounded resumable cache           |
 | `read_cached_content`  | Reads cached text by line or opaque cursor, optionally re-fetching a URL |
 | `run_command`          | Runs an authorized argument vector within a 30-second lifecycle deadline |
-| `manage_skills`        | Manages skill activation and progressively loads bounded skill resources |
+| `activate_skill`       | Loads matching skill instructions before task work                        |
+| `manage_skills`        | Manages active skills and progressively loads bounded skill resources     |
 
 `run_command` applies one monotonic deadline to process execution, output draining, reader
 completion, termination, and direct-child reaping. Output is decoded as UTF-8 with invalid byte

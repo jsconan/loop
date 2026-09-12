@@ -28,6 +28,7 @@ def test_builtin_manifest_has_every_tool_in_deterministic_order():
         "write_text_file",
         "edit_text_file",
         "delete_path",
+        "activate_skill",
         "manage_skills",
         "run_command",
         "fetch_content",

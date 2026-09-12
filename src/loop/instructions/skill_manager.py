@@ -516,7 +516,7 @@ class SkillManager:
         """
         if not self._skills:
             return None
-        header = "<available_skills>\n$name is a hint; use manage_skills for relevant skills.\n"
+        header = "<available_skills>\nWhen a task matches, call activate_skill(name) before work.\n"
         footer = "</available_skills>"
         if max_chars < len(header) + len(footer):
             return None
@@ -546,7 +546,7 @@ class SkillManager:
             used += len(entry)
         while True:
             warning = (
-                f"<warning>{omitted} skill(s) omitted by catalog limit.</warning>\n"
+                f"<warning>{omitted} skill(s) omitted; list via manage_skills.</warning>\n"
                 if omitted
                 else ""
             )

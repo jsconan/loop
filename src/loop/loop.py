@@ -563,7 +563,7 @@ class Loop:
                     ):
                         self._interaction.warning(
                             "Referenced skill metadata could not fit in the instruction budget; "
-                            "use manage_skills to activate a skill."
+                            "use activate_skill to load a skill."
                         )
                 except (OSError, UnicodeError, ValueError) as error:
                     problem = Problem.from_exception(

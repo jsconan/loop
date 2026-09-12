@@ -45,6 +45,7 @@ from loop import (
     ToolRegistry,
     ToolResult,
     Usage,
+    activate_skill,
     constants,
     manage_skills,
     tool,
@@ -713,7 +714,7 @@ def test_run_attaches_files_but_treats_skill_mentions_as_non_mutating_hints(tmp_
     request_instructions = backend.get_response.call_args.kwargs["instructions"]
     assert "Follow review instructions." not in request_instructions
     assert "<name>review</name>" in request_instructions
-    assert "$name is a hint; use manage_skills" in request_instructions
+    assert "When a task matches, call activate_skill(name) before work." in request_instructions
     assert loop.session.active_skills == []
     assert interaction.info.call_args_list[0] == call("Attached my app.py: 15 bytes.")
     completer = interaction.prompt.call_args_list[0].kwargs["completer"]
@@ -748,7 +749,7 @@ def test_run_warns_when_a_skill_hint_cannot_fit_the_instruction_budget(tmp_path)
 
     interaction.warning.assert_called_once_with(
         "Referenced skill metadata could not fit in the instruction budget; "
-        "use manage_skills to activate a skill."
+        "use activate_skill to load a skill."
     )
     request_instructions = backend.get_response.call_args.kwargs["instructions"]
     assert "<name>ascii</name>" in request_instructions
@@ -1738,7 +1739,7 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
         "---\nname: review\ndescription: Review code.\n---\n\nFollow review instructions.",
         encoding="utf-8",
     )
-    registry = ToolRegistry([manage_skills])
+    registry = ToolRegistry([activate_skill])
     backend = Mock(default_model="model")
     backend.get_response.return_value = [ResponseCompleted()]
     manager = SkillManager([Skill("review", "Review code.", location)])
@@ -1752,8 +1753,8 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
     )
     call = ToolCall(
         call_id="skill-call",
-        name="manage_skills",
-        arguments='{"action":"activate","name":"review"}',
+        name="activate_skill",
+        arguments='{"name":"review"}',
     )
     response = Response(
         answer="",
@@ -1779,7 +1780,7 @@ def test_skill_activation_is_persisted_with_its_tool_result(tmp_path):
     location.write_text(
         "---\nname: review\ndescription: Review code.\n---\n\nReview.", encoding="utf-8"
     )
-    registry = ToolRegistry([manage_skills])
+    registry = ToolRegistry([activate_skill])
     backend = Mock(default_model="model")
     store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     sessions = SessionManager(session_store=store)
@@ -1797,8 +1798,8 @@ def test_skill_activation_is_persisted_with_its_tool_result(tmp_path):
     )
     call = ToolCall(
         call_id="skill-call",
-        name="manage_skills",
-        arguments='{"action":"activate","name":"review"}',
+        name="activate_skill",
+        arguments='{"name":"review"}',
     )
 
     response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))

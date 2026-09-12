@@ -39,6 +39,79 @@ def fresh_tool_registry():
     tool_registry = ToolRegistry(BUILTIN_TOOLS)
 
 
+def test_activate_skill_loads_matching_instructions_with_a_single_argument(tmp_path):
+    """The model-facing activation tool exposes only the matching skill name."""
+    location = tmp_path / "example" / "SKILL.md"
+    location.parent.mkdir()
+    location.write_text(
+        "---\nname: example\ndescription: Example workflow.\n---\nDo the work.",
+        encoding="utf-8",
+    )
+    manager = InstructionsManager(
+        skill_manager=SkillManager([Skill("example", "Example workflow.", location)])
+    )
+
+    interaction = approving_interaction()
+    result = decoded(
+        tool_registry.call(
+            "activate_skill",
+            '{"name":"example"}',
+            interaction=interaction,
+            instructions_manager=manager,
+        )
+    )
+    definition = next(tool for tool in tool_registry.definitions() if tool.name == "activate_skill")
+
+    assert result == {
+        "name": "example",
+        "status": "activated",
+        "instructions_updated": True,
+        "skill_root": "skill:example/",
+    }
+    assert definition.description == "Load matching skill instructions before beginning task work."
+    assert set(definition.parameters["properties"]) == {"name"}
+    assert definition.parameters["required"] == ["name"]
+    assert "Do the work." in manager.instructions
+    interaction.prompt.assert_called_once()
+
+
+def test_activate_skill_reports_unavailable_manager():
+    """The dedicated activation tool preserves the public manager-unavailable error."""
+    result = decoded(
+        tool_registry.call(
+            "activate_skill",
+            '{"name":"example"}',
+            interaction=approving_interaction(),
+        )
+    )
+
+    assert result["code"] == "skill.manager_unavailable"
+    assert result["title"] == "Skills unavailable"
+    assert result["detail"] == "No InstructionsManager is active."
+    assert result["operation"] == "activate_skill"
+
+
+def test_activate_skill_sanitizes_loading_failures(tmp_path):
+    """The dedicated activation tool withholds local failure details from the model."""
+    location = tmp_path / "private" / "SKILL.md"
+    manager = InstructionsManager(
+        skill_manager=SkillManager([Skill("broken", "Broken skill.", location)])
+    )
+
+    result = decoded(
+        tool_registry.call(
+            "activate_skill",
+            '{"name":"broken"}',
+            interaction=approving_interaction(),
+            instructions_manager=manager,
+        )
+    )
+
+    assert result["code"] == "skill.operation_failed"
+    assert result["detail"] == "The activate action failed for skill 'broken'."
+    assert str(location) not in json.dumps(result)
+
+
 def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path):
     """The skill lifecycle returns only fields required by each model-facing action."""
     location = tmp_path / "example" / "SKILL.md"

@@ -2,6 +2,7 @@
 
 __all__ = [
     "BUILTIN_TOOLS",
+    "activate_skill",
     "create_default_tool_registry",
     "delete_path",
     "edit_text_file",
@@ -19,6 +20,7 @@ __all__ = [
 
 from .catalog import (
     BUILTIN_TOOLS,
+    activate_skill,
     create_default_tool_registry,
     delete_path,
     edit_text_file,

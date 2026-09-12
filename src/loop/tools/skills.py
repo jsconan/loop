@@ -79,6 +79,20 @@ def _skill_plan(arguments: dict[str, Any]) -> OperationPlan:
     return OperationPlan(arguments=arguments, operations=operations)
 
 
+def _activate_skill_plan(arguments: dict[str, Any]) -> OperationPlan:
+    """Plan the session mutation performed by dedicated skill activation."""
+    return OperationPlan(
+        arguments=arguments,
+        operations=(
+            Operation(
+                tool_id="",
+                action=Action.SESSION_MUTATE,
+                target=SessionTarget(identifier=arguments["name"]),
+            ),
+        ),
+    )
+
+
 def _skill_result_presentation(
     arguments: Mapping[str, Any],
     result: Any,
@@ -102,6 +116,43 @@ def _skill_result_presentation(
     if action == "read_resource":
         return ToolResultPresentationSpec(kind=ToolResultPresentation.TEXT)
     return ToolResultPresentationSpec(kind=ToolResultPresentation.JSON)
+
+
+@tool(
+    actions={Action.SESSION_MUTATE},
+    operation_planner=_activate_skill_plan,
+)
+def activate_skill(
+    context: ToolContext,
+    name: Annotated[
+        str,
+        Field(
+            description=(
+                "Exact name from available_skills. Load it before working when the user's task "
+                "matches its description."
+            )
+        ),
+    ],
+) -> PublicSkillOperationResult:
+    """Load matching skill instructions before beginning task work."""
+    manager = context.instructions_manager
+    if manager is None:
+        return SkillOperationError(
+            code="skill.manager_unavailable",
+            title="Skills unavailable",
+            detail="No InstructionsManager is active.",
+            operation="activate_skill",
+        )
+    try:
+        return _public_result("activate", manager.activate_skill(name))
+    except (OSError, UnicodeError, ValueError) as error:
+        return SkillOperationError.from_exception(
+            error,
+            code="skill.operation_failed",
+            title="Skill operation failed",
+            detail=f"The activate action failed for skill '{name}'.",
+            operation="activate_skill",
+        )
 
 
 @tool(

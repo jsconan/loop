@@ -182,6 +182,7 @@ __all__ = [
     "Workspace",
     "WorkspaceNameSource",
     "WorkspaceRepository",
+    "activate_skill",
     "command",
     "create_default_tool_registry",
     "delete_path",
@@ -408,6 +409,7 @@ from .tooling import (
 )
 from .tools import (
     BUILTIN_TOOLS,
+    activate_skill,
     create_default_tool_registry,
     delete_path,
     edit_text_file,

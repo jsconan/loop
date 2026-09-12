@@ -432,7 +432,7 @@ def test_catalog_returns_none_without_skills_and_warns_when_entries_are_omitted(
     catalog = manager.catalog(max_chars=180)
 
     assert len(catalog) <= 180
-    assert "2 skill(s) omitted by catalog limit" in catalog
+    assert "2 skill(s) omitted; list via manage_skills" in catalog
 
 
 def test_catalog_prioritizes_referenced_skills_without_loading_instructions(tmp_path):
@@ -486,7 +486,7 @@ def test_catalog_drops_entries_to_keep_an_omission_warning_within_its_limit(tmp_
     catalog = manager.catalog(max_chars=180)
 
     assert len(catalog) <= 180
-    assert "2 skill(s) omitted by catalog limit" in catalog
+    assert "2 skill(s) omitted; list via manage_skills" in catalog
     assert catalog.endswith("</available_skills>")
 
 
@@ -498,7 +498,7 @@ def test_catalog_omits_an_oversized_preferred_entry_without_truncating_markup(tm
 
     assert catalog == (
         "<available_skills>\n"
-        "$name is a hint; use manage_skills for relevant skills.\n"
+        "When a task matches, call activate_skill(name) before work.\n"
         "</available_skills>"
     )
 

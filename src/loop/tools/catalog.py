@@ -12,7 +12,7 @@ from .files import (
     search_text,
     write_text_file,
 )
-from .skills import manage_skills
+from .skills import activate_skill, manage_skills
 from .system import run_command
 from .web import fetch_content, read_cached_content
 
@@ -24,6 +24,7 @@ BUILTIN_TOOLS = (
     write_text_file,
     edit_text_file,
     delete_path,
+    activate_skill,
     manage_skills,
     run_command,
     fetch_content,
