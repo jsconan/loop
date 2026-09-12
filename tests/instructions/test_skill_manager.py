@@ -433,3 +433,78 @@ def test_catalog_returns_none_without_skills_and_warns_when_entries_are_omitted(
 
     assert len(catalog) <= 180
     assert "2 skill(s) omitted by catalog limit" in catalog
+
+
+def test_catalog_prioritizes_referenced_skills_without_loading_instructions(tmp_path):
+    """Requested catalog names are retained first while catalog output stays metadata-only."""
+    skills_directory = tmp_path / "skills"
+    write_skill(skills_directory / "first", "first", "Follow first body.")
+    write_skill(skills_directory / "second", "second", "Follow second body.")
+    manager = SkillManager.discover(tmp_path, [skills_directory])
+
+    catalog = manager.catalog(max_chars=300, preferred_names=("second", "unknown"))
+
+    assert "<name>second</name>" in catalog
+    assert catalog.index("<name>second</name>") < catalog.index("<name>first</name>")
+    assert "unknown" not in catalog
+
+
+def test_catalog_preserves_the_source_order_of_referenced_skills(tmp_path):
+    """Referenced skills retain their mention order rather than alphabetical order."""
+    manager = SkillManager(
+        [
+            Skill("zebra", "Follow zebra body.", tmp_path / "zebra" / "SKILL.md"),
+            Skill("alpha", "Follow alpha body.", tmp_path / "alpha" / "SKILL.md"),
+        ]
+    )
+
+    catalog = manager.catalog(preferred_names=("zebra", "alpha"))
+
+    assert catalog.index("<name>zebra</name>") < catalog.index("<name>alpha</name>")
+
+
+def test_catalog_retains_a_referenced_skill_when_a_warning_would_exhaust_the_limit(tmp_path):
+    """A requested skill's metadata takes precedence over an omission warning under pressure."""
+    skills_directory = tmp_path / "skills"
+    write_skill(skills_directory / "first", "first", "First.")
+    write_skill(skills_directory / "second", "second", "Second.")
+    manager = SkillManager.discover(tmp_path, [skills_directory])
+
+    catalog = manager.catalog(max_chars=180, preferred_names=("second",))
+
+    assert "<name>second</name>" in catalog
+    assert "<name>first</name>" not in catalog
+
+
+def test_catalog_drops_entries_to_keep_an_omission_warning_within_its_limit(tmp_path):
+    """A tight limit retains valid catalog framing and an accurate omission warning."""
+    skills_directory = tmp_path / "skills"
+    write_skill(skills_directory / "first", "first", "First.")
+    write_skill(skills_directory / "second", "second", "Second.")
+    manager = SkillManager.discover(tmp_path, [skills_directory])
+
+    catalog = manager.catalog(max_chars=180)
+
+    assert len(catalog) <= 180
+    assert "2 skill(s) omitted by catalog limit" in catalog
+    assert catalog.endswith("</available_skills>")
+
+
+def test_catalog_omits_an_oversized_preferred_entry_without_truncating_markup(tmp_path):
+    """An oversized preferred skill leaves a complete, bounded catalog document."""
+    manager = SkillManager([Skill("long", "x" * 500, tmp_path / "long" / "SKILL.md")])
+
+    catalog = manager.catalog(max_chars=120, preferred_names=("long",))
+
+    assert catalog == (
+        "<available_skills>\n"
+        "$name is a hint; use manage_skills for relevant skills.\n"
+        "</available_skills>"
+    )
+
+
+def test_catalog_returns_none_when_framing_cannot_fit(tmp_path):
+    """A limit smaller than the catalog framing produces no malformed catalog."""
+    manager = SkillManager([Skill("one", "One.", tmp_path / "one" / "SKILL.md")])
+
+    assert manager.catalog(max_chars=10) is None

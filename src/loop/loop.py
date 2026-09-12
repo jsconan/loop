@@ -13,12 +13,15 @@ from .compaction import CompactionCommands, ContextCompaction
 from .completion import (
     CommandCompletionAdapter,
     CompletionManager,
+    CompletionValue,
+    MarkerCompletionAdapter,
 )
 from .configuration import ApplicationSettings
 from .errors import Problem, log_problem
 from .instructions import InstructionsManager, RuntimeEnvironment, SkillCommands
 from .interaction import Interaction
-from .mentions import MentionManager, ProjectPathMentionHandler, SkillMentionHandler
+from .mentions import MentionManager, ProjectPathMentionHandler
+from .mentions.parser import parse_mentions
 from .model_selection import ModelCommands, ModelSelection
 from .models import ConversationItem, ReasoningEffort
 from .permissions import PermissionCommands, PermissionManager
@@ -48,6 +51,8 @@ class Loop:
         working_directory (PathReference): Current workspace-directory reference.
         owns_session_name_generator (bool): Whether the naming service is a backend-dependent
             default owned by this loop. Defaults to ``False`` for explicitly assembled loops.
+        skill_hints_enabled (bool): Whether ``$skill`` references prioritize matching metadata for
+            one default-configured request. Defaults to ``False`` for explicitly assembled loops.
 
     """
 
@@ -63,6 +68,7 @@ class Loop:
     _agent: Agent
     _agent_runner: AgentRunner
     _owns_session_name_generator: bool
+    _skill_hints_enabled: bool
 
     def __init__(
         self,
@@ -74,6 +80,7 @@ class Loop:
         mention_manager: MentionManager,
         working_directory: Path | PathReference,
         owns_session_name_generator: bool = False,
+        skill_hints_enabled: bool = False,
     ) -> None:
         self._agent_runner = agent_runner
         self._agent = agent_runner.agent
@@ -85,6 +92,7 @@ class Loop:
         self._completion_manager = completion_manager
         self._session_name_generator = session_name_generator
         self._owns_session_name_generator = owns_session_name_generator
+        self._skill_hints_enabled = skill_hints_enabled
         self._mention_manager = mention_manager
         self._instructions_manager = agent_runner.instructions_manager
         self._permission_manager = agent_runner.permission_manager
@@ -245,19 +253,28 @@ class Loop:
             providers=providers,
             interaction=configured_interaction,
         )
+        skill_hints_enabled = mention_manager is None
         configured_mentions = mention_manager or MentionManager(
-            (
-                ProjectPathMentionHandler(directory_reference),
-                SkillMentionHandler(configured_instructions),
-            )
+            (ProjectPathMentionHandler(directory_reference),)
         )
+        completion_adapters = list(configured_mentions.completion_adapters)
+        if skill_hints_enabled:
+            completion_adapters.append(
+                MarkerCompletionAdapter(
+                    "$",
+                    lambda: tuple(
+                        CompletionValue(skill.name, skill.description)
+                        for skill in configured_instructions.skill_manager.skills
+                    ),
+                )
+            )
         configured_completion = CompletionManager(
             (
                 CommandCompletionAdapter(
                     lambda: configured_commands.commands,
                     providers=providers,
                 ),
-                *configured_mentions.completion_adapters,
+                *completion_adapters,
             )
         )
         return cls(
@@ -268,6 +285,7 @@ class Loop:
             mention_manager=configured_mentions,
             working_directory=directory_reference,
             owns_session_name_generator=owns_name_generator,
+            skill_hints_enabled=skill_hints_enabled,
         )
 
     @property
@@ -529,6 +547,34 @@ class Loop:
                     "Recover the interrupted run or start a new session before sending a message."
                 )
                 continue
+            if self._skill_hints_enabled:
+                try:
+                    skill_mentions = tuple(
+                        dict.fromkeys(
+                            mention.value
+                            for mention in parse_mentions(
+                                user_input,
+                                {"$": self._instructions_manager.skill_manager.names},
+                            )
+                        )
+                    )
+                    if not self._instructions_manager.set_skill_catalog_priorities(
+                        skill_mentions, self._agent
+                    ):
+                        self._interaction.warning(
+                            "Referenced skill metadata could not fit in the instruction budget; "
+                            "use manage_skills to activate a skill."
+                        )
+                except (OSError, UnicodeError, ValueError) as error:
+                    problem = Problem.from_exception(
+                        error,
+                        code="skill_hint.preparation_failed",
+                        title="Could not prepare skill hint",
+                        operation="prepare_skill_hint",
+                    )
+                    log_problem(_LOGGER, problem, error)
+                    self._interaction.report(problem)
+                    continue
             try:
                 context = self._mention_manager.resolve(user_input)
             except (OSError, UnicodeError, ValueError) as error:
@@ -540,24 +586,44 @@ class Loop:
                 )
                 log_problem(_LOGGER, problem, error)
                 self._interaction.report(problem)
+                if self._skill_hints_enabled:
+                    self._clear_skill_catalog_priorities()
                 continue
-            with self._session_manager.next_message_span():
-                for reference in context:
-                    included = reference.included_bytes
-                    size = reference.size_bytes
-                    if included < size:
-                        self._interaction.info(
-                            f"Attached {reference.path}: {included} of {size} bytes"
-                            "; additional content stays local until read."
-                        )
-                    else:
-                        self._interaction.info(f"Attached {reference.path}: {included} bytes.")
-                telemetry_activity("message.accepted", component="session_manager")
-                self._session_manager.add_user_message(user_input, context=context)
-                result = self._agent_runner.run()
-                self._complete_agent_run(result)
+            try:
+                with self._session_manager.next_message_span():
+                    for reference in context:
+                        included = reference.included_bytes
+                        size = reference.size_bytes
+                        if included < size:
+                            self._interaction.info(
+                                f"Attached {reference.path}: {included} of {size} bytes"
+                                "; additional content stays local until read."
+                            )
+                        else:
+                            self._interaction.info(f"Attached {reference.path}: {included} bytes.")
+                    telemetry_activity("message.accepted", component="session_manager")
+                    self._session_manager.add_user_message(user_input, context=context)
+                    result = self._agent_runner.run()
+                    self._complete_agent_run(result)
+            finally:
+                if self._skill_hints_enabled:
+                    self._clear_skill_catalog_priorities()
 
         self._interaction.conversation_ended()
+
+    def _clear_skill_catalog_priorities(self) -> None:
+        """Clear request-scoped skill priorities without masking the preceding outcome."""
+        try:
+            self._instructions_manager.set_skill_catalog_priorities(())
+        except (OSError, UnicodeError, ValueError) as error:
+            problem = Problem.from_exception(
+                error,
+                code="skill_hint.cleanup_failed",
+                title="Could not clear skill hint",
+                operation="clear_skill_hint",
+            )
+            log_problem(_LOGGER, problem, error)
+            self._interaction.report(problem)
 
     def _complete_agent_run(self, result: AgentRunResult) -> None:
         """Present metrics and finalize naming for one completed or recovered run."""

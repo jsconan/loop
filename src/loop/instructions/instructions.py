@@ -81,6 +81,7 @@ class InstructionsManager:
     _agents_filenames: tuple[str, ...]
     _workspace_id: str | None
     _workspace_root: Path | None
+    _skill_catalog_priorities: tuple[str, ...]
 
     def __init__(
         self,
@@ -108,6 +109,7 @@ class InstructionsManager:
         self._workspace_root = (
             Path(workspace_root).resolve() if workspace_root is not None else None
         )
+        self._skill_catalog_priorities = ()
         self._dirty = False
         self._generation = 0
         self._signature = self._discovery_signature(self._working_directory)
@@ -234,6 +236,44 @@ class InstructionsManager:
             self._runtime_environment = environment
             self._context_instructions = self._build_instructions()
             self._generation += 1
+
+    def set_skill_catalog_priorities(
+        self,
+        names: Iterable[str],
+        agent: Agent | None = None,
+    ) -> bool:
+        """Prioritize referenced skills in subsequent bounded catalog renders.
+
+        This request-scoped presentation state never activates skills or changes durable state.
+
+        Args:
+            names (Iterable[str]): Candidate skill names in source order. Duplicate and unknown
+                names are ignored.
+            agent (Agent | None): Agent whose complete instruction document must remain within
+                the configured limit. Defaults to validating the contextual document alone.
+
+        Returns:
+            bool: Whether the requested priorities fit within the configured instruction limit.
+
+        Raises:
+            OSError: An applicable project instruction cannot be read while refreshing state.
+            UnicodeError: An applicable project instruction is not valid UTF-8.
+        """
+        with self._lock:
+            self._refresh_context()
+            available = {skill.name for skill in self._skill_manager.skills}
+            priorities = tuple(dict.fromkeys(name for name in names if name in available))
+            if priorities == self._skill_catalog_priorities:
+                return self._encoded_size(self._build_instructions(agent)) <= self._max_bytes
+            previous = self._skill_catalog_priorities
+            self._skill_catalog_priorities = priorities
+            instructions = self._build_instructions(agent)
+            if self._encoded_size(instructions) > self._max_bytes:
+                self._skill_catalog_priorities = previous
+                return False
+            self._context_instructions = self._build_instructions()
+            self._generation += 1
+            return True
 
     @property
     def path_aliases(self) -> PathAliases:
@@ -724,7 +764,7 @@ class InstructionsManager:
                     "runtime",
                 )
             )
-        catalog = self._skill_manager.catalog()
+        catalog = self._skill_manager.catalog(preferred_names=self._skill_catalog_priorities)
         if catalog:
             sections.append(InstructionSection("skill_catalog", catalog, "skill_discovery"))
         sections.extend(
@@ -768,7 +808,7 @@ class InstructionsManager:
             *sources,
             project_instructions,
             runtime_environment.render() if runtime_environment is not None else None,
-            skill_manager.catalog(),
+            skill_manager.catalog(preferred_names=self._skill_catalog_priorities),
             active,
         )
 

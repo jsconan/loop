@@ -106,8 +106,9 @@ keyword grammar. Each adapter owns its value source and activation rules; adding
 require changing the manager or a shared context model.
 
 Submitted mentions are resolved by an independently injected `MentionManager`. The default
-registry attaches bounded snapshots for `@` project paths and activates explicitly selected `$`
-skills before the first model request. Each mention handler owns one marker namespace, its live
+registry attaches bounded snapshots for `@` project paths. Explicit `$` skill references prioritize
+matching metadata in the request-scoped skill catalog without loading their instructions; the model
+activates a skill through `manage_skills`. Each mention handler owns one marker namespace, its live
 completion source, validation, and resolution behavior; library callers can inject a replacement
 manager or compose different handlers without modifying the manager. OpenAI requests represent
 referenced files as native multipart `input_file` content and precede the payloads with a compact

@@ -664,8 +664,8 @@ def test_resume_command_reports_an_unknown_session_id(tmp_path):
     assert "Session 'missing-id' was not found" in interaction.report.call_args.args[0].detail
 
 
-def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(tmp_path):
-    """Mentioned files are attached and mentioned skill instructions enter the first request."""
+def test_run_attaches_files_but_treats_skill_mentions_as_non_mutating_hints(tmp_path):
+    """Skill references remain visible without loading their bodies or changing active state."""
     source = tmp_path / "my app.py"
     source.write_text("print('hello')\n", encoding="utf-8")
     location = tmp_path / "skills" / "review" / "SKILL.md"
@@ -710,9 +710,108 @@ def test_run_resolves_file_context_and_activates_mentioned_skills_before_query(t
             ),
         ),
     )
-    assert "Follow review instructions." in backend.get_response.call_args.kwargs["instructions"]
-    assert loop.session.active_skills == [("review", str(location))]
+    request_instructions = backend.get_response.call_args.kwargs["instructions"]
+    assert "Follow review instructions." not in request_instructions
+    assert "<name>review</name>" in request_instructions
+    assert "$name is a hint; use manage_skills" in request_instructions
+    assert loop.session.active_skills == []
     assert interaction.info.call_args_list[0] == call("Attached my app.py: 15 bytes.")
+    completer = interaction.prompt.call_args_list[0].kwargs["completer"]
+    assert [item.text for item in completer.get_completions(Document("$rev"), Mock())] == [
+        "$review"
+    ]
+
+
+def test_run_warns_when_a_skill_hint_cannot_fit_the_instruction_budget(tmp_path):
+    """A rejected skill hint reports that its metadata was not made available to the model."""
+    skills = [
+        Skill("ascii", "a" * 6500, tmp_path / "ascii" / "SKILL.md"),
+        Skill("unicode", "€" * 6500, tmp_path / "unicode" / "SKILL.md"),
+    ]
+    probe = InstructionsManager(skill_manager=SkillManager(skills))
+    instruction_limit = len(probe.prepare(Agent("Loop")).content.encode("utf-8")) + 512
+    instructions = InstructionsManager(
+        skill_manager=SkillManager(skills), max_bytes=instruction_limit
+    )
+    backend = Mock(default_model="model")
+    backend.get_context_window.return_value = None
+    backend.get_response.return_value = [ResponseCompleted()]
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["Use $unicode", False]
+
+    Loop.create_default(
+        backend=backend,
+        interaction=interaction,
+        instructions_manager=instructions,
+        working_directory=tmp_path,
+    ).run()
+
+    interaction.warning.assert_called_once_with(
+        "Referenced skill metadata could not fit in the instruction budget; "
+        "use manage_skills to activate a skill."
+    )
+    request_instructions = backend.get_response.call_args.kwargs["instructions"]
+    assert "<name>ascii</name>" in request_instructions
+    assert "<name>unicode</name>" not in request_instructions
+
+
+def test_run_reports_a_skill_hint_instruction_refresh_failure(tmp_path):
+    """Skill-hint refresh failures are reported without starting an agent run."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("Initial project instructions.", encoding="utf-8")
+    skill = Skill("review", "Review code.", tmp_path / "skills" / "review" / "SKILL.md")
+    instructions = InstructionsManager(
+        skill_manager=SkillManager([skill]), working_directory=tmp_path
+    )
+    backend = Mock(default_model="model")
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["Use $review", False]
+
+    loop = Loop.create_default(
+        backend=backend,
+        interaction=interaction,
+        instructions_manager=instructions,
+        working_directory=tmp_path,
+    )
+    agents.write_bytes(b"\xff")
+
+    loop.run()
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "skill_hint.preparation_failed"
+    assert problem.operation == "prepare_skill_hint"
+    backend.get_response.assert_not_called()
+
+
+def test_run_reports_a_skill_hint_cleanup_failure_without_masking_completion(tmp_path):
+    """Skill-hint cleanup failures preserve the completed agent run and report the problem."""
+    skill = Skill("review", "Review code.", tmp_path / "skills" / "review" / "SKILL.md")
+    instructions = InstructionsManager(skill_manager=SkillManager([skill]))
+    original_set_priorities = instructions.set_skill_catalog_priorities
+    set_priorities = Mock(wraps=original_set_priorities)
+    set_priorities.side_effect = lambda names, agent=None: (
+        original_set_priorities(names, agent)
+        if names
+        else (_ for _ in ()).throw(UnicodeError("invalid project instructions"))
+    )
+    instructions.set_skill_catalog_priorities = set_priorities
+    backend = Mock(default_model="model")
+    backend.get_context_window.return_value = None
+    backend.get_response.return_value = [ResponseCompleted()]
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["Use $review", False]
+
+    Loop.create_default(
+        backend=backend,
+        interaction=interaction,
+        instructions_manager=instructions,
+        working_directory=tmp_path,
+    ).run()
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "skill_hint.cleanup_failed"
+    assert problem.operation == "clear_skill_hint"
+    assert backend.get_response.call_count == 1
 
 
 def test_run_reports_each_attached_reference_and_local_remainder(tmp_path):
@@ -1097,20 +1196,52 @@ def test_loop_uses_an_injected_mention_registry(tmp_path):
     mentions = Mock(spec=MentionManager)
     mentions.completion_adapters = ()
     mentions.resolve.return_value = ()
+    skill = Skill("review", "Review code.", tmp_path / "skills" / "review" / "SKILL.md")
+    instructions = InstructionsManager(skill_manager=SkillManager([skill]))
+    set_priorities = Mock(wraps=instructions.set_skill_catalog_priorities)
+    instructions.set_skill_catalog_priorities = set_priorities
     backend = MagicMock(default_model="model")
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
-    interaction.prompt.side_effect = ["Custom !reference", False]
+    interaction.prompt.side_effect = ["Custom $review", False]
 
     Loop.create_default(
         backend=backend,
         interaction=interaction,
         mention_manager=mentions,
+        instructions_manager=instructions,
         working_directory=tmp_path,
     ).run()
 
-    mentions.resolve.assert_called_once_with("Custom !reference")
+    mentions.resolve.assert_called_once_with("Custom $review")
+    set_priorities.assert_not_called()
+    completer = interaction.prompt.call_args_list[0].kwargs["completer"]
+    assert not list(completer.get_completions(Document("$"), Mock()))
+
+
+def test_loop_leaves_skill_hints_unchanged_after_an_injected_mention_failure(tmp_path):
+    """Injected mention failures do not mutate the skill-hint presentation state."""
+    mentions = Mock(spec=MentionManager)
+    mentions.completion_adapters = ()
+    mentions.resolve.side_effect = ValueError("invalid custom reference")
+    instructions = InstructionsManager()
+    set_priorities = Mock(wraps=instructions.set_skill_catalog_priorities)
+    instructions.set_skill_catalog_priorities = set_priorities
+    backend = MagicMock(default_model="model")
+    interaction = output_interaction()
+    interaction.prompt.side_effect = ["Custom $reference", False]
+
+    Loop.create_default(
+        backend=backend,
+        interaction=interaction,
+        mention_manager=mentions,
+        instructions_manager=instructions,
+        working_directory=tmp_path,
+    ).run()
+
+    set_priorities.assert_not_called()
+    backend.get_response.assert_not_called()
 
 
 def test_loop_passes_custom_instruction_fallbacks_to_discovery(tmp_path):

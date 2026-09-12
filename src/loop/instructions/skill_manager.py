@@ -498,26 +498,41 @@ class SkillManager:
                 )
             return result
 
-    def catalog(self, max_chars: int = constants.MAX_CATALOG_CHARS) -> str | None:
+    def catalog(
+        self,
+        max_chars: int = constants.MAX_CATALOG_CHARS,
+        preferred_names: Iterable[str] = (),
+    ) -> str | None:
         """Format a bounded metadata-only catalog for the model's initial instructions.
 
         Args:
             max_chars (int): Maximum number of characters in the returned catalog.
+            preferred_names (Iterable[str]): Available skill names to include before the remaining
+                catalog entries. Unknown names are ignored. Defaults to no prioritization.
 
         Returns:
-            str | None: The catalog, or ``None`` when no skills were discovered.
+            str | None: The complete bounded catalog, or ``None`` when no skills were discovered
+                or its framing cannot fit within ``max_chars``.
         """
         if not self._skills:
             return None
-        header = (
-            "<available_skills>\n"
-            "Use manage_skills to activate before use and deactivate when no longer needed.\n"
-        )
+        header = "<available_skills>\n$name is a hint; use manage_skills for relevant skills.\n"
         footer = "</available_skills>"
+        if max_chars < len(header) + len(footer):
+            return None
         entries = []
         omitted = 0
         used = len(header) + len(footer)
-        for skill in self._skills:
+        preferred_order = {name: index for index, name in enumerate(dict.fromkeys(preferred_names))}
+        preferred = set(preferred_order)
+        skills = sorted(
+            self._skills,
+            key=lambda skill: (
+                skill.name not in preferred_order,
+                preferred_order.get(skill.name, 0),
+            ),
+        )
+        for skill in skills:
             entry = (
                 "<skill>\n"
                 f"<name>{escape(skill.name)}</name>\n"
@@ -527,12 +542,31 @@ class SkillManager:
             if used + len(entry) > max_chars:
                 omitted += 1
                 continue
-            entries.append(entry)
+            entries.append((skill, entry))
             used += len(entry)
-        warning = (
-            f"<warning>{omitted} skill(s) omitted by catalog limit.</warning>\n" if omitted else ""
-        )
-        return f"{header}{''.join(entries)}{warning}{footer}"[:max_chars]
+        while True:
+            warning = (
+                f"<warning>{omitted} skill(s) omitted by catalog limit.</warning>\n"
+                if omitted
+                else ""
+            )
+            catalog = f"{header}{''.join(entry for _, entry in entries)}{warning}{footer}"
+            if len(catalog) <= max_chars:
+                return catalog
+            if not entries:
+                return f"{header}{footer}"
+            removable = next(
+                (
+                    index
+                    for index in range(len(entries) - 1, -1, -1)
+                    if entries[index][0].name not in preferred
+                ),
+                None,
+            )
+            if removable is None:
+                return f"{header}{''.join(entry for _, entry in entries)}{footer}"
+            entries.pop(removable)
+            omitted += 1
 
     def _summary(self, skill: Skill) -> SkillSummary:
         """Return model-readable metadata for one skill."""

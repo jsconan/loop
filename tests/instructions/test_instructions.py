@@ -97,6 +97,96 @@ def test_manager_combines_project_catalog_and_active_skills_in_stable_order(tmp_
     assert len(context["digest"]) == 64
 
 
+def test_manager_prioritizes_referenced_skill_metadata_without_activation(tmp_path):
+    """A request-scoped catalog priority exposes metadata but leaves skills inactive."""
+    first = write_skill(tmp_path / "first", "first", "First instructions.")
+    second = write_skill(tmp_path / "second", "second", "Second instructions.")
+    manager = configured_manager(skill_manager=SkillManager([first, second]))
+
+    manager.set_skill_catalog_priorities(("second", "missing", "second"))
+    snapshot = manager.prepare(TEST_AGENT)
+    instructions = snapshot.content
+    catalog = next(
+        section.content for section in snapshot.sections if section.kind == "skill_catalog"
+    )
+
+    assert instructions.index("<name>second</name>") < instructions.index("<name>first</name>")
+    assert catalog.index("<name>second</name>") < catalog.index("<name>first</name>")
+    assert "Second instructions." not in instructions
+    assert manager.active_skill_identities == []
+
+
+def test_manager_rejects_catalog_priorities_that_exceed_the_instruction_budget(tmp_path):
+    """Priority changes leave the fitting complete instruction document intact on UTF-8 overflow."""
+    skills = [
+        Skill("ascii", "a" * 6500, tmp_path / "ascii" / "SKILL.md"),
+        Skill("unicode", "€" * 6500, tmp_path / "unicode" / "SKILL.md"),
+    ]
+    baseline = configured_manager(skill_manager=SkillManager(skills))
+    manager = configured_manager(
+        skill_manager=SkillManager(skills),
+        max_bytes=len(prepared(baseline).encode("utf-8")),
+    )
+    generation = manager.generation
+
+    accepted = manager.set_skill_catalog_priorities(("unicode",), TEST_AGENT)
+
+    assert accepted is False
+    assert "<name>ascii</name>" in manager.instructions
+    assert "<name>unicode</name>" not in manager.instructions
+    assert manager.generation == generation
+    assert prepared(manager) == prepared(baseline)
+
+
+def test_manager_refreshes_before_validating_catalog_priorities(tmp_path):
+    """Priority validation rejects a refreshed document that would exceed its budget."""
+    agents = tmp_path / "AGENTS.md"
+    skills = [
+        Skill("ascii", "a" * 6500, tmp_path / "ascii" / "SKILL.md"),
+        Skill("unicode", "€" * 6500, tmp_path / "unicode" / "SKILL.md"),
+    ]
+    agents.write_text("Old rules.", encoding="utf-8")
+    agents.write_text("New rules." * 20, encoding="utf-8")
+    baseline = configured_discovered(tmp_path, skill_manager=SkillManager(skills))
+    prioritized = configured_discovered(tmp_path, skill_manager=SkillManager(skills))
+    assert prioritized.set_skill_catalog_priorities(("unicode",), TEST_AGENT) is True
+    limit = len(prepared(prioritized).encode("utf-8")) - 1
+    assert len(prepared(baseline).encode("utf-8")) <= limit
+
+    agents.write_text("Old rules.", encoding="utf-8")
+    manager = configured_discovered(
+        tmp_path,
+        skill_manager=SkillManager(skills),
+        max_bytes=limit,
+    )
+    agents.write_text("New rules." * 20, encoding="utf-8")
+
+    assert manager.set_skill_catalog_priorities(("unicode",), TEST_AGENT) is False
+    assert "New rules." in manager.instructions
+    assert "<name>ascii</name>" in manager.instructions
+    assert "<name>unicode</name>" not in manager.instructions
+    assert prepared(manager)
+
+
+def test_manager_revalidates_unchanged_catalog_priorities_for_an_agent(tmp_path):
+    """An unchanged priority set still rejects an agent document that exceeds its budget."""
+    skills = [
+        Skill("ascii", "a" * 6500, tmp_path / "ascii" / "SKILL.md"),
+        Skill("unicode", "€" * 6500, tmp_path / "unicode" / "SKILL.md"),
+    ]
+    probe = configured_manager(skill_manager=SkillManager(skills))
+    assert probe.set_skill_catalog_priorities(("unicode",)) is True
+    manager = configured_manager(
+        skill_manager=SkillManager(skills),
+        max_bytes=len(probe.instructions.encode("utf-8")),
+    )
+
+    assert manager.set_skill_catalog_priorities(("unicode",)) is True
+    assert manager.set_skill_catalog_priorities(("unicode",), TEST_AGENT) is False
+    with pytest.raises(ValueError, match="Prepared instructions exceed"):
+        manager.prepare(TEST_AGENT)
+
+
 def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
     """Runtime context participates in composition, generation, and the hard budget."""
     baseline_size = len(prepared(configured_manager()).encode("utf-8"))

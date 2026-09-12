@@ -18,6 +18,7 @@ from loop import (
     SkillMentionHandler,
     constants,
 )
+from loop.mentions.handlers import MentionHandler
 from loop.utils import (
     PathHolder,
     cached_path,
@@ -32,6 +33,34 @@ def complete(handler, text):
     return [item.text for item in manager.get_completions(Document(text), Mock())]
 
 
+def test_base_handler_rejects_markdown_links_by_default():
+    """Handlers inherit disabled Markdown-link resolution unless they opt in."""
+
+    class DefaultMentionHandler(MentionHandler):
+        """Provide the minimum public behavior needed to test base defaults."""
+
+        @property
+        def marker(self):
+            return "?"
+
+        @property
+        def completion_adapter(self):
+            return Mock()
+
+        def candidates(self):
+            return ()
+
+        def resolve(self, values):
+            del values
+            return ()
+
+        def resolve_optional(self, values):
+            del values
+            return ()
+
+    assert DefaultMentionHandler().accepts_markdown_links is False
+
+
 def test_project_paths_complete_after_cache_expiry_and_resolve_unique_snapshots(
     monkeypatch, tmp_path
 ):
@@ -41,6 +70,8 @@ def test_project_paths_complete_after_cache_expiry_and_resolve_unique_snapshots(
     current = [tmp_path]
     directory = PathHolder(current[0])
     handler = ProjectPathMentionHandler(directory)
+    assert handler.marker == "@"
+    assert handler.accepts_markdown_links is True
     assert complete(handler, "@") == []
     (tmp_path / "code.py").write_text("print('ok')\n", encoding="utf-8")
     now[0] += 5.0
@@ -293,6 +324,8 @@ def test_skill_handler_exposes_live_candidates_and_rolls_back_failed_activation(
     ]
     handler = SkillMentionHandler(instructions)
 
+    assert handler.marker == "$"
+    assert handler.accepts_markdown_links is False
     assert handler.candidates() == ("first", "second")
     assert complete(handler, "$fir") == ["$first"]
     with pytest.raises(ValueError, match="Too much skill context"):
