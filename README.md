@@ -430,6 +430,15 @@ base_url = "http://localhost:8000/v1"
 default_model = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 api_key = "local-api-key"
 max_retries = 2
+request_timeout_seconds = 600.0
+# max_generation_seconds = <unset>
+# max_response_chars = <unset>
+# max_output_tokens = <unset>
+repetition_detection = "auto" # "off" | "client" | "server" | "both" | "auto"
+# repetition_penalty = <unset>
+repetition_min_pattern_size = 1024
+repetition_max_pattern_size = 16384
+repetition_min_count = 3
 structured_output_mode = "auto"
 structured_output_max_retries = 1
 hyperparameter_policy = "fallback"
@@ -508,8 +517,25 @@ backend = OpenAIBackend(
     api_key="your-api-key",
     default_model="your-model-id",
     max_retries=2,
+    request_timeout_seconds=600.0,
+    repetition_detection="auto",
+    repetition_min_pattern_size=1024,
+    repetition_max_pattern_size=16384,
+    repetition_min_count=3,
 )
 ```
+
+For OpenAI-compatible local models, `repetition_detection = "auto"` sends optional server
+repetition extensions through the Responses API and records only a sanitized advisory when the
+portable detector sees a substantial exact repeated block. `client` and `both` explicitly opt in
+to client-side cancellation; `server` uses that detector only after the server rejects its
+extension. Server terminal `repetition_detected` results always recover once.
+`request_timeout_seconds` is an idle transport timeout, not a total generation deadline. Loop
+does not impose a generation-duration or character limit by default: set
+`max_generation_seconds`, `max_response_chars`, or `max_output_tokens` only when an unattended
+deployment intentionally requires that budget. Large artifacts should normally be written through
+the file tools rather than returned as chat text. Server repetition settings are optional
+extensions and gracefully fall back.
 
 Referenced text files use native `input_file` parts when `base_url` is omitted for the official
 OpenAI endpoint. Setting a custom `base_url` defaults to portable `input_text` parts because many

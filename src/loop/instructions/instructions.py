@@ -413,11 +413,12 @@ class InstructionsManager:
             if self._working_directory is not None:
                 self._dirty = True
 
-    def prepare(self, agent: Agent) -> PreparedInstructions:
+    def prepare(self, agent: Agent, *, recovery: str | None = None) -> PreparedInstructions:
         """Prepare an immutable request snapshot for an explicit agent.
 
         Args:
             agent (Agent): Agent whose intrinsic identity and instructions start the document.
+            recovery (str | None): Named transient recovery section for this request.
 
         Returns:
             PreparedInstructions: Prepared document and exact provenance for one request.
@@ -443,7 +444,7 @@ class InstructionsManager:
                 self._refresh_changes,
             )
             self._refresh_context()
-            instructions = self._build_instructions(agent)
+            instructions = self._build_instructions(agent, recovery)
             if self._encoded_size(instructions) > self._max_bytes:
                 (
                     self._project_instructions,
@@ -461,7 +462,7 @@ class InstructionsManager:
                 raise InstructionBudgetExceededError(
                     "Prepared instructions exceed the configured instruction limit."
                 )
-            return self._snapshot(agent, instructions)
+            return self._snapshot(agent, instructions, recovery)
 
     def _refresh_context(self) -> bool:
         """Refresh stale contextual sources without requiring an agent binding."""
@@ -508,14 +509,19 @@ class InstructionsManager:
                 )
             return self._snapshot(agent, instructions)
 
-    def _snapshot(self, agent: Agent, instructions: str) -> PreparedInstructions:
+    def _snapshot(
+        self,
+        agent: Agent,
+        instructions: str,
+        recovery: str | None = None,
+    ) -> PreparedInstructions:
         """Capture immutable provenance for an already composed agent document."""
         return PreparedInstructions(
             content=instructions,
             generation=self._generation,
             working_directory=self._working_directory,
             active_skills=tuple(self._skill_manager.active_identities),
-            sections=self._instruction_sections(agent),
+            sections=self._instruction_sections(agent, recovery),
             digest=sha256_digest(instructions),
         )
 
@@ -702,11 +708,15 @@ class InstructionsManager:
             self._generation += 1
         return changed
 
-    def _build_instructions(self, agent: Agent | None = None) -> str:
+    def _build_instructions(self, agent: Agent | None = None, recovery: str | None = None) -> str:
         """Render the current instruction sources."""
         return (
             self._compose(
-                agent, self._project_instructions, self._skill_manager, self._runtime_environment
+                agent,
+                self._project_instructions,
+                self._skill_manager,
+                self._runtime_environment,
+                recovery,
             )
             or ""
         )
@@ -730,7 +740,11 @@ class InstructionsManager:
             self._generation += 1
         return result
 
-    def _instruction_sections(self, agent: Agent | None = None) -> tuple[InstructionSection, ...]:
+    def _instruction_sections(
+        self,
+        agent: Agent | None = None,
+        recovery: str | None = None,
+    ) -> tuple[InstructionSection, ...]:
         """Return typed provenance for every currently composed section."""
         sections = []
         if agent is not None:
@@ -754,6 +768,10 @@ class InstructionsManager:
             for source in self._project_sources
             if source.content
         )
+        if recovery == "repetition":
+            sections.append(
+                InstructionSection("recovery", self._recovery_instruction(recovery), "repetition")
+            )
         if self._project_instructions and not self._project_sources:
             sections.append(InstructionSection("agents", self._project_instructions, "injected"))
         if self._runtime_environment is not None:
@@ -793,6 +811,7 @@ class InstructionsManager:
         project_instructions: str | None,
         skill_manager: SkillManager,
         runtime_environment: RuntimeEnvironment | None = None,
+        recovery: str | None = None,
     ) -> str:
         """Render an instruction document from candidate sources."""
         entries = []
@@ -810,7 +829,18 @@ class InstructionsManager:
             runtime_environment.render() if runtime_environment is not None else None,
             skill_manager.catalog(preferred_names=self._skill_catalog_priorities),
             active,
+            self._recovery_instruction(recovery),
         )
+
+    @staticmethod
+    def _recovery_instruction(recovery: str | None) -> str | None:
+        """Return centrally owned request-scoped recovery guidance."""
+        if recovery == "repetition":
+            return (
+                "The previous generation was stopped after repetitive output. Produce one complete "
+                "replacement response. Do not repeat phrases, sections, or prior output."
+            )
+        return None
 
     def _discovery_signature(self, working_directory: Path | None) -> tuple:
         """Return cheap metadata identifying discoverable instruction sources."""

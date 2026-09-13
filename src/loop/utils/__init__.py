@@ -6,6 +6,8 @@ __all__ = [
     "CachedContentMetadata",
     "ChoiceItem",
     "FloatValueHolder",
+    "GenerationStop",
+    "GenerationWatchdog",
     "IgnoreRule",
     "IgnoreRules",
     "IntValueHolder",
@@ -47,6 +49,7 @@ __all__ = [
     "is_path_ignored",
     "iter_visible_paths",
     "kill_process_group",
+    "list_terms",
     "local_now",
     "normalized_key",
     "parse_command_line",
@@ -64,6 +67,7 @@ __all__ = [
     "store_text_stream",
     "utc_now",
     "validate_content_handle",
+    "validate_term",
     "write_text_atomically",
 ]
 
@@ -89,6 +93,7 @@ from .content import (
 )
 from .dates import as_utc, local_now, utc_now
 from .files import is_binary_file, write_text_atomically
+from .generation import GenerationStop, GenerationWatchdog
 from .hashing import payload_digest, sha256_digest
 from .models import (
     BoundedTextContent,
@@ -119,7 +124,9 @@ from .text import (
     format_content_diff,
     format_content_preview,
     format_tool_call_arguments,
+    list_terms,
     snippet,
+    validate_term,
 )
 from .value_holder import (
     BoolValueHolder,

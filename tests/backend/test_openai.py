@@ -39,9 +39,11 @@ from loop import (
     BackendConflictError,
     BackendConnectionError,
     BackendError,
+    BackendGenerationLimitError,
     BackendNotFoundError,
     BackendPermissionDeniedError,
     BackendRateLimitError,
+    BackendRepetitionError,
     BackendResponseError,
     BackendServerError,
     BackendStatusError,
@@ -178,6 +180,7 @@ class AsyncEvents:
     def __init__(self, events):
         self._events = iter(events)
         self.yielded = 0
+        self.closed = False
 
     def __aiter__(self):
         return self
@@ -189,6 +192,10 @@ class AsyncEvents:
             raise StopAsyncIteration from exc
         self.yielded += 1
         return event
+
+    async def aclose(self):
+        """Record that the backend closed this asynchronous stream."""
+        self.closed = True
 
 
 async def collect_events(events):
@@ -224,10 +231,10 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
         assert asyncio.run(client.get_models_async()) == []
 
     openai.assert_called_once_with(
-        base_url="https://example.test/v1", api_key="secret", max_retries=2
+        base_url="https://example.test/v1", api_key="secret", max_retries=2, timeout=600.0
     )
     async_openai.assert_called_once_with(
-        base_url="https://example.test/v1", api_key="secret", max_retries=2
+        base_url="https://example.test/v1", api_key="secret", max_retries=2, timeout=600.0
     )
 
 
@@ -240,6 +247,14 @@ def test_configuration_rejects_invalid_structured_output_policy():
     for value in (-1, True, 1.5):
         with pytest.raises(ValueError, match="Maximum retries"):
             OpenAIBackend(max_retries=value)
+    for option, value, message in (
+        ("request_timeout_seconds", "invalid", "Request timeout"),
+        ("max_generation_seconds", float("nan"), "generation duration"),
+        ("max_response_chars", 0, "response characters"),
+        ("max_output_tokens", 0, "output tokens"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            OpenAIBackend(**{option: value})
     for value in (-0.1, 2.1, True):
         with pytest.raises(ValueError, match="Temperature"):
             GenerationHyperparameters(temperature=value)
@@ -247,6 +262,144 @@ def test_configuration_rejects_invalid_structured_output_policy():
         OpenAIBackend(hyperparameter_policy="ignore")
     with pytest.raises(ValueError, match="Retention policy"):
         OpenAIBackend(retention_policy="unknown")
+    for options, message in (
+        ({"repetition_detection": "invalid"}, "Repetition detection"),
+        ({"repetition_penalty": float("nan")}, "Repetition penalty"),
+        ({"repetition_min_pattern_size": -1}, "pattern size"),
+        ({"repetition_min_pattern_size": 5, "repetition_max_pattern_size": 4}, "cannot exceed"),
+        ({"repetition_min_count": 1}, "at least two"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            OpenAIBackend(**options)
+
+
+@pytest.mark.parametrize(
+    ("policy", "expects_server", "expects_client"),
+    [
+        ("off", False, False),
+        ("client", False, True),
+        ("server", True, False),
+        ("both", True, True),
+        ("auto", True, False),
+    ],
+)
+def test_repetition_policy_selects_server_extensions_and_client_protection(
+    policy, expects_server, expects_client
+):
+    """Each repetition policy independently chooses server and client protection."""
+    client = OpenAIBackend(default_model="model", repetition_detection=policy)
+
+    assert bool(client._repetition_request("model")) is expects_server
+    assert client._client_repetition_observes("model") is expects_client
+    assert client._client_repetition_cancels() is (policy in ("client", "server", "both"))
+
+
+def test_server_policy_enables_client_stopping_fallback_after_extension_rejection():
+    """The explicit server policy safely falls back when Responses rejects the extension."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "unsupported parameter: repetition_detection",
+        response=httpx.Response(400, request=request),
+        body={"message": "unsupported parameter: repetition_detection"},
+    )
+    backend = OpenAIBackend(default_model="model", repetition_detection="server")
+
+    assert (
+        backend._unsupported_extension(
+            rejected,
+            "model",
+            {"extra_body": {"repetition_detection": {}}},
+        )
+        == "repetition_detection"
+    )
+    assert backend._client_repetition_observes("model") is True
+    assert backend._client_repetition_cancels() is True
+
+
+def test_repetition_extension_rejection_retries_once_and_caches_only_that_extension():
+    """A rejected extension is removed without losing independently supported extensions."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "bad request",
+        response=httpx.Response(422, request=request),
+        body={"message": "unsupported parameter: repetition_detection"},
+    )
+    sdk = Mock()
+    sdk.responses.create.side_effect = [
+        rejected,
+        sdk_response(output=[], output_text="done", usage=None, model="model"),
+        sdk_response(output=[], output_text="done", usage=None, model="model"),
+    ]
+    backend = OpenAIBackend(
+        default_model="model", repetition_detection="auto", repetition_penalty=1.03
+    )
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        list(backend.get_response("hello"))
+        list(backend.get_response("hello"))
+
+    first, fallback, cached = [call.kwargs for call in sdk.responses.create.call_args_list]
+    assert "repetition_detection" in first["extra_body"]
+    assert fallback["extra_body"] == {"repetition_penalty": 1.03}
+    assert cached["extra_body"] == {"repetition_penalty": 1.03}
+    assert backend._client_repetition_observes("model") is True
+
+
+def test_server_repetition_terminal_becomes_a_recoverable_repetition_error():
+    """A provider repetition terminal preserves safe request metadata and source."""
+    sdk = Mock()
+    sdk.responses.create.return_value = sdk_response(
+        status="incomplete",
+        id="response-id",
+        error=None,
+        incomplete_details={"reason": "repetition_detected"},
+    )
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendRepetitionError) as raised,
+    ):
+        list(OpenAIBackend(default_model="model").get_response("hello"))
+
+    assert raised.value.request_id == "response-id"
+    assert raised.value.details["source"] == "server"
+
+
+def test_extension_rejection_ignores_unrelated_statuses_and_requests():
+    """Only explicit client errors for an extension are treated as capability rejection."""
+    backend = OpenAIBackend(default_model="model")
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    server_error = APIStatusError(
+        "failed", response=httpx.Response(500, request=request), body=None
+    )
+    client_error = APIStatusError(
+        "unsupported", response=httpx.Response(400, request=request), body=None
+    )
+
+    assert backend._unsupported_extension(server_error, "model", {"extra_body": {}}) is None
+    assert backend._unsupported_extension(client_error, "model", {}) is None
+
+
+def test_async_extension_rejection_removes_the_extra_body_field():
+    """Async creation follows the same one-field extension fallback as synchronous creation."""
+    request = httpx.Request("POST", "https://compatible.test/v1/responses")
+    rejected = APIStatusError(
+        "unsupported repetition_detection",
+        response=httpx.Response(400, request=request),
+        body=None,
+    )
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(side_effect=[rejected, object()])
+    backend = OpenAIBackend(default_model="model")
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        asyncio.run(
+            backend._create_response_async(
+                {"model": "model", "extra_body": {"repetition_detection": {}}}, "model"
+            )
+        )
+
+    assert sdk.responses.create.await_args.kwargs["extra_body"] == {}
 
 
 @pytest.mark.parametrize(
@@ -432,8 +585,8 @@ def test_configured_transport_retries_reach_both_clients():
         backend.get_models()
         asyncio.run(backend.get_models_async())
 
-    openai.assert_called_once_with(base_url=None, api_key=None, max_retries=5)
-    async_openai.assert_called_once_with(base_url=None, api_key=None, max_retries=5)
+    openai.assert_called_once_with(base_url=None, api_key=None, max_retries=5, timeout=600.0)
+    async_openai.assert_called_once_with(base_url=None, api_key=None, max_retries=5, timeout=600.0)
 
 
 def test_backend_does_not_read_process_configuration(monkeypatch):
@@ -492,7 +645,7 @@ def test_native_compaction_round_trips_exact_provider_items():
             data={"type": "compaction", "id": "cmp", "encrypted_content": "opaque"},
         ),
     )
-    assert result.usage.total_tokens == 110
+    assert result.usage.total_tokens == 110  # pylint: disable=no-member
     assert result.context_tokens == 20
     compact_request = sdk.responses.compact.call_args.kwargs
     sdk.responses.compact.assert_called_once()
@@ -591,7 +744,7 @@ def test_context_window_must_be_positive(context_window):
 
 def test_file_input_mode_must_be_supported():
     """File transport rejects modes without defined serialization semantics."""
-    with pytest.raises(ValueError, match="'text' or 'native'"):
+    with pytest.raises(ValueError, match="None, 'text', or 'native'"):
         OpenAIBackend(file_input_mode="automatic")
 
 
@@ -1143,6 +1296,13 @@ def test_sync_response_forwards_schema_streaming_and_model_selection():
         instructions="Follow the project rules.",
         stream=True,
         stream_options={"include_usage": True},
+        extra_body={
+            "repetition_detection": {
+                "min_pattern_size": 1024,
+                "max_pattern_size": 16384,
+                "min_count": 3,
+            }
+        },
         tools=[
             {
                 "type": "function",
@@ -1655,6 +1815,13 @@ def test_async_response_uses_default_model():
         instructions=None,
         stream=False,
         stream_options={"include_usage": True},
+        extra_body={
+            "repetition_detection": {
+                "min_pattern_size": 1024,
+                "max_pattern_size": 16384,
+                "min_count": 3,
+            }
+        },
         tools=[],
     )
 
@@ -2747,6 +2914,212 @@ def test_stream_failure_records_that_normalized_output_started():
 
 
 @pytest.mark.parametrize(
+    ("error", "error_type"),
+    [
+        (httpx.ReadTimeout("idle"), BackendTimeoutError),
+        (httpx.ReadError("closed"), BackendConnectionError),
+    ],
+)
+def test_stream_iteration_translates_raw_transport_errors(error, error_type):
+    """Raw SDK stream transport failures retain backend error semantics and partial-state data."""
+
+    def failing_stream():
+        """Emit output before the transport reports the supplied failure."""
+        yield ResponseTextDeltaEvent(
+            delta="partial",
+            item_id="m",
+            output_index=0,
+            content_index=0,
+            sequence_number=1,
+            type="response.output_text.delta",
+            logprobs=[],
+        )
+        raise error
+
+    sdk = Mock()
+    sdk.responses.create.return_value = failing_stream()
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(error_type) as raised,
+    ):
+        list(OpenAIBackend(default_model="model").get_response("hello", stream=True))
+
+    assert raised.value.response_started is True
+
+
+def test_sync_stream_stops_a_repeated_output_loop_and_closes_the_provider_stream():
+    """A substantial repeated suffix aborts the stream without retaining generated text."""
+
+    class CloseableEvents:
+        """Iterate provider events while recording explicit stream closure."""
+
+        def __init__(self, events):
+            self._events = iter(events)
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._events)
+
+        def close(self):
+            """Record that the backend abandoned this stream."""
+            self.closed = True
+
+    events = [
+        ResponseTextDeltaEvent(
+            delta="loop-message ",
+            item_id="m",
+            output_index=0,
+            content_index=0,
+            sequence_number=index,
+            type="response.output_text.delta",
+            logprobs=[],
+        )
+        for index in range(1, 10)
+    ]
+    stream = CloseableEvents(events)
+    sdk = Mock()
+    sdk.responses.create.return_value = stream
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendRepetitionError) as raised,
+    ):
+        list(
+            OpenAIBackend(
+                default_model="model",
+                repetition_detection="client",
+                repetition_min_pattern_size=4,
+                repetition_max_pattern_size=16,
+            ).get_response("hello", stream=True)
+        )
+
+    assert raised.value.response_started is True
+    assert raised.value.details["source"] == "client"
+    assert raised.value.details["channel"] == "answer"
+    assert raised.value.details["generated_characters"] > 0
+    assert raised.value.details["pattern_size"] > 0
+    assert raised.value.details["repetition_count"] >= 3
+    assert stream.closed is True
+
+
+def test_sync_stream_stops_at_the_portable_character_limit():
+    """The backend limits streamed output even when provider token usage is unavailable."""
+    sdk = Mock()
+    sdk.responses.create.return_value = [
+        ResponseTextDeltaEvent(
+            delta="abcdef",
+            item_id="m",
+            output_index=0,
+            content_index=0,
+            sequence_number=1,
+            type="response.output_text.delta",
+            logprobs=[],
+        )
+    ]
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendGenerationLimitError) as raised,
+    ):
+        list(
+            OpenAIBackend(default_model="model", max_response_chars=5).get_response(
+                "hello", stream=True
+            )
+        )
+
+    assert raised.value.details["reason"] == "character_limit"
+    assert raised.value.details["generated_characters"] == 6
+    assert raised.value.details["channel"] == "answer"
+
+
+def test_auto_repetition_detection_reports_without_cancelling_productive_output():
+    """Auto records a suspicion after a server rejects its detection extension."""
+    sdk = Mock()
+    request = httpx.Request("POST", "https://example.test/v1/responses")
+    rejected = APIStatusError(
+        "unsupported parameter: repetition_detection",
+        response=httpx.Response(400, request=request),
+        body={"message": "unsupported parameter: repetition_detection"},
+    )
+    sdk.responses.create.side_effect = [
+        rejected,
+        [
+            ResponseTextDeltaEvent(
+                delta="abcdabcdabcd",
+                item_id="m",
+                output_index=0,
+                content_index=0,
+                sequence_number=1,
+                type="response.output_text.delta",
+                logprobs=[],
+            ),
+            sdk_completion_event(),
+        ],
+    ]
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    try:
+        with patch("loop.backend.openai.OpenAI", return_value=sdk):
+            events = list(
+                OpenAIBackend(
+                    default_model="model",
+                    repetition_min_pattern_size=4,
+                    repetition_max_pattern_size=16,
+                ).get_response("hello", stream=True)
+            )
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    assert isinstance(events[-1], ResponseCompleted)
+    assert "gen_ai.repetition_suspected" in [record.event_name for record in adapter.records]
+
+
+def test_sync_stream_stops_after_the_configured_generation_duration():
+    """An active stream cannot run beyond its configured elapsed-time boundary."""
+    sdk = Mock()
+    sdk.responses.create.return_value = [
+        ResponseTextDeltaEvent(
+            delta="first",
+            item_id="m",
+            output_index=0,
+            content_index=0,
+            sequence_number=1,
+            type="response.output_text.delta",
+            logprobs=[],
+        )
+    ]
+
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendGenerationLimitError) as raised,
+    ):
+        list(
+            OpenAIBackend(default_model="model", max_generation_seconds=0.000_000_1).get_response(
+                "hello", stream=True
+            )
+        )
+
+    assert raised.value.details["reason"] == "duration"
+
+
+def test_optional_output_token_limit_is_forwarded_to_the_provider():
+    """Configured output-token limits use the portable Responses API parameter."""
+    sdk = Mock()
+    sdk.responses.create.return_value = sdk_response(output_text="done", output=[], model="model")
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        list(OpenAIBackend(default_model="model", max_output_tokens=12).get_response("hello"))
+
+    assert sdk.responses.create.call_args.kwargs["max_output_tokens"] == 12
+
+
+@pytest.mark.parametrize(
     ("status", "error_type"),
     [("failed", BackendStatusError), ("incomplete", BackendResponseError)],
 )
@@ -2865,6 +3238,15 @@ def test_async_streaming_response_uses_the_normalized_event_contract():
             type="response.output_text.delta",
             logprobs=[],
         ),
+        ResponseTextDeltaEvent(
+            delta="   ",
+            item_id="m",
+            output_index=1,
+            content_index=0,
+            sequence_number=5,
+            type="response.output_text.delta",
+            logprobs=[],
+        ),
         sdk_completion_event(total_tokens=None),
     ]
     sdk = Mock()
@@ -2881,8 +3263,114 @@ def test_async_streaming_response_uses_the_normalized_event_contract():
         ReasoningDelta(text="think"),
         ReasoningDelta(text="ing"),
         AnswerDelta(text="answer"),
+        AnswerDelta(text="   "),
         ResponseCompleted(model="served-model"),
     ]
+
+
+def test_async_stream_stops_a_repeated_output_loop_and_closes_the_provider_stream():
+    """The asynchronous stream enforces the same loop guard and cancellation behavior."""
+    stream = AsyncEvents(
+        [
+            ResponseTextDeltaEvent(
+                delta="loop-message ",
+                item_id="m",
+                output_index=0,
+                content_index=0,
+                sequence_number=index,
+                type="response.output_text.delta",
+                logprobs=[],
+            )
+            for index in range(1, 10)
+        ]
+    )
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=stream)
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(BackendRepetitionError),
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(
+                    default_model="model",
+                    repetition_detection="client",
+                    repetition_min_pattern_size=4,
+                    repetition_max_pattern_size=16,
+                ).get_response_async("hello", stream=True)
+            )
+        )
+
+    assert stream.closed is True
+
+
+def test_async_stream_allows_a_provider_iterator_without_a_close_method():
+    """An OpenAI-compatible async iterator need not expose an explicit close operation."""
+
+    class BareAsyncEvents:
+        """Yield provider events without a resource-release API."""
+
+        def __init__(self, events):
+            self._events = iter(events)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._events)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=BareAsyncEvents([sdk_completion_event()]))
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        events = asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async("hello", stream=True)
+            )
+        )
+
+    assert isinstance(events[-1], ResponseCompleted)
+
+
+def test_async_stream_supports_a_synchronous_close_method():
+    """Compatible async iterators may expose a synchronous close method."""
+
+    class SynchronousCloseEvents:
+        """Yield provider events and record synchronous cleanup."""
+
+        def __init__(self, events):
+            self._events = iter(events)
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._events)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+        def close(self):
+            """Record synchronous cleanup."""
+            self.closed = True
+
+    stream = SynchronousCloseEvents([sdk_completion_event()])
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=stream)
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async("hello", stream=True)
+            )
+        )
+
+    assert stream.closed is True
 
 
 def test_async_stream_iteration_translates_deferred_provider_errors():
@@ -2891,7 +3379,7 @@ def test_async_stream_iteration_translates_deferred_provider_errors():
     async def failing_stream():
         """Raise a timeout when the consumer advances the asynchronous stream."""
         raise APITimeoutError(httpx.Request("GET", "https://example.test"))
-        yield
+        yield  # pylint: disable=unreachable
 
     sdk = Mock()
     sdk.responses.create = AsyncMock(return_value=failing_stream())
@@ -2933,6 +3421,45 @@ def test_async_stream_failure_records_that_normalized_output_started():
     with (
         patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
         pytest.raises(BackendTimeoutError) as raised,
+    ):
+        asyncio.run(
+            collect_events(
+                OpenAIBackend(default_model="model").get_response_async("hello", stream=True)
+            )
+        )
+
+    assert raised.value.response_started is True
+
+
+@pytest.mark.parametrize(
+    ("error", "error_type"),
+    [
+        (httpx.ReadTimeout("idle"), BackendTimeoutError),
+        (httpx.ReadError("closed"), BackendConnectionError),
+    ],
+)
+def test_async_stream_iteration_translates_raw_transport_errors(error, error_type):
+    """Raw async transport failures retain backend error and partial-state semantics."""
+
+    async def failing_stream():
+        """Emit output before the transport reports the supplied failure."""
+        yield ResponseTextDeltaEvent(
+            delta="partial",
+            item_id="m",
+            output_index=0,
+            content_index=0,
+            sequence_number=1,
+            type="response.output_text.delta",
+            logprobs=[],
+        )
+        raise error
+
+    sdk = Mock()
+    sdk.responses.create = AsyncMock(return_value=failing_stream())
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(error_type) as raised,
     ):
         asyncio.run(
             collect_events(

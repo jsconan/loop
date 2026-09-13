@@ -1536,6 +1536,20 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     assert "working_directory: ." in instructions
 
 
+def test_query_composes_recovery_guidance_without_replacing_active_instructions(tmp_path):
+    """A recovery query preserves project instructions through the manager-owned mode."""
+    (tmp_path / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
+    backend = Mock(default_model="default-model")
+    backend.get_response.return_value = [ResponseCompleted()]
+    loop = Loop.create_default(backend=backend, working_directory=tmp_path)
+
+    loop.agent_runner._query("repetition")
+
+    instructions = backend.get_response.call_args.kwargs["instructions"]
+    assert "Project rules." in instructions
+    assert "The previous generation was stopped after repetitive output." in instructions
+
+
 def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
     """A query persists model context capacity without hidden tokenization calls."""
     backend = Mock(default_model="model")

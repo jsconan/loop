@@ -47,6 +47,47 @@ def snippet(text: str, language: str | None = None, preserve_fence: bool = True)
     return f"{fence}{language or ''}\n{text}\n{fence}"
 
 
+def list_terms(terms: Iterable[str | None], exclusive: bool = True, quote: str = "") -> str:
+    """Format a list of terms as a human-readable string.
+
+    Args:
+        terms (Iterable[str | None]): The terms to format. ``None`` is rendered without quotes.
+        exclusive (bool, optional): Whether to use "or" (True) or "and" (False) before
+            the last term. Defaults to True.
+        quote (str, optional): The string to place around each term. An empty string disables
+            quoting. Defaults to "".
+
+    Returns:
+        str: The formatted list of terms.
+    """
+    terms = [
+        "None" if term is None else f"{quote}{term}{quote}" if quote else term for term in terms
+    ]
+    if not terms:
+        return ""
+    if len(terms) == 1:
+        return terms[0]
+    conjunction = "or" if exclusive else "and"
+    separator = f", {conjunction} " if len(terms) > 2 else f" {conjunction} "
+    return ", ".join(terms[:-1]) + separator + terms[-1]
+
+
+def validate_term(value: Any, values: list[Any], message: str) -> None:
+    """Validate that a value is in a list of allowed values.
+
+    Args:
+        value (Any): The value to validate.
+        values (list[Any]): The list of allowed values.
+        message (str): The error message to display if validation fails.
+
+    Raises:
+        ValueError: If the value is not in the list of allowed values.
+    """
+    if value not in values:
+        terms = list_terms(values, quote="'")
+        raise ValueError(f"{message} {terms}.")
+
+
 def choice_items(
     values: Iterable[str | ChoiceItem] | Mapping[object, str],
     *,

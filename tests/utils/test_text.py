@@ -12,7 +12,9 @@ from loop.utils.text import (
     format_content_diff,
     format_content_preview,
     format_tool_call_arguments,
+    list_terms,
     snippet,
+    validate_term,
 )
 
 
@@ -96,6 +98,59 @@ def test_snippet_normalizes_supported_inputs_when_preservation_is_disabled(text,
 def test_snippet_expands_the_fence_when_text_contains_it():
     """Snippet expands its delimiter until it cannot prematurely close the block."""
     assert snippet("before ``` after") == "````\nbefore ``` after\n````"
+
+
+@pytest.mark.parametrize(
+    ("terms", "exclusive", "quote", "expected"),
+    [
+        ([], True, "", ""),
+        (["first"], True, "", "first"),
+        (["first", "second"], True, "", "first or second"),
+        (["first", "second"], False, "", "first and second"),
+        (["first", "second", "third"], True, "", "first, second, or third"),
+        (["first", "second", "third"], False, "", "first, second, and third"),
+        (["first"], True, '"', '"first"'),
+        (["first", "second", "third"], True, '"', '"first", "second", or "third"'),
+        (["first", "second", "third"], False, "'", "'first', 'second', and 'third'"),
+        ([None, "text", "native"], True, "'", "None, 'text', or 'native'"),
+    ],
+)
+def test_list_terms_formats_empty_single_and_multiple_terms(terms, exclusive, quote, expected):
+    """List terms use the appropriate conjunction and punctuation for each list size."""
+    assert list_terms(terms, exclusive=exclusive, quote=quote) == expected
+
+
+def test_list_terms_accepts_a_general_iterable():
+    """List terms consume iterable inputs without requiring a concrete collection."""
+    assert list_terms(term for term in ("first", "second")) == "first or second"
+
+
+@pytest.mark.parametrize(
+    ("value", "values"),
+    [
+        ("second", ["first", "second"]),
+        (None, [None, "text"]),
+    ],
+)
+def test_validate_term_accepts_values_in_the_allowed_list(value, values):
+    """Term validation accepts values that are present in the allowed list."""
+    validate_term(value, values, "Value must be")
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ([], "Value must be ."),
+        (["only"], "Value must be 'only'."),
+        (["first", "second"], "Value must be 'first' or 'second'."),
+        (["first", "second", "third"], "Value must be 'first', 'second', or 'third'."),
+        ([None, "text"], "Value must be None or 'text'."),
+    ],
+)
+def test_validate_term_rejects_values_with_the_allowed_terms(values, expected):
+    """Term validation reports the supplied message and every allowed term."""
+    with pytest.raises(ValueError, match=f"^{expected}$"):
+        validate_term("missing", values, "Value must be")
 
 
 def test_choice_items_normalizes_iterables_and_mappings():

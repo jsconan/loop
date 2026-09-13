@@ -86,6 +86,16 @@ class BackendTimeoutError(BackendConnectionError):
     """Indicate that a backend operation timed out."""
 
 
+class BackendRepetitionError(BackendError):
+    """Indicate that client or server repetition detection stopped a response."""
+
+    recoverable = True
+
+
+class BackendGenerationLimitError(BackendError):
+    """Indicate that generated output exceeded a duration or character boundary."""
+
+
 class BackendResponseError(BackendError):
     """Indicate that a backend returned an invalid response."""
 

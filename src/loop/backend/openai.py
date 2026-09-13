@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from copy import deepcopy
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from inspect import isawaitable
+from math import isfinite
 from mimetypes import guess_type
 from typing import Any, Literal
 
@@ -64,6 +66,7 @@ from ..models import (
     Reasoning,
     ReasoningCompleted,
     ReasoningDelta,
+    RepetitionDetection,
     ResponseCompleted,
     ResponseEvent,
     ResponseMetadata,
@@ -79,7 +82,16 @@ from ..models import (
     Usage,
 )
 from ..telemetry import ModelInputPolicy, telemetry_activity, telemetry_trace_event
-from ..utils import base64_encode, data_url, get_binary, payload_digest, snippet
+from ..utils import (
+    GenerationStop,
+    GenerationWatchdog,
+    base64_encode,
+    data_url,
+    get_binary,
+    payload_digest,
+    snippet,
+    validate_term,
+)
 from .backend import Backend, GenerationHyperparameters
 from .errors import (
     BackendAuthenticationError,
@@ -87,9 +99,11 @@ from .errors import (
     BackendConflictError,
     BackendConnectionError,
     BackendError,
+    BackendGenerationLimitError,
     BackendNotFoundError,
     BackendPermissionDeniedError,
     BackendRateLimitError,
+    BackendRepetitionError,
     BackendResponseError,
     BackendServerError,
     BackendStatusError,
@@ -119,6 +133,18 @@ class OpenAIBackend(Backend):
         structured_output_max_retries (int): Number of corrective generations after a structured
             response fails local validation.
         max_retries (int): Number of automatic SDK retries for transient request failures.
+        request_timeout_seconds (float): Maximum idle time for one provider request or stream.
+        max_generation_seconds (float | None): Optional explicit total deadline for one streamed
+            generation. Defaults to no deadline because productive local inference may be slow.
+        max_response_chars (int | None): Optional explicit answer and reasoning character budget.
+            Defaults to no budget because valid artifacts can be large.
+        max_output_tokens (int | None): Optional provider-enforced output-token limit.
+        repetition_detection (str): Repetition protection policy for optional server extensions
+            and the portable client detector.
+        repetition_penalty (float | None): Optional server-side sampling extension.
+        repetition_min_pattern_size (int): Smallest repeated exact suffix to detect.
+        repetition_max_pattern_size (int): Largest repeated exact suffix to detect.
+        repetition_min_count (int): Adjacent suffix repetitions required to stop.
         hyperparameter_policy (HyperparameterPolicy): Whether to retry without a
             hyperparameter explicitly rejected as unsupported, or preserve that rejection.
         retention_policy (RetentionPolicy | None): Provider retention capability. Defaults to
@@ -137,9 +163,19 @@ class OpenAIBackend(Backend):
     _structured_output_max_retries: int
     _prompt_structured_models: set[str]
     _max_retries: int
+    _request_timeout_seconds: float
+    _max_generation_seconds: float | None
+    _max_response_chars: int | None
+    _max_output_tokens: int | None
+    _repetition_detection: RepetitionDetection
+    _repetition_penalty: float | None
+    _repetition_min_pattern_size: int
+    _repetition_max_pattern_size: int
+    _repetition_min_count: int
     _hyperparameter_policy: HyperparameterPolicy
     _retention_policy: RetentionPolicy
     _unsupported_hyperparameters: dict[str, set[str]]
+    _unsupported_extensions: dict[str, set[str]]
     _declared_hyperparameters: dict[str, frozenset[str]]
     _hyperparameter_discovery_attempted: set[str]
     _schema_annotation_keys = frozenset(
@@ -161,6 +197,15 @@ class OpenAIBackend(Backend):
         structured_output_mode: StructuredOutputMode = (constants.DEFAULT_STRUCTURED_OUTPUT_MODE),
         structured_output_max_retries: int = constants.DEFAULT_STRUCTURED_OUTPUT_MAX_RETRIES,
         max_retries: int = constants.DEFAULT_MAX_RETRIES,
+        request_timeout_seconds: float = constants.DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        max_generation_seconds: float | None = constants.DEFAULT_MAX_GENERATION_SECONDS,
+        max_response_chars: int | None = constants.DEFAULT_MAX_RESPONSE_CHARS,
+        max_output_tokens: int | None = None,
+        repetition_detection: RepetitionDetection = "auto",
+        repetition_penalty: float | None = None,
+        repetition_min_pattern_size: int = constants.DEFAULT_REPETITION_MIN_PATTERN_SIZE,
+        repetition_max_pattern_size: int = constants.DEFAULT_REPETITION_MAX_PATTERN_SIZE,
+        repetition_min_count: int = constants.DEFAULT_REPETITION_MIN_COUNT,
         hyperparameter_policy: HyperparameterPolicy = (constants.DEFAULT_HYPERPARAMETER_POLICY),
         retention_policy: RetentionPolicy | None = None,
     ) -> None:
@@ -172,40 +217,116 @@ class OpenAIBackend(Backend):
         self._client = None
         self._async_client = None
         self._configured_context_window = context_window
-        if self._configured_context_window is not None and self._configured_context_window <= 0:
-            raise ValueError("Context window must be a positive integer.")
-        if file_input_mode not in (None, "text", "native"):
-            raise ValueError("File input mode must be 'text' or 'native'.")
         self._file_input_mode = file_input_mode or ("text" if base_url is not None else "native")
         self._context_windows = {}
-        if structured_output_mode not in ("auto", "native", "prompt"):
-            raise ValueError("Structured output mode must be 'auto', 'native', or 'prompt'.")
-        if structured_output_max_retries < 0:
-            raise ValueError("Structured output maximum retries must not be negative.")
-        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
-            raise ValueError("Maximum retries must be a non-negative integer.")
         self._structured_output_mode = structured_output_mode
         self._structured_output_max_retries = structured_output_max_retries
         self._prompt_structured_models = set()
         self._max_retries = max_retries
-        if hyperparameter_policy not in ("fallback", "strict"):
-            raise ValueError("Hyperparameter policy must be 'fallback' or 'strict'.")
+        self._request_timeout_seconds = request_timeout_seconds
+        self._max_generation_seconds = max_generation_seconds
+        self._max_response_chars = max_response_chars
+        self._max_output_tokens = max_output_tokens
+        self._repetition_detection = repetition_detection
+        self._repetition_penalty = repetition_penalty
+        self._repetition_min_pattern_size = repetition_min_pattern_size
+        self._repetition_max_pattern_size = repetition_max_pattern_size
+        self._repetition_min_count = repetition_min_count
         self._hyperparameter_policy = hyperparameter_policy
         if retention_policy is None:
             retention_policy = "required_false" if base_url is None else "provider_managed"
-        if retention_policy not in ("required_false", "supported_false", "provider_managed"):
-            raise ValueError(
-                "Retention policy must be 'required_false', 'supported_false', or "
-                "'provider_managed'."
-            )
         self._retention_policy = retention_policy
         self._unsupported_hyperparameters = {}
+        self._unsupported_extensions = {}
         self._declared_hyperparameters = {}
         self._hyperparameter_discovery_attempted = set()
         registered_secrets = (api_key,) if api_key and api_key != constants.DEFAULT_API_KEY else ()
         self._model_input_policy = ModelInputPolicy(
             registered_secrets,
             reporter=self._report_model_input_redactions,
+        )
+        self._validate_attributes()
+
+    def _validate_attributes(self) -> None:
+        """Validate the backend attributes after initialization."""
+        if self._configured_context_window is not None and self._configured_context_window <= 0:
+            raise ValueError("Context window must be a positive integer.")
+        validate_term(
+            self._file_input_mode,
+            (None, "text", "native"),
+            "File input mode must be",
+        )
+        validate_term(
+            self._structured_output_mode,
+            ("auto", "native", "prompt"),
+            "Structured output mode must be",
+        )
+        if self._structured_output_max_retries < 0:
+            raise ValueError("Structured output maximum retries must not be negative.")
+        if (
+            isinstance(self._max_retries, bool)
+            or not isinstance(self._max_retries, int)
+            or self._max_retries < 0
+        ):
+            raise ValueError("Maximum retries must be a non-negative integer.")
+        if (
+            isinstance(self._request_timeout_seconds, bool)
+            or not isinstance(self._request_timeout_seconds, (int, float))
+            or not isfinite(self._request_timeout_seconds)
+            or self._request_timeout_seconds <= 0
+        ):
+            raise ValueError("Request timeout must be positive.")
+        if self._max_generation_seconds is not None and (
+            isinstance(self._max_generation_seconds, bool)
+            or not isinstance(self._max_generation_seconds, (int, float))
+            or not isfinite(self._max_generation_seconds)
+            or self._max_generation_seconds <= 0
+        ):
+            raise ValueError("Maximum generation duration must be positive.")
+        if self._max_response_chars is not None and (
+            isinstance(self._max_response_chars, bool)
+            or not isinstance(self._max_response_chars, int)
+            or self._max_response_chars <= 0
+        ):
+            raise ValueError("Maximum response characters must be a positive integer.")
+        if self._max_output_tokens is not None and (
+            isinstance(self._max_output_tokens, bool)
+            or not isinstance(self._max_output_tokens, int)
+            or self._max_output_tokens <= 0
+        ):
+            raise ValueError("Maximum output tokens must be a positive integer when configured.")
+        validate_term(
+            self._repetition_detection,
+            ("off", "client", "server", "both", "auto"),
+            "Repetition detection must be",
+        )
+        if self._repetition_penalty is not None and (
+            isinstance(self._repetition_penalty, bool)
+            or not isinstance(self._repetition_penalty, (int, float))
+            or not isfinite(self._repetition_penalty)
+            or self._repetition_penalty <= 0
+        ):
+            raise ValueError("Repetition penalty must be a finite positive number when configured.")
+        for name, value in (
+            ("minimum pattern size", self._repetition_min_pattern_size),
+            ("maximum pattern size", self._repetition_max_pattern_size),
+            ("minimum repetition count", self._repetition_min_count),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Repetition {name} must be a non-negative integer.")
+        if self._repetition_min_pattern_size > self._repetition_max_pattern_size:
+            raise ValueError("Minimum repetition pattern size cannot exceed the maximum.")
+        if self._repetition_max_pattern_size > 0 and self._repetition_min_count < 2:
+            raise ValueError("Repetition minimum count must be at least two when enabled.")
+        validate_term(
+            self._hyperparameter_policy,
+            ("fallback", "strict"),
+            "Hyperparameter policy must be",
+        )
+        validate_term(
+            self._retention_policy,
+            ("required_false", "supported_false", "provider_managed"),
+            "Retention policy must be",
         )
 
     @property
@@ -224,6 +345,7 @@ class OpenAIBackend(Backend):
                 base_url=self._base_url,
                 api_key=self._api_key,
                 max_retries=self._max_retries,
+                timeout=self._request_timeout_seconds,
             )
         return self._client
 
@@ -234,6 +356,7 @@ class OpenAIBackend(Backend):
                 base_url=self._base_url,
                 api_key=self._api_key,
                 max_retries=self._max_retries,
+                timeout=self._request_timeout_seconds,
             )
         return self._async_client
 
@@ -496,8 +619,13 @@ class OpenAIBackend(Backend):
                 self._raise_retention_error(error)
                 parameter = self._unsupported_hyperparameter(error, model, effective_request)
                 if parameter is None:
+                    parameter = self._unsupported_extension(error, model, effective_request)
+                if parameter is None:
                     raise
-                effective_request.pop(parameter)
+                if parameter in effective_request:
+                    effective_request.pop(parameter)
+                else:
+                    effective_request["extra_body"].pop(parameter)
 
     async def _create_response_async(self, request: dict[str, object], model: str) -> Any:
         """Asynchronously create a response with the synchronous fallback policy."""
@@ -511,14 +639,52 @@ class OpenAIBackend(Backend):
                 self._raise_retention_error(error)
                 parameter = self._unsupported_hyperparameter(error, model, effective_request)
                 if parameter is None:
+                    parameter = self._unsupported_extension(error, model, effective_request)
+                if parameter is None:
                     raise
-                effective_request.pop(parameter)
+                if parameter in effective_request:
+                    effective_request.pop(parameter)
+                else:
+                    effective_request["extra_body"].pop(parameter)
 
     def _retention_request(self, request: dict[str, object]) -> dict[str, object]:
         """Apply the explicitly configured provider retention capability."""
         if self._retention_policy == "provider_managed":
             return dict(request)
         return {**request, "store": False}
+
+    def _output_limit_request(self) -> dict[str, int]:
+        """Return the optional portable provider output-token limit."""
+        if self._max_output_tokens is None:
+            return {}
+        return {"max_output_tokens": self._max_output_tokens}
+
+    def _repetition_request(self, model: str) -> dict[str, object]:
+        """Return optional server extensions through the SDK extra-body mechanism."""
+        if self._repetition_detection in ("off", "client"):
+            return {}
+        unsupported = self._unsupported_extensions.get(model, set())
+        body = {}
+        if self._repetition_penalty is not None and "repetition_penalty" not in unsupported:
+            body["repetition_penalty"] = self._repetition_penalty
+        if "repetition_detection" not in unsupported:
+            body["repetition_detection"] = {
+                "min_pattern_size": self._repetition_min_pattern_size,
+                "max_pattern_size": self._repetition_max_pattern_size,
+                "min_count": self._repetition_min_count,
+            }
+        return {"extra_body": body} if body else {}
+
+    def _client_repetition_observes(self, model: str) -> bool:
+        """Return whether the portable detector should inspect this request."""
+        return self._repetition_detection in ("client", "both") or (
+            self._repetition_detection in ("server", "auto")
+            and "repetition_detection" in self._unsupported_extensions.get(model, set())
+        )
+
+    def _client_repetition_cancels(self) -> bool:
+        """Return whether an explicitly selected client policy may cancel output."""
+        return self._repetition_detection in ("client", "server", "both")
 
     def _raise_retention_error(self, error: APIStatusError) -> None:
         """Fail clearly when a no-storage requirement is rejected by the provider."""
@@ -572,6 +738,44 @@ class OpenAIBackend(Backend):
             severity="info",
             model=model,
             hyperparameter=parameter,
+        )
+        return parameter
+
+    def _unsupported_extension(
+        self,
+        error: APIStatusError,
+        model: str,
+        request: dict[str, object],
+    ) -> str | None:
+        """Cache and remove one explicitly rejected optional server extension."""
+        if error.status_code not in (400, 422):
+            return None
+        body_message = error.body.get("message") if isinstance(error.body, dict) else None
+        message = f"{error} {body_message or ''}".lower()
+        if not any(
+            marker in message
+            for marker in ("unsupported", "not supported", "unknown", "unrecognized")
+        ):
+            return None
+        body = request.get("extra_body")
+        if not isinstance(body, dict):
+            return None
+        parameter = next(
+            (
+                name
+                for name in ("repetition_detection", "repetition_penalty")
+                if name in body and name in message
+            ),
+            None,
+        )
+        if parameter is None:
+            return None
+        self._unsupported_extensions.setdefault(model, set()).add(parameter)
+        telemetry_activity(
+            "gen_ai.repetition_extension_unsupported",
+            severity="info",
+            model=model,
+            extension=parameter,
         )
         return parameter
 
@@ -670,6 +874,20 @@ class OpenAIBackend(Backend):
             translated = self._translated_error(error, operation)
             translated.response_started = response_started
             raise translated from error
+        except httpx.TimeoutException as error:
+            raise BackendTimeoutError(
+                "The provider stream was idle beyond the configured transport timeout.",
+                provider="openai",
+                operation=operation,
+                response_started=response_started,
+            ) from error
+        except httpx.HTTPError as error:
+            raise BackendConnectionError(
+                "The provider stream ended with a transport error.",
+                provider="openai",
+                operation=operation,
+                response_started=response_started,
+            ) from error
         except BackendError as error:
             error.operation = operation
             error.response_started = response_started
@@ -699,6 +917,8 @@ class OpenAIBackend(Backend):
                 "stream": stream,
                 "stream_options": {"include_usage": True},
                 "tools": serialized_tools,
+                **self._output_limit_request(),
+                **self._repetition_request(selected_model),
                 **self._hyperparameter_request_parameters(selected_model, hyperparameters),
             }
             response = self._create_response(request, selected_model)
@@ -706,17 +926,22 @@ class OpenAIBackend(Backend):
                 items = []
                 reasoning_channels = {}
                 completed = False
-                for event in response:
-                    self._trace_provider_value("gen_ai.response.stream_event", event)
-                    if completed:
-                        reason = self._invalid_completion_event(event)
-                        raise self._invalid_terminal_error(reason)
-                    translated = self._translated_stream_event(
-                        event, items, None, reasoning_channels
-                    )
-                    if any(isinstance(item, ResponseCompleted) for item in translated):
-                        completed = True
-                    yield from translated
+                watchdog = self._generation_watchdog(selected_model)
+                try:
+                    for event in response:
+                        self._trace_provider_value("gen_ai.response.stream_event", event)
+                        if completed:
+                            reason = self._invalid_completion_event(event)
+                            raise self._invalid_terminal_error(reason)
+                        translated = self._translated_stream_event(
+                            event, items, None, reasoning_channels
+                        )
+                        self._raise_watchdog_stop(watchdog.observe(translated))
+                        if any(isinstance(item, ResponseCompleted) for item in translated):
+                            completed = True
+                        yield from translated
+                finally:
+                    self._close_stream(response)
                 if not completed:
                     raise self._invalid_terminal_error("stream ended before response.completed")
                 return
@@ -738,6 +963,8 @@ class OpenAIBackend(Backend):
                     "stream": stream,
                     "stream_options": {"include_usage": True},
                     "tools": serialized_tools,
+                    **self._output_limit_request(),
+                    **self._repetition_request(selected_model),
                     **self._hyperparameter_request_parameters(selected_model, hyperparameters),
                     **self._structured_output_request(output_format, mode),
                 }
@@ -753,6 +980,8 @@ class OpenAIBackend(Backend):
                     "stream": stream,
                     "stream_options": {"include_usage": True},
                     "tools": serialized_tools,
+                    **self._output_limit_request(),
+                    **self._repetition_request(selected_model),
                     **self._hyperparameter_request_parameters(selected_model, hyperparameters),
                 }
                 response = self._create_response(request, selected_model)
@@ -760,7 +989,9 @@ class OpenAIBackend(Backend):
                 self._trace_provider_value("gen_ai.response", response)
             try:
                 events = (
-                    self._buffered_stream_events(response, output_format)
+                    self._buffered_stream_events(
+                        response, output_format, self._generation_watchdog(selected_model)
+                    )
                     if stream
                     else list(self._response_events(response, output_format))
                 )
@@ -832,6 +1063,20 @@ class OpenAIBackend(Backend):
             translated = self._translated_error(error, operation)
             translated.response_started = response_started
             raise translated from error
+        except httpx.TimeoutException as error:
+            raise BackendTimeoutError(
+                "The provider stream was idle beyond the configured transport timeout.",
+                provider="openai",
+                operation=operation,
+                response_started=response_started,
+            ) from error
+        except httpx.HTTPError as error:
+            raise BackendConnectionError(
+                "The provider stream ended with a transport error.",
+                provider="openai",
+                operation=operation,
+                response_started=response_started,
+            ) from error
         except BackendError as error:
             error.operation = operation
             error.response_started = response_started
@@ -861,6 +1106,8 @@ class OpenAIBackend(Backend):
                 "stream": stream,
                 "stream_options": {"include_usage": True},
                 "tools": serialized_tools,
+                **self._output_limit_request(),
+                **self._repetition_request(selected_model),
                 **self._hyperparameter_request_parameters(selected_model, hyperparameters),
             }
             response = await self._create_response_async(request, selected_model)
@@ -872,18 +1119,23 @@ class OpenAIBackend(Backend):
             items = []
             reasoning_channels = {}
             completed = False
-            async for event in response:
-                self._trace_provider_value("gen_ai.response.stream_event", event)
-                if completed:
-                    reason = self._invalid_completion_event(event)
-                    raise self._invalid_terminal_error(reason)
-                translated_events = self._translated_stream_event(
-                    event, items, None, reasoning_channels
-                )
-                if any(isinstance(item, ResponseCompleted) for item in translated_events):
-                    completed = True
-                for translated in translated_events:
-                    yield translated
+            watchdog = self._generation_watchdog(selected_model)
+            try:
+                async for event in response:
+                    self._trace_provider_value("gen_ai.response.stream_event", event)
+                    if completed:
+                        reason = self._invalid_completion_event(event)
+                        raise self._invalid_terminal_error(reason)
+                    translated_events = self._translated_stream_event(
+                        event, items, None, reasoning_channels
+                    )
+                    self._raise_watchdog_stop(watchdog.observe(translated_events))
+                    if any(isinstance(item, ResponseCompleted) for item in translated_events):
+                        completed = True
+                    for translated in translated_events:
+                        yield translated
+            finally:
+                await self._close_stream_async(response)
             if not completed:
                 raise self._invalid_terminal_error("stream ended before response.completed")
             return
@@ -902,6 +1154,8 @@ class OpenAIBackend(Backend):
                     "stream": stream,
                     "stream_options": {"include_usage": True},
                     "tools": serialized_tools,
+                    **self._output_limit_request(),
+                    **self._repetition_request(selected_model),
                     **self._hyperparameter_request_parameters(selected_model, hyperparameters),
                     **self._structured_output_request(output_format, mode),
                 }
@@ -917,6 +1171,8 @@ class OpenAIBackend(Backend):
                     "stream": stream,
                     "stream_options": {"include_usage": True},
                     "tools": serialized_tools,
+                    **self._output_limit_request(),
+                    **self._repetition_request(selected_model),
                     **self._hyperparameter_request_parameters(selected_model, hyperparameters),
                 }
                 response = await self._create_response_async(request, selected_model)
@@ -924,7 +1180,9 @@ class OpenAIBackend(Backend):
                 self._trace_provider_value("gen_ai.response", response)
             try:
                 events = (
-                    await self._buffered_stream_events_async(response, output_format)
+                    await self._buffered_stream_events_async(
+                        response, output_format, self._generation_watchdog(selected_model)
+                    )
                     if stream
                     else list(self._response_events(response, output_format))
                 )
@@ -1548,50 +1806,121 @@ class OpenAIBackend(Backend):
             error.usage = cls._usage(completed_response)
             raise
 
-    @classmethod
+    def _generation_watchdog(self, model: str) -> GenerationWatchdog:
+        """Return a fresh bounded-output watchdog for one streamed request."""
+        return GenerationWatchdog(
+            self._max_generation_seconds,
+            self._max_response_chars,
+            self._repetition_min_pattern_size if self._client_repetition_observes(model) else 0,
+            self._repetition_max_pattern_size if self._client_repetition_observes(model) else 0,
+            self._repetition_min_count,
+        )
+
+    def _raise_watchdog_stop(self, stop: GenerationStop | None) -> None:
+        """Handle an explicit budget or client repetition observation safely."""
+        if stop is None:
+            return
+        details = {
+            "channel": stop.channel,
+            "elapsed_seconds": stop.elapsed_seconds,
+            "generated_characters": stop.generated_characters,
+            "pattern_size": stop.pattern_size,
+            "repetition_count": stop.repetition_count,
+        }
+        if stop.reason == "repetition":
+            if not self._client_repetition_cancels():
+                telemetry_activity(
+                    "gen_ai.repetition_suspected",
+                    severity="info",
+                    channel=stop.channel,
+                    generated_characters=stop.generated_characters,
+                    pattern_size=stop.pattern_size,
+                    repetition_count=stop.repetition_count,
+                )
+                return
+            raise BackendRepetitionError(
+                "Model generation was stopped after repetitive output.",
+                provider="openai",
+                operation="stream_response",
+                details={"source": "client", **details},
+            )
+        raise BackendGenerationLimitError(
+            "Model generation exceeded a configured safety limit.",
+            provider="openai",
+            operation="stream_response",
+            details={"reason": stop.reason, **details},
+        )
+
+    @staticmethod
+    def _close_stream(response: object) -> None:
+        """Close a synchronous provider stream when its iterator is abandoned."""
+        closer = getattr(response, "close", None)
+        if callable(closer):
+            closer()
+
+    @staticmethod
+    async def _close_stream_async(response: object) -> None:
+        """Close an asynchronous provider stream when its iterator is abandoned."""
+        closer = getattr(response, "aclose", None) or getattr(response, "close", None)
+        if callable(closer):
+            result = closer()
+            if isawaitable(result):
+                await result
+
     def _buffered_stream_events(
-        cls,
+        self,
         response: Iterable[OpenAIResponseStreamEvent],
         output_format: StructuredOutputFormat,
+        watchdog: GenerationWatchdog,
     ) -> list[ResponseEvent]:
         """Buffer structured stream events until terminal validation succeeds."""
         items = []
         events = []
         reasoning_channels = {}
         completed = False
-        for provider_event in response:
-            cls._trace_provider_value("gen_ai.response.stream_event", provider_event)
-            if completed:
-                reason = cls._invalid_completion_event(provider_event)
-                raise cls._invalid_terminal_error(reason)
-            cls._buffer_event(provider_event, events, items, output_format, reasoning_channels)
-            if events and isinstance(events[-1], ResponseCompleted):
-                completed = True
+        try:
+            for provider_event in response:
+                self._trace_provider_value("gen_ai.response.stream_event", provider_event)
+                if completed:
+                    reason = self._invalid_completion_event(provider_event)
+                    raise self._invalid_terminal_error(reason)
+                previous_length = len(events)
+                self._buffer_event(provider_event, events, items, output_format, reasoning_channels)
+                self._raise_watchdog_stop(watchdog.observe(events[previous_length:]))
+                if events and isinstance(events[-1], ResponseCompleted):
+                    completed = True
+        finally:
+            self._close_stream(response)
         if not completed:
-            raise cls._invalid_terminal_error("stream ended before response.completed")
+            raise self._invalid_terminal_error("stream ended before response.completed")
         return events
 
-    @classmethod
     async def _buffered_stream_events_async(
-        cls,
+        self,
         response: AsyncIterator[OpenAIResponseStreamEvent],
         output_format: StructuredOutputFormat,
+        watchdog: GenerationWatchdog,
     ) -> list[ResponseEvent]:
         """Asynchronously buffer structured events until terminal validation succeeds."""
         items = []
         events = []
         reasoning_channels = {}
         completed = False
-        async for provider_event in response:
-            cls._trace_provider_value("gen_ai.response.stream_event", provider_event)
-            if completed:
-                reason = cls._invalid_completion_event(provider_event)
-                raise cls._invalid_terminal_error(reason)
-            cls._buffer_event(provider_event, events, items, output_format, reasoning_channels)
-            if events and isinstance(events[-1], ResponseCompleted):
-                completed = True
+        try:
+            async for provider_event in response:
+                self._trace_provider_value("gen_ai.response.stream_event", provider_event)
+                if completed:
+                    reason = self._invalid_completion_event(provider_event)
+                    raise self._invalid_terminal_error(reason)
+                previous_length = len(events)
+                self._buffer_event(provider_event, events, items, output_format, reasoning_channels)
+                self._raise_watchdog_stop(watchdog.observe(events[previous_length:]))
+                if events and isinstance(events[-1], ResponseCompleted):
+                    completed = True
+        finally:
+            await self._close_stream_async(response)
         if not completed:
-            raise cls._invalid_terminal_error("stream ended before response.completed")
+            raise self._invalid_terminal_error("stream ended before response.completed")
         return events
 
     @staticmethod
@@ -1753,6 +2082,18 @@ class OpenAIBackend(Backend):
         code = getattr(provider_error, "code", None)
         response_id = getattr(response, "id", None)
         incomplete_details = getattr(response, "incomplete_details", None)
+        terminal_reason = getattr(incomplete_details, "reason", None)
+        if terminal_reason is None and isinstance(incomplete_details, dict):
+            terminal_reason = incomplete_details.get("reason")
+        if terminal_reason == "repetition_detected":
+            return BackendRepetitionError(
+                "The provider stopped the response after repetitive output.",
+                provider="openai",
+                operation="create_response",
+                code=code if isinstance(code, str) else None,
+                request_id=response_id if isinstance(response_id, str) else None,
+                details={"source": "server", "terminal_state": status, "reason": terminal_reason},
+            )
         details = {
             "terminal_state": status,
             "error": (

@@ -4,6 +4,27 @@ import pytest
 from pydantic import ValidationError
 
 from loop.configuration import ConfigurationManager
+from loop.configuration.models import BackendSettings
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"request_timeout_seconds": float("nan")},
+        {"max_generation_seconds": float("inf")},
+        {"repetition_penalty": float("inf")},
+        {"repetition_min_pattern_size": 5, "repetition_max_pattern_size": 4},
+        {
+            "repetition_min_pattern_size": 0,
+            "repetition_max_pattern_size": 1,
+            "repetition_min_count": 0,
+        },
+    ],
+)
+def test_backend_settings_reject_nonfinite_and_incoherent_repetition_values(values):
+    """Backend settings reject finite and threshold combinations Pydantic bounds cannot express."""
+    with pytest.raises(ValidationError):
+        BackendSettings.model_validate(values)
 
 
 def test_manager_snapshots_its_configuration_path(tmp_path):

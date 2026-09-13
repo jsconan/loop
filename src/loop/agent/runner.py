@@ -8,7 +8,7 @@ from datetime import datetime
 from time import perf_counter, sleep
 
 from .. import constants
-from ..backend import Backend, BackendError, BackendNotFoundError
+from ..backend import Backend, BackendError, BackendNotFoundError, BackendRepetitionError
 from ..compaction import ContextCompaction
 from ..errors import Problem, log_problem
 from ..instructions import InstructionBudgetExceededError, InstructionsManager
@@ -529,10 +529,10 @@ class AgentRunner:
         with telemetry_span():
             return self._query()
 
-    def _query(self) -> Response:
+    def _query(self, recovery: str | None = None) -> Response:
         """Request and collect one response inside the active model-operation span."""
         selected_model = self._model_selection.effective
-        snapshot = self._instructions_manager.prepare(self._agent)
+        snapshot = self._instructions_manager.prepare(self._agent, recovery=recovery)
         self._session_manager.update_instruction_state(
             working_directory=str(snapshot.working_directory or self._working_directory),
             active_skills=list(snapshot.active_skills),
@@ -616,9 +616,13 @@ class AgentRunner:
 
     def _query_with_recovery(self) -> Response | None:
         """Request one response while escalating exhausted failures to the user."""
+        recovery = None
         while True:
             try:
-                return self.query()
+                if recovery is None:
+                    return self.query()
+                with telemetry_span():
+                    return self._query(recovery)
             except BackendNotFoundError:
                 self._interaction.warning("The selected model is not available.")
                 if not self._model_selection.select_fallback(self._interaction):
@@ -639,6 +643,13 @@ class AgentRunner:
                 self._interaction.report(problem)
                 return None
             except BackendError as error:
+                if isinstance(error, BackendRepetitionError) and recovery is None:
+                    telemetry_activity("agent.repetition_recovery", component="agent_runner")
+                    self._interaction.warning(
+                        "The model response was stopped after repetitive output. Retrying once..."
+                    )
+                    recovery = "repetition"
+                    continue
                 self._report_backend_error(error)
                 if not error.recoverable or not self._prompt_on_recoverable_error:
                     return None

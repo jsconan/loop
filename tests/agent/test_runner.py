@@ -8,6 +8,7 @@ import pytest
 
 from loop import (
     BackendConnectionError,
+    BackendRepetitionError,
     InstructionsManager,
     Interaction,
     PendingToolCall,
@@ -118,6 +119,28 @@ def test_runner_reconfigures_subsequent_runs():
     assert runner.prompt_on_recoverable_error is False
     with pytest.raises(ValueError, match="non-negative"):
         runner.max_turns = -1
+
+
+def test_runner_retries_one_detected_generation_loop_without_prompting():
+    """A stopped looping response is retried once with recovery guidance."""
+    error = BackendRepetitionError(
+        "looping", provider="test", operation="stream_response", response_started=True
+    )
+    final = Response(answer="done", reasoning="")
+    runner, _, interaction = agent_runner(responses=[error])
+    runner._query = Mock(return_value=final)
+
+    result = runner.run()
+
+    assert result.final_response is final
+    assert result.turns == 1
+    assert runner.query.call_count == 1
+    assert runner.query.call_count == 1
+    assert runner._query.call_args.args == ("repetition",)
+    interaction.confirm.assert_not_called()
+    interaction.warning.assert_called_once_with(
+        "The model response was stopped after repetitive output. Retrying once..."
+    )
 
 
 def test_runner_replaces_agent():
