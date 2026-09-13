@@ -346,22 +346,133 @@ def test_format_content_diff_shows_complete_unified_hunks():
     assert " one" in result
 
 
-def test_format_content_diff_omits_whole_hunks_at_the_preview_limit():
-    """Diff previews never include a partial hunk when their limit is reached."""
-    before = "\n".join(("first", *("same" for _ in range(10)), "last"))
-    after = "\n".join(("changed first", *("same" for _ in range(10)), "changed last"))
-    result = format_content_diff(before, after, "notes.txt", max_lines=7)
-    assert "... (2 changed hunk(s) omitted; preview limit reached)" in result
-    assert "\n@@" not in result
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [
+        ("", "+++", "1 addition(s), 0 deletion(s)"),
+        ("+++", "", "0 addition(s), 1 deletion(s)"),
+    ],
+)
+def test_format_content_diff_counts_changed_lines_with_header_like_content(before, after, expected):
+    """Diff previews count changed lines whose content resembles a diff file header."""
+    result = format_content_diff(before, after, "notes.txt")
+
+    assert result.startswith(expected)
+
+
+def test_format_content_diff_reduces_context_when_the_first_hunk_exceeds_line_limit():
+    """Diff previews retain the first complete hunk by reducing unchanged context."""
+    result = format_content_diff("one\ntwo\nthree", "one\nchanged\nthree", "notes.txt", max_lines=5)
+
+    assert "@@ -2 +2 @@" in result
+    assert "-two" in result
+    assert "+changed" in result
+    assert "change excerpt" not in result
 
 
 def test_format_content_diff_omits_later_hunks_after_a_complete_hunk():
     """Diff previews retain an included hunk when later hunks exceed the limit."""
     before = "\n".join(("first", *("same" for _ in range(10)), "last"))
     after = "\n".join(("changed first", *("same" for _ in range(10)), "changed last"))
-    result = format_content_diff(before, after, "notes.txt", max_lines=8)
+    result = format_content_diff(before, after, "notes.txt", max_lines=9)
     assert "... (1 changed hunk(s) omitted; preview limit reached)" in result
     assert result.count("\n@@") == 1
+    assert len(result.partition("\n")[2].splitlines()) <= 9
+
+
+def test_format_content_diff_omits_later_reduced_context_hunks_after_the_first():
+    """Reduced-context previews still report later hunks that do not fit."""
+    before = "\n".join(("first", *("same" for _ in range(10)), "last"))
+    after = "\n".join(("changed first", *("same" for _ in range(10)), "changed last"))
+
+    result = format_content_diff(before, after, "notes.txt", max_lines=6)
+
+    assert "@@ -1 +1 @@" in result
+    assert "... (1 changed hunk(s) omitted; preview limit reached)" in result
+
+
+def test_format_content_diff_counts_reduced_context_hunks_consistently():
+    """Reduced context reports the hunk count used by its rendered preview."""
+    before = "\n".join(("old first", *("same" for _ in range(5)), "old last"))
+    after = "\n".join(("new first", *("same" for _ in range(5)), "new last"))
+
+    result = format_content_diff(before, after, "notes.txt", max_lines=6)
+
+    assert result.startswith("2 addition(s), 2 deletion(s), 2 changed hunk(s)")
+    assert "... (1 changed hunk(s) omitted; preview limit reached)" in result
+
+
+def test_format_content_diff_shows_an_excerpt_when_changed_lines_exceed_char_limit():
+    """Oversized changed lines retain visible evidence from both versions."""
+    result = format_content_diff("a" * 200, "b" * 200, "notes.txt", max_chars=220)
+    diff_preview = result.partition("\n")[2]
+
+    assert "change excerpt; not a complete unified diff" in result
+    assert "-a" in result
+    assert "+b" in result
+    assert "chars omitted" in result
+    assert len(diff_preview) <= 220
+
+
+def test_format_content_diff_marks_tiny_changed_line_excerpts():
+    """Tight excerpt budgets retain each changed-line marker when text cannot fit."""
+    result = format_content_diff("a" * 200, "b" * 200, "notes.txt", max_chars=180)
+
+    assert "-…" in result
+    assert "+…" in result
+
+
+def test_format_content_diff_keeps_short_changed_lines_in_an_excerpt():
+    """Line-limited excerpts retain complete short changes when character space permits."""
+    before = "\n".join(f"before {index}" for index in range(6))
+    after = "\n".join(f"after {index}" for index in range(7))
+
+    result = format_content_diff(before, after, "notes.txt", max_lines=7)
+
+    assert "change excerpt; not a complete unified diff" in result
+    assert "-before 0" in result
+    assert "+after 0" in result
+    assert "chars omitted" not in result
+
+
+def test_format_content_diff_keeps_the_excerpt_bounded_when_metadata_uses_the_budget():
+    """Below the metadata floor the excerpt is trimmed to fit, keeping only the label."""
+    result = format_content_diff("a" * 200, "b" * 200, "notes.txt", max_chars=150)
+    preview = result.partition("\n")[2]
+
+    assert "change excerpt; not a complete unified diff" in result
+    assert "changed line(s)" not in result  # the omission notice cannot fit the tiny budget
+    assert len(preview) <= 150
+
+
+def test_format_content_diff_keeps_label_and_notice_when_the_budget_allows_it():
+    """A budget covering the metadata floor keeps the label and notice without content."""
+    result = format_content_diff("a" * 200, "b" * 200, "notes.txt", max_chars=160)
+    preview = result.partition("\n")[2]
+
+    assert "change excerpt; not a complete unified diff" in result
+    assert "changed line(s)" in result
+    assert len(preview) <= 160
+
+
+def test_format_content_diff_excerpt_never_exceeds_the_budget_beyond_the_header_floor():
+    """The preview is bounded by max_chars/max_lines unless it is only the file headers."""
+    before = "\n".join(f"line-{index}-alpha" for index in range(30))
+    after = "\n".join(f"line-{index}-beta" for index in range(30))
+
+    for max_chars in range(50, 130):
+        preview = format_content_diff(before, after, "notes.txt", max_chars=max_chars).partition(
+            "\n"
+        )[2]
+        if len(preview.splitlines()) > 2:
+            assert len(preview) <= max_chars
+
+    for max_lines in range(1, 8):
+        preview = format_content_diff(before, after, "notes.txt", max_lines=max_lines).partition(
+            "\n"
+        )[2]
+        if len(preview.splitlines()) > 2:
+            assert len(preview.splitlines()) <= max_lines
 
 
 def test_format_content_diff_reports_unchanged_content():

@@ -302,57 +302,178 @@ def format_content_diff(
 ) -> str:
     """Format a bounded unified diff for a file replacement preview.
 
-    Keeps complete changed hunks so the displayed preview is always valid unified-diff output.
+    Prefers complete unified-diff hunks with three lines of context. When the first hunk does not
+    fit, it reduces context down to zero; when even that cannot fit, it shows a clearly labelled
+    bounded change excerpt instead of an empty diff.
 
     Args:
         before (str): Existing UTF-8 text in the destination file.
         after (str): Replacement UTF-8 text proposed for the destination file.
         path (str): Destination path used in the diff headers.
-        max_chars (int): Maximum characters displayed, excluding the omission notice.
-        max_lines (int): Maximum lines displayed, excluding the omission notice.
+        max_chars (int): Maximum characters in the rendered diff, excluding its summary.
+        max_lines (int): Maximum lines in the rendered diff, excluding its summary.
 
     Returns:
         str: A summary and bounded unified diff, or a no-change summary.
+
+        The rendered diff never exceeds ``max_chars``/``max_lines`` unless the fixed metadata
+        (the file headers, plus the excerpt descriptor and omission notice) is itself larger
+        than the budget, in which case only the headers can remain.
     """
-    diff_lines = list(
+    diff_lines = _content_diff_lines(before, after, path, context_lines=3)
+    if not diff_lines:
+        return "No content changes."
+
+    headers = diff_lines[:2]
+    body_lines = diff_lines[2:]
+    additions = sum(line.startswith("+") for line in body_lines)
+    deletions = sum(line.startswith("-") for line in body_lines)
+    first_hunks = _content_diff_hunks(body_lines)
+
+    # Prefer complete unified-diff hunks with three lines of context. Reducing ``n`` changes
+    # each hunk's body (fewer unchanged context lines), which lets a hunk fit once the first
+    # cannot. Fall back to a bounded, labelled excerpt when no context level fits a hunk.
+    for context_lines in range(3, -1, -1):
+        hunks = (
+            first_hunks
+            if context_lines == 3
+            else _content_diff_hunks(
+                _content_diff_lines(before, after, path, context_lines=context_lines)[2:]
+            )
+        )
+        included, included_hunks = _bounded_diff_hunks(headers, hunks, max_chars, max_lines)
+        if included_hunks:
+            summary = (
+                f"{additions} addition(s), {deletions} deletion(s), {len(hunks)} changed hunk(s)"
+            )
+            omitted = len(hunks) - included_hunks
+            preview = "\n".join((summary, *included))
+            if omitted:
+                preview += f"\n... ({omitted} changed hunk(s) omitted; preview limit reached)"
+            return preview
+
+    summary = (
+        f"{additions} addition(s), {deletions} deletion(s), {len(first_hunks)} changed hunk(s)"
+    )
+    return "\n".join((summary, *_content_diff_excerpt(headers, first_hunks, max_chars, max_lines)))
+
+
+def _content_diff_lines(before: str, after: str, path: str, *, context_lines: int) -> list[str]:
+    """Return unified-diff lines with the requested amount of unchanged context."""
+    return list(
         unified_diff(
             before.splitlines(),
             after.splitlines(),
             fromfile=f"a/{path}",
             tofile=f"b/{path}",
-            n=3,
+            n=context_lines,
             lineterm="",
         )
     )
-    if not diff_lines:
-        return "No content changes."
 
-    additions = sum(line.startswith("+") and not line.startswith("+++") for line in diff_lines)
-    deletions = sum(line.startswith("-") and not line.startswith("---") for line in diff_lines)
-    headers = diff_lines[:2]
+
+def _content_diff_hunks(lines: list[str]) -> list[list[str]]:
+    """Group unified-diff body lines into complete hunks."""
     hunks = []
-    for line in diff_lines[2:]:
+    for line in lines:
         if line.startswith("@@"):
             hunks.append([line])
         else:
             hunks[-1].append(line)
+    return hunks
 
+
+def _bounded_diff_hunks(
+    headers: list[str],
+    hunks: list[list[str]],
+    max_chars: int,
+    max_lines: int,
+) -> tuple[list[str], int]:
+    """Return complete hunks that fit after the unified-diff headers.
+
+    Returns the rendered lines — the headers followed by the hunks that fit — plus the number
+    of hunks included. The rendered lines omit the trailing omission notice, which the caller
+    appends when some hunks did not fit.
+    """
     included = headers.copy()
     included_hunks = 0
-    for hunk in hunks:
+    for index, hunk in enumerate(hunks):
         candidate = [*included, *hunk]
-        if included_hunks and (len(candidate) > max_lines or len("\n".join(candidate)) > max_chars):
-            break
-        if not included_hunks and (
-            len(candidate) > max_lines or len("\n".join(candidate)) > max_chars
-        ):
+        omitted_hunks = len(hunks) - index - 1
+        omission = (
+            f"... ({omitted_hunks} changed hunk(s) omitted; preview limit reached)"
+            if omitted_hunks
+            else ""
+        )
+        rendered = [*candidate, omission] if omission else candidate
+        if len(rendered) > max_lines or len("\n".join(rendered)) > max_chars:
             break
         included = candidate
         included_hunks += 1
+    return included, included_hunks
 
-    summary = f"{additions} addition(s), {deletions} deletion(s), {len(hunks)} changed hunk(s)"
-    preview = "\n".join((summary, *included))
-    omitted_hunks = len(hunks) - included_hunks
-    if omitted_hunks:
-        preview += f"\n... ({omitted_hunks} changed hunk(s) omitted; preview limit reached)"
-    return preview
+
+def _content_diff_excerpt(
+    headers: list[str],
+    hunks: list[list[str]],
+    max_chars: int,
+    max_lines: int,
+) -> list[str]:
+    """Return a bounded, explicitly non-patch excerpt for an oversized first hunk.
+
+    The result is the preview rendered after the summary line. Changed lines are packed
+    inside the budget; when the metadata block (the file headers, descriptor, and omission
+    notice) is itself larger than ``max_chars``/``max_lines``, the least-critical metadata
+    is trimmed so the excerpt still respects the budget down to the header-only floor.
+    """
+    changed_lines = [line for hunk in hunks for line in hunk if line.startswith(("+", "-"))]
+    required = [
+        next((line for line in changed_lines if line.startswith(prefix)), None)
+        for prefix in ("-", "+")
+    ]
+    selected = list(dict.fromkeys(line for line in required if line is not None))
+    selected.extend(line for line in changed_lines if line not in selected)
+    descriptor = "... (change excerpt; not a complete unified diff)"
+    available_lines = max(0, max_lines - len(headers) - 2)
+    selected = selected[:available_lines]
+
+    def notice(omitted_lines: int) -> str:
+        return (
+            f"... ({omitted_lines} changed line(s) and {max(0, len(hunks) - 1)} later hunk(s) "
+            "omitted; preview limit reached)"
+        )
+
+    final_notice = notice(len(changed_lines) - len(selected))
+    available_chars = max_chars - len("\n".join((*headers, descriptor, final_notice)))
+    shortened = []
+    for index, line in enumerate(selected):
+        available_chars -= 1
+        remaining_lines = len(selected) - index
+        if available_chars < 2 * remaining_lines:
+            break
+        shortened_line = _truncate_diff_line(line, available_chars // remaining_lines)
+        shortened.append(shortened_line)
+        available_chars -= len(shortened_line)
+    final_notice = notice(len(changed_lines) - len(shortened))
+    block = [*headers, descriptor, *shortened, final_notice]
+
+    # Honour the requested budget even when it is smaller than the metadata floor. The
+    # omission notice is always final, so truncating from the end drops it first and then
+    # any remaining over-budget lines, degrading the preview down to the file headers.
+    while len(block) > len(headers) and (
+        len(block) > max_lines or len("\n".join(block)) > max_chars
+    ):
+        block.pop()
+    return block
+
+
+def _truncate_diff_line(line: str, max_chars: int) -> str:
+    """Return one changed line bounded by the remaining excerpt character budget."""
+    if len(line) <= max_chars:
+        return line
+    for visible_chars in range(min(len(line), max_chars), -1, -1):
+        omitted_chars = len(line) - visible_chars
+        candidate = f"{line[:visible_chars]}… ({omitted_chars} chars omitted)"
+        if len(candidate) <= max_chars:
+            return candidate
+    return f"{line[:1]}…"
