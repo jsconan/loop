@@ -149,6 +149,7 @@ class ApplicationRuntime:
             permission_manager = PermissionManager(
                 workspace.root,
                 configuration_path=workspace_paths.permissions,
+                user_configuration_path=paths.user_permissions,
                 audit_path=paths.permissions_audit,
                 workspace_id=workspace.id,
                 interaction=interaction,

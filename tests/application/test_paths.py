@@ -19,6 +19,7 @@ def test_paths_discover_independent_absolute_environment_overrides(tmp_path: Pat
 
     assert paths == ApplicationPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
     assert paths.user_configuration == tmp_path / "config" / "config.toml"
+    assert paths.user_permissions == tmp_path / "config" / "permissions.yaml"
     assert paths.workspace_catalog == tmp_path / "data" / "workspaces.db"
 
 

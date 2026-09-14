@@ -12,6 +12,7 @@ from loop import (
     PermissionConfiguration,
     ProcessTarget,
     SessionTarget,
+    UserPermissionConfiguration,
 )
 from loop.permissions import PermissionPreset
 
@@ -76,6 +77,19 @@ def test_policy_configuration_has_a_versioned_complete_default():
     assert configuration.version == 1
     assert set(configuration.defaults) == set(Action)
     assert configuration.defaults[Action.FILESYSTEM_READ] is Decision.ALLOW
+
+
+def test_user_permission_configuration_rejects_duplicate_rule_identifiers():
+    """User-wide remembered approvals cannot use ambiguous rule identifiers."""
+    with pytest.raises(ValueError, match="rule identifiers must be unique"):
+        UserPermissionConfiguration.model_validate(
+            {
+                "rules": [
+                    {"id": "same", "decision": "allow"},
+                    {"id": "same", "decision": "allow"},
+                ]
+            }
+        )
 
 
 def test_permission_presets_reject_duplicate_rule_identifiers():

@@ -182,6 +182,7 @@ __all__ = [
     "ToolStatus",
     "UnsupportedConversationItemError",
     "Usage",
+    "UserPermissionConfiguration",
     "Workspace",
     "WorkspaceNameSource",
     "WorkspaceRepository",
@@ -368,6 +369,7 @@ from .permissions import (
     ProcessTarget,
     SessionPolicyOverrides,
     SessionTarget,
+    UserPermissionConfiguration,
 )
 from .session import (
     BackendSessionNameGenerator,

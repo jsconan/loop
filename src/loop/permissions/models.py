@@ -75,6 +75,7 @@ class ApprovalChoice(StrEnum):
     ONCE = "once"
     SESSION = "session"
     WORKSPACE = "workspace"
+    USER = "user"
 
 
 class ProcessBoundary(StrEnum):
@@ -663,6 +664,38 @@ class PermissionConfiguration(BaseModel):
 
         Returns:
             PermissionConfiguration: This validated configuration.
+
+        Raises:
+            ValueError: If multiple rules use the same identifier.
+        """
+        identifiers = [rule.id for rule in self.rules]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Permission rule identifiers must be unique.")
+        return self
+
+
+class UserPermissionConfiguration(BaseModel):
+    """Store remembered exact approvals shared by every workspace.
+
+    User policy deliberately contains rules only. Application-wide defaults and enforcement limits
+    would widen authority beyond a single reviewed approval and require their own management flow.
+
+    Args:
+        version (Literal[1]): Persisted schema version.
+        rules (list[PermissionRule]): Exact user-approved operation rules.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    rules: list[PermissionRule] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_rule_ids(self) -> UserPermissionConfiguration:
+        """Require every persisted rule to have a distinct identifier.
+
+        Returns:
+            UserPermissionConfiguration: This validated configuration.
 
         Raises:
             ValueError: If multiple rules use the same identifier.

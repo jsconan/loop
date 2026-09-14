@@ -93,6 +93,15 @@ class ApplicationPaths:
         return self.configuration_root / constants.APP_CONFIGURATION_FILENAME
 
     @property
+    def user_permissions(self) -> Path:
+        """Return the user-wide remembered-permission policy path.
+
+        Returns:
+            Path: User-owned YAML policy applied in every workspace.
+        """
+        return self.configuration_root / constants.PERMISSIONS_FILENAME
+
+    @property
     def workspace_catalog(self) -> Path:
         """Return the workspace registry database.
 

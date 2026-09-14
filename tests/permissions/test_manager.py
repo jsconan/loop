@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -57,15 +57,16 @@ def test_shutdown_cleanup_releases_live_manager_temporary_directories():
 
 
 @pytest.mark.parametrize(
-    ("workspace_available", "selection", "expected", "workspace_label"),
+    ("workspace_available", "user_available", "selection", "expected", "workspace_label"),
     [
-        (True, ApprovalChoice.WORKSPACE, ApprovalChoice.WORKSPACE, True),
-        (False, ApprovalChoice.SESSION, ApprovalChoice.SESSION, False),
-        (True, False, ApprovalChoice.DENY, True),
+        (True, True, ApprovalChoice.WORKSPACE, ApprovalChoice.WORKSPACE, True),
+        (False, False, ApprovalChoice.SESSION, ApprovalChoice.SESSION, False),
+        (True, True, False, ApprovalChoice.DENY, True),
     ],
 )
 def test_request_permission_offers_valid_scopes_and_fails_closed(
     workspace_available,
+    user_available,
     selection,
     expected,
     workspace_label,
@@ -76,7 +77,10 @@ def test_request_permission_offers_valid_scopes_and_fails_closed(
     interaction.prompt.return_value = selection
     recorder = Mock()
     manager = PermissionManager(
-        tmp_path if workspace_available else None, interaction=interaction, recorder=recorder
+        tmp_path if workspace_available else None,
+        user_configuration_path=tmp_path / "user.yaml" if user_available else None,
+        interaction=interaction,
+        recorder=recorder,
     )
 
     result = manager.request_permission(
@@ -87,13 +91,16 @@ def test_request_permission_offers_valid_scopes_and_fails_closed(
     assert result is expected
     choices = interaction.prompt.call_args.kwargs["choices"]
     assert (ApprovalChoice.WORKSPACE in choices) is workspace_label
+    assert (ApprovalChoice.USER in choices) is user_available
 
 
 def test_request_permission_forwards_index_map_to_prompt(tmp_path):
     """Permission prompts forward short letter indexes to the generic prompt layer."""
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = ApprovalChoice.ONCE
-    manager = PermissionManager(tmp_path, interaction=interaction)
+    manager = PermissionManager(
+        tmp_path, user_configuration_path=tmp_path / "user.yaml", interaction=interaction
+    )
 
     manager.request_permission("Approve?")
 
@@ -102,6 +109,9 @@ def test_request_permission_forwards_index_map_to_prompt(tmp_path):
     assert index[ApprovalChoice.DENY] == "N"
     assert index[ApprovalChoice.ONCE] == "Y"
     assert index[ApprovalChoice.SESSION] == "S"
+    assert index[ApprovalChoice.USER] == "U"
+    interaction.info.assert_called_once_with("Approve?")
+    assert interaction.prompt.call_args.args[0] == "Proceed?"
 
 
 def test_request_permission_includes_workspace_index_when_configured(tmp_path):
@@ -114,6 +124,140 @@ def test_request_permission_includes_workspace_index_when_configured(tmp_path):
 
     index = interaction.prompt.call_args.kwargs["index"]
     assert index[ApprovalChoice.WORKSPACE] == "W"
+
+
+def test_request_permission_displays_details_before_choices_and_proceed_prompt(tmp_path):
+    """Permission details precede the approval catalog and its final input prompt."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    calls = Mock()
+    calls.attach_mock(interaction.info, "info")
+    calls.attach_mock(interaction.prompt, "prompt")
+    manager = PermissionManager(tmp_path, interaction=interaction)
+
+    manager.request_permission("Approve these operations?")
+
+    assert calls.mock_calls[0] == call.info("Approve these operations?")
+    assert calls.mock_calls[1].args == ("Proceed?",)
+
+
+def test_user_approval_persists_across_workspace_managers(tmp_path):
+    """A remembered user approval authorizes its exact operation in another workspace."""
+    user_path = tmp_path / "user" / "permissions.yaml"
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.USER
+    requested = operation(
+        Action.NETWORK_REQUEST,
+        target=NetworkTarget(url="https://example.com/api", origin="https://example.com"),
+    )
+    first = PermissionManager(
+        first_workspace, user_configuration_path=user_path, interaction=interaction
+    )
+
+    approved = first.authorize((requested,))
+    second = PermissionManager(second_workspace, user_configuration_path=user_path)
+
+    assert approved.decision is Decision.ALLOW
+    assert approved.approval_choice is ApprovalChoice.USER
+    assert approved.installed_rule_ids
+    assert second.evaluate((requested,)).decision is Decision.ALLOW
+    assert len(second.user_rules) == 1
+
+
+def test_workspace_deny_overrides_a_matching_user_approval(tmp_path):
+    """A workspace-local denial remains stronger than a user-wide exact allow rule."""
+    user_path = tmp_path / "user" / "permissions.yaml"
+    requested = operation(
+        Action.NETWORK_REQUEST,
+        target=NetworkTarget(url="https://example.com/api", origin="https://example.com"),
+    )
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.USER
+    approving = PermissionManager(
+        tmp_path / "first", user_configuration_path=user_path, interaction=interaction
+    )
+    approving.authorize((requested,))
+    denying = PermissionManager(
+        tmp_path / "second",
+        user_configuration_path=user_path,
+        configuration=PermissionConfiguration(
+            rules=[
+                PermissionRule(
+                    decision=Decision.DENY,
+                    tool=requested.tool_id,
+                    tool_exact=True,
+                    action=requested.action,
+                    target=requested.target,
+                )
+            ]
+        ),
+    )
+
+    result = denying.evaluate((requested,))
+
+    assert result.decision is Decision.DENY
+    assert result.sources[0].startswith("rule:workspace:")
+
+
+def test_invalid_user_policy_is_ignored_without_being_replaced(tmp_path):
+    """Invalid user approvals fail closed and remain available for manual repair."""
+    user_path = tmp_path / "user" / "permissions.yaml"
+    user_path.parent.mkdir()
+    user_path.write_text("version: invalid\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+
+    manager = PermissionManager(
+        tmp_path / "workspace", user_configuration_path=user_path, interaction=interaction
+    )
+
+    assert not manager.user_rules
+    assert user_path.read_text(encoding="utf-8") == "version: invalid\n"
+    interaction.report.assert_called_once()
+    interaction.warning.assert_called_once_with(
+        "Ignoring user-wide approvals until the policy is fixed."
+    )
+
+
+def test_invalid_user_policy_raises_in_strict_mode(tmp_path):
+    """Strict loading exposes an invalid user policy instead of applying any approval."""
+    user_path = tmp_path / "user" / "permissions.yaml"
+    user_path.parent.mkdir()
+    user_path.write_text("version: invalid\n", encoding="utf-8")
+
+    with pytest.raises(PermissionConfigurationError, match="permissions.yaml"):
+        PermissionManager(tmp_path / "workspace", user_configuration_path=user_path)
+
+
+def test_invalid_user_policy_reports_without_interaction_in_automatic_mode(tmp_path):
+    """Automatic loading logs and ignores invalid user approvals in a headless process."""
+    user_path = tmp_path / "user" / "permissions.yaml"
+    user_path.parent.mkdir()
+    user_path.write_text("version: invalid\n", encoding="utf-8")
+
+    manager = PermissionManager(
+        tmp_path / "workspace",
+        user_configuration_path=user_path,
+        load_policy=PermissionLoadPolicy.AUTO,
+    )
+
+    assert not manager.user_rules
+
+
+def test_unavailable_user_approval_fails_closed(tmp_path, monkeypatch):
+    """An unavailable user policy path cannot authorize a spoofed user selection."""
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    monkeypatch.setattr(manager, "request_permission", Mock(return_value=ApprovalChoice.USER))
+
+    result = manager.authorize((file_operation(Action.FILESYSTEM_CREATE, tmp_path / "new.txt"),))
+
+    assert result.decision is Decision.DENY
+    assert result.approval_choice is ApprovalChoice.DENY
+    assert manager.user_configuration_path is None
 
 
 def test_default_policy_allows_scoped_reads_and_fails_closed_for_approval(tmp_path):
@@ -1381,7 +1525,7 @@ def test_process_target_display_resolves_local_paths_to_workspace_virtual_paths(
     )
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
-    prompt = interaction.prompt.call_args.args[0]
+    prompt = interaction.info.call_args.args[0]
     assert "cat /workspace/README.md" in prompt
     assert "(cwd: /workspace/src/loop)" in prompt
     assert "../" not in prompt
@@ -1406,7 +1550,7 @@ def test_process_target_display_preserves_workspace_relative_argv(tmp_path):
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
-    assert "cat README.md (cwd: /workspace)" in interaction.prompt.call_args.args[0]
+    assert "cat README.md (cwd: /workspace)" in interaction.info.call_args.args[0]
 
 
 def test_process_target_display_preserves_argument_boundaries(tmp_path):
@@ -1428,7 +1572,7 @@ def test_process_target_display_preserves_argument_boundaries(tmp_path):
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
-    assert "tool 'a b' (cwd: /workspace)" in interaction.prompt.call_args.args[0]
+    assert "tool 'a b' (cwd: /workspace)" in interaction.info.call_args.args[0]
 
 
 def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
@@ -1452,5 +1596,5 @@ def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
-    prompt = interaction.prompt.call_args.args[0]
+    prompt = interaction.info.call_args.args[0]
     assert "/tmp/output.log" in prompt

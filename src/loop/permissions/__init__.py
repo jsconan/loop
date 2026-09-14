@@ -38,6 +38,7 @@ __all__ = [
     "SQLitePermissionAudit",
     "SessionPolicyOverrides",
     "SessionTarget",
+    "UserPermissionConfiguration",
 ]
 
 from .audit import SQLitePermissionAudit
@@ -78,4 +79,5 @@ from .models import (
     ProcessTarget,
     SessionPolicyOverrides,
     SessionTarget,
+    UserPermissionConfiguration,
 )

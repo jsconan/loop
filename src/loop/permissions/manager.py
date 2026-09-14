@@ -60,6 +60,7 @@ from .models import (
     ProcessTarget,
     SessionPolicyOverrides,
     SessionTarget,
+    UserPermissionConfiguration,
 )
 
 if TYPE_CHECKING:
@@ -98,6 +99,8 @@ class PermissionManager:
         workspace_root (Path | str | None): Workspace used to resolve policy root tokens.
         configuration_path (Path | str | None): YAML policy path. Defaults to
             <workspace_root>/.loop/permissions.yaml when a workspace is supplied.
+        user_configuration_path (Path | str | None): User-wide remembered-approval YAML path.
+            User scope is unavailable when omitted.
         audit_path (Path | str | None): Central SQLite audit database path.
         workspace_id (str | None): Stable identity attached to centralized audit records.
         interaction (Interaction | None): User interaction used for approval prompts.
@@ -118,9 +121,11 @@ class PermissionManager:
 
     _workspace_root: Path | None
     _configuration_path: Path | None
+    _user_configuration_path: Path | None
     _interaction: Interaction | None
     _recorder: PermissionRecorder | None
     _configuration: PermissionConfiguration
+    _user_configuration: UserPermissionConfiguration
     _load_policy: PermissionLoadPolicy
     _session_overrides: SessionPolicyOverrides
     _temporary_directory: tempfile.TemporaryDirectory[str]
@@ -134,6 +139,7 @@ class PermissionManager:
         workspace_root: Path | str | None = None,
         *,
         configuration_path: Path | str | None = None,
+        user_configuration_path: Path | str | None = None,
         audit_path: Path | str | None = None,
         workspace_id: str | None = None,
         interaction: Interaction | None = None,
@@ -158,6 +164,11 @@ class PermissionManager:
                 if self._workspace_root is not None
                 else None
             )
+            self._user_configuration_path = (
+                Path(user_configuration_path).expanduser().resolve()
+                if user_configuration_path is not None
+                else None
+            )
             self._workspace_id = workspace_id
             self._audit_store = (
                 SQLitePermissionAudit(audit_path) if audit_path is not None else None
@@ -174,6 +185,8 @@ class PermissionManager:
             self._configuration = configuration or PermissionConfiguration()
             if configuration is None:
                 self._load_configuration()
+            self._user_configuration = UserPermissionConfiguration()
+            self._load_user_configuration()
             self._session_overrides = SessionPolicyOverrides()
             builtin_presets = self._load_presets()
             catalog = (*builtin_presets, *(presets or ()))
@@ -244,6 +257,15 @@ class PermissionManager:
         return self._configuration_path
 
     @property
+    def user_configuration_path(self) -> Path | None:
+        """Return the user-wide remembered-approval policy path.
+
+        Returns:
+            Path | None: YAML path, or None when user-wide approvals are unavailable.
+        """
+        return self._user_configuration_path
+
+    @property
     def temporary_directory(self) -> Path:
         """Return the manager-owned scratch directory allowed by ``loop-temp``.
 
@@ -298,6 +320,15 @@ class PermissionManager:
         return tuple(rule.model_copy(deep=True) for rule in self._configuration.rules)
 
     @property
+    def user_rules(self) -> tuple[PermissionRule, ...]:
+        """Return user-wide remembered approval rules in display order.
+
+        Returns:
+            tuple[PermissionRule, ...]: Immutable snapshot of user-wide rules.
+        """
+        return tuple(rule.model_copy(deep=True) for rule in self._user_configuration.rules)
+
+    @property
     def session_rules(self) -> tuple[PermissionRule, ...]:
         """Return process-local policy rules in display order.
 
@@ -348,9 +379,10 @@ class PermissionManager:
                 reason = "Approval is required but no interactive user is available."
                 source = "headless"
             else:
-                prompt = self._prompt(operations)
+                prompt_body = self._prompt(operations)
+                prompt = f"{prompt_body}\nProceed?"
                 selected = self.request_permission(
-                    prompt,
+                    prompt_body,
                     interaction=active_interaction,
                 )
                 approval_choice = (
@@ -364,16 +396,25 @@ class PermissionManager:
                     approval_choice = ApprovalChoice.DENY
                     decision = Decision.DENY
                     reason = "Workspace approval is unavailable without a workspace policy path."
+                if approval_choice is ApprovalChoice.USER and self._user_configuration_path is None:
+                    approval_choice = ApprovalChoice.DENY
+                    decision = Decision.DENY
+                    reason = "User approval is unavailable without a user policy path."
                 if approval_choice is not ApprovalChoice.DENY:
                     decision = Decision.ALLOW
                     reason = f"Approved by the user with {approval_choice.value} scope."
-                    if approval_choice in {ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE}:
-                        scope = PolicyScope(approval_choice.value)
+                    if approval_choice in {
+                        ApprovalChoice.SESSION,
+                        ApprovalChoice.WORKSPACE,
+                        ApprovalChoice.USER,
+                    }:
                         try:
-                            installed_rule_ids = self._remember_approval(operations, scope=scope)
+                            installed_rule_ids = self._remember_approval(
+                                operations, scope=approval_choice
+                            )
                         except OSError as exc:
                             decision = Decision.DENY
-                            reason = f"Could not persist the approved workspace policy: {exc}"
+                            reason = f"Could not persist the approved permission policy: {exc}"
                             source = "persistence"
                 elif reason == policy.reason:
                     decision = Decision.DENY
@@ -439,9 +480,13 @@ class PermissionManager:
         if self._configuration_path is not None:
             choices[ApprovalChoice.WORKSPACE] = "Allow in this workspace"
             index[ApprovalChoice.WORKSPACE] = "W"
+        if self._user_configuration_path is not None:
+            choices[ApprovalChoice.USER] = "Always allow for this user"
+            index[ApprovalChoice.USER] = "U"
         active_interaction = interaction if interaction is not None else self._interaction
+        active_interaction.info(prompt)
         selected = active_interaction.prompt(
-            prompt,
+            "Proceed?",
             exit_commands=None,
             choices=choices,
             index=index,
@@ -452,10 +497,15 @@ class PermissionManager:
         self,
         operations: Operations,
         *,
-        scope: PolicyScope,
+        scope: ApprovalChoice,
     ) -> tuple[str, ...]:
         """Install exact, deduplicated allow rules for one approved operation set."""
-        existing = (*self._configuration.rules, *self._session_overrides.rules)
+        if scope is ApprovalChoice.USER:
+            existing = self._user_configuration.rules
+        elif scope is ApprovalChoice.WORKSPACE:
+            existing = self._configuration.rules
+        else:
+            existing = self._session_overrides.rules
         additions = []
         for operation in operations:
             target = self._approval_target(operation.target)
@@ -478,7 +528,11 @@ class PermissionManager:
                     description=f"Approved interactively for this {scope.value}.",
                 )
             )
-        if scope is PolicyScope.WORKSPACE:
+        if scope is ApprovalChoice.USER:
+            updated = self._user_configuration.model_copy(deep=True)
+            updated.rules.extend(additions)
+            self._replace_user_configuration(updated)
+        elif scope is ApprovalChoice.WORKSPACE:
             updated = self._configuration.model_copy(deep=True)
             updated.rules.extend(additions)
             self._replace_configuration(updated)
@@ -867,7 +921,9 @@ class PermissionManager:
             PermissionConfigurationError: If loading fails in strict mode.
             ShutdownRequested: If the user exits interactive recovery.
         """
-        return self._load_configuration(retain_on_failure=True)
+        result = self._load_configuration(retain_on_failure=True)
+        self._load_user_configuration()
+        return result
 
     def reset_configuration(self) -> Path | None:
         """Archive an invalid workspace policy and replace it with supervised defaults.
@@ -943,18 +999,29 @@ class PermissionManager:
     def _persist(self, configuration: PermissionConfiguration) -> None:
         if self._configuration_path is None:
             raise ValueError("An in-memory PermissionManager cannot persist configuration.")
-        self._configuration_path.parent.mkdir(parents=True, exist_ok=True)
+        self._persist_configuration(self._configuration_path, configuration)
+
+    @staticmethod
+    def _persist_configuration(
+        path: Path,
+        configuration: PermissionConfiguration | UserPermissionConfiguration,
+    ) -> None:
+        """Atomically persist one validated permission configuration to its owning path."""
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = configuration.model_dump(mode="json")
-        temporary_path = self._configuration_path.with_suffix(
-            self._configuration_path.suffix + ".tmp"
-        )
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
         temporary_path.write_text(yaml.safe_dump(payload, sort_keys=False), "utf-8")
-        temporary_path.replace(self._configuration_path)
+        temporary_path.replace(path)
 
     def _replace_configuration(self, configuration: PermissionConfiguration) -> None:
         """Persist and activate one workspace policy transactionally."""
         self._persist(configuration)
         self._configuration = configuration
+
+    def _replace_user_configuration(self, configuration: UserPermissionConfiguration) -> None:
+        """Persist and activate one user-wide remembered-approval policy transactionally."""
+        self._persist_configuration(self._user_configuration_path, configuration)
+        self._user_configuration = configuration
 
     def _rules_for_scope(self, scope: PolicyScope) -> tuple[PermissionRule, ...]:
         """Return deep-copied rules from one exact policy layer."""
@@ -1146,6 +1213,26 @@ class PermissionManager:
         except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
             raise PermissionConfigurationError(self._configuration_path, str(exc)) from exc
 
+    def _read_user_configuration(self) -> UserPermissionConfiguration:
+        """Read and validate the user-wide approval policy without changing active state."""
+        if self._user_configuration_path is None or not self._user_configuration_path.exists():
+            return UserPermissionConfiguration()
+        try:
+            payload = yaml.safe_load(self._user_configuration_path.read_text("utf-8"))
+            return UserPermissionConfiguration.model_validate(payload or {})
+        except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+            raise PermissionConfigurationError(self._user_configuration_path, str(exc)) from exc
+
+    def _load_user_configuration(self) -> None:
+        """Load user-wide approvals and fail closed if their file is invalid."""
+        try:
+            self._user_configuration = self._read_user_configuration()
+        except PermissionConfigurationError as exc:
+            if self._load_policy is PermissionLoadPolicy.ERROR:
+                raise
+            self._user_configuration = UserPermissionConfiguration()
+            self._report_user_configuration_error(exc)
+
     def _load_configuration(
         self,
         *,
@@ -1240,6 +1327,22 @@ class PermissionManager:
         else:
             _LOGGER.warning("Recovered according to the automatic permission policy")
 
+    def _report_user_configuration_error(self, error: PermissionConfigurationError) -> None:
+        """Report an invalid user approval policy while retaining fail-closed behavior."""
+        problem = Problem.from_exception(
+            error,
+            code="permission.user_configuration_invalid",
+            title="Invalid user permission policy",
+            operation="load_user_permission_policy",
+            metadata={"path": error.path},
+        )
+        log_problem(_LOGGER, problem, error)
+        if self._interaction is not None:
+            self._interaction.report(problem)
+            self._interaction.warning("Ignoring user-wide approvals until the policy is fixed.")
+        else:
+            _LOGGER.warning("Ignoring invalid user-wide approval policy")
+
     def _load_presets(self) -> tuple[PermissionPreset, ...]:
         """Load presets and completely handle invalid catalog artifacts."""
         presets, failures = PermissionPreset.load_builtin_presets()
@@ -1264,12 +1367,17 @@ class PermissionManager:
         if boundary is not None:
             return boundary
         matching = [
-            (PolicyScope.WORKSPACE, rule)
-            for rule in self._configuration.rules
+            (ApprovalChoice.USER.value, rule)
+            for rule in self._user_configuration.rules
             if self._matches(rule, operation)
         ]
         matching.extend(
-            (PolicyScope.SESSION, rule)
+            (ApprovalChoice.WORKSPACE.value, rule)
+            for rule in self._configuration.rules
+            if self._matches(rule, operation)
+        )
+        matching.extend(
+            (ApprovalChoice.SESSION.value, rule)
             for rule in self._session_overrides.rules
             if self._matches(rule, operation)
         )
@@ -1302,7 +1410,7 @@ class PermissionManager:
                 return PolicyDecision(
                     decision=decision,
                     reason=f"Matched explicit {decision.value} policy rule(s).",
-                    sources=tuple(f"rule:{scope.value}:{rule.id}" for scope, rule in determining),
+                    sources=tuple(f"rule:{scope}:{rule.id}" for scope, rule in determining),
                 )
         session_decision = self._session_overrides.defaults.get(operation.action)
         decision = session_decision or self._configuration.defaults.get(
@@ -1488,7 +1596,6 @@ class PermissionManager:
                 f"{operation.action.icon} {operation.tool_id}: "
                 f"{operation.action.value}{target}{reason}"
             )
-        lines.append("Proceed?")
         return "\n".join(lines)
 
     def _display_resource(self, operation: Operation) -> str | None:
