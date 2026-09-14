@@ -14,7 +14,7 @@ from ..instructions.models import (
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, Operation, OperationPlan, SessionTarget
 from ..tooling import ToolContext, tool
-from ..utils import PathAliases
+from ..utils import VirtualPath
 
 _FIELDS_BY_NAME = {
     "activate": ("name", "status", "instructions_updated", "skill_root"),
@@ -58,7 +58,7 @@ def _public_result(action: str, result: SkillOperationResult) -> PublicSkillOper
         }
     public = _filter_fields(result, _FIELDS_BY_NAME[action])
     if action == "activate":
-        public["skill_root"] = f"{PathAliases.SKILL_PREFIX}{result['name']}/"
+        public["skill_root"] = f"{VirtualPath.SKILLS}/{result['name']}"
     return public
 
 

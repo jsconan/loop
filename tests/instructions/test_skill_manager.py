@@ -80,7 +80,8 @@ def test_activated_skills_returns_immutable_discovery_ordered_snapshot(tmp_path)
     write_skill(skills_directory / "second", "second", "Second skill.")
     manager = SkillManager.discover(tmp_path, [skills_directory])
 
-    assert manager.activated_skills == ()
+    assert not manager.activated_skills
+    assert not manager.activated_locations
 
     manager.activate("second")
     manager.activate("first")
@@ -91,6 +92,10 @@ def test_activated_skills_returns_immutable_discovery_ordered_snapshot(tmp_path)
         "Instructions",
         "Instructions",
     )
+    assert manager.activated_locations == {
+        "first": (skills_directory / "first").resolve(),
+        "second": (skills_directory / "second").resolve(),
+    }
     assert manager.active_identities == (
         ("first", str((skills_directory / "first" / "SKILL.md").resolve())),
         ("second", str((skills_directory / "second" / "SKILL.md").resolve())),
@@ -144,7 +149,8 @@ def test_deactivate_reports_unknown_names_and_deactivate_all_clears_every_skill(
     assert manager.deactivate_all() == 0
 
     assert manager.activated == 0
-    assert manager.activated_skills == ()
+    assert not manager.activated_skills
+    assert not manager.activated_locations
 
 
 def test_restore_owns_identity_matching_and_lifecycle_diagnostics(tmp_path):

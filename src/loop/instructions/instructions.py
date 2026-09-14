@@ -10,7 +10,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Self
 
 from .. import constants
-from ..utils import PathAliases, sha256_digest
+from ..utils import VirtualPath, sha256_digest
 from .models import (
     AgentInstructionsSource,
     CapturedInstruction,
@@ -276,21 +276,25 @@ class InstructionsManager:
             return True
 
     @property
-    def path_aliases(self) -> PathAliases:
-        """Return current logical roots for metadata and declared tool path arguments.
+    def virtual_paths(self) -> VirtualPath:
+        """Return current model-visible roots for metadata and declared tool path arguments.
 
         Returns:
-            PathAliases: Workspace, scratch and active-skill roots reconstructed from local state.
+            VirtualPath: Workspace, temporary, and active-skill roots reconstructed from local
+                state.
         """
-        roots = {}
-        if self._runtime_environment is not None:
-            roots[PathAliases.WORKSPACE_PREFIX] = self._runtime_environment.working_directory
-            roots[PathAliases.SCRATCH_PREFIX] = self._runtime_environment.temporary_directory
-        roots.update(
-            (f"skill:{skill.name}/", skill.location.parent)
-            for skill in self._skill_manager.activated_skills
+        environment = self._runtime_environment
+        if environment is None:
+            workspace = None
+            temporary_directory = None
+        else:
+            workspace = environment.working_directory
+            temporary_directory = environment.temporary_directory
+        return VirtualPath(
+            workspace=workspace,
+            temporary_directory=temporary_directory,
+            skill_roots=self._skill_manager.activated_locations,
         )
-        return PathAliases(roots)
 
     def list_skills(self) -> ManagedSkillListResult:
         """Return available skills and activation diagnostics.

@@ -66,7 +66,7 @@ def test_activate_skill_loads_matching_instructions_with_a_single_argument(tmp_p
         "name": "example",
         "status": "activated",
         "instructions_updated": True,
-        "skill_root": "skill:example/",
+        "skill_root": "/skills/example",
     }
     assert definition.description == "Load matching skill instructions before beginning task work."
     assert set(definition.parameters["properties"]) == {"name"}
@@ -184,7 +184,7 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
         "name": "example",
         "status": "activated",
         "instructions_updated": True,
-        "skill_root": "skill:example/",
+        "skill_root": "/skills/example",
     }
     assert resources == {
         "name": "example",

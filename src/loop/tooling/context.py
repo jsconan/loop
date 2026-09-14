@@ -73,6 +73,20 @@ class ToolContext:
         if self.instructions_manager is not None:
             self.instructions_manager.invalidate(path)
 
+    def display_path(self, path: Path | str) -> str:
+        """Return a model-safe display form for one resolved local path.
+
+        Args:
+            path (Path | str): Local path used by the tool implementation.
+
+        Returns:
+            str: Logical or virtual path when instruction management is available.
+        """
+        rendered = str(path)
+        if self.instructions_manager is not None:
+            return self.instructions_manager.virtual_paths.display(rendered)
+        return rendered
+
     def confirm(self, message: str, *, default: bool = False) -> bool:
         """Ask the user to confirm an action through the interaction service.
 

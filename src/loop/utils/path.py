@@ -2,7 +2,7 @@
 
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from pathspec import GitIgnoreSpec
 
@@ -10,84 +10,98 @@ from .. import constants
 from .models import IgnoreRule, IgnoreRules
 
 
-class PathAliases:
-    """Translate declared local path fields without rewriting execution content.
+class VirtualPath:
+    """Translate a fixed model-visible filesystem into local execution paths.
 
     Args:
-        roots (Mapping[str, Path]): Stable logical prefixes mapped to authorized local roots.
-            Aliases identify locations; they never grant permission to access them.
+        workspace (Path | None): Local directory represented as ``/workspace``.
+        temporary_directory (Path | None): Local directory represented as ``/tmp``.
+        skill_roots (Mapping[str, Path]): Skill resource directories represented below
+            ``/skills/<name>``.
+
+    Virtual paths are a typed tool-interface protocol, not shell aliases. Callers resolve them
+    before a filesystem operation or a process ``cwd`` is planned. Command arguments remain opaque
+    and should use relative paths from the selected virtual working directory.
     """
 
-    WORKSPACE_PREFIX = "workspace:/"
-    SCRATCH_PREFIX = "scratch:/"
-    SKILL_PREFIX = "skill:"
+    WORKSPACE = "/workspace"
+    TEMPORARY = "/tmp"
+    SKILLS = "/skills"
+    EXTERNAL = "<external>"
 
     _roots: dict[str, Path]
 
-    def __init__(self, roots: Mapping[str, Path]) -> None:
-        self._roots = {prefix: root.absolute() for prefix, root in roots.items()}
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        temporary_directory: Path | None = None,
+        skill_roots: Mapping[str, Path] | None = None,
+    ) -> None:
+        roots = {}
+        if workspace is not None:
+            roots[self.WORKSPACE] = workspace.absolute()
+        if temporary_directory is not None:
+            roots[self.TEMPORARY] = temporary_directory.absolute()
+        roots.update(
+            (f"{self.SKILLS}/{name}", root.absolute()) for name, root in (skill_roots or {}).items()
+        )
+        self._roots = roots
 
     def resolve(self, value: str) -> str:
-        """Resolve a logical path before normal operation planning and authorization.
+        """Resolve one virtual or workspace-relative path for local execution.
 
         Args:
-            value (str): A declared path argument, logical or native.
+            value (str): Model-supplied virtual or workspace-relative path.
 
         Returns:
-            str: Native lexical path, preserving leaf symlinks for mutation planners.
+            str: Local lexical path, preserving leaf symlinks for mutation planners.
 
         Raises:
-            ValueError: If a logical path escapes its root or uses an unavailable alias.
+            ValueError: The path is outside a configured virtual root or escapes its root.
         """
-        for prefix, root in self._roots.items():
-            if value.startswith(prefix):
-                suffix = value[len(prefix) :]
-                candidate = Path(os.path.abspath(root / suffix))
-                if not candidate.is_relative_to(root):
-                    raise ValueError("Logical path escapes its root.")
-                return str(candidate)
-
-        if value.startswith((self.WORKSPACE_PREFIX, self.SCRATCH_PREFIX, self.SKILL_PREFIX)):
-            raise ValueError("Logical path root is unavailable.")
-
-        if not Path(value).is_absolute() and self.WORKSPACE_PREFIX in self._roots:
-            root = self._roots[self.WORKSPACE_PREFIX]
-            candidate = Path(os.path.abspath(root / value))
-            if not candidate.is_relative_to(root):
-                raise ValueError("Relative path escapes workspace root.")
-            return str(candidate)
-
-        return value
+        if not value or "//" in value:
+            raise ValueError("Path must be a virtual or workspace-relative path.")
+        if value.startswith(("workspace:", "scratch:", "skill:")):  # Detect deprecated path aliases
+            raise ValueError("Path aliases are not supported; use a VirtualPath.")
+        if value.startswith("/"):
+            for virtual_root, local_root in self._roots.items():
+                if value == virtual_root or value.startswith(f"{virtual_root}/"):
+                    return self._local_path(local_root, value[len(virtual_root) :].lstrip("/"))
+            raise ValueError("Absolute paths must be inside a configured virtual root.")
+        workspace = self._roots.get(self.WORKSPACE)
+        if workspace is None:
+            raise ValueError("Workspace-relative paths require a configured workspace.")
+        return self._local_path(workspace, value)
 
     def display(self, value: str) -> str:
-        """Return a stable logical name for one native metadata path.
+        """Render a local path without disclosing configured host roots.
 
         Args:
-            value (str): Native path metadata; relative or unmatched paths remain unchanged.
+            value (str): Local path or relative metadata path.
 
         Returns:
-            str: Logical path when a declared root contains the value.
+            str: Virtual path, unchanged relative path, or ``<external>``.
         """
         path = Path(value)
-        for prefix, root in sorted(
+        if not path.is_absolute():
+            return value
+        for virtual_root, local_root in sorted(
             self._roots.items(), key=lambda pair: len(str(pair[1])), reverse=True
         ):
-            if path.is_relative_to(root):
-                relative = path.relative_to(root).as_posix()
-                if prefix == self.WORKSPACE_PREFIX:
-                    return relative
-                return prefix + ("" if relative == "." else relative)
-        return value
+            if path.is_relative_to(local_root):
+                relative = path.relative_to(local_root).as_posix()
+                return virtual_root if relative == "." else f"{virtual_root}/{relative}"
+        return self.EXTERNAL
 
     def metadata(self, value: object, fields: tuple[tuple[str, ...], ...]) -> object:
-        """Minimize only tool-declared local path fields in structured results.
+        """Render declared local metadata fields as virtual paths.
 
         Args:
             value (object): Parsed tool result or reference metadata.
             fields (tuple[tuple[str, ...], ...]): Declared key paths; ``"*"`` selects list items.
 
         Returns:
-            object: Copy with declared metadata path values represented logically.
+            object: Copy with declared metadata path values represented virtually.
         """
 
         def rewrite(item: object, path: tuple[str, ...]) -> object:
@@ -104,6 +118,29 @@ class PathAliases:
         for field in fields:
             prepared = rewrite(prepared, field)
         return prepared
+
+    def redact(self, value: str) -> str:
+        """Replace configured local roots in implementation-generated text.
+
+        Args:
+            value (str): Diagnostic text that may include one declared root.
+
+        Returns:
+            str: Text with configured local roots represented virtually.
+        """
+        for prefix, root in sorted(
+            self._roots.items(), key=lambda pair: len(str(pair[1])), reverse=True
+        ):
+            value = value.replace(str(root), prefix)
+        return value
+
+    @staticmethod
+    def _local_path(root: Path, suffix: str) -> str:
+        """Join one virtual suffix to its local root without allowing traversal."""
+        if ".." in PurePosixPath(suffix).parts:
+            raise ValueError("Virtual path escapes its root.")
+        candidate = Path(os.path.abspath(root / suffix))
+        return str(candidate)
 
 
 def canonical_path(path: Path | str) -> str:

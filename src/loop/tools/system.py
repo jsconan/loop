@@ -5,6 +5,7 @@ import os
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from typing import Annotated
 
 from pydantic import Field
@@ -123,9 +124,17 @@ def _timeout_error(timeout: float, output: dict) -> Problem:
     )
 
 
-def _stream_output(chunks: list[str], discarded: int | None, source: str) -> dict:
+def _stream_output(
+    chunks: list[str],
+    discarded: int | None,
+    source: str,
+    redactor: Callable[[str], str] | None = None,
+) -> dict:
     """Return a recoverable preview and explicit capture-loss status for one stream."""
-    encoded = "".join(chunks).encode("utf-8")
+    content = "".join(chunks)
+    if redactor is not None:
+        content = redactor(content)
+    encoded = content.encode("utf-8")
     preview = encoded[: constants.MAX_TOOL_CONTENT_BYTES // 2].decode("utf-8", errors="ignore")
     included = len(preview.encode("utf-8"))
     result = {
@@ -146,19 +155,24 @@ def _stream_output(chunks: list[str], discarded: int | None, source: str) -> dic
     return result
 
 
-def _process_output(returncode: int | None, chunks: list[list[str]], discarded: list) -> dict:
+def _process_output(
+    returncode: int | None,
+    chunks: list[list[str]],
+    discarded: list,
+    redactor: Callable[[str], str] | None = None,
+) -> dict:
     """Preserve exit status and both streams without hiding incomplete capture."""
     return {
         "exit_code": returncode,
-        "stdout": _stream_output(chunks[0], discarded[0], "command stdout"),
-        "stderr": _stream_output(chunks[1], discarded[1], "command stderr"),
+        "stdout": _stream_output(chunks[0], discarded[0], "command stdout", redactor),
+        "stderr": _stream_output(chunks[1], discarded[1], "command stderr", redactor),
     }
 
 
 def _command_plan(arguments: dict[str, object]) -> OperationPlan:
     """Plan an exact shell-free process invocation."""
     argv = parse_command_line(str(arguments["command"]))
-    cwd = os.path.realpath(str(arguments["cwd"]))
+    cwd = str(arguments["cwd"])
     normalized = dict(arguments)
     normalized.update({"cwd": cwd})
     return OperationPlan(
@@ -190,7 +204,7 @@ def run_command(
     ],
     cwd: Annotated[
         str,
-        "loop:path",
+        "loop:virtual-path",
         Field(description="Working directory for the process."),
     ] = ".",
 ) -> dict | Problem:
@@ -201,20 +215,26 @@ def run_command(
     deadline = time.monotonic() + timeout
     cleanup_reserve = min(_CLEANUP_RESERVE_SECONDS, timeout / 2)
     execution_deadline = deadline - cleanup_reserve
+    output_redactor = None
     try:
         operation = context.operations[0] if context.operations else None
         target = operation.target if operation is not None else None
         if not isinstance(target, ProcessTarget):
             raise TypeError("Authorized process target is missing.")
+        command_argv = list(target.argv)
+        command_cwd = os.path.realpath(target.cwd)
+        command_environment = {
+            name: value
+            for name in ("PATH", "SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
+            if (value := os.environ.get(name)) is not None
+        }
+        if context.instructions_manager is not None:
+            output_redactor = context.instructions_manager.virtual_paths.redact
         process = subprocess.Popen(  # pylint: disable=consider-using-with
-            list(target.argv),
+            command_argv,
             shell=False,
-            cwd=target.cwd,
-            env={
-                name: value
-                for name in ("PATH", "SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
-                if (value := os.environ.get(name)) is not None
-            },
+            cwd=command_cwd,
+            env=command_environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -255,18 +275,24 @@ def run_command(
         except subprocess.TimeoutExpired:
             _cleanup_process(process, started_readers, deadline)
             return _timeout_error(
-                timeout, _process_output(None, [stdout_chunks, stderr_chunks], discarded)
+                timeout,
+                _process_output(None, [stdout_chunks, stderr_chunks], discarded, output_redactor),
             )
         if not _join_readers(started_readers, execution_deadline):
             _cleanup_process(process, started_readers, deadline)
             return _timeout_error(
-                timeout, _process_output(returncode, [stdout_chunks, stderr_chunks], discarded)
+                timeout,
+                _process_output(
+                    returncode, [stdout_chunks, stderr_chunks], discarded, output_redactor
+                ),
             )
         if reader_error := next((error for error in reader_errors if error is not None), None):
             raise reader_error
 
         _close_process_streams(process)
-        output = _process_output(returncode, [stdout_chunks, stderr_chunks], discarded)
+        output = _process_output(
+            returncode, [stdout_chunks, stderr_chunks], discarded, output_redactor
+        )
         if returncode != 0:
             return Problem(
                 code="process.nonzero_exit",

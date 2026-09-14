@@ -135,11 +135,11 @@ schema identifiers remain intact. Official OpenAI requests require `store=False`
 servers default to provider-managed retention and can explicitly declare `supported_false` or
 `required_false`. This transport setting is not a guarantee about provider-wide retention.
 
-Runtime instructions specify `.` for the current workspace directory, `scratch:/` for the
-permitted temporary directory, and `skill:<name>/` for active skill resources. File tools and terminal
-commands use standard workspace-relative paths (e.g. `src/main.py`), while logical prefixes like
-`workspace:/` and `scratch:/` remain supported for backward-compatible resolution. Result path
-metadata uses clean relative paths. Arbitrary command text, source code, and output are not rewritten.
+Runtime instructions expose `/workspace`, `/tmp`, and `/skills/<name>` as VirtualPaths rather than
+host locations. File tools and command working directories resolve those typed paths at the tool
+boundary; command arguments remain opaque, so commands use relative paths after selecting `cwd`.
+Known workspace, temporary, and skill roots are redacted from declared result-path metadata,
+implementation diagnostics, and command output. Arbitrary source text is not rewritten.
 Command results retain exit status and both stdout/stderr previews, including partial timeout
 output. Continuation handles recover the captured remainder; output beyond the capture cap is
 explicitly marked as lost.
@@ -680,14 +680,12 @@ processes or private-network access is explicit. Network origins use glob patter
 all origins, while an empty origin list denies all network requests. Adding the first specific
 origin replaces the default `*`, making the boundary restrictive. Relative filesystem roots in
 the YAML policy are resolved from the workspace, not from the shell's launch directory. Each Loop
-instance owns a private `loop-temp` directory and announces its exact path to the model. Host
-process execution requires both opening the `host-process` boundary and choosing an appropriate
-`process.execute` default or rule. The built-in executor does not supply an operating-system
-sandbox, so this boundary must remain closed for untrusted process execution. Ignore files limit
-discovery only; they are not authorization policy.
+instance owns a private `loop-temp` directory. Host process execution requires both opening the
+`host-process` boundary and choosing an appropriate `process.execute` default or rule. Ignore files
+limit discovery only; they are not authorization policy.
 The command tool accepts an exact argument vector and never invokes a shell, while web requests do
-not follow redirects implicitly. Policy is still distinct from operating-system containment, so an
-enforcement sandbox remains required before enabling untrusted process execution.
+not follow redirects implicitly. Policy is distinct from operating-system containment; a sandbox
+executor requires a separately reviewed design before enabling untrusted process execution.
 
 ## Built-in tools
 
@@ -739,10 +737,9 @@ The base installation does not include ripgrep. Install the optional `tools` ext
 (`uv sync --extra tools`), or install `rg` separately and make it available on `PATH`. When it is
 unavailable, searches return a structured `filesystem.search_unavailable` problem.
 
-These tools operate with the permissions of the process running `loop`. Filesystem access is
-authorized but not OS-sandboxed; approved commands use an exact argument vector and never invoke
-a shell. Run the project only in an environment where you are comfortable granting the model that
-access.
+Direct filesystem tools and approved commands operate with the permissions of the process running
+`loop`; they are authorization-controlled rather than OS-sandboxed. Commands use an exact argument
+vector and never invoke a shell.
 
 ### Value-holder thread safety
 

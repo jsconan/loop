@@ -25,8 +25,8 @@ from .. import constants
 from ..errors import Problem, log_problem
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import (
-    PathAliases,
     ShutdownRequested,
+    VirtualPath,
     canonical_path,
     local_now,
     sha256_digest,
@@ -1496,7 +1496,7 @@ class PermissionManager:
 
         File paths are shown relative to the workspace root. Process targets include
         their working directory and quote argument boundaries after normalizing
-        absolute paths through ``PathAliases``.
+        absolute paths through ``VirtualPath``.
 
         Args:
             operation (Operation): The operation whose target should be displayed.
@@ -1518,17 +1518,15 @@ class PermissionManager:
             except ValueError:
                 return operation.resource
         if isinstance(operation.target, ProcessTarget):
-            aliases = PathAliases(
-                {
-                    PathAliases.WORKSPACE_PREFIX: self._workspace_root,
-                    PathAliases.SCRATCH_PREFIX: self._temporary_path,
-                }
+            virtual_paths = VirtualPath(
+                workspace=self._workspace_root,
+                temporary_directory=self._temporary_path,
             )
             cleaned_argv = tuple(
-                aliases.display(arg) if Path(arg).is_absolute() else arg
+                virtual_paths.display(arg) if Path(arg).is_absolute() else arg
                 for arg in operation.target.argv
             )
-            cwd = aliases.display(operation.target.cwd)
+            cwd = virtual_paths.display(operation.target.cwd)
             return f"{shlex.join(cleaned_argv)} (cwd: {cwd})"
         return operation.resource
 

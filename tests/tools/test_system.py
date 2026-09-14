@@ -23,6 +23,7 @@ from loop import (
     ToolRegistry,
 )
 from loop.constants import MAX_OUTPUT_CHARS
+from loop.instructions import InstructionsManager, RuntimeEnvironment
 from loop.tools.system import run_command as run_command_tool
 from loop.utils import cached_path
 
@@ -215,11 +216,34 @@ def test_run_command_fails_closed_without_an_authorized_process_target():
     assert result.detail == "Authorized process target is missing."
 
 
+def test_run_command_resolves_virtual_cwd_and_redacts_known_host_roots(
+    monkeypatch, confirmed, tmp_path
+):
+    """Virtual working directories execute locally without returning their backing root."""
+    process = make_process(stdout=(f"{tmp_path}/created.txt\n", ""))
+    popen = MagicMock(return_value=process)
+    monkeypatch.setattr("loop.tools.system.subprocess.Popen", popen)
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "temporary")
+    )
+
+    result = tool_registry.call(
+        "run_command",
+        json.dumps({"command": "pwd", "cwd": "/workspace"}),
+        interaction=ConsoleInteraction(),
+        instructions_manager=instructions,
+    )
+
+    assert json.loads(result)["result"]["stdout"]["content"] == "/workspace/created.txt\n"
+    assert popen.call_args.kwargs["cwd"] == str(tmp_path.resolve())
+
+
 def test_successful_run_command_invalidates_instruction_scope(monkeypatch, tmp_path, confirmed):
     """Successful shell operations request a conservative instruction refresh."""
     manager = MagicMock()
-    manager.path_aliases.resolve.side_effect = lambda value: value
-    manager.path_aliases.metadata.side_effect = lambda value: value
+    manager.virtual_paths.resolve.side_effect = lambda value: value
+    manager.virtual_paths.metadata.side_effect = lambda value: value
+    manager.virtual_paths.redact.side_effect = lambda value: value
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("loop.tools.system.subprocess.Popen", subprocess.Popen)
 

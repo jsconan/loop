@@ -110,6 +110,19 @@ class SkillManager:
         return tuple(skill for skill in self._skills if skill.location in self._activated)
 
     @property
+    def activated_locations(self) -> dict[str, Path]:
+        """Return the canonical locations of all activated skills.
+
+        Returns:
+            dict[str, Path]: Mapping of skill name to its canonical location in discovery order.
+        """
+        return {
+            skill.name: skill.location.parent
+            for skill in self._skills
+            if skill.location in self._activated
+        }
+
+    @property
     def activated_instructions(self) -> tuple[tuple[Skill, str], ...]:
         """Return activated skill bodies in discovery order.
 

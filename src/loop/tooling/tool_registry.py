@@ -395,7 +395,7 @@ class ToolRegistry:
             instructions_manager,
         )
         if planning_error is not None:
-            return planning_error, 0
+            return self._model_result(planning_error, instructions_manager, tool), 0
         context = self._context_for(
             tool,
             interaction=interaction,
@@ -501,7 +501,7 @@ class ToolRegistry:
             instructions_manager,
         )
         if planning_error is not None:
-            return planning_error, 0
+            return self._model_result(planning_error, instructions_manager, tool), 0
         context = self._context_for(
             tool,
             interaction=interaction,
@@ -567,7 +567,7 @@ class ToolRegistry:
                     )
                 )
             )
-        plan, planning_error = self._command_plan(tool, validated)
+        plan, planning_error = self._command_plan(tool, validated, instructions_manager)
         if planning_error is not None:
             return ToolExecutionResult(planning_error)
         context = self._context_for(
@@ -577,7 +577,11 @@ class ToolRegistry:
             operations=plan.operations,
             prerequisite_operations=plan.prerequisite_operations,
         )
-        return tool.execute(plan.arguments, context)
+        result = tool.execute(plan.arguments, context)
+        return ToolExecutionResult(
+            self._model_result(result.output, instructions_manager, tool),
+            result.presentation,
+        )
 
     @staticmethod
     def _model_result(
@@ -585,14 +589,27 @@ class ToolRegistry:
         instructions_manager: InstructionsManager | None,
         tool: Tool,
     ) -> str:
-        """Minimize structured result paths only on the model invocation route."""
-        if instructions_manager is None or not tool.result_path_fields:
+        """Minimize structured result paths on both the model and command invocation routes."""
+        if instructions_manager is None:
             return output
         try:
             value = json.loads(output)
         except (json.JSONDecodeError, TypeError):
             return output
-        prepared = instructions_manager.path_aliases.metadata(value, tool.result_path_fields)
+        prepared = (
+            instructions_manager.virtual_paths.metadata(value, tool.result_path_fields)
+            if tool.result_path_fields
+            else value
+        )
+        problem = prepared.get("problem") if isinstance(prepared, dict) else None
+        if isinstance(problem, dict) and isinstance(problem.get("detail"), str):
+            prepared = {
+                **prepared,
+                "problem": {
+                    **problem,
+                    "detail": instructions_manager.virtual_paths.redact(problem["detail"]),
+                },
+            }
         return output if value == prepared else json.dumps(prepared, ensure_ascii=False)
 
     def _authorized_plan(
@@ -606,12 +623,7 @@ class ToolRegistry:
         """Resolve and authorize every phase of one operation plan."""
         try:
             if instructions_manager is not None:
-                arguments = {
-                    name: instructions_manager.path_aliases.resolve(value)
-                    if "loop:path" in tool.arguments_model.model_fields[name].metadata
-                    else value
-                    for name, value in arguments.items()
-                }
+                arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
             plan = tool.plan(arguments)
             prerequisites = ()
             while True:
@@ -638,11 +650,32 @@ class ToolRegistry:
                 "tool.planning_failed", "Tool planning failed", str(exc), tool.name or "tool"
             )
 
+    def _resolve_model_paths(
+        self,
+        tool: Tool,
+        arguments: dict[str, object],
+        instructions_manager: InstructionsManager,
+    ) -> dict[str, object]:
+        """Resolve typed model paths through the virtual-path boundary."""
+        resolved = {}
+        for name, value in arguments.items():
+            metadata = tool.arguments_model.model_fields[name].metadata
+            if "loop:virtual-path" in metadata:
+                resolved[name] = instructions_manager.virtual_paths.resolve(str(value))
+            else:
+                resolved[name] = value
+        return resolved
+
     def _command_plan(
-        self, tool: Tool, arguments: dict[str, object]
+        self,
+        tool: Tool,
+        arguments: dict[str, object],
+        instructions_manager: InstructionsManager | None = None,
     ) -> tuple[OperationPlan | None, str | None]:
         """Resolve every planning phase for a direct user command."""
         try:
+            if instructions_manager is not None:
+                arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
             plan = tool.plan(arguments)
             prerequisites = ()
             while plan.continuation is not None:

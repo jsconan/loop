@@ -198,15 +198,40 @@ def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
     manager.set_runtime_environment(environment)
 
     assert str(tmp_path) not in prepared(manager)
-    assert "working_directory: ." in prepared(manager)
+    assert "working_directory: /workspace" in prepared(manager)
     assert manager.generation == generation
     manager.set_runtime_environment(RuntimeEnvironment(tmp_path, tmp_path / ("x" * 900)))
-    assert "scratch:/" in prepared(manager)
+    assert "temporary_directory: /tmp" in prepared(manager)
 
 
-def test_path_aliases_are_passive_without_a_runtime_environment():
-    """A static instruction manager leaves ordinary relative paths unchanged."""
-    assert configured_manager().path_aliases.resolve("relative.txt") == "relative.txt"
+def test_virtual_paths_require_a_runtime_environment_for_workspace_relative_paths():
+    """A static instruction manager cannot resolve workspace-relative model paths."""
+    with pytest.raises(ValueError):
+        configured_manager().virtual_paths.resolve("relative.txt")
+
+
+def test_runtime_environment_exposes_only_virtual_roots(tmp_path):
+    """Instructions and typed file paths use virtual roots without exposing host roots."""
+    manager = configured_manager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "temporary")
+    )
+
+    assert str(tmp_path) not in prepared(manager)
+    assert "working_directory: /workspace" in prepared(manager)
+    assert "temporary_directory: /tmp" in prepared(manager)
+    assert manager.virtual_paths.resolve("/workspace/source.py") == str(tmp_path / "source.py")
+    assert manager.virtual_paths.resolve("/tmp/output.txt") == str(
+        tmp_path / "temporary/output.txt"
+    )
+    assert manager.virtual_paths.display(str(tmp_path / "source.py")) == "/workspace/source.py"
+    assert (
+        manager.virtual_paths.display(str(tmp_path / "temporary/output.txt")) == "/tmp/output.txt"
+    )
+    assert manager.virtual_paths.redact(f"Failed at {tmp_path}/source.py") == (
+        "Failed at /workspace/source.py"
+    )
+    with pytest.raises(ValueError):
+        manager.virtual_paths.resolve("scratch:/output.txt")
 
 
 def test_runtime_environment_is_independent_from_observed_instruction_directory(tmp_path):
@@ -223,15 +248,15 @@ def test_runtime_environment_is_independent_from_observed_instruction_directory(
     manager.observe_path(observed, directory=True)
     manager.prepare(TEST_AGENT)
 
-    assert "working_directory: ." in prepared(manager)
+    assert "working_directory: /workspace" in prepared(manager)
     assert manager.working_directory == observed.resolve()
-    assert manager.path_aliases.resolve(".") == str(initial.resolve())
+    assert manager.virtual_paths.resolve(".") == str(initial.resolve())
     sections = manager.list_skills()["instruction_context"]["sections"]
     assert [section["kind"] for section in sections] == ["runtime_environment"]
 
     manager.set_working_directory(observed)
 
-    assert manager.path_aliases.resolve(".") == str(observed.resolve())
+    assert manager.virtual_paths.resolve(".") == str(observed.resolve())
 
 
 def test_manager_discovers_project_instructions_and_skills(tmp_path):

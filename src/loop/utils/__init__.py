@@ -11,7 +11,6 @@ __all__ = [
     "IgnoreRule",
     "IgnoreRules",
     "IntValueHolder",
-    "PathAliases",
     "PathHolder",
     "PathInput",
     "PathReference",
@@ -24,6 +23,7 @@ __all__ = [
     "TextSearchMatch",
     "ValueHolder",
     "ValueReference",
+    "VirtualPath",
     "as_utc",
     "base64_decode",
     "base64_encode",
@@ -108,7 +108,7 @@ from .models import (
 )
 from .normalization import normalized_key, safe_scalar
 from .path import (
-    PathAliases,
+    VirtualPath,
     canonical_path,
     filter_paths_by_globs,
     find_project_root,

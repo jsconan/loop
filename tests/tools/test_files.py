@@ -274,17 +274,16 @@ def test_file_navigation_reports_successful_instruction_context_changes(tmp_path
 
     tool_registry.call(
         "list_folder",
-        json.dumps({"path": str(nested)}),
+        json.dumps({"path": "/workspace/nested"}),
         interaction=interaction,
         instructions_manager=manager,
     )
     assert manager.working_directory == nested.resolve()
-    assert manager.path_aliases.resolve(".") == str(tmp_path.resolve())
+    assert manager.virtual_paths.resolve(".") == str(tmp_path.resolve())
 
-    written = nested / "written.txt"
     tool_registry.call(
         "write_text_file",
-        json.dumps({"path": str(written), "content": "content"}),
+        json.dumps({"path": "/workspace/nested/written.txt", "content": "content"}),
         interaction=interaction,
         instructions_manager=manager,
     )

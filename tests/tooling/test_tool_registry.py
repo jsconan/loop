@@ -52,6 +52,12 @@ def result_value(output: str):
     return payload["result"]
 
 
+@declare_tool()
+def passive_tool() -> str:
+    """Return a passive result for sandbox-routing coverage."""
+    return "ok"
+
+
 def planner_for(action: Action):
     """Return a concrete operation planner for an authority-bearing test tool."""
 
@@ -533,7 +539,8 @@ def test_registry_view_forwards_definitions_and_timed_calls():
     execution_started = Mock()
     interaction = Mock(spec=Interaction)
     instructions_manager = Mock(spec=InstructionsManager)
-    instructions_manager.path_aliases.metadata.side_effect = lambda value: value
+    instructions_manager.virtual_paths.metadata.side_effect = lambda value: value
+    instructions_manager.virtual_paths.redact.side_effect = lambda value: value
     permission_manager = Mock(spec=PermissionManager)
 
     assert view.definitions() is definitions
@@ -646,7 +653,8 @@ def test_call_routes_arguments_and_runtime_context():
     registry.register(calculate)
     runtime = Mock(spec=Interaction)
     manager = Mock(spec=InstructionsManager)
-    manager.path_aliases.metadata.side_effect = lambda value: value
+    manager.virtual_paths.metadata.side_effect = lambda value: value
+    manager.virtual_paths.redact.side_effect = lambda value: value
     execution_started = Mock()
 
     assert (
@@ -830,6 +838,22 @@ def test_call_command_retains_dynamic_result_presentation():
 
     assert result_value(execution.output) == {"count": 3}
     assert execution.presentation is presentation
+
+
+def test_call_command_resolves_virtual_paths_before_execution(tmp_path):
+    """Direct tool commands use the same virtual-path boundary as model tool calls."""
+    target = tmp_path / "notes.txt"
+    target.write_text("virtual content", encoding="utf-8")
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "temporary")
+    )
+
+    execution = ToolRegistry([read_text_file]).command(
+        "read_text_file", ("/workspace/notes.txt",), instructions_manager=instructions
+    )
+
+    assert result_value(execution.output)["content"] == "virtual content"
+    assert result_value(execution.output)["path"] == "/workspace/notes.txt"
 
 
 def test_call_command_reports_unknown_tools_and_invalid_parameters():
@@ -1073,10 +1097,10 @@ def test_call_with_timing_async_returns_zero_before_invocation(name, arguments, 
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_logical_file_paths_resolve_before_authorization_and_return_logical_metadata(
+def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_metadata(
     tmp_path, asynchronous
 ):
-    """Aliases preserve file access while approvals receive the actual execution target."""
+    """Virtual paths preserve file access while approvals receive the actual execution target."""
     path = tmp_path / "é notes.txt"
     path.write_text("useful content", encoding="utf-8")
     permissions = Mock(spec=PermissionManager)
@@ -1087,7 +1111,7 @@ def test_logical_file_paths_resolve_before_authorization_and_return_logical_meta
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
     kwargs = {"instructions_manager": instructions}
-    args = json.dumps({"path": "workspace:/é notes.txt"})
+    args = json.dumps({"path": "/workspace/é notes.txt"})
     output, _ = (
         asyncio.run(registry.call_with_timing_async("read_text_file", args, **kwargs))
         if asynchronous
@@ -1095,7 +1119,7 @@ def test_logical_file_paths_resolve_before_authorization_and_return_logical_meta
     )
     result = result_value(output)
     assert result["content"] == "useful content"
-    assert result["path"] == "é notes.txt"
+    assert result["path"] == "/workspace/é notes.txt"
     assert str(path) in str(permissions.authorize.call_args.args[0])
 
 
@@ -1118,12 +1142,12 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path)
         instructions_manager=instructions,
     )
 
-    assert result_value(output)["stdout"]["content"].strip() == str(tmp_path)
+    assert result_value(output)["stdout"]["content"].strip() == "/workspace"
     assert "cwd='" + str(tmp_path) + "'" in str(permissions.authorize.call_args.args[0])
 
 
-def test_delete_path_accepts_a_logical_workspace_path(tmp_path):
-    """Deletion resolves its declared path alias before planning and execution."""
+def test_delete_path_accepts_a_virtual_workspace_path(tmp_path):
+    """Deletion resolves its declared virtual path before planning and execution."""
     target = tmp_path / "obsolete.txt"
     target.write_text("obsolete", encoding="utf-8")
     instructions = InstructionsManager(
@@ -1133,12 +1157,33 @@ def test_delete_path_accepts_a_logical_workspace_path(tmp_path):
 
     output = registry.call(
         "delete_path",
-        json.dumps({"path": "workspace:/obsolete.txt"}),
+        json.dumps({"path": "/workspace/obsolete.txt"}),
         interaction=Mock(spec=Interaction, prompt=Mock(return_value=ApprovalChoice.ONCE)),
         instructions_manager=instructions,
     )
 
-    assert result_value(output) == f"Successfully deleted path '{target}'."
+    assert result_value(output) == "Successfully deleted path '/workspace/obsolete.txt'."
+    assert not target.exists()
+
+
+def test_delete_path_uses_virtual_paths_without_disclosing_the_host_root(tmp_path):
+    """Virtual file operations resolve paths without returning the backing host root."""
+    target = tmp_path / "obsolete.txt"
+    target.write_text("obsolete", encoding="utf-8")
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "temporary")
+    )
+    registry = ToolRegistry([delete_path], permission_manager=PermissionManager(tmp_path))
+
+    output = registry.call(
+        "delete_path",
+        json.dumps({"path": "/workspace/obsolete.txt"}),
+        interaction=Mock(spec=Interaction, prompt=Mock(return_value=ApprovalChoice.ONCE)),
+        instructions_manager=instructions,
+    )
+
+    assert result_value(output) == "Successfully deleted path '/workspace/obsolete.txt'."
+    assert str(tmp_path) not in output
     assert not target.exists()
 
 

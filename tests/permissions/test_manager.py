@@ -1359,8 +1359,8 @@ def test_approval_prompt_renders_session_targets_without_workspace():
     assert "config" in result.prompt
 
 
-def test_process_target_display_resolves_relative_paths_to_workspace_root(tmp_path):
-    """Process target argv is normalized through workspace-relative path aliases."""
+def test_process_target_display_resolves_local_paths_to_workspace_virtual_paths(tmp_path):
+    """Process target prompts render local workspace paths as VirtualPaths."""
     sub = tmp_path / "src" / "loop"
     sub.mkdir(parents=True)
     readme = tmp_path / "README.md"
@@ -1382,8 +1382,8 @@ def test_process_target_display_resolves_relative_paths_to_workspace_root(tmp_pa
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
     prompt = interaction.prompt.call_args.args[0]
-    assert "cat README.md" in prompt
-    assert "(cwd: src/loop)" in prompt
+    assert "cat /workspace/README.md" in prompt
+    assert "(cwd: /workspace/src/loop)" in prompt
     assert "../" not in prompt
 
 
@@ -1406,7 +1406,7 @@ def test_process_target_display_preserves_workspace_relative_argv(tmp_path):
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
-    assert "cat README.md (cwd: .)" in interaction.prompt.call_args.args[0]
+    assert "cat README.md (cwd: /workspace)" in interaction.prompt.call_args.args[0]
 
 
 def test_process_target_display_preserves_argument_boundaries(tmp_path):
@@ -1428,11 +1428,11 @@ def test_process_target_display_preserves_argument_boundaries(tmp_path):
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
-    assert "tool 'a b' (cwd: .)" in interaction.prompt.call_args.args[0]
+    assert "tool 'a b' (cwd: /workspace)" in interaction.prompt.call_args.args[0]
 
 
-def test_process_target_display_handles_scratch_paths(tmp_path):
-    """Scratch directory paths are prefixed with the scratch alias."""
+def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
+    """Temporary directory paths are rendered below the temporary VirtualPath."""
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = ApprovalChoice.ONCE
     manager = PermissionManager(
@@ -1453,4 +1453,4 @@ def test_process_target_display_handles_scratch_paths(tmp_path):
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
     prompt = interaction.prompt.call_args.args[0]
-    assert "scratch:/output.log" in prompt
+    assert "/tmp/output.log" in prompt

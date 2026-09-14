@@ -67,7 +67,7 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
         update={
             "loop": settings.loop.model_copy(
                 update={"temperature": 0.2, "reasoning_effort": "medium"}
-            )
+            ),
         }
     )
     configuration = Mock()

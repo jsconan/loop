@@ -571,7 +571,9 @@ def _matches_manifest(path: Path, target: FileTarget) -> bool:
 def list_folder(
     context: ToolContext,
     path: Annotated[
-        str, "loop:path", Field(description="Path to the folder whose entries should be listed.")
+        str,
+        "loop:virtual-path",
+        Field(description="Path to the folder whose entries should be listed."),
     ],
     entry_type: Annotated[
         Literal["files", "folders", "all"],
@@ -626,7 +628,7 @@ def list_folder(
 )
 def read_text_file(
     context: ToolContext,
-    path: Annotated[str, "loop:path", Field(description="Path to the text file to read.")],
+    path: Annotated[str, "loop:virtual-path", Field(description="Path to the text file to read.")],
     start_line: Annotated[
         int,
         Field(description="One-based starting line.", ge=1),
@@ -651,7 +653,7 @@ def read_text_file(
         file_path = Path(path)
         if file_path.stat().st_size == 0:
             context.observe_file(path)
-            return f"File '{path}' is empty."
+            return f"File '{context.display_path(path)}' is empty."
         result = FileContentResult(
             path=path,
             **read_bounded_text(
@@ -691,7 +693,7 @@ def read_text_file(
 def search_text(
     context: ToolContext,
     path: Annotated[
-        str, "loop:path", Field(description="Path to a text file or folder to search.")
+        str, "loop:virtual-path", Field(description="Path to a text file or folder to search.")
     ],
     query: Annotated[
         str,
@@ -798,7 +800,7 @@ def search_text(
 )
 def write_text_file(
     context: ToolContext,
-    path: Annotated[str, "loop:path", Field(description="Path to the text file to write.")],
+    path: Annotated[str, "loop:virtual-path", Field(description="Path to the text file to write.")],
     content: Annotated[str, Field(description="Content to write to the file.")],
 ) -> str | Problem:
     """Write content to a file on the local disk."""
@@ -820,7 +822,7 @@ def write_text_file(
         )
         context.observe_file(target)
         context.invalidate_instructions(target)
-        return f"Successfully wrote to file '{path}'."
+        return f"Successfully wrote to file '{context.display_path(path)}'."
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         problem = Problem.from_exception(
             exc,
@@ -839,7 +841,7 @@ def write_text_file(
 def edit_text_file(
     context: ToolContext,
     path: Annotated[
-        str, "loop:path", Field(description="Path to the existing UTF-8 text file to edit.")
+        str, "loop:virtual-path", Field(description="Path to the existing UTF-8 text file to edit.")
     ],
     old_content: Annotated[
         str,
@@ -883,7 +885,9 @@ def edit_text_file(
         context.observe_file(target)
         context.invalidate_instructions(target)
         noun = "replacement" if replacement_count == 1 else "replacements"
-        return f"Successfully edited file '{path}' ({replacement_count} {noun})."
+        return (
+            f"Successfully edited file '{context.display_path(path)}' ({replacement_count} {noun})."
+        )
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         problem = Problem.from_exception(
             exc,
@@ -903,7 +907,7 @@ def delete_path(
     context: ToolContext,
     path: Annotated[
         str,
-        "loop:path",
+        "loop:virtual-path",
         Field(description="Path to the file, symbolic link, or folder to permanently delete."),
     ],
 ) -> str | Problem:
@@ -933,7 +937,7 @@ def delete_path(
         else:
             raise RuntimeError("Authorized deletion capability has an unsupported target kind.")
         context.invalidate_instructions(target)
-        return f"Successfully deleted path '{path}'."
+        return f"Successfully deleted path '{context.display_path(target)}'."
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         problem = Problem.from_exception(
             exc,

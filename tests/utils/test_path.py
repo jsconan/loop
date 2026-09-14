@@ -3,7 +3,7 @@
 import pytest
 
 from loop.utils import (
-    PathAliases,
+    VirtualPath,
     canonical_path,
     filter_paths_by_globs,
     find_project_root,
@@ -12,43 +12,48 @@ from loop.utils import (
 )
 
 
-def test_path_aliases_preserve_identity_and_content_without_granting_authority(tmp_path):
-    """Logical paths preserve distinct roots, spaces and symlink identity before authorization."""
+def test_virtual_paths_preserve_identity_without_disclosing_local_roots(tmp_path):
+    """Virtual paths resolve typed roots while keeping host roots out of model-facing metadata."""
     scratch = tmp_path / "temporary"
     scratch.mkdir()
-    aliases = PathAliases({"workspace:/": tmp_path, "scratch:/": scratch})
-    assert aliases.resolve("workspace:/a b/é.txt") == str(tmp_path / "a b/é.txt")
-    assert aliases.resolve("notes.txt") == str(tmp_path / "notes.txt")
-    assert aliases.resolve(str(tmp_path / "absolute")) == str(tmp_path / "absolute")
-    assert aliases.display(str(tmp_path)) == "."
-    assert aliases.display(str(tmp_path / "notes.txt")) == "notes.txt"
-    assert aliases.display(str(scratch / "notes.txt")) == "scratch:/notes.txt"
-    assert aliases.display("notes.txt") == "notes.txt"
-    assert PathAliases({}).resolve("relative") == "relative"
+    paths = VirtualPath(tmp_path, scratch)
+    assert paths.resolve("/workspace/a b/é.txt") == str(tmp_path / "a b/é.txt")
+    assert paths.resolve("notes.txt") == str(tmp_path / "notes.txt")
+    assert paths.display(str(tmp_path)) == "/workspace"
+    assert paths.display(str(tmp_path / "notes.txt")) == "/workspace/notes.txt"
+    assert paths.display(str(scratch / "notes.txt")) == "/tmp/notes.txt"
+    assert paths.display("notes.txt") == "notes.txt"
+    assert paths.display(str(tmp_path.parent / "external")) == "<external>"
     link = tmp_path / "link"
     link.symlink_to(tmp_path.parent, target_is_directory=True)
-    assert aliases.resolve("workspace:/link") == str(link)
-    assert aliases.metadata(
+    assert paths.resolve("/workspace/link") == str(link)
+    assert paths.metadata(
         {"rows": [{"path": str(scratch / "notes.txt")}], "content": str(tmp_path)},
         (("rows", "*", "path"),),
-    ) == {"rows": [{"path": "scratch:/notes.txt"}], "content": str(tmp_path)}
-    for value in ("workspace:/../escape", "workspace://outside", "skill:missing/file", "../escape"):
+    ) == {"rows": [{"path": "/tmp/notes.txt"}], "content": str(tmp_path)}
+    assert paths.redact(f"Failed at {tmp_path}/notes.txt") == "Failed at /workspace/notes.txt"
+    for value in (
+        "/workspace/../escape",
+        "/workspace//outside",
+        "/skills/missing/file",
+        "../escape",
+    ):
         with pytest.raises(ValueError):
-            aliases.resolve(value)
+            paths.resolve(value)
 
-    assert aliases.metadata({"other": "value"}, (("missing",),)) == {"other": "value"}
-    assert aliases.metadata({"items": "not-a-list"}, (("items", "*", "path"),)) == {
+    assert paths.metadata({"other": "value"}, (("missing",),)) == {"other": "value"}
+    assert paths.metadata({"items": "not-a-list"}, (("items", "*", "path"),)) == {
         "items": "not-a-list"
     }
-    assert aliases.metadata({"path": 42}, (("path",),)) == {"path": 42}
+    assert paths.metadata({"path": 42}, (("path",),)) == {"path": 42}
 
 
-def test_logical_paths_reconstruct_after_workspace_relocation(tmp_path):
-    """A stable alias addresses the equivalent file after a local root is relocated."""
-    original = PathAliases({"workspace:/": tmp_path / "old"})
-    moved = PathAliases({"workspace:/": tmp_path / "new"})
-    alias = original.display(str(tmp_path / "old" / "notes.txt"))
-    assert moved.resolve(alias) == str(tmp_path / "new" / "notes.txt")
+def test_virtual_paths_reconstruct_after_workspace_relocation(tmp_path):
+    """A stable virtual path addresses the equivalent file after a local root is relocated."""
+    original = VirtualPath(tmp_path / "old")
+    moved = VirtualPath(tmp_path / "new")
+    virtual = original.display(str(tmp_path / "old" / "notes.txt"))
+    assert moved.resolve(virtual) == str(tmp_path / "new" / "notes.txt")
 
 
 def test_canonical_path_handles_existing_and_missing_targets(tmp_path):
