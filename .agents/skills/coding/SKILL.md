@@ -1,6 +1,6 @@
 ---
 name: coding
-description: Implement, modify, refactor, fix, and review Python code under src/ while preserving the repository's architecture, public behavior, and documentation conventions. Use for any source-code change in src/, including modules, classes, functions, methods, properties, private helpers, and registered tools.
+description: Implement, modify, refactor, fix, review, diagnose, or analyze Python source under src/, preserving the repository's architecture, public behavior, and documentation conventions. Activate for any source-code change in src/ (edits, refactors, additions, removals) and also for reviews or diagnosis of existing src/ code when the task only inspects or analyzes modules, classes, functions, methods, properties, private helpers, or registered tools, rather than changing them.
 ---
 
 # Coding

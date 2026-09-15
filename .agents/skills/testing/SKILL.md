@@ -1,6 +1,6 @@
 ---
 name: testing
-description: Write, update, reorganize, diagnose, and verify isolated pytest unit tests. Use whenever work affects tests, test placement, mocks or fixtures, behavioral coverage, edge and error cases, or this repository's 100% statement-and-branch coverage requirement.
+description: Write, update, reorganize, diagnose, and verify isolated pytest unit tests. Activate whenever a change adds, modifies, or removes tests or test fixtures, or when the task verifies behavior, mocks, fixtures, edge and error cases, or the repository's 100% statement-and-branch coverage requirement, including running the suite or coverage to validate any other change.
 ---
 
 # Testing
