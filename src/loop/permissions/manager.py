@@ -1603,7 +1603,8 @@ class PermissionManager:
 
         File paths are shown relative to the workspace root. Process targets include
         their working directory and quote argument boundaries after normalizing
-        absolute paths through ``VirtualPath``.
+        recognized absolute paths through ``VirtualPath``. Paths outside the
+        configured virtual roots remain visible rather than being redacted.
 
         Args:
             operation (Operation): The operation whose target should be displayed.
@@ -1629,11 +1630,17 @@ class PermissionManager:
                 workspace=self._workspace_root,
                 temporary_directory=self._temporary_path,
             )
+
+            def display_path(path: str) -> str:
+                """Render a recognized virtual path or retain an external path verbatim."""
+                rendered = virtual_paths.display(path)
+                return path if rendered == VirtualPath.EXTERNAL else rendered
+
             cleaned_argv = tuple(
-                virtual_paths.display(arg) if Path(arg).is_absolute() else arg
+                display_path(arg) if Path(arg).is_absolute() else arg
                 for arg in operation.target.argv
             )
-            cwd = virtual_paths.display(operation.target.cwd)
+            cwd = display_path(operation.target.cwd)
             return f"{shlex.join(cleaned_argv)} (cwd: {cwd})"
         return operation.resource
 

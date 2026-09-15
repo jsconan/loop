@@ -258,8 +258,9 @@ class RuntimeEnvironment:
             "temporary_directory: /tmp\n"
             "File tools accept workspace-relative paths and VirtualPaths below /workspace, /tmp, "
             "or /skills.\n"
-            "For terminal commands, select cwd '/workspace' or '/tmp' and use relative paths "
-            "inside the command. VirtualPaths are not shell paths.\n"
+            "For terminal commands, select cwd '/workspace' or '/tmp' and prefer relative paths. "
+            "VirtualPath arguments, including option values such as '--root=/workspace', are "
+            "translated before the process starts.\n"
             "</runtime_environment>"
         )
 

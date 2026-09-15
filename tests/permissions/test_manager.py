@@ -1598,3 +1598,28 @@ def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
 
     prompt = interaction.info.call_args.args[0]
     assert "/tmp/output.log" in prompt
+
+
+def test_process_target_display_preserves_external_temporary_paths(tmp_path):
+    """An external temporary path is not redacted in an approval prompt."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    manager = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        configuration=PermissionConfiguration(
+            limits=PolicyLimits(allow_host_processes=True),
+        ),
+    )
+    external_path = Path("/tmp/verify_review.py")
+    target = ProcessTarget(
+        argv=(".venv/bin/python", str(external_path)),
+        cwd=str(tmp_path),
+        boundary=ProcessBoundary.HOST,
+    )
+
+    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
+
+    prompt = interaction.info.call_args.args[0]
+    assert str(external_path) in prompt
+    assert "<external>" not in prompt

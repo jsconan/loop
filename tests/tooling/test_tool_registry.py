@@ -16,7 +16,9 @@ from loop import (
     NetworkTarget,
     Operation,
     OperationPlan,
+    PermissionConfiguration,
     PermissionManager,
+    PolicyLimits,
     Problem,
     ProblemException,
     RuntimeEnvironment,
@@ -1144,6 +1146,35 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path)
 
     assert result_value(output)["stdout"]["content"].strip() == "/workspace"
     assert "cwd='" + str(tmp_path) + "'" in str(permissions.authorize.call_args.args[0])
+
+
+def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path):
+    """The workspace shorthand renders and executes as the workspace root."""
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    permissions = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        configuration=PermissionConfiguration(
+            limits=PolicyLimits(allow_host_processes=True),
+        ),
+    )
+    registry = ToolRegistry([run_command], permission_manager=permissions)
+
+    output = registry.call(
+        "run_command",
+        json.dumps({"command": "pwd", "cwd": "workspace"}),
+        interaction=interaction,
+        instructions_manager=instructions,
+    )
+
+    assert result_value(output)["stdout"]["content"].strip() == "/workspace"
+    prompt = interaction.info.call_args.args[0]
+    assert "git status (cwd: /workspace/workspace)" not in prompt
+    assert "pwd (cwd: /workspace)" in prompt
 
 
 def test_delete_path_accepts_a_virtual_workspace_path(tmp_path):

@@ -238,10 +238,33 @@ def test_run_command_resolves_virtual_cwd_and_redacts_known_host_roots(
     assert popen.call_args.kwargs["cwd"] == str(tmp_path.resolve())
 
 
+def test_run_command_resolves_virtual_path_arguments_before_execution(
+    monkeypatch, confirmed, tmp_path
+):
+    """Virtual command arguments execute against the corresponding local paths."""
+    process = make_process()
+    popen = MagicMock(return_value=process)
+    monkeypatch.setattr("loop.tools.system.subprocess.Popen", popen)
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "temporary")
+    )
+
+    result = tool_registry.call(
+        "run_command",
+        json.dumps({"command": "git -C /workspace status", "cwd": "/workspace"}),
+        interaction=ConsoleInteraction(),
+        instructions_manager=instructions,
+    )
+
+    assert json.loads(result)["result"]["exit_code"] == 0
+    assert popen.call_args.args == (["git", "-C", str(tmp_path.resolve()), "status"],)
+
+
 def test_successful_run_command_invalidates_instruction_scope(monkeypatch, tmp_path, confirmed):
     """Successful shell operations request a conservative instruction refresh."""
     manager = MagicMock()
     manager.virtual_paths.resolve.side_effect = lambda value: value
+    manager.virtual_paths.resolve_command.side_effect = lambda value: value
     manager.virtual_paths.metadata.side_effect = lambda value: value
     manager.virtual_paths.redact.side_effect = lambda value: value
     monkeypatch.chdir(tmp_path)

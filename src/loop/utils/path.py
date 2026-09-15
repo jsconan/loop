@@ -1,6 +1,7 @@
 """Provide repository-aware path discovery and traversal utilities."""
 
 import os
+import shlex
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
@@ -8,6 +9,7 @@ from pathspec import GitIgnoreSpec
 
 from .. import constants
 from .models import IgnoreRule, IgnoreRules
+from .process import parse_command_line
 
 
 class VirtualPath:
@@ -93,6 +95,21 @@ class VirtualPath:
                 return virtual_root if relative == "." else f"{virtual_root}/{relative}"
         return self.EXTERNAL
 
+    def resolve_command(self, command: str) -> str:
+        """Resolve VirtualPath arguments in one restricted command line.
+
+        Args:
+            command (str): Model-supplied shell-free command line.
+
+        Returns:
+            str: Equivalent command line with virtual path arguments replaced by local paths.
+
+        Raises:
+            ValueError: The command is malformed or a virtual argument escapes its root.
+        """
+        argv = parse_command_line(command)
+        return shlex.join(tuple(self._resolve_command_argument(argument) for argument in argv))
+
     def metadata(self, value: object, fields: tuple[tuple[str, ...], ...]) -> object:
         """Render declared local metadata fields as virtual paths.
 
@@ -133,6 +150,17 @@ class VirtualPath:
         ):
             value = value.replace(str(root), prefix)
         return value
+
+    def _resolve_command_argument(self, argument: str) -> str:
+        """Resolve an exact virtual argument or the value portion of an option."""
+        value = argument
+        prefix = ""
+        if argument.startswith("-") and "=" in argument:
+            prefix, value = argument.split("=", maxsplit=1)
+            prefix += "="
+        if any(value == root or value.startswith(f"{root}/") for root in self._roots):
+            return prefix + self.resolve(value)
+        return argument
 
     @staticmethod
     def _local_path(root: Path, suffix: str) -> str:

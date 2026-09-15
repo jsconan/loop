@@ -195,6 +195,7 @@ def run_command(
     context: ToolContext,
     command: Annotated[
         str,
+        "loop:virtual-command",
         Field(
             description="Executable followed by its arguments. "
             "This is a restricted command line, not a shell: quote or escape shell "
@@ -205,7 +206,11 @@ def run_command(
     cwd: Annotated[
         str,
         "loop:virtual-path",
-        Field(description="Working directory for the process."),
+        "loop:workspace-cwd",
+        Field(
+            description="Working directory for the process. Use '/workspace' for the workspace "
+            "root; 'workspace' is accepted as a workspace-root shorthand."
+        ),
     ] = ".",
 ) -> dict | Problem:
     """Run a shell-free process and return exit status and recoverable stdout/stderr previews."""

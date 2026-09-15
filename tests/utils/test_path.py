@@ -1,5 +1,7 @@
 """Tests for path discovery helpers."""
 
+import shlex
+
 import pytest
 
 from loop.utils import (
@@ -24,6 +26,17 @@ def test_virtual_paths_preserve_identity_without_disclosing_local_roots(tmp_path
     assert paths.display(str(scratch / "notes.txt")) == "/tmp/notes.txt"
     assert paths.display("notes.txt") == "notes.txt"
     assert paths.display(str(tmp_path.parent / "external")) == "<external>"
+    assert paths.resolve_command(
+        "git -C /workspace --root=/workspace/config.toml /tmp/output.txt"
+    ) == shlex.join(
+        (
+            "git",
+            "-C",
+            str(tmp_path),
+            f"--root={tmp_path}/config.toml",
+            f"{scratch}/output.txt",
+        )
+    )
     link = tmp_path / "link"
     link.symlink_to(tmp_path.parent, target_is_directory=True)
     assert paths.resolve("/workspace/link") == str(link)
