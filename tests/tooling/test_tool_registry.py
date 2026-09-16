@@ -357,6 +357,7 @@ def test_register_halts_when_the_user_rejects_a_broken_required_tool(raises):
     assert registry.names == []
     interaction.warning.assert_called_once()
     interaction.prompt.assert_called_once()
+    assert interaction.prompt.call_args.kwargs["index"] == {"halt": "Q", "continue": "C"}
 
 
 def test_register_continues_without_a_broken_required_tool_when_selected():
@@ -375,6 +376,7 @@ def test_register_continues_without_a_broken_required_tool_when_selected():
 
     assert registry.register(required) is False
     assert registry.names == []
+    assert interaction.prompt.call_args.kwargs["index"] == {"halt": "Q", "continue": "C"}
 
 
 def test_register_admits_degraded_tools_after_warning():

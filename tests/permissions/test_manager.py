@@ -1378,6 +1378,12 @@ def test_interactive_policy_retries_a_repaired_file(tmp_path):
 
     assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
     interaction.report.assert_called_once()
+    assert interaction.prompt.call_args.kwargs["index"] == {
+        "retry": "R",
+        "continue": "S",
+        "reset": "A",
+        "exit": "Q",
+    }
 
 
 @pytest.mark.parametrize(

@@ -286,9 +286,10 @@ class ToolRegistry:
                         f"Required tool '{tool_name}' is unavailable:",
                         exit_commands=(),
                         choices={
-                            "halt": "Halt startup",
+                            "halt": "Exit application",
                             "continue": "Continue without this tool",
                         },
+                        index={"halt": "Q", "continue": "C"},
                     )
                     != "continue"
                 ):

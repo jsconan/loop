@@ -1290,8 +1290,9 @@ class PermissionManager:
                 "retry": "Retry after fixing the permission file",
                 "continue": continue_description,
                 "reset": "Archive the invalid file and reset to supervised defaults",
-                "exit": "Exit Loop",
+                "exit": "Exit application",
             },
+            index={"retry": "R", "continue": "S", "reset": "A", "exit": "Q"},
         )
         if choice == "retry":
             return PermissionLoadResult.LOADED
