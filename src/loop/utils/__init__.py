@@ -51,6 +51,7 @@ __all__ = [
     "kill_process_group",
     "list_terms",
     "local_now",
+    "matches_digest",
     "normalized_key",
     "parse_command_line",
     "payload_digest",
@@ -94,7 +95,7 @@ from .content import (
 from .dates import as_utc, local_now, utc_now
 from .files import is_binary_file, write_text_atomically
 from .generation import GenerationStop, GenerationWatchdog
-from .hashing import payload_digest, sha256_digest
+from .hashing import matches_digest, payload_digest, sha256_digest
 from .models import (
     BoundedTextContent,
     CachedContentMetadata,
