@@ -61,19 +61,19 @@ fixtures or scoped context managers.
 Run the affected suite independently first:
 
 ```shell
-.venv/bin/pytest tests/path/to/test_module.py
+uv run pytest tests/path/to/test_module.py
 ```
 
 Then run the complete suite with strict coverage:
 
 ```shell
-.venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100
+uv run pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100
 ```
 
 After changing tests, run:
 
 ```shell
-.venv/bin/ruff format tests
-.venv/bin/ruff check tests
+uv run ruff format tests
+uv run ruff check tests
 git diff --check
 ```

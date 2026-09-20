@@ -11,8 +11,16 @@ unrelated refactoring or new dependencies.
 
 ## Implement the behavior
 
+- Follow PEP 8 for all Python source: preserve its naming, indentation, whitespace, blank-line,
+  import-grouping, line-length, and module-ordering conventions. Treat Ruff's configured PEP 8
+  checks as required, and resolve violations rather than suppressing them without a documented,
+  code-specific reason.
 - Reuse existing project patterns, standard-library features, and installed dependencies before
   adding new abstractions or packages.
+- Before implementing a helper, feature, or integration, search the relevant source, tests, and
+  documentation for an existing implementation or extension point. Reuse it when it matches the
+  required semantics; if it does not, record the mismatch and why a parallel implementation is
+  necessary.
 - Before adding a private helper, consider whether its semantics are generic and reusable across
   modules. When they are, prefer a focused common helper in `src/loop/utils/`; keep behavior that
   is specific to one implementation private to that module or class.
@@ -37,6 +45,8 @@ unrelated refactoring or new dependencies.
   or module-boundary problem instead. Local or lazy imports are allowed only when they prevent
   systematically loading a genuinely heavy resource or loading an optional resource. Imports
   used only for annotations may be placed under `if TYPE_CHECKING:`.
+- In a new `__init__.py`, declare the module-level `__all__` variable immediately after the
+  module docstring and before any imports, following PEP 8's module-level dunder ordering.
 - Remove only imports or code made unused by the current change.
 - State material assumptions, tradeoffs, and deliberately accepted limitations.
 
@@ -45,16 +55,16 @@ unrelated refactoring or new dependencies.
 - Add docstrings to every public module, class, function, method, and property.
 - Start each docstring with a concise, imperative summary.
 - Use complete Google-style sections for the final signature and behavior:
-  - `Args:` documents every parameter except `self` and `cls` as `name (type): description`, even
-    when the signature has a type annotation. Include the meaning of defaults when it is not
-    obvious. In a class docstring, document every `__init__` parameter there.
-  - `Returns:` documents every non-`None` return value as `type: description`, even when the
-    signature has a return annotation. For a tuple, document the composite tuple type and the
-    meaning of each member. Omit it only when every normal path returns `None`.
-  - `Yields:` replaces `Returns:` for an iterator and documents each yielded value as
-    `type: description`.
-  - `Raises:` documents each exception that the callable deliberately raises or exposes as part of
-    its contract. Do not list incidental implementation exceptions.
+    - `Args:` documents every parameter except `self` and `cls` as `name (type): description`, even
+      when the signature has a type annotation. Include the meaning of defaults when it is not
+      obvious. In a class docstring, document every `__init__` parameter there.
+    - `Returns:` documents every non-`None` return value as `type: description`, even when the
+      signature has a return annotation. For a tuple, document the composite tuple type and the
+      meaning of each member. Omit it only when every normal path returns `None`.
+    - `Yields:` replaces `Returns:` for an iterator and documents each yielded value as
+      `type: description`.
+    - `Raises:` documents each exception that the callable deliberately raises or exposes as part of
+      its contract. Do not list incidental implementation exceptions.
 - Do not omit an applicable entry or its type merely because the signature or annotation provides
   the same information.
 - Do not add docstrings to dunder methods.
@@ -99,8 +109,8 @@ changed.
 After changing code, run:
 
 ```shell
-.venv/bin/ruff format src
-.venv/bin/ruff check src
+uv run ruff format src
+uv run ruff check src
 git diff --check
 ```
 

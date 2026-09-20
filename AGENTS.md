@@ -13,10 +13,15 @@
 - Apply YAGNI. Before writing new code, prefer, in order: doing nothing when no change is needed,
   reusing an existing project pattern or helper, using the standard library or a native platform
   feature, and using an already-installed dependency. Only then add the minimum new code required.
+- Before implementing a helper, feature, or integration, search the relevant source, tests, and
+  documentation for an existing implementation or extension point. Reuse it when it matches the
+  required semantics; if it does not, explain the mismatch before adding a parallel path.
 - Avoid new dependencies when the existing codebase or standard library is sufficient. Avoid
   boilerplate, single-use abstractions, speculative extensibility, and unrequested configuration.
 - Prefer boring, direct code and fewer files over cleverness. When equally small alternatives
   exist, choose the one that handles edge cases correctly.
+- Declare instance attributes, including their type hints, at class level; initialize their values
+  in `__init__`. Do not combine declaration and initialization in the constructor body.
 - For bug fixes, identify the root cause and inspect callers of the code being changed. Fix the
   shared cause once when appropriate rather than patching only the reported symptom.
 - Keep changes surgical: match the surrounding style, avoid unrelated refactors or formatting,
@@ -39,6 +44,10 @@
 
 - Treat documentation as part of the implementation. When a signature or behavior changes, update
   the affected docstring in the same change and compare it against the final implementation.
+- Add a complete docstring to every public function and method. Put constructor documentation on
+  the class docstring, including its initialization behavior and arguments; do not add docstrings
+  to dunder methods. Keep private functions and methods documented with a concise summary, adding
+  detail only when their behavior is non-obvious.
 - Complete every applicable docstring section: document every argument with its type and purpose,
   every returned or yielded value with its type and purpose, and every intentionally raised
   exception. Do not leave sections partial merely because annotations or the signature provide
