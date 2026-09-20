@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import RLock
+from typing import IO
 from uuid import UUID, uuid4
 
 from .. import constants
@@ -62,6 +63,23 @@ def base64_decode(encoded: str, binary: bool = False) -> str | bytes:
     """
     decoded = base64.b64decode(encoded, validate=True)
     return decoded if binary else decoded.decode("utf-8")
+
+
+def json_encode(content: object, stream: None | IO[str] = None) -> str:
+    """Encode a Python object as canonical JSON string and optionally write it to a stream.
+
+    Args:
+        content (object): The Python object to encode.
+        stream (None | IO[str]): Optional stream to write the JSON string to.
+            If None, the JSON string is only returned.
+
+    Returns:
+        str: Canonical JSON representation of the object.
+    """
+    result = json.dumps(content, sort_keys=True, separators=(",", ":"))
+    if stream is not None:
+        stream.write(result)
+    return result
 
 
 def data_url(content: str | bytes, media_type: str) -> str:

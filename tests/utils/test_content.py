@@ -1,6 +1,7 @@
 """Tests for bounded text ranges and out-of-context content caching."""
 
 import json
+from io import StringIO
 
 import pytest
 
@@ -17,6 +18,7 @@ from loop.utils.content import (
     decode_content_cursor,
     encode_content_cursor,
     get_binary,
+    json_encode,
     read_bounded_text,
     register_cached_metadata,
     store_content,
@@ -57,6 +59,23 @@ def test_base64_encode_encodes_text_and_binary_content(content, expected):
 def test_base64_decode_decodes_text_and_binary_content(encoded, expected, binary):
     """Base64 strings decode back to UTF-8 or raw bytes correctly."""
     assert base64_decode(encoded, binary=binary) == expected
+
+
+def test_json_encode_returns_sorted_compact_json():
+    """JSON encoding sorts keys recursively and omits optional whitespace."""
+    value = {"z": [2, {"b": True, "a": "text"}], "a": 1}
+
+    assert json_encode(value) == '{"a":1,"z":[2,{"a":"text","b":true}]}'
+
+
+def test_json_encode_writes_encoded_value_to_stream():
+    """JSON encoding returns the value and writes the same text to a stream."""
+    stream = StringIO()
+
+    result = json_encode({"b": 2, "a": 1}, stream)
+
+    assert result == '{"a":1,"b":2}'
+    assert stream.getvalue() == result
 
 
 @pytest.mark.parametrize(
