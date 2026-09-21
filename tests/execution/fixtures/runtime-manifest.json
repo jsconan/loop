@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "mode": "fixture",
+  "artifacts": [{
+    "artifact_id": "runtime", "version": "1", "role": "nerdctl", "platform": {"os": "linux", "architecture": "amd64"},
+    "source": "https://example.test/runtime", "size": 1, "digest": "sha256:2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881", "acquisition": "file", "media_type": "application/octet-stream",
+    "layout": {"files": ["bin/tool"], "executables": ["bin/tool"], "identities": {"bin/tool": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"}, "symlinks": {}, "allow_unlisted_files": false},
+    "dependencies": [], "capabilities": ["fixture-runtime"], "metadata": [], "sbom": "https://example.test/sbom", "notices": "https://example.test/notices", "allowed_redirect_origins": []
+  }]
+}

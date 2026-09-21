@@ -1,0 +1,67 @@
+ARG BASE_IMAGE=docker.io/library/debian@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_SNAPSHOT=20260918T000000Z
+ARG PACKAGES
+RUN --mount=type=secret,id=loop-ca,target=/run/secrets/loop-ca,required=true,mode=0444 \
+    test -n "${PACKAGES}" \
+    && printf '%s\n' \
+        "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
+        > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/* \
+    && apt-get \
+        -o Acquire::Check-Valid-Until=false \
+        -o Acquire::https::CaInfo=/run/secrets/loop-ca \
+        -o APT::Update::Error-Mode=any \
+        update \
+    && DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Acquire::https::CaInfo=/run/secrets/loop-ca \
+        install --yes --no-install-recommends ${PACKAGES} \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG UV_VERSION
+ARG UV_ORIGIN
+ARG UV_MAX_BYTES
+ARG UV_AARCH64_SHA256
+ARG UV_X86_64_SHA256
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+        arm64) uv_arch=aarch64; uv_sha256="${UV_AARCH64_SHA256}" ;; \
+        amd64) uv_arch=x86_64; uv_sha256="${UV_X86_64_SHA256}" ;; \
+        *) exit 64 ;; \
+    esac; \
+    uv_archive="uv-${uv_arch}-unknown-linux-gnu.tar.gz"; \
+    uv_directory="${uv_archive%.tar.gz}"; \
+    uv_url="${UV_ORIGIN}/${uv_archive}"; \
+    install --directory --mode=0755 /tools/bin; \
+    work=$(mktemp -d); \
+    trap 'rm -rf "$work"' EXIT HUP INT TERM; \
+    wget --https-only --max-redirect=0 --quota="$UV_MAX_BYTES" \
+        --ca-certificate=/etc/ssl/certs/ca-certificates.crt \
+        --output-document="$work/$uv_archive" "$uv_url"; \
+    test "$(stat -c %s "$work/$uv_archive")" -le "$UV_MAX_BYTES"; \
+    printf '%s  %s\n' "$uv_sha256" "$work/$uv_archive" | sha256sum --check --strict -; \
+    printf '%s\n' "$uv_directory/" "$uv_directory/uv" "$uv_directory/uvx" \
+        > "$work/expected-members"; \
+    tar -tzf "$work/$uv_archive" | LC_ALL=C sort > "$work/members"; \
+    LC_ALL=C sort -o "$work/expected-members" "$work/expected-members"; \
+    cmp "$work/expected-members" "$work/members"; \
+    tar -xzf "$work/$uv_archive" --strip-components=1 -C /tools/bin \
+        "$uv_directory/uv" "$uv_directory/uvx"; \
+    case "$(/tools/bin/uv --version)" in "uv ${UV_VERSION} ("*")") ;; *) exit 1 ;; esac; \
+    case "$(/tools/bin/uvx --version)" in "uvx ${UV_VERSION} ("*")") ;; *) exit 1 ;; esac
+
+RUN groupadd --gid 1000 agent \
+    && useradd --uid 1000 --gid agent --create-home --shell /bin/bash agent \
+    && install --directory --owner=agent --group=agent --mode=0755 /workspace /tools/bin \
+    && install --directory --mode=0755 /usr/share/loop
+
+COPY inventory.json /usr/share/loop/sandbox-inventory.json
+RUN chmod 0444 /usr/share/loop/sandbox-inventory.json
+
+ENV HOME=/home/agent \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/tools/bin:/usr/local/bin:/usr/bin:/bin
+USER agent:agent
+WORKDIR /workspace

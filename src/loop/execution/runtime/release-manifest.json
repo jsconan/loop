@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "mode": "release",
+  "artifacts": [
+    {
+      "artifact_id": "lima", "version": "2.2.0", "role": "lima", "platform": {"os": "macos", "architecture": "arm64"},
+      "source": "https://github.com/lima-vm/lima/releases/download/v2.2.0/lima-2.2.0-Darwin-arm64.tar.gz", "size": 37586365, "digest": "sha256:bbdef91774885a0d05f7b048c4eb89ae2bcf3a0c252ae7ca7934e63df76d93c3", "acquisition": "archive", "media_type": "application/gzip",
+      "layout": {"files": ["bin/limactl"], "executables": ["bin/limactl"], "identities": {"bin/limactl": "f19a4fca3875e1017a5285672be4a62699c1e55918fb6a7afce86a14199e10d9"}, "symlinks": {"share/doc/lima/templates": "../../lima/templates"}, "allow_unlisted_files": true},
+      "dependencies": [], "capabilities": ["sandbox-management"], "metadata": [{"name": "codesign-entitlement.com.apple.security.network.client", "value": "true"}, {"name": "codesign-entitlement.com.apple.security.network.server", "value": "true"}, {"name": "codesign-entitlement.com.apple.security.virtualization", "value": "true"}],
+      "sbom": "https://github.com/lima-vm/lima/releases/tag/v2.2.0", "notices": "https://github.com/lima-vm/lima/blob/v2.2.0/LICENSE", "allowed_redirect_origins": ["https://release-assets.githubusercontent.com"]
+    },
+    {
+      "artifact_id": "guest-image", "version": "26.04-20260720", "role": "guest-image", "platform": {"os": "linux", "architecture": "arm64"},
+      "source": "https://cloud-images.ubuntu.com/releases/resolute/release-20260720/ubuntu-26.04-server-cloudimg-arm64.img", "size": 941132800, "digest": "sha256:7bcf159e29ad0000bfed9c57875908c39268f5ed1257f4958fa6a9f5f60edd54", "acquisition": "file", "media_type": "application/octet-stream", "layout": null,
+      "dependencies": [], "capabilities": [], "metadata": [], "sbom": "https://cloud-images.ubuntu.com/releases/resolute/release-20260720/SHA256SUMS", "notices": "https://ubuntu.com/legal/terms-and-policies", "allowed_redirect_origins": []
+    },
+    {
+      "artifact_id": "nerdctl-full", "version": "2.2.0", "role": "nerdctl", "platform": {"os": "linux", "architecture": "arm64"},
+      "source": "https://github.com/containerd/nerdctl/releases/download/v2.2.0/nerdctl-full-2.2.0-linux-arm64.tar.gz", "size": 250964672, "digest": "sha256:5398f037ae095d43cf3cb8c30765a24e511e38cafe02977b928a41b26e842ed1", "acquisition": "archive", "media_type": "application/gzip", "layout": null,
+      "dependencies": [], "capabilities": [], "metadata": [{"name": "component.nerdctl", "value": "2.2.0"}, {"name": "component.containerd", "value": "2.2.0"}, {"name": "component.runc", "value": "1.3.3"}, {"name": "component.buildkit", "value": "0.25.2"}],
+      "sbom": "https://github.com/containerd/nerdctl/releases/tag/v2.2.0", "notices": "https://github.com/containerd/nerdctl/blob/v2.2.0/LICENSE", "allowed_redirect_origins": ["https://release-assets.githubusercontent.com"]
+    },
+    {
+      "artifact_id": "envoy", "version": "1.39.1", "role": "envoy", "platform": {"os": "linux", "architecture": "arm64"},
+      "source": "docker.io/envoyproxy/envoy:distroless-v1.39.1@sha256:eb2c01c13125d1629637cb4e4cce7207009fb7cc2c8027f9742758549d15b6f4", "size": null, "digest": "sha256:eb2c01c13125d1629637cb4e4cce7207009fb7cc2c8027f9742758549d15b6f4", "acquisition": "oci", "media_type": "application/vnd.oci.image.index.v1+json", "layout": null,
+      "oci_identity": {"index_digest": "sha256:eb2c01c13125d1629637cb4e4cce7207009fb7cc2c8027f9742758549d15b6f4", "manifest_digest": "sha256:62649e9cb5073a995b57d888f98382927ad15e91c53affac92a8a48a365027db", "config_digest": "sha256:370bbc1c75d7593733a11822c83fa99ce79247d3f79fb76bca210311ab12ec9a"},
+      "dependencies": [], "capabilities": ["network-broker"], "metadata": [], "sbom": "https://github.com/envoyproxy/envoy/releases/tag/v1.39.1", "notices": "https://github.com/envoyproxy/envoy/blob/v1.39.1/LICENSE", "allowed_redirect_origins": []
+    }
+  ]
+}
