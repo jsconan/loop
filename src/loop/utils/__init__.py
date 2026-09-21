@@ -47,6 +47,7 @@ __all__ = [
     "get_binary",
     "is_binary_file",
     "is_path_ignored",
+    "is_workspace_path_ignored",
     "iter_visible_paths",
     "json_encode",
     "list_terms",
@@ -112,6 +113,7 @@ from .path import (
     filter_paths_by_globs,
     find_project_root,
     is_path_ignored,
+    is_workspace_path_ignored,
     iter_visible_paths,
 )
 from .rotating_file import PrivateRotatingTextFile

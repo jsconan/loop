@@ -53,8 +53,7 @@ def create_command_executor(
         system (str | None): Platform-system override for isolated tests.
         machine (str | None): CPU-architecture override for isolated tests.
         secret_authority (SecretAuthority | None): Application-owned exact secret resolver retained
-            for broker composition. Secret effects remain explicitly unsupported until output
-            non-disclosure and cumulative network controls are both enforceable.
+            for audience-bound and explicitly raw secret broker composition.
 
     Returns:
         SandboxCommandExecutor | None: macOS sandbox executor, or ``None`` until another platform
@@ -128,5 +127,6 @@ def create_command_executor(
         agent_run_id,
         image.source_version,
         runtime_resolver=adapter.ensure_sandbox,
-        supports_secret_exposures=False,
+        supports_network_effects=True,
+        supports_secret_exposures=secret_authority is not None,
     )

@@ -188,6 +188,28 @@ def test_archive_inspection_handles_native_metacopy_redirect_metadata(tmp_path: 
     assert delta.entries[2].source_path == "source"
 
 
+def test_archive_inspection_discards_ignored_publication_effects(tmp_path: Path) -> None:
+    """Ignored cache writes and deletions never become persistent workspace effects."""
+    archive = tmp_path / "ignored.tar"
+    with tarfile.open(archive, "w") as bundle:
+        _add_file(bundle, ".venv/bin/python", b"guest executable")
+        _add_file(bundle, "source.py", b"print('kept')\n")
+        whiteout = tarfile.TarInfo("directory/old")
+        whiteout.type = tarfile.CHRTYPE
+        whiteout.devmajor = 0
+        whiteout.devminor = 0
+        bundle.addfile(whiteout)
+
+    delta = MacosDeltaArchiveInspector(
+        StagedContentStore(tmp_path / "store"),
+        ignore_path=lambda path: path.startswith(".venv") or path == "directory/old",
+    ).inspect("attempt", archive, _base())
+
+    assert [(entry.effect, entry.destination_path) for entry in delta.entries] == [
+        (DeltaEffect.CREATE, "source.py")
+    ]
+
+
 @pytest.mark.parametrize(
     ("member_type", "headers", "message"),
     (

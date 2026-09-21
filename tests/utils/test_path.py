@@ -8,6 +8,7 @@ from loop.utils import (
     filter_paths_by_globs,
     find_project_root,
     is_path_ignored,
+    is_workspace_path_ignored,
     iter_visible_paths,
 )
 
@@ -177,6 +178,30 @@ def test_is_path_ignored_falls_back_to_path_parent_and_rejects_outside_root(tmp_
 
     with pytest.raises(ValueError):
         is_path_ignored(tmp_path.parent / "outside.txt", root=tmp_path)
+
+
+def test_workspace_ignore_policy_keeps_git_and_excludes_platform_artifacts(tmp_path):
+    """Sandbox synchronization keeps VCS state but drops ignored and host-native artifacts."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "index").touch()
+    (tmp_path / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    (tmp_path / "generated").mkdir()
+    (tmp_path / "generated" / "result").touch()
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "python").touch()
+    (tmp_path / "module.pyc").touch()
+    source = tmp_path / "source.py"
+    source.touch()
+
+    assert not is_workspace_path_ignored(tmp_path / ".git", tmp_path)
+    assert not is_workspace_path_ignored(tmp_path / ".git" / "index", tmp_path)
+    assert is_workspace_path_ignored(tmp_path / "generated", tmp_path)
+    assert is_workspace_path_ignored(tmp_path / ".venv" / "python", tmp_path)
+    assert is_workspace_path_ignored(tmp_path / "module.pyc", tmp_path)
+    assert not is_workspace_path_ignored(source, tmp_path)
+
+    with pytest.raises(ValueError):
+        is_workspace_path_ignored(tmp_path.parent / "outside", tmp_path)
 
 
 def test_iter_visible_paths_prunes_rules_recurses_and_does_not_follow_symlinks(tmp_path):

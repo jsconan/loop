@@ -10,6 +10,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from ...utils.path import is_workspace_path_ignored
 from .manifest import SnapshotManifest, SnapshotManifestEntry
 from .models import (
     BaseSnapshotId,
@@ -204,6 +205,8 @@ class SnapshotBuilder:
             for name in sorted(os.listdir(descriptor)):
                 relative_path = f"{relative}/{name}" if relative else name
                 source_metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if is_workspace_path_ignored(root.path / relative_path, root.path):
+                    continue
                 destination_path = destination / name
                 if stat.S_ISDIR(source_metadata.st_mode):
                     destination_path.mkdir(mode=stat.S_IMODE(source_metadata.st_mode))

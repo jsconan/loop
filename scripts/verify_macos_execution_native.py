@@ -495,6 +495,7 @@ def _verify_execution(
                 private_root / "product-execution",
                 execution_permissions,
                 OciResourceLimits(256 * 2**20, 64, 100000),
+                secret_authority=NativeSecrets(),
                 prepared_runtime=prepared,
             )
             command_executor = SandboxCommandExecutor(
@@ -503,6 +504,8 @@ def _verify_execution(
                 "native-verifier-workspace",
                 "native-agent",
                 image.identity.manifest_digest,
+                supports_network_effects=True,
+                supports_secret_exposures=True,
             )
             registry = create_default_tool_registry(
                 permission_manager=permission_manager,
@@ -598,7 +601,7 @@ def _verify_execution(
                     f"Public PTY allocation and initial resize failed: {pty_result!r}."
                 )
 
-            unavailable_network = json.loads(
+            public_network = json.loads(
                 registry.call(
                     "run_command",
                     json.dumps(
@@ -608,8 +611,8 @@ def _verify_execution(
                             "network_connections": [
                                 {
                                     "hostname": "example.com",
-                                    "port": 443,
-                                    "protocol": "https",
+                                    "port": 80,
+                                    "protocol": "http",
                                     "addresses": ["93.184.216.34"],
                                     "max_connections": 2,
                                     "max_bytes": 1024,
@@ -617,14 +620,12 @@ def _verify_execution(
                             ],
                         }
                     ),
-                    call_id="native-product-network-unsupported",
+                    call_id="native-product-network",
                 )
             )
-            if unavailable_network.get("problem", {}).get("code") != (
-                "process.unsupported_capability"
-            ):
-                raise RuntimeError("Public network effects did not fail closed.")
-            unavailable_secret = json.loads(
+            if public_network.get("ok") is not True:
+                raise RuntimeError("Public network broker execution failed.")
+            public_secret = json.loads(
                 registry.call(
                     "run_command",
                     json.dumps(
@@ -641,21 +642,29 @@ def _verify_execution(
                             ],
                         }
                     ),
-                    call_id="native-product-secret-unsupported",
+                    call_id="native-product-secret",
                 )
             )
-            if unavailable_secret.get("problem", {}).get("code") != (
-                "process.unsupported_capability"
-            ):
-                raise RuntimeError("Public secret effects did not fail closed.")
+            if public_secret.get("ok") is not True:
+                raise RuntimeError("Public secret broker execution failed.")
 
-            unavailable_header = json.loads(
+            public_header = json.loads(
                 registry.call(
                     "run_command",
                     json.dumps(
                         {
                             "command": "true",
                             "cwd": "/workspace",
+                            "network_connections": [
+                                {
+                                    "hostname": "example.com",
+                                    "port": 80,
+                                    "protocol": "http",
+                                    "addresses": ["93.184.216.34"],
+                                    "max_connections": 2,
+                                    "max_bytes": 1024,
+                                }
+                            ],
                             "secret_exposures": [
                                 {
                                     "secret_id": "native-header",
@@ -666,15 +675,13 @@ def _verify_execution(
                             ],
                         }
                     ),
-                    call_id="native-product-header-secret-unsupported",
+                    call_id="native-product-header-secret",
                 )
             )
-            if unavailable_header.get("problem", {}).get("code") != (
-                "process.unsupported_capability"
-            ):
-                raise RuntimeError("Public header-secret effects did not fail closed.")
+            if public_header.get("ok") is not True:
+                raise RuntimeError("Public header-secret broker execution failed.")
 
-            unavailable_listener = json.loads(
+            public_listener = json.loads(
                 registry.call(
                     "run_command",
                     json.dumps(
@@ -684,13 +691,11 @@ def _verify_execution(
                             "network_listeners": [{"port": 18080, "target_port": 18080}],
                         }
                     ),
-                    call_id="native-product-listener-unsupported",
+                    call_id="native-product-listener",
                 )
             )
-            if unavailable_listener.get("problem", {}).get("code") != (
-                "process.unsupported_capability"
-            ):
-                raise RuntimeError("Public listener effects did not fail closed.")
+            if public_listener.get("ok") is not True:
+                raise RuntimeError("Public listener broker execution failed.")
 
             started_job = json.loads(
                 registry.call(

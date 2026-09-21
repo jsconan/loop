@@ -1043,12 +1043,15 @@ class MacosDeltaArchiveInspector:
         maximum_entries (int): Maximum accepted archive members and observed effects.
         maximum_content_bytes (int): Maximum total staged regular-file bytes.
         maximum_archive_bytes (int): Maximum accepted archive size including metadata.
+        ignore_path (Callable[[str], bool] | None): Workspace-relative publication exclusion
+            policy. Excluded effects are discarded before content staging.
     """
 
     content_store: StagedContentStore
     maximum_entries: int
     maximum_content_bytes: int
     maximum_archive_bytes: int
+    ignore_path: Callable[[str], bool]
 
     def __init__(
         self,
@@ -1057,6 +1060,7 @@ class MacosDeltaArchiveInspector:
         maximum_entries: int = 10_000,
         maximum_content_bytes: int = 1 << 30,
         maximum_archive_bytes: int = 2 << 30,
+        ignore_path: Callable[[str], bool] | None = None,
     ) -> None:
         """Configure bounded inspection of trusted guest-produced archives."""
         if min(maximum_entries, maximum_content_bytes, maximum_archive_bytes) < 0:
@@ -1065,6 +1069,7 @@ class MacosDeltaArchiveInspector:
         self.maximum_entries = maximum_entries
         self.maximum_content_bytes = maximum_content_bytes
         self.maximum_archive_bytes = maximum_archive_bytes
+        self.ignore_path = ignore_path or (lambda _path: False)
 
     def inspect(
         self,
@@ -1109,11 +1114,13 @@ class MacosDeltaArchiveInspector:
                         continue
                     whiteout = _whiteout_path(member, path)
                     if whiteout is not None:
-                        if whiteout:
+                        if whiteout and not self.ignore_path(whiteout):
                             deletions.add(whiteout)
-                        else:
+                        elif not whiteout and not self.ignore_path(path):
                             parent = str(PurePosixPath(path).parent)
                             opaque_directories.add("" if parent == "." else parent)
+                        continue
+                    if self.ignore_path(path):
                         continue
                     if _truthy_xattr(metadata_headers, _OPAQUE_XATTRS):
                         opaque_directories.add(path)
@@ -1154,7 +1161,10 @@ class MacosDeltaArchiveInspector:
             deletions.update(
                 path
                 for path in current
-                if path.startswith(prefix) and path not in visible and path != directory
+                if path.startswith(prefix)
+                and path not in visible
+                and path != directory
+                and not self.ignore_path(path)
             )
         return normalize_delta(
             ObservedDelta(

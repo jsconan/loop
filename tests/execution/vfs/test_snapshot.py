@@ -51,6 +51,32 @@ def test_snapshot_captures_real_files_and_literal_symlinks_without_following_the
     assert not snapshot.directory.parent.exists()
 
 
+def test_snapshot_excludes_ignore_rules_and_host_platform_artifacts(tmp_path: Path) -> None:
+    """Source synchronization omits ignored data and host-specific environments."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".gitignore").write_text("secret.env\nbuild/\n", encoding="utf-8")
+    (workspace / ".agentignore").write_text("private.txt\n", encoding="utf-8")
+    (workspace / "secret.env").write_text("secret", encoding="utf-8")
+    (workspace / "private.txt").write_text("private", encoding="utf-8")
+    (workspace / "build").mkdir()
+    (workspace / "build" / "native").write_bytes(b"binary")
+    (workspace / ".venv").mkdir()
+    (workspace / ".venv" / "python").write_bytes(b"Mach-O")
+    (workspace / "source.py").write_text("print('portable')\n", encoding="utf-8")
+
+    with AuthenticatedWorkspaceRoot(workspace) as root:
+        snapshot = SnapshotBuilder(tmp_path / "snapshots").build(root)
+
+    assert (snapshot.directory / ".gitignore").is_file()
+    assert (snapshot.directory / ".agentignore").is_file()
+    assert (snapshot.directory / "source.py").is_file()
+    assert not (snapshot.directory / "secret.env").exists()
+    assert not (snapshot.directory / "private.txt").exists()
+    assert not (snapshot.directory / "build").exists()
+    assert not (snapshot.directory / ".venv").exists()
+
+
 def test_authenticated_root_rejects_symlinks_and_root_replacement(tmp_path: Path):
     """Root authentication refuses aliases and detects replacement before descriptor use."""
     workspace = tmp_path / "workspace"

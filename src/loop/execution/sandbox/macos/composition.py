@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import RLock
 
 from ....permissions.execution_adapter import ExecutionPermissionAdapter
+from ....utils import is_workspace_path_ignored
 from ...broker import SecretAuthority
 from ...contracts import JobHandle, SandboxExecutionRequest
 from ...results import ExecutionResult
@@ -261,6 +262,9 @@ class MacosProductAdapter:
                     content_store,
                     maximum_content_bytes=self.limits.persistent_write_bytes,
                     maximum_archive_bytes=self.limits.disk_bytes,
+                    ignore_path=lambda relative: is_workspace_path_ignored(
+                        root.path / relative, root.path
+                    ),
                 ),
                 publication,
                 self._load_manifest,

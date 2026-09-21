@@ -101,7 +101,7 @@ def test_command_executor_composes_lazy_macos_product_boundary(tmp_path, monkeyp
     assert isinstance(executor, SandboxCommandExecutor)
     assert executor.agent_run_id is identity
     assert executor.runtime_digest.startswith("sha256:")
-    assert executor.supports_network_effects is False
+    assert executor.supports_network_effects is True
     assert executor.supports_secret_exposures is False
     execution_module.RuntimeBootstrapper.assert_called_once()
     execution_module.MacosSandboxBackend.assert_called_once()
@@ -124,7 +124,8 @@ def test_command_executor_composes_lazy_macos_product_boundary(tmp_path, monkeyp
         secret_authority=authority,
     )
     assert enabled is not None
-    assert enabled.supports_secret_exposures is False
+    assert enabled.supports_network_effects is True
+    assert enabled.supports_secret_exposures is True
 
 
 def test_command_executor_management_invalidates_cached_readiness() -> None:
