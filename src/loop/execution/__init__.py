@@ -10,6 +10,7 @@ __all__ = [
     "ExecutionResult",
     "ExecutionService",
     "HostExecutionRequest",
+    "HostExecutionResult",
     "JobHandle",
     "JobOperation",
     "NetworkConnectionLease",
@@ -46,5 +47,6 @@ from .contracts import (
     WorkspaceDelta,
     WorkspaceDeltaEntry,
 )
+from .host import HostExecutionResult
 from .results import ExecutionResult
 from .service import ExecutionService, SandboxAdapter
