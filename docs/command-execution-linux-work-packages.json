@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "plan": "docs/command-execution-linux-implementation-plan.md",
+  "packages": {
+    "L0": {
+      "status": "pending",
+      "verification": [],
+      "blocker": null,
+      "resume_from": null
+    },
+    "L1": {
+      "status": "pending",
+      "verification": [],
+      "blocker": null,
+      "resume_from": null
+    },
+    "L2": {
+      "status": "pending",
+      "verification": [],
+      "blocker": null,
+      "resume_from": null
+    },
+    "L3": {
+      "status": "pending",
+      "verification": [],
+      "blocker": null,
+      "resume_from": null
+    },
+    "L4": {
+      "status": "pending",
+      "verification": [],
+      "blocker": null,
+      "resume_from": null
+    },
+    "L5": {
+      "status": "pending",
+      "verification": [],
+      "blocker": null,
+      "resume_from": null
+    },
+    "L6": {
+      "status": "pending",
+      "verification": [],
+      "blocker": null,
+      "resume_from": null
+    },
+    "L7": {
+      "status": "pending",
+      "verification": [],
+      "blocker": null,
+      "resume_from": null
+    },
+    "L8": {
+      "status": "pending",
+      "verification": [],
+      "blocker": null,
+      "resume_from": null
+    }
+  }
+}

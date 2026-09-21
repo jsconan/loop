@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "plan": "docs/command-execution-production-architecture.md",
+  "packages": {
+    "WP0.1": {
+      "status": "complete",
+      "verification": [
+        "rg -n 'Stage [A-Z]|M0[.]|E4[.]|R-M|I-M|L1|WP0[.]' src tests scripts docs/runtime-candidates docs/runtime-*.md",
+        ".venv/bin/pytest tests/execution -q"
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP0.2": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/pytest tests/execution -q"
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP0.3": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/pytest tests/execution -q",
+        ".venv/bin/pytest tests/integration/execution -q"
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP0.4": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/pytest tests/execution/vfs/test_agent_workspace.py tests/execution/vfs/test_commit_broker.py --cov=loop.execution.vfs.agent_workspace --cov=loop.execution.vfs.journal --cov=loop.execution.vfs.coordinator --cov-report=term-missing --cov-branch",
+        ".venv/bin/ruff format src",
+        ".venv/bin/ruff format tests",
+        ".venv/bin/ruff check src",
+        ".venv/bin/ruff check tests",
+        "git diff --check",
+        ".venv/bin/pytest tests/execution -q",
+        ".venv/bin/pytest tests/integration/execution -q",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100"
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP0.5": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/pytest tests/permissions tests/execution/policy -q",
+        ".venv/bin/pytest tests/execution/test_architecture.py -q",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100",
+        "git diff --check"
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP1": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/pytest tests/execution/sandbox/macos/test_backend.py --cov=loop.execution.sandbox.macos.backend --cov-report=term-missing --cov-branch",
+        ".venv/bin/pytest tests/execution -q",
+        ".venv/bin/pytest tests/integration/execution -q",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/lw3-state",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100",
+        ".venv/bin/ruff format --check src tests scripts",
+        ".venv/bin/ruff check src tests scripts",
+        "git diff --check"
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP1.1": {
+      "status": "blocked",
+      "verification": [
+        ".venv/bin/pytest tests/execution/test_image.py tests/execution/sandbox/macos/test_images.py tests/execution/sandbox/macos/test_control_plane.py -q",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --verify-host-toolchain-parity --state-root /private/tmp/loop-wp11-parity",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/loop-wp11-baseline-20260921",
+        "test ! -e /private/tmp/loop-wp11-baseline-20260921",
+        "git diff --check",
+        "git diff --cached --check"
+      ],
+      "blocker": "The required WP1.1 exit corpus needs Rust and Go, and the product constraint requires them in the image, but neither is installed on this Mac; section 5 and the WP1.1 readiness rule require host-absent managed developer tools to be absent from the command PATH. The authoritative requirements do not specify which rule governs these tools.",
+      "resume_from": "Resolve whether host-absent Rust and Go remain in the complete image or are omitted by parity; then implement and natively verify the chosen manifest-keyed realization."
+    },
+    "WP2": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/pytest tests/execution/sandbox/macos/test_workspace.py tests/execution/sandbox/oci/test_control.py tests/execution/sandbox/macos/test_lima_client.py tests/execution/vfs/test_agent_workspace.py tests/execution/vfs/test_models.py -q",
+        ".venv/bin/pytest tests/execution -q",
+        ".venv/bin/pytest tests/integration/execution -q",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/loop-wp2-recovery-20260920-e",
+        "test ! -e /private/tmp/loop-wp2-recovery-20260920-e",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100 -q",
+        ".venv/bin/ruff format scripts/verify_macos_execution_native.py src/loop/execution/sandbox/macos/workspace.py tests/execution/sandbox/macos/test_workspace.py tests/execution/sandbox/oci/test_control.py",
+        ".venv/bin/ruff format --check src tests scripts",
+        ".venv/bin/ruff check src tests scripts",
+        "git diff --check",
+        "git diff --cached --check",
+        "graphify update ."
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP3": {
+      "status": "in_progress",
+      "verification": [
+        ".venv/bin/pytest tests/utils/test_path.py tests/execution/vfs/test_snapshot.py tests/execution/sandbox/macos/test_workspace.py -q",
+        ".venv/bin/pytest tests/execution/sandbox/macos/test_execution.py tests/execution/sandbox/macos/test_workspace.py tests/execution/vfs/test_staging.py tests/execution/vfs/test_snapshot.py tests/execution/vfs/test_agent_workspace.py tests/execution/vfs/test_commit_broker.py --cov=loop.execution.sandbox.macos.execution --cov=loop.execution.sandbox.macos.workspace --cov=loop.execution.vfs.agent_workspace --cov=loop.execution.vfs.commit_broker --cov=loop.execution.vfs.coordinator --cov=loop.execution.vfs.snapshot --cov=loop.execution.vfs.staging --cov-report=term-missing --cov-branch -q",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/lw3repair9",
+        "git diff --check",
+        "graphify update ."
+      ],
+      "blocker": "Snapshot and publication now exclude hierarchical ignore rules and hard platform artifacts, but raw .git metadata remains copied to preserve current VCS behavior. Linked-worktree indirection, hooks, and local Git configuration still require sanitized portable reconstruction plus a persisted inclusion-policy digest.",
+      "resume_from": "Add a descriptor-safe source-selection manifest, standard Git tracked/untracked selection, separate explicit .dockerignore handling, and sanitized Git metadata reconstruction; extend native tests for linked worktrees and tracked ignored files."
+    },
+    "WP4": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/pytest tests/permissions/test_execution.py tests/tools/test_system.py --cov=loop.permissions.execution --cov=loop.permissions.execution_adapter --cov=loop.execution.command --cov=loop.tools.system --cov-report=term-missing --cov-branch -q",
+        ".venv/bin/ruff check --fix src tests scripts",
+        ".venv/bin/ruff format src tests scripts",
+        ".venv/bin/pytest -q",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100 -q",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/lw4x",
+        "git diff --check"
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP5": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/pytest tests/execution/sandbox/oci/test_control.py tests/execution/sandbox/macos/test_control_plane.py tests/integration/execution/test_oci_process.py --cov=loop.execution.sandbox.oci.control --cov=loop.execution.sandbox.oci.process --cov=loop.execution.sandbox.macos.control_plane --cov-report=term-missing --cov-branch --cov-fail-under=100 -q",
+        ".venv/bin/pytest -q",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100 -q",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/lw5final1",
+        ".venv/bin/ruff format --check src tests scripts",
+        ".venv/bin/ruff check src tests scripts",
+        "git diff --check",
+        "graphify update ."
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP6": {
+      "status": "in_progress",
+      "verification": [
+        ".venv/bin/pytest tests/application/test_execution.py tests/execution/test_broker.py tests/execution/sandbox/macos/test_broker.py -q",
+        ".venv/bin/pytest tests/execution/test_broker.py -q",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/lw6-final-j",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100 -q",
+        ".venv/bin/pytest tests/integration -q",
+        ".venv/bin/ruff format --check src tests scripts",
+        ".venv/bin/ruff check src tests scripts",
+        "git diff --check",
+        "graphify update ."
+      ],
+      "blocker": "Product composition now advertises the implemented network broker and enables secrets only when an application secret authority exists. The native verifier must still replace its UnsupportedCapability expectation with positive and negative public run_command broker cases.",
+      "resume_from": "Add real product-path outbound, listener, audience-bound secret, raw secret, rebinding, metadata/private-address, redirect, SNI, cleanup, and disclosure tests."
+    },
+    "WP7": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/lw7native13",
+        ".venv/bin/pytest -q",
+        ".venv/bin/pytest tests/integration -q",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100 -q",
+        ".venv/bin/ruff format --check src tests scripts",
+        ".venv/bin/ruff check src tests scripts",
+        "git diff --check",
+        "git diff --cached --check",
+        "graphify update ."
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP8": {
+      "status": "complete",
+      "verification": [
+        ".venv/bin/pytest tests/execution/host tests/permissions/test_host_adapter.py tests/execution/infrastructure/test_process.py tests/integration/execution/test_host_execution.py --cov=loop.execution.host --cov=loop.execution.infrastructure.process --cov=loop.permissions.host_adapter --cov-report=term-missing --cov-branch -q",
+        ".venv/bin/pytest tests/execution tests/permissions -q",
+        ".venv/bin/pytest tests/integration -q",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100 -q",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/lw8final3",
+        ".venv/bin/ruff format --check src tests scripts",
+        ".venv/bin/ruff check src tests scripts",
+        "git diff --check",
+        "git diff --cached --check",
+        "graphify update ."
+      ],
+      "blocker": null,
+      "resume_from": null
+    },
+    "WP9": {
+      "status": "blocked",
+      "verification": [
+        ".venv/bin/pytest tests/permissions tests/tools/test_system.py tests/application/test_execution.py tests/execution/test_architecture.py tests/execution/test_runtime.py tests/execution/sandbox/macos/test_control_plane.py -q",
+        ".venv/bin/pytest tests/integration -q",
+        ".venv/bin/pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100 -q",
+        ".venv/bin/python scripts/verify_macos_execution_native.py --state-root /private/tmp/lw9-native-20260920-c",
+        "test ! -e /private/tmp/lw9-native-20260920-c",
+        ".venv/bin/ruff format src tests scripts",
+        ".venv/bin/ruff check src tests scripts",
+        "git diff --check",
+        "git diff --cached --check",
+        "graphify update ."
+      ],
+      "blocker": "Release qualification cannot complete until reopened WP1.1 host-tool parity, WP3 portable Git/source synchronization, and WP6 product broker end-to-end gates pass. Existing green tests and the previous native corpus do not exercise those requirements.",
+      "resume_from": "Complete WP1.1, WP3, and WP6; then rerun clean-install, actual-repository, offline-cache, update/rollback, security, and 20-sample warm performance qualification."
+    }
+  }
+}

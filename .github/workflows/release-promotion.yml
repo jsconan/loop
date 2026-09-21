@@ -1,0 +1,39 @@
+name: macOS Release Promotion
+
+on:
+    workflow_dispatch:
+    pull_request:
+    push:
+        tags:
+            - 'v*'
+
+jobs:
+    macos-native-security:
+        name: macOS Apple Silicon native and security
+        runs-on: [self-hosted, macOS, ARM64, loop-native-security]
+        timeout-minutes: 90
+        steps:
+            - uses: actions/checkout@v7
+            - uses: astral-sh/setup-uv@v10
+            - run: uv sync --group dev
+            - name: Verify physical Apple Silicon host
+              run: |
+                  test "$(uname -s)" = Darwin
+                  test "$(uname -m)" = arm64
+                  test "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" != 1
+            - name: Run clean native product, security, recovery, concurrency, and performance gate
+              run: |
+                  state_root="/private/tmp/loop-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+                  evidence="${RUNNER_TEMP}/loop-macos-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+                  test ! -e "$state_root"
+                  test ! -e "$evidence"
+                  uv run python scripts/verify_macos_execution_native.py \
+                    --state-root "$state_root" --evidence "$evidence"
+                  test ! -e "$state_root"
+            - name: Retain bounded native release evidence
+              uses: actions/upload-artifact@v6
+              with:
+                  name: macos-native-${{ github.run_id }}-${{ github.run_attempt }}
+                  path: ${{ runner.temp }}/loop-macos-native-${{ github.run_id }}-${{ github.run_attempt }}.json
+                  if-no-files-found: error
+                  retention-days: 30
