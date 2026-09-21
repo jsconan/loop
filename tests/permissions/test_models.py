@@ -10,7 +10,6 @@ from loop import (
     NetworkTarget,
     Operation,
     PermissionConfiguration,
-    ProcessTarget,
     SessionTarget,
     UserPermissionConfiguration,
 )
@@ -26,7 +25,6 @@ def test_actions_map_to_distinct_prompt_icons():
         Action.FILESYSTEM_REPLACE: "✏️",
         Action.FILESYSTEM_DELETE: "🗑️",
         Action.NETWORK_REQUEST: "🌐",
-        Action.PROCESS_EXECUTE: "⚙️",
         Action.SESSION_MUTATE: "💾",
     }
 
@@ -41,11 +39,6 @@ def test_operations_expose_stable_resource_representations():
             target=NetworkTarget(url="https://my-host.local/a", origin="https://my-host.local"),
         ),
         Operation(
-            tool_id="exec",
-            action=Action.PROCESS_EXECUTE,
-            target=ProcessTarget(argv=("git", "status"), cwd="/x"),
-        ),
-        Operation(
             tool_id="skills",
             action=Action.SESSION_MUTATE,
             target=SessionTarget(identifier="activate:demo"),
@@ -55,7 +48,6 @@ def test_operations_expose_stable_resource_representations():
     assert tuple(operation.resource for operation in operations) == (
         "/x",
         "https://my-host.local/a",
-        "git status",
         "activate:demo",
     )
 

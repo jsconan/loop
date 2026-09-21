@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from enum import StrEnum
 from importlib.resources import files
@@ -13,7 +12,8 @@ from uuid import uuid4
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
-from ..utils import sha256_digest
+from ..utils import json_encode, sha256_digest
+from .execution import PolicyGrant
 
 type FileKind = Literal["file", "directory", "symlink"]
 type Operations = tuple[Operation, ...]
@@ -28,7 +28,6 @@ class Action(StrEnum):
     FILESYSTEM_REPLACE = "filesystem.replace"
     FILESYSTEM_DELETE = "filesystem.delete"
     NETWORK_REQUEST = "network.request"
-    PROCESS_EXECUTE = "process.execute"
     SESSION_MUTATE = "session.mutate"
 
     @property
@@ -48,7 +47,6 @@ _ACTION_ICONS = {
     Action.FILESYSTEM_REPLACE: "✏️",
     Action.FILESYSTEM_DELETE: "🗑️",
     Action.NETWORK_REQUEST: "🌐",
-    Action.PROCESS_EXECUTE: "⚙️",
     Action.SESSION_MUTATE: "💾",
 }
 
@@ -76,13 +74,6 @@ class ApprovalChoice(StrEnum):
     SESSION = "session"
     WORKSPACE = "workspace"
     USER = "user"
-
-
-class ProcessBoundary(StrEnum):
-    """Identify the execution boundary supplied by a process executor."""
-
-    HOST = "host"
-    SANDBOXED = "sandboxed"
 
 
 class FileManifestEntry(BaseModel):
@@ -171,24 +162,6 @@ class NetworkTarget(BaseModel):
     sends_body: bool = False
 
 
-class ProcessTarget(BaseModel):
-    """Identify an exact process invocation.
-
-    Args:
-        kind (Literal["process"]): Target discriminator.
-        argv (tuple[str, ...]): Executable and arguments without shell parsing.
-        cwd (str): Canonical process working directory.
-        boundary (ProcessBoundary): Execution boundary enforced by the process executor.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    kind: Literal["process"] = "process"
-    argv: tuple[str, ...]
-    cwd: str
-    boundary: ProcessBoundary = ProcessBoundary.HOST
-
-
 class SessionTarget(BaseModel):
     """Identify one mutation to in-memory agent state.
 
@@ -204,7 +177,7 @@ class SessionTarget(BaseModel):
 
 
 OperationTarget = Annotated[
-    FileTarget | NetworkTarget | ProcessTarget | SessionTarget,
+    FileTarget | NetworkTarget | SessionTarget,
     Field(discriminator="kind"),
 ]
 
@@ -241,8 +214,6 @@ class Operation(BaseModel):
             if self.action.value.startswith("filesystem.")
             else NetworkTarget
             if self.action is Action.NETWORK_REQUEST
-            else ProcessTarget
-            if self.action is Action.PROCESS_EXECUTE
             else SessionTarget
         )
         if not isinstance(self.target, expected_type):
@@ -263,8 +234,6 @@ class Operation(BaseModel):
             return self.target.path
         if isinstance(self.target, NetworkTarget):
             return self.target.url
-        if isinstance(self.target, ProcessTarget):
-            return " ".join(self.target.argv)
         if isinstance(self.target, SessionTarget):
             return self.target.identifier
         raise AssertionError("Every operation target has a resource.")  # pragma: no cover
@@ -521,7 +490,7 @@ class PermissionPreset(BaseModel):
             str: ``sha256:``-prefixed digest of the schema-normalized artifact.
         """
         payload = self.model_dump(mode="json")
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        encoded = json_encode(payload).encode()
         return f"sha256:{sha256_digest(encoded)}"
 
     @classmethod
@@ -636,7 +605,6 @@ def _default_decisions() -> dict[Action, Decision]:
         Action.FILESYSTEM_REPLACE: Decision.ASK,
         Action.FILESYSTEM_DELETE: Decision.ASK,
         Action.NETWORK_REQUEST: Decision.ASK,
-        Action.PROCESS_EXECUTE: Decision.ASK,
         Action.SESSION_MUTATE: Decision.ASK,
     }
 
@@ -645,18 +613,21 @@ class PermissionConfiguration(BaseModel):
     """Represent a complete persisted local operation policy.
 
     Args:
-        version (Literal[1]): Configuration schema version.
+        version (Literal[1, 2]): Configuration schema version. Version 1 rules retain only their
+            legacy operation semantics; version 2 additionally stores typed execution grants.
         defaults (dict[Action, Decision]): Fallback decision for every known action.
         limits (PolicyLimits): User-configurable ceilings ordinary rules cannot override.
         rules (list[PermissionRule]): Composed explicit policy rules.
+        execution_grants (list[PolicyGrant]): Typed execution grants introduced by version 2.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 1
     defaults: dict[Action, Decision] = Field(default_factory=_default_decisions)
     limits: PolicyLimits = Field(default_factory=PolicyLimits)
     rules: list[PermissionRule] = Field(default_factory=list)
+    execution_grants: list[PolicyGrant] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_rule_ids(self) -> PermissionConfiguration:
@@ -671,6 +642,11 @@ class PermissionConfiguration(BaseModel):
         identifiers = [rule.id for rule in self.rules]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Permission rule identifiers must be unique.")
+        grant_ids = [grant.grant_id for grant in self.execution_grants]
+        if len(grant_ids) != len(set(grant_ids)):
+            raise ValueError("Execution grant identifiers must be unique.")
+        if self.version == 1 and self.execution_grants:
+            raise ValueError("Version 1 permission policies cannot contain execution grants.")
         return self
 
 
@@ -681,14 +657,17 @@ class UserPermissionConfiguration(BaseModel):
     would widen authority beyond a single reviewed approval and require their own management flow.
 
     Args:
-        version (Literal[1]): Persisted schema version.
+        version (Literal[1, 2]): Persisted schema version.
         rules (list[PermissionRule]): Exact user-approved operation rules.
+        execution_grants (list[PolicyGrant]): Typed user grants that retain explicit workspace
+            binding where required.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 1
     rules: list[PermissionRule] = Field(default_factory=list)
+    execution_grants: list[PolicyGrant] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_rule_ids(self) -> UserPermissionConfiguration:
@@ -703,6 +682,11 @@ class UserPermissionConfiguration(BaseModel):
         identifiers = [rule.id for rule in self.rules]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Permission rule identifiers must be unique.")
+        grant_ids = [grant.grant_id for grant in self.execution_grants]
+        if len(grant_ids) != len(set(grant_ids)):
+            raise ValueError("Execution grant identifiers must be unique.")
+        if self.version == 1 and self.execution_grants:
+            raise ValueError("Version 1 user policies cannot contain execution grants.")
         return self
 
 
@@ -733,6 +717,7 @@ class SessionPolicyOverrides(BaseModel):
         defaults (dict[Action, Decision]): Session fallback decisions by action.
         limits (PolicyLimitOverrides): Session replacements for selected workspace limits.
         rules (list[PermissionRule]): Session-only matching rules.
+        execution_grants (list[PolicyGrant]): Process-local typed execution grants.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -740,6 +725,7 @@ class SessionPolicyOverrides(BaseModel):
     defaults: dict[Action, Decision] = Field(default_factory=dict)
     limits: PolicyLimitOverrides = Field(default_factory=PolicyLimitOverrides)
     rules: list[PermissionRule] = Field(default_factory=list)
+    execution_grants: list[PolicyGrant] = Field(default_factory=list)
 
 
 class PolicyDecision(BaseModel):

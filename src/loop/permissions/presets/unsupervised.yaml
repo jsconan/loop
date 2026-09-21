@@ -13,6 +13,5 @@ defaults:
   filesystem.replace: allow
   filesystem.delete: allow
   network.request: allow
-  process.execute: allow
   session.mutate: allow
 rules: []

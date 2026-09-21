@@ -22,7 +22,6 @@ _ACTION_DESCRIPTIONS = {
     Action.FILESYSTEM_REPLACE: "Replace an existing filesystem object's contents.",
     Action.FILESYSTEM_DELETE: "Permanently delete a filesystem object.",
     Action.NETWORK_REQUEST: "Send an outbound HTTP request.",
-    Action.PROCESS_EXECUTE: "Execute an exact process argument vector.",
     Action.SESSION_MUTATE: "Change process-local agent session state.",
 }
 _DECISION_DESCRIPTIONS = {
@@ -144,7 +143,45 @@ class PermissionCommands:
         if arguments[:1] == ("preset",):
             self._change_preset(context, arguments[1:])
             return
+        if arguments[:1] == ("grant",):
+            self._change_execution_grant(context, arguments[1:])
+            return
         raise ValueError("Invalid permission command arguments.")
+
+    def _change_execution_grant(
+        self,
+        context: CommandContext,
+        arguments: tuple[str, ...],
+    ) -> None:
+        """List or revoke typed sandbox and explicit-host execution grants."""
+        manager = self._permission_manager
+        if not arguments or arguments == ("list",):
+            grants = manager.execution_grants
+            if not grants:
+                context.interaction.info("Typed execution grants: none")
+                return
+            context.interaction.info(
+                "Typed execution grants:\n"
+                + "\n".join(
+                    "  "
+                    f"{grant.grant_id} {grant.decision.value} scope={grant.scope.value} "
+                    f"boundary={grant.boundary.value} effect={grant.effect.value} "
+                    f"resource={grant.resource.model_dump_json()} "
+                    f"revoked={str(grant.revoked).lower()}"
+                    for grant in grants
+                )
+            )
+            return
+        if len(arguments) == 2 and arguments[0] == "revoke":
+            grant_id = arguments[1]
+            if manager.revoke_execution_grant(grant_id):
+                context.interaction.info(f"Revoked typed execution grant {grant_id}.")
+            else:
+                context.interaction.warning(
+                    f"Active typed execution grant {grant_id} was not found."
+                )
+            return
+        raise ValueError("Invalid typed execution grant arguments.")
 
     def _change_preset(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
         """List, inspect, preview, or explicitly replace one scoped policy preset."""
@@ -446,6 +483,15 @@ class PermissionCommands:
                 ),
             },
         )
+        grant = CommandCompletion(
+            values=(
+                CompletionValue("list", "List typed sandbox and explicit-host grants."),
+                CompletionValue("revoke", "Revoke an active typed execution grant."),
+            ),
+            children={
+                "revoke": CommandCompletion(provider=self._execution_grant_values),
+            },
+        )
         explain_resources = {
             action.value: CommandCompletion(values=(self._example_resource(action),))
             for action in Action
@@ -466,6 +512,7 @@ class PermissionCommands:
                 CompletionValue(
                     "preset", "Inspect or explicitly replace scoped policy defaults and rules."
                 ),
+                CompletionValue("grant", "Inspect or revoke typed execution grants."),
                 CompletionValue("help", "Explain policy concepts and common commands."),
             ),
             children={
@@ -483,6 +530,7 @@ class PermissionCommands:
                 "rule": rule,
                 "limit": limit,
                 "preset": preset,
+                "grant": grant,
             },
         )
 
@@ -630,6 +678,17 @@ class PermissionCommands:
             if getattr(overrides, field) is not None
         )
 
+    def _execution_grant_values(self) -> tuple[CompletionValue, ...]:
+        """Return active typed grants suitable for explicit revocation."""
+        return tuple(
+            CompletionValue(
+                grant.grant_id,
+                f"{grant.scope.value} {grant.boundary.value} {grant.effect.value}",
+            )
+            for grant in self._permission_manager.execution_grants
+            if not grant.revoked
+        )
+
     @staticmethod
     def _limit_example(label: str) -> CompletionValue:
         if label in {"read-root", "write-root"}:
@@ -655,8 +714,6 @@ class PermissionCommands:
             return CompletionValue("workspace", "Example workspace-relative path.")
         if action is Action.NETWORK_REQUEST:
             return CompletionValue("https://my-host.local", "Example HTTP request URL.")
-        if action is Action.PROCESS_EXECUTE:
-            return CompletionValue("git", "Example shell-free process command line.")
         return CompletionValue("state", "Example session-state identifier.")
 
     @staticmethod
@@ -747,6 +804,7 @@ class PermissionCommands:
         return (
             "Usage: /permissions [show [effective|workspace|session] | "
             "help | reload | session reset | "
+            "grant [list] | grant revoke <grant-id> | "
             "preset <list|show|diff|replace> ... | "
             "explain <tool> <action> <resource> | default set <workspace|session> <action> "
             "<decision> | default reset <workspace|session> <action> | rule add "
@@ -758,21 +816,24 @@ class PermissionCommands:
 
     @staticmethod
     def _help() -> str:
-        """Return a concise guide to policy defaults, rules, and boundaries."""
+        """Return a concise guide to operation rules, typed grants, and boundaries."""
         return (
             "Use /permissions show to inspect policy and /permissions show effective for its "
             "combined view. Defaults choose allow, ask, or deny by action; rules refine matching "
             "tools, actions, and resources; boundaries restrict reachable roots, origins, and host "
-            "processes regardless of rules.\n\n"
+            "processes regardless of rules. Sandboxed execution uses typed effect grants created "
+            "only from observed or privileged effect prompts; use /permissions grant list and "
+            "/permissions grant revoke to manage them.\n\n"
             "Examples:\n"
             "  /permissions default set workspace filesystem.delete deny\n"
             "  /permissions rule add session allow read_text_file filesystem.read '*'\n"
             "  /permissions limit add workspace read-root system-temp\n"
             "  /permissions limit set session host-process allow\n"
-            "  /permissions default set session process.execute ask\n\n"
+            "  /permissions grant list\n"
+            "  /permissions default set session session.mutate ask\n\n"
             "Presets replace only the explicitly selected workspace or session defaults and rules. "
             "They never replace enforcement limits or the other policy layer; replace prompts for "
             "confirmation and diff previews the exact policy change.\n\n"
-            "Host-process permission runs commands with this application's host access; Loop does "
-            "not currently provide an OS sandbox executor."
+            "Host-process permission runs commands with this application's host access and remains "
+            "separate from ordinary sandbox execution."
         )

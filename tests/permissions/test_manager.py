@@ -27,8 +27,6 @@ from loop import (
     PermissionRule,
     PolicyLimits,
     PolicyScope,
-    ProcessBoundary,
-    ProcessTarget,
     SessionTarget,
 )
 from loop.permissions import PermissionLoadFailure
@@ -456,39 +454,25 @@ def test_policy_mutations_write_timestamped_local_and_structured_audit_records(t
     assert adapter.records[0].attributes["scope"] == "session"
 
 
-def test_process_grants_distinguish_argument_boundaries_working_directory_and_sandbox(tmp_path):
-    """Remembered process approval compares argv, cwd, and execution boundary structurally."""
+def test_session_approval_remembers_the_exact_state_target(tmp_path):
+    """Remember a session-state approval without widening it to other state identifiers."""
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = ApprovalChoice.SESSION
     manager = PermissionManager(tmp_path, interaction=interaction)
     approved = operation(
-        Action.PROCESS_EXECUTE,
-        target=ProcessTarget(
-            argv=("tool", "a b"),
-            cwd=str(tmp_path),
-            boundary=ProcessBoundary.SANDBOXED,
-        ),
-    )
-    ambiguous = operation(
-        Action.PROCESS_EXECUTE,
-        target=ProcessTarget(
-            argv=("tool", "a", "b"),
-            cwd=str(tmp_path),
-            boundary=ProcessBoundary.SANDBOXED,
-        ),
+        Action.SESSION_MUTATE,
+        target=SessionTarget(identifier="activate:review"),
     )
 
     manager.authorize((approved,))
 
     assert manager.evaluate((approved,)).decision is Decision.ALLOW
-    assert manager.evaluate((ambiguous,)).decision is Decision.ASK
     assert (
         manager.evaluate(
             (
-                approved.model_copy(
-                    update={
-                        "target": approved.target.model_copy(update={"cwd": str(tmp_path / "sub")})
-                    }
+                operation(
+                    Action.SESSION_MUTATE,
+                    target=SessionTarget(identifier="activate:other"),
                 ),
             )
         ).decision
@@ -689,14 +673,6 @@ def test_filesystem_boundaries_cannot_be_overridden(tmp_path, path, action, sour
             PolicyLimits(network_origins=("https://allowed.test",)),
             "limit:workspace:network_origins",
         ),
-        (
-            Action.PROCESS_EXECUTE,
-            lambda root: ProcessTarget(
-                argv=("git", "status"), cwd=str(root), boundary=ProcessBoundary.HOST
-            ),
-            PolicyLimits(),
-            "limit:workspace:allow_host_processes",
-        ),
     ],
 )
 def test_check_boundaries_returns_first_hard_denial_without_policy_matching(
@@ -885,30 +861,6 @@ def test_relative_roots_resolve_against_workspace_and_temp_is_manager_owned(tmp_
     assert first.temporary_directory.is_dir()
 
 
-def test_host_processes_require_an_explicit_boundary_opt_in(tmp_path):
-    """Policy rules cannot authorize host-process execution by default."""
-    target = ProcessTarget(argv=("git", "status"), cwd=str(tmp_path), boundary=ProcessBoundary.HOST)
-    denied = PermissionManager(
-        tmp_path,
-        configuration=PermissionConfiguration(rules=[PermissionRule(decision=Decision.ALLOW)]),
-    )
-    allowed = PermissionManager(
-        tmp_path,
-        configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
-            defaults={Action.PROCESS_EXECUTE: Decision.ALLOW},
-        ),
-    )
-
-    assert denied.evaluate((operation(Action.PROCESS_EXECUTE, target=target),)).sources == (
-        "limit:workspace:allow_host_processes",
-    )
-    assert (
-        allowed.evaluate((operation(Action.PROCESS_EXECUTE, target=target),)).decision
-        is Decision.ALLOW
-    )
-
-
 def test_policy_mutations_persist_defaults_and_rule_lifetimes(tmp_path):
     """Policy changes round-trip while session rules remain process-local."""
     manager = PermissionManager(tmp_path)
@@ -940,7 +892,7 @@ def test_preset_replacement_changes_the_selected_defaults_and_rule_layer(tmp_pat
         PermissionRule(
             id="session-guard",
             decision=Decision.DENY,
-            action=Action.PROCESS_EXECUTE,
+            action=Action.SESSION_MUTATE,
         ),
         scope=PolicyScope.SESSION,
     )
@@ -1168,16 +1120,16 @@ def test_session_overrides_never_leak_into_later_workspace_saves(tmp_path):
 def test_session_resets_restore_workspace_inheritance_without_changing_disk(tmp_path):
     """Per-field and whole-session resets reveal the underlying workspace policy."""
     manager = PermissionManager(tmp_path)
-    manager.set_default(Action.PROCESS_EXECUTE, Decision.DENY)
+    manager.set_default(Action.SESSION_MUTATE, Decision.DENY)
     manager.set_limit("allow_host_processes", True)
-    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
+    manager.set_default(Action.SESSION_MUTATE, Decision.ALLOW, scope=PolicyScope.SESSION)
     manager.set_limit("allow_host_processes", False, scope=PolicyScope.SESSION)
 
-    assert manager.reset_default(Action.PROCESS_EXECUTE) is True
-    assert manager.reset_default(Action.PROCESS_EXECUTE) is False
+    assert manager.reset_default(Action.SESSION_MUTATE) is True
+    assert manager.reset_default(Action.SESSION_MUTATE) is False
     assert manager.reset_limit("allow_host_processes") is True
     assert manager.reset_limit("allow_host_processes") is False
-    assert manager.effective_configuration.defaults[Action.PROCESS_EXECUTE] is Decision.DENY
+    assert manager.effective_configuration.defaults[Action.SESSION_MUTATE] is Decision.DENY
     assert manager.effective_configuration.limits.allow_host_processes is True
 
     manager.add_rule(
@@ -1247,14 +1199,11 @@ def test_explain_constructs_every_typed_target_without_prompting(tmp_path):
         manager.explain("fetch", Action.NETWORK_REQUEST, "https://my-host.local/file").decision
         is Decision.ASK
     )
-    assert manager.explain("run", Action.PROCESS_EXECUTE, "git status").decision is Decision.ASK
     assert (
         manager.explain("skills", Action.SESSION_MUTATE, "activate:review").decision is Decision.ASK
     )
     with pytest.raises(ValueError, match="absolute HTTP"):
         manager.explain("fetch", Action.NETWORK_REQUEST, "relative")
-    with pytest.raises(ValueError, match="non-empty command"):
-        manager.explain("run", Action.PROCESS_EXECUTE, "")
 
 
 def test_remove_rule_scans_past_nonmatching_rules():
@@ -1324,12 +1273,25 @@ def test_empty_yaml_loads_as_default_policy(tmp_path):
     assert PermissionManager(tmp_path).configuration == PermissionConfiguration()
 
 
+def test_retired_process_rules_fail_closed_instead_of_authorizing_host_execution(tmp_path):
+    """Reject persisted process rules from the removed ordinary host executor."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text(
+        "version: 1\ndefaults:\n  process.execute: allow\n",
+        "utf-8",
+    )
+
+    with pytest.raises(PermissionConfigurationError, match="permissions.yaml"):
+        PermissionManager(tmp_path)
+
+
 def test_error_policy_raises_configuration_errors_and_preserves_active_policy(tmp_path):
     """Strict startup and reload expose typed errors without replacing valid active policy."""
     manager = PermissionManager(tmp_path)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
     path = tmp_path / ".loop" / "permissions.yaml"
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
 
     with pytest.raises(PermissionConfigurationError) as raised:
         manager.reload()
@@ -1345,14 +1307,14 @@ def test_auto_policy_reports_and_uses_defaults_or_last_known_good(tmp_path, capl
     """Automatic recovery reports startup defaults and retains valid policy on reload."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
 
     manager = PermissionManager(tmp_path, load_policy=PermissionLoadPolicy.AUTO)
 
     assert manager.configuration == PermissionConfiguration()
     assert "automatic permission policy" in caplog.text
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
     interaction = Mock(spec=Interaction)
     manager.interaction = interaction
 
@@ -1366,7 +1328,7 @@ def test_interactive_policy_retries_a_repaired_file(tmp_path):
     """Interactive recovery rereads a file repaired while the recovery prompt is active."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
     interaction = Mock(spec=Interaction)
 
     def repair(*_args, **_kwargs):
@@ -1395,7 +1357,7 @@ def test_interactive_reload_can_retain_the_active_policy(tmp_path, choice, expec
     interaction = Mock(spec=Interaction)
     manager = PermissionManager(tmp_path, interaction=interaction)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    manager.configuration_path.write_text("version: 2\n", "utf-8")
+    manager.configuration_path.write_text("version: 3\n", "utf-8")
     interaction.prompt.return_value = choice
 
     assert manager.reload() is expected
@@ -1412,7 +1374,7 @@ def test_interactive_loading_requires_an_interaction(tmp_path):
     manager = PermissionManager(tmp_path, interaction=interaction)
     manager.interaction = None
     manager.configuration_path.parent.mkdir(exist_ok=True)
-    manager.configuration_path.write_text("version: 2\n", "utf-8")
+    manager.configuration_path.write_text("version: 3\n", "utf-8")
     with pytest.raises(PermissionConfigurationError):
         manager.reload()
 
@@ -1507,125 +1469,3 @@ def test_approval_prompt_renders_session_targets_without_workspace():
 
     assert result.prompt is not None
     assert "config" in result.prompt
-
-
-def test_process_target_display_resolves_local_paths_to_workspace_virtual_paths(tmp_path):
-    """Process target prompts render local workspace paths as VirtualPaths."""
-    sub = tmp_path / "src" / "loop"
-    sub.mkdir(parents=True)
-    readme = tmp_path / "README.md"
-    readme.touch()
-    interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.ONCE
-    manager = PermissionManager(
-        tmp_path,
-        interaction=interaction,
-        configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
-        ),
-    )
-    target = ProcessTarget(
-        argv=("cat", str(readme)),
-        cwd=str(sub),
-        boundary=ProcessBoundary.HOST,
-    )
-    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
-
-    prompt = interaction.info.call_args.args[0]
-    assert "cat /workspace/README.md" in prompt
-    assert "(cwd: /workspace/src/loop)" in prompt
-    assert "../" not in prompt
-
-
-def test_process_target_display_preserves_workspace_relative_argv(tmp_path):
-    """Relative argv that stays within workspace passes through cleanly."""
-    target = ProcessTarget(
-        argv=("cat", "README.md"),
-        cwd=str(tmp_path),
-        boundary=ProcessBoundary.HOST,
-    )
-    interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.ONCE
-    manager = PermissionManager(
-        tmp_path,
-        interaction=interaction,
-        configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
-        ),
-    )
-
-    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
-
-    assert "cat README.md (cwd: /workspace)" in interaction.info.call_args.args[0]
-
-
-def test_process_target_display_preserves_argument_boundaries(tmp_path):
-    """Process prompts quote arguments so distinct argv remain visibly distinct."""
-    interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.ONCE
-    manager = PermissionManager(
-        tmp_path,
-        interaction=interaction,
-        configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
-        ),
-    )
-    target = ProcessTarget(
-        argv=("tool", "a b"),
-        cwd=str(tmp_path),
-        boundary=ProcessBoundary.HOST,
-    )
-
-    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
-
-    assert "tool 'a b' (cwd: /workspace)" in interaction.info.call_args.args[0]
-
-
-def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
-    """Temporary directory paths are rendered below the temporary VirtualPath."""
-    interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.ONCE
-    manager = PermissionManager(
-        tmp_path,
-        interaction=interaction,
-        configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
-        ),
-    )
-    scratch_file = manager.temporary_directory / "output.log"
-    scratch_file.parent.mkdir(exist_ok=True)
-    target = ProcessTarget(
-        argv=("cat", str(scratch_file)),
-        cwd=str(tmp_path),
-        boundary=ProcessBoundary.HOST,
-    )
-
-    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
-
-    prompt = interaction.info.call_args.args[0]
-    assert "/tmp/output.log" in prompt
-
-
-def test_process_target_display_preserves_external_temporary_paths(tmp_path):
-    """An external temporary path is not redacted in an approval prompt."""
-    interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.ONCE
-    manager = PermissionManager(
-        tmp_path,
-        interaction=interaction,
-        configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
-        ),
-    )
-    external_path = Path("/tmp/verify_review.py")
-    target = ProcessTarget(
-        argv=(".venv/bin/python", str(external_path)),
-        cwd=str(tmp_path),
-        boundary=ProcessBoundary.HOST,
-    )
-
-    manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
-
-    prompt = interaction.info.call_args.args[0]
-    assert str(external_path) in prompt
-    assert "<external>" not in prompt

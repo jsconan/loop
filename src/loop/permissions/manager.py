@@ -6,9 +6,7 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 import logging
-import shlex
 import sqlite3
 import tempfile
 from atexit import register
@@ -17,6 +15,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+from uuid import uuid4
 from weakref import WeakSet
 
 import yaml
@@ -26,12 +25,28 @@ from ..errors import Problem, log_problem
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import (
     ShutdownRequested,
-    VirtualPath,
     canonical_path,
+    json_encode,
     local_now,
     sha256_digest,
 )
 from .audit import SQLitePermissionAudit
+from .execution import (
+    ExecutionAuthorizationResult,
+    GrantAuthority,
+    GrantDecision,
+    GrantEffect,
+    GrantScope,
+    NetworkEndpoint,
+    NetworkListener,
+    OpaqueResource,
+    PolicyExplanation,
+    PolicyGrant,
+    PolicyRequest,
+    SecretUse,
+    VirtualPathTree,
+    evaluate_grant,
+)
 from .models import (
     Action,
     ApprovalChoice,
@@ -56,8 +71,6 @@ from .models import (
     PolicyScope,
     PresetReplacementPreview,
     PresetSource,
-    ProcessBoundary,
-    ProcessTarget,
     SessionPolicyOverrides,
     SessionTarget,
     UserPermissionConfiguration,
@@ -336,6 +349,338 @@ class PermissionManager:
             tuple[PermissionRule, ...]: Immutable snapshot of session rules.
         """
         return tuple(rule.model_copy(deep=True) for rule in self._session_overrides.rules)
+
+    @property
+    def execution_grants(self) -> tuple[PolicyGrant, ...]:
+        """Return every typed execution grant visible to this manager.
+
+        Returns:
+            tuple[PolicyGrant, ...]: User, workspace, and process-local grants in precedence order.
+        """
+        return tuple(
+            grant.model_copy(deep=True)
+            for grant in (
+                *self._user_configuration.execution_grants,
+                *self._configuration.execution_grants,
+                *self._session_overrides.execution_grants,
+            )
+        )
+
+    def authorize_execution(
+        self,
+        requests: tuple[PolicyRequest, ...],
+        *,
+        interaction: Interaction | None = None,
+        prompt: str | None = None,
+    ) -> ExecutionAuthorizationResult:
+        """Authorize one atomic set of typed execution effects through this facade.
+
+        Args:
+            requests (tuple[PolicyRequest, ...]): Fully typed effects from one execution phase.
+            interaction (Interaction | None): Invocation interaction overriding the default.
+            prompt (str | None): Complete caller-owned disclosure for a specialized boundary.
+
+        Returns:
+            ExecutionAuthorizationResult: Atomic decision and any newly installed grant IDs.
+        """
+        explanations = tuple(self._evaluate_execution(request) for request in requests)
+        denied = tuple(
+            explanation
+            for explanation in explanations
+            if explanation.decision is GrantDecision.DENY
+        )
+        pending = tuple(
+            explanation
+            for explanation in explanations
+            if explanation.decision is GrantDecision.PROMPT
+        )
+        if denied:
+            return self._execution_result(
+                requests,
+                explanations,
+                GrantDecision.DENY,
+                "A typed deny or product boundary rejected the execution effect.",
+            )
+        if not pending:
+            return self._execution_result(
+                requests,
+                explanations,
+                GrantDecision.ALLOW,
+                "Every typed execution effect is already authorized.",
+            )
+        active_interaction = interaction if interaction is not None else self._interaction
+        if active_interaction is None:
+            return self._execution_result(
+                requests,
+                explanations,
+                GrantDecision.DENY,
+                "Approval is required but no interactive user is available.",
+            )
+        rendered_prompt = (
+            prompt if prompt is not None else self._execution_prompt(requests, explanations)
+        )
+        choice = self.request_permission(rendered_prompt, interaction=active_interaction)
+        if choice is ApprovalChoice.DENY:
+            return self._execution_result(
+                requests,
+                explanations,
+                GrantDecision.DENY,
+                "Rejected by the user.",
+                prompted=True,
+                approval_scope=GrantScope.ONCE,
+            )
+        scope = {
+            ApprovalChoice.ONCE: GrantScope.ONCE,
+            ApprovalChoice.SESSION: GrantScope.SESSION,
+            ApprovalChoice.WORKSPACE: GrantScope.WORKSPACE,
+            ApprovalChoice.USER: GrantScope.USER_POLICY,
+        }[choice]
+        try:
+            installed = self._remember_execution_approval(requests, scope)
+        except (OSError, ValueError) as error:
+            return self._execution_result(
+                requests,
+                explanations,
+                GrantDecision.DENY,
+                f"Could not persist the approved permission policy: {error}",
+                prompted=True,
+                approval_scope=scope,
+            )
+        return self._execution_result(
+            requests,
+            explanations,
+            GrantDecision.ALLOW,
+            f"Approved by the user with {scope.value} scope.",
+            prompted=True,
+            approval_scope=scope,
+            installed_grant_ids=installed,
+        )
+
+    def revoke_execution_grant(self, grant_id: str) -> bool:
+        """Revoke one typed grant without deleting its audit-relevant record.
+
+        Args:
+            grant_id (str): Stable typed grant identifier.
+
+        Returns:
+            bool: Whether an active grant was found and revoked.
+        """
+        for owner in (
+            self._session_overrides,
+            self._configuration,
+            self._user_configuration,
+        ):
+            grants = owner.execution_grants
+            for index, grant in enumerate(grants):
+                if grant.grant_id != grant_id or grant.revoked:
+                    continue
+                updated = owner.model_copy(deep=True)
+                updated.execution_grants[index] = grant.model_copy(update={"revoked": True})
+                if owner is self._configuration:
+                    self._replace_configuration(updated)
+                elif owner is self._user_configuration:
+                    self._replace_user_configuration(updated)
+                else:
+                    self._session_overrides = updated
+                self._append_audit("permission.execution_grant_revoked", {"grant_id": grant_id})
+                return True
+        return False
+
+    def _evaluate_execution(self, request: PolicyRequest) -> PolicyExplanation:
+        """Evaluate one typed request plus frictionless sandbox read defaults."""
+        explanation = evaluate_grant(self.execution_grants, request)
+        if (
+            request.boundary.value == "host"
+            and request.effect is GrantEffect.HOST_EXECUTE
+            and not self.effective_configuration.limits.allow_host_processes
+        ):
+            return explanation.model_copy(
+                update={
+                    "decision": GrantDecision.DENY,
+                    "reason": "The host-execution administrator ceiling is disabled.",
+                    "reusable": False,
+                }
+            )
+        if explanation.matched_grant_id is not None:
+            return explanation
+        if (
+            request.boundary.value == "sandbox"
+            and request.effect.value == "fs.read"
+            and isinstance(request.resource, VirtualPathTree)
+            and request.resource.root.removesuffix("/**") in {"/workspace", "/runtime"}
+        ):
+            return explanation.model_copy(
+                update={
+                    "decision": GrantDecision.ALLOW,
+                    "reason": "Product policy grants sandbox workspace and runtime reads.",
+                    "reusable": True,
+                }
+            )
+        if (
+            request.boundary.value == "sandbox"
+            and request.effect in {GrantEffect.PROCESS_SPAWN, GrantEffect.PROCESS_SIGNAL}
+            and isinstance(request.resource, OpaqueResource)
+            and request.resource.name == "loop-managed-attempt"
+        ):
+            return explanation.model_copy(
+                update={
+                    "decision": GrantDecision.ALLOW,
+                    "reason": "Product policy grants lifecycle control inside the sandbox.",
+                    "reusable": True,
+                }
+            )
+        return explanation
+
+    def _remember_execution_approval(
+        self,
+        requests: tuple[PolicyRequest, ...],
+        scope: GrantScope,
+    ) -> tuple[str, ...]:
+        """Install exact typed grants in the scope owned by this manager."""
+        if scope is GrantScope.ONCE:
+            return ()
+        additions = []
+        for request in requests:
+            if self._evaluate_execution(request).decision is GrantDecision.ALLOW:
+                continue
+            additions.append(
+                PolicyGrant(
+                    grant_id=str(uuid4()),
+                    subject=request.subject,
+                    boundary=request.boundary,
+                    effect=request.effect,
+                    resource=request.resource,
+                    decision=GrantDecision.ALLOW,
+                    authority=GrantAuthority.USER_ALLOW,
+                    scope=scope,
+                    workspace_binding=(
+                        request.workspace_id
+                        if scope in {GrantScope.WORKSPACE, GrantScope.USER_POLICY}
+                        else None
+                    ),
+                    scope_binding=(
+                        request.scope_binding
+                        if scope in {GrantScope.PROCESS, GrantScope.SESSION}
+                        else None
+                    ),
+                    constraints=request.constraints,
+                    policy_version=request.policy_version,
+                    issued_at_ns=request.now_ns,
+                    origin="interactive_user",
+                )
+            )
+        if scope is GrantScope.USER_POLICY:
+            if self._user_configuration_path is None:
+                raise ValueError("User approval is unavailable without a user policy path.")
+            updated = self._user_configuration.model_copy(deep=True)
+            updated.version = 2
+            updated.execution_grants.extend(additions)
+            self._replace_user_configuration(updated)
+        elif scope is GrantScope.WORKSPACE:
+            if self._configuration_path is None:
+                raise ValueError(
+                    "Workspace approval is unavailable without a workspace policy path."
+                )
+            updated = self._configuration.model_copy(deep=True)
+            updated.version = 2
+            updated.execution_grants.extend(additions)
+            self._replace_configuration(updated)
+        else:
+            self._session_overrides.execution_grants.extend(additions)
+        for grant in additions:
+            self._append_audit(
+                "permission.execution_grant_issued",
+                {
+                    "grant_id": grant.grant_id,
+                    "effect": grant.effect.value,
+                    "boundary": grant.boundary.value,
+                    "scope": grant.scope.value,
+                    "workspace_binding": grant.workspace_binding,
+                    "policy_version": grant.policy_version,
+                },
+            )
+        return tuple(grant.grant_id for grant in additions)
+
+    @staticmethod
+    def _execution_prompt(
+        requests: tuple[PolicyRequest, ...], explanations: tuple[PolicyExplanation, ...]
+    ) -> str:
+        """Render typed effects as a user-facing approval explanation."""
+        lines = [
+            "Approval required",
+            "Reason: This operation needs permissions that are not currently granted.",
+        ]
+        for request, explanation in zip(requests, explanations, strict=True):
+            if explanation.decision is GrantDecision.ALLOW:
+                continue
+            resource = request.resource
+            if isinstance(resource, VirtualPathTree):
+                resource_description = resource.root
+            elif isinstance(resource, NetworkEndpoint):
+                resource_description = (
+                    f"{resource.protocol.value}://{resource.host}:{resource.port}"
+                )
+            elif isinstance(resource, NetworkListener):
+                visibility = "external" if resource.externally_visible else "local"
+                resource_description = (
+                    f"{visibility} port {resource.port} to sandbox port {resource.target_port}"
+                )
+            elif isinstance(resource, SecretUse):
+                resource_description = (
+                    f"secret {resource.secret_id!r} for {resource.audience!r} "
+                    f"via {resource.mechanism}"
+                )
+            else:
+                resource_description = resource.name
+            lines.extend(
+                (
+                    f"Operation: {request.effect.value}",
+                    f"Resource: {resource_description}",
+                    f"Boundary: {request.boundary.value}",
+                )
+            )
+        lines.append(
+            "Future coverage: a remembered approval applies only to the same operation, "
+            "resource, sandbox boundary, workspace, and constraints."
+        )
+        return "\n".join(lines)
+
+    def _execution_result(
+        self,
+        requests: tuple[PolicyRequest, ...],
+        explanations: tuple[PolicyExplanation, ...],
+        decision: GrantDecision,
+        reason: str,
+        *,
+        prompted: bool = False,
+        approval_scope: GrantScope | None = None,
+        installed_grant_ids: tuple[str, ...] = (),
+    ) -> ExecutionAuthorizationResult:
+        """Record and return one minimized typed authorization result."""
+        result = ExecutionAuthorizationResult(
+            requests=requests,
+            explanations=explanations,
+            decision=decision,
+            prompted=prompted,
+            approval_scope=approval_scope,
+            installed_grant_ids=installed_grant_ids,
+            reason=reason,
+        )
+        self._append_audit(
+            "permission.execution_decided",
+            {
+                "decision": decision.value,
+                "prompted": prompted,
+                "approval_scope": approval_scope.value if approval_scope else None,
+                "request_count": len(requests),
+                "matched_grants": [
+                    explanation.matched_grant_id
+                    for explanation in explanations
+                    if explanation.matched_grant_id is not None
+                ],
+            },
+        )
+        return result
 
     @property
     def presets(self) -> tuple[PermissionPreset, ...]:
@@ -974,15 +1319,6 @@ class PermissionManager:
             if parsed.port is not None:
                 origin += f":{parsed.port}"
             target = NetworkTarget(url=resource, origin=origin)
-        elif action is Action.PROCESS_EXECUTE:
-            argv = tuple(shlex.split(resource))
-            if not argv:
-                raise ValueError("Process explanation requires a non-empty command line.")
-            target = ProcessTarget(
-                argv=argv,
-                cwd=str(self._workspace_root or Path.cwd()),
-                boundary=ProcessBoundary.HOST,
-            )
         else:
             target = SessionTarget(identifier=resource)
         return self.evaluate((Operation(tool_id=tool, action=action, target=target),))
@@ -1073,7 +1409,7 @@ class PermissionManager:
             if scope is PolicyScope.WORKSPACE
             else self._session_overrides.model_dump(mode="json")
         )
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        encoded = json_encode(payload).encode()
         return f"sha256:{sha256_digest(encoded)}"
 
     def describe(self, view: str = "all") -> str:
@@ -1449,12 +1785,6 @@ class PermissionManager:
                 return self._limit_denial("network_origin", "network_origins")
             if limits.deny_private_networks and self._is_private_network(target):
                 return self._limit_denial("private_network", "deny_private_networks")
-        elif (
-            isinstance(target, ProcessTarget)
-            and target.boundary is ProcessBoundary.HOST
-            and not limits.allow_host_processes
-        ):
-            return self._limit_denial("host_process", "allow_host_processes")
         return None
 
     def _limit_denial(self, name: str, field: str) -> PolicyDecision:
@@ -1602,10 +1932,7 @@ class PermissionManager:
     def _display_resource(self, operation: Operation) -> str | None:
         """Return a workspace-friendly display name for the operation target.
 
-        File paths are shown relative to the workspace root. Process targets include
-        their working directory and quote argument boundaries after normalizing
-        recognized absolute paths through ``VirtualPath``. Paths outside the
-        configured virtual roots remain visible rather than being redacted.
+        File paths are shown relative to the workspace root.
 
         Args:
             operation (Operation): The operation whose target should be displayed.
@@ -1626,23 +1953,6 @@ class PermissionManager:
                 )
             except ValueError:
                 return operation.resource
-        if isinstance(operation.target, ProcessTarget):
-            virtual_paths = VirtualPath(
-                workspace=self._workspace_root,
-                temporary_directory=self._temporary_path,
-            )
-
-            def display_path(path: str) -> str:
-                """Render a recognized virtual path or retain an external path verbatim."""
-                rendered = virtual_paths.display(path)
-                return path if rendered == VirtualPath.EXTERNAL else rendered
-
-            cleaned_argv = tuple(
-                display_path(arg) if Path(arg).is_absolute() else arg
-                for arg in operation.target.argv
-            )
-            cwd = display_path(operation.target.cwd)
-            return f"{shlex.join(cleaned_argv)} (cwd: {cwd})"
         return operation.resource
 
     def _audit(self, result: AuthorizationResult) -> None:

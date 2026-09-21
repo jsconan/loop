@@ -12,6 +12,5 @@ defaults:
   filesystem.replace: deny
   filesystem.delete: deny
   network.request: deny
-  process.execute: deny
   session.mutate: deny
 rules: []

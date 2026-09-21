@@ -317,7 +317,7 @@ def test_loop_continues_with_supervised_defaults_after_permission_load_failure(t
     """The manager completes interactive fallback during Loop construction."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
     interaction = output_interaction()
     interaction.prompt.return_value = choice
 
@@ -336,7 +336,7 @@ def test_loop_resets_invalid_permission_policy_only_after_user_selection(tmp_pat
     """The reset choice delegates archival and default activation to PermissionManager."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
     interaction = output_interaction()
     interaction.prompt.return_value = "reset"
 
@@ -356,7 +356,7 @@ def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
     """The recovery prompt can stop startup without changing the invalid policy file."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
     interaction = output_interaction()
     interaction.prompt.return_value = choice
 
@@ -365,7 +365,7 @@ def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
             backend=loop_backend(), interaction=interaction, working_directory=tmp_path
         )
 
-    assert path.read_text("utf-8") == "version: 2\n"
+    assert path.read_text("utf-8") == "version: 3\n"
 
 
 def test_loop_reports_presets_excluded_by_permission_manager(tmp_path, monkeypatch):

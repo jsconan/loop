@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .. import constants
-from ..utils import sha256_digest
+from ..utils import json_encode, sha256_digest
 
 
 class SQLitePermissionAudit:
@@ -67,7 +67,7 @@ class SQLitePermissionAudit:
                     workspace_id,
                     os.getpid(),
                     event_name,
-                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    json_encode(payload),
                     1,
                 ),
             )
@@ -111,11 +111,7 @@ class SQLitePermissionAudit:
                                 workspace_id,
                                 record.get("process_id", 0),
                                 record.get("event_name", "permission.legacy"),
-                                json.dumps(
-                                    record.get("payload", {}),
-                                    sort_keys=True,
-                                    separators=(",", ":"),
-                                ),
+                                json_encode(record.get("payload", {})),
                                 record.get("schema_version", 1),
                             ),
                         )

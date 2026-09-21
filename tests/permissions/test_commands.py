@@ -6,6 +6,7 @@ from prompt_toolkit.document import Document
 
 from loop import (
     Action,
+    ApprovalChoice,
     CommandCompletionAdapter,
     CommandManager,
     CompletionManager,
@@ -18,7 +19,14 @@ from loop import (
     PermissionRule,
     PolicyScope,
 )
-from loop.permissions import PermissionCommands
+from loop.execution.contracts import ExecutionBoundary
+from loop.permissions import (
+    GrantEffect,
+    PermissionCommands,
+    PolicyRequest,
+    SubjectIdentity,
+    VirtualPathTree,
+)
 
 
 def command_manager(permissions, interaction):
@@ -26,6 +34,28 @@ def command_manager(permissions, interaction):
     manager = CommandManager(interaction=interaction)
     manager.register_provider(PermissionCommands(permissions))
     return manager
+
+
+def typed_write_request() -> PolicyRequest:
+    """Return one exact sandbox write request for permission-command tests."""
+    return PolicyRequest(
+        subject=SubjectIdentity(
+            tool_id="run_command",
+            publisher="loop",
+            profile_id="ordinary-shell",
+            profile_version="1",
+        ),
+        boundary=ExecutionBoundary.SANDBOX,
+        effect=GrantEffect.FS_REPLACE,
+        resource=VirtualPathTree(
+            root="/workspace/readme.md",
+            effects=frozenset({GrantEffect.FS_REPLACE}),
+        ),
+        workspace_id="workspace",
+        policy_version="2",
+        now_ns=1,
+        scope_binding="agent",
+    )
 
 
 def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes(tmp_path):
@@ -44,7 +74,7 @@ def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes
         "rule add workspace allow read_text_file filesystem.read '/project/*' 'Read docs'",
     )
     persistent_id = permissions.persistent_rules[0].id
-    manager.call("permissions", "rule add session deny run_command process.execute")
+    manager.call("permissions", "rule add session deny manage_skills session.mutate")
     session_id = permissions.session_rules[0].id
 
     loaded = PermissionManager(tmp_path)
@@ -72,16 +102,16 @@ def test_permissions_rule_add_defaults_omitted_matchers_to_wildcards(tmp_path):
         ("rule add session allow", "*", None, None),
         ("rule add session allow run_command", "run_command", None, None),
         (
-            "rule add session allow run_command process.execute",
-            "run_command",
-            Action.PROCESS_EXECUTE,
+            "rule add session allow manage_skills session.mutate",
+            "manage_skills",
+            Action.SESSION_MUTATE,
             None,
         ),
         (
-            "rule add session allow run_command process.execute 'git *'",
-            "run_command",
-            Action.PROCESS_EXECUTE,
-            "git *",
+            "rule add session allow manage_skills session.mutate 'activate:*'",
+            "manage_skills",
+            Action.SESSION_MUTATE,
+            "activate:*",
         ),
     )
     for command, tool, action, resource in variants:
@@ -99,7 +129,7 @@ def test_permissions_rule_add_confirms_broad_matchers_before_mutation(tmp_path):
     manager = command_manager(permissions, interaction)
 
     interaction.confirm.return_value = False
-    manager.call("permissions", "rule add session allow run_command process.execute")
+    manager.call("permissions", "rule add session allow manage_skills session.mutate")
 
     assert not permissions.session_rules
     prompt = interaction.confirm.call_args.args[0]
@@ -109,13 +139,13 @@ def test_permissions_rule_add_confirms_broad_matchers_before_mutation(tmp_path):
     interaction.warning.assert_called_once_with("Permission rule creation was not approved.")
 
     interaction.confirm.return_value = True
-    manager.call("permissions", "rule add session allow run_command process.execute")
+    manager.call("permissions", "rule add session allow manage_skills session.mutate")
 
     assert len(permissions.session_rules) == 1
     assert permissions.session_rules[0].resource is None
 
     interaction.confirm.return_value = False
-    manager.call("permissions", "rule add session deny * process.execute git")
+    manager.call("permissions", "rule add session deny * session.mutate activate:demo")
     prompt = interaction.confirm.call_args.args[0]
     assert "every tool" in prompt
     assert "resource" not in prompt
@@ -143,6 +173,35 @@ def test_permissions_rule_without_mutation_lists_scoped_rules(tmp_path):
     assert "Session permission rules:\n  session-rule" in scoped
     assert "Workspace permission rules:" not in scoped
     interaction.report.assert_not_called()
+
+
+def test_permissions_commands_list_and_revoke_typed_execution_grants(tmp_path):
+    """Typed sandbox grants remain inspectable and revocable without a broad grant command."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.SESSION
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    result = permissions.authorize_execution((typed_write_request(),))
+    grant_id = result.installed_grant_ids[0]
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "grant list")
+    listed = interaction.info.call_args.args[0]
+    assert grant_id in listed
+    assert "boundary=sandbox effect=fs.replace" in listed
+    assert "revoked=false" in listed
+
+    manager.call("permissions", f"grant revoke {grant_id}")
+    assert permissions.execution_grants[0].revoked is True
+    assert f"Revoked typed execution grant {grant_id}." in interaction.info.call_args.args[0]
+
+    manager.call("permissions", f"grant revoke {grant_id}")
+    assert "was not found" in interaction.warning.call_args.args[0]
+    manager.call("permissions", "grant")
+    assert "revoked=true" in interaction.info.call_args.args[0]
+
+    empty = command_manager(PermissionManager(tmp_path / "empty"), interaction)
+    empty.call("permissions", "grant")
+    interaction.info.assert_called_with("Typed execution grants: none")
 
 
 def test_permissions_show_and_explain_report_the_complete_effective_policy(tmp_path):
@@ -195,7 +254,7 @@ def test_permissions_reload_reports_invalid_policy_without_replacing_active_poli
     interaction.prompt.return_value = "continue"
     permissions = PermissionManager(tmp_path, interaction=interaction)
     permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    (tmp_path / ".loop" / "permissions.yaml").write_text("version: 2\n", "utf-8")
+    (tmp_path / ".loop" / "permissions.yaml").write_text("version: 3\n", "utf-8")
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "reload")
@@ -218,7 +277,7 @@ def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
 
     manager.call("permissions", "limit set session host-process allow")
     manager.call("permissions", "limit add session network-origin https://my-host.local")
-    manager.call("permissions", "default set session process.execute allow")
+    manager.call("permissions", "default set session session.mutate allow")
     manager.call("permissions", "show session")
     shown = interaction.info.call_args.args[0]
     assert "allow_host_processes: True" in shown
@@ -226,8 +285,8 @@ def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
     assert PermissionManager(tmp_path).configuration.limits == permissions.configuration.limits
 
     manager.call("permissions", "limit reset session host-process")
-    manager.call("permissions", "default reset session process.execute")
-    manager.call("permissions", "default reset session process.execute")
+    manager.call("permissions", "default reset session session.mutate")
+    manager.call("permissions", "default reset session session.mutate")
     assert "already inherited" in interaction.warning.call_args.args[0]
     manager.call("permissions", "session reset")
     manager.call("permissions", "session reset")
@@ -396,6 +455,7 @@ def test_permissions_command_rejects_every_malformed_branch(tmp_path):
         "preset unknown",
         "preset show missing extra",
         "preset diff invalid workspace",
+        "grant invalid",
     )
     for arguments in invalid:
         manager.call("permissions", arguments)
@@ -420,6 +480,10 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
         ),
         scope=PolicyScope.SESSION,
     )
+    approval = Mock(spec=Interaction)
+    approval.prompt.return_value = ApprovalChoice.SESSION
+    permissions.interaction = approval
+    grant_id = permissions.authorize_execution((typed_write_request(),)).installed_grant_ids[0]
     manager = CommandManager()
     manager.register_provider(PermissionCommands(permissions))
     tool_completions = Mock()
@@ -446,6 +510,7 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
         "rule",
         "limit",
         "preset",
+        "grant",
         "session",
         "help",
     }
@@ -475,6 +540,9 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
     assert {item.text for item in presets} == {"list", "show", "diff", "replace"}
     presets = complete(completer, "/permissions preset replace session w")
     assert [item.text for item in presets] == ["workspace"]
+    grants = complete(completer, "/permissions grant revoke ")
+    assert [item.text for item in grants] == [grant_id]
+    assert grants[0].display_meta_text == "session sandbox fs.replace"
     roots = complete(completer, "/permissions limit remove workspace read-root ")
     assert [item.text for item in roots] == ["loop-temp", "workspace"]
     root_tokens = complete(completer, "/permissions limit add workspace read-root ")

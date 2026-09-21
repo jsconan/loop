@@ -12,6 +12,5 @@ defaults:
   filesystem.replace: allow
   filesystem.delete: ask
   network.request: ask
-  process.execute: ask
   session.mutate: ask
 rules: []
