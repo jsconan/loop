@@ -23,12 +23,14 @@ import yaml
 
 from .. import constants
 from ..errors import Problem, log_problem
+from ..sandbox import SandboxPlan
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import (
     ShutdownRequested,
     VirtualPath,
     canonical_path,
     local_now,
+    parse_command_line,
     sha256_digest,
 )
 from .audit import SQLitePermissionAudit
@@ -40,6 +42,7 @@ from .models import (
     FileTarget,
     NetworkTarget,
     Operation,
+    OperationPlanningContext,
     Operations,
     OperationTarget,
     PermissionConfiguration,
@@ -273,6 +276,36 @@ class PermissionManager:
             Path: Existing private temporary directory removed with this manager.
         """
         return self._temporary_path
+
+    @property
+    def workspace_root(self) -> Path | None:
+        """Return the canonical workspace policy root.
+
+        Returns:
+            Path | None: Workspace root, or ``None`` for an unscoped in-memory manager.
+        """
+        return self._workspace_root
+
+    @property
+    def effective_filesystem_roots(self) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+        """Return canonical effective read and write roots for command containment.
+
+        Returns:
+            tuple[tuple[Path, ...], tuple[Path, ...]]: Readable roots followed by writable roots.
+        """
+        limits = self.effective_configuration.limits
+        return (
+            tuple(
+                root
+                for configured in limits.readable_roots
+                if (root := self._root_path(configured)) is not None
+            ),
+            tuple(
+                root
+                for configured in limits.writable_roots
+                if (root := self._root_path(configured)) is not None
+            ),
+        )
 
     @property
     def interaction(self) -> Interaction | None:
@@ -950,13 +983,21 @@ class PermissionManager:
         self._audit_policy_change("permission.configuration_reset", PolicyScope.WORKSPACE)
         return backup_path
 
-    def explain(self, tool: str, action: Action, resource: str) -> PolicyDecision:
+    def explain(
+        self,
+        tool: str,
+        action: Action,
+        resource: str,
+        planning_context: OperationPlanningContext | None = None,
+    ) -> PolicyDecision:
         """Evaluate one concrete operation without prompting or recording.
 
         Args:
             tool (str): Registered tool identity to evaluate.
             action (Action): Typed action to evaluate.
             resource (str): Path, URL, command, or session identifier.
+            planning_context (OperationPlanningContext | None): Invocation filesystem authority
+                used to reproduce an exact process target, or ``None`` to use manager roots.
 
         Returns:
             PolicyDecision: Effective policy decision and determining sources.
@@ -975,13 +1016,41 @@ class PermissionManager:
                 origin += f":{parsed.port}"
             target = NetworkTarget(url=resource, origin=origin)
         elif action is Action.PROCESS_EXECUTE:
-            argv = tuple(shlex.split(resource))
-            if not argv:
-                raise ValueError("Process explanation requires a non-empty command line.")
+            argv = parse_command_line(resource)
+            context = planning_context or OperationPlanningContext(
+                workspace=self._workspace_root or Path.cwd(),
+                temporary_directory=self._temporary_path,
+            )
+            if context.workspace is None:
+                raise ValueError("Process explanation requires a configured workspace root.")
+            readable_roots, writable_roots = self.effective_filesystem_roots
+            sandbox_plan = SandboxPlan.create(
+                argv,
+                context.workspace,
+                context.workspace,
+                temporary_directory=context.temporary_directory,
+                read_only_roots=context.read_only_roots,
+                readable_roots=(
+                    readable_roots if context.readable_roots is None else context.readable_roots
+                ),
+                writable_roots=(
+                    writable_roots if context.writable_roots is None else context.writable_roots
+                ),
+            )
             target = ProcessTarget(
-                argv=argv,
-                cwd=str(self._workspace_root or Path.cwd()),
-                boundary=ProcessBoundary.HOST,
+                argv=sandbox_plan.argv,
+                cwd=str(sandbox_plan.cwd),
+                workspace=str(sandbox_plan.workspace),
+                temporary_directory=(
+                    str(sandbox_plan.temporary_directory)
+                    if sandbox_plan.temporary_directory is not None
+                    else None
+                ),
+                read_only_roots=tuple(str(root) for root in sandbox_plan.read_only_roots),
+                readable_roots=tuple(str(root) for root in sandbox_plan.readable_roots),
+                writable_roots=tuple(str(root) for root in sandbox_plan.writable_roots),
+                boundary=ProcessBoundary.SANDBOXED,
+                sandbox_policy=sandbox_plan.policy_digest,
             )
         else:
             target = SessionTarget(identifier=resource)
@@ -1208,7 +1277,9 @@ class PermissionManager:
         if self._configuration_path is None or not self._configuration_path.exists():
             return PermissionConfiguration()
         try:
-            payload = yaml.safe_load(self._configuration_path.read_text("utf-8"))
+            payload = self._migrate_policy_payload(
+                yaml.safe_load(self._configuration_path.read_text("utf-8"))
+            )
             return PermissionConfiguration.model_validate(payload or {})
         except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
             raise PermissionConfigurationError(self._configuration_path, str(exc)) from exc
@@ -1218,10 +1289,48 @@ class PermissionManager:
         if self._user_configuration_path is None or not self._user_configuration_path.exists():
             return UserPermissionConfiguration()
         try:
-            payload = yaml.safe_load(self._user_configuration_path.read_text("utf-8"))
+            payload = self._migrate_policy_payload(
+                yaml.safe_load(self._user_configuration_path.read_text("utf-8"))
+            )
             return UserPermissionConfiguration.model_validate(payload or {})
         except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
             raise PermissionConfigurationError(self._user_configuration_path, str(exc)) from exc
+
+    @staticmethod
+    def _migrate_policy_payload(payload: object) -> object:
+        """Upgrade schema-one policy content without widening its authority.
+
+        Args:
+            payload (object): Parsed YAML policy content.
+
+        Returns:
+            object: Equivalent current-schema content suitable for model validation.
+        """
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return payload
+        migrated_rules = []
+        for rule in payload.get("rules", []):
+            if not isinstance(rule, dict):
+                migrated_rules.append(rule)
+                continue
+            target = rule.get("target")
+            if not isinstance(target, dict) or target.get("kind") != "process":
+                migrated_rules.append(rule)
+                continue
+            # Schema one had host process targets without containment fields. Retain the exact
+            # historical target while giving it a deliberately non-matching containment digest;
+            # it can never authorize the newly sandboxed process operation.
+            migrated_rules.append(
+                {
+                    **rule,
+                    "target": {
+                        **target,
+                        "workspace": target.get("workspace", target.get("cwd", ".")),
+                        "sandbox_policy": target.get("sandbox_policy", "0" * 64),
+                    },
+                }
+            )
+        return {**payload, "version": 2, "rules": migrated_rules}
 
     def _load_user_configuration(self) -> None:
         """Load user-wide approvals and fail closed if their file is invalid."""

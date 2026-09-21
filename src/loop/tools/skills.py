@@ -12,7 +12,7 @@ from ..instructions.models import (
     SkillOperationResult,
 )
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
-from ..permissions import Action, Operation, OperationPlan, SessionTarget
+from ..permissions import Action, Operation, OperationPlan, OperationPlanningContext, SessionTarget
 from ..tooling import ToolContext, tool
 from ..utils import VirtualPath
 
@@ -62,7 +62,7 @@ def _public_result(action: str, result: SkillOperationResult) -> PublicSkillOper
     return public
 
 
-def _skill_plan(arguments: dict[str, Any]) -> OperationPlan:
+def _skill_plan(arguments: dict[str, Any], _context: OperationPlanningContext) -> OperationPlan:
     """Plan read-only or state-mutating skill operations."""
     action = arguments["action"]
     operations = (
@@ -79,7 +79,10 @@ def _skill_plan(arguments: dict[str, Any]) -> OperationPlan:
     return OperationPlan(arguments=arguments, operations=operations)
 
 
-def _activate_skill_plan(arguments: dict[str, Any]) -> OperationPlan:
+def _activate_skill_plan(
+    arguments: dict[str, Any],
+    _context: OperationPlanningContext,
+) -> OperationPlan:
     """Plan the session mutation performed by dedicated skill activation."""
     return OperationPlan(
         arguments=arguments,

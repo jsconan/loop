@@ -13,7 +13,7 @@ from pydantic import Field, HttpUrl, TypeAdapter
 from .. import constants
 from ..errors import Problem, ProblemException, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
-from ..permissions import Action, NetworkTarget, Operation, OperationPlan
+from ..permissions import Action, NetworkTarget, Operation, OperationPlan, OperationPlanningContext
 from ..tooling import ToolContext, tool
 from ..utils import (
     BoundedTextContent,
@@ -108,7 +108,10 @@ def _cached_result(
     return result
 
 
-def _network_plan(arguments: dict[str, object]) -> OperationPlan:
+def _network_plan(
+    arguments: dict[str, object],
+    _context: OperationPlanningContext,
+) -> OperationPlan:
     """Plan one normalized outbound HTTP request."""
     url = str(_HTTP_URL_ADAPTER.validate_python(arguments["url"]))
     parsed = urlsplit(url)
@@ -135,17 +138,20 @@ def _network_plan(arguments: dict[str, object]) -> OperationPlan:
     )
 
 
-def _cached_content_plan(arguments: dict[str, object]) -> OperationPlan:
+def _cached_content_plan(
+    arguments: dict[str, object],
+    context: OperationPlanningContext,
+) -> OperationPlan:
     """Plan local cached access, a source reload, or one redirected reload hop."""
     if "url" in arguments:
-        return _network_plan(arguments)
+        return _network_plan(arguments, context)
     metadata = (
         None if cached_path(str(arguments["handle"])) else cached_metadata(str(arguments["handle"]))
     )
     source = metadata["source"] if metadata and metadata["reloadable"] else None
     if source is None:
         return OperationPlan(arguments=arguments)
-    network = _network_plan({"url": source})
+    network = _network_plan({"url": source}, context)
     return OperationPlan(arguments=arguments, operations=network.operations)
 
 

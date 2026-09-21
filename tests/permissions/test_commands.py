@@ -1,5 +1,6 @@
 """Tests for complete operation-policy user commands."""
 
+import shlex
 from unittest.mock import Mock
 
 from prompt_toolkit.document import Document
@@ -18,13 +19,14 @@ from loop import (
     PermissionRule,
     PolicyScope,
 )
+from loop.instructions import InstructionsManager, RuntimeEnvironment
 from loop.permissions import PermissionCommands
 
 
-def command_manager(permissions, interaction):
+def command_manager(permissions, interaction, instructions=None):
     """Return a command manager exposing the supplied permission policy."""
     manager = CommandManager(interaction=interaction)
-    manager.register_provider(PermissionCommands(permissions))
+    manager.register_provider(PermissionCommands(permissions, instructions))
     return manager
 
 
@@ -171,6 +173,26 @@ def test_permissions_show_and_explain_report_the_complete_effective_policy(tmp_p
     assert "rule:" in explained
 
 
+def test_process_explanation_uses_active_runtime_roots(tmp_path):
+    """Process explanations reproduce the active workspace and temporary authority."""
+    executable = tmp_path / "tool"
+    executable.write_text("tool", encoding="utf-8")
+    executable.chmod(0o755)
+    temporary = tmp_path / "temporary"
+    temporary.mkdir()
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path)
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, temporary))
+    manager = command_manager(permissions, interaction, instructions)
+
+    manager.call(
+        "permissions",
+        f"explain run_command process.execute {shlex.quote(str(executable))}",
+    )
+
+    assert "Effective decision: ask" in interaction.info.call_args.args[0]
+
+
 def test_permissions_reload_and_limit_removal_report_outcomes(tmp_path):
     """Reload validates disk policy and unchanged collection operations produce warnings."""
     interaction = Mock(spec=Interaction)
@@ -195,7 +217,7 @@ def test_permissions_reload_reports_invalid_policy_without_replacing_active_poli
     interaction.prompt.return_value = "continue"
     permissions = PermissionManager(tmp_path, interaction=interaction)
     permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    (tmp_path / ".loop" / "permissions.yaml").write_text("version: 2\n", "utf-8")
+    (tmp_path / ".loop" / "permissions.yaml").write_text("version: 0\n", "utf-8")
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "reload")
@@ -216,16 +238,16 @@ def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
 
-    manager.call("permissions", "limit set session host-process allow")
+    manager.call("permissions", "limit set session private-network allow")
     manager.call("permissions", "limit add session network-origin https://my-host.local")
     manager.call("permissions", "default set session process.execute allow")
     manager.call("permissions", "show session")
     shown = interaction.info.call_args.args[0]
-    assert "allow_host_processes: True" in shown
+    assert "deny_private_networks: False" in shown
     assert "network_origins: https://my-host.local" in shown
     assert PermissionManager(tmp_path).configuration.limits == permissions.configuration.limits
 
-    manager.call("permissions", "limit reset session host-process")
+    manager.call("permissions", "limit reset session private-network")
     manager.call("permissions", "default reset session process.execute")
     manager.call("permissions", "default reset session process.execute")
     assert "already inherited" in interaction.warning.call_args.args[0]
@@ -241,15 +263,14 @@ def test_permissions_limit_without_mutation_lists_scoped_values(tmp_path):
     """Bare and explicitly scoped limit inspection distinguish values from inheritance."""
     interaction = Mock(spec=Interaction)
     permissions = PermissionManager(tmp_path)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_limit("deny_private_networks", False, scope=PolicyScope.SESSION)
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "limit")
     listed = interaction.info.call_args.args[0]
     assert "Workspace permission limits:" in listed
     assert "Session permission limits:" in listed
-    assert "  host-process: true" in listed
-    assert "  private-network: inherited" in listed
+    assert "  private-network: true" in listed
 
     manager.call("permissions", "limit list workspace")
     scoped = interaction.info.call_args.args[0]
@@ -468,7 +489,7 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
     permissions.add_rule(PermissionRule(id="persistent-rule", decision=Decision.ASK))
     persistent = complete(completer, "/permissions rule remove workspace persistent")
     assert [item.text for item in persistent] == ["persistent-rule"]
-    limits = complete(completer, "/permissions limit set session host-process ")
+    limits = complete(completer, "/permissions limit set session private-network ")
     assert [item.text for item in limits] == ["allow", "deny"]
     assert all(item.display_meta_text for item in limits)
     presets = complete(completer, "/permissions preset ")
@@ -484,6 +505,6 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
         "workspace",
     ]
     assert all(item.display_meta_text for item in root_tokens)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
-    reset_limits = complete(completer, "/permissions limit reset session host")
-    assert [item.text for item in reset_limits] == ["host-process"]
+    permissions.set_limit("deny_private_networks", False, scope=PolicyScope.SESSION)
+    reset_limits = complete(completer, "/permissions limit reset session private")
+    assert [item.text for item in reset_limits] == ["private-network"]

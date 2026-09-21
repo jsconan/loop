@@ -12,7 +12,15 @@ from pydantic import Field
 from .. import constants
 from ..errors import Problem, ProblemException, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
-from ..permissions import Action, FileKind, FileManifestEntry, FileTarget, Operation, OperationPlan
+from ..permissions import (
+    Action,
+    FileKind,
+    FileManifestEntry,
+    FileTarget,
+    Operation,
+    OperationPlan,
+    OperationPlanningContext,
+)
 from ..tooling import TOOL_READY, ToolContext, ToolPreflightResult, ToolStatus, tool
 from ..utils import (
     TextSearchCase,
@@ -53,7 +61,7 @@ def _write_preview(path: Path, content: str, existing: str | None) -> str:
 def _file_plan(action: Action):
     """Return a planner for one non-mutating filesystem operation."""
 
-    def _plan(arguments: dict[str, object]) -> OperationPlan:
+    def _plan(arguments: dict[str, object], _context: OperationPlanningContext) -> OperationPlan:
         path = Path(str(arguments["path"]))
         resource = canonical_path(path)
         normalized = dict(arguments)
@@ -220,7 +228,7 @@ def _read_operation(action: Action, path: str) -> Operation:
     return Operation(tool_id="", action=action, target=FileTarget(path=path))
 
 
-def _write_plan(arguments: dict[str, object]) -> OperationPlan:
+def _write_plan(arguments: dict[str, object], _context: OperationPlanningContext) -> OperationPlan:
     """Authorize target inspection before planning a create or replacement."""
     path = _lexical_mutation_path(Path(str(arguments["path"])))
     resource = str(path)
@@ -299,7 +307,7 @@ def _finish_write_plan(arguments: dict[str, object]) -> OperationPlan:
     return OperationPlan(arguments=normalized, operations=(operation,))
 
 
-def _edit_plan(arguments: dict[str, object]) -> OperationPlan:
+def _edit_plan(arguments: dict[str, object], _context: OperationPlanningContext) -> OperationPlan:
     """Plan prerequisite authorization for one exact UTF-8 text replacement."""
     path = _lexical_mutation_path(Path(str(arguments["path"])))
     resource = str(path)
@@ -352,7 +360,7 @@ def _finish_edit_plan(arguments: dict[str, object]) -> OperationPlan:
     )
 
 
-def _delete_plan(arguments: dict[str, object]) -> OperationPlan:
+def _delete_plan(arguments: dict[str, object], _context: OperationPlanningContext) -> OperationPlan:
     """Plan protected-boundary and prerequisite inspection for one deletion."""
     path = _lexical_mutation_path(Path(str(arguments["path"])))
     resource = str(path)

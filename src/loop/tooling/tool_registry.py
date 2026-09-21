@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from time import perf_counter
 from typing import Any
 
@@ -26,10 +26,13 @@ from ..permissions import (
     Decision,
     OperationPlan,
     OperationPlanner,
+    OperationPlanningContext,
     Operations,
     PermissionManager,
 )
-from ..utils import callable_name
+from ..sandbox import HostProcessPlan, SandboxPlan, spawn_host
+from ..telemetry import telemetry_audit
+from ..utils import VirtualPath, callable_name
 from .context import ToolContext
 from .models import (
     ToolPreflight,
@@ -625,7 +628,9 @@ class ToolRegistry:
         try:
             if instructions_manager is not None:
                 arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
-            plan = tool.plan(arguments)
+            plan = tool.plan(
+                arguments, self._planning_context(instructions_manager, permission_manager)
+            )
             prerequisites = ()
             while True:
                 boundary_denial = permission_manager.check_boundaries(plan.boundary_operations)
@@ -671,6 +676,29 @@ class ToolRegistry:
                 resolved[name] = value
         return resolved
 
+    def _planning_context(
+        self,
+        instructions_manager: InstructionsManager | None,
+        permission_manager: PermissionManager | None = None,
+    ) -> OperationPlanningContext:
+        """Return canonical filesystem authority for operation planning."""
+        if instructions_manager is None:
+            return OperationPlanningContext()
+        roots = instructions_manager.virtual_paths.roots
+        if not isinstance(roots, Mapping):
+            return OperationPlanningContext()
+        manager = permission_manager or self._permission_manager
+        readable_roots, writable_roots = manager.effective_filesystem_roots
+        return OperationPlanningContext(
+            workspace=roots.get(VirtualPath.WORKSPACE),
+            temporary_directory=roots.get(VirtualPath.TEMPORARY),
+            read_only_roots=tuple(
+                root for name, root in roots.items() if name.startswith(f"{VirtualPath.SKILLS}/")
+            ),
+            readable_roots=readable_roots,
+            writable_roots=writable_roots,
+        )
+
     def _command_plan(
         self,
         tool: Tool,
@@ -681,7 +709,7 @@ class ToolRegistry:
         try:
             if instructions_manager is not None:
                 arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
-            plan = tool.plan(arguments)
+            plan = tool.plan(arguments, self._planning_context(instructions_manager))
             prerequisites = ()
             while plan.continuation is not None:
                 prerequisites += plan.operations
@@ -748,7 +776,7 @@ class ToolRegistry:
             """Plan and authorize one runtime-discovered operation set."""
             if permission_manager is None:  # pragma: no cover - callback is omitted below.
                 raise RuntimeError("Additional authorization is unavailable.")
-            plan = tool.plan(arguments)
+            plan = tool.plan(arguments, self._planning_context(instructions_manager))
             result = permission_manager.authorize(plan.operations, interaction=interaction)
             if result.decision is Decision.DENY:
                 raise ProblemException(
@@ -762,6 +790,65 @@ class ToolRegistry:
                 )
             return plan
 
+        def request_host_process(
+            sandbox_plan: SandboxPlan,
+            reason: str,
+            popen_options: Mapping[str, Any],
+        ):
+            """Require a fresh non-persistable confirmation for exact host authority."""
+            manager = permission_manager or self._permission_manager
+            if not manager.effective_configuration.limits.allow_host_processes:
+                telemetry_audit("process.host.denied", source="ceiling")
+                raise ProblemException(
+                    Problem(
+                        code="process.sandbox_incompatible",
+                        title="Command is incompatible with the sandbox",
+                        detail=reason,
+                        severity="warning",
+                        operation=tool.name,
+                    )
+                )
+            if interaction is None:
+                telemetry_audit("process.host.denied", source="headless")
+                raise ProblemException(
+                    Problem(
+                        code="process.host_denied",
+                        title="Host execution requires interaction",
+                        detail="A fresh interactive confirmation is required for every host run.",
+                        severity="warning",
+                        operation=tool.name,
+                    )
+                )
+            host_plan = HostProcessPlan.create(sandbox_plan, reason)
+            argv = "\n".join(
+                f"  [{index}] {argument!r}" for index, argument in enumerate(host_plan.argv)
+            )
+            prompt = (
+                "Run this command once on the host?\n\n"
+                "WARNING: This is not sandboxed. It will have Loop's host-user filesystem, "
+                "credential, process, IPC, GUI, and network access.\n"
+                f"Sandbox incompatibility: {host_plan.incompatibility_reason}\n"
+                f"Canonical cwd: {host_plan.cwd}\n"
+                f"Canonical argv boundaries:\n{argv}\n"
+                f"Confirmation identity: {host_plan.confirmation_digest}"
+            )
+            approved = interaction.confirm(prompt, default=False)
+            telemetry_audit(
+                "process.host.confirmed" if approved else "process.host.rejected",
+                decision="allow" if approved else "deny",
+            )
+            if not approved:
+                raise ProblemException(
+                    Problem(
+                        code="process.host_rejected",
+                        title="Host execution rejected",
+                        detail="The command was not started.",
+                        severity="warning",
+                        operation=tool.name,
+                    )
+                )
+            return spawn_host(host_plan, popen_options=popen_options)
+
         return ToolContext(
             interaction=interaction,
             tool_name=tool.name,
@@ -772,6 +859,7 @@ class ToolRegistry:
             additional_authorizer=(
                 authorize_additional if permission_manager is not None else None
             ),
+            host_process_requester=request_host_process,
             settings=self._settings,
         )
 

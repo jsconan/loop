@@ -243,7 +243,7 @@ class Loop:
         )
         providers = (
             SessionCommands(configured_sessions, configured_name_generator),
-            PermissionCommands(configured_permissions),
+            PermissionCommands(configured_permissions, configured_instructions),
             SkillCommands(configured_instructions),
             ToolCommands(configured_tools, configured_instructions),
             ModelCommands(configured_selection),

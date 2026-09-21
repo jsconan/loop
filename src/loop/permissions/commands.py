@@ -4,10 +4,13 @@ from typing import Annotated
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration, CommandRemainder
 from ..completion import CommandCompletion, CompletionValue
+from ..instructions import InstructionsManager
+from ..utils import VirtualPath
 from .manager import PermissionManager
 from .models import (
     Action,
     Decision,
+    OperationPlanningContext,
     PermissionLoadResult,
     PermissionPreset,
     PermissionRule,
@@ -71,10 +74,17 @@ class PermissionCommands:
 
     Args:
         permission_manager (PermissionManager): Policy manager controlled by the command.
+        instructions_manager (InstructionsManager | None): Active virtual-root owner used to
+            reproduce exact process targets, or ``None`` to use manager roots.
     """
 
-    def __init__(self, permission_manager: PermissionManager) -> None:
+    def __init__(
+        self,
+        permission_manager: PermissionManager,
+        instructions_manager: InstructionsManager | None = None,
+    ) -> None:
         self._permission_manager = permission_manager
+        self._instructions_manager = instructions_manager
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return permission command registrations.
@@ -103,6 +113,7 @@ class PermissionCommands:
             raise CommandArgumentError(f"{exc}\n{self._usage()}") from exc
 
     def _dispatch(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
+        # pylint: disable=too-many-branches
         manager = self._permission_manager
         if not arguments or arguments == ("show",):
             context.interaction.info(manager.describe())
@@ -125,7 +136,24 @@ class PermissionCommands:
             return
         if len(arguments) == 4 and arguments[0] == "explain":
             _, tool, raw_action, resource = arguments
-            decision = manager.explain(tool, Action(raw_action), resource)
+            planning_context = None
+            if self._instructions_manager is not None:
+                roots = self._instructions_manager.virtual_paths.roots
+                readable_roots, writable_roots = manager.effective_filesystem_roots
+                planning_context = OperationPlanningContext(
+                    workspace=roots.get(VirtualPath.WORKSPACE),
+                    temporary_directory=roots.get(VirtualPath.TEMPORARY),
+                    read_only_roots=tuple(
+                        root
+                        for name, root in roots.items()
+                        if name.startswith(f"{VirtualPath.SKILLS}/")
+                    ),
+                    readable_roots=readable_roots,
+                    writable_roots=writable_roots,
+                )
+            decision = manager.explain(
+                tool, Action(raw_action), resource, planning_context=planning_context
+            )
             context.interaction.info(
                 f"Effective decision: {decision.decision.value}\n"
                 f"Reason: {decision.reason}\n"
@@ -762,8 +790,8 @@ class PermissionCommands:
         return (
             "Use /permissions show to inspect policy and /permissions show effective for its "
             "combined view. Defaults choose allow, ask, or deny by action; rules refine matching "
-            "tools, actions, and resources; boundaries restrict reachable roots, origins, and host "
-            "processes regardless of rules.\n\n"
+            "tools, actions, and resources; boundaries restrict reachable roots and origins "
+            "regardless of rules.\n\n"
             "Examples:\n"
             "  /permissions default set workspace filesystem.delete deny\n"
             "  /permissions rule add session allow read_text_file filesystem.read '*'\n"
@@ -773,6 +801,5 @@ class PermissionCommands:
             "Presets replace only the explicitly selected workspace or session defaults and rules. "
             "They never replace enforcement limits or the other policy layer; replace prompts for "
             "confirmation and diff previews the exact policy change.\n\n"
-            "Host-process permission runs commands with this application's host access; Loop does "
-            "not currently provide an OS sandbox executor."
+            "Agent commands always run through Loop's mandatory operating-system sandbox."
         )

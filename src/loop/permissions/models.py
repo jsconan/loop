@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import StrEnum
 from importlib.resources import files
 from pathlib import Path
-from typing import Annotated, Any, Literal, Protocol
+from typing import Annotated, Literal, Protocol
 from uuid import uuid4
 
 import yaml
@@ -178,7 +179,13 @@ class ProcessTarget(BaseModel):
         kind (Literal["process"]): Target discriminator.
         argv (tuple[str, ...]): Executable and arguments without shell parsing.
         cwd (str): Canonical process working directory.
+        workspace (str): Canonical writable workspace root.
+        temporary_directory (str | None): Canonical writable private temporary root.
+        read_only_roots (tuple[str, ...]): Canonical invocation-scoped readable roots.
+        readable_roots (tuple[str, ...]): Effective sandbox read roots.
+        writable_roots (tuple[str, ...]): Effective sandbox write roots.
         boundary (ProcessBoundary): Execution boundary enforced by the process executor.
+        sandbox_policy (str): Digest of the complete mandatory containment plan.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -186,7 +193,13 @@ class ProcessTarget(BaseModel):
     kind: Literal["process"] = "process"
     argv: tuple[str, ...]
     cwd: str
-    boundary: ProcessBoundary = ProcessBoundary.HOST
+    workspace: str
+    temporary_directory: str | None = None
+    read_only_roots: tuple[str, ...] = ()
+    readable_roots: tuple[str, ...] = ()
+    writable_roots: tuple[str, ...] = ()
+    boundary: ProcessBoundary = ProcessBoundary.SANDBOXED
+    sandbox_policy: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class SessionTarget(BaseModel):
@@ -311,7 +324,36 @@ class PresetSource(BaseModel):
     rule_id: str
 
 
-OperationPlanner = Callable[[dict[str, Any]], OperationPlan]
+@dataclass(frozen=True, slots=True)
+class OperationPlanningContext:
+    """Describe invocation-scoped roots available while planning operations.
+
+    Args:
+        workspace (Path | None): Canonical writable workspace root, or ``None`` when unavailable.
+        temporary_directory (Path | None): Canonical writable temporary root, or ``None``.
+        read_only_roots (tuple[Path, ...]): Canonical invocation-scoped readable roots.
+        readable_roots (tuple[Path, ...] | None): Effective command read roots, or ``None`` when
+            permission policy is unavailable.
+        writable_roots (tuple[Path, ...] | None): Effective command write roots, or ``None`` when
+            permission policy is unavailable.
+    """
+
+    workspace: Path | None = None
+    temporary_directory: Path | None = None
+    read_only_roots: tuple[Path, ...] = ()
+    readable_roots: tuple[Path, ...] | None = None
+    writable_roots: tuple[Path, ...] | None = None
+
+
+class OperationPlanner(Protocol):
+    """Plan operations from validated arguments and explicit runtime authority."""
+
+    def __call__(
+        self,
+        arguments: dict[str, object],
+        context: OperationPlanningContext,
+    ) -> OperationPlan:
+        """Return the complete immutable operation plan."""
 
 
 class PermissionRule(BaseModel):
@@ -645,7 +687,7 @@ class PermissionConfiguration(BaseModel):
     """Represent a complete persisted local operation policy.
 
     Args:
-        version (Literal[1]): Configuration schema version.
+        version (Literal[2]): Configuration schema version.
         defaults (dict[Action, Decision]): Fallback decision for every known action.
         limits (PolicyLimits): User-configurable ceilings ordinary rules cannot override.
         rules (list[PermissionRule]): Composed explicit policy rules.
@@ -653,7 +695,7 @@ class PermissionConfiguration(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     defaults: dict[Action, Decision] = Field(default_factory=_default_decisions)
     limits: PolicyLimits = Field(default_factory=PolicyLimits)
     rules: list[PermissionRule] = Field(default_factory=list)
@@ -681,13 +723,13 @@ class UserPermissionConfiguration(BaseModel):
     would widen authority beyond a single reviewed approval and require their own management flow.
 
     Args:
-        version (Literal[1]): Persisted schema version.
+        version (Literal[2]): Persisted schema version.
         rules (list[PermissionRule]): Exact user-approved operation rules.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     rules: list[PermissionRule] = Field(default_factory=list)
 
     @model_validator(mode="after")

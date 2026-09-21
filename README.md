@@ -614,10 +614,10 @@ before its function is invoked. A tool first produces one complete, canonical op
 all effects knowable before execution; the whole plan is then allowed, denied, or approved
 atomically. An effect discovered only while the tool runs must pass another registry-owned planning
 and authorization checkpoint before it occurs. Pure tools require no authority. The default
-supervised policy permits reads in the workspace and Loop-owned temporary directory, asks for
-mutations and network access, and denies host-process execution at a user-configurable boundary.
-Ordinary rules cannot override boundaries. A required approval is denied when no interactive user
-is available.
+supervised policy permits reads in the workspace and Loop-owned temporary directory and asks for
+mutations, network access, and sandboxed command execution. Agent commands can never opt into host
+execution. Ordinary rules cannot override boundaries. A required approval is denied when no
+interactive user is available.
 
 The policy is stored in centralized UUID-scoped workspace data and is created when first changed.
 Decisions are appended to the application-global SQLite `audit.db` with `workspace_id` correlation
@@ -636,10 +636,8 @@ decision, and event filters; pass `force=true` only when replacement is intentio
 /permissions default set session process.execute ask
 /permissions rule add workspace allow read_text_file filesystem.read "/project/docs/*"
 /permissions rule add session deny run_command process.execute "*"
-/permissions limit set session host-process allow
 /permissions limit add workspace network-origin https://my-host.local
 /permissions limit add workspace read-root system-temp
-/permissions limit reset session host-process
 /permissions session reset
 /permissions explain run_command process.execute "git status"
 /permissions preset list
@@ -673,19 +671,55 @@ and session overrides; `limit list workspace` and `limit list session` select on
 
 Actions are `filesystem.list`, `filesystem.read`, `filesystem.create`, `filesystem.replace`,
 `filesystem.delete`, `network.request`, `process.execute`, and `session.mutate`. Filesystem roots,
-control paths, network origins/private addresses, and host processes are configurable enforcement
-boundaries that rules cannot override. `workspace` and `loop-temp` roots are available by default;
-add `system-temp` only when cross-application temporary-file access is necessary. Enabling host
-processes or private-network access is explicit. Network origins use glob patterns: `*` permits
+control paths, and network origins/private addresses are configurable enforcement boundaries that
+rules cannot override. `workspace` and `loop-temp` roots are available by default; add
+`system-temp` only when cross-application temporary-file access is necessary. Private-network
+access is explicit. Network origins use glob patterns: `*` permits
 all origins, while an empty origin list denies all network requests. Adding the first specific
 origin replaces the default `*`, making the boundary restrictive. Relative filesystem roots in
 the YAML policy are resolved from the workspace, not from the shell's launch directory. Each Loop
-instance owns a private `loop-temp` directory. Host process execution requires both opening the
-`host-process` boundary and choosing an appropriate `process.execute` default or rule. Ignore files
-limit discovery only; they are not authorization policy.
-The command tool accepts an exact argument vector and never invokes a shell, while web requests do
-not follow redirects implicitly. Policy is distinct from operating-system containment; a sandbox
-executor requires a separately reviewed design before enabling untrusted process execution.
+instance owns a private `loop-temp` directory. Ignore files limit discovery only; they are not
+authorization policy. The command tool accepts an exact argument vector and never invokes a shell,
+while web requests do not follow redirects implicitly.
+
+Every command plan resolves its executable before approval and includes a digest of the complete
+sandbox authority. Execution reconstructs and verifies that digest, so a remembered approval
+cannot be reused after the command, working directory, effective permission roots, backend policy,
+or containment contract changes. The command working directory must be inside an effective
+readable or writable root; empty and restricted root sets therefore constrain commands exactly as
+they constrain direct filesystem tools. Activated skill roots and executable runtime files are
+read-only. `.loop` is unreadable and unwritable; `.git`, `.gitignore`, and
+`.agentignore` are read-only even when initially missing or represented by a symlink. Network
+access is always denied. Child processes receive a deterministic minimal environment whose home
+and temporary paths stay inside writable sandbox roots; arbitrary host environment variables are
+not inherited. Executable and exposed-root identities are revalidated immediately before launch.
+
+On macOS, commands use the system Seatbelt executor with a deny-by-default profile. On Linux they
+require Bubblewrap and run with isolated user, mount, PID, IPC, UTS, and network namespaces, no
+capabilities, a seccomp deny filter, a minimal filesystem, and protected control-path overlays.
+Bubblewrap resolves only from fixed system locations whose complete parent chain is not
+agent-writable. Capability is checked against the exact authorized plan at execution time. A
+sandbox failure is returned as `process.sandbox_incompatible`; it never retries automatically.
+Windows currently fails closed until a native AppContainer launcher is implemented.
+
+CPU, address-space, process-count, descriptor, output, file-size, core-dump, and wall-clock limits
+are applied by an in-sandbox launcher before the approved command executes. macOS kernels may
+reject individual POSIX resource-limit classes; those limits are retained when supported without
+preventing Seatbelt containment from starting. The Linux PID namespace, Bubblewrap init, and
+`--die-with-parent` contain descendants. These controls are practical process containment, not a
+claim of protection against kernel vulnerabilities or hardware side channels.
+
+Host execution is a separate high-risk boundary. `allow_host_processes` defaults to false and only
+permits Loop to offer a one-time confirmation after a specific sandbox incompatibility is known.
+It never authorizes execution by itself. Every host run builds a new content-bound plan and asks
+again, even when an ordinary process rule was remembered. The prompt shows canonical argv
+boundaries, cwd, incompatibility reason, and warns that the command receives Loop's host-user
+filesystem, credentials, processes, IPC, GUI, and network authority. Rejection and headless calls
+create no process. Host results are labeled `host`; sandbox results are labeled `sandboxed`.
+
+Native denial and lifecycle validation belongs to the opt-in, provisioned
+[command sandbox integration suite](docs/command-sandbox-integration-tests.md), not the ordinary
+unit suite.
 
 ## Built-in tools
 
@@ -702,17 +736,15 @@ The default registry exposes these functions to the model:
 | `get_current_datetime` | Returns the current local date and time                                  |
 | `fetch_content`        | Streams authorized HTTP(S) text into a bounded resumable cache           |
 | `read_cached_content`  | Reads cached text by line or opaque cursor, optionally re-fetching a URL |
-| `run_command`          | Runs an authorized argument vector within a 30-second lifecycle deadline |
+| `run_command`          | Runs an authorized argument vector in a mandatory native sandbox          |
 | `activate_skill`       | Loads matching skill instructions before task work                        |
 | `manage_skills`        | Manages active skills and progressively loads bounded skill resources     |
 
-`run_command` applies one monotonic deadline to process execution, output draining, reader
+`run_command` applies one monotonic deadline to sandbox execution, output draining, reader
 completion, termination, and direct-child reaping. Output is decoded as UTF-8 with invalid byte
-sequences replaced. On POSIX, each command starts an isolated session and timeout cleanup kills
-that owned process group, including descendants that retain output pipes. On Windows, the command
-starts a new process group, but Python's portable process API can forcibly terminate only the
-direct child; descendant cleanup is therefore best-effort and waiting for readers remains bounded
-by the deadline.
+sequences replaced. On POSIX, each sandbox wrapper starts an isolated session and timeout cleanup
+kills that owned process group. Linux additionally uses a PID namespace and Bubblewrap's
+`--die-with-parent` to contain descendants. Waiting for readers remains bounded by the deadline.
 
 Text reads report exact source and included byte sizes, returned ranges, truncation reasons, and
 continuation positions. File reads also report line ranges while retaining the byte ceiling. As a
@@ -737,9 +769,9 @@ The base installation does not include ripgrep. Install the optional `tools` ext
 (`uv sync --extra tools`), or install `rg` separately and make it available on `PATH`. When it is
 unavailable, searches return a structured `filesystem.search_unavailable` problem.
 
-Direct filesystem tools and approved commands operate with the permissions of the process running
-`loop`; they are authorization-controlled rather than OS-sandboxed. Commands use an exact argument
-vector and never invoke a shell.
+Direct filesystem tools operate with the permissions of the process running `loop` after
+authorization and their own path-boundary checks. Approved commands instead run in the mandatory
+operating-system sandbox, use an exact argument vector, and never invoke a shell.
 
 ### Value-holder thread safety
 

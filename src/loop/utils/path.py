@@ -4,6 +4,7 @@ import os
 import shlex
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 
 from pathspec import GitIgnoreSpec
 
@@ -74,6 +75,15 @@ class VirtualPath:
         if workspace is None:
             raise ValueError("Workspace-relative paths require a configured workspace.")
         return self._local_path(workspace, value)
+
+    @property
+    def roots(self) -> Mapping[str, Path]:
+        """Return an immutable snapshot of configured virtual roots.
+
+        Returns:
+            Mapping[str, Path]: Virtual-root names mapped to local absolute paths.
+        """
+        return MappingProxyType(self._roots.copy())
 
     def display(self, value: str) -> str:
         """Render a local path without disclosing configured host roots.

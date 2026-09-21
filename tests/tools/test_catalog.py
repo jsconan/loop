@@ -3,8 +3,12 @@
 import importlib
 from unittest.mock import Mock
 
+import pytest
+
 from loop import BUILTIN_TOOLS, Interaction, PermissionManager, ToolRegistry
 from loop.tools import create_default_tool_registry
+
+pytestmark = pytest.mark.usefixtures("available_command_sandbox")
 
 files_module = importlib.import_module("loop.tools.files")
 

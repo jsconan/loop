@@ -51,3 +51,20 @@ def test_additional_authorization_delegates_or_fails_closed():
     with pytest.raises(ProblemException) as denied:
         ToolContext(interaction, "fetch").authorize_additional({"url": "https://my-host.local"})
     assert denied.value.problem.code == "tool.authorization_unavailable"
+
+
+def test_host_process_requests_delegate_or_fail_as_sandbox_incompatible():
+    """Only a registry-owned host requester can cross the sandbox boundary."""
+    interaction = Mock(spec=Interaction)
+    process = Mock()
+    requester = Mock(return_value=process)
+    plan = Mock()
+    options = {"text": True}
+    context = ToolContext(interaction, "run_command", host_process_requester=requester)
+
+    assert context.request_host_process(plan, "unsupported", options) is process
+    requester.assert_called_once_with(plan, "unsupported", options)
+
+    with pytest.raises(ProblemException) as denied:
+        ToolContext(interaction, "run_command").request_host_process(plan, "unsupported", options)
+    assert denied.value.problem.code == "process.sandbox_incompatible"

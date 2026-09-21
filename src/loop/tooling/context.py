@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..errors import Problem, ProblemException
 from ..interaction import Interaction
 from .models import ToolRuntimeSettings
 
 if TYPE_CHECKING:
+    import subprocess
+
     from ..instructions import InstructionsManager
     from ..permissions import OperationPlan, Operations
+    from ..sandbox import SandboxPlan
 
 AdditionalAuthorizer = Callable[[dict[str, object]], "OperationPlan"]
+HostProcessRequester = Callable[["SandboxPlan", str, Mapping[str, Any]], "subprocess.Popen[str]"]
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,8 @@ class ToolContext:
         additional_authorizer (AdditionalAuthorizer | None): Registry-owned callback that plans
             and authorizes effects discovered during execution, or ``None`` when unavailable.
         settings (ToolRuntimeSettings): Scoped settings available to tool implementations.
+        host_process_requester (HostProcessRequester | None): Registry-owned mandatory one-time
+            host confirmation path, or ``None`` when host execution is unavailable.
     """
 
     interaction: Interaction | None
@@ -45,6 +51,7 @@ class ToolContext:
     call_id: str | None = None
     additional_authorizer: AdditionalAuthorizer | None = None
     settings: ToolRuntimeSettings = field(default_factory=ToolRuntimeSettings)
+    host_process_requester: HostProcessRequester | None = None
 
     def observe_file(self, path: Path | str) -> None:
         """Report a successfully loaded file to instruction management.
@@ -137,3 +144,34 @@ class ToolContext:
                 )
             )
         return self.additional_authorizer(arguments)
+
+    def request_host_process(
+        self,
+        plan: SandboxPlan,
+        reason: str,
+        popen_options: Mapping[str, Any],
+    ) -> subprocess.Popen[str]:
+        """Request a separately confirmed exact host invocation.
+
+        Args:
+            plan (SandboxPlan): Canonical sandbox intent that could not be supported.
+            reason (str): Specific known sandbox incompatibility.
+            popen_options (Mapping[str, Any]): Bounded pipe options for host execution.
+
+        Returns:
+            subprocess.Popen[str]: Confirmed running host process.
+
+        Raises:
+            ProblemException: If host execution is disabled, headless, or rejected.
+        """
+        if self.host_process_requester is None:
+            raise ProblemException(
+                Problem(
+                    code="process.sandbox_incompatible",
+                    title="Command is incompatible with the sandbox",
+                    detail=reason,
+                    severity="warning",
+                    operation=self.tool_name,
+                )
+            )
+        return self.host_process_requester(plan, reason, popen_options)

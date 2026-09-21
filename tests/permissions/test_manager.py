@@ -31,7 +31,7 @@ from loop import (
     ProcessTarget,
     SessionTarget,
 )
-from loop.permissions import PermissionLoadFailure
+from loop.permissions import OperationPlanningContext, PermissionLoadFailure
 from loop.permissions import manager as manager_module
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.telemetry.policy import thaw
@@ -466,7 +466,9 @@ def test_process_grants_distinguish_argument_boundaries_working_directory_and_sa
         target=ProcessTarget(
             argv=("tool", "a b"),
             cwd=str(tmp_path),
+            workspace=str(tmp_path),
             boundary=ProcessBoundary.SANDBOXED,
+            sandbox_policy="a" * 64,
         ),
     )
     ambiguous = operation(
@@ -474,7 +476,9 @@ def test_process_grants_distinguish_argument_boundaries_working_directory_and_sa
         target=ProcessTarget(
             argv=("tool", "a", "b"),
             cwd=str(tmp_path),
+            workspace=str(tmp_path),
             boundary=ProcessBoundary.SANDBOXED,
+            sandbox_policy="a" * 64,
         ),
     )
 
@@ -482,6 +486,18 @@ def test_process_grants_distinguish_argument_boundaries_working_directory_and_sa
 
     assert manager.evaluate((approved,)).decision is Decision.ALLOW
     assert manager.evaluate((ambiguous,)).decision is Decision.ASK
+    assert (
+        manager.evaluate(
+            (
+                approved.model_copy(
+                    update={
+                        "target": approved.target.model_copy(update={"sandbox_policy": "b" * 64})
+                    }
+                ),
+            )
+        ).decision
+        is Decision.ASK
+    )
     assert (
         manager.evaluate(
             (
@@ -692,7 +708,11 @@ def test_filesystem_boundaries_cannot_be_overridden(tmp_path, path, action, sour
         (
             Action.PROCESS_EXECUTE,
             lambda root: ProcessTarget(
-                argv=("git", "status"), cwd=str(root), boundary=ProcessBoundary.HOST
+                argv=("git", "status"),
+                cwd=str(root),
+                workspace=str(root),
+                boundary=ProcessBoundary.HOST,
+                sandbox_policy="0" * 64,
             ),
             PolicyLimits(),
             "limit:workspace:allow_host_processes",
@@ -887,7 +907,13 @@ def test_relative_roots_resolve_against_workspace_and_temp_is_manager_owned(tmp_
 
 def test_host_processes_require_an_explicit_boundary_opt_in(tmp_path):
     """Policy rules cannot authorize host-process execution by default."""
-    target = ProcessTarget(argv=("git", "status"), cwd=str(tmp_path), boundary=ProcessBoundary.HOST)
+    target = ProcessTarget(
+        argv=("git", "status"),
+        cwd=str(tmp_path),
+        workspace=str(tmp_path),
+        boundary=ProcessBoundary.HOST,
+        sandbox_policy="0" * 64,
+    )
     denied = PermissionManager(
         tmp_path,
         configuration=PermissionConfiguration(rules=[PermissionRule(decision=Decision.ALLOW)]),
@@ -934,7 +960,7 @@ def test_preset_replacement_changes_the_selected_defaults_and_rule_layer(tmp_pat
     """A preset replaces selected-scope defaults and rules while preserving limits and overlays."""
     manager = PermissionManager(tmp_path)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    manager.set_limit("allow_host_processes", True)
+    manager.set_limit("deny_private_networks", False)
     manager.add_rule(PermissionRule(id="old-workspace", decision=Decision.DENY))
     manager.add_rule(
         PermissionRule(
@@ -957,7 +983,7 @@ def test_preset_replacement_changes_the_selected_defaults_and_rule_layer(tmp_pat
     assert manager.configuration.defaults[Action.FILESYSTEM_CREATE] is Decision.ALLOW
     assert manager.configuration.defaults[Action.FILESYSTEM_REPLACE] is Decision.ALLOW
     assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ASK
-    assert manager.configuration.limits.allow_host_processes is True
+    assert manager.configuration.limits.deny_private_networks is False
     assert [rule.id for rule in manager.session_rules] == ["session-guard"]
     assert (
         manager.explain("write_text_file", Action.FILESYSTEM_CREATE, str(tmp_path / "new")).decision
@@ -1151,17 +1177,17 @@ def test_session_overrides_never_leak_into_later_workspace_saves(tmp_path):
     session_rule = PermissionRule(id="session-only", decision=Decision.DENY)
 
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.ALLOW, scope=PolicyScope.SESSION)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_limit("deny_private_networks", False, scope=PolicyScope.SESSION)
     manager.add_rule(session_rule, scope=PolicyScope.SESSION)
     manager.set_default(Action.NETWORK_REQUEST, Decision.DENY)
 
     loaded = PermissionManager(tmp_path)
     assert loaded.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ASK
     assert loaded.configuration.defaults[Action.NETWORK_REQUEST] is Decision.DENY
-    assert loaded.configuration.limits.allow_host_processes is False
+    assert loaded.configuration.limits.deny_private_networks is True
     assert loaded.configuration.rules == []
     assert manager.effective_configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ALLOW
-    assert manager.effective_configuration.limits.allow_host_processes is True
+    assert manager.effective_configuration.limits.deny_private_networks is False
     assert manager.session_rules == (session_rule,)
 
 
@@ -1169,16 +1195,16 @@ def test_session_resets_restore_workspace_inheritance_without_changing_disk(tmp_
     """Per-field and whole-session resets reveal the underlying workspace policy."""
     manager = PermissionManager(tmp_path)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.DENY)
-    manager.set_limit("allow_host_processes", True)
+    manager.set_limit("deny_private_networks", False)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
-    manager.set_limit("allow_host_processes", False, scope=PolicyScope.SESSION)
+    manager.set_limit("deny_private_networks", True, scope=PolicyScope.SESSION)
 
     assert manager.reset_default(Action.PROCESS_EXECUTE) is True
     assert manager.reset_default(Action.PROCESS_EXECUTE) is False
-    assert manager.reset_limit("allow_host_processes") is True
-    assert manager.reset_limit("allow_host_processes") is False
+    assert manager.reset_limit("deny_private_networks") is True
+    assert manager.reset_limit("deny_private_networks") is False
     assert manager.effective_configuration.defaults[Action.PROCESS_EXECUTE] is Decision.DENY
-    assert manager.effective_configuration.limits.allow_host_processes is True
+    assert manager.effective_configuration.limits.deny_private_networks is False
 
     manager.add_rule(
         PermissionRule(id="temporary", decision=Decision.ASK),
@@ -1232,7 +1258,7 @@ def test_explain_constructs_every_typed_target_without_prompting(tmp_path):
     """Effective-policy explanation handles absolute paths, URLs, processes, and session state."""
     manager = PermissionManager(
         tmp_path,
-        configuration=PermissionConfiguration(limits=PolicyLimits(allow_host_processes=True)),
+        configuration=PermissionConfiguration(limits=PolicyLimits()),
     )
 
     assert (
@@ -1253,8 +1279,16 @@ def test_explain_constructs_every_typed_target_without_prompting(tmp_path):
     )
     with pytest.raises(ValueError, match="absolute HTTP"):
         manager.explain("fetch", Action.NETWORK_REQUEST, "relative")
-    with pytest.raises(ValueError, match="non-empty command"):
+    with pytest.raises(ValueError, match="include an executable"):
         manager.explain("run", Action.PROCESS_EXECUTE, "")
+    with pytest.raises(ValueError, match="configured workspace"):
+        manager.explain(
+            "run",
+            Action.PROCESS_EXECUTE,
+            "unresolved-command",
+            planning_context=OperationPlanningContext(),
+        )
+    assert manager.workspace_root == tmp_path.resolve()
 
 
 def test_remove_rule_scans_past_nonmatching_rules():
@@ -1324,12 +1358,49 @@ def test_empty_yaml_loads_as_default_policy(tmp_path):
     assert PermissionManager(tmp_path).configuration == PermissionConfiguration()
 
 
+def test_schema_one_workspace_and_user_policies_migrate_without_losing_rules(tmp_path):
+    """Schema-one policy files retain their defaults and rule data after loading."""
+    workspace_policy = tmp_path / ".loop" / "permissions.yaml"
+    workspace_policy.parent.mkdir()
+    workspace_policy.write_text(
+        "version: 1\ndefaults:\n  filesystem.delete: deny\nrules:\n"
+        "  - decision: allow\n    tool: read_text_file\n    action: filesystem.read\n"
+        "    resource: /workspace/docs/*\n",
+        "utf-8",
+    )
+    user_policy = tmp_path / "user-permissions.yaml"
+    user_policy.write_text(
+        "version: 1\nrules:\n  - decision: allow\n    tool: run_command\n"
+        "    tool_exact: true\n    action: process.execute\n    target:\n"
+        "      kind: process\n      argv: [/usr/bin/true]\n      cwd: /workspace\n"
+        "      boundary: host\n",
+        "utf-8",
+    )
+
+    manager = PermissionManager(tmp_path, user_configuration_path=user_policy)
+
+    assert manager.configuration.version == 2
+    assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+    assert manager.configuration.rules[0].resource == "/workspace/docs/*"
+    assert user_policy.exists()
+
+
+def test_schema_one_migration_preserves_invalid_rule_diagnostics(tmp_path):
+    """Malformed schema-one rules are still rejected after format migration."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text("version: 1\nrules:\n  - invalid\n", "utf-8")
+
+    with pytest.raises(PermissionConfigurationError, match="permissions.yaml"):
+        PermissionManager(tmp_path)
+
+
 def test_error_policy_raises_configuration_errors_and_preserves_active_policy(tmp_path):
     """Strict startup and reload expose typed errors without replacing valid active policy."""
     manager = PermissionManager(tmp_path)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
     path = tmp_path / ".loop" / "permissions.yaml"
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 0\n", "utf-8")
 
     with pytest.raises(PermissionConfigurationError) as raised:
         manager.reload()
@@ -1345,14 +1416,14 @@ def test_auto_policy_reports_and_uses_defaults_or_last_known_good(tmp_path, capl
     """Automatic recovery reports startup defaults and retains valid policy on reload."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 0\n", "utf-8")
 
     manager = PermissionManager(tmp_path, load_policy=PermissionLoadPolicy.AUTO)
 
     assert manager.configuration == PermissionConfiguration()
     assert "automatic permission policy" in caplog.text
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 0\n", "utf-8")
     interaction = Mock(spec=Interaction)
     manager.interaction = interaction
 
@@ -1366,11 +1437,11 @@ def test_interactive_policy_retries_a_repaired_file(tmp_path):
     """Interactive recovery rereads a file repaired while the recovery prompt is active."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 0\n", "utf-8")
     interaction = Mock(spec=Interaction)
 
     def repair(*_args, **_kwargs):
-        path.write_text("version: 1\ndefaults:\n  filesystem.delete: deny\n", "utf-8")
+        path.write_text("version: 2\ndefaults:\n  filesystem.delete: deny\n", "utf-8")
         return "retry"
 
     interaction.prompt.side_effect = repair
@@ -1395,7 +1466,7 @@ def test_interactive_reload_can_retain_the_active_policy(tmp_path, choice, expec
     interaction = Mock(spec=Interaction)
     manager = PermissionManager(tmp_path, interaction=interaction)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    manager.configuration_path.write_text("version: 2\n", "utf-8")
+    manager.configuration_path.write_text("version: 0\n", "utf-8")
     interaction.prompt.return_value = choice
 
     assert manager.reload() is expected
@@ -1412,7 +1483,7 @@ def test_interactive_loading_requires_an_interaction(tmp_path):
     manager = PermissionManager(tmp_path, interaction=interaction)
     manager.interaction = None
     manager.configuration_path.parent.mkdir(exist_ok=True)
-    manager.configuration_path.write_text("version: 2\n", "utf-8")
+    manager.configuration_path.write_text("version: 0\n", "utf-8")
     with pytest.raises(PermissionConfigurationError):
         manager.reload()
 
@@ -1521,13 +1592,15 @@ def test_process_target_display_resolves_local_paths_to_workspace_virtual_paths(
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
     )
     target = ProcessTarget(
         argv=("cat", str(readme)),
         cwd=str(sub),
-        boundary=ProcessBoundary.HOST,
+        workspace=str(tmp_path),
+        boundary=ProcessBoundary.SANDBOXED,
+        sandbox_policy="0" * 64,
     )
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
@@ -1542,7 +1615,9 @@ def test_process_target_display_preserves_workspace_relative_argv(tmp_path):
     target = ProcessTarget(
         argv=("cat", "README.md"),
         cwd=str(tmp_path),
-        boundary=ProcessBoundary.HOST,
+        workspace=str(tmp_path),
+        boundary=ProcessBoundary.SANDBOXED,
+        sandbox_policy="0" * 64,
     )
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = ApprovalChoice.ONCE
@@ -1550,7 +1625,7 @@ def test_process_target_display_preserves_workspace_relative_argv(tmp_path):
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
     )
 
@@ -1567,13 +1642,15 @@ def test_process_target_display_preserves_argument_boundaries(tmp_path):
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
     )
     target = ProcessTarget(
         argv=("tool", "a b"),
         cwd=str(tmp_path),
-        boundary=ProcessBoundary.HOST,
+        workspace=str(tmp_path),
+        boundary=ProcessBoundary.SANDBOXED,
+        sandbox_policy="0" * 64,
     )
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
@@ -1589,7 +1666,7 @@ def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
     )
     scratch_file = manager.temporary_directory / "output.log"
@@ -1597,7 +1674,10 @@ def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
     target = ProcessTarget(
         argv=("cat", str(scratch_file)),
         cwd=str(tmp_path),
-        boundary=ProcessBoundary.HOST,
+        workspace=str(tmp_path),
+        temporary_directory=str(manager.temporary_directory),
+        boundary=ProcessBoundary.SANDBOXED,
+        sandbox_policy="0" * 64,
     )
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
@@ -1614,14 +1694,16 @@ def test_process_target_display_preserves_external_temporary_paths(tmp_path):
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
     )
     external_path = Path("/tmp/verify_review.py")
     target = ProcessTarget(
         argv=(".venv/bin/python", str(external_path)),
         cwd=str(tmp_path),
-        boundary=ProcessBoundary.HOST,
+        workspace=str(tmp_path),
+        boundary=ProcessBoundary.SANDBOXED,
+        sandbox_policy="0" * 64,
     )
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))

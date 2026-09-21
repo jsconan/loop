@@ -43,7 +43,9 @@ def test_operations_expose_stable_resource_representations():
         Operation(
             tool_id="exec",
             action=Action.PROCESS_EXECUTE,
-            target=ProcessTarget(argv=("git", "status"), cwd="/x"),
+            target=ProcessTarget(
+                argv=("git", "status"), cwd="/x", workspace="/x", sandbox_policy="0" * 64
+            ),
         ),
         Operation(
             tool_id="skills",
@@ -74,7 +76,7 @@ def test_policy_configuration_has_a_versioned_complete_default():
     """The editable YAML schema exposes a version and every action fallback."""
     configuration = PermissionConfiguration()
 
-    assert configuration.version == 1
+    assert configuration.version == 2
     assert set(configuration.defaults) == set(Action)
     assert configuration.defaults[Action.FILESYSTEM_READ] is Decision.ALLOW
 

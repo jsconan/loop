@@ -21,3 +21,8 @@ def close_permission_managers(monkeypatch):
     yield
     for manager in reversed(managers):
         manager.close()
+
+
+@pytest.fixture
+def available_command_sandbox():
+    """Document that command capability is checked by the injected execution backend."""

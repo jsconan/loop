@@ -6,14 +6,23 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field
 
 from .. import constants
-from ..errors import Problem, log_problem
-from ..permissions import Action, Operation, OperationPlan, ProcessBoundary, ProcessTarget
-from ..tooling import ToolContext, tool
+from ..errors import Problem, ProblemException, log_problem
+from ..permissions import (
+    Action,
+    Operation,
+    OperationPlan,
+    OperationPlanningContext,
+    ProcessBoundary,
+    ProcessTarget,
+)
+from ..sandbox import SandboxPlan, SandboxUnavailableError, spawn_sandboxed
+from ..tooling import ToolContext, ToolPreflightResult, ToolStatus, tool
 from ..utils import (
     encode_content_cursor,
     kill_process_group,
@@ -169,27 +178,61 @@ def _process_output(
     }
 
 
-def _command_plan(arguments: dict[str, object]) -> OperationPlan:
+def _command_plan(
+    arguments: dict[str, object],
+    planning_context: OperationPlanningContext,
+) -> OperationPlan:
     """Plan an exact shell-free process invocation."""
     argv = parse_command_line(str(arguments["command"]))
     cwd = str(arguments["cwd"])
+    if planning_context.workspace is None:
+        raise ValueError("Sandbox planning requires a configured workspace root.")
+    sandbox_plan = SandboxPlan.create(
+        argv,
+        Path(cwd),
+        planning_context.workspace,
+        temporary_directory=planning_context.temporary_directory,
+        read_only_roots=planning_context.read_only_roots,
+        readable_roots=planning_context.readable_roots,
+        writable_roots=planning_context.writable_roots,
+    )
     normalized = dict(arguments)
-    normalized.update({"cwd": cwd})
+    normalized.update({"cwd": str(sandbox_plan.cwd)})
     return OperationPlan(
         arguments=normalized,
         operations=(
             Operation(
                 tool_id="",
                 action=Action.PROCESS_EXECUTE,
-                target=ProcessTarget(argv=argv, cwd=cwd, boundary=ProcessBoundary.HOST),
+                target=ProcessTarget(
+                    argv=sandbox_plan.argv,
+                    cwd=str(sandbox_plan.cwd),
+                    workspace=str(sandbox_plan.workspace),
+                    temporary_directory=(
+                        str(sandbox_plan.temporary_directory)
+                        if sandbox_plan.temporary_directory is not None
+                        else None
+                    ),
+                    read_only_roots=tuple(str(root) for root in sandbox_plan.read_only_roots),
+                    readable_roots=tuple(str(root) for root in sandbox_plan.readable_roots),
+                    writable_roots=tuple(str(root) for root in sandbox_plan.writable_roots),
+                    boundary=ProcessBoundary.SANDBOXED,
+                    sandbox_policy=sandbox_plan.policy_digest,
+                ),
             ),
         ),
     )
 
 
+def _command_preflight() -> ToolPreflightResult:
+    """Expose command planning; capability is probed against the authorized plan at execution."""
+    return ToolPreflightResult(status=ToolStatus.READY)
+
+
 @tool(
     actions={Action.PROCESS_EXECUTE},
     operation_planner=_command_plan,
+    preflight=_command_preflight,
 )
 def run_command(
     context: ToolContext,
@@ -214,6 +257,8 @@ def run_command(
     ] = ".",
 ) -> dict | Problem:
     """Run a shell-free process and return exit status and recoverable stdout/stderr previews."""
+    # pylint: disable=too-many-branches,too-many-statements
+    del command, cwd  # Execution uses only the canonical, authorized ProcessTarget.
     process = None
     started_readers = []
     timeout = context.settings.command_timeout
@@ -221,35 +266,40 @@ def run_command(
     cleanup_reserve = min(_CLEANUP_RESERVE_SECONDS, timeout / 2)
     execution_deadline = deadline - cleanup_reserve
     output_redactor = None
+    execution_boundary = ProcessBoundary.SANDBOXED.value
     try:
         operation = context.operations[0] if context.operations else None
         target = operation.target if operation is not None else None
         if not isinstance(target, ProcessTarget):
             raise TypeError("Authorized process target is missing.")
-        command_argv = list(target.argv)
-        command_cwd = os.path.realpath(target.cwd)
-        command_environment = {
-            name: value
-            for name in ("PATH", "SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
-            if (value := os.environ.get(name)) is not None
-        }
+        command_cwd = Path(target.cwd)
         if context.instructions_manager is not None:
             output_redactor = context.instructions_manager.virtual_paths.redact
-        process = subprocess.Popen(  # pylint: disable=consider-using-with
-            command_argv,
-            shell=False,
-            cwd=command_cwd,
-            env=command_environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=os.name == "posix",
-            creationflags=(
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+        sandbox_plan = SandboxPlan.create(
+            target.argv,
+            command_cwd,
+            Path(target.workspace),
+            temporary_directory=(
+                Path(target.temporary_directory) if target.temporary_directory is not None else None
             ),
+            read_only_roots=tuple(Path(root) for root in target.read_only_roots),
+            readable_roots=tuple(Path(root) for root in target.readable_roots),
+            writable_roots=tuple(Path(root) for root in target.writable_roots),
         )
+        if target.sandbox_policy != sandbox_plan.policy_digest:
+            raise TypeError("Authorized sandbox policy is stale.")
+        popen_options = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        try:
+            process = spawn_sandboxed(sandbox_plan, popen_options=popen_options)
+        except SandboxUnavailableError as exc:
+            process = context.request_host_process(sandbox_plan, str(exc), popen_options)
+            execution_boundary = ProcessBoundary.HOST.value
         if process.stdout is None or process.stderr is None:
             raise RuntimeError("Command process did not expose its output streams.")
         stdout_chunks = []
@@ -279,17 +329,23 @@ def run_command(
             )
         except subprocess.TimeoutExpired:
             _cleanup_process(process, started_readers, deadline)
+            timed_out = _process_output(
+                None, [stdout_chunks, stderr_chunks], discarded, output_redactor
+            )
+            timed_out["boundary"] = execution_boundary
             return _timeout_error(
                 timeout,
-                _process_output(None, [stdout_chunks, stderr_chunks], discarded, output_redactor),
+                timed_out,
             )
         if not _join_readers(started_readers, execution_deadline):
             _cleanup_process(process, started_readers, deadline)
+            timed_out = _process_output(
+                returncode, [stdout_chunks, stderr_chunks], discarded, output_redactor
+            )
+            timed_out["boundary"] = execution_boundary
             return _timeout_error(
                 timeout,
-                _process_output(
-                    returncode, [stdout_chunks, stderr_chunks], discarded, output_redactor
-                ),
+                timed_out,
             )
         if reader_error := next((error for error in reader_errors if error is not None), None):
             raise reader_error
@@ -298,6 +354,7 @@ def run_command(
         output = _process_output(
             returncode, [stdout_chunks, stderr_chunks], discarded, output_redactor
         )
+        output["boundary"] = execution_boundary
         if returncode != 0:
             return Problem(
                 code="process.nonzero_exit",
@@ -311,6 +368,8 @@ def run_command(
         # therefore triggers a bounded signature refresh on the next request.
         context.invalidate_instructions()
         return output
+    except ProblemException:
+        raise
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         if process is not None:
             _cleanup_process(process, started_readers, deadline)

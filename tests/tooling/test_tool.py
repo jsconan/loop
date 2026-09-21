@@ -64,7 +64,7 @@ def test_tool_returns_the_original_function_with_pure_defaults():
 def test_plan_rejects_operations_outside_the_declared_action_bound():
     """A planner cannot silently expand the authority declared by its tool."""
 
-    def planner(arguments):
+    def planner(arguments, _context):
         return OperationPlan(
             arguments=arguments,
             operations=(

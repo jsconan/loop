@@ -19,7 +19,13 @@ from ..models import (
     ToolResultPresentationDeclaration,
     ToolResultPresentationSpec,
 )
-from ..permissions import Action, OperationPlan, OperationPlanner, Operations
+from ..permissions import (
+    Action,
+    OperationPlan,
+    OperationPlanner,
+    OperationPlanningContext,
+    Operations,
+)
 from ..utils import callable_name
 from .context import ToolContext
 from .models import ToolPreflight
@@ -283,11 +289,17 @@ class Tool:
             )
         return validated.model_dump(), None
 
-    def plan(self, arguments: dict[str, Any]) -> OperationPlan:
+    def plan(
+        self,
+        arguments: dict[str, Any],
+        planning_context: OperationPlanningContext | None = None,
+    ) -> OperationPlan:
         """Return canonical execution arguments and the complete operation set.
 
         Args:
             arguments (dict[str, Any]): Validated tool arguments.
+            planning_context (OperationPlanningContext | None): Invocation-scoped filesystem
+                authority, or ``None`` when planning outside an instruction-managed runtime.
 
         Returns:
             OperationPlan: Canonical arguments and complete typed operations.
@@ -295,11 +307,11 @@ class Tool:
         Raises:
             ValueError: If a planner returns an undeclared action.
         """
-        plan = (
-            self.operation_planner(arguments)
-            if self.operation_planner is not None
-            else OperationPlan(arguments=arguments)
-        )
+        context = planning_context or OperationPlanningContext()
+        if self.operation_planner is None:
+            plan = OperationPlan(arguments=arguments)
+        else:
+            plan = self.operation_planner(arguments, context)
         return self.normalize_plan(plan)
 
     def normalize_plan(self, plan: OperationPlan) -> OperationPlan:

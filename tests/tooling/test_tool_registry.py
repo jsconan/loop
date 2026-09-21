@@ -3,6 +3,8 @@
 import asyncio
 import importlib
 import json
+import os
+import subprocess
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -44,7 +46,22 @@ from loop.tooling import (
 )
 from loop.tooling import tool as declare_tool
 
+pytestmark = pytest.mark.usefixtures("available_command_sandbox")
+
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
+
+
+def spawn_command_for_test(plan, *, popen_options):
+    """Run a planned command directly while testing registry routing."""
+    return subprocess.Popen(
+        list(plan.argv),
+        shell=False,
+        cwd=plan.cwd,
+        env=plan.environment,
+        start_new_session=os.name == "posix",
+        creationflags=0,
+        **popen_options,
+    )
 
 
 def result_value(output: str):
@@ -63,7 +80,7 @@ def passive_tool() -> str:
 def planner_for(action: Action):
     """Return a concrete operation planner for an authority-bearing test tool."""
 
-    def plan(arguments):
+    def plan(arguments, _context):
         target = (
             NetworkTarget(url="https://my-host.local", origin="https://my-host.local")
             if action is Action.NETWORK_REQUEST
@@ -865,7 +882,7 @@ def test_call_command_reports_unknown_tools_and_invalid_parameters():
     registry = ToolRegistry()
     register(registry)
 
-    def invalid_planner(_arguments):
+    def invalid_planner(_arguments, _context):
         """Reject planning to verify the user-command error boundary."""
         raise ValueError("invalid operation plan")
 
@@ -951,7 +968,7 @@ def test_sync_and_async_dispatch_report_operation_planning_failures():
         calls.append(True)
         return "unreachable"
 
-    def fail_plan(_arguments):
+    def fail_plan(_arguments, _context):
         raise ValueError("cannot canonicalize target")
 
     registry = ToolRegistry()
@@ -978,7 +995,7 @@ def test_sync_and_async_dispatch_report_operation_planning_failures():
 def test_all_dispatch_paths_normalize_expected_filesystem_planning_failures(failure):
     """Expected filesystem planning errors remain structured across every dispatcher."""
 
-    def fail_plan(_arguments):
+    def fail_plan(_arguments, _context):
         raise failure
 
     @declare_tool(operation_planner=fail_plan)
@@ -998,7 +1015,7 @@ def test_all_dispatch_paths_normalize_expected_filesystem_planning_failures(fail
 def test_command_dispatch_resolves_planning_continuations():
     """Direct command dispatch executes a phased planner before invoking its tool."""
 
-    def initial_plan(arguments):
+    def initial_plan(arguments, _context):
         return OperationPlan(
             arguments=arguments,
             continuation=lambda: OperationPlan(arguments={"number": 7}),
@@ -1023,7 +1040,7 @@ def test_all_dispatch_paths_preserve_structured_operation_planning_problems():
         operation="calculate",
     )
 
-    def fail_plan(_arguments):
+    def fail_plan(_arguments, _context):
         raise ProblemException(planning_problem)
 
     @declare_tool(actions={Action.SESSION_MUTATE}, operation_planner=fail_plan)
@@ -1108,6 +1125,7 @@ def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_meta
     path = tmp_path / "é notes.txt"
     path.write_text("useful content", encoding="utf-8")
     permissions = Mock(spec=PermissionManager)
+    permissions.effective_filesystem_roots = ((tmp_path,), (tmp_path,))
     permissions.check_boundaries.return_value = None
     permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
     registry = ToolRegistry([read_text_file], permission_manager=permissions)
@@ -1127,18 +1145,21 @@ def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_meta
     assert str(path) in str(permissions.authorize.call_args.args[0])
 
 
-def test_observed_file_scope_does_not_change_command_working_directory(tmp_path):
+def test_observed_file_scope_does_not_change_command_working_directory(tmp_path, monkeypatch):
     """A file observation cannot change the cwd used by a later process."""
     nested = tmp_path / "src" / "loop"
     nested.mkdir(parents=True)
+    (tmp_path / "scratch").mkdir()
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
     instructions.observe_path(nested, directory=True)
     permissions = Mock(spec=PermissionManager)
+    permissions.effective_filesystem_roots = ((tmp_path,), (tmp_path,))
     permissions.check_boundaries.return_value = None
     permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
     registry = ToolRegistry([run_command], permission_manager=permissions)
+    monkeypatch.setattr("loop.tools.system.spawn_sandboxed", spawn_command_for_test)
 
     output = registry.call(
         "run_command",
@@ -1150,8 +1171,9 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path)
     assert "cwd='" + str(tmp_path) + "'" in str(permissions.authorize.call_args.args[0])
 
 
-def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path):
+def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path, monkeypatch):
     """The workspace shorthand renders and executes as the workspace root."""
+    (tmp_path / "scratch").mkdir()
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
@@ -1161,10 +1183,11 @@ def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path):
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
     )
     registry = ToolRegistry([run_command], permission_manager=permissions)
+    monkeypatch.setattr("loop.tools.system.spawn_sandboxed", spawn_command_for_test)
 
     output = registry.call(
         "run_command",
