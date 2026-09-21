@@ -53,13 +53,10 @@ __all__ = [
     "local_now",
     "matches_digest",
     "normalized_key",
-    "parse_command_line",
     "payload_digest",
-    "read_bounded_stream",
     "read_bounded_text",
     "register_cached_metadata",
     "register_shutdown_signals",
-    "ripgrep_path",
     "safe_scalar",
     "search_text_paths",
     "sha256_digest",
@@ -117,9 +114,8 @@ from .path import (
     is_path_ignored,
     iter_visible_paths,
 )
-from .process import kill_process_group, parse_command_line, read_bounded_stream
 from .rotating_file import PrivateRotatingTextFile
-from .search import ripgrep_path, search_text_paths
+from .search import search_text_paths
 from .signals import ShutdownRequested, register_shutdown_signals
 from .text import (
     choice_items,

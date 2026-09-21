@@ -6,7 +6,7 @@ import json
 import logging
 from collections.abc import Callable, Iterable
 from time import perf_counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -40,6 +40,10 @@ from .models import (
 from .tool import Tool, ToolRegistration
 from .utils import serialize_tool_problem
 
+if TYPE_CHECKING:
+    from ..execution.command import SandboxCommandExecutor
+    from ..execution.host import HostExecutionBroker
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -57,6 +61,10 @@ class ToolRegistry:
             Defaults to an in-memory supervised policy manager.
         settings (ToolRuntimeSettings | None): Scoped settings supplied to context-aware tools, or
             ``None`` to use an independent default instance.
+        command_executor (SandboxCommandExecutor | None): Sandbox-only ordinary command service.
+        host_execution_broker (HostExecutionBroker | None): Separately authorized host-only
+            execution service.
+        cancellation (Callable[[], bool]): Predicate requesting cancellation of blocking tools.
     """
 
     _tools: dict[str, Tool]
@@ -64,6 +72,9 @@ class ToolRegistry:
     _permission_manager: PermissionManager
     _registration_problems: list[Problem]
     _settings: ToolRuntimeSettings
+    _command_executor: SandboxCommandExecutor | None
+    _host_execution_broker: HostExecutionBroker | None
+    _cancellation: Callable[[], bool]
 
     def __init__(
         self,
@@ -71,12 +82,18 @@ class ToolRegistry:
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
         settings: ToolRuntimeSettings | None = None,
+        command_executor: SandboxCommandExecutor | None = None,
+        host_execution_broker: HostExecutionBroker | None = None,
+        cancellation: Callable[[], bool] = lambda: False,
     ) -> None:
         self._tools = {}
         self._registration_problems = []
         self._interaction = interaction
         self._permission_manager = permission_manager or PermissionManager(interaction=interaction)
         self._settings = settings or ToolRuntimeSettings()
+        self._command_executor = command_executor
+        self._host_execution_broker = host_execution_broker
+        self._cancellation = cancellation
         for tool in tools or ():
             self.register(tool)
 
@@ -661,11 +678,7 @@ class ToolRegistry:
         resolved = {}
         for name, value in arguments.items():
             metadata = tool.arguments_model.model_fields[name].metadata
-            if "loop:workspace-cwd" in metadata and value == "workspace":
-                resolved[name] = instructions_manager.virtual_paths.resolve("/workspace")
-            elif "loop:virtual-command" in metadata:
-                resolved[name] = instructions_manager.virtual_paths.resolve_command(str(value))
-            elif "loop:virtual-path" in metadata:
+            if "loop:virtual-path" in metadata:
                 resolved[name] = instructions_manager.virtual_paths.resolve(str(value))
             else:
                 resolved[name] = value
@@ -773,6 +786,9 @@ class ToolRegistry:
                 authorize_additional if permission_manager is not None else None
             ),
             settings=self._settings,
+            command_executor=self._command_executor,
+            host_execution_broker=self._host_execution_broker,
+            cancellation=self._cancellation,
         )
 
 

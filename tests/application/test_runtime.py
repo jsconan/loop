@@ -10,6 +10,7 @@ import pytest
 import loop.application.runtime as runtime_module
 from loop.application import ApplicationPaths
 from loop.application.runtime import ApplicationRuntime
+from loop.application.secrets import ApplicationSecretAuthority
 from loop.configuration import ApplicationSettings
 from loop.telemetry import SQLiteTelemetryAdapter, Telemetry
 from loop.workspace import Workspace
@@ -38,6 +39,7 @@ def dependencies(monkeypatch):
         "SQLiteSessionStore",
         "SessionManager",
         "PermissionManager",
+        "create_command_executor",
     )
     result = {name: Mock(return_value=Mock()) for name in names}
     loop = Mock()
@@ -91,6 +93,11 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     tool_kwargs = dependencies["create_default_tool_registry"].call_args.kwargs
     assert tool_kwargs["settings"].user_agent == settings.web.user_agent
     assert tool_kwargs["settings"].command_timeout == settings.tools.command_timeout
+    assert tool_kwargs["permission_manager"] is dependencies["PermissionManager"].return_value
+    assert tool_kwargs["command_executor"] is dependencies["create_command_executor"].return_value
+    assert dependencies["create_command_executor"].call_args.kwargs["secret_authority"] is None
+    cancellation = tool_kwargs["cancellation"]
+    assert cancellation() is False
     assert loop_kwargs["working_directory"] is workspace.working_directory
     assert loop_kwargs["stream"] is settings.loop.stream
     assert loop_kwargs["temperature"] == 0.2
@@ -102,6 +109,7 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
 
     runtime.run()
     runtime.stop()
+    assert cancellation() is True
     runtime.close()
 
     dependencies["Loop"].create_default.return_value.run.assert_called_once_with()
@@ -112,6 +120,33 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
         ]
     )
     dependencies["set_telemetry"].assert_called_with(None)
+
+
+def test_create_owns_and_closes_explicit_command_secrets(
+    dependencies, assembled, monkeypatch
+) -> None:
+    """Copy trusted secret bindings into runtime-owned memory and erase them at shutdown."""
+    workspace, paths, workspace_paths, settings = assembled
+    authority = Mock(spec=ApplicationSecretAuthority)
+    constructor = Mock(return_value=authority)
+    monkeypatch.setattr(runtime_module, "ApplicationSecretAuthority", constructor)
+    material = {("token", "api.example"): b"sensitive"}
+
+    runtime = ApplicationRuntime.create(
+        workspace,
+        paths,
+        workspace_paths,
+        settings,
+        Mock(),
+        Mock(),
+        Mock(),
+        command_secrets=material,
+    )
+
+    constructor.assert_called_once_with(material)
+    assert dependencies["create_command_executor"].call_args.kwargs["secret_authority"] is authority
+    runtime.close()
+    authority.close.assert_called_once_with()
 
 
 def test_create_requires_identity_and_skips_environment_model_callback(dependencies, assembled):
@@ -362,7 +397,12 @@ def test_publication_follows_complete_command_registration(dependencies, assembl
         workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
     )
 
-    assert [name for name, _value in events] == ["register", "register", "register", "publish"]
+    assert [name for name, _value in events] == [
+        "register",
+        "register",
+        "register",
+        "publish",
+    ]
     runtime.close()
 
 

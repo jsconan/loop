@@ -1,324 +1,499 @@
-"""Provide tools for interacting with the system."""
+"""Provide sandboxed command execution tools."""
 
-import logging
-import os
-import subprocess
-import threading
-import time
-from collections.abc import Callable
+from __future__ import annotations
+
 from typing import Annotated
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 
-from .. import constants
-from ..errors import Problem, log_problem
-from ..permissions import Action, Operation, OperationPlan, ProcessBoundary, ProcessTarget
-from ..tooling import ToolContext, tool
-from ..utils import (
-    encode_content_cursor,
-    kill_process_group,
-    parse_command_line,
-    read_bounded_stream,
-    store_content,
+from ..errors import Problem
+from ..execution.contracts import (
+    HostExecutionRequest,
+    JobHandle,
+    JobOperation,
+    NetworkConnectionLease,
+    NetworkListenerLease,
+    SecretExposure,
+    TerminalMode,
 )
-
-_LOGGER = logging.getLogger(__name__)
-_CLEANUP_RESERVE_SECONDS = 0.1
-_PROCESS_POLL_SECONDS = 0.01
-
-
-def _remaining(deadline: float) -> float:
-    """Return the non-negative time remaining before a monotonic deadline."""
-    return max(0.0, deadline - time.monotonic())
-
-
-def _read_stream(
-    stream,
-    chunks: list[str],
-    errors: list[Exception | None],
-    index: int,
-    changed: threading.Event,
-    discarded: list[int | None],
-) -> None:
-    """Capture a bounded stream and retain a reader failure for the calling thread."""
-    try:
-        discarded[index] = read_bounded_stream(stream, chunks, constants.MAX_OUTPUT_CHARS)
-    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-        errors[index] = exc
-    finally:
-        changed.set()
-
-
-def _join_readers(readers: list[threading.Thread], deadline: float) -> bool:
-    """Join readers against one deadline and report whether every reader completed."""
-    for reader in readers:
-        reader.join(_remaining(deadline))
-    return all(not reader.is_alive() for reader in readers)
-
-
-def _close_process_streams(process: subprocess.Popen[str]) -> None:
-    """Close parent-owned process pipe endpoints."""
-    for stream in (process.stdout, process.stderr):
-        if stream is not None:
-            stream.close()
-
-
-def _interrupt_process_streams(process: subprocess.Popen[str]) -> None:
-    """Close pipe descriptors without waiting for locks held by blocked text readers."""
-    for stream in (process.stdout, process.stderr):
-        try:
-            os.close(stream.fileno())  # type: ignore[union-attr]
-        except (OSError, TypeError, ValueError):
-            pass
-
-
-def _wait_for_process(
-    process: subprocess.Popen[str],
-    changed: threading.Event,
-    errors: list[Exception | None],
-    deadline: float,
-) -> int:
-    """Wait for process exit while surfacing reader failures before the deadline."""
-    while True:
-        if reader_error := next((error for error in errors if error is not None), None):
-            raise reader_error
-        try:
-            return process.wait(timeout=min(_PROCESS_POLL_SECONDS, _remaining(deadline)))
-        except subprocess.TimeoutExpired:
-            if _remaining(deadline) == 0:
-                raise
-            changed.clear()
-            changed.wait(min(_PROCESS_POLL_SECONDS, _remaining(deadline)))
-
-
-def _cleanup_process(
-    process: subprocess.Popen[str],
-    readers: list[threading.Thread],
-    deadline: float,
-) -> None:
-    """Kill owned processes, reap the child, and finish readers within the deadline."""
-    kill_process_group(process)
-    remaining = _remaining(deadline)
-    reap_deadline = time.monotonic() + remaining / 3
-    try:
-        process.wait(timeout=_remaining(reap_deadline))
-    except subprocess.TimeoutExpired:
-        pass
-    reader_deadline = time.monotonic() + _remaining(deadline) / 2
-    if _join_readers(readers, reader_deadline):
-        _close_process_streams(process)
-        return
-    _interrupt_process_streams(process)
-    _join_readers(readers, deadline)
-
-
-def _timeout_error(timeout: float, output: dict) -> Problem:
-    """Return a standardized timeout error problem."""
-    return Problem(
-        code="process.timeout",
-        title="Command timed out",
-        detail=(f"Command did not complete within {timeout} seconds."),
-        retryable=True,
-        operation="run_command",
-        metadata=output,
-    )
-
-
-def _stream_output(
-    chunks: list[str],
-    discarded: int | None,
-    source: str,
-    redactor: Callable[[str], str] | None = None,
-) -> dict:
-    """Return a recoverable preview and explicit capture-loss status for one stream."""
-    content = "".join(chunks)
-    if redactor is not None:
-        content = redactor(content)
-    encoded = content.encode("utf-8")
-    preview = encoded[: constants.MAX_TOOL_CONTENT_BYTES // 2].decode("utf-8", errors="ignore")
-    included = len(preview.encode("utf-8"))
-    result = {
-        "content": preview,
-        "captured_bytes": len(encoded),
-        "included_bytes": included,
-        "truncated": included < len(encoded) or discarded != 0,
-        "capture_complete": discarded == 0,
-        "discarded_characters": discarded,
-    }
-    if included < len(encoded):
-        handle = store_content(encoded, source)
-        result.update(
-            handle=handle,
-            next_cursor=encode_content_cursor(handle, included),
-            continuation="Use read_cached_content with this handle and cursor.",
-        )
-    return result
-
-
-def _process_output(
-    returncode: int | None,
-    chunks: list[list[str]],
-    discarded: list,
-    redactor: Callable[[str], str] | None = None,
-) -> dict:
-    """Preserve exit status and both streams without hiding incomplete capture."""
-    return {
-        "exit_code": returncode,
-        "stdout": _stream_output(chunks[0], discarded[0], "command stdout", redactor),
-        "stderr": _stream_output(chunks[1], discarded[1], "command stderr", redactor),
-    }
+from ..execution.host.models import (
+    HostCompleted,
+    HostPermissionDenialReason,
+    HostPermissionDenied,
+)
+from ..execution.results import Completed, TimedOut
+from ..execution.sandbox.oci.control import OciSignal
+from ..permissions import OperationPlan
+from ..tooling import ToolContext, tool
 
 
 def _command_plan(arguments: dict[str, object]) -> OperationPlan:
-    """Plan an exact shell-free process invocation."""
-    argv = parse_command_line(str(arguments["command"]))
-    cwd = str(arguments["cwd"])
-    normalized = dict(arguments)
-    normalized.update({"cwd": cwd})
-    return OperationPlan(
-        arguments=normalized,
-        operations=(
-            Operation(
-                tool_id="",
-                action=Action.PROCESS_EXECUTE,
-                target=ProcessTarget(argv=argv, cwd=cwd, boundary=ProcessBoundary.HOST),
-            ),
-        ),
+    """Normalize opaque shell source without claiming host-process authority."""
+    return OperationPlan(arguments=dict(arguments))
+
+
+def _host_command_plan(arguments: dict[str, object]) -> OperationPlan:
+    """Keep explicit host authorization inside the dedicated host broker."""
+    return OperationPlan(arguments=dict(arguments))
+
+
+def _job_handle(job_id: str, token: str) -> JobHandle:
+    """Validate an opaque durable handle at the public tool boundary."""
+    return JobHandle(job_id=job_id, token=token)
+
+
+def _job_problem(error: Exception, operation: str) -> Problem:
+    """Return a sanitized durable lifecycle failure."""
+    return Problem(
+        code="process.durable_job_failed",
+        title="Durable job operation failed",
+        detail=f"{operation} could not complete safely: {type(error).__name__}.",
+        operation=operation,
     )
 
 
-@tool(
-    actions={Action.PROCESS_EXECUTE},
-    operation_planner=_command_plan,
-)
+def _stream_output(content: bytes, truncated: bool) -> dict[str, object]:
+    """Return one bounded UTF-8 stream using the established result shape."""
+    text = content.decode("utf-8", errors="replace")
+    return {
+        "content": text,
+        "captured_bytes": len(content),
+        "included_bytes": len(content),
+        "truncated": truncated,
+        "capture_complete": not truncated,
+        "discarded_characters": None if truncated else 0,
+    }
+
+
+def _output(result) -> dict[str, object]:
+    """Return model-safe bounded output from a closed sandbox result."""
+    return {
+        "exit_code": getattr(result, "exit_code", None),
+        "stdout": _stream_output(result.stdout, result.stdout_truncated),
+        "stderr": _stream_output(result.stderr, result.stderr_truncated),
+    }
+
+
+def _host_denial_detail(result: HostPermissionDenied) -> str:
+    """Return actionable feedback for one safe explicit-host denial category."""
+    if result.reason is HostPermissionDenialReason.HOST_PROCESSES_DISABLED:
+        return (
+            "This operation requires direct Host execution, but host processes are disabled. "
+            "Enable the workspace option with `/permissions limit set workspace host-process "
+            "allow`, then retry."
+        )
+    if result.reason is HostPermissionDenialReason.USER_DENIED:
+        return "The explicit Host execution request was not approved."
+    if result.reason is HostPermissionDenialReason.APPROVAL_UNAVAILABLE:
+        return "Direct Host execution requires approval, but no interactive user is available."
+    return "Direct Host execution is not authorized by the current permission policy."
+
+
+@tool(operation_planner=_command_plan)
 def run_command(
     context: ToolContext,
     command: Annotated[
         str,
-        "loop:virtual-command",
         Field(
-            description="Executable followed by its arguments. "
-            "This is a restricted command line, not a shell: quote or escape shell "
-            "characters when they are literal argument data.",
+            description=(
+                "POSIX shell source executed only inside the managed sandbox. Ordinary developer "
+                "tools and language toolchains use the managed sandbox image; never substitute "
+                "Host execution for a missing sandbox command."
+            ),
             min_length=1,
         ),
     ],
     cwd: Annotated[
         str,
-        "loop:virtual-path",
-        "loop:workspace-cwd",
         Field(
-            description="Working directory for the process. Use '/workspace' for the workspace "
-            "root; 'workspace' is accepted as a workspace-root shorthand."
+            description="Absolute virtual working directory. Use '/workspace' for the root.",
+            min_length=1,
         ),
-    ] = ".",
+    ] = "/workspace",
+    pty: Annotated[
+        bool,
+        Field(description="Allocate one merged pseudo-terminal for interactive programs."),
+    ] = False,
+    terminal_columns: Annotated[int, Field(ge=1, le=16384)] = 80,
+    terminal_rows: Annotated[int, Field(ge=1, le=16384)] = 24,
+    network_connections: Annotated[
+        tuple[NetworkConnectionLease, ...],
+        Field(
+            description=(
+                "Explicit pre-resolved outbound destinations. Omit for an offline command."
+            )
+        ),
+    ] = (),
+    network_listeners: Annotated[
+        tuple[NetworkListenerLease, ...],
+        Field(description="Explicit inbound TCP ports to publish through the broker."),
+    ] = (),
+    secret_exposures: Annotated[
+        tuple[SecretExposure, ...],
+        Field(
+            description=(
+                "Explicit audience-bound credential injection or warned raw env/file exposure."
+            )
+        ),
+    ] = (),
+    stdin: Annotated[
+        str,
+        Field(
+            description="Bounded UTF-8 input delivered to the command before EOF.", max_length=65536
+        ),
+    ] = "",
 ) -> dict | Problem:
-    """Run a shell-free process and return exit status and recoverable stdout/stderr previews."""
-    process = None
-    started_readers = []
-    timeout = context.settings.command_timeout
-    deadline = time.monotonic() + timeout
-    cleanup_reserve = min(_CLEANUP_RESERVE_SECONDS, timeout / 2)
-    execution_deadline = deadline - cleanup_reserve
-    output_redactor = None
-    try:
-        operation = context.operations[0] if context.operations else None
-        target = operation.target if operation is not None else None
-        if not isinstance(target, ProcessTarget):
-            raise TypeError("Authorized process target is missing.")
-        command_argv = list(target.argv)
-        command_cwd = os.path.realpath(target.cwd)
-        command_environment = {
-            name: value
-            for name in ("PATH", "SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
-            if (value := os.environ.get(name)) is not None
-        }
-        if context.instructions_manager is not None:
-            output_redactor = context.instructions_manager.virtual_paths.redact
-        process = subprocess.Popen(  # pylint: disable=consider-using-with
-            command_argv,
-            shell=False,
-            cwd=command_cwd,
-            env=command_environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=os.name == "posix",
-            creationflags=(
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
-            ),
-        )
-        if process.stdout is None or process.stderr is None:
-            raise RuntimeError("Command process did not expose its output streams.")
-        stdout_chunks = []
-        stderr_chunks = []
-        reader_errors = [None, None]
-        reader_changed = threading.Event()
-        discarded = [None, None]
-        readers = [
-            threading.Thread(
-                target=_read_stream,
-                args=(process.stdout, stdout_chunks, reader_errors, 0, reader_changed, discarded),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=_read_stream,
-                args=(process.stderr, stderr_chunks, reader_errors, 1, reader_changed, discarded),
-                daemon=True,
-            ),
-        ]
-        for reader in readers:
-            reader.start()
-            started_readers.append(reader)
-
-        try:
-            returncode = _wait_for_process(
-                process, reader_changed, reader_errors, execution_deadline
-            )
-        except subprocess.TimeoutExpired:
-            _cleanup_process(process, started_readers, deadline)
-            return _timeout_error(
-                timeout,
-                _process_output(None, [stdout_chunks, stderr_chunks], discarded, output_redactor),
-            )
-        if not _join_readers(started_readers, execution_deadline):
-            _cleanup_process(process, started_readers, deadline)
-            return _timeout_error(
-                timeout,
-                _process_output(
-                    returncode, [stdout_chunks, stderr_chunks], discarded, output_redactor
-                ),
-            )
-        if reader_error := next((error for error in reader_errors if error is not None), None):
-            raise reader_error
-
-        _close_process_streams(process)
-        output = _process_output(
-            returncode, [stdout_chunks, stderr_chunks], discarded, output_redactor
-        )
-        if returncode != 0:
-            return Problem(
-                code="process.nonzero_exit",
-                title="Command failed",
-                detail=f"Command exited with code {returncode}.",
-                operation="run_command",
-                metadata=output,
-            )
-        # Commands may create, remove, or edit instruction files. Their exact effects are
-        # intentionally not inferred from arbitrary command text; a successful command
-        # therefore triggers a bounded signature refresh on the next request.
-        context.invalidate_instructions()
-        return output
-    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
-        if process is not None:
-            _cleanup_process(process, started_readers, deadline)
-        problem = Problem.from_exception(
-            exc,
-            code="process.execution_failed",
-            title="Could not run command",
+    """Run POSIX shell source in the managed sandbox and return bounded output."""
+    if context.command_executor is None:
+        return Problem(
+            code="process.sandbox_unavailable",
+            title="Sandbox unavailable",
+            detail="Managed command execution is not configured.",
             operation="run_command",
         )
-        log_problem(_LOGGER, problem, exc)
-        return problem
+    if not cwd.startswith("/") or "/../" in f"{cwd}/" or "//" in cwd:
+        return Problem(
+            code="process.invalid_virtual_cwd",
+            title="Invalid working directory",
+            detail="Command working directory must be a normalized absolute virtual path.",
+            operation="run_command",
+        )
+    try:
+        network_connections = tuple(
+            value
+            if isinstance(value, NetworkConnectionLease)
+            else NetworkConnectionLease.model_validate(value)
+            for value in network_connections
+        )
+        network_listeners = tuple(
+            value
+            if isinstance(value, NetworkListenerLease)
+            else NetworkListenerLease.model_validate(value)
+            for value in network_listeners
+        )
+        secret_exposures = tuple(
+            value if isinstance(value, SecretExposure) else SecretExposure.model_validate(value)
+            for value in secret_exposures
+        )
+    except (TypeError, ValidationError, ValueError):
+        return Problem(
+            code="process.invalid_effect_lease",
+            title="Invalid effect lease",
+            detail="Network and secret effects require exact structured leases.",
+            operation="run_command",
+        )
+    options = {
+        "request_id": context.call_id,
+        "terminal": TerminalMode.PTY if pty else TerminalMode.PIPE,
+        "terminal_columns": terminal_columns if pty else None,
+        "terminal_rows": terminal_rows if pty else None,
+    }
+    if stdin:
+        options["stdin"] = stdin.encode()
+    if network_connections or network_listeners or secret_exposures:
+        options.update(
+            network_connections=network_connections,
+            network_listeners=network_listeners,
+            secret_exposures=secret_exposures,
+        )
+    result = context.command_executor.execute(
+        command,
+        cwd,
+        context.settings.command_timeout,
+        cancellation=context.cancellation,
+        **options,
+    )
+    output = _output(result)
+    if isinstance(result, Completed):
+        if result.exit_code == 0:
+            context.invalidate_instructions()
+            return output
+        return Problem(
+            code="process.nonzero_exit",
+            title="Command failed",
+            detail=f"Command exited with code {result.exit_code}.",
+            operation="run_command",
+            metadata=output,
+        )
+    if isinstance(result, TimedOut):
+        return Problem(
+            code="process.timeout",
+            title="Command timed out",
+            detail=(f"Command did not complete within {context.settings.command_timeout} seconds."),
+            retryable=True,
+            operation="run_command",
+            metadata=output,
+        )
+    return Problem(
+        code=f"process.{result.kind}",
+        title="Command could not complete",
+        detail="Managed sandbox execution stopped safely.",
+        operation="run_command",
+        metadata={**output, "diagnostic_id": result.diagnostic_id},
+    )
+
+
+@tool(operation_planner=_host_command_plan)
+def run_host_command(
+    context: ToolContext,
+    executable: Annotated[
+        str,
+        Field(
+            description=(
+                "Absolute host executable requested through the explicit Host flow, for example "
+                "'/usr/bin/git'."
+            )
+        ),
+    ],
+    arguments: Annotated[
+        tuple[str, ...],
+        Field(description="Exact host arguments excluding the executable itself."),
+    ] = (),
+    cwd: Annotated[
+        str,
+        Field(
+            description=(
+                "Absolute authenticated host working directory. Use '/workspace' for the active "
+                "project or '/workspace/path' for one of its subdirectories."
+            )
+        ),
+    ] = "/",
+    display_cwd: Annotated[
+        str,
+        Field(description="Sanitized working-directory label shown in the Host warning."),
+    ] = "host filesystem",
+    reason: Annotated[
+        str,
+        Field(description="Why the managed sandbox cannot satisfy this operation."),
+    ] = "This operation requires an explicitly approved host resource.",
+    resource_class: Annotated[
+        str,
+        Field(description="Bounded host resource category shown during approval."),
+    ] = "host process",
+) -> dict | Problem:
+    """Run an explicit host request after a separate warning, lease, and audit."""
+    broker = context.host_execution_broker
+    if broker is None:
+        return Problem(
+            code="host.unavailable",
+            title="Host execution unavailable",
+            detail="Explicit host execution is not configured.",
+            operation="run_host_command",
+        )
+    try:
+        request = HostExecutionRequest(
+            request_id=context.call_id or "host-request",
+            executable=executable,
+            argv=(executable, *arguments),
+            cwd=cwd,
+            display_cwd=display_cwd,
+            resource_class=resource_class,
+            reason=reason,
+            deadline_seconds=context.settings.command_timeout,
+        )
+    except ValidationError:
+        return Problem(
+            code="host.invalid_request",
+            title="Invalid host request",
+            detail="Explicit host request fields are invalid or ambiguous.",
+            operation="run_host_command",
+        )
+    result = broker.execute(request, context.cancellation)
+    output = _output(result)
+    if isinstance(result, HostCompleted):
+        if result.exit_code == 0:
+            context.invalidate_instructions()
+            return output
+        return Problem(
+            code="host.nonzero_exit",
+            title="Host command failed",
+            detail=f"Host command exited with code {result.exit_code}.",
+            operation="run_host_command",
+            metadata=output,
+        )
+    if isinstance(result, HostPermissionDenied):
+        return Problem(
+            code=result.kind,
+            title="Host execution not authorized",
+            detail=_host_denial_detail(result),
+            operation="run_host_command",
+            metadata=output,
+        )
+    return Problem(
+        code=result.kind,
+        title="Host command could not complete",
+        detail="The separately authorized Host operation stopped safely.",
+        operation="run_host_command",
+        metadata=output,
+    )
+
+
+@tool(operation_planner=_command_plan)
+def start_command_job(
+    context: ToolContext,
+    command: Annotated[str, Field(min_length=1, description="Opaque POSIX shell source.")],
+    cwd: Annotated[
+        str, Field(description="Normalized absolute virtual working directory.")
+    ] = "/workspace",
+    terminal_columns: Annotated[int, Field(ge=1, le=16384)] = 80,
+    terminal_rows: Annotated[int, Field(ge=1, le=16384)] = 24,
+) -> dict | Problem:
+    """Start an explicitly durable managed PTY job."""
+    executor = context.command_executor
+    if executor is None:
+        return Problem(
+            code="process.sandbox_unavailable",
+            title="Sandbox unavailable",
+            detail="Managed durable jobs are not configured.",
+            operation="start_command_job",
+        )
+    try:
+        result = executor.start_job(
+            command,
+            cwd,
+            context.settings.command_timeout,
+            request_id=context.call_id,
+            terminal_columns=terminal_columns,
+            terminal_rows=terminal_rows,
+        )
+    except Exception as error:  # noqa: BLE001 - platform details remain private.
+        return _job_problem(error, "start_command_job")
+    if isinstance(result, JobHandle):
+        return result.model_dump(mode="json")
+    return Problem(
+        code=f"process.{result.kind}",
+        title="Durable job could not start",
+        detail="The managed sandbox refused the durable start safely.",
+        operation="start_command_job",
+    )
+
+
+def _job_operation(context: ToolContext, job_id: str, token: str, operation: JobOperation):
+    """Return a manager, authenticated handle, and fresh operation lease."""
+    executor = context.command_executor
+    if executor is None:
+        raise RuntimeError("Managed durable jobs are unavailable.")
+    handle = _job_handle(job_id, token)
+    return (
+        executor.job_manager(),
+        handle,
+        executor.job_lease(operation, context.settings.command_timeout),
+    )
+
+
+@tool(operation_planner=_command_plan)
+def command_job_status(context: ToolContext, job_id: str, token: str) -> dict | Problem:
+    """Return one authenticated durable job status."""
+    try:
+        manager, handle, lease = _job_operation(context, job_id, token, JobOperation.STATUS)
+        return manager.status(handle, lease).model_dump(mode="json")
+    except Exception as error:  # noqa: BLE001 - public lifecycle stays sanitized.
+        return _job_problem(error, "command_job_status")
+
+
+@tool(operation_planner=_command_plan)
+def attach_command_job(context: ToolContext, job_id: str, token: str) -> dict | Problem:
+    """Attach to one authenticated running durable job."""
+    try:
+        manager, handle, lease = _job_operation(context, job_id, token, JobOperation.ATTACH)
+        manager.attach(handle, lease, deadline_seconds=context.settings.command_timeout)
+        return {"attached": True}
+    except Exception as error:  # noqa: BLE001 - public lifecycle stays sanitized.
+        return _job_problem(error, "attach_command_job")
+
+
+@tool(operation_planner=_command_plan)
+def read_command_job(
+    context: ToolContext,
+    job_id: str,
+    token: str,
+    timeout_seconds: Annotated[float, Field(ge=0, le=5)] = 0,
+) -> dict | Problem:
+    """Read one bounded frame from an authenticated durable attachment."""
+    try:
+        manager, handle, lease = _job_operation(context, job_id, token, JobOperation.ATTACH)
+        frame = manager.read(handle, lease, timeout_seconds)
+        if frame is None:
+            return {"frame": None}
+        return {"frame": {"stream": frame.stream, "data": _stream_output(frame.data, False)}}
+    except Exception as error:  # noqa: BLE001 - public lifecycle stays sanitized.
+        return _job_problem(error, "read_command_job")
+
+
+@tool(operation_planner=_command_plan)
+def write_command_job(
+    context: ToolContext,
+    job_id: str,
+    token: str,
+    data: Annotated[str, Field(max_length=65536)] = "",
+    eof: bool = False,
+) -> dict | Problem:
+    """Write bounded UTF-8 input or EOF to an authenticated durable attachment."""
+    try:
+        manager, handle, lease = _job_operation(context, job_id, token, JobOperation.STDIN)
+        if data:
+            manager.write(handle, lease, data.encode())
+        if eof:
+            manager.close_stdin(handle, lease)
+        return {"accepted_bytes": len(data.encode()), "eof": eof}
+    except Exception as error:  # noqa: BLE001 - public lifecycle stays sanitized.
+        return _job_problem(error, "write_command_job")
+
+
+@tool(operation_planner=_command_plan)
+def resize_command_job(
+    context: ToolContext,
+    job_id: str,
+    token: str,
+    columns: Annotated[int, Field(ge=1, le=16384)],
+    rows: Annotated[int, Field(ge=1, le=16384)],
+) -> dict | Problem:
+    """Resize an authenticated durable PTY attachment."""
+    try:
+        manager, handle, lease = _job_operation(context, job_id, token, JobOperation.RESIZE)
+        manager.resize(handle, lease, columns, rows)
+        return {"columns": columns, "rows": rows}
+    except Exception as error:  # noqa: BLE001 - public lifecycle stays sanitized.
+        return _job_problem(error, "resize_command_job")
+
+
+@tool(operation_planner=_command_plan)
+def signal_command_job(
+    context: ToolContext,
+    job_id: str,
+    token: str,
+    signal: Annotated[str, Field(pattern="^(INT|TERM|HUP)$")],
+) -> dict | Problem:
+    """Deliver one reviewed signal to an authenticated durable job."""
+    signals = {
+        "INT": OciSignal.INTERRUPT,
+        "TERM": OciSignal.TERMINATE,
+        "HUP": OciSignal.HANGUP,
+    }
+    try:
+        manager, handle, lease = _job_operation(context, job_id, token, JobOperation.SIGNAL)
+        manager.signal(handle, lease, signals[signal])
+        return {"signal": signal}
+    except Exception as error:  # noqa: BLE001 - public lifecycle stays sanitized.
+        return _job_problem(error, "signal_command_job")
+
+
+@tool(operation_planner=_command_plan)
+def detach_command_job(context: ToolContext, job_id: str, token: str) -> dict | Problem:
+    """Detach management I/O without stopping an authenticated durable job."""
+    try:
+        manager, handle, lease = _job_operation(context, job_id, token, JobOperation.ATTACH)
+        manager.detach(handle, lease)
+        return {"detached": True}
+    except Exception as error:  # noqa: BLE001 - public lifecycle stays sanitized.
+        return _job_problem(error, "detach_command_job")
+
+
+@tool(operation_planner=_command_plan)
+def cancel_command_job(context: ToolContext, job_id: str, token: str) -> dict | Problem:
+    """Cancel, reap, and finalize an authenticated durable job."""
+    try:
+        manager, handle, lease = _job_operation(context, job_id, token, JobOperation.CANCEL)
+        return manager.cancel(handle, lease).model_dump(mode="json")
+    except Exception as error:  # noqa: BLE001 - public lifecycle stays sanitized.
+        return _job_problem(error, "cancel_command_job")

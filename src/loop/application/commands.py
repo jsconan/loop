@@ -11,6 +11,7 @@ from pydantic import Field
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
 from ..completion import CommandCompletion, CompletionValue
+from ..execution.command import SandboxCommandExecutor
 from ..permissions import SQLitePermissionAudit
 from .paths import ApplicationPaths, WorkspacePaths
 
@@ -22,27 +23,31 @@ class ApplicationCommands:
         paths (ApplicationPaths): Immutable global application paths.
         workspace_paths (WorkspacePaths): Immutable active-workspace storage paths.
         workspace_id (str): Active initialized workspace identifier.
+        command_executor (SandboxCommandExecutor | None): Managed sandbox lifecycle facade.
     """
 
     _paths: ApplicationPaths
     _workspace_paths: WorkspacePaths
     _workspace_id: str
+    _command_executor: SandboxCommandExecutor | None
 
     def __init__(
         self,
         paths: ApplicationPaths,
         workspace_paths: WorkspacePaths,
         workspace_id: str,
+        command_executor: SandboxCommandExecutor | None = None,
     ) -> None:
         self._paths = paths
         self._workspace_paths = workspace_paths
         self._workspace_id = workspace_id
+        self._command_executor = command_executor
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
-        """Return the application command registration.
+        """Return the application command registrations.
 
         Returns:
-            tuple[CommandRegistration, ...]: The ``/app`` command.
+            tuple[CommandRegistration, ...]: The ``/app`` and ``/sandbox`` commands.
         """
         return (
             CommandRegistration(
@@ -61,7 +66,63 @@ class ApplicationCommands:
                     },
                 ),
             ),
+            CommandRegistration(
+                self.sandbox,
+                name="sandbox",
+                completion=CommandCompletion(
+                    values=(
+                        CompletionValue("status", "Show the active workspace sandbox status."),
+                        CompletionValue("list", "List active-workspace sandboxes."),
+                        CompletionValue("stop", "Stop the active workspace sandbox."),
+                        CompletionValue(
+                            "delete", "Delete the sandbox VM, disk, images, and containers."
+                        ),
+                    ),
+                    children={
+                        "status": CommandCompletion(),
+                        "list": CommandCompletion(),
+                        "stop": CommandCompletion(),
+                        "delete": CommandCompletion(),
+                    },
+                ),
+            ),
         )
+
+    def sandbox(
+        self,
+        context: CommandContext,
+        action: Annotated[
+            Literal["status", "list", "stop", "delete"],
+            Field(description="Sandbox inspection or cleanup operation."),
+        ] = "status",
+    ) -> None:
+        """Inspect, stop, or delete the active workspace's managed sandbox."""
+        if self._command_executor is None:
+            raise CommandArgumentError("Managed sandbox execution is unavailable.")
+        try:
+            if action == "status":
+                status = self._command_executor.sandbox_status()
+                if status is None:
+                    context.interaction.info("No managed sandbox exists for this workspace.")
+                else:
+                    context.interaction.info(f"Managed sandbox {status[0]} is {status[1].lower()}.")
+                return
+            if action == "list":
+                records = self._command_executor.list_sandboxes()
+                context.interaction.table(
+                    ({"instance": name, "state": state.lower()} for name, state in records),
+                    title="Managed sandboxes for this workspace:",
+                    columns=("instance", "state"),
+                )
+                return
+            existed = self._command_executor.manage_sandbox(delete=action == "delete")
+        except RuntimeError as error:
+            raise CommandArgumentError(str(error)) from error
+        if not existed:
+            context.interaction.info("No managed sandbox exists for this workspace.")
+            return
+        verb = "Deleted" if action == "delete" else "Stopped"
+        context.interaction.info(f"{verb} the managed sandbox for this workspace.")
 
     def app(
         self,

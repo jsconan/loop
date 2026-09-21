@@ -20,7 +20,6 @@ from loop import (
     ToolRegistry,
 )
 from loop.tooling import ToolContext
-from loop.tools import files as files_module
 from loop.tools.files import delete_path as delete_path_tool
 from loop.tools.files import edit_text_file as edit_text_file_tool
 from loop.tools.files import list_folder as list_folder_tool
@@ -47,7 +46,6 @@ def problem(output: str):
 def approve_tool_calls(monkeypatch, tmp_path):
     """Approve central permission prompts unless a case overrides the decision."""
     global tool_registry  # pylint: disable=global-statement
-    monkeypatch.setattr(files_module, "ripgrep_path", MagicMock(return_value="rg"))
     tool_registry = ToolRegistry(
         BUILTIN_TOOLS,
         permission_manager=PermissionManager(tmp_path),
@@ -551,7 +549,7 @@ def test_search_text_skips_binary_and_ignored_content(tmp_path, monkeypatch):
     assert tmp_path / "linked.txt" not in searched
 
 
-def test_search_text_reports_empty_missing_invalid_and_unavailable_searches(tmp_path, monkeypatch):
+def test_search_text_reports_empty_missing_invalid_and_failed_searches(tmp_path, monkeypatch):
     """Empty selections and distinct root, regex, and engine failures remain actionable."""
     (tmp_path / "empty.txt").touch()
     engine = MagicMock(return_value=([], False))
@@ -565,8 +563,8 @@ def test_search_text_reports_empty_missing_invalid_and_unavailable_searches(tmp_
         "filesystem.invalid_search_pattern"
     )
 
-    engine.side_effect = FileNotFoundError("rg missing")
-    assert problem(search_text(tmp_path, "text"))["code"] == "filesystem.search_unavailable"
+    engine.side_effect = OSError("read failed")
+    assert problem(search_text(tmp_path, "text"))["code"] == "filesystem.search_failed"
 
 
 def test_write_text_file_requires_confirmation_and_reports_success(tmp_path, monkeypatch):

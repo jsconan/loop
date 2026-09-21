@@ -12,6 +12,8 @@ from ..interaction import Interaction
 from .models import ToolRuntimeSettings
 
 if TYPE_CHECKING:
+    from ..execution.command import SandboxCommandExecutor
+    from ..execution.host import HostExecutionBroker
     from ..instructions import InstructionsManager
     from ..permissions import OperationPlan, Operations
 
@@ -35,6 +37,10 @@ class ToolContext:
         additional_authorizer (AdditionalAuthorizer | None): Registry-owned callback that plans
             and authorizes effects discovered during execution, or ``None`` when unavailable.
         settings (ToolRuntimeSettings): Scoped settings available to tool implementations.
+        command_executor (SandboxCommandExecutor | None): Sandbox-only ordinary command service.
+        host_execution_broker (HostExecutionBroker | None): Separately authorized host-only
+            execution service.
+        cancellation (Callable[[], bool]): Predicate requesting cancellation of blocking work.
     """
 
     interaction: Interaction | None
@@ -45,6 +51,9 @@ class ToolContext:
     call_id: str | None = None
     additional_authorizer: AdditionalAuthorizer | None = None
     settings: ToolRuntimeSettings = field(default_factory=ToolRuntimeSettings)
+    command_executor: SandboxCommandExecutor | None = None
+    host_execution_broker: HostExecutionBroker | None = None
+    cancellation: Callable[[], bool] = field(default=lambda: False, repr=False, compare=False)
 
     def observe_file(self, path: Path | str) -> None:
         """Report a successfully loaded file to instruction management.

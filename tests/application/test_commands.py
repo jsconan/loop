@@ -48,6 +48,78 @@ def test_dirs_prints_only_existing_global_and_workspace_paths(application):
     assert all(Path(row["path"]).exists() for row in rows if row["name"] != "Active workspace ID")
     assert interaction.table.call_args.kwargs["columns"] == ("name", "path")
     assert commands.get_commands()[0].name == "app"
+    assert commands.get_commands()[1].name == "sandbox"
+
+
+@pytest.mark.parametrize(
+    ("action", "delete", "message"),
+    [
+        ("stop", False, "Stopped"),
+        ("delete", True, "Deleted"),
+    ],
+)
+def test_sandbox_command_manages_workspace_runtime(application, action, delete, message) -> None:
+    """Sandbox management reports stop and complete deletion outcomes."""
+    _, paths = application
+    project = paths.configuration_root.parent / "managed-project"
+    project.mkdir()
+    workspace_paths = paths.for_workspace("workspace-id", project)
+    executor = Mock()
+    executor.manage_sandbox.return_value = True
+    commands = ApplicationCommands(paths, workspace_paths, "workspace-id", executor)
+    interaction = Mock()
+
+    commands.sandbox(CommandContext("sandbox", interaction), action)
+
+    executor.manage_sandbox.assert_called_once_with(delete=delete)
+    assert message in interaction.info.call_args.args[0]
+
+
+def test_sandbox_command_reports_absence_and_cleanup_failure(application) -> None:
+    """Sandbox management provides actionable absent and live-job outcomes."""
+    _, paths = application
+    project = paths.configuration_root.parent / "other-project"
+    project.mkdir()
+    workspace_paths = paths.for_workspace("workspace-id", project)
+    executor = Mock()
+    commands = ApplicationCommands(paths, workspace_paths, "workspace-id", executor)
+    context = CommandContext("sandbox", Mock())
+    executor.sandbox_status.return_value = None
+    commands.sandbox(context)
+    assert "No managed sandbox" in context.interaction.info.call_args.args[0]
+    executor.manage_sandbox.return_value = False
+    commands.sandbox(context, "stop")
+    assert "No managed sandbox" in context.interaction.info.call_args.args[0]
+    executor.manage_sandbox.side_effect = RuntimeError("Live durable jobs prevent cleanup.")
+    with pytest.raises(CommandArgumentError, match="Live durable jobs"):
+        commands.sandbox(context, "delete")
+
+    unavailable, _ = application
+    with pytest.raises(CommandArgumentError, match="unavailable"):
+        unavailable.sandbox(context)
+
+
+def test_sandbox_command_reports_status_and_inventory(application) -> None:
+    """Default status and list provide read-only workspace sandbox inspection."""
+    _, paths = application
+    project = paths.configuration_root.parent / "inventory-project"
+    project.mkdir()
+    workspace_paths = paths.for_workspace("workspace-id", project)
+    executor = Mock()
+    executor.sandbox_status.return_value = ("loop-one", "RUNNING")
+    executor.list_sandboxes.return_value = (("loop-one", "RUNNING"),)
+    commands = ApplicationCommands(paths, workspace_paths, "workspace-id", executor)
+    interaction = Mock()
+    context = CommandContext("sandbox", interaction)
+
+    commands.sandbox(context)
+    commands.sandbox(context, "list")
+
+    assert "loop-one is running" in interaction.info.call_args.args[0]
+    assert list(interaction.table.call_args.args[0]) == [
+        {"instance": "loop-one", "state": "running"}
+    ]
+    assert interaction.table.call_args.kwargs["columns"] == ("instance", "state")
 
 
 def test_logs_and_audit_export_create_files_and_filter_workspace(application, tmp_path):

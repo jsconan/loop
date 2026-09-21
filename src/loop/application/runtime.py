@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable, Mapping
 from types import TracebackType
 from typing import Self
 
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
+from ..execution.host import HostExecutionBroker
 from ..instructions import InstructionsManager
 from ..interaction import Interaction
 from ..loop import Loop
-from ..permissions import PermissionManager
+from ..permissions import HostExecutionPermissionAdapter, PermissionManager
 from ..session import SessionManager, SQLiteSessionStore
 from ..telemetry import (
     SQLiteTelemetryAdapter,
@@ -26,7 +28,9 @@ from ..tooling import ToolRuntimeSettings
 from ..tools import create_default_tool_registry
 from ..workspace import Workspace, WorkspaceCommands, WorkspaceRepository
 from .commands import ApplicationCommands
+from .execution import create_command_executor
 from .paths import ApplicationPaths, WorkspacePaths
+from .secrets import ApplicationSecretAuthority
 
 
 class ApplicationRuntime:
@@ -39,6 +43,7 @@ class ApplicationRuntime:
         logging_handler (logging.Handler | None): Owned process-global log handler.
         cleanup_callbacks (list[Callable[[], object]] | None): Acquired-resource cleanup actions in
             acquisition order. Defaults to telemetry and optional logging cleanup.
+        cancellation (threading.Event | None): Shared cancellation event for blocking tools.
     """
 
     _loop: Loop
@@ -47,6 +52,7 @@ class ApplicationRuntime:
     _logging_handler: logging.Handler | None
     _cleanup_callbacks: list[Callable[[], object]]
     _closed: bool
+    _cancellation: threading.Event
 
     def __init__(
         self,
@@ -56,11 +62,13 @@ class ApplicationRuntime:
         *,
         logging_handler: logging.Handler | None = None,
         cleanup_callbacks: list[Callable[[], object]] | None = None,
+        cancellation: threading.Event | None = None,
     ) -> None:
         self._loop = loop
         self._telemetry = telemetry
         self._shutdown_timeout = shutdown_timeout
         self._logging_handler = logging_handler
+        self._cancellation = cancellation or threading.Event()
         if cleanup_callbacks is None:
             self._cleanup_callbacks = [lambda: self._close_telemetry(telemetry, shutdown_timeout)]
             if logging_handler is not None:
@@ -81,6 +89,8 @@ class ApplicationRuntime:
         configuration: ConfigurationManager,
         workspace_repository: WorkspaceRepository,
         interaction: Interaction,
+        *,
+        command_secrets: Mapping[tuple[str, str], bytes] | None = None,
     ) -> ApplicationRuntime:
         """Build a runtime from initialized workspace and application-owned references.
 
@@ -92,6 +102,10 @@ class ApplicationRuntime:
             configuration (ConfigurationManager): Persistent configuration owner.
             workspace_repository (WorkspaceRepository): Owner of workspace registry operations.
             interaction (Interaction): User interaction service.
+            command_secrets (Mapping[tuple[str, str], bytes] | None): Optional trusted
+                application input containing exact ``(secret_id, audience)`` bindings. Values
+                are copied into application-owned mutable memory and erased during rollback or
+                shutdown. No environment or configuration fallback is used.
 
         Returns:
             ApplicationRuntime: Fully composed active runtime.
@@ -102,6 +116,7 @@ class ApplicationRuntime:
         if workspace.id is None:
             raise ValueError("Application runtime requires an initialized workspace.")
         cleanup_callbacks = []
+        cancellation = threading.Event()
         try:
             root_logger = logging.getLogger()
             previous_logging_level = root_logger.level
@@ -146,6 +161,11 @@ class ApplicationRuntime:
                 workspace_id=workspace.id,
             )
             cls._track_close(session_store, cleanup_callbacks)
+            session_manager = SessionManager(
+                interaction=interaction,
+                session_store=session_store,
+                workspace_id=workspace.id,
+            )
             permission_manager = PermissionManager(
                 workspace.root,
                 configuration_path=workspace_paths.permissions,
@@ -155,15 +175,46 @@ class ApplicationRuntime:
                 interaction=interaction,
             )
             cls._track_close(permission_manager, cleanup_callbacks)
+            secret_authority = (
+                ApplicationSecretAuthority(command_secrets) if command_secrets is not None else None
+            )
+            cls._track_close(secret_authority, cleanup_callbacks)
+            command_executor = create_command_executor(
+                workspace,
+                paths,
+                workspace_paths,
+                permission_manager,
+                lambda: session_manager.session.id,
+                progress=interaction.info,
+                secret_authority=secret_authority,
+            )
+            cls._track_close(command_executor, cleanup_callbacks)
+            host_execution_broker = HostExecutionBroker(
+                HostExecutionPermissionAdapter(
+                    permission_manager,
+                    "run_host_command",
+                    "loop",
+                    workspace.id,
+                    "2",
+                    lambda: session_manager.session.id,
+                ),
+                workspace.id,
+                "2",
+                workspace_root=workspace.root,
+            )
             loop = Loop.create_default(
                 backend,
                 interaction=interaction,
                 tool_registry=create_default_tool_registry(
                     interaction=interaction,
+                    permission_manager=permission_manager,
                     settings=ToolRuntimeSettings(
                         user_agent=settings.web.user_agent,
                         command_timeout=settings.tools.command_timeout,
                     ),
+                    command_executor=command_executor,
+                    host_execution_broker=host_execution_broker,
+                    cancellation=cancellation.is_set,
                 ),
                 working_directory=workspace.working_directory,
                 instructions_manager=InstructionsManager.discover(
@@ -172,11 +223,7 @@ class ApplicationRuntime:
                     workspace_root=workspace.root,
                 ),
                 permission_manager=permission_manager,
-                session_manager=SessionManager(
-                    interaction=interaction,
-                    session_store=session_store,
-                    workspace_id=workspace.id,
-                ),
+                session_manager=session_manager,
                 agent_name=settings.loop.agent_name,
                 model=settings.loop.model,
                 temperature=settings.loop.temperature,
@@ -198,6 +245,7 @@ class ApplicationRuntime:
                 settings.telemetry.shutdown_timeout,
                 logging_handler=logging_handler,
                 cleanup_callbacks=cleanup_callbacks,
+                cancellation=cancellation,
             )
             loop.command_manager.register_all(
                 ConfigurationCommands(
@@ -207,7 +255,12 @@ class ApplicationRuntime:
                 ).get_commands()
             )
             loop.command_manager.register_all(
-                ApplicationCommands(paths, workspace_paths, workspace.id).get_commands()
+                ApplicationCommands(
+                    paths,
+                    workspace_paths,
+                    workspace.id,
+                    command_executor,
+                ).get_commands()
             )
             loop.command_manager.register_all(
                 WorkspaceCommands(workspace, workspace_repository).get_commands()
@@ -303,6 +356,7 @@ class ApplicationRuntime:
 
     def stop(self) -> None:
         """Record an interrupted application shutdown."""
+        self._cancellation.set()
         telemetry_activity("application.stopping", severity="info", reason="interrupted")
 
     def close(self) -> None:
