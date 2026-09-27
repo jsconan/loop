@@ -22,9 +22,8 @@ class VirtualPath:
         skill_roots (Mapping[str, Path]): Skill resource directories represented below
             ``/skills/<name>``.
 
-    Virtual paths are a typed tool-interface protocol, not shell aliases. Callers resolve them
-    before a filesystem operation or a process ``cwd`` is planned. Command arguments remain opaque
-    and should use relative paths from the selected virtual working directory.
+    Virtual paths are resolved before filesystem operations and process launch. Literal roots in
+    model-authored shell source can be replaced with private shell-safe aliases.
     """
 
     WORKSPACE = "/workspace"
@@ -178,10 +177,13 @@ class VirtualPath:
         Returns:
             str: Text with configured local roots represented virtually.
         """
-        for prefix, root in sorted(
-            self._roots.items(), key=lambda pair: len(str(pair[1])), reverse=True
-        ):
-            value = value.replace(str(root), prefix)
+        roots = (
+            (str(local), virtual)
+            for virtual, root in self._roots.items()
+            for local in (root, root.resolve(strict=False))
+        )
+        for local, virtual in sorted(roots, key=lambda pair: len(pair[0]), reverse=True):
+            value = value.replace(local, virtual)
         return value
 
     def _resolve_command_argument(self, argument: str) -> str:

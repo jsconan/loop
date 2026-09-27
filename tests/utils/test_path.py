@@ -70,6 +70,17 @@ def test_virtual_paths_reconstruct_after_workspace_relocation(tmp_path):
     assert moved.resolve(virtual) == str(tmp_path / "new" / "notes.txt")
 
 
+def test_virtual_paths_redact_canonical_symlink_targets(tmp_path):
+    """Command output through a symlinked workspace cannot expose its canonical host root."""
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(actual, target_is_directory=True)
+    paths = VirtualPath(linked)
+
+    assert paths.redact(f"{actual}/file {linked}/file") == "/workspace/file /workspace/file"
+
+
 def test_virtual_shell_roots_translate_in_one_pass_without_reparsing(tmp_path):
     """Literal roots translate across quoting while path-like nonmatches stay intact."""
     paths = VirtualPath(
