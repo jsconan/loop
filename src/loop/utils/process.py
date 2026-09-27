@@ -1,5 +1,6 @@
 """Provide safe process invocation utilities."""
 
+import errno
 import os
 import signal
 import subprocess
@@ -13,6 +14,9 @@ class TextStream(Protocol):
 
     def read(self, size: int = -1) -> str:
         """Read at most ``size`` characters from the stream."""
+
+    def close(self) -> None:
+        """Release the stream wrapper after its reader exits."""
 
 
 _SHELL_SYNTAX = frozenset("|;&<>`()$")
@@ -84,24 +88,48 @@ def parse_command_line(command: str) -> tuple[str, ...]:  # pylint: disable=too-
     return tuple(argv)
 
 
-def read_bounded_stream(stream: TextStream, chunks: list[str], maximum: int) -> int:
-    """Drain a text stream while retaining no more than the requested character limit.
+def read_bounded_stream(
+    stream: TextStream,
+    chunks: list[str],
+    *,
+    chunk_size: int = constants.DEFAULT_STREAM_CHUNK_SIZE,
+    maximum: int = constants.MAX_OUTPUT_CHARS,
+) -> int:
+    """Drain and close a text stream while retaining the requested character limit.
 
     Args:
         stream (TextStream): Stream drained until its ``read`` method returns an empty string.
         chunks (list[str]): Destination receiving retained text chunks.
-        maximum (int): Maximum total characters retained in ``chunks``.
+        chunk_size (int, optional): Number of characters to read per chunk.
+            Defaults to ``constants.DEFAULT_STREAM_CHUNK_SIZE``.
+        maximum (int, optional): Maximum total characters retained in ``chunks``.
+            Defaults to ``constants.MAX_OUTPUT_CHARS``.
 
     Returns:
         int: Number of characters discarded after the capture limit.
     """
     remaining = maximum
     discarded = 0
-    while chunk := stream.read(constants.DEFAULT_STREAM_CHUNK_SIZE):
-        discarded += max(0, len(chunk) - remaining)
-        if remaining:
-            chunks.append(chunk[:remaining])
-            remaining -= len(chunk[:remaining])
+    try:
+        while True:
+            try:
+                chunk = stream.read(chunk_size)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
+                break
+            if not chunk:
+                break
+            discarded += max(0, len(chunk) - remaining)
+            if remaining:
+                chunks.append(chunk[:remaining])
+                remaining -= len(chunk[:remaining])
+    finally:
+        try:
+            stream.close()
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
     return discarded
 
 

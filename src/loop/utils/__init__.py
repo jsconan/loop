@@ -49,6 +49,7 @@ __all__ = [
     "is_path_ignored",
     "iter_visible_paths",
     "json_encode",
+    "kill_process_group",
     "list_terms",
     "local_now",
     "matches_digest",

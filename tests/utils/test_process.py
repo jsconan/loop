@@ -1,5 +1,6 @@
 """Tests for safe process invocation utilities."""
 
+import errno
 from unittest.mock import MagicMock
 
 import pytest
@@ -50,7 +51,7 @@ def test_read_bounded_stream_drains_every_chunk_but_retains_the_configured_limit
     stream.read.side_effect = ["abcd", "efgh", "ignored", ""]
     chunks = []
 
-    discarded = read_bounded_stream(stream, chunks, 6)
+    discarded = read_bounded_stream(stream, chunks, maximum=6)
 
     assert chunks == ["abcd", "ef"]
     assert discarded == 9
@@ -64,7 +65,7 @@ def test_read_bounded_stream_can_drain_without_retaining_output():
     stream.read.side_effect = ["content", ""]
     chunks = []
 
-    discarded = read_bounded_stream(stream, chunks, 0)
+    discarded = read_bounded_stream(stream, chunks, maximum=0)
 
     assert chunks == []
     assert discarded == 7
@@ -77,10 +78,39 @@ def test_read_bounded_stream_reports_no_discarded_characters_within_limit():
     stream.read.side_effect = ["content", ""]
     chunks = []
 
-    discarded = read_bounded_stream(stream, chunks, len("content"))
+    discarded = read_bounded_stream(stream, chunks, maximum=len("content"))
 
     assert chunks == ["content"]
     assert discarded == 0
+
+
+def test_read_bounded_stream_tolerates_supervisor_pipe_close():
+    """An intentional descriptor close during timeout cleanup ends the reader quietly."""
+    stream = MagicMock()
+    stream.read.side_effect = ["partial", OSError(errno.EBADF, "Bad file descriptor")]
+    chunks = []
+
+    assert read_bounded_stream(stream, chunks, maximum=20) == 0
+    assert chunks == ["partial"]
+
+
+def test_read_bounded_stream_preserves_unrelated_read_failures():
+    """An unrelated stream error still reaches its owning supervisor."""
+    stream = MagicMock()
+    stream.read.side_effect = OSError(errno.EIO, "I/O error")
+
+    with pytest.raises(OSError, match="I/O error"):
+        read_bounded_stream(stream, [], maximum=20)
+
+
+def test_read_bounded_stream_preserves_unrelated_close_failures():
+    """A stream-close failure other than an intentional descriptor close is surfaced."""
+    stream = MagicMock()
+    stream.read.return_value = ""
+    stream.close.side_effect = OSError(errno.EIO, "close failed")
+
+    with pytest.raises(OSError, match="close failed"):
+        read_bounded_stream(stream, [], maximum=20)
 
 
 def test_kill_process_group_terminates_the_complete_posix_group(monkeypatch):
