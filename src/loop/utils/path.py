@@ -1,6 +1,7 @@
 """Provide repository-aware path discovery and traversal utilities."""
 
 import os
+import re
 import shlex
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -109,6 +110,38 @@ class VirtualPath:
         """
         argv = parse_command_line(command)
         return shlex.join(tuple(self._resolve_command_argument(argument) for argument in argv))
+
+    def command_roots(self) -> tuple[tuple[str, Path], ...]:
+        """Return configured virtual roots and their local directories for shell translation.
+
+        Returns:
+            tuple[tuple[str, Path], ...]: Roots ordered from longest virtual name to shortest.
+        """
+        return tuple(sorted(self._roots.items(), key=lambda pair: len(pair[0]), reverse=True))
+
+    @staticmethod
+    def translate_shell_source(source: str, aliases: Mapping[str, Path]) -> str:
+        """Replace declared literal virtual roots without reconstructing POSIX shell syntax.
+
+        Args:
+            source (str): Opaque model-authored POSIX shell source.
+            aliases (Mapping[str, Path]): Configured virtual roots mapped to shell-safe aliases.
+
+        Returns:
+            str: Source with path-segment root occurrences replaced in one pass. A bare
+                directory root gains a trailing slash so tools traverse the alias symlink.
+        """
+        if not aliases:
+            return source
+        roots = "|".join(re.escape(root) for root in sorted(aliases, key=len, reverse=True))
+        pattern = re.compile(rf"(?<![\w./~%-])({roots})(?=/|$|[^\w.-])")
+        return pattern.sub(
+            lambda match: (
+                str(aliases[match.group(1)])
+                + ("" if match.end() < len(source) and source[match.end()] == "/" else "/")
+            ),
+            source,
+        )
 
     def metadata(self, value: object, fields: tuple[tuple[str, ...], ...]) -> object:
         """Render declared local metadata fields as virtual paths.
