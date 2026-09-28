@@ -35,10 +35,12 @@ __all__ = [
     "PresetSource",
     "ProcessBoundary",
     "ProcessTarget",
+    "ProtectedWorkspacePaths",
     "SQLitePermissionAudit",
     "SessionPolicyOverrides",
     "SessionTarget",
     "UserPermissionConfiguration",
+    "protected_workspace_paths",
 ]
 
 from .audit import SQLitePermissionAudit
@@ -81,3 +83,4 @@ from .models import (
     SessionTarget,
     UserPermissionConfiguration,
 )
+from .protection import ProtectedWorkspacePaths, protected_workspace_paths
