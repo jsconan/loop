@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import StrEnum
 from importlib.resources import files
 from pathlib import Path
@@ -59,6 +60,32 @@ class Decision(StrEnum):
     ALLOW = "allow"
     ASK = "ask"
     DENY = "deny"
+
+
+class CommandReviewStatus(StrEnum):
+    """Identify the approval lifetime required by a command inspector."""
+
+    REVIEW = "review"
+    FRESH = "fresh"
+
+
+@dataclass(frozen=True)
+class CommandFinding:
+    """Describe one applicable command review policy.
+
+    Args:
+        policy_id (str): Stable identifier for the matching inspector.
+        status (CommandReviewStatus): Required approval behavior.
+        context (str): Short human-readable description of the observed command.
+        reason (str): Action requiring permission, suitable for a combined prompt.
+        requests_git_write (bool): Whether Git metadata write authority should be requested.
+    """
+
+    policy_id: str
+    status: CommandReviewStatus
+    context: str
+    reason: str
+    requests_git_write: bool = False
 
 
 class PolicyScope(StrEnum):

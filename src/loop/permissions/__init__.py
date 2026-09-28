@@ -4,6 +4,11 @@ __all__ = [
     "Action",
     "ApprovalChoice",
     "AuthorizationResult",
+    "CommandAnalysis",
+    "CommandFinding",
+    "CommandInspection",
+    "CommandMatcher",
+    "CommandReviewStatus",
     "Decision",
     "FileKind",
     "FileManifestEntry",
@@ -40,16 +45,27 @@ __all__ = [
     "SessionPolicyOverrides",
     "SessionTarget",
     "UserPermissionConfiguration",
+    "match_destructive_command",
+    "match_git_mutation",
     "protected_workspace_paths",
 ]
 
 from .audit import SQLitePermissionAudit
 from .commands import PermissionCommands
+from .inspection import (
+    CommandAnalysis,
+    CommandInspection,
+    CommandMatcher,
+    match_destructive_command,
+    match_git_mutation,
+)
 from .manager import PermissionManager
 from .models import (
     Action,
     ApprovalChoice,
     AuthorizationResult,
+    CommandFinding,
+    CommandReviewStatus,
     Decision,
     FileKind,
     FileManifestEntry,
