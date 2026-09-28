@@ -12,8 +12,9 @@ from ..interaction import Interaction
 from .models import ToolRuntimeSettings
 
 if TYPE_CHECKING:
+    from ..execution import CommandExecutionService
     from ..instructions import InstructionsManager
-    from ..permissions import OperationPlan, Operations
+    from ..permissions import OperationPlan, Operations, PermissionManager
 
 AdditionalAuthorizer = Callable[[dict[str, object]], "OperationPlan"]
 
@@ -35,6 +36,10 @@ class ToolContext:
         additional_authorizer (AdditionalAuthorizer | None): Registry-owned callback that plans
             and authorizes effects discovered during execution, or ``None`` when unavailable.
         settings (ToolRuntimeSettings): Scoped settings available to tool implementations.
+        permission_manager (PermissionManager | None): Authority for a native command's one-off
+            approval, or None outside registry dispatch.
+        execution_service (CommandExecutionService | None): Registry-injected facade for tools
+            with native execution authorization, or ``None`` otherwise.
     """
 
     interaction: Interaction | None
@@ -45,6 +50,8 @@ class ToolContext:
     call_id: str | None = None
     additional_authorizer: AdditionalAuthorizer | None = None
     settings: ToolRuntimeSettings = field(default_factory=ToolRuntimeSettings)
+    permission_manager: PermissionManager | None = None
+    execution_service: CommandExecutionService | None = None
 
     def observe_file(self, path: Path | str) -> None:
         """Report a successfully loaded file to instruction management.

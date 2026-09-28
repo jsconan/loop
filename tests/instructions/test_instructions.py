@@ -190,8 +190,10 @@ def test_manager_revalidates_unchanged_catalog_priorities_for_an_agent(tmp_path)
 def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
     """Runtime context participates in composition, generation, and the hard budget."""
     baseline_size = len(prepared(configured_manager()).encode("utf-8"))
-    manager = configured_manager(max_bytes=baseline_size + 512)
     environment = RuntimeEnvironment(tmp_path, tmp_path / "temporary")
+    manager = configured_manager(
+        max_bytes=baseline_size + len(environment.render().encode("utf-8")) + 128
+    )
     manager.set_runtime_environment(environment)
     generation = manager.generation
 
@@ -210,8 +212,8 @@ def test_virtual_paths_require_a_runtime_environment_for_workspace_relative_path
         configured_manager().virtual_paths.resolve("relative.txt")
 
 
-def test_runtime_environment_exposes_only_virtual_roots(tmp_path):
-    """Instructions and typed file paths use virtual roots without exposing host roots."""
+def test_runtime_environment_keeps_host_paths_private(tmp_path):
+    """Both file and command guidance retain virtual roots without revealing host paths."""
     manager = configured_manager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "temporary")
     )
@@ -219,6 +221,11 @@ def test_runtime_environment_exposes_only_virtual_roots(tmp_path):
     assert str(tmp_path) not in prepared(manager)
     assert "working_directory: /workspace" in prepared(manager)
     assert "temporary_directory: /tmp" in prepared(manager)
+    assert "resolve_executable" in prepared(manager)
+    assert "verified managed toolchains" in prepared(manager)
+    assert "grant_reference for executable_grant" in prepared(manager)
+    assert "does not prove a host tool is absent" in prepared(manager)
+    assert "default sandbox can read workspace files" in prepared(manager)
     assert manager.virtual_paths.resolve("/workspace/source.py") == str(tmp_path / "source.py")
     assert manager.virtual_paths.resolve("/tmp/output.txt") == str(
         tmp_path / "temporary/output.txt"

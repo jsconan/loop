@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -21,6 +22,8 @@ from loop import (
     PolicyLimits,
     Problem,
     ProblemException,
+    ProcessBoundary,
+    ProcessTarget,
     RuntimeEnvironment,
     SessionTarget,
     Tool,
@@ -28,10 +31,17 @@ from loop import (
     ToolResultPresentationSpec,
     delete_path,
     read_text_file,
+    resolve_executable,
     run_command,
 )
+from loop.execution import CommandExecutionService
+from loop.execution.coordinator import LocalHostCommandExecutor
+from loop.execution.sandbox import CommandProcessResult, SandboxOutcome
+from loop.execution.sandbox.macos import MacOSSeatbeltBackend
 from loop.instructions import InstructionsManager
 from loop.interaction import Interaction
+from loop.permissions import CommandAnalysis
+from loop.permissions.protection import protected_workspace_paths
 from loop.tooling import (
     ToolContext,
     ToolPreflightResult,
@@ -43,8 +53,18 @@ from loop.tooling import (
     ToolStatus,
 )
 from loop.tooling import tool as declare_tool
+from loop.utils import cached_path
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
+
+
+def _approving_interaction():
+    """Provide explicit native approval for path-boundary test requests."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.side_effect = lambda message, **kwargs: (
+        "deny" if "without the OS sandbox" in message else "approve"
+    )
+    return interaction
 
 
 def result_value(output: str):
@@ -87,6 +107,14 @@ def register(registry: ToolRegistry):
 
     registry.register(calculate)
     return calculate
+
+
+def test_registry_closes_its_execution_service():
+    """Registry teardown releases the bound command execution service once."""
+    service = Mock()
+    ToolRegistry(execution_service=service).close()
+    service.close.assert_called_once()
+    ToolRegistry().close()
 
 
 def test_constructor_registers_in_order_and_exposes_sorted_snapshots():
@@ -657,6 +685,7 @@ def test_call_routes_arguments_and_runtime_context():
     registry.register(calculate)
     runtime = Mock(spec=Interaction)
     manager = Mock(spec=InstructionsManager)
+    manager.agents_filenames = ("AGENTS.md",)
     manager.virtual_paths.metadata.side_effect = lambda value: value
     manager.virtual_paths.redact.side_effect = lambda value: value
     execution_started = Mock()
@@ -1127,7 +1156,7 @@ def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_meta
     assert str(path) in str(permissions.authorize.call_args.args[0])
 
 
-def test_observed_file_scope_does_not_change_command_working_directory(tmp_path):
+def test_observed_file_scope_does_not_change_command_working_directory(tmp_path, monkeypatch):
     """A file observation cannot change the cwd used by a later process."""
     nested = tmp_path / "src" / "loop"
     nested.mkdir(parents=True)
@@ -1138,7 +1167,21 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path)
     permissions = Mock(spec=PermissionManager)
     permissions.check_boundaries.return_value = None
     permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
-    registry = ToolRegistry([run_command], permission_manager=permissions)
+    permissions.analyze_command.return_value = CommandAnalysis((), False, ())
+    permissions.protected_sandbox_paths.return_value = protected_workspace_paths()
+    registry = ToolRegistry(
+        [run_command],
+        interaction=_approving_interaction(),
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED, exit_code=0, stdout=f"{tmp_path}\n"
+    )
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
     output = registry.call(
         "run_command",
@@ -1147,16 +1190,18 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path)
     )
 
     assert result_value(output)["stdout"]["content"].strip() == "/workspace"
-    assert "cwd='" + str(tmp_path) + "'" in str(permissions.authorize.call_args.args[0])
+    request = permissions.authorize_sandboxed_command.call_args.args[0]
+    assert request.cwd == tmp_path
 
 
-def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path):
+def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path, monkeypatch):
     """The workspace shorthand renders and executes as the workspace root."""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
     interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.ONCE
+    interaction.prompt.return_value = "approve"
     permissions = PermissionManager(
         tmp_path,
         interaction=interaction,
@@ -1164,19 +1209,335 @@ def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path):
             limits=PolicyLimits(allow_host_processes=True),
         ),
     )
-    registry = ToolRegistry([run_command], permission_manager=permissions)
+    registry = ToolRegistry(
+        [run_command],
+        interaction=_approving_interaction(),
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED, exit_code=0, stdout=f"{tmp_path}\n"
+    )
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
     output = registry.call(
         "run_command",
-        json.dumps({"command": "pwd", "cwd": "workspace"}),
+        json.dumps({"command": "printf cwd", "cwd": "workspace"}),
         interaction=interaction,
         instructions_manager=instructions,
     )
 
     assert result_value(output)["stdout"]["content"].strip() == "/workspace"
-    prompt = interaction.info.call_args.args[0]
-    assert "git status (cwd: /workspace/workspace)" not in prompt
-    assert "pwd (cwd: /workspace)" in prompt
+    assert str(tmp_path) not in output
+    interaction.prompt.assert_not_called()
+    assert backend.run.call_args.args[0].cwd == tmp_path
+
+
+def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, monkeypatch):
+    """A workspace read root remains within default authority and needs no prompt."""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    nested = tmp_path / "src"
+    nested.mkdir()
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    interaction = Mock(spec=Interaction)
+    registry = ToolRegistry(
+        [run_command],
+        interaction=interaction,
+        permission_manager=PermissionManager(tmp_path, interaction=interaction),
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+
+    output = registry.call(
+        "run_command",
+        json.dumps(
+            {
+                "command": "cd /workspace && git diff --cached --stat",
+                "cwd": "workspace",
+                "read_only": True,
+                "read_roots": ["/workspace", "/workspace/src"],
+            }
+        ),
+        instructions_manager=instructions,
+    )
+
+    assert result_value(output)["boundary"] == "sandbox"
+    request = backend.run.call_args.args[0]
+    assert request.cwd == tmp_path
+    assert request.read_roots == ()
+    assert request.execution_source != request.source
+    interaction.prompt.assert_not_called()
+
+
+def test_denied_command_virtualizes_offer_and_cached_output(tmp_path, monkeypatch):
+    """A public denial hides configured roots in every model-visible field and cache."""
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    interaction = _approving_interaction()
+    registry = ToolRegistry(
+        [run_command],
+        interaction=interaction,
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.DENIED,
+        stdout=(str(tmp_path) + "/output\n") * 600,
+        detail=f"Denied {tmp_path}/.ssh/fake",
+    )
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+    source = f"cat {tmp_path}/.ssh/fake /workspace/file"
+
+    output = registry.call(
+        "run_command",
+        json.dumps({"command": source, "cwd": "/workspace", "read_only": True}),
+        interaction=interaction,
+        instructions_manager=instructions,
+    )
+
+    problem = json.loads(output)["problem"]
+    assert problem["code"] == "sandbox.denied"
+    assert str(tmp_path) not in output
+    assert "/workspace/.ssh/fake" in problem["metadata"]["host_offer"]
+    assert any(str(tmp_path) in call.args[0] for call in interaction.info.call_args_list)
+    handle = problem["metadata"]["stdout"]["handle"]
+    path, _ = cached_path(handle)
+    assert str(tmp_path) not in path.read_text()
+
+
+def test_command_accepts_virtual_workspace_cwd(tmp_path, monkeypatch):
+    """The command tool resolves a virtual cwd before native authorization."""
+    nested = tmp_path / "src"
+    nested.mkdir()
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    permissions = PermissionManager(tmp_path)
+    registry = ToolRegistry(
+        [run_command],
+        interaction=_approving_interaction(),
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+    output = registry.call(
+        "run_command",
+        json.dumps({"command": "pwd", "cwd": "/workspace/src"}),
+        instructions_manager=instructions,
+    )
+    assert result_value(output)["boundary"] == "sandbox"
+    assert backend.run.call_args.args[0].cwd == nested
+
+
+def test_command_output_and_failure_details_hide_host_workspace(tmp_path, monkeypatch):
+    """Command streams and diagnostics use virtual paths in model-visible results."""
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    registry = ToolRegistry(
+        [run_command],
+        interaction=_approving_interaction(),
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED,
+        exit_code=1,
+        stdout=f"{tmp_path}/one\n",
+        stderr=f"failed at {tmp_path}/two\n",
+    )
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+
+    output = registry.call(
+        "run_command",
+        json.dumps({"command": "pwd", "read_only": True}),
+        instructions_manager=instructions,
+    )
+
+    assert str(tmp_path) not in output
+    problem = json.loads(output)["problem"]
+    assert problem["metadata"]["stdout"]["content"] == "/workspace/one\n"
+    assert problem["metadata"]["stderr"]["content"] == "failed at /workspace/two\n"
+
+
+def test_command_sandbox_failure_hides_host_workspace(tmp_path, monkeypatch):
+    """Sandbox failure details are virtualized before returning to the model."""
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    registry = ToolRegistry(
+        [run_command],
+        interaction=_approving_interaction(),
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.UNAVAILABLE, detail=f"failed to inspect {tmp_path}/source.py"
+    )
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+
+    output = registry.call(
+        "run_command",
+        json.dumps({"command": "pwd", "read_only": True}),
+        instructions_manager=instructions,
+    )
+
+    assert str(tmp_path) not in output
+    assert json.loads(output)["problem"]["detail"] == ("failed to inspect /workspace/source.py")
+    assert "PATH=" not in json.loads(output)["problem"]["metadata"]["host_offer"]
+
+
+def test_command_translates_virtual_roots_and_redacts_aliases(tmp_path, monkeypatch):
+    """Default sandbox access translates roots while output hides local aliases."""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    scratch = tmp_path.with_name(tmp_path.name + "-scratch")
+    scratch.mkdir()
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, scratch))
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "approve"
+    registry = ToolRegistry(
+        [run_command],
+        interaction=_approving_interaction(),
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    observed = []
+
+    def execute(request):
+        """Inspect the live alias request before the tool cleans it up."""
+        observed.append(request)
+        assert request.paths_are_current()
+        assert request.source == "cat /workspace/a '/tmp/b'"
+        assert request.execution_source.startswith(f"cat {request.aliases[0][1]}")
+        assert request.aliases[0][0] == "/workspace"
+        assert request.aliases[1][0] == "/tmp"
+        assert scratch in request.write_roots
+        return CommandProcessResult(
+            SandboxOutcome.COMPLETED,
+            exit_code=0,
+            stdout=f"{request.aliases[0][1]}/a {request.aliases[1][1]}/b",
+        )
+
+    backend = Mock()
+    backend.run.side_effect = execute
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+
+    output = registry.call(
+        "run_command",
+        json.dumps({"command": "cat /workspace/a '/tmp/b'"}),
+        interaction=interaction,
+        instructions_manager=instructions,
+    )
+
+    assert result_value(output)["stdout"]["content"] == "/workspace/a /tmp/b"
+    interaction.prompt.assert_not_called()
+    assert str(tmp_path) not in output
+    assert not observed[0].paths_are_current()
+
+
+def test_command_ignores_virtual_root_substrings(tmp_path, monkeypatch):
+    """A path-like substring cannot require an alias for an unrelated missing root."""
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "missing-scratch")
+    )
+    registry = ToolRegistry(
+        [run_command],
+        interaction=_approving_interaction(),
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+
+    output = registry.call(
+        "run_command",
+        json.dumps({"command": "echo /tmp-old", "read_only": True}),
+        instructions_manager=instructions,
+    )
+
+    assert result_value(output)["boundary"] == "sandbox"
+    request = backend.run.call_args.args[0]
+    assert request.execution_source == "echo /tmp-old"
+    assert request.aliases == ()
+
+
+def test_virtual_command_host_retry_uses_same_live_translation(tmp_path, monkeypatch):
+    """One-off host retry executes the bound alias source before alias cleanup."""
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "approve"
+    registry = ToolRegistry(
+        [run_command],
+        interaction=_approving_interaction(),
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.UNAVAILABLE, detail="profile unavailable"
+    )
+    host = Mock()
+
+    def execute(request):
+        """Observe the alias while the separately approved host run is active."""
+        alias = Path(request.source.removeprefix("cat ").rstrip("/"))
+        assert alias.parent.name.startswith("loop-vpath-")
+        assert alias.is_symlink()
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0, stdout=request.source)
+
+    host.run_host_command.side_effect = execute
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+    monkeypatch.setattr(registry._execution_service, "_host_executor", host)
+
+    output = registry.call(
+        "run_command",
+        json.dumps({"command": "cat /workspace"}),
+        interaction=interaction,
+        instructions_manager=instructions,
+    )
+
+    assert result_value(output)["boundary"] == "host"
+    assert result_value(output)["stdout"]["content"] == "cat /workspace/"
+    warning = interaction.info.call_args_list[-1].args[0]
+    assert 'Command: "cat /workspace"' in warning
+    assert "Reason: The sandbox was unavailable." in warning
+    assert str(tmp_path) not in warning
+    assert "Execution source:" not in warning
+    assert "Virtual path mappings:" not in warning
+    assert "Environment:" not in warning
+    assert str(tmp_path) not in output
 
 
 def test_delete_path_accepts_a_virtual_workspace_path(tmp_path):
@@ -1230,3 +1591,156 @@ def test_model_result_returns_non_json_output_unchanged(tmp_path):
         raw_output, instructions, Tool(lambda: None, result_path_fields=(("result", "path"),))
     )
     assert output == raw_output
+
+
+def test_execution_capability_requires_a_service(tmp_path):
+    """A renamed native tool cannot run when no executor was injected."""
+    registry = ToolRegistry([ToolRegistration(run_command, name="other_command")])
+
+    output = registry.call("other_command", json.dumps({"command": "pwd", "cwd": str(tmp_path)}))
+
+    assert json.loads(output)["problem"]["code"] == "sandbox.unavailable"
+
+
+def test_execution_capability_rejects_an_unbound_plan(tmp_path):
+    """An execution declaration cannot route a host-bound process through native approval."""
+
+    def host_plan(arguments):
+        """Return an inadmissible host process for this declared capability."""
+        return OperationPlan(
+            arguments=arguments,
+            operations=(
+                Operation(
+                    tool_id="",
+                    action=Action.PROCESS_EXECUTE,
+                    target=ProcessTarget(
+                        argv=("/bin/sh", "-c", str(arguments["command"])),
+                        cwd=str(tmp_path),
+                        boundary=ProcessBoundary.HOST,
+                    ),
+                ),
+            ),
+        )
+
+    def second_command(context: ToolContext, command: str) -> object:
+        """Route through the declared native service if authorized."""
+        return context.execution_service.run_command(context, command)
+
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+    registry = ToolRegistry(
+        [
+            ToolRegistration(
+                second_command,
+                name="second_command",
+                actions=frozenset({Action.PROCESS_EXECUTE}),
+                operation_planner=host_plan,
+                execution_authorization=True,
+            )
+        ],
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(
+            MacOSSeatbeltBackend(), LocalHostCommandExecutor()
+        ),
+    )
+
+    output = registry.call("second_command", json.dumps({"command": "pwd"}))
+
+    assert json.loads(output)["problem"]["code"] == "sandbox.unavailable"
+
+
+def test_execution_capability_validates_registration():
+    """A declaration without a context-aware process planner is refused."""
+
+    def invalid() -> str:
+        """Return a placeholder value."""
+        return "invalid"
+
+    with pytest.raises(ToolRegistrationError, match="context-aware process planner"):
+        ToolRegistry(
+            [
+                ToolRegistration(
+                    invalid,
+                    actions=frozenset({Action.PROCESS_EXECUTE}),
+                    operation_planner=lambda args: OperationPlan(arguments=args),
+                    execution_authorization=True,
+                )
+            ]
+        )
+
+
+@pytest.mark.parametrize("second_tool", [False, True])
+def test_execution_capability_guards_renamed_and_second_tools(tmp_path, second_tool):
+    """Every declared execution tool passes its registered identity into native approval."""
+
+    def native_plan(arguments):
+        """Bind one sandbox process for the second test tool."""
+        return OperationPlan(
+            arguments=arguments,
+            operations=(
+                Operation(
+                    tool_id="",
+                    action=Action.PROCESS_EXECUTE,
+                    target=ProcessTarget(
+                        argv=("/bin/sh", "-c", str(arguments["command"])),
+                        cwd=str(tmp_path),
+                        boundary=ProcessBoundary.SANDBOXED,
+                    ),
+                ),
+            ),
+        )
+
+    def other_native(context: ToolContext, command: str) -> object:
+        """Ask the registered facade to run the test shell source."""
+        return context.execution_service.run_command(context, command)
+
+    declaration = (
+        ToolRegistration(
+            other_native,
+            name="second_command",
+            actions=frozenset({Action.PROCESS_EXECUTE}),
+            operation_planner=native_plan,
+            execution_authorization=True,
+        )
+        if second_tool
+        else ToolRegistration(run_command, name="renamed_command")
+    )
+    name = "second_command" if second_tool else "renamed_command"
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+    permissions.authorize_sandboxed_command.return_value = True
+    permissions.analyze_command.return_value = CommandAnalysis((), False, ())
+    permissions.protected_sandbox_paths.return_value = protected_workspace_paths()
+    registry = ToolRegistry(
+        [declaration],
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(backend, Mock()),
+    )
+
+    output = registry.call(
+        name,
+        json.dumps(
+            {"command": "pwd", "cwd": str(tmp_path)} if not second_tool else {"command": "pwd"}
+        ),
+    )
+
+    assert result_value(output)["boundary"] == "sandbox"
+    assert permissions.authorize_sandboxed_command.call_args.kwargs["tool_id"] == name
+    backend.run.assert_called_once()
+
+
+def test_renamed_executable_lookup_receives_declared_service():
+    """Execution service injection follows registration metadata after a lookup is renamed."""
+    service = Mock()
+    service.resolve_executable.return_value = {"name": "git", "status": "installed_on_host"}
+    registry = ToolRegistry(
+        [ToolRegistration(resolve_executable, name="find_tool")],
+        execution_service=service,
+    )
+
+    output = registry.call("find_tool", json.dumps({"name": "git"}))
+
+    assert result_value(output)["status"] == "installed_on_host"
+    assert service.resolve_executable.call_args.args[0].tool_name == "find_tool"

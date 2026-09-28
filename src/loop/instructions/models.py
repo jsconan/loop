@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
 from ..errors import Problem
-from ..utils import sha256_digest
+from ..utils import VirtualPath, sha256_digest
 
 
 @dataclass(frozen=True)
@@ -254,13 +254,18 @@ class RuntimeEnvironment:
         """
         return (
             "<runtime_environment>\n"
-            "working_directory: /workspace\n"
-            "temporary_directory: /tmp\n"
-            "File tools accept workspace-relative paths and VirtualPaths below /workspace, /tmp, "
-            "or /skills.\n"
-            "For terminal commands, select cwd '/workspace' or '/tmp' and prefer relative paths. "
-            "VirtualPath arguments, including option values such as '--root=/workspace', are "
-            "translated before the process starts.\n"
+            f"working_directory: {VirtualPath.WORKSPACE}\n"
+            f"temporary_directory: {VirtualPath.TEMPORARY}\n"
+            f"File tools and command shell source use {VirtualPath.WORKSPACE}, "
+            f"{VirtualPath.TEMPORARY}, or {VirtualPath.SKILLS} paths. "
+            "Literal configured virtual roots in command source are mapped to approved local "
+            "paths before execution. Set read_only when workspace writes are unnecessary. "
+            "The default sandbox can read workspace files and return them in output. "
+            "PATH gives external installed tools lookup only; verified managed toolchains "
+            "are granted by the sandbox execution layer. For other installations, "
+            "resolve_executable can provide a bound grant_reference for executable_grant. "
+            "A failed sandbox command does not prove a host tool is absent. "
+            "Use $TMPDIR for transient cache or report files.\n"
             "</runtime_environment>"
         )
 

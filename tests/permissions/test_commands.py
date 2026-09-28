@@ -1,11 +1,13 @@
 """Tests for complete operation-policy user commands."""
 
+import time
 from unittest.mock import Mock
 
 from prompt_toolkit.document import Document
 
 from loop import (
     Action,
+    ApprovalChoice,
     CommandCompletionAdapter,
     CommandManager,
     CompletionManager,
@@ -18,7 +20,114 @@ from loop import (
     PermissionRule,
     PolicyScope,
 )
+from loop.execution.sandbox import SandboxRequest
 from loop.permissions import PermissionCommands
+
+
+def test_permissions_sandbox_rules_can_be_listed_and_removed(tmp_path):
+    """The permission command exposes a revocation path for native approvals."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "session"
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    command = command_manager(permissions, interaction)
+    approved = SandboxRequest.create(
+        source="git status",
+        cwd=tmp_path,
+        workspace=tmp_path,
+        read_roots=(tmp_path.parent,),
+        write_roots=(tmp_path,),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin"},
+        policy_version="macos-seatbelt-v1",
+        deadline=time.monotonic() + 60,
+        workspace_id="test",
+    )
+    assert permissions.authorize_sandboxed_command(approved, tool_id="run_command")
+    rule = permissions.sandboxed_command_rules(ApprovalChoice.SESSION)[0]
+    command.call("permissions", "sandbox")
+    assert rule.id in interaction.info.call_args.args[0]
+    command.call("permissions", f"sandbox remove session {rule.id}")
+    assert not permissions.sandboxed_command_rules(ApprovalChoice.SESSION)
+    command.call("permissions", f"sandbox remove session {rule.id}")
+    assert "No matching" in interaction.info.call_args.args[0]
+    command.call("permissions", "sandbox unknown")
+    interaction.report.assert_called()
+
+
+def test_permissions_host_rules_can_be_listed_and_revoked(tmp_path):
+    """A recorded host choice has a user-visible session revocation command."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    command = command_manager(permissions, interaction)
+    command.call("permissions", "host list")
+    assert "none" in interaction.info.call_args.args[0]
+    approved = SandboxRequest.create(
+        source="printf host",
+        cwd=tmp_path,
+        workspace=tmp_path,
+        read_roots=(),
+        write_roots=(tmp_path,),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin"},
+        policy_version="macos-seatbelt-v1",
+        deadline=time.monotonic() + 60,
+        workspace_id="test",
+    )
+    rule = permissions.remember_host_command_rule(approved)
+    command.call("permissions", "host list")
+    assert rule.id in interaction.info.call_args.args[0]
+    command.call("permissions", f"host remove {rule.id}")
+    assert not permissions.host_command_rules()
+    command.call("permissions", f"host remove {rule.id}")
+    assert "No matching" in interaction.info.call_args.args[0]
+    command.call("permissions", "host unknown")
+    interaction.report.assert_called()
+
+
+def test_permissions_sandbox_cli_preserves_other_persisted_scope(tmp_path):
+    """CLI revocation of a workspace approval leaves a user approval visible."""
+    interaction = Mock(spec=Interaction)
+    user_path = tmp_path / "user.yaml"
+    permissions = PermissionManager(
+        tmp_path, user_configuration_path=user_path, interaction=interaction
+    )
+    command = command_manager(permissions, interaction)
+    request = SandboxRequest.create(
+        source="printf workspace",
+        cwd=tmp_path,
+        workspace=tmp_path,
+        read_roots=(tmp_path.parent,),
+        write_roots=(tmp_path,),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin"},
+        policy_version="macos-seatbelt-v1",
+        deadline=time.monotonic() + 60,
+        workspace_id="test",
+    )
+    interaction.prompt.return_value = "workspace"
+    assert permissions.authorize_sandboxed_command(request, tool_id="run_command")
+    interaction.prompt.return_value = "user"
+    assert permissions.authorize_sandboxed_command(
+        SandboxRequest.create(
+            source="printf user",
+            cwd=tmp_path,
+            workspace=tmp_path,
+            read_roots=(tmp_path.parent,),
+            write_roots=(tmp_path,),
+            network=False,
+            environment={"PATH": "/usr/bin:/bin"},
+            policy_version="macos-seatbelt-v1",
+            deadline=time.monotonic() + 60,
+            workspace_id="test",
+        ),
+        tool_id="run_command",
+    )
+    workspace_rule = permissions.sandboxed_command_rules(ApprovalChoice.WORKSPACE)[0]
+    user_rule = permissions.sandboxed_command_rules(ApprovalChoice.USER)[0]
+    command.call("permissions", f"sandbox remove workspace {workspace_rule.id}")
+    command.call("permissions", "sandbox list")
+    assert user_rule.id in interaction.info.call_args.args[0]
+    assert workspace_rule.id not in interaction.info.call_args.args[0]
 
 
 def command_manager(permissions, interaction):
@@ -444,12 +553,18 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
         "explain",
         "default",
         "rule",
+        "sandbox",
+        "host",
         "limit",
         "preset",
         "session",
         "help",
     }
     assert all(item.display_meta_text for item in commands)
+    assert [item.text for item in complete(completer, "/permissions sandbox ")] == [
+        "list",
+        "remove",
+    ]
     assert [item.text for item in complete(completer, "/permissions rule add session al")] == [
         "allow"
     ]
@@ -462,6 +577,12 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
     )
     assert [item.text for item in actions] == ["filesystem.replace"]
     assert actions[0].display_meta_text
+    process_actions = complete(
+        completer,
+        "/permissions rule add session allow read_text_file process.exe",
+    )
+    assert [item.text for item in process_actions] == ["process.execute"]
+    assert process_actions[0].display_meta_text == "Execute a process."
     removable = complete(completer, "/permissions rule remove session saved")
     assert [item.text for item in removable] == ["saved-rule"]
     assert removable[0].display_meta_text == "Read documentation"

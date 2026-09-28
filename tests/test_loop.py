@@ -34,6 +34,7 @@ from loop import (
     PermissionPreset,
     Response,
     ResponseCompleted,
+    RuntimeEnvironment,
     Session,
     SessionManager,
     ShutdownRequested,
@@ -730,7 +731,12 @@ def test_run_warns_when_a_skill_hint_cannot_fit_the_instruction_budget(tmp_path)
         Skill("unicode", "€" * 6500, tmp_path / "unicode" / "SKILL.md"),
     ]
     probe = InstructionsManager(skill_manager=SkillManager(skills))
-    instruction_limit = len(probe.prepare(Agent("Loop")).content.encode("utf-8")) + 512
+    runtime = RuntimeEnvironment(tmp_path, tmp_path / "temporary")
+    instruction_limit = (
+        len(probe.prepare(Agent("Loop")).content.encode("utf-8"))
+        + len(runtime.render().encode("utf-8"))
+        + 128
+    )
     instructions = InstructionsManager(
         skill_manager=SkillManager(skills), max_bytes=instruction_limit
     )

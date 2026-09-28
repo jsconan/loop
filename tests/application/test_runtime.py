@@ -38,6 +38,7 @@ def dependencies(monkeypatch):
         "SQLiteSessionStore",
         "SessionManager",
         "PermissionManager",
+        "CommandExecutionService",
     )
     result = {name: Mock(return_value=Mock()) for name in names}
     loop = Mock()
@@ -91,6 +92,8 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     tool_kwargs = dependencies["create_default_tool_registry"].call_args.kwargs
     assert tool_kwargs["settings"].user_agent == settings.web.user_agent
     assert tool_kwargs["settings"].command_timeout == settings.tools.command_timeout
+    assert tool_kwargs["permission_manager"] is dependencies["PermissionManager"].return_value
+    assert loop_kwargs["permission_manager"] is tool_kwargs["permission_manager"]
     assert loop_kwargs["working_directory"] is workspace.working_directory
     assert loop_kwargs["stream"] is settings.loop.stream
     assert loop_kwargs["temperature"] == 0.2
@@ -136,6 +139,25 @@ def test_create_requires_identity_and_skips_environment_model_callback(dependenc
             repository,
             Mock(),
         )
+
+
+def test_create_accepts_execution_service_without_close_hook(dependencies, assembled, monkeypatch):
+    """Composition leaves ownership with the registry when a service has no close hook."""
+    workspace, paths, workspace_paths, settings = assembled
+    service = object()
+    monkeypatch.setattr(
+        runtime_module, "CommandExecutionService", Mock(for_host=Mock(return_value=service))
+    )
+
+    runtime = ApplicationRuntime.create(
+        workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+    )
+
+    assert (
+        dependencies["create_default_tool_registry"].call_args.kwargs["execution_service"]
+        is service
+    )
+    runtime.close()
 
 
 def test_apply_configuration_routes_aggregate_domain_and_scalar_changes(dependencies):

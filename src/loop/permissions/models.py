@@ -14,7 +14,7 @@ from uuid import uuid4
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
-from ..utils import sha256_digest
+from ..utils import VirtualPath, sha256_digest
 
 type FileKind = Literal["file", "directory", "symlink"]
 type Operations = tuple[Operation, ...]
@@ -384,6 +384,72 @@ class PermissionRule(BaseModel):
         return self
 
 
+class SandboxedCommandRule(BaseModel):
+    """Remember one sandbox-only command approval for a reviewed authority context.
+
+    Args:
+        id (str): Stable identifier for managing the approval.
+        signature (str): Digest of the sandbox authority and execution context.
+        source (str): Exact shell source, restricted leading command phrase, or label for
+            a session tool-access rule.
+        similar (bool): Whether source may match a longer simple command.
+        scope (ApprovalChoice): Lifetime and breadth of this sandbox-only approval.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    signature: str
+    source: str
+    similar: bool = False
+    scope: ApprovalChoice = ApprovalChoice.SESSION
+
+
+class HostCommandRule(BaseModel):
+    """Remember an exact unrestricted host retry for the current session.
+
+    Args:
+        id (str): Identifier used to list and revoke the approval.
+        signature (str): Digest of virtual workspace coordinates and safe command shape only.
+        cwd (str): Virtual workspace working directory; never a host path.
+        source (str): Path-free command label for listing and revocation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    signature: str
+    cwd: str
+    source: str
+
+    @model_validator(mode="after")
+    def validate_virtual_context(self) -> HostCommandRule:
+        """Reject real paths and malformed portable rule identities.
+
+        Returns:
+            HostCommandRule: Rule containing virtual workspace context only.
+
+        Raises:
+            ValueError: If a path or malformed digest is stored in the rule.
+        """
+        relative = self.cwd.removeprefix(f"{VirtualPath.WORKSPACE}/")
+        if (
+            (
+                self.cwd != VirtualPath.WORKSPACE
+                and (
+                    not self.cwd.startswith(f"{VirtualPath.WORKSPACE}/")
+                    or not relative
+                    or any(part in {"", ".", ".."} for part in relative.split("/"))
+                )
+            )
+            or "/" in self.source
+            or len(self.signature) != 64
+            or any(character not in "0123456789abcdef" for character in self.signature)
+        ):
+            raise ValueError("Host rule must contain only virtual context and a SHA-256 digest.")
+        return self
+
+
 class PresetMetadata(BaseModel):
     """Describe a versioned, user-selectable permission preset.
 
@@ -710,12 +776,14 @@ class UserPermissionConfiguration(BaseModel):
     Args:
         version (Literal[1]): Persisted schema version.
         rules (list[PermissionRule]): Exact user-approved operation rules.
+        sandboxed_command_rules (list[SandboxedCommandRule]): User-persisted sandbox-only approvals.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     version: Literal[1] = 1
     rules: list[PermissionRule] = Field(default_factory=list)
+    sandboxed_command_rules: list[SandboxedCommandRule] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_rule_ids(self) -> UserPermissionConfiguration:
@@ -728,8 +796,11 @@ class UserPermissionConfiguration(BaseModel):
             ValueError: If multiple rules use the same identifier.
         """
         identifiers = [rule.id for rule in self.rules]
+        sandbox_identifiers = [rule.id for rule in self.sandboxed_command_rules]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Permission rule identifiers must be unique.")
+        if len(sandbox_identifiers) != len(set(sandbox_identifiers)):
+            raise ValueError("Sandbox command rule identifiers must be unique.")
         return self
 
 
@@ -760,6 +831,8 @@ class SessionPolicyOverrides(BaseModel):
         defaults (dict[Action, Decision]): Session fallback decisions by action.
         limits (PolicyLimitOverrides): Session replacements for selected workspace limits.
         rules (list[PermissionRule]): Session-only matching rules.
+        sandboxed_command_rules (list[SandboxedCommandRule]): Session-only sandbox approvals.
+        host_command_rules (list[HostCommandRule]): Session-only exact host retry approvals.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -767,6 +840,8 @@ class SessionPolicyOverrides(BaseModel):
     defaults: dict[Action, Decision] = Field(default_factory=dict)
     limits: PolicyLimitOverrides = Field(default_factory=PolicyLimitOverrides)
     rules: list[PermissionRule] = Field(default_factory=list)
+    sandboxed_command_rules: list[SandboxedCommandRule] = Field(default_factory=list)
+    host_command_rules: list[HostCommandRule] = Field(default_factory=list)
 
 
 class PolicyDecision(BaseModel):

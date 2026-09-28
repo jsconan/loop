@@ -1,5 +1,6 @@
 """Compose the built-in tool catalog without sharing runtime registry state."""
 
+from ..execution import CommandExecutionService
 from ..interaction import Interaction
 from ..permissions import PermissionManager
 from ..tooling import ToolRegistry, ToolRuntimeSettings
@@ -13,7 +14,7 @@ from .files import (
     write_text_file,
 )
 from .skills import activate_skill, manage_skills
-from .system import run_command
+from .system import resolve_executable, run_command
 from .web import fetch_content, read_cached_content
 
 BUILTIN_TOOLS = (
@@ -26,6 +27,7 @@ BUILTIN_TOOLS = (
     delete_path,
     activate_skill,
     manage_skills,
+    resolve_executable,
     run_command,
     fetch_content,
     read_cached_content,
@@ -38,6 +40,7 @@ def create_default_tool_registry(
     interaction: Interaction | None = None,
     permission_manager: PermissionManager | None = None,
     settings: ToolRuntimeSettings | None = None,
+    execution_service: CommandExecutionService | None = None,
 ) -> ToolRegistry:
     """Create an isolated registry containing every built-in tool.
 
@@ -48,6 +51,8 @@ def create_default_tool_registry(
             to create the registry's default manager.
         settings (ToolRuntimeSettings | None): Scoped settings supplied to context-aware built-in
             tools, or ``None`` to use built-in tool defaults.
+        execution_service (CommandExecutionService | None): Application-selected native execution
+            service, or None to probe and select a qualified built-in backend.
 
     Returns:
         ToolRegistry: A new registry containing the complete built-in tool manifest.
@@ -57,4 +62,5 @@ def create_default_tool_registry(
         interaction=interaction,
         permission_manager=permission_manager,
         settings=settings or ToolRuntimeSettings(),
+        execution_service=execution_service or CommandExecutionService.for_host(),
     )

@@ -296,6 +296,15 @@ class InstructionsManager:
             skill_roots=self._skill_manager.activated_locations,
         )
 
+    @property
+    def agents_filenames(self) -> tuple[str, ...]:
+        """Return instruction filenames considered during workspace discovery.
+
+        Returns:
+            tuple[str, ...]: Configured filenames in discovery precedence order.
+        """
+        return self._agents_filenames
+
     def list_skills(self) -> ManagedSkillListResult:
         """Return available skills and activation diagnostics.
 

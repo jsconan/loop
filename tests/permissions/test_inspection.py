@@ -24,6 +24,94 @@ def test_command_inspection_collects_every_default_finding_from_nested_shell():
     assert [finding.requests_git_write for finding in findings] == [True, False]
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "rm -rf build",
+        "cd /workspace && /bin/rm -rf build",
+        "command rm build",
+        "exec rmdir empty",
+        "unlink obsolete",
+        "shred old-key",
+        "truncate -s 0 report",
+        "find . -name '*.tmp' -delete",
+        "git reset --hard HEAD",
+        "git clean -fd",
+        "git branch -D obsolete",
+        "git add file",
+        "git commit -m change",
+        "git checkout other-branch",
+        "git switch other-branch",
+        "git restore file",
+        "git apply patch.diff",
+        "git merge other-branch",
+        "git rebase main",
+        "git cherry-pick HEAD~1",
+        "git stash pop",
+        "git tag release",
+        "git push origin main",
+        "git diff --output=changes.patch",
+        "git diff --ext-diff",
+        "git grep --open-files-in-pager=vim needle",
+        "command git add file",
+        "cd /workspace && env git add file",
+        "env GIT_CONFIG_NOSYSTEM=1 git add file",
+        "sh -c 'git add file'",
+        "sh -c 'rm -rf build'",
+        "env rm -f victim",
+        "env -i /bin/rm victim",
+        "env -u HOME -- /bin/rm victim",
+        "env --unset=HOME /bin/rm victim",
+        "env -i /usr/bin/git clean -fd",
+        "env -u HOME -- /usr/bin/git clean -fd",
+        "env --unset=HOME /usr/bin/git clean -fd",
+        "env --unknown /bin/rm victim",
+        "env -u",
+        "FOO=1 rm -f victim",
+        "cp source existing",
+        "mv source existing",
+        "install source existing",
+        "dd if=source of=existing",
+        "tee existing < source",
+        "sed -i.bak s/old/new/ existing",
+        "perl -i -pe 's/old/new/' existing",
+        "env cp source existing && echo done",
+        "FOO=1 command mv source existing",
+        "sh -c 'install source existing'",
+        ": > victim",
+        "printf text > victim",
+        "printf text &> victim",
+        "printf text >& victim",
+        "printf text 1>& victim",
+        "printf text 2&> victim",
+        "env FOO=1 git add file",
+        "FOO=1 git add file; echo done",
+    ],
+)
+def test_destructive_shell_syntax_is_classified_for_fresh_review(source):
+    """Recognized shell spellings request a fresh Git or destructive decision."""
+    findings = CommandInspection().inspect(source)
+    assert findings
+    assert all(finding.status is CommandReviewStatus.FRESH for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "printf '%s' 'rm -rf build'",
+        "printf text 2>&1",
+        "printf text >&1",
+        "; printf ok",
+        "exec",
+        "env",
+        "echo '",
+    ],
+)
+def test_non_destructive_or_invalid_syntax_has_no_finding(source):
+    """Literal output and invalid shell text do not imply a file mutation."""
+    assert not CommandInspection().inspect(source)
+
+
 def test_command_inspection_does_not_claim_safety_from_no_findings():
     """An inspection reports no finding for unrecognized, invalid, or incomplete shell text."""
     inspection = CommandInspection()

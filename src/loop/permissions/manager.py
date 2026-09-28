@@ -8,8 +8,10 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import re
 import shlex
 import sqlite3
+import stat
 import tempfile
 from atexit import register
 from collections.abc import Iterable
@@ -32,12 +34,16 @@ from ..utils import (
     sha256_digest,
 )
 from .audit import SQLitePermissionAudit
+from .inspection import CommandAnalysis, CommandInspection
 from .models import (
     Action,
     ApprovalChoice,
     AuthorizationResult,
+    CommandFinding,
+    CommandReviewStatus,
     Decision,
     FileTarget,
+    HostCommandRule,
     NetworkTarget,
     Operation,
     Operations,
@@ -58,12 +64,15 @@ from .models import (
     PresetSource,
     ProcessBoundary,
     ProcessTarget,
+    SandboxedCommandRule,
     SessionPolicyOverrides,
     SessionTarget,
     UserPermissionConfiguration,
 )
+from .protection import ProtectedWorkspacePaths, protected_workspace_paths
 
 if TYPE_CHECKING:
+    from ..execution.sandbox import SandboxRequest
     from ..interaction import Interaction
 
 _READ_ACTIONS = {Action.FILESYSTEM_LIST, Action.FILESYSTEM_READ}
@@ -80,6 +89,7 @@ _LIMIT_NAMES = (
     "allow_host_processes",
 )
 _LOGGER = logging.getLogger(__name__)
+_SIMPLE_COMMAND = re.compile(r"[A-Za-z0-9_./:@+=,-]+(?: [A-Za-z0-9_./:@+=,-]+)+")
 _LIVE_MANAGERS: WeakSet[PermissionManager] = WeakSet()
 
 
@@ -110,6 +120,8 @@ class PermissionManager:
             the built-in catalog. Duplicate identifiers are rejected.
         load_policy (PermissionLoadPolicy | None): Artifact failure behavior. Defaults to
             interactive recovery when an interaction is available and strict errors otherwise.
+        command_inspection (CommandInspection | None): Trusted command inspection. Defaults to
+            the built-in matchers.
 
     Raises:
         PermissionConfigurationError: If a policy is invalid in strict mode.
@@ -133,6 +145,8 @@ class PermissionManager:
     _presets: dict[str, PermissionPreset]
     _audit_store: SQLitePermissionAudit | None
     _workspace_id: str | None
+    _command_inspection: CommandInspection
+    _host_runtime_bindings: dict[str, str]
 
     def __init__(
         self,
@@ -147,7 +161,12 @@ class PermissionManager:
         configuration: PermissionConfiguration | None = None,
         presets: Iterable[PermissionPreset] | None = None,
         load_policy: PermissionLoadPolicy | None = None,
+        command_inspection: CommandInspection | None = None,
     ) -> None:
+        self._command_inspection = (
+            command_inspection if command_inspection is not None else CommandInspection()
+        )
+        self._host_runtime_bindings = {}
         self._workspace_root = (
             Path(workspace_root).resolve() if workspace_root is not None else None
         )
@@ -354,6 +373,7 @@ class PermissionManager:
         *,
         interaction: Interaction | None = None,
         recorder: PermissionRecorder | None = None,
+        protected_instruction_names: tuple[str, ...] = (),
     ) -> AuthorizationResult:
         """Evaluate and approve one complete operation set atomically.
 
@@ -361,11 +381,23 @@ class PermissionManager:
             operations (Operations): Complete normalized effects of one tool call.
             interaction (Interaction | None): Invocation interaction overriding the default.
             recorder (PermissionRecorder | None): Invocation recorder overriding the default.
+            protected_instruction_names (tuple[str, ...]): Active instruction filenames that
+                require a fresh decision when a structured tool changes them.
 
         Returns:
             AuthorizationResult: Policy, prompt, and effective result for the complete set.
         """
         policy = self.evaluate(operations)
+        fresh_file_review = self._requires_fresh_file_review(
+            operations, self.protected_instruction_names(protected_instruction_names)
+        )
+        if fresh_file_review and policy.decision is not Decision.DENY:
+            policy = PolicyDecision(
+                decision=Decision.ASK,
+                reason="A user-managed replacement, deletion, "
+                "or instruction change needs fresh approval.",
+                sources=("boundary:fresh_file_review",),
+            )
         active_interaction = interaction if interaction is not None else self._interaction
         prompt = None
         decision = policy.decision
@@ -380,10 +412,15 @@ class PermissionManager:
                 source = "headless"
             else:
                 prompt_body = self._prompt(operations)
-                prompt = f"{prompt_body}\nProceed?"
+                prompt = (
+                    f"{prompt_body}\nProceed with this one file change?"
+                    if fresh_file_review
+                    else f"{prompt_body}\nProceed?"
+                )
                 selected = self.request_permission(
                     prompt_body,
                     interaction=active_interaction,
+                    fresh_only=fresh_file_review,
                 )
                 approval_choice = (
                     selected
@@ -392,6 +429,8 @@ class PermissionManager:
                     if selected is True
                     else ApprovalChoice.DENY
                 )
+                if fresh_file_review and approval_choice is not ApprovalChoice.ONCE:
+                    approval_choice = ApprovalChoice.DENY
                 if approval_choice is ApprovalChoice.WORKSPACE and self._configuration_path is None:
                     approval_choice = ApprovalChoice.DENY
                     decision = Decision.DENY
@@ -452,17 +491,793 @@ class PermissionManager:
             active_recorder.record_authorization(result)
         return result
 
+    def _requires_fresh_file_review(
+        self,
+        operations: Operations,
+        protected_instruction_names: tuple[str, ...],
+    ) -> bool:
+        """Identify user-owned replacement/deletion and instruction mutations."""
+        protection = protected_workspace_paths(protected_instruction_names)
+        for operation in operations:
+            target = operation.target
+            if not isinstance(target, FileTarget) or operation.action not in _WRITE_ACTIONS:
+                continue
+            if operation.action in {Action.FILESYSTEM_REPLACE, Action.FILESYSTEM_DELETE}:
+                return True
+            if self._workspace_root is None:
+                continue
+            path = Path(target.path).resolve(strict=False)
+            if not path.is_relative_to(self._workspace_root):
+                continue
+            relative = path.relative_to(self._workspace_root)
+            if relative.name in (
+                *protection.instruction_names,
+                *protection.files,
+            ) or protection.protects_directory(relative):
+                return True
+        return False
+
+    def inspect_command(self, source: str) -> tuple[CommandFinding, ...]:
+        """Collect command findings from this manager's registry.
+
+        Args:
+            source (str): Opaque shell source to inspect heuristically.
+
+        Returns:
+            tuple[CommandFinding, ...]: Applicable findings; absence does not prove safety.
+        """
+        return self._command_inspection.inspect(source)
+
+    def analyze_command(self, source: str) -> CommandAnalysis:
+        """Collect advisory findings and executable names in one inspection.
+
+        Args:
+            source (str): Opaque shell source to inspect heuristically.
+
+        Returns:
+            CommandAnalysis: Bounded findings and candidate names; absence proves no safety.
+        """
+        return self._command_inspection.analyze(source)
+
+    def protected_instruction_names(self, configured: Iterable[str] = ()) -> tuple[str, ...]:
+        """Bind configured instruction filenames into native command protection.
+
+        Args:
+            configured (Iterable[str]): Active project instruction basenames.
+
+        Returns:
+            tuple[str, ...]: Default and active filenames requiring native write denial.
+
+        Raises:
+            ValueError: If a configured name is not a plain filename.
+        """
+        return protected_workspace_paths(configured).instruction_names
+
+    def protected_sandbox_paths(self, configured: Iterable[str] = ()) -> ProtectedWorkspacePaths:
+        """Describe workspace paths that ordinary sandbox commands cannot mutate.
+
+        Args:
+            configured (Iterable[str]): Active project instruction basenames.
+
+        Returns:
+            ProtectedWorkspacePaths: Instruction basenames and protected relative paths.
+
+        Raises:
+            ValueError: If a configured instruction name is not a plain filename.
+        """
+        return protected_workspace_paths(configured)
+
+    @staticmethod
+    def git_sandbox_roots(
+        workspace: Path,
+        *,
+        read: bool,
+        write: bool,
+    ) -> tuple[tuple[Path, ...], tuple[Path, ...], bool]:
+        """Bind Git metadata reads, writes, and creation for one workspace.
+
+        Args:
+            workspace (Path): Canonical workspace root.
+            read (bool): Whether the command inspects Git metadata.
+            write (bool): Whether Git metadata mutation was requested.
+
+        Returns:
+            tuple[tuple[Path, ...], tuple[Path, ...], bool]: Linked metadata read roots,
+                approved metadata write roots, and new repository creation intent.
+
+        Raises:
+            ValueError: If a linked worktree pointer or creation target is unsafe.
+        """
+        if not (read or write):
+            return (), (), False
+        git_directory = workspace / constants.GIT_DIRECTORY
+        if git_directory.is_file():
+            details = git_directory.lstat()
+            if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+                raise ValueError("Unsafe linked worktree Git pointer.")
+            pointer = git_directory.read_text(encoding="utf-8").strip()
+            if not pointer.startswith("gitdir: "):
+                raise ValueError("Invalid linked worktree Git directory pointer.")
+            git_root = (git_directory.parent / pointer[8:]).resolve(strict=True)
+            if not git_root.is_dir() or not (git_root / "HEAD").is_file():
+                raise ValueError("Invalid linked worktree Git metadata directory.")
+            reads = (git_root,)
+            common_pointer = git_root / "commondir"
+            if common_pointer.exists():
+                common_details = common_pointer.lstat()
+                if not stat.S_ISREG(common_details.st_mode) or common_details.st_nlink != 1:
+                    raise ValueError("Unsafe linked worktree common Git pointer.")
+                common_directory = (
+                    git_root / common_pointer.read_text(encoding="utf-8").strip()
+                ).resolve(strict=True)
+                if not common_directory.is_dir() or not (common_directory / "HEAD").is_file():
+                    raise ValueError("Invalid linked worktree common Git directory.")
+                reads = (*reads, common_directory)
+            return reads, reads if write else (), False
+        if write:
+            if git_directory.is_symlink():
+                raise ValueError("Unsafe Git metadata creation target.")
+            return (
+                (),
+                (git_directory,) if git_directory.exists() else (),
+                not git_directory.exists(),
+            )
+        return (), (), False
+
+    @staticmethod
+    def describe_sandbox_reads(
+        workspace: Path,
+        roots: tuple[Path, ...],
+        manual_roots: tuple[Path, ...],
+        tool_names: tuple[str, ...],
+        package_installation: bool,
+    ) -> str | None:
+        """Describe expanded read authority without exposing host paths in a prompt.
+
+        Args:
+            workspace (Path): Selected user workspace root.
+            roots (tuple[Path, ...]): All effective extra read roots.
+            manual_roots (tuple[Path, ...]): Roots supplied directly by the caller.
+            tool_names (tuple[str, ...]): Names of identity-bound installed tools.
+            package_installation (bool): Whether all tool roots are a recognized package install.
+
+        Returns:
+            str | None: Honest plain-language context for expanded reads, if any.
+        """
+        if not roots:
+            return None
+        if any(
+            root == Path("/")
+            or (workspace.is_relative_to(root) and root != workspace)
+            or (root in manual_roots and len(root.parts) <= 3)
+            for root in roots
+        ):
+            return "Read a broad area outside the workspace"
+        if tool_names and manual_roots:
+            return "Use installed tools and read an additional folder outside the workspace"
+        if len(tool_names) > 1:
+            return "Use installed developer tools"
+        if tool_names:
+            return (
+                f"Use installed {tool_names[0]}"
+                if package_installation
+                else f"Read the installed {tool_names[0]} tool folder"
+            )
+        return "Read an additional folder outside the workspace"
+
+    @staticmethod
+    def host_retry_prompt(
+        source: str,
+        outcome: str,
+        exit_code: int | None,
+        possible_effects: bool,
+    ) -> str:
+        """Describe an offered unrestricted host run and possible repeated effects.
+
+        Args:
+            source (str): Exact shell source proposed for the host retry.
+            outcome (str): Completed, denied, or unavailable sandbox outcome.
+            exit_code (int | None): Completed sandbox command's exit code, if any.
+            possible_effects (bool): Whether the sandbox attempt may have changed state.
+
+        Returns:
+            str: Human warning for the separate host authorization boundary.
+        """
+        if outcome == "completed":
+            reason = (
+                "The command exited with code "
+                f"{exit_code}, and the OS denied an operation during this attempt. "
+                "The denial may be unrelated to the exit."
+            )
+        else:
+            reason = (
+                "The sandbox denied this command."
+                if outcome == "denied"
+                else "The sandbox was unavailable."
+            )
+        repeat = (
+            "\nThe sandboxed attempt may already have had effects. "
+            "Retrying may repeat those effects."
+            if possible_effects or outcome == "completed"
+            else ""
+        )
+        return (
+            f"Command: {json.dumps(source)}\n"
+            f"Reason: {reason} Running without the OS sandbox can read private files, "
+            "change files outside the workspace, and use the network."
+            f"{repeat}"
+        )
+
+    @staticmethod
+    def host_retry_choices(reusable: bool) -> tuple[dict[str, str], dict[str, str]]:
+        """Return permission-owned choices for a fresh or reusable host offer.
+
+        Args:
+            reusable (bool): Whether a prelaunch failure permits a stable exact session rule.
+
+        Returns:
+            tuple[dict[str, str], dict[str, str]]: Choice labels and keyboard index.
+        """
+        choices = {"deny": "Deny", "approve": "Approve this one host run"}
+        index = {"deny": "N", "approve": "Y"}
+        if reusable:
+            choices["session"] = "Allow this exact host command for this session"
+            index["session"] = "S"
+        return choices, index
+
+    def command_needs_git_write(self, source: str) -> bool:
+        """Report whether this registry requests Git metadata write authority.
+
+        Args:
+            source (str): Opaque shell source to inspect conservatively.
+
+        Returns:
+            bool: Whether any inspector requests Git write authority. Unrecognized shell
+                indirection remains subject to the OS protection on Git metadata.
+        """
+        return any(finding.requests_git_write for finding in self.inspect_command(source))
+
+    def authorize_sandboxed_command(
+        self,
+        request: SandboxRequest,
+        *,
+        tool_id: str,
+        interaction: Interaction | None = None,
+    ) -> bool:
+        """Authorize a bound sandbox request using sandbox-only scoped approval rules.
+
+        Legacy process allow rules never approve this request. Explicit deny policy still takes
+        precedence. Commands within the default workspace sandbox run without a prompt;
+        additional authority requires a sandbox-only approval.
+
+        Args:
+            request (SandboxRequest): Exact command, authority, and path identities to approve.
+            tool_id (str): Registered execution tool identity for policy and audit.
+            interaction (Interaction | None): Interactive approval surface.
+
+        Returns:
+            bool: Whether policy or the user approved this sandbox attempt.
+        """
+        policy = self.evaluate((self._sandbox_operation(request, tool_id),))
+        if policy.decision is Decision.DENY:
+            self._audit_sandbox_denial(request, source="policy")
+            return False
+        scratch_roots = self._sandbox_scratch_roots(request)
+        explicit_ask = policy.decision is Decision.ASK and any(
+            source.startswith("rule:") for source in policy.sources
+        )
+        findings = self.inspect_command(request.source)
+        fresh_review = any(finding.status is CommandReviewStatus.FRESH for finding in findings)
+        self._audit_sandbox_scope(request, findings)
+        if self._has_default_sandbox_access(
+            request,
+            scratch_roots,
+            explicit_ask=explicit_ask,
+            findings=findings,
+        ):
+            self._audit_sandbox_decision(request, decision="allow", source="workspace_sandbox")
+            return True
+        matched_scope = None if fresh_review else self._matching_sandbox_rule_scope(request)
+        if matched_scope is not None:
+            self._audit_sandbox_decision(
+                request,
+                decision="allow",
+                source=f"rule:{matched_scope.value}",
+            )
+            return True
+        active_interaction = interaction if interaction is not None else self._interaction
+        if active_interaction is None:
+            self._audit_sandbox_denial(request, source="headless")
+            return False
+
+        approved = self._request_sandbox_approval(
+            request,
+            interaction=active_interaction,
+            scratch_roots=scratch_roots,
+            findings=findings,
+            explicit_ask=explicit_ask,
+            fresh_review=fresh_review,
+        )
+        self._audit_sandbox_decision(
+            request,
+            decision="allow" if approved else "deny",
+            source="interactive",
+        )
+        return approved
+
+    @staticmethod
+    def _sandbox_operation(request: SandboxRequest, tool_id: str) -> Operation:
+        """Build the policy operation representing one sandboxed command."""
+        return Operation(
+            tool_id=tool_id,
+            action=Action.PROCESS_EXECUTE,
+            target=ProcessTarget(
+                argv=("/bin/sh", "-c", request.source),
+                cwd=str(request.cwd),
+                boundary=ProcessBoundary.SANDBOXED,
+            ),
+        )
+
+    @staticmethod
+    def _sandbox_scratch_roots(request: SandboxRequest) -> set[Path]:
+        """Return host paths backing the request's temporary aliases."""
+        return {
+            target for virtual, _, target in request.aliases if virtual == VirtualPath.TEMPORARY
+        }
+
+    def _audit_sandbox_scope(
+        self,
+        request: SandboxRequest,
+        findings: tuple[CommandFinding, ...],
+    ) -> None:
+        """Record the exact sandbox authority considered for approval."""
+        self._append_audit(
+            "sandbox.permission_scope",
+            {
+                "attempt_id": request.attempt_id,
+                "read_roots": [str(root) for root in request.read_roots],
+                "automatic_tool_reads": [str(root) for root in request.automatic_tool_reads],
+                "read_aliases": [str(alias) for alias in request.read_aliases],
+                "executables": [
+                    {"name": name, "spelling": str(spelling), "target": str(resolved)}
+                    for name, spelling, resolved, _, _ in request.executable_identities
+                ],
+                "write_roots": [str(root) for root in request.write_roots],
+                "policy_version": request.policy_version,
+                "review_policies": [finding.policy_id for finding in findings],
+            },
+        )
+
+    @staticmethod
+    def _has_default_sandbox_access(
+        request: SandboxRequest,
+        scratch_roots: set[Path],
+        *,
+        explicit_ask: bool,
+        findings: tuple[CommandFinding, ...],
+    ) -> bool:
+        """Report whether a request stays inside the unprompted workspace sandbox."""
+        allowed_aliases = all(
+            (virtual == VirtualPath.WORKSPACE and target == request.workspace)
+            or (virtual == VirtualPath.TEMPORARY and target in scratch_roots)
+            for virtual, _, target in request.aliases
+        )
+        return (
+            not explicit_ask
+            and not findings
+            and set(request.read_roots) <= set(request.automatic_tool_reads)
+            and not request.network
+            and not request.git_create
+            and set(request.write_roots) <= {request.workspace, *scratch_roots}
+            and allowed_aliases
+        )
+
+    def _matching_sandbox_rule_scope(self, request: SandboxRequest) -> ApprovalChoice | None:
+        """Return the first remembered scope that approves this exact request."""
+        for scope in (
+            ApprovalChoice.SESSION,
+            ApprovalChoice.WORKSPACE,
+            ApprovalChoice.USER,
+        ):
+            signature = request.sandbox_command_signature(
+                self._sandbox_scope_identity(request, scope)
+            )
+            if any(
+                self._sandbox_matches(rule, request.source, signature)
+                for rule in self.sandboxed_command_rules(scope)
+            ):
+                return scope
+        return None
+
+    def _request_sandbox_approval(
+        self,
+        request: SandboxRequest,
+        *,
+        interaction: Interaction,
+        scratch_roots: set[Path],
+        findings: tuple[CommandFinding, ...],
+        explicit_ask: bool,
+        fresh_review: bool,
+    ) -> bool:
+        """Prompt for a sandbox command and remember a selected approval when allowed."""
+        interaction.info(
+            self._sandbox_permission_message(
+                request,
+                scratch_roots=scratch_roots,
+                findings=findings,
+                explicit_ask=explicit_ask,
+            )
+        )
+        choices, index, prefix = self._sandbox_approval_choices(request, fresh_review=fresh_review)
+        selected = interaction.prompt(
+            "Allow this command?", exit_commands=None, choices=choices, index=index
+        )
+        if selected not in choices or selected == "deny":
+            return False
+        return selected == "approve" or self._remember_sandbox_approval(
+            request,
+            selected=selected,
+            prefix=prefix,
+        )
+
+    def _sandbox_permission_message(
+        self,
+        request: SandboxRequest,
+        *,
+        scratch_roots: set[Path],
+        findings: tuple[CommandFinding, ...],
+        explicit_ask: bool,
+    ) -> str:
+        """Describe the additional authority requested without exposing local paths."""
+        reads_outside_workspace = request.read_roots or any(
+            not (
+                (virtual == VirtualPath.WORKSPACE and target == request.workspace)
+                or (virtual == VirtualPath.TEMPORARY and target in scratch_roots)
+            )
+            for virtual, _, target in request.aliases
+        )
+        read_context = self._sandbox_read_context(request, reads_outside_workspace)
+        reasons = self._sandbox_permission_reasons(
+            request,
+            scratch_roots=scratch_roots,
+            findings=findings,
+            reads_outside_workspace=reads_outside_workspace,
+            explicit_ask=explicit_ask,
+        )
+        contexts = [read_context] if read_context is not None else []
+        contexts.extend(finding.context for finding in findings)
+        if not contexts:
+            contexts.append("Run this command with additional sandbox access")
+        return (
+            f"Command: {json.dumps(request.source)}\n"
+            f"Context: {'; '.join(contexts)}.\n"
+            f"Reason: Needs permission to {', '.join(reasons)}."
+        )
+
+    @staticmethod
+    def _sandbox_read_context(request: SandboxRequest, reads_outside_workspace: bool) -> str | None:
+        """Describe extra read authority at a human-safe level."""
+        if not reads_outside_workspace:
+            return request.read_context
+        if request.read_context is not None:
+            return request.read_context
+        broad_roots = {
+            Path("/"),
+            Path("/Users"),
+            Path("/opt"),
+            Path("/usr"),
+            Path("/private/tmp"),
+            Path("/tmp"),
+        }
+        if any(
+            root in broad_roots
+            or (request.workspace.is_relative_to(root) and root != request.workspace)
+            for root in request.read_roots
+        ):
+            return "Read a broad area outside the workspace"
+        return "Read an additional folder outside the workspace"
+
+    @staticmethod
+    def _sandbox_permission_reasons(
+        request: SandboxRequest,
+        *,
+        scratch_roots: set[Path],
+        findings: tuple[CommandFinding, ...],
+        reads_outside_workspace: bool,
+        explicit_ask: bool,
+    ) -> list[str]:
+        """List the policy reasons that require an interactive decision."""
+        reasons = ["read files outside this workspace"] if reads_outside_workspace else []
+        extra_writes = set(request.write_roots) - {request.workspace, *scratch_roots}
+        if extra_writes:
+            reasons.append(
+                "change Git metadata"
+                if all(".git" in root.parts for root in extra_writes)
+                else "write outside this workspace"
+            )
+        if request.git_create:
+            reasons.append("create Git metadata")
+        if request.network:
+            reasons.append("use the network")
+        reasons.extend(finding.reason for finding in findings)
+        if explicit_ask and not reasons:
+            reasons.append("run under your command approval rule")
+        return reasons
+
+    def _sandbox_approval_choices(
+        self,
+        request: SandboxRequest,
+        *,
+        fresh_review: bool,
+    ) -> tuple[dict[str, str], dict[str, str], str | None]:
+        """Build permitted interactive choices and their optional similar-command prefix."""
+        choices = {"deny": "Deny", "approve": "Allow once", "session": "Allow for this session"}
+        index = {"deny": "N", "approve": "Y", "session": "S"}
+        if fresh_review:
+            choices.pop("session")
+            index.pop("session")
+            return choices, index, None
+        if self._user_configuration_path is not None:
+            choices["workspace"] = "Allow in this workspace"
+            index["workspace"] = "W"
+            choices["user"] = "Allow for this user"
+            index["user"] = "U"
+        prefix = self._similar_prefix(request.source)
+        if prefix is not None:
+            self._add_similar_sandbox_choices(choices, index, prefix)
+        return choices, index, prefix
+
+    @staticmethod
+    def _add_similar_sandbox_choices(
+        choices: dict[str, str],
+        index: dict[str, str],
+        prefix: str,
+    ) -> None:
+        """Add similar-command choices for each available remembered-rule scope."""
+        for scope, shortcut in (("session", "A"), ("workspace", "B"), ("user", "C")):
+            if scope in choices:
+                choices[f"similar_{scope}"] = f"Allow similar '{prefix} …' commands ({scope})"
+                index[f"similar_{scope}"] = shortcut
+
+    def _remember_sandbox_approval(
+        self,
+        request: SandboxRequest,
+        *,
+        selected: str,
+        prefix: str | None,
+    ) -> bool:
+        """Persist a remembered approval selected through the sandbox command prompt."""
+        similar = selected.startswith("similar_")
+        scope = ApprovalChoice(selected.removeprefix("similar_"))
+        rule = SandboxedCommandRule(
+            signature=request.sandbox_command_signature(
+                self._sandbox_scope_identity(request, scope)
+            ),
+            source=prefix if similar else request.source,
+            similar=similar,
+            scope=scope,
+        )
+        try:
+            if scope is ApprovalChoice.SESSION:
+                self._session_overrides.sandboxed_command_rules.append(rule)
+            else:
+                updated_user = self._user_configuration.model_copy(deep=True)
+                updated_user.sandboxed_command_rules.append(rule)
+                self._replace_user_configuration(updated_user)
+        except OSError:
+            return False
+        telemetry_audit(
+            "sandbox.permission_rule_added",
+            workspace_id=request.workspace_id,
+            scope=scope.value,
+            rule_id=rule.id,
+            similar=similar,
+        )
+        return True
+
+    @staticmethod
+    def _audit_sandbox_decision(request: SandboxRequest, *, decision: str, source: str) -> None:
+        """Record a completed sandbox authorization decision."""
+        telemetry_audit(
+            "sandbox.permission_decided",
+            workspace_id=request.workspace_id,
+            attempt_id=request.attempt_id,
+            decision=decision,
+            source=source,
+        )
+
+    @staticmethod
+    def _audit_sandbox_denial(request: SandboxRequest, *, source: str) -> None:
+        """Record a sandbox denial before interactive approval is available."""
+        telemetry_audit(
+            "sandbox.permission_denied",
+            workspace_id=request.workspace_id,
+            attempt_id=request.attempt_id,
+            source=source,
+        )
+
+    @staticmethod
+    def _sandbox_scope_identity(request: SandboxRequest, scope: ApprovalChoice) -> str:
+        """Return the policy identity applicable to one remembered-rule scope."""
+        return request.workspace_id if scope is not ApprovalChoice.USER else "user"
+
+    @staticmethod
+    def _similar_prefix(source: str) -> str | None:
+        """Offer similarity only for simple literal command words."""
+        if _SIMPLE_COMMAND.fullmatch(source) is None:
+            return None
+        words = source.split()
+        if words[0] in {
+            "python",
+            "python3",
+            "sh",
+            "bash",
+            "zsh",
+            "node",
+            "ruby",
+            "perl",
+            "env",
+        }:
+            return None
+        if words[1].startswith("-"):
+            return None
+        return " ".join(words[:2])
+
+    @staticmethod
+    def _sandbox_matches(rule: SandboxedCommandRule, source: str, signature: str) -> bool:
+        """Match an exact source or reviewed simple prefix at one authority."""
+        if rule.signature != signature:
+            return False
+        if not rule.similar:
+            return rule.source == source
+        return PermissionManager._similar_prefix(source) == rule.source and (
+            source == rule.source or source.startswith(rule.source + " ")
+        )
+
+    def sandboxed_command_rules(self, scope: ApprovalChoice) -> tuple[SandboxedCommandRule, ...]:
+        """Return sandbox-only approvals stored at one lifetime scope.
+
+        Args:
+            scope (ApprovalChoice): Session, workspace, or user policy layer.
+
+        Returns:
+            tuple[SandboxedCommandRule, ...]: Copies of remembered sandbox approvals.
+
+        Raises:
+            ValueError: If the scope cannot store approvals.
+        """
+        if scope is ApprovalChoice.SESSION:
+            rules = self._session_overrides.sandboxed_command_rules
+        elif scope in {ApprovalChoice.WORKSPACE, ApprovalChoice.USER}:
+            rules = [
+                rule
+                for rule in self._user_configuration.sandboxed_command_rules
+                if rule.scope is scope
+            ]
+        else:
+            raise ValueError("Native command rules require session, workspace, or user scope.")
+        return tuple(rule.model_copy(deep=True) for rule in rules)
+
+    def remove_sandboxed_command_rule(self, scope: ApprovalChoice, rule_id: str) -> bool:
+        """Remove one remembered sandbox-only approval by identifier.
+
+        Args:
+            scope (ApprovalChoice): Session, workspace, or user policy layer.
+            rule_id (str): Identifier of the approval to remove.
+
+        Returns:
+            bool: Whether a rule was removed.
+
+        Raises:
+            ValueError: If the scope cannot store approvals.
+            OSError: If the changed persistent policy cannot be written.
+        """
+        rules = list(self.sandboxed_command_rules(scope))
+        remaining = [rule for rule in rules if rule.id != rule_id]
+        if len(remaining) == len(rules):
+            return False
+        if scope is ApprovalChoice.SESSION:
+            self._session_overrides.sandboxed_command_rules = remaining
+        else:
+            updated_user = self._user_configuration.model_copy(deep=True)
+            updated_user.sandboxed_command_rules = [
+                rule
+                for rule in updated_user.sandboxed_command_rules
+                if rule.id != rule_id or rule.scope is not scope
+            ]
+            self._replace_user_configuration(updated_user)
+        telemetry_audit("sandbox.permission_rule_removed", scope=scope.value, rule_id=rule_id)
+        return True
+
+    def host_command_rules(self) -> tuple[HostCommandRule, ...]:
+        """List revocable exact host approvals for this session.
+
+        Returns:
+            tuple[HostCommandRule, ...]: Independent copies of active host rules.
+        """
+        return tuple(
+            rule.model_copy(deep=True) for rule in self._session_overrides.host_command_rules
+        )
+
+    def matching_host_command_rule(self, request: SandboxRequest) -> HostCommandRule | None:
+        """Find an exact host rule for the current bound command context.
+
+        Args:
+            request (SandboxRequest): Freshly validated command request.
+
+        Returns:
+            HostCommandRule | None: Matching session approval, if present.
+        """
+        signature = request.host_command_signature()
+        return next(
+            (
+                rule.model_copy(deep=True)
+                for rule in self._session_overrides.host_command_rules
+                if rule.signature == signature
+                and self._host_runtime_bindings.get(rule.id)
+                == request.host_command_runtime_signature()
+            ),
+            None,
+        )
+
+    def remember_host_command_rule(self, request: SandboxRequest) -> HostCommandRule:
+        """Record one explicitly approved exact host retry for this session.
+
+        Args:
+            request (SandboxRequest): Unchanged context approved at the host boundary.
+
+        Returns:
+            HostCommandRule: New revocable host-only decision.
+        """
+        relative_cwd = request.cwd.relative_to(request.workspace)
+        rule = HostCommandRule(
+            signature=request.host_command_signature(),
+            cwd=(
+                VirtualPath.WORKSPACE
+                if relative_cwd == Path(".")
+                else f"{VirtualPath.WORKSPACE}/{relative_cwd.as_posix()}"
+            ),
+            source=request.source if "/" not in request.source else "<path-bearing-command>",
+        )
+        self._session_overrides.host_command_rules.append(rule)
+        self._host_runtime_bindings[rule.id] = request.host_command_runtime_signature()
+        telemetry_audit(
+            "host_command.rule_added", workspace_id=request.workspace_id, rule_id=rule.id
+        )
+        return rule.model_copy(deep=True)
+
+    def remove_host_command_rule(self, rule_id: str) -> bool:
+        """Revoke one session host approval by identifier.
+
+        Args:
+            rule_id (str): Identifier of the recorded approval.
+
+        Returns:
+            bool: Whether a matching rule was removed.
+        """
+        before = len(self._session_overrides.host_command_rules)
+        self._session_overrides.host_command_rules = [
+            rule for rule in self._session_overrides.host_command_rules if rule.id != rule_id
+        ]
+        removed = len(self._session_overrides.host_command_rules) != before
+        if removed:
+            self._host_runtime_bindings.pop(rule_id, None)
+            telemetry_audit("host_command.rule_removed", rule_id=rule_id)
+        return removed
+
     def request_permission(
         self,
         prompt: str,
         *,
         interaction: Interaction | None = None,
+        fresh_only: bool = False,
     ) -> ApprovalChoice:
         """Request one scoped approval through a generic user interaction.
 
         Args:
             prompt (str): Complete operation description to display.
             interaction (Interaction | None): Invocation interaction overriding the default.
+            fresh_only (bool): Offer only a one-time choice for user-managed data changes.
 
         Returns:
             ApprovalChoice: Selected denial or approval lifetime. Cancellation denies.
@@ -477,10 +1292,13 @@ class PermissionManager:
             ApprovalChoice.ONCE: "Y",
             ApprovalChoice.SESSION: "S",
         }
-        if self._configuration_path is not None:
+        if fresh_only:
+            choices.pop(ApprovalChoice.SESSION)
+            index.pop(ApprovalChoice.SESSION)
+        if not fresh_only and self._configuration_path is not None:
             choices[ApprovalChoice.WORKSPACE] = "Allow in this workspace"
             index[ApprovalChoice.WORKSPACE] = "W"
-        if self._user_configuration_path is not None:
+        if not fresh_only and self._user_configuration_path is not None:
             choices[ApprovalChoice.USER] = "Always allow for this user"
             index[ApprovalChoice.USER] = "U"
         active_interaction = interaction if interaction is not None else self._interaction
@@ -907,6 +1725,7 @@ class PermissionManager:
         """
         changed = self._session_overrides != SessionPolicyOverrides()
         self._session_overrides = SessionPolicyOverrides()
+        self._host_runtime_bindings.clear()
         if changed:
             self._audit_policy_change("permission.session_reset", PolicyScope.SESSION)
         return changed
@@ -1020,6 +1839,7 @@ class PermissionManager:
 
     def _replace_user_configuration(self, configuration: UserPermissionConfiguration) -> None:
         """Persist and activate one user-wide remembered-approval policy transactionally."""
+        configuration = UserPermissionConfiguration.model_validate(configuration.model_dump())
         self._persist_configuration(self._user_configuration_path, configuration)
         self._user_configuration = configuration
 

@@ -14,6 +14,7 @@ from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
 from ..constants import OMIT, Omit
 from ..errors import Problem, ProblemException, log_problem
+from ..execution import CommandExecutionService
 from ..instructions import InstructionsManager
 from ..interaction import Interaction
 from ..models import (
@@ -28,8 +29,10 @@ from ..permissions import (
     OperationPlanner,
     Operations,
     PermissionManager,
+    ProcessBoundary,
+    ProcessTarget,
 )
-from ..utils import callable_name
+from ..utils import VirtualPath, callable_name
 from .context import ToolContext
 from .models import (
     ToolPreflight,
@@ -57,6 +60,8 @@ class ToolRegistry:
             Defaults to an in-memory supervised policy manager.
         settings (ToolRuntimeSettings | None): Scoped settings supplied to context-aware tools, or
             ``None`` to use an independent default instance.
+        execution_service (CommandExecutionService | None): Injected command execution service, or
+            ``None`` to reject execution-capable tools before invocation.
     """
 
     _tools: dict[str, Tool]
@@ -64,6 +69,7 @@ class ToolRegistry:
     _permission_manager: PermissionManager
     _registration_problems: list[Problem]
     _settings: ToolRuntimeSettings
+    _execution_service: CommandExecutionService | None
 
     def __init__(
         self,
@@ -71,14 +77,21 @@ class ToolRegistry:
         interaction: Interaction | None = None,
         permission_manager: PermissionManager | None = None,
         settings: ToolRuntimeSettings | None = None,
+        execution_service: CommandExecutionService | None = None,
     ) -> None:
         self._tools = {}
         self._registration_problems = []
         self._interaction = interaction
         self._permission_manager = permission_manager or PermissionManager(interaction=interaction)
         self._settings = settings or ToolRuntimeSettings()
+        self._execution_service = execution_service
         for tool in tools or ():
             self.register(tool)
+
+    def close(self) -> None:
+        """Release the execution service owned by this registry."""
+        if self._execution_service is not None:
+            self._execution_service.close()
 
     @property
     def interaction(self) -> Interaction | None:
@@ -182,6 +195,8 @@ class ToolRegistry:
         result_presentation: ToolResultPresentationDeclaration | Omit = OMIT,
         preflight: ToolPreflight | None | Omit = OMIT,
         required: bool | Omit = OMIT,
+        execution_authorization: bool | Omit = OMIT,
+        requires_execution_service: bool | Omit = OMIT,
     ) -> bool:
         """Create and register a tool from a callable or configured registration.
 
@@ -202,6 +217,10 @@ class ToolRegistry:
                 to inherit; pass ``None`` to remove one.
             required (bool | Omit): Whether a broken tool requires an explicit choice to continue.
                 Omit it to inherit.
+            execution_authorization (bool | Omit): Native execution capability for this
+                registration, or omit to inherit its declaration.
+            requires_execution_service (bool | Omit): Native service dependency, or omit to
+                inherit its declaration.
 
         Returns:
             bool: Whether the tool was registered.
@@ -229,6 +248,16 @@ class ToolRegistry:
             )
             preflight = registration.preflight if isinstance(preflight, Omit) else preflight
             required = registration.required if isinstance(required, Omit) else required
+            execution_authorization = (
+                registration.execution_authorization
+                if isinstance(execution_authorization, Omit)
+                else execution_authorization
+            )
+            requires_execution_service = (
+                registration.requires_execution_service
+                if isinstance(requires_execution_service, Omit)
+                else requires_execution_service
+            )
         declared_tool = Tool.get_declaration(function)
         if declared_tool is None:
             declared_tool = Tool(function=function)
@@ -243,6 +272,8 @@ class ToolRegistry:
             result_presentation=result_presentation,
             preflight=preflight,
             required=required,
+            execution_authorization=execution_authorization,
+            requires_execution_service=requires_execution_service,
         )
         if registered.preflight is not None:
             preflight_error = None
@@ -577,6 +608,7 @@ class ToolRegistry:
             instructions_manager=instructions_manager,
             operations=plan.operations,
             prerequisite_operations=plan.prerequisite_operations,
+            permission_manager=(self._permission_manager if tool.execution_authorization else None),
         )
         result = tool.execute(plan.arguments, context)
         return ToolExecutionResult(
@@ -631,7 +663,13 @@ class ToolRegistry:
                 boundary_denial = permission_manager.check_boundaries(plan.boundary_operations)
                 if boundary_denial is not None:
                     return None, self._denied_problem(tool, boundary_denial.reason)
-                denied = self._authorize(tool, plan.operations, interaction, permission_manager)
+                denied = self._authorize(
+                    tool,
+                    plan.operations,
+                    interaction,
+                    permission_manager,
+                    instructions_manager,
+                )
                 if denied is not None:
                     return None, denied
                 if plan.continuation is None:
@@ -662,9 +700,7 @@ class ToolRegistry:
         for name, value in arguments.items():
             metadata = tool.arguments_model.model_fields[name].metadata
             if "loop:workspace-cwd" in metadata and value == "workspace":
-                resolved[name] = instructions_manager.virtual_paths.resolve("/workspace")
-            elif "loop:virtual-command" in metadata:
-                resolved[name] = instructions_manager.virtual_paths.resolve_command(str(value))
+                resolved[name] = instructions_manager.virtual_paths.resolve(VirtualPath.WORKSPACE)
             elif "loop:virtual-path" in metadata:
                 resolved[name] = instructions_manager.virtual_paths.resolve(str(value))
             else:
@@ -702,10 +738,38 @@ class ToolRegistry:
         operations: Operations,
         interaction: Interaction | None,
         permission_manager: PermissionManager,
+        instructions_manager: InstructionsManager | None,
     ) -> str | None:
         """Return a serialized denial or authorize the complete operation plan."""
+        if tool.execution_authorization:
+            if self._execution_service is None:
+                return self._problem(
+                    "sandbox.unavailable",
+                    "Sandbox unavailable",
+                    "Native execution service is unavailable.",
+                    tool.name,
+                )
+            if not operations or any(
+                operation.action is not Action.PROCESS_EXECUTE
+                or not isinstance(operation.target, ProcessTarget)
+                or operation.target.boundary is not ProcessBoundary.SANDBOXED
+                for operation in operations
+            ):
+                return self._problem(
+                    "sandbox.unavailable",
+                    "Sandbox unavailable",
+                    "Native execution request is not bound to a sandbox.",
+                    tool.name,
+                )
+            return None
         active_interaction = interaction if interaction is not None else self._interaction
-        result = permission_manager.authorize(operations, interaction=active_interaction)
+        result = permission_manager.authorize(
+            operations,
+            interaction=active_interaction,
+            protected_instruction_names=(
+                instructions_manager.agents_filenames if instructions_manager is not None else ()
+            ),
+        )
         if result.decision is Decision.DENY:
             return self._denied_problem(tool, result.reason)
         return None
@@ -749,7 +813,15 @@ class ToolRegistry:
             if permission_manager is None:  # pragma: no cover - callback is omitted below.
                 raise RuntimeError("Additional authorization is unavailable.")
             plan = tool.plan(arguments)
-            result = permission_manager.authorize(plan.operations, interaction=interaction)
+            result = permission_manager.authorize(
+                plan.operations,
+                interaction=interaction,
+                protected_instruction_names=(
+                    instructions_manager.agents_filenames
+                    if instructions_manager is not None
+                    else ()
+                ),
+            )
             if result.decision is Decision.DENY:
                 raise ProblemException(
                     Problem(
@@ -773,6 +845,10 @@ class ToolRegistry:
                 authorize_additional if permission_manager is not None else None
             ),
             settings=self._settings,
+            permission_manager=permission_manager,
+            execution_service=self._execution_service
+            if tool.execution_authorization or tool.requires_execution_service
+            else None,
         )
 
 

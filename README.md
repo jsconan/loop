@@ -18,7 +18,8 @@ The project defaults to a local server at `http://localhost:8000/v1` running
 - Responses API function-call handling
 - A decorator-based registry for synchronous and asynchronous Python tools
 - Built-in tools for filesystem access, shell commands, and the current date and time
-- Confirmation before a model writes a file or runs a shell command
+- Confirmation for file writes, destructive workspace commands, Git changes, and commands
+  that expand the default workspace sandbox
 - Hierarchical project instructions from `AGENTS.md` files
 - Progressive discovery and activation of Agent Skills from `SKILL.md` files
 
@@ -38,8 +39,7 @@ cd loop
 uv sync
 ```
 
-To install the optional tools dependency, which provides ripgrep for the
-`search_text` tool, include the `tools` extra:
+To install optional ripgrep for shell commands, include the `tools` extra:
 
 ```bash
 uv sync --extra tools
@@ -135,11 +135,15 @@ schema identifiers remain intact. Official OpenAI requests require `store=False`
 servers default to provider-managed retention and can explicitly declare `supported_false` or
 `required_false`. This transport setting is not a guarantee about provider-wide retention.
 
-Runtime instructions expose `/workspace`, `/tmp`, and `/skills/<name>` as VirtualPaths rather than
-host locations. File tools and command working directories resolve those typed paths at the tool
-boundary; command arguments remain opaque, so commands use relative paths after selecting `cwd`.
-Known workspace, temporary, and skill roots are redacted from declared result-path metadata,
-implementation diagnostics, and command output. Arbitrary source text is not rewritten.
+Runtime instructions expose `/workspace`, `/tmp`, and `/skills/<name>` as VirtualPaths. The command
+`cwd` accepts `workspace`, a workspace-relative path, or a virtual workspace path and resolves it
+before launch. Literal `/workspace`, `/tmp`, and configured `/skills/<name>` roots in shell source
+are translated to private local aliases before execution; all other shell syntax stays intact.
+Command stdout, stderr, and diagnostics replace alias and host roots with virtual roots before
+reaching the model. This translation applies to the submitted command source, including nested
+shell text within it; it does not rewrite scripts or binaries already on disk. Bare virtual
+directory roots gain a trailing slash so directory tools follow the private alias. To print a
+literal root string as data, split it across shell tokens, for example `printf '%s' '/''workspace'`.
 Command results retain exit status and both stdout/stderr previews, including partial timeout
 output. Continuation handles recover the captured remainder; output beyond the capture cap is
 explicitly marked as lost.
@@ -222,9 +226,16 @@ prepared snapshots additionally expose agent-section provenance.
 Successful local file reads, directory listings, and writes update the active instruction scope
 before the next model request.
 
-When the model requests a file write or shell command, the loop displays the
-operation and asks for confirmation first. File and directory reads do not
-require confirmation.
+When the model requests a file write, the loop displays the operation and asks
+for confirmation first. Routine shell commands run in the default workspace
+sandbox without an individual prompt, including commands that read workspace
+files or write within the workspace. Extra read roots, Git metadata writes or
+creation, network access, and unrestricted host retries require separate
+approval. File and directory reads do not require confirmation.
+
+The command sandbox writes to the live checkout. Concurrent user and agent commands may race on
+source files, caches, and build outputs; opaque shell scripts can overwrite files without a
+prelaunch prompt specific to that effect. There is no conflict detection or rollback.
 
 ### Use the backend directly
 
@@ -680,12 +691,102 @@ processes or private-network access is explicit. Network origins use glob patter
 all origins, while an empty origin list denies all network requests. Adding the first specific
 origin replaces the default `*`, making the boundary restrictive. Relative filesystem roots in
 the YAML policy are resolved from the workspace, not from the shell's launch directory. Each Loop
-instance owns a private `loop-temp` directory. Host process execution requires both opening the
-`host-process` boundary and choosing an appropriate `process.execute` default or rule. Ignore files
-limit discovery only; they are not authorization policy.
-The command tool accepts an exact argument vector and never invokes a shell, while web requests do
-not follow redirects implicitly. Policy is distinct from operating-system containment; a sandbox
-executor requires a separately reviewed design before enabling untrusted process execution.
+instance owns a private `loop-temp` directory. Legacy `host-process` rules and
+`process.execute` defaults do not approve native commands or unrestricted retries. Native
+commands needing extra sandbox access have separate exact and simple-prefix approvals with session, workspace, and user
+lifetimes. Workspace and user approvals are stored in Loop's user-owned permission file, with
+workspace approvals bound to the current workspace. `/permissions sandbox list` shows them and
+`/permissions sandbox remove <scope> <id>`
+revokes one. A prelaunch sandbox failure can receive an exact host approval for this session;
+`/permissions host list` shows recorded host approvals and `/permissions host remove <id>`
+revokes one. The stored rule contains a virtual workspace cwd and path-free command label;
+concrete command, environment, workspace, policy, grant, and executable identities are bound
+separately in session memory and rechecked before each host launch. A sandbox or generic process rule never grants a host retry. Ignore files limit
+discovery only; they are not authorization policy.
+The command tool accepts opaque POSIX shell source and runs the host's `/bin/sh -c` under a native
+macOS Seatbelt policy. Its cwd and executable paths are real host paths. A scoped approval for extra access binds the
+command, workspace, environment, and sandbox grants before native preparation. Routine offline commands
+run without individual approval inside the workspace sandbox, including `read_only=true` commands. This mode denies workspace writes but permits
+transient writes in a fresh private `$TMPDIR` and writes to the configured `/tmp` VirtualPath root;
+commands can print scratch results through bounded
+stdout or stderr. For read-only calls, `uv` skips environment synchronization, Ruff disables its
+cache, and pytest-cov writes coverage data to private command scratch. Terminal test and lint
+reports therefore run without workspace write permission. A missing or stale virtual environment
+may still fail read-only `uv run`; commands that update it or retain `.coverage`, HTML reports,
+or snapshots use the default workspace write grant. Loop recognizes common direct destructive
+and Git-changing shell forms for fresh approval, but cannot infer every effect of arbitrary shell
+source. Recognized forms include removal, shell overwrite redirection, destination-bearing
+`cp`, `mv`, `install`, and `tee`, `dd of=`, and `sed` or `perl` in-place editing. These
+forms ask even when the destination might be new. The approved workspace is readable input to sandboxed commands, including
+`.env` files and Git configuration. A command may print that data into model-visible output even
+when offline and write restricted. The macOS policy denies reads under `.ssh`, `.aws`, `.gnupg`,
+`.config`, `.loop`, and `Library` directories inside the workspace, approved extra read roots,
+reviewed system/tool roots, effective `PATH` search roots, and the user's home directory.
+Existing protected entries and their containing workspace directories cannot be renamed
+out of those path-based read and write restrictions; ordinary directory moves remain available.
+The present default writable mode grants the live checkout. Concurrent builds can affect the
+same checkout files; there is no private work area or conflict-aware publication stage planned.
+The system runtime read grant uses specific system-managed directories under `/System`,
+`/usr`, and other required system paths. User-writable installed-tool trees such as
+`/opt/homebrew`, `/usr/local`, and `/Library` need bounded sandboxed read authority.
+Verified versioned Homebrew installations receive this automatically as described below;
+other external installations need an explicit bound grant. Granted roots are scanned for
+hardlinks before launch and may add substantial latency for a large installation. Without a
+grant, a tool may be found in `PATH` but cannot read its executable or support files.
+Protected directories cannot themselves be selected as workspace or extra read roots.
+Prelaunch checks reject preexisting
+hardlinked regular files in the workspace and explicitly granted read roots,
+including for read-only commands; this can also reject harmless hardlinks.
+Preexisting compiler object files matching the narrow Darwin temporary-file exception also make
+preflight fail closed. An overlapping compiler process can therefore make an unrelated command
+temporarily return `sandbox.unavailable` until its matching object file disappears.
+Manual additional readable roots require explicit approval. A `read_roots` entry under `/workspace` is resolved to the
+configured workspace and does not request additional access. Existing `PATH` directories remain
+bound to the command request. Outside reviewed system/tool locations and explicit read roots,
+they allow only lookup metadata, not file contents or execution. An unused external `PATH`
+entry therefore does not prompt for a routine command. Empty and relative `PATH` entries resolve
+from the command's working directory, matching the host shell. `resolve_executable` accepts the
+same optional `cwd` so a relative entry is looked up and granted for the directory where the
+command will run. On macOS, the execution layer
+automatically binds versioned Homebrew tools named by the command and tools linked from a
+workspace `PATH` directory, after checking installation receipts and executable identities.
+Only those package roots become readable; protected paths and hardlinks remain blocked.
+Other external installations require a bound executable grant and an additional-read approval
+for their directory. Verified Homebrew package reads run inside the sandbox without a separate
+prompt; manual `read_roots`, network, Git changes, and host
+execution still need their own decisions. `resolve_executable` checks one named tool without running it and
+returns an opaque `grant_reference` for a usable external tool. Pass that reference as
+`run_command.executable_grant` to request its bound installation read access inside the sandbox.
+Other child executables outside the verified set can still need a separate reference; arbitrary
+shell source cannot reveal every child before launch. The command receives a private
+`$XDG_CACHE_HOME` under its per-command `$TMPDIR` for tool caches. Ruff uses private scratch
+for writable calls and no cache for read-only calls. Executable
+lookup exits (72, 126, and 127) keep their sandbox result and recovery hint even if an unrelated
+OS denial was observed; they do not offer a host retry.
+An incidental macOS diagnostic-logging preference denial does not trigger a host retry.
+The reference is bound to the current PATH, executable identity, and workspace; a changed
+identity requires another lookup. For versioned Homebrew tools, the grant binds the package
+and the runtime dependencies declared by its bounded installation receipt, including exact
+`opt` symlinks, rather than the whole Homebrew tree. Other packaging formats may need a
+separate support-file grant. Symlinks
+to private files outside granted roots remain denied. General local IPC and output to the model
+are separate disclosure surfaces, so this mode is not a secret-isolation guarantee. A Seatbelt
+setup or launch failure produces a typed sandbox failure and a separate, warned host retry offer.
+When a started shell exits nonzero after an OS denial was observed, Loop preserves the shell's
+exit code and output and reports the denial separately. A host retry is offered only when bounded
+child output also reports a related permission failure; a read-only workspace-write denial never
+offers one. Related output and a tagged denial cannot prove causality. A retry after the shell
+may have had effects always needs a fresh one-time host approval; session host rules apply only
+to failures without possible effects. Declining preserves the shell result. Web
+requests do not follow redirects implicitly.
+The macOS backend starts one managed live kernel-denial stream before sandboxed commands and
+matches records to each command's random attempt tag. A bounded post-exit log query is retained
+as a fallback. A nonzero exit or `EPERM` text alone never produces a host retry offer. If macOS
+does not deliver a verified record, a real denial can appear as an ordinary nonzero exit.
+An extra-access approval shows the command and a plain-language reason, without local path mappings.
+The host retry prompt shows the original command, the observed failure or uncertain denial,
+and the risk of running without filesystem or network restrictions. Internal paths and
+environment details remain bound to the retry but are not shown in the prompt.
 
 ## Built-in tools
 
@@ -695,24 +796,39 @@ The default registry exposes these functions to the model:
 | ---------------------- | ------------------------------------------------------------------------ |
 | `list_folder`          | Lists typed file/folder entries, optionally including nested entries     |
 | `read_text_file`       | Reads bounded UTF-8 text by line range                                   |
-| `search_text`          | Searches files or folders with bounded, structured ripgrep matches       |
+| `search_text`          | Searches files or folders with bounded, structured text matches          |
 | `write_text_file`      | Writes a UTF-8 text file after centralized authorization                 |
 | `edit_text_file`       | Replaces exact UTF-8 text with ambiguity and change safeguards           |
 | `delete_path`          | Permanently deletes an authorized file, symbolic link, or folder tree    |
 | `get_current_datetime` | Returns the current local date and time                                  |
 | `fetch_content`        | Streams authorized HTTP(S) text into a bounded resumable cache           |
 | `read_cached_content`  | Reads cached text by line or opaque cursor, optionally re-fetching a URL |
-| `run_command`          | Runs an authorized argument vector within a 30-second lifecycle deadline |
+| `resolve_executable`   | Checks host PATH metadata for one tool and offers an opaque sandbox read grant without exposing external paths |
+| `run_command`          | Runs approved shell source under the host OS sandbox within a 30-second deadline |
 | `activate_skill`       | Loads matching skill instructions before task work                        |
 | `manage_skills`        | Manages active skills and progressively loads bounded skill resources     |
 
-`run_command` applies one monotonic deadline to process execution, output draining, reader
-completion, termination, and direct-child reaping. Output is decoded as UTF-8 with invalid byte
-sequences replaced. On POSIX, each command starts an isolated session and timeout cleanup kills
-that owned process group, including descendants that retain output pipes. On Windows, the command
-starts a new process group, but Python's portable process API can forcibly terminate only the
-direct child; descendant cleanup is therefore best-effort and waiting for readers remains bounded
-by the deadline.
+`run_command` applies one monotonic deadline to Seatbelt preparation, process execution, output
+draining, and reader completion. Process reaping and reader cleanup have separate bounded waits
+after that deadline. Output is decoded as UTF-8 with invalid byte sequences
+replaced and captured within bounds. Commands start an isolated session; timeout cleanup kills the
+owned process group. Deliberately detached descendants may outlive that cleanup, but remain under
+their inherited Seatbelt restrictions. Offline network and protected paths are denied by default.
+An approved `network` grant permits general egress, `read_roots` grants additional canonical host
+directories, and `git_write` grants top-level or linked-worktree Git metadata writes, including
+creation of a missing top-level `.git` directory for an approved `git init`. The prompt describes
+the extra authority and offers once, session, workspace, or user approval and, for simple
+literal commands, an explicit similar-command rule. None launches an
+unrestricted process. A granted workspace or extra read root containing a hardlinked regular file
+fails before command launch. On any macOS version or architecture, startup selection now requires a real Seatbelt probe
+that permits a workspace write while denying a protected credential read and an outside write.
+Failure leaves ordinary commands unavailable. The full native regression corpus has run only on
+macOS 26.7 arm64; other versions still need that corpus before a broader rollout. Linux has no
+backend. Apple's `sandbox-exec` interface is deprecated. The first release does not provide strong
+per-command memory or PID quotas, domain-filtered egress, or guaranteed reaping of deliberately
+detached descendants. On the qualified host, the local warm backend p95 gates are ≤35 ms for the
+small public corpus and ≤65 ms for a 14,000-file workspace, including read-only requests. The
+mandatory hardlink walk contributes to the larger-tree cost; other sizes need measurement.
 
 Text reads report exact source and included byte sizes, returned ranges, truncation reasons, and
 continuation positions. File reads also report line ranges while retaining the byte ceiling. As a
@@ -731,15 +847,21 @@ not prevent an explicitly requested file from being read or changed.
 
 `search_text` performs literal smart-case matching by default, with optional regular expressions,
 case control, inclusive Git-style globs, neighboring lines, and a global result limit. Folder
-searches reuse Loop's ignore traversal before passing explicit visible files to ripgrep, skip
-binary files and symbolic links, and return paths relative to the requested folder.
-The base installation does not include ripgrep. Install the optional `tools` extra
-(`uv sync --extra tools`), or install `rg` separately and make it available on `PATH`. When it is
-unavailable, searches return a structured `filesystem.search_unavailable` problem.
+searches reuse Loop's ignore traversal, skip binary files and symbolic links, and return paths
+relative to the requested folder. Literal and regular-expression searches use ripgrep with fixed
+arguments and selected file descriptors inside a read-only native sandbox when a trusted system
+or verified managed installation is found; otherwise they use the bounded in-process Python
+`regex` matcher. Ripgrep's default regex dialect differs from Python `regex`, so a pattern may
+work in fallback and fail with a pattern error when native ripgrep is selected. The optional
+`tools` extra installs ripgrep in the workspace virtual environment for shell commands; that
+workspace-writable binary does not qualify as a trusted public-search helper. Search limits
+patterns to 1,000 characters and work to 30 seconds. The in-process matcher skips oversized
+lines and reports truncation while continuing through later lines and files. Native ripgrep
+limits its reported line length and bounded output.
 
-Direct filesystem tools and approved commands operate with the permissions of the process running
-`loop`; they are authorization-controlled rather than OS-sandboxed. Commands use an exact argument
-vector and never invoke a shell.
+Direct filesystem tools operate with the permissions of the process running `loop`. Ordinary
+approved shell commands run under the native OS sandbox; only a separately warned and approved
+host retry runs without that boundary.
 
 ### Value-holder thread safety
 

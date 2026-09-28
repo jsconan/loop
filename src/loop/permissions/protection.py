@@ -8,6 +8,21 @@ from pathlib import Path
 
 from .. import constants
 
+PRIVATE_READ_COMPONENTS = (".ssh", ".aws", ".gnupg", ".config", ".loop", "Library")
+_PRIVATE_READ_FOLDED = frozenset(name.casefold() for name in PRIVATE_READ_COMPONENTS)
+
+
+def is_protected_external_read(path: Path) -> bool:
+    """Check whether an external read root contains protected private data.
+
+    Args:
+        path (Path): Canonical candidate read root.
+
+    Returns:
+        bool: Whether the root includes a protected path component.
+    """
+    return any(part.casefold() in _PRIVATE_READ_FOLDED for part in path.parts)
+
 
 @dataclass(frozen=True)
 class ProtectedWorkspacePaths:

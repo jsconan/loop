@@ -13,7 +13,7 @@ from .. import constants
 from ..errors import Problem, ProblemException, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, FileKind, FileManifestEntry, FileTarget, Operation, OperationPlan
-from ..tooling import TOOL_READY, ToolContext, ToolPreflightResult, ToolStatus, tool
+from ..tooling import ToolContext, tool
 from ..utils import (
     TextSearchCase,
     canonical_path,
@@ -24,7 +24,6 @@ from ..utils import (
     is_path_ignored,
     iter_visible_paths,
     read_bounded_text,
-    ripgrep_path,
     search_text_paths,
     sha256_digest,
     write_text_atomically,
@@ -32,15 +31,6 @@ from ..utils import (
 from .models import FileContentResult, FolderEntry, TextSearchResult
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _check_text_search() -> ToolPreflightResult:
-    """Return whether the external text-search capability is available."""
-    try:
-        ripgrep_path()
-    except FileNotFoundError as exc:
-        return ToolPreflightResult(status=ToolStatus.BROKEN, detail=str(exc))
-    return TOOL_READY
 
 
 def _write_preview(path: Path, content: str, existing: str | None) -> str:
@@ -687,8 +677,8 @@ def read_text_file(
 @tool(
     actions={Action.FILESYSTEM_READ},
     operation_planner=_file_plan(Action.FILESYSTEM_READ),
-    preflight=_check_text_search,
     result_path_fields=(("result", "matches", "*", "path"),),
+    requires_execution_service=True,
 )
 def search_text(
     context: ToolContext,
@@ -765,6 +755,11 @@ def search_text(
             context_lines=context_lines,
             max_results=max_results,
             max_bytes=max_bytes,
+            native_runner=(
+                context.execution_service.run_trusted_search
+                if context.execution_service is not None
+                else None
+            ),
         )
         if target.is_dir():
             context.observe_directory(target)

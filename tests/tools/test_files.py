@@ -19,12 +19,13 @@ from loop import (
     RuntimeEnvironment,
     ToolRegistry,
 )
+from loop.execution import CommandExecutionService
 from loop.tooling import ToolContext
-from loop.tools import files as files_module
 from loop.tools.files import delete_path as delete_path_tool
 from loop.tools.files import edit_text_file as edit_text_file_tool
 from loop.tools.files import list_folder as list_folder_tool
 from loop.tools.files import write_text_file as write_text_file_tool
+from loop.utils.process import ProcessCapture, ProcessCaptureStatus
 
 tool_registry: ToolRegistry
 
@@ -47,7 +48,6 @@ def problem(output: str):
 def approve_tool_calls(monkeypatch, tmp_path):
     """Approve central permission prompts unless a case overrides the decision."""
     global tool_registry  # pylint: disable=global-statement
-    monkeypatch.setattr(files_module, "ripgrep_path", MagicMock(return_value="rg"))
     tool_registry = ToolRegistry(
         BUILTIN_TOOLS,
         permission_manager=PermissionManager(tmp_path),
@@ -472,6 +472,134 @@ def test_search_text_finds_literal_unicode_with_smart_case_and_context(tmp_path,
     assert result == {"matches": matches, "truncated": False}
     assert engine.call_args.kwargs["case"] == "smart"
     assert engine.call_args.kwargs["context_lines"] == 1
+
+
+def test_public_search_ignores_forged_virtual_environment_ripgrep(tmp_path, monkeypatch):
+    """An unverified virtual environment helper cannot forge public search results."""
+    source = tmp_path / "source.txt"
+    source.write_text("actual needle\n", encoding="utf-8")
+    binary = tmp_path / "venv" / "bin" / "rg"
+    binary.parent.mkdir(parents=True)
+    marker = tmp_path / "forged-helper-ran"
+    binary.write_text(f"#!/bin/sh\nprintf forged > {marker}\n", encoding="utf-8")
+    binary.chmod(0o755)
+    backend = MagicMock()
+    backend.system_read_roots = ()
+    backend.installed_tool_roots.return_value = ((binary.parent,), ())
+    backend.managed_tool_root.return_value = False
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(backend, MagicMock()),
+    )
+    monkeypatch.setattr("loop.execution.facade.ripgrep_path", lambda: str(binary))
+
+    result = json.loads(
+        registry.call("search_text", json.dumps({"path": str(source), "query": "needle"}))
+    )
+
+    assert result["result"]["matches"][0]["text"] == "actual needle"
+    assert not marker.exists()
+    backend.run_read_only_argv.assert_not_called()
+
+
+@pytest.mark.parametrize("provenance", ["missing", "untrusted"])
+def test_public_regex_search_uses_python_fallback_without_qualified_ripgrep(
+    tmp_path, monkeypatch, provenance
+):
+    """Unavailable or untrusted ripgrep leaves bounded Python regex semantics in place."""
+    source = tmp_path / "source.txt"
+    source.write_text("before\n€ needle needle\nafter\nNEEDLE\n", encoding="utf-8")
+    executable = tmp_path / "rg"
+    executable.write_text("helper", encoding="utf-8")
+    backend = MagicMock()
+    backend.system_read_roots = ()
+    backend.installed_tool_roots.return_value = ((), ())
+    if provenance == "missing":
+        monkeypatch.setattr(
+            "loop.execution.facade.ripgrep_path",
+            MagicMock(side_effect=FileNotFoundError("missing")),
+        )
+    else:
+        monkeypatch.setattr("loop.execution.facade.ripgrep_path", lambda: str(executable))
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(backend, MagicMock()),
+    )
+
+    def search(query, **options):
+        """Dispatch one public regex request through the normal registry."""
+        return json.loads(
+            registry.call(
+                "search_text",
+                json.dumps({"path": str(source), "query": query, "regex": True, **options}),
+            )
+        )
+
+    lookbehind = search(r"(?<=€ )needle", context_lines=1)
+    assert lookbehind["result"]["matches"][0]["column"] == 3
+    assert lookbehind["result"]["matches"][0]["context"] == [
+        {"line": 1, "text": "before"},
+        {"line": 3, "text": "after"},
+    ]
+    assert search(r"(needle) \1")["result"]["matches"][0]["column"] == 3
+    assert len(search("needle", case="insensitive", max_results=1)["result"]["matches"]) == 1
+    assert search("needle", case="insensitive", max_results=1)["result"]["truncated"]
+    assert search("(")["problem"]["code"] == "filesystem.invalid_search_pattern"
+    backend.run_read_only_argv.assert_not_called()
+
+
+def test_public_regex_search_uses_qualified_native_runner(tmp_path, monkeypatch):
+    """A qualified helper receives regex patterns and reports its own dialect errors."""
+    source = tmp_path / "source.txt"
+    source.write_text("€ needle\n", encoding="utf-8")
+    executable = tmp_path / "rg"
+    executable.write_text("helper", encoding="utf-8")
+    backend = MagicMock()
+    backend.system_read_roots = (tmp_path,)
+
+    def native_search(_executable, arguments, descriptors, _deadline):
+        """Return a selected-file event or the native parser's pattern error."""
+        if "(?<=€ )needle" in arguments:
+            return ProcessCapture(
+                ProcessCaptureStatus.COMPLETED,
+                exit_code=2,
+                stderr="look-around is not supported",
+            )
+        event = {
+            "type": "match",
+            "data": {
+                "path": {"text": f"/dev/fd/{descriptors[0]:05d}"},
+                "lines": {"text": "€ needle\n"},
+                "line_number": 1,
+                "submatches": [{"start": 4}],
+            },
+        }
+        return ProcessCapture(ProcessCaptureStatus.COMPLETED, exit_code=0, stdout=json.dumps(event))
+
+    backend.run_read_only_argv.side_effect = native_search
+    monkeypatch.setattr("loop.execution.facade.ripgrep_path", lambda: str(executable))
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(backend, MagicMock()),
+    )
+
+    def search(query):
+        """Dispatch a regex pattern through the public search tool."""
+        return json.loads(
+            registry.call(
+                "search_text",
+                json.dumps({"path": str(source), "query": query, "regex": True}),
+            )
+        )
+
+    match = search("needle$")
+    assert match["result"]["matches"][0]["column"] == 3
+    assert "--fixed-strings" not in backend.run_read_only_argv.call_args.args[1]
+    assert search(r"(?<=€ )needle")["problem"]["code"] == "filesystem.invalid_search_pattern"
+    assert backend.run_read_only_argv.call_count == 2
 
 
 def test_search_text_supports_regex_case_globs_files_and_result_limits(tmp_path, monkeypatch):

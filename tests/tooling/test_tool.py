@@ -182,6 +182,18 @@ def test_tool_rejects_redeclaring_the_same_function():
         tool(name="other")(calculate)
 
 
+def test_service_dependency_requires_a_context_aware_tool():
+    """A declared execution service cannot be injected into a context-free callable."""
+
+    @tool(requires_execution_service=True)
+    def calculate(number: int) -> int:
+        """Calculate a number."""
+        return number
+
+    with pytest.raises(ToolRegistrationError, match="context-aware execution service"):
+        ToolRegistry([calculate])
+
+
 def test_definition_adapts_the_argument_model(monkeypatch):
     """Definition exposes neutral tool metadata and delegates schema adaptation."""
     adapt = Mock(return_value={"adapted": True})

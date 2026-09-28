@@ -2,6 +2,7 @@
 
 import errno
 import logging
+import shlex
 import subprocess
 import time
 from unittest.mock import MagicMock
@@ -35,6 +36,7 @@ def test_supervise_process_bounds_both_streams_and_preserves_exit(caplog):
     assert capture.stdout == "abc"
     assert capture.stdout_discarded == 3
     assert capture.stderr == "xy"
+    assert not caplog.records
 
 
 def test_supervise_process_kills_a_child_after_deadline(caplog):
@@ -52,6 +54,25 @@ def test_supervise_process_kills_a_child_after_deadline(caplog):
 
     assert capture.status is ProcessCaptureStatus.TIMED_OUT
     assert process.poll() is not None
+
+
+def test_supervise_process_kills_same_group_descendant_after_parent_exit(tmp_path):
+    """A descendant that retains output pipes is killed when the supervisor times out."""
+    marker = tmp_path / "descendant-ran"
+    command = f"(sleep 0.4; printf child > {shlex.quote(str(marker))}) & exit 0"
+    process = subprocess.Popen(
+        ["/bin/sh", "-c", command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+    capture = supervise_process(process, time.monotonic() + 0.1)
+
+    assert capture.status is ProcessCaptureStatus.TIMED_OUT
+    time.sleep(0.5)
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize(
@@ -172,8 +193,8 @@ def test_kill_process_group_terminates_the_complete_posix_group(monkeypatch):
     process.kill.assert_not_called()
 
 
-def test_kill_process_group_logs_a_posix_lookup_race(monkeypatch, caplog):
-    """A process-group lookup race is warned about without surfacing the failure."""
+def test_kill_process_group_ignores_an_already_exited_posix_group(monkeypatch, caplog):
+    """A vanished process group is normal cleanup and does not emit a warning."""
     process = MagicMock(pid=123)
     monkeypatch.setattr("loop.utils.process.os.name", "posix")
     monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock(side_effect=ProcessLookupError))
@@ -181,10 +202,7 @@ def test_kill_process_group_logs_a_posix_lookup_race(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="loop.utils.process"):
         kill_process_group(process)
 
-    assert [record.getMessage() for record in caplog.records] == [
-        "Process group 123 was already gone during termination."
-    ]
-    assert all(record.levelno == logging.WARNING for record in caplog.records)
+    assert not caplog.records
     process.kill.assert_not_called()
 
 

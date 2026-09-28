@@ -58,6 +58,10 @@ class Tool:
         preflight (ToolPreflight | None): Optional readiness check run before registration.
         required (bool): Whether a user must explicitly choose to continue when the tool is
             broken. Without an interaction, a broken required tool raises ``ToolRegistrationError``.
+        execution_authorization (bool): Require an injected native execution service and a
+            sandbox-bound process operation before invoking this tool.
+        requires_execution_service (bool): Inject the native execution service without granting
+            process execution authority.
     """
 
     function: Callable[..., Any]
@@ -70,6 +74,8 @@ class Tool:
     result_path_fields: tuple[tuple[str, ...], ...] = ()
     preflight: ToolPreflight | None = None
     required: bool = False
+    execution_authorization: bool = False
+    requires_execution_service: bool = False
 
     def registered(
         self,
@@ -82,6 +88,8 @@ class Tool:
         result_path_fields: tuple[tuple[str, ...], ...] | None = None,
         preflight: ToolPreflight | None | Omit = OMIT,
         required: bool | Omit = OMIT,
+        execution_authorization: bool | Omit = OMIT,
+        requires_execution_service: bool | Omit = OMIT,
     ) -> Tool:
         """Return a registry-ready copy with resolved metadata and argument validation.
 
@@ -101,9 +109,17 @@ class Tool:
                 to inherit; pass ``None`` to remove one.
             required (bool | Omit): Whether the tool must be available for the container to be
                 considered ready. Omit it to inherit; pass ``None`` to remove one.
+            execution_authorization (bool | Omit): Native execution capability for this
+                registration, or omit to inherit its declaration.
+            requires_execution_service (bool | Omit): Native service dependency, or omit to
+                inherit its declaration.
 
         Returns:
             Tool: Immutable, fully resolved tool for one registry.
+
+        Raises:
+            ToolRegistrationError: If an authority-bearing declaration lacks a matching planner
+                or execution capability.
         """
         resolved_name = name or self.name or callable_name(self.function)
         registered = replace(
@@ -124,12 +140,35 @@ class Tool:
             ),
             preflight=self.preflight if isinstance(preflight, Omit) else preflight,
             required=self.required if isinstance(required, Omit) else required,
+            execution_authorization=(
+                self.execution_authorization
+                if isinstance(execution_authorization, Omit)
+                else execution_authorization
+            ),
+            requires_execution_service=(
+                self.requires_execution_service
+                if isinstance(requires_execution_service, Omit)
+                else requires_execution_service
+            ),
             arguments_model=get_tool_arguments_model(self.function, resolved_name),
         )
         if registered.actions and registered.operation_planner is None:
             raise ToolRegistrationError(
                 f"Tool '{resolved_name}' declares authority-bearing actions without an "
                 "operation planner."
+            )
+        if registered.execution_authorization and (
+            Action.PROCESS_EXECUTE not in registered.actions
+            or registered.operation_planner is None
+            or not takes_tool_context(registered.function)
+        ):
+            raise ToolRegistrationError(
+                f"Tool '{resolved_name}' requires a context-aware process planner "
+                "for execution authorization."
+            )
+        if registered.requires_execution_service and not takes_tool_context(registered.function):
+            raise ToolRegistrationError(
+                f"Tool '{resolved_name}' requires a context-aware execution service."
             )
         return registered
 
@@ -400,6 +439,9 @@ class ToolRegistration:
             to inherit.
         required (bool | Omit): Whether the tool must be available for the container to be
             considered ready. Omit it to inherit; pass ``None`` to remove one.
+        execution_authorization (bool | Omit): Native execution capability for this
+            registration, or omit to inherit its declaration.
+        requires_execution_service (bool | Omit): Native service dependency, or omit to inherit.
     """
 
     function: Callable[..., Any]
@@ -410,6 +452,8 @@ class ToolRegistration:
     result_presentation: ToolResultPresentationDeclaration | Omit = OMIT
     preflight: ToolPreflight | None | Omit = OMIT
     required: bool | Omit = OMIT
+    execution_authorization: bool | Omit = OMIT
+    requires_execution_service: bool | Omit = OMIT
 
 
 @overload
@@ -429,6 +473,8 @@ def tool[ToolFunction: Callable[..., Any]](
     result_path_fields: tuple[tuple[str, ...], ...] = (),
     preflight: ToolPreflight | None = None,
     required: bool = False,
+    execution_authorization: bool = False,
+    requires_execution_service: bool = False,
 ) -> Callable[[ToolFunction], ToolFunction]: ...
 
 
@@ -444,6 +490,8 @@ def tool[ToolFunction: Callable[..., Any]](
     result_path_fields: tuple[tuple[str, ...], ...] = (),
     preflight: ToolPreflight | None = None,
     required: bool = False,
+    execution_authorization: bool = False,
+    requires_execution_service: bool = False,
 ) -> ToolFunction | Callable[[ToolFunction], ToolFunction]:
     """Declare a function as an LLM-callable tool without registering it.
 
@@ -463,6 +511,8 @@ def tool[ToolFunction: Callable[..., Any]](
         preflight (ToolPreflight | None): Optional readiness check run before registration.
         required (bool): Whether a user must explicitly choose to continue when the tool is
             broken. Without an interaction, a broken required tool raises ``ToolRegistrationError``.
+        execution_authorization (bool): Require an injected sandbox execution service.
+        requires_execution_service (bool): Inject the execution service without process authority.
 
     Returns:
         ToolFunction | Callable[[ToolFunction], ToolFunction]: The unchanged declared function,
@@ -484,6 +534,8 @@ def tool[ToolFunction: Callable[..., Any]](
                 result_path_fields=result_path_fields,
                 preflight=preflight,
                 required=required,
+                execution_authorization=execution_authorization,
+                requires_execution_service=requires_execution_service,
             ),
         )
         return target

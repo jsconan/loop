@@ -14,7 +14,7 @@ from loop import (
     SessionTarget,
     UserPermissionConfiguration,
 )
-from loop.permissions import PermissionPreset
+from loop.permissions import HostCommandRule, PermissionPreset
 
 
 def test_actions_map_to_distinct_prompt_icons():
@@ -90,6 +90,23 @@ def test_user_permission_configuration_rejects_duplicate_rule_identifiers():
                 ]
             }
         )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"cwd": "/Users/alice/project"},
+        {"cwd": "/workspace/../private"},
+        {"source": "cat /Users/alice/private"},
+        {"signature": "/Users/alice/project"},
+    ],
+)
+def test_host_rule_rejects_real_paths_and_malformed_virtual_context(change):
+    """Session host rule records contain virtual paths and a path-free digest only."""
+    values = {"signature": "a" * 64, "cwd": "/workspace", "source": "printf ok"}
+    values.update(change)
+    with pytest.raises(ValidationError, match="virtual context"):
+        HostCommandRule.model_validate(values)
 
 
 def test_permission_presets_reject_duplicate_rule_identifiers():

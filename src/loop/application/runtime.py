@@ -9,6 +9,7 @@ from typing import Self
 
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
+from ..execution import CommandExecutionService
 from ..instructions import InstructionsManager
 from ..interaction import Interaction
 from ..loop import Loop
@@ -155,16 +156,24 @@ class ApplicationRuntime:
                 interaction=interaction,
             )
             cls._track_close(permission_manager, cleanup_callbacks)
+            execution_service = CommandExecutionService.for_host()
+            execution_tracked = cls._track_close(execution_service, cleanup_callbacks)
+            tool_registry = create_default_tool_registry(
+                interaction=interaction,
+                permission_manager=permission_manager,
+                settings=ToolRuntimeSettings(
+                    user_agent=settings.web.user_agent,
+                    command_timeout=settings.tools.command_timeout,
+                ),
+                execution_service=execution_service,
+            )
+            if execution_tracked:
+                cleanup_callbacks.pop()
+            cls._track_close(tool_registry, cleanup_callbacks)
             loop = Loop.create_default(
                 backend,
                 interaction=interaction,
-                tool_registry=create_default_tool_registry(
-                    interaction=interaction,
-                    settings=ToolRuntimeSettings(
-                        user_agent=settings.web.user_agent,
-                        command_timeout=settings.tools.command_timeout,
-                    ),
-                ),
+                tool_registry=tool_registry,
                 working_directory=workspace.working_directory,
                 instructions_manager=InstructionsManager.discover(
                     workspace.working_directory.resolve(),

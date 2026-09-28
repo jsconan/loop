@@ -172,7 +172,7 @@ def read_bounded_stream(
 
 
 def kill_process_group(process: subprocess.Popen[str]) -> None:
-    """Terminate a process and, on POSIX, its isolated process group.
+    """Terminate a process group, treating a concurrently exited group as already stopped.
 
     POSIX callers must create the process with ``start_new_session=True`` so the stored PID is
     also the owned process-group ID. Python's portable Windows process API cannot forcibly
@@ -187,7 +187,7 @@ def kill_process_group(process: subprocess.Popen[str]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
-        _LOGGER.warning("Process group %s was already gone during termination.", process.pid)
+        return
 
 
 def supervise_process(

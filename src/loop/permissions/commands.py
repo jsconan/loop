@@ -7,6 +7,7 @@ from ..completion import CommandCompletion, CompletionValue
 from .manager import PermissionManager
 from .models import (
     Action,
+    ApprovalChoice,
     Decision,
     PermissionLoadResult,
     PermissionPreset,
@@ -22,7 +23,7 @@ _ACTION_DESCRIPTIONS = {
     Action.FILESYSTEM_REPLACE: "Replace an existing filesystem object's contents.",
     Action.FILESYSTEM_DELETE: "Permanently delete a filesystem object.",
     Action.NETWORK_REQUEST: "Send an outbound HTTP request.",
-    Action.PROCESS_EXECUTE: "Execute an exact process argument vector.",
+    Action.PROCESS_EXECUTE: "Execute a process.",
     Action.SESSION_MUTATE: "Change process-local agent session state.",
 }
 _DECISION_DESCRIPTIONS = {
@@ -138,6 +139,12 @@ class PermissionCommands:
         if arguments[:1] == ("rule",):
             self._change_rule(context, arguments[1:])
             return
+        if arguments[:1] == ("sandbox",):
+            self._sandbox_rules(context, arguments[1:])
+            return
+        if arguments[:1] == ("host",):
+            self._host_rules(context, arguments[1:])
+            return
         if arguments[:1] == ("limit",):
             self._change_limit(context, arguments[1:])
             return
@@ -145,6 +152,51 @@ class PermissionCommands:
             self._change_preset(context, arguments[1:])
             return
         raise ValueError("Invalid permission command arguments.")
+
+    def _sandbox_rules(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
+        """List or remove sandbox-only command approvals."""
+        manager = self._permission_manager
+        if not arguments or arguments == ("list",):
+            lines = []
+            for scope in ("session", "workspace", "user"):
+                for rule in manager.sandboxed_command_rules(ApprovalChoice(scope)):
+                    pattern = f"{rule.source} …" if rule.similar else rule.source
+                    lines.append(f"{scope} {rule.id} {pattern}")
+            context.interaction.info(
+                "Sandboxed command approvals:\n" + ("\n".join(lines) or "none")
+            )
+            return
+        if len(arguments) == 3 and arguments[0] == "remove":
+            _, raw_scope, rule_id = arguments
+            removed = manager.remove_sandboxed_command_rule(ApprovalChoice(raw_scope), rule_id)
+            context.interaction.info(
+                "Removed sandboxed command approval."
+                if removed
+                else "No matching sandboxed command approval."
+            )
+            return
+        raise ValueError(
+            "Use /permissions sandbox list or sandbox remove <session|workspace|user> <id>."
+        )
+
+    def _host_rules(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
+        """List or revoke exact host approvals for the current session."""
+        manager = self._permission_manager
+        if not arguments or arguments == ("list",):
+            rules = manager.host_command_rules()
+            context.interaction.info(
+                "Session host command approvals:\n"
+                + ("\n".join(f"{rule.id} {rule.source}" for rule in rules) or "none")
+            )
+            return
+        if len(arguments) == 2 and arguments[0] == "remove":
+            context.interaction.info(
+                "Removed host command approval."
+                if manager.remove_host_command_rule(arguments[1])
+                else "No matching host command approval."
+            )
+            return
+        raise ValueError("Use /permissions host list or host remove <id>.")
 
     def _change_preset(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
         """List, inspect, preview, or explicitly replace one scoped policy preset."""
@@ -454,6 +506,45 @@ class PermissionCommands:
             provider="tools",
             next=CommandCompletion(values=actions, children=explain_resources),
         )
+        sandbox_scopes = (ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE, ApprovalChoice.USER)
+        sandbox = CommandCompletion(
+            values=(
+                CompletionValue("list", "Show sandbox-only command approvals."),
+                CompletionValue("remove", "Revoke a sandbox-only command approval."),
+            ),
+            children={
+                "remove": CommandCompletion(
+                    values=tuple(
+                        CompletionValue(scope.value, "Approval scope.") for scope in sandbox_scopes
+                    ),
+                    children={
+                        scope.value: CommandCompletion(
+                            provider=lambda selected=scope: tuple(
+                                CompletionValue(rule.id, rule.source)
+                                for rule in self._permission_manager.sandboxed_command_rules(
+                                    selected
+                                )
+                            )
+                        )
+                        for scope in sandbox_scopes
+                    },
+                )
+            },
+        )
+        host = CommandCompletion(
+            values=(
+                CompletionValue("list", "Show recorded session host approvals."),
+                CompletionValue("remove", "Revoke a recorded session host approval."),
+            ),
+            children={
+                "remove": CommandCompletion(
+                    provider=lambda: tuple(
+                        CompletionValue(rule.id, rule.source)
+                        for rule in self._permission_manager.host_command_rules()
+                    )
+                )
+            },
+        )
         return CommandCompletion(
             values=(
                 CompletionValue("show", "Show all policy layers or one selected view."),
@@ -462,6 +553,8 @@ class PermissionCommands:
                 CompletionValue("explain", "Explain one concrete effective decision."),
                 CompletionValue("default", "Manage scoped fallback decisions by action."),
                 CompletionValue("rule", "Manage workspace and session rules."),
+                CompletionValue("sandbox", "List or revoke sandbox-only command approvals."),
+                CompletionValue("host", "List or revoke recorded session host approvals."),
                 CompletionValue("limit", "Manage scoped roots, network, and process limits."),
                 CompletionValue(
                     "preset", "Inspect or explicitly replace scoped policy defaults and rules."
@@ -481,6 +574,8 @@ class PermissionCommands:
                 "explain": explain,
                 "default": default,
                 "rule": rule,
+                "sandbox": sandbox,
+                "host": host,
                 "limit": limit,
                 "preset": preset,
             },
@@ -752,6 +847,8 @@ class PermissionCommands:
             "<decision> | default reset <workspace|session> <action> | rule add "
             "<workspace|session> <decision> [tool|*] [action|*] [resource|*] [description] | "
             "rule [list [workspace|session]] | rule remove <workspace|session> <rule-id> | "
+            "sandbox list | sandbox remove <session|workspace|user> <rule-id> | "
+            "host list | host remove <rule-id> | "
             "limit [list [workspace|session]] | limit <set|add|remove|reset> "
             "<workspace|session> <name> [value]]"
         )
@@ -769,10 +866,14 @@ class PermissionCommands:
             "  /permissions rule add session allow read_text_file filesystem.read '*'\n"
             "  /permissions limit add workspace read-root system-temp\n"
             "  /permissions limit set session host-process allow\n"
-            "  /permissions default set session process.execute ask\n\n"
+            "  /permissions sandbox list\n"
+            "  /permissions host list\n"
+            "\n"
             "Presets replace only the explicitly selected workspace or session defaults and rules. "
             "They never replace enforcement limits or the other policy layer; replace prompts for "
             "confirmation and diff previews the exact policy change.\n\n"
-            "Host-process permission runs commands with this application's host access; Loop does "
-            "not currently provide an OS sandbox executor."
+            "Sandboxed command approvals are sandbox-only; list or remove them with "
+            "/permissions sandbox. A prelaunch host failure can receive an exact session "
+            "approval; list or revoke it with /permissions host. Retries after possible "
+            "effects require a fresh one-time decision."
         )
