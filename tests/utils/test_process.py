@@ -1,11 +1,57 @@
 """Tests for safe process invocation utilities."""
 
 import errno
+import logging
+import subprocess
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
-from loop.utils.process import kill_process_group, parse_command_line, read_bounded_stream
+from loop.utils.process import (
+    ProcessCaptureStatus,
+    kill_process_group,
+    parse_command_line,
+    read_bounded_stream,
+    supervise_process,
+)
+
+
+def test_supervise_process_bounds_both_streams_and_preserves_exit(caplog):
+    """The shared supervisor drains real child pipes and reports discarded output."""
+    caplog.set_level(logging.WARNING, logger="loop.utils.process")
+    process = subprocess.Popen(
+        ["/bin/sh", "-c", "printf abcdef; printf xy >&2"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+    capture = supervise_process(process, time.monotonic() + 2, stdout_limit=3)
+
+    assert capture.status is ProcessCaptureStatus.COMPLETED
+    assert capture.exit_code == 0
+    assert capture.stdout == "abc"
+    assert capture.stdout_discarded == 3
+    assert capture.stderr == "xy"
+
+
+def test_supervise_process_kills_a_child_after_deadline(caplog):
+    """Timeout cleanup terminates the owned process group and bounds wall time."""
+    caplog.set_level(logging.WARNING, logger="loop.utils.process")
+    process = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 2"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+    capture = supervise_process(process, time.monotonic() + 0.1)
+
+    assert capture.status is ProcessCaptureStatus.TIMED_OUT
+    assert process.poll() is not None
 
 
 @pytest.mark.parametrize(
@@ -126,15 +172,72 @@ def test_kill_process_group_terminates_the_complete_posix_group(monkeypatch):
     process.kill.assert_not_called()
 
 
-def test_kill_process_group_ignores_a_posix_lookup_race(monkeypatch):
-    """A process that exits during cleanup does not surface a spurious failure."""
+def test_kill_process_group_logs_a_posix_lookup_race(monkeypatch, caplog):
+    """A process-group lookup race is warned about without surfacing the failure."""
     process = MagicMock(pid=123)
     monkeypatch.setattr("loop.utils.process.os.name", "posix")
     monkeypatch.setattr("loop.utils.process.os.killpg", MagicMock(side_effect=ProcessLookupError))
 
-    kill_process_group(process)
+    with caplog.at_level(logging.WARNING, logger="loop.utils.process"):
+        kill_process_group(process)
 
+    assert [record.getMessage() for record in caplog.records] == [
+        "Process group 123 was already gone during termination."
+    ]
+    assert all(record.levelno == logging.WARNING for record in caplog.records)
     process.kill.assert_not_called()
+
+
+def test_supervise_process_logs_failed_reader_stream_close(caplog):
+    """A failed forced pipe close is captured as a warning during cleanup."""
+    process = MagicMock(stdout=MagicMock(), stderr=MagicMock(), returncode=0)
+    process.wait.return_value = 0
+    process.stdout.fileno.side_effect = ValueError("private stream detail")
+    process.stderr.fileno.side_effect = ValueError("private stream detail")
+    thread = MagicMock()
+    thread.is_alive.return_value = True
+
+    with caplog.at_level(logging.WARNING, logger="loop.utils.process"):
+        capture = supervise_process(
+            process,
+            time.monotonic() + 1,
+            terminate=MagicMock(),
+            thread_factory=lambda **kwargs: thread,
+        )
+
+    assert capture.status is ProcessCaptureStatus.TIMED_OUT
+    assert [record.getMessage() for record in caplog.records] == [
+        "Could not close a process output stream during cleanup.",
+        "Could not close a process output stream during cleanup.",
+    ]
+    assert all(record.levelno == logging.WARNING for record in caplog.records)
+    assert "private stream detail" not in caplog.text
+
+
+def test_supervise_process_logs_cleanup_wait_timeout(caplog):
+    """A child that outlives the cleanup wait is captured as a warning."""
+    process = MagicMock(stdout=MagicMock(), stderr=MagicMock(), pid=123, returncode=None)
+    process.wait.side_effect = [
+        None,
+        subprocess.TimeoutExpired("private command", 1),
+    ]
+    thread = MagicMock()
+    thread.is_alive.return_value = False
+
+    with caplog.at_level(logging.WARNING, logger="loop.utils.process"):
+        capture = supervise_process(
+            process,
+            time.monotonic() + 1,
+            terminate=MagicMock(),
+            thread_factory=lambda **kwargs: thread,
+        )
+
+    assert capture.status is ProcessCaptureStatus.COMPLETED
+    assert [record.getMessage() for record in caplog.records] == [
+        "Process 123 did not exit within the cleanup wait time."
+    ]
+    assert all(record.levelno == logging.WARNING for record in caplog.records)
+    assert "private command" not in caplog.text
 
 
 def test_kill_process_group_uses_the_portable_single_process_fallback(monkeypatch):

@@ -15,12 +15,15 @@ __all__ = [
     "PathInput",
     "PathReference",
     "PrivateRotatingTextFile",
+    "ProcessCapture",
+    "ProcessCaptureStatus",
     "Scalar",
     "ShutdownRequested",
     "StrValueHolder",
     "TextSearchCase",
     "TextSearchContext",
     "TextSearchMatch",
+    "TextStream",
     "ValueHolder",
     "ValueReference",
     "VirtualPath",
@@ -67,6 +70,7 @@ __all__ = [
     "snippet",
     "store_content",
     "store_text_stream",
+    "supervise_process",
     "utc_now",
     "validate_content_handle",
     "validate_term",
@@ -118,7 +122,15 @@ from .path import (
     is_path_ignored,
     iter_visible_paths,
 )
-from .process import kill_process_group, parse_command_line, read_bounded_stream
+from .process import (
+    ProcessCapture,
+    ProcessCaptureStatus,
+    TextStream,
+    kill_process_group,
+    parse_command_line,
+    read_bounded_stream,
+    supervise_process,
+)
 from .rotating_file import PrivateRotatingTextFile
 from .search import ripgrep_path, search_text_paths
 from .signals import ShutdownRequested, register_shutdown_signals

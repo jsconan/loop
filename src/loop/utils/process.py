@@ -1,12 +1,20 @@
 """Provide safe process invocation utilities."""
 
 import errno
+import logging
 import os
 import signal
 import subprocess
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 from .. import constants
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class TextStream(Protocol):
@@ -17,6 +25,36 @@ class TextStream(Protocol):
 
     def close(self) -> None:
         """Release the stream wrapper after its reader exits."""
+
+
+class ProcessCaptureStatus(StrEnum):
+    """Classify a supervised process independently of its exit code."""
+
+    COMPLETED = "completed"
+    UNAVAILABLE = "unavailable"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class ProcessCapture:
+    """Hold bounded child output and supervision outcome.
+
+    Args:
+        status (ProcessCaptureStatus): Lifecycle result.
+        exit_code (int | None): Child exit status on completion.
+        stdout (str): Captured standard output.
+        stderr (str): Captured standard error.
+        stdout_discarded (int | None): Characters discarded, or unknown if draining stalled.
+        stderr_discarded (int | None): Characters discarded, or unknown if draining stalled.
+    """
+
+    status: ProcessCaptureStatus
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    stdout_discarded: int | None = 0
+    stderr_discarded: int | None = 0
 
 
 _SHELL_SYNTAX = frozenset("|;&<>`()$")
@@ -149,4 +187,114 @@ def kill_process_group(process: subprocess.Popen[str]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
-        pass
+        _LOGGER.warning("Process group %s was already gone during termination.", process.pid)
+
+
+def supervise_process(
+    process: subprocess.Popen[str],
+    deadline: float,
+    *,
+    stdout_limit: int = constants.MAX_OUTPUT_CHARS,
+    stderr_limit: int = constants.MAX_OUTPUT_CHARS,
+    terminate: Callable[[subprocess.Popen[str]], None] = kill_process_group,
+    reader: Callable[..., int] = read_bounded_stream,
+    thread_factory: Callable[..., threading.Thread] = threading.Thread,
+) -> ProcessCapture:
+    """Drain two child pipes within one deadline, then kill and reap the process group.
+
+    Args:
+        process (subprocess.Popen[str]): Child started in its own process group.
+        deadline (float): Absolute monotonic deadline for exit and complete pipe draining.
+        stdout_limit (int): Maximum retained standard-output characters.
+        stderr_limit (int): Maximum retained standard-error characters.
+        terminate (Callable[[subprocess.Popen[str]], None]): Process-group terminator.
+        reader (Callable[..., int]): Bounded stream reader.
+        thread_factory (Callable[..., threading.Thread]): Reader-thread constructor.
+
+    Returns:
+        ProcessCapture: Exit, timeout, cancellation, or missing-pipe result.
+    """
+    if process.stdout is None or process.stderr is None:
+        terminate(process)
+        _wait_process(process)
+        return ProcessCapture(ProcessCaptureStatus.UNAVAILABLE)
+
+    streams = (process.stdout, process.stderr)
+    chunks = ([], [])
+    discarded = [0, 0]
+    readers = [
+        thread_factory(
+            target=lambda index=i: discarded.__setitem__(
+                index,
+                reader(
+                    streams[index],
+                    chunks[index],
+                    maximum=stdout_limit if index == 0 else stderr_limit,
+                ),
+            ),
+            daemon=True,
+        )
+        for i in range(2)
+    ]
+
+    for thread in readers:
+        thread.start()
+
+    try:
+        process.wait(timeout=max(0, deadline - time.monotonic()))
+        for thread in readers:
+            thread.join(max(0, deadline - time.monotonic()))
+
+        if any(thread.is_alive() for thread in readers):
+            return ProcessCapture(
+                ProcessCaptureStatus.TIMED_OUT,
+                stdout="".join(chunks[0]),
+                stderr="".join(chunks[1]),
+                stdout_discarded=discarded[0] if not readers[0].is_alive() else None,
+                stderr_discarded=discarded[1] if not readers[1].is_alive() else None,
+            )
+
+        return ProcessCapture(
+            ProcessCaptureStatus.COMPLETED,
+            exit_code=process.returncode,
+            stdout="".join(chunks[0]),
+            stderr="".join(chunks[1]),
+            stdout_discarded=discarded[0],
+            stderr_discarded=discarded[1],
+        )
+    except subprocess.TimeoutExpired:
+        return ProcessCapture(
+            ProcessCaptureStatus.TIMED_OUT,
+            stdout="".join(chunks[0]),
+            stderr="".join(chunks[1]),
+            stdout_discarded=None,
+            stderr_discarded=None,
+        )
+    except KeyboardInterrupt:
+        return ProcessCapture(ProcessCaptureStatus.CANCELLED)
+    finally:
+        terminate(process)
+        _wait_process(process)
+
+        for thread, stream in zip(readers, streams, strict=True):
+            if thread.is_alive():
+                try:
+                    os.close(stream.fileno())
+                except (OSError, TypeError, ValueError):
+                    _LOGGER.warning("Could not close a process output stream during cleanup.")
+            else:
+                stream.close()
+
+        for thread in readers:
+            thread.join(constants.COMMAND_CLEANUP_WAIT_SECONDS)
+
+
+def _wait_process(
+    process: subprocess.Popen[str],
+    timeout: float = constants.COMMAND_CLEANUP_WAIT_SECONDS,
+):
+    """Wait for the given process to complete within the cleanup wait time."""
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _LOGGER.warning("Process %s did not exit within the cleanup wait time.", process.pid)
