@@ -106,8 +106,15 @@ disable = [
 ]
 
 [tool.pytest.ini_options]
-addopts = ["-ra", "-q"]
-testpaths = ["tests/"]
+addopts = ["-ra", "-q", "--strict-markers", "--import-mode=importlib", "-p", "no:cacheprovider"]
+markers = [
+    "integration: exercises real OS or dependency boundaries in disposable scratch",
+    "e2e: exercises public dispatch through permissions and native execution",
+    "macos: requires macOS native facilities",
+    "linux: requires Linux native facilities",
+]
+tmp_path_retention_count = 0
+testpaths = ["tests/unit/"]
 
 [tool.coverage.run]
 branch = true

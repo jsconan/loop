@@ -45,7 +45,7 @@ To install optional ripgrep for shell commands, include the `tools` extra:
 uv sync --extra tools
 ```
 
-To install the latest version directly as a `uv` tool instead, run:
+To install directly as a `uv` tool, run:
 
 ```bash
 uv tool install git+https://github.com/jsconan/loop.git
@@ -513,7 +513,7 @@ session scope, reset restores the built-in default explicitly. The configuration
 `unset` operations remove values from their selected scope instead of writing defaults.
 
 Session settings override environment and file values for that Loop process only. File values are
-still saved when an environment variable currently wins, so a later run without that variable uses
+still saved when an environment variable takes precedence, so a later run without that variable uses
 the saved value. Backend settings and supported interactive-loop settings apply immediately;
 logging, telemetry, and agent-identity changes are saved but require a restart. API-key input and
 configuration output remain masked.
@@ -724,8 +724,8 @@ when offline and write restricted. The macOS policy denies reads under `.ssh`, `
 reviewed system/tool roots, effective `PATH` search roots, and the user's home directory.
 Existing protected entries and their containing workspace directories cannot be renamed
 out of those path-based read and write restrictions; ordinary directory moves remain available.
-The present default writable mode grants the live checkout. Concurrent builds can affect the
-same checkout files; there is no private work area or conflict-aware publication stage planned.
+The default writable mode grants the live checkout. Concurrent builds can affect the same
+checkout files; commands do not receive a private work area or a conflict-aware publication stage.
 The system runtime read grant uses specific system-managed directories under `/System`,
 `/usr`, and other required system paths. User-writable installed-tool trees such as
 `/opt/homebrew`, `/usr/local`, and `/Library` need bounded sandboxed read authority.
@@ -820,15 +820,12 @@ creation of a missing top-level `.git` directory for an approved `git init`. The
 the extra authority and offers once, session, workspace, or user approval and, for simple
 literal commands, an explicit similar-command rule. None launches an
 unrestricted process. A granted workspace or extra read root containing a hardlinked regular file
-fails before command launch. On any macOS version or architecture, startup selection now requires a real Seatbelt probe
-that permits a workspace write while denying a protected credential read and an outside write.
-Failure leaves ordinary commands unavailable. The full native regression corpus has run only on
-macOS 26.7 arm64; other versions still need that corpus before a broader rollout. Linux has no
-backend. Apple's `sandbox-exec` interface is deprecated. The first release does not provide strong
+fails before command launch. On macOS, startup selection requires a real Seatbelt probe that
+permits a workspace write while denying a protected credential read and an outside write.
+Failure leaves ordinary commands unavailable. Linux has no native command backend.
+Apple's `sandbox-exec` interface is deprecated. The command sandbox does not provide strong
 per-command memory or PID quotas, domain-filtered egress, or guaranteed reaping of deliberately
-detached descendants. On the qualified host, the local warm backend p95 gates are ≤35 ms for the
-small public corpus and ≤65 ms for a 14,000-file workspace, including read-only requests. The
-mandatory hardlink walk contributes to the larger-tree cost; other sizes need measurement.
+detached descendants. Mandatory hardlink scanning adds work proportional to the granted trees.
 
 Text reads report exact source and included byte sizes, returned ranges, truncation reasons, and
 continuation positions. File reads also report line ranges while retaining the byte ceiling. As a
@@ -899,11 +896,16 @@ Run the test suite and linters:
 
 ```bash
 make test
+make test-integration
 uv run ruff check .
 uv run ruff format --check .
 git diff --check
 uv run pylint src
 ```
+
+`make test` runs the portable unit suite with 100% statement and branch coverage. Integration
+and end-to-end checks live separately under `tests/integration/` and skip unsupported platforms.
+`make test-all` runs both sets. See [test organization, execution and isolation](tests/README.md).
 
 The package uses a `src` layout. Its main components are:
 
