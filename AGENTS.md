@@ -34,6 +34,9 @@
 
 ### Verification
 
+- Fix the root cause of unexpected warnings and errors. Do not suppress them, weaken assertions,
+  or change warning/error filters to make checks pass. When a diagnostic is an intended test
+  outcome, capture and assert its specific category, message, or structured result in that test.
 - Define concrete success criteria before implementation and verify them after the change. For
   multi-step work, use a brief plan whose steps each have an observable check.
 - A bug fix should have a check that reproduces the failure; a refactor should preserve passing
@@ -42,6 +45,14 @@
 
 ### Documentation
 
+- Keep maintained documentation, including the main and test READMEs, focused on supported
+  behavior, usage, configuration, architecture, test organization, and durable constraints.
+  Update it when those contracts change, not after an individual development or verification run.
+- Do not put review findings, progress notes, migration history, dated verification results,
+  test counts, host-specific benchmark results, or rollout plans in maintained documentation.
+  Report transient evidence in the task response or an explicitly requested temporary artifact.
+- Describe limitations as product behavior. Do not replace concrete safety limits with roadmap
+  promises, historical qualification claims, or assertions about future support.
 - Treat documentation as part of the implementation. When a signature or behavior changes, update
   the affected docstring in the same change and compare it against the final implementation.
 - Add a complete docstring to every public function and method. Put constructor documentation on

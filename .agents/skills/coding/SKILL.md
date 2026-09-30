@@ -52,6 +52,10 @@ unrelated refactoring or new dependencies.
 
 ## Document the public surface
 
+Apply the project-wide documentation rules to maintained READMEs and reference documents:
+explain the final supported behavior and durable limitations, without review notes, development
+history, dated test results, benchmark observations, or transient plan references.
+
 - Add docstrings to every public module, class, function, method, and property.
 - Start each docstring with a concise, imperative summary.
 - Use complete Google-style sections for the final signature and behavior:
