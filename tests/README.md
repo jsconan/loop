@@ -24,7 +24,7 @@ The macOS integration suites are organized by behavior:
 | Suite | Guarantees |
 | --- | --- |
 | `macos/test_sandbox.py` | Native execution, exit status, authority binding, filesystem confinement, aliases, protected paths, grants, relocation, detached children, network/IPC and descriptors |
-| `macos/test_system.py` | Public command dispatch, virtual paths, destructive and Git authorization, host recovery, scratch authority, output bounds and registration aliases |
+| `macos/test_system.py` | Public command dispatch, virtual paths, destination-aware redirection and Git authorization, host recovery, scratch authority, output bounds and registration aliases |
 | `macos/test_search.py` | Public search, Unicode columns, regex, binary handling, result bounds, executable lookup and outside symlinks |
 
 ## Running tests

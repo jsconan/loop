@@ -85,6 +85,37 @@ def test_read_only_command_writes_only_owned_scratch(public_command, native_work
     public_command.host.run_host_command.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "printf text >/dev/null; printf done",
+        "printf text >|/dev/null; printf done",
+        "printf text 2>&-; printf done",
+        "printf text >/tmp/report; cat /tmp/report",
+    ],
+)
+def test_public_safe_redirections_run_without_approval(public_command, source):
+    """Null-device and managed temporary output preserve native enforcement without prompts."""
+    result = public_command.call(source, read_only=True)
+    assert result["ok"] is True
+    public_command.interaction.prompt.assert_not_called()
+    public_command.host.run_host_command.assert_not_called()
+
+
+def test_public_safe_redirect_does_not_bypass_workspace_overwrite_review(
+    public_command, native_workspace
+):
+    """A harmless output sink cannot hide a preceding workspace truncation."""
+    interaction = Mock()
+    interaction.prompt.return_value = "deny"
+    result = public_command.call(
+        "printf unsafe >ordinary >/dev/null", chosen_interaction=interaction
+    )
+    assert result["problem"]["code"] == "tool.denied"
+    assert (native_workspace / "ordinary").read_text() == "ordinary-data"
+    public_command.host.run_host_command.assert_not_called()
+
+
 @pytest.mark.parametrize("code", [7, 17, 65, 71, 127])
 def test_public_nonzero_is_not_a_host_authorization(public_command, code):
     """Forged permission text preserves the real exit and cannot authorize unrestricted execution."""

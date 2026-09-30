@@ -12,6 +12,49 @@ from .models import CommandFinding, CommandReviewStatus
 
 type CommandMatcher = Callable[[list[str]], CommandFinding | None]
 
+_SHELL_TOKEN = re.compile(
+    r"(?P<operator>&>>|<<-|>>|>\||<>|>&|<&|&>|<<|&&|\|\||[;&|()<>\n])"
+    r"|(?P<word>(?:[^\s;&|()<>'\"\\]+|'[^']*'|\"(?:\\.|[^\"\\])*\"|\\[\s\S])+)",
+)
+
+
+@dataclass(frozen=True)
+class ShellToken:
+    """Retain word quoting and operator identity for bounded lexical inspection."""
+
+    value: str
+    raw: str
+    operator: bool
+    start: int
+    end: int
+
+
+def _shell_tokens(source: str) -> list[ShellToken]:
+    """Tokenize shell words without mistaking quoted punctuation for operators."""
+    tokens = []
+    position = 0
+    while position < len(source):
+        if source[position] in " \t\r":
+            position += 1
+            continue
+        if source.startswith("\\\n", position):
+            position += 2
+            continue
+        if source[position] == "#":
+            position = source.find("\n", position)
+            if position == -1:
+                break
+            continue
+        match = _SHELL_TOKEN.match(source, position)
+        if match is None:
+            raise ValueError("Unsupported or incomplete shell word.")
+        raw = match.group()
+        operator = match.lastgroup == "operator"
+        value = raw if operator else shlex.split(raw.replace("\\\n", ""), comments=False)[0]
+        tokens.append(ShellToken(value, raw, operator, position, match.end()))
+        position = match.end()
+    return tokens
+
 
 @dataclass(frozen=True)
 class CommandAnalysis:
@@ -126,7 +169,8 @@ class CommandInspection:
 
     SHELLS = frozenset({"sh", "bash", "zsh"})
     SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")"})
-    DESTRUCTIVE_REDIRECTIONS = frozenset({">", ">|", "<>", "&>"})
+    WRITE_REDIRECTIONS = frozenset({">", ">|", ">>", "<>", "&>", "&>>", ">&"})
+    REDIRECTIONS = WRITE_REDIRECTIONS | frozenset({"<", "<&", "<<", "<<-"})
     DEFAULT_COMMAND_MATCHERS = (match_git_mutation, match_destructive_command)
 
     _matchers: tuple[CommandMatcher, ...]
@@ -145,27 +189,36 @@ class CommandInspection:
         """
         return CommandInspection((*self._matchers, matcher))
 
-    def inspect(self, source: str) -> tuple[CommandFinding, ...]:
+    def inspect(
+        self,
+        source: str,
+        *,
+        temporary_roots: tuple[Path, ...] = (),
+    ) -> tuple[CommandFinding, ...]:
         """Collect all applicable findings in matcher registration order.
 
         Args:
             source (str): Opaque POSIX shell source to inspect heuristically.
+            temporary_roots (tuple[Path, ...]): Bound, managed temporary roots whose literal
+                destinations need no destructive review. Defaults to no temporary exemptions.
 
         Returns:
             tuple[CommandFinding, ...]: Applicable findings; absence does not prove safety.
         """
-        return self.analyze(source).findings
+        return self.analyze(source, temporary_roots=temporary_roots).findings
 
-    def analyze(self, source: str) -> CommandAnalysis:
+    def analyze(self, source: str, *, temporary_roots: tuple[Path, ...] = ()) -> CommandAnalysis:
         """Inspect source once for effects and candidate executables.
 
         Args:
             source (str): Opaque POSIX shell source to inspect heuristically.
+            temporary_roots (tuple[Path, ...]): Bound, managed temporary roots whose literal
+                destinations need no destructive review. Defaults to no temporary exemptions.
 
         Returns:
             CommandAnalysis: Bounded advisory classification; absence never proves safety.
         """
-        findings, git_read, executables = self._scan(source)
+        findings, git_read, executables = self._scan(source, temporary_roots)
         return CommandAnalysis(
             tuple(finding for finding in findings if finding is not None),
             git_read,
@@ -173,26 +226,30 @@ class CommandInspection:
         )
 
     def _scan(
-        self, source: str, depth: int = 0
+        self,
+        source: str,
+        temporary_roots: tuple[Path, ...],
+        depth: int = 0,
     ) -> tuple[list[CommandFinding | None], bool, list[str]]:
         """Scan one shell level and merge bounded nested command classifications."""
         findings = [None] * len(self._matchers)
         git_read = False
         executables = []
         try:
-            lexer = shlex.shlex(source, posix=True, punctuation_chars=";&|()<>")
-            lexer.whitespace_split = True
-            tokens = list(lexer)
+            tokens = _shell_tokens(source)
         except ValueError:
             return findings, git_read, executables
         start = 0
         for index in range(len(tokens) + 1):
-            if index < len(tokens) and tokens[index] not in self.SEPARATORS:
+            if index < len(tokens) and not (
+                tokens[index].operator and tokens[index].value in self.SEPARATORS | {"\n"}
+            ):
                 continue
-            command = tokens[start:index]
+            segment = tokens[start:index]
             start = index + 1
-            if self._has_destructive_redirection(command):
-                self._add_destructive_finding(findings)
+            command, review = self._strip_redirections(segment, temporary_roots)
+            if review:
+                self._add_destructive_finding(findings, redirection=True)
             command, ambiguous = self._strip_shell_prefixes(command)
             if ambiguous:
                 self._add_destructive_finding(findings)
@@ -211,7 +268,7 @@ class CommandInspection:
                 position = arguments.index("-c")
                 if position + 1 < len(arguments):
                     nested_findings, nested_git_read, nested_executables = self._scan(
-                        arguments[position + 1], depth + 1
+                        arguments[position + 1], temporary_roots, depth + 1
                     )
                     git_read = git_read or nested_git_read
                     executables.extend(nested_executables)
@@ -220,27 +277,82 @@ class CommandInspection:
                             findings[nested_position] = finding
         return findings, git_read, executables
 
-    def _add_destructive_finding(self, findings: list[CommandFinding | None]) -> None:
+    def _add_destructive_finding(
+        self,
+        findings: list[CommandFinding | None],
+        *,
+        redirection: bool = False,
+    ) -> None:
         """Record a redirection or ambiguous-wrapper destructive finding when enabled."""
         for position, matcher in enumerate(self._matchers):
             if matcher is match_destructive_command and findings[position] is None:
                 findings[position] = CommandFinding(
                     policy_id="destructive_command",
                     status=CommandReviewStatus.FRESH,
-                    context="Review a destructive workspace command",
-                    reason="delete or overwrite files in this workspace",
+                    context=(
+                        "Review an output destination" if redirection else "Review a shell wrapper"
+                    ),
+                    reason=(
+                        "write to an output destination that may overwrite or modify files"
+                        if redirection
+                        else "run a shell wrapper whose effects could not be determined"
+                    ),
                 )
 
-    def _has_destructive_redirection(self, command: list[str]) -> bool:
-        """Return whether a shell segment contains a destination-bearing redirection."""
-        return any(
-            token in self.DESTRUCTIVE_REDIRECTIONS
-            or (
-                token == ">&"
-                and (position + 1 == len(command) or not command[position + 1].isdigit())
-            )
-            for position, token in enumerate(command)
-        )
+    def _strip_redirections(
+        self,
+        tokens: list[ShellToken],
+        temporary_roots: tuple[Path, ...],
+    ) -> tuple[list[str], bool]:
+        """Separate command words from redirects, retaining review for unproven destinations."""
+        words = []
+        last_word_position = -1
+        review = False
+        position = 0
+        while position < len(tokens):
+            token = tokens[position]
+            if not token.operator or token.value not in self.REDIRECTIONS:
+                words.append(token.value)
+                last_word_position = position
+                position += 1
+                continue
+            if (
+                last_word_position == position - 1
+                and position > 0
+                and tokens[position - 1].end == token.start
+                and tokens[position - 1].raw.isdecimal()
+            ):
+                words.pop()
+            position += 1
+            destination = tokens[position] if position < len(tokens) else None
+            if token.value in self.WRITE_REDIRECTIONS:
+                descriptor = (
+                    token.value == ">&"
+                    and destination is not None
+                    and (destination.value.isdecimal() or destination.value == "-")
+                )
+                review = review or not (
+                    descriptor or self._managed_destination(destination, temporary_roots)
+                )
+            if destination is not None:
+                position += 1
+        return words, review
+
+    @staticmethod
+    def _managed_destination(token: ShellToken | None, temporary_roots: tuple[Path, ...]) -> bool:
+        """Recognize only literal null-device or contained managed temporary destinations."""
+        if token is None or token.operator or any(char in token.raw for char in "$`*?[\n"):
+            return False
+        path = Path(token.value)
+        if token.value == "/dev/null":
+            return True
+        if not path.is_absolute() or ".." in path.parts:
+            return False
+        try:
+            resolved = path.resolve(strict=False)
+            return any(resolved.is_relative_to(root) for root in temporary_roots)
+        except (OSError, RuntimeError):
+            return False
 
     def _strip_shell_prefixes(self, command: list[str]) -> tuple[list[str], bool]:
         """Remove supported shell prefixes; flag ambiguous wrappers for fresh review."""

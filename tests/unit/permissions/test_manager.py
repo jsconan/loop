@@ -180,6 +180,8 @@ def test_native_destructive_workspace_commands_require_approval(tmp_path, source
     if "git" in source:
         assert "Review a Git state-changing command" in interaction.info.call_args.args[0]
         assert "change repository state" in interaction.info.call_args.args[0]
+    elif ">" in source:
+        assert "Review an output destination" in interaction.info.call_args.args[0]
     else:
         assert "Review a destructive workspace command" in interaction.info.call_args.args[0]
         assert "delete or overwrite files" in interaction.info.call_args.args[0]
@@ -689,6 +691,74 @@ def test_native_read_prompt_distinguishes_tool_folder_data_and_broad_scope(tmp_p
         assert 'Command: "opaque-command"' in message
         assert str(external) not in message
         assert str(tmp_path) not in message
+
+
+def test_native_automatic_tool_reads_are_not_presented_as_permission_reasons(tmp_path):
+    """A destructive review does not claim that already authorized tool reads need approval."""
+    tool_root = tmp_path.parent / "installed-tool"
+    tool_root.mkdir()
+    executable = tool_root / "tool"
+    executable.write_text("installed", encoding="utf-8")
+    executable.chmod(0o700)
+    details = executable.stat()
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "deny"
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    bound = native_request(
+        tmp_path,
+        "rm victim",
+        read_roots=(tool_root,),
+        automatic_tool_reads=(tool_root,),
+        executable_identities=(("tool", executable, executable, details.st_dev, details.st_ino),),
+        environment={"PATH": str(tool_root)},
+        read_context="Use installed developer tools",
+    )
+    assert not manager.authorize_sandboxed_command(bound, tool_id="run_command")
+    message = interaction.info.call_args.args[0]
+    assert "Review a destructive workspace command" in message
+    assert "read files outside" not in message
+    assert "Use installed developer tools" not in message
+
+
+@pytest.mark.parametrize("escape", [False, True])
+def test_native_redirection_exemption_uses_bound_temporary_alias(tmp_path, escape):
+    """Only a translated, contained temporary destination can bypass output review."""
+    scratch = tmp_path.parent / "managed-scratch"
+    scratch.mkdir()
+    alias = tmp_path.parent / "temporary-alias"
+    alias.symlink_to(scratch, target_is_directory=True)
+    (scratch / "link").symlink_to(tmp_path, target_is_directory=True)
+    suffix = "link/victim" if escape else "report"
+    bound = native_request(
+        tmp_path,
+        f"printf text >/tmp/{suffix}",
+        execution_source=f"printf text >{alias}/{suffix}",
+        aliases=(("/tmp", alias, scratch),),
+        read_roots=(),
+        write_roots=(tmp_path, scratch),
+    )
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "deny"
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    assert manager.authorize_sandboxed_command(bound, tool_id="run_command") is not escape
+    assert interaction.prompt.call_count == int(escape)
+
+
+def test_native_literal_command_scratch_redirection_needs_no_review(tmp_path):
+    """The bound private command TMPDIR is an output exemption without trusting variables."""
+    with tempfile.TemporaryDirectory(prefix="loop-seatbelt-") as directory:
+        scratch = Path(directory).resolve()
+        interaction = Mock(spec=Interaction)
+        interaction.prompt.return_value = "deny"
+        manager = PermissionManager(tmp_path, interaction=interaction)
+        bound = native_request(
+            tmp_path,
+            f"printf text >{scratch}/report",
+            read_roots=(),
+            environment={"TMPDIR": str(scratch)},
+        )
+        assert manager.authorize_sandboxed_command(bound, tool_id="run_command")
+        interaction.prompt.assert_not_called()
 
 
 def test_native_read_scope_audit_keeps_exact_roots_out_of_prompt(tmp_path):

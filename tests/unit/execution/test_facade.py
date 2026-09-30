@@ -3,7 +3,7 @@
 from unittest.mock import Mock
 
 from loop.execution import CommandExecutionService
-from loop.execution.sandbox import UnavailableSandboxBackend
+from loop.execution.sandbox import CommandProcessResult, SandboxOutcome, UnavailableSandboxBackend
 from loop.permissions import Action, Operation, PermissionManager, ProcessBoundary, ProcessTarget
 from loop.tooling import ToolContext
 
@@ -68,6 +68,43 @@ def test_unsupported_native_backend_offers_host_retry_without_launching_it(tmp_p
     assert result.code == "sandbox.unavailable"
     assert result.detail == "Unqualified host."
     assert "host_offer" in result.metadata
+    host.run_host_command.assert_not_called()
+
+
+def test_public_command_budget_starts_after_sandbox_approval(tmp_path, monkeypatch):
+    """The public facade preserves a full execution budget after a slow permission decision."""
+    now = [100.0]
+    monkeypatch.setattr("loop.execution.facade.time.monotonic", lambda: now[0])
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    interaction = Mock()
+
+    def approve(*_args, **_kwargs):
+        """Return a user decision after the initial deadline has elapsed."""
+        now[0] = 243.0
+        return "approve"
+
+    interaction.prompt.side_effect = approve
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", "printf text >victim"),
+            cwd=str(tmp_path),
+            boundary=ProcessBoundary.SANDBOXED,
+        ),
+    )
+    host = Mock()
+    service = CommandExecutionService(backend, host)
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(operation,),
+        permission_manager=PermissionManager(tmp_path),
+    )
+    result = service.run_command(context, "printf text >victim")
+    assert result["boundary"] == "sandbox"
+    assert backend.run.call_args.args[0].deadline == 273.0
     host.run_host_command.assert_not_called()
 
 

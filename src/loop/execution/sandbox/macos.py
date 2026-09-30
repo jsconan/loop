@@ -290,6 +290,15 @@ def _check_deadline(deadline: float) -> float:
     return remaining
 
 
+def _request_failure(request: SandboxRequest) -> CommandProcessResult | None:
+    """Distinguish changed authorization and expired budgets from native unavailability."""
+    if not request.paths_are_current():
+        return CommandProcessResult(SandboxOutcome.STALE, detail="Approved path identity changed.")
+    if time.monotonic() >= request.deadline:
+        return CommandProcessResult(SandboxOutcome.TIMED_OUT, detail="Command deadline expired.")
+    return None
+
+
 def _walk_granted_root(
     root: Path,
     deadline: float,
@@ -946,12 +955,12 @@ class MacOSSeatbeltBackend:
         """
         if platform.system() != "Darwin" or request.policy_version != _POLICY_VERSION:
             return CommandProcessResult(
-                SandboxOutcome.UNAVAILABLE, detail="Unsupported macOS policy."
+                SandboxOutcome.UNAVAILABLE,
+                detail="Unsupported macOS policy.",
+                failure_context="No compatible native sandbox policy is available.",
             )
-        if not request.paths_are_current() or time.monotonic() >= request.deadline:
-            return CommandProcessResult(
-                SandboxOutcome.UNAVAILABLE, detail="Approved path or deadline changed."
-            )
+        if failure := _request_failure(request):
+            return failure
         try:
             bound_scratch = request.shell_environment().get("TMPDIR")
             scratch_context = (
@@ -992,10 +1001,8 @@ class MacOSSeatbeltBackend:
                 darwin_temp = self._diagnostics.darwin_temp(request.deadline)
                 environment = request.shell_environment()
                 environment["TMPDIR"] = str(scratch)
-                if not request.paths_are_current() or time.monotonic() >= request.deadline:
-                    return CommandProcessResult(
-                        SandboxOutcome.UNAVAILABLE, detail="Approved path or deadline changed."
-                    )
+                if failure := _request_failure(request):
+                    return failure
                 if not self._diagnostics.parent_verified():
                     probe_tag = "LOOP_SBX_" + secrets.token_hex(16)
                     compatibility_files = _python_environment_configs(request)
@@ -1024,12 +1031,11 @@ class MacOSSeatbeltBackend:
                             SandboxOutcome.UNAVAILABLE,
                             detail=f"Seatbelt launch check failed (exit {probe.returncode}): "
                             f"{probe.stderr.strip()[:_MAX_DIAGNOSTIC_CHARS]}",
+                            failure_context="Native sandbox launch check failed.",
                         )
                     self._diagnostics.mark_parent_verified()
-                if not request.paths_are_current() or time.monotonic() >= request.deadline:
-                    return CommandProcessResult(
-                        SandboxOutcome.UNAVAILABLE, detail="Approved path or deadline changed."
-                    )
+                if failure := _request_failure(request):
+                    return failure
                 tag = "LOOP_SBX_" + secrets.token_hex(16)
                 compatibility_files = _python_environment_configs(request)
                 profile = _profile(
@@ -1043,18 +1049,21 @@ class MacOSSeatbeltBackend:
                 monitor = self._diagnostics.monitor(request.deadline)
                 monitor.register(tag)
                 try:
-                    if not request.paths_are_current() or time.monotonic() >= request.deadline:
-                        return CommandProcessResult(
-                            SandboxOutcome.UNAVAILABLE,
-                            detail="Approved path or deadline changed.",
-                        )
+                    if failure := _request_failure(request):
+                        return failure
                     return self._execute(request, profile, environment, tag, monitor)
                 finally:
                     monitor.unregister(tag)
         except (TimeoutError, subprocess.TimeoutExpired) as exc:
             return CommandProcessResult(SandboxOutcome.TIMED_OUT, detail=str(exc))
-        except (OSError, ValueError) as exc:
-            return CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail=str(exc))
+        except ValueError as exc:
+            return CommandProcessResult(SandboxOutcome.INVALID, detail=str(exc))
+        except OSError as exc:
+            return CommandProcessResult(
+                SandboxOutcome.UNAVAILABLE,
+                detail=str(exc),
+                failure_context="Native sandbox preparation or process launch failed.",
+            )
         except KeyboardInterrupt:
             return CommandProcessResult(SandboxOutcome.CANCELLED, detail="Command cancelled.")
 
@@ -1110,7 +1119,10 @@ class MacOSSeatbeltBackend:
         )
         if capture.status is ProcessCaptureStatus.UNAVAILABLE:
             return CommandProcessResult(
-                SandboxOutcome.UNAVAILABLE, detail="Child pipes unavailable."
+                SandboxOutcome.UNAVAILABLE,
+                detail="Child pipes unavailable.",
+                failure_context="Native command output pipes could not be initialized.",
+                possible_effects=True,
             )
         if capture.status is not ProcessCaptureStatus.COMPLETED:
             return CommandProcessResult(
@@ -1127,6 +1139,7 @@ class MacOSSeatbeltBackend:
                 SandboxOutcome.UNAVAILABLE,
                 stderr=capture.stderr,
                 detail=f"Seatbelt failed before command launch (exit {capture.exit_code}).",
+                failure_context="Native sandbox failed before the command could start.",
             )
         observed_denial = (
             monitor.denial(tag, request.deadline)

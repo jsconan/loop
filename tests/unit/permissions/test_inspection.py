@@ -1,5 +1,7 @@
 """Tests for composable, advisory shell command findings."""
 
+from pathlib import Path
+
 import pytest
 
 from loop.permissions import (
@@ -110,6 +112,102 @@ def test_destructive_shell_syntax_is_classified_for_fresh_review(source):
 def test_non_destructive_or_invalid_syntax_has_no_finding(source):
     """Literal output and invalid shell text do not imply a file mutation."""
     assert not CommandInspection().inspect(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "echo '>'",
+        'echo ">"',
+        r"echo \>",
+        "echo 'a; rm victim'",
+        "printf text 2>&-",
+        "printf text <&0",
+        "printf text >&'1'",
+        "printf text >/dev/null",
+        "printf text >|/dev/null",
+        "printf text >>/dev/null",
+        "printf text &>/dev/null",
+        "printf text &>>/dev/null",
+        "printf text <>/dev/null",
+        "printf text 2> '/dev/null'",
+        ">/dev/null printf text",
+        "sh -c 'printf text >/dev/null'",
+        "printf text # >victim",
+        "printf text\n# >victim",
+        "printf text # >victim\nprintf done",
+        "\\\nprintf text >/dev/null",
+        "printf \\\ntext >/dev/null",
+        "printf te\\\nxt >/dev/null",
+        "cat <input >/dev/null",
+        (
+            "ls src/loop/utils src/loop/tools 2>/dev/null | head -40; "
+            'echo "=== counts"; find src/loop -name "*.py" -not -name "__init__.py" | wc -l; '
+            'find tests/unit -name "test_*.py" | wc -l; echo "=== collect"; '
+            "PYTHONDONTWRITEBYTECODE=1 uv run --no-sync pytest tests/unit -q --co 2>&1 | tail -5"
+        ),
+    ],
+)
+def test_safe_redirections_and_quoted_operators_require_no_review(source):
+    """Literal output sinks and descriptor operations do not imply workspace mutation."""
+    assert not CommandInspection().inspect(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "printf text >/dev/null >victim",
+        "printf text >victim >/dev/null",
+        "printf text >>victim",
+        "printf text >|victim",
+        "printf text <>victim",
+        "printf text &>>victim",
+        'printf text >"$OUTPUT"',
+        'printf text >"$TMPDIR/report"',
+        "printf text >/tmp/report",
+        "printf text >/dev/null-other",
+        "printf text >",
+        "printf text >&",
+        "printf text >1>victim",
+        "printf text >; rm victim",
+        "rm victim >/dev/null",
+        ">/dev/null rm victim",
+        "2>/dev/null git add victim",
+        "printf text\nrm victim",
+    ],
+)
+def test_safe_redirect_cannot_hide_other_mutation_or_unknown_output(source):
+    """Every output destination and direct executable retains its independent review gate."""
+    assert CommandInspection().inspect(source)
+
+
+@pytest.mark.parametrize("operator", [">", ">>", ">|", "<>", "&>", "&>>"])
+def test_literal_managed_temporary_outputs_need_no_review(tmp_path, operator):
+    """Bound temporary destinations are exempt for each destination-bearing write form."""
+    inspection = CommandInspection()
+    source = f"printf text {operator}'{tmp_path}/report'"
+    assert not inspection.analyze(source, temporary_roots=(tmp_path,)).findings
+    assert not inspection.inspect(f'sh -c "{source}"', temporary_roots=(tmp_path,))
+
+
+@pytest.mark.parametrize("suffix", ["../victim", "link/victim", "report*", "$(echo report)"])
+def test_temporary_exemption_rejects_escape_or_dynamic_destinations(tmp_path, suffix):
+    """Traversal, symlinks outside scratch and runtime destinations retain output review."""
+    (tmp_path / "link").symlink_to(tmp_path.parent, target_is_directory=True)
+    assert CommandInspection().inspect(
+        f"printf text >{tmp_path}/{suffix}", temporary_roots=(tmp_path,)
+    )
+
+
+def test_destination_resolution_failure_retains_review(monkeypatch):
+    """Unresolvable temporary paths do not receive an exemption."""
+
+    def fail_resolution(*_args, **_kwargs):
+        """Model an unreadable or cyclic destination path."""
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolution)
+    assert CommandInspection().inspect("printf text >/tmp/report", temporary_roots=(Path("/tmp"),))
 
 
 def test_command_inspection_does_not_claim_safety_from_no_findings():

@@ -671,6 +671,7 @@ class PermissionManager:
         outcome: str,
         exit_code: int | None,
         possible_effects: bool,
+        failure_context: str = "Native sandbox execution could not start.",
     ) -> str:
         """Describe an offered unrestricted host run and possible repeated effects.
 
@@ -679,6 +680,8 @@ class PermissionManager:
             outcome (str): Completed, denied, or unavailable sandbox outcome.
             exit_code (int | None): Completed sandbox command's exit code, if any.
             possible_effects (bool): Whether the sandbox attempt may have changed state.
+            failure_context (str): Path-free failure explanation supplied by the execution
+                boundary. Defaults to an unspecified native start failure.
 
         Returns:
             str: Human warning for the separate host authorization boundary.
@@ -695,6 +698,7 @@ class PermissionManager:
                 if outcome == "denied"
                 else "The sandbox was unavailable."
             )
+            reason += f" {failure_context}"
         repeat = (
             "\nThe sandboxed attempt may already have had effects. "
             "Retrying may repeat those effects."
@@ -766,7 +770,14 @@ class PermissionManager:
         explicit_ask = policy.decision is Decision.ASK and any(
             source.startswith("rule:") for source in policy.sources
         )
-        findings = self.inspect_command(request.source)
+        temporary_roots = tuple(scratch_roots)
+        scratch = request.shell_environment().get("TMPDIR")
+        if scratch is not None:
+            temporary_roots += (Path(scratch),)
+        findings = self._command_inspection.inspect(
+            request.execution_source,
+            temporary_roots=temporary_roots,
+        )
         fresh_review = any(finding.status is CommandReviewStatus.FRESH for finding in findings)
         self._audit_sandbox_scope(request, findings)
         if self._has_default_sandbox_access(
@@ -929,14 +940,16 @@ class PermissionManager:
         explicit_ask: bool,
     ) -> str:
         """Describe the additional authority requested without exposing local paths."""
-        reads_outside_workspace = request.read_roots or any(
+        reads_outside_workspace = set(request.read_roots) - set(
+            request.automatic_tool_reads
+        ) or any(
             not (
                 (virtual == VirtualPath.WORKSPACE and target == request.workspace)
                 or (virtual == VirtualPath.TEMPORARY and target in scratch_roots)
             )
             for virtual, _, target in request.aliases
         )
-        read_context = self._sandbox_read_context(request, reads_outside_workspace)
+        read_context = self._sandbox_read_context(request) if reads_outside_workspace else None
         reasons = self._sandbox_permission_reasons(
             request,
             scratch_roots=scratch_roots,
@@ -955,10 +968,8 @@ class PermissionManager:
         )
 
     @staticmethod
-    def _sandbox_read_context(request: SandboxRequest, reads_outside_workspace: bool) -> str | None:
+    def _sandbox_read_context(request: SandboxRequest) -> str:
         """Describe extra read authority at a human-safe level."""
-        if not reads_outside_workspace:
-            return request.read_context
         if request.read_context is not None:
             return request.read_context
         broad_roots = {

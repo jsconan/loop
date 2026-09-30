@@ -80,7 +80,8 @@ def test_classified_failure_only_offers_host_retry(tmp_path):
     assert attempt.offer is not None
     assert attempt.offer.warning == (
         'Command: "printf ok"\n'
-        "Reason: The sandbox was unavailable. Running without the OS sandbox can read "
+        "Reason: The sandbox was unavailable. Native sandbox execution could not start. "
+        "Running without the OS sandbox can read "
         "private files, change files outside the workspace, and use the network.\n"
         "The sandboxed attempt may already have had effects. Retrying may repeat those effects."
     )
@@ -486,24 +487,81 @@ def test_auto_approval_and_changed_root_start_none(tmp_path):
     host.run_host_command.assert_not_called()
 
 
-def test_changed_root_before_sandbox_launch_produces_unavailable_offer(tmp_path):
-    """The application does not call the backend after approved root replacement."""
-    service, backend, host, _ = coordinator(
+@pytest.mark.parametrize("execution_timeout", [None, 30.0])
+def test_changed_root_during_sandbox_approval_produces_no_host_offer(tmp_path, execution_timeout):
+    """Renewing an execution budget never accepts a root replaced during authorization."""
+    service, backend, host, interaction = coordinator(
         tmp_path, CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     )
     approved = request(tmp_path)
-    tmp_path.rename(tmp_path.with_name("old-workspace"))
-    tmp_path.mkdir()
 
-    attempt = service.run_sandboxed(approved, "run_command")
+    def answer(*_args, **_kwargs):
+        """Replace the workspace while the user considers the approval."""
+        tmp_path.rename(tmp_path.with_name("old-workspace"))
+        tmp_path.mkdir()
+        return "approve"
 
-    assert attempt.result.outcome is SandboxOutcome.UNAVAILABLE
-    assert attempt.offer is not None
+    interaction.prompt.side_effect = answer
+    attempt = service.run_sandboxed(approved, "run_command", execution_timeout=execution_timeout)
+
+    assert attempt.result.outcome is SandboxOutcome.STALE
+    assert attempt.offer is None
     backend.run.assert_not_called()
     host.run_host_command.assert_not_called()
 
 
-def test_host_retry_rechecks_root_after_approval(tmp_path):
+def test_sandbox_approval_wait_does_not_consume_execution_budget(tmp_path, monkeypatch):
+    """A long interactive wait leaves a full bounded sandbox budget after approval."""
+    now = [100.0]
+    monkeypatch.setattr("loop.execution.coordinator.time.monotonic", lambda: now[0])
+    service, backend, host, interaction = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    )
+    approved = request(tmp_path, deadline=130.0)
+
+    def answer(*_args, **_kwargs):
+        """Return approval after the original execution deadline would have expired."""
+        now[0] = 243.0
+        return "approve"
+
+    interaction.prompt.side_effect = answer
+    attempt = service.run_sandboxed(approved, "run_command", execution_timeout=30.0)
+    launched = backend.run.call_args.args[0]
+    assert launched.deadline == 273.0
+    assert launched.source == approved.source
+    assert launched.attempt_id == approved.attempt_id
+    assert launched.paths_are_current()
+    assert attempt.result.outcome is SandboxOutcome.COMPLETED
+    assert attempt.offer is None
+    host.run_host_command.assert_not_called()
+
+
+def test_expired_absolute_budget_never_offers_host_execution(tmp_path, monkeypatch):
+    """An already expired execution budget remains a timeout rather than an escalation."""
+    service, backend, host, _ = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    )
+    approved = request(tmp_path, deadline=100.0)
+    monkeypatch.setattr("loop.execution.coordinator.time.monotonic", lambda: 101.0)
+    attempt = service.run_sandboxed(approved, "run_command")
+    assert attempt.result.outcome is SandboxOutcome.TIMED_OUT
+    assert attempt.offer is None
+    backend.run.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("outcome", [SandboxOutcome.INVALID, SandboxOutcome.STALE])
+def test_unsafe_or_stale_native_preparation_never_offers_host_execution(tmp_path, outcome):
+    """Native safety validation failures cannot become unrestricted host authority."""
+    service, _, host, _ = coordinator(tmp_path, CommandProcessResult(outcome))
+    attempt = service.run_sandboxed(request(tmp_path), "run_command")
+    assert attempt.result.outcome is outcome
+    assert attempt.offer is None
+    host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("execution_timeout", [None, 30.0])
+def test_host_retry_rechecks_root_after_approval(tmp_path, execution_timeout):
     """A root replacement during the one-off prompt invalidates the approved host launch."""
     service, _, host, interaction = coordinator(
         tmp_path, CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="launcher missing")
@@ -518,7 +576,7 @@ def test_host_retry_rechecks_root_after_approval(tmp_path):
         return "approve"
 
     interaction.prompt.side_effect = replace_root
-    assert service.retry_host_command(offer, approved) is None
+    assert service.retry_host_command(offer, approved, execution_timeout=execution_timeout) is None
     host.run_host_command.assert_not_called()
 
 
@@ -533,6 +591,33 @@ def test_host_retry_uses_fresh_deadline_with_the_same_command_identity(tmp_path)
 
     assert service.retry_host_command(offer, renewed) == "host-result"
     host.run_host_command.assert_called_once_with(HostCommandRequest.from_sandbox(renewed))
+
+
+def test_host_approval_wait_does_not_consume_execution_budget(tmp_path, monkeypatch):
+    """The separately approved host attempt starts its budget after the host decision."""
+    now = [100.0]
+    monkeypatch.setattr("loop.execution.coordinator.time.monotonic", lambda: now[0])
+    service, _, host, interaction = coordinator(
+        tmp_path,
+        CommandProcessResult(
+            SandboxOutcome.UNAVAILABLE,
+            detail=f"launcher failed at {tmp_path}",
+            failure_context="Native sandbox launch check failed.",
+        ),
+    )
+    approved = request(tmp_path, deadline=130.0)
+    offer = service.run_sandboxed(approved, "run_command").offer
+
+    def answer(*_args, **_kwargs):
+        """Delay the host decision without changing approved authority."""
+        now[0] = 300.0
+        return "approve"
+
+    interaction.prompt.side_effect = answer
+    assert service.retry_host_command(offer, approved, execution_timeout=30.0) == "host-result"
+    assert host.run_host_command.call_args.args[0].deadline == 330.0
+    assert "Native sandbox launch check failed." in interaction.info.call_args.args[0]
+    assert str(tmp_path) not in interaction.info.call_args.args[0]
 
 
 def test_host_executor_failure_is_audited_and_not_replayed(tmp_path):

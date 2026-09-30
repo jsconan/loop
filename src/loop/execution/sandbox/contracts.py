@@ -25,6 +25,8 @@ class SandboxOutcome(StrEnum):
     DENIED = "denied"
     TIMED_OUT = "timed_out"
     CANCELLED = "cancelled"
+    STALE = "stale"
+    INVALID = "invalid"
 
 
 @dataclass(frozen=True)
@@ -576,6 +578,8 @@ class CommandProcessResult:
         observed_denial (str): Verified OS denial observed during a completed shell attempt;
             it does not establish why the shell exited.
         possible_effects (bool): Whether the attempt may have changed state before failure.
+        failure_context (str): Path-free explanation of the failed native execution stage,
+            safe to display in a host approval prompt.
     """
 
     outcome: SandboxOutcome
@@ -587,6 +591,7 @@ class CommandProcessResult:
     detail: str = ""
     observed_denial: str = ""
     possible_effects: bool = False
+    failure_context: str = "Native sandbox execution could not start."
 
     def __post_init__(self) -> None:
         if (self.outcome is SandboxOutcome.COMPLETED) != (self.exit_code is not None):

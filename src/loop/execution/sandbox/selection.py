@@ -101,7 +101,11 @@ class UnavailableSandboxBackend:
         Returns:
             CommandProcessResult: Unavailable boundary result.
         """
-        return CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail=self._reason)
+        return CommandProcessResult(
+            SandboxOutcome.UNAVAILABLE,
+            detail=self._reason,
+            failure_context="Native sandbox capability check failed.",
+        )
 
 
 def select_sandbox_backend() -> SandboxBackend:

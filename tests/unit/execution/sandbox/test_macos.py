@@ -267,7 +267,20 @@ def test_backend_rejects_stale_initial_identity(monkeypatch, tmp_path):
     value = request(tmp_path)
     monkeypatch.setattr(SandboxRequest, "paths_are_current", lambda self: False)
     result = MacOSSeatbeltBackend().run(value)
-    assert "path or deadline" in result.detail
+    assert result.outcome is SandboxOutcome.STALE
+    assert "path identity changed" in result.detail
+
+
+def test_backend_expired_budget_is_timeout_before_native_launch(monkeypatch, tmp_path):
+    """An expired request remains a timeout without attempting native initialization."""
+    value = request(tmp_path, deadline=100.0)
+    monkeypatch.setattr("loop.execution.sandbox.macos.time.monotonic", lambda: 101.0)
+    popen = MagicMock()
+    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
+    result = MacOSSeatbeltBackend().run(value)
+    assert result.outcome is SandboxOutcome.TIMED_OUT
+    assert result.detail == "Command deadline expired."
+    popen.assert_not_called()
 
 
 def test_backend_builds_profile_and_runs_child(monkeypatch, tmp_path):
@@ -410,7 +423,7 @@ def test_backend_rejects_scratch_without_its_own_prefix(tmp_path):
         )
         result = MacOSSeatbeltBackend().run(bound)
 
-    assert result.outcome is SandboxOutcome.UNAVAILABLE
+    assert result.outcome is SandboxOutcome.INVALID
     assert "Unsafe command scratch directory" in result.detail
 
 
@@ -780,7 +793,7 @@ def test_backend_omits_private_search_root_through_symlink(monkeypatch, tmp_path
 
 @pytest.mark.parametrize("fake_darwin_temp", ["real_home"], indirect=True)
 def test_backend_fails_closed_when_account_home_is_unavailable(monkeypatch, tmp_path):
-    """Missing trusted account home produces a typed unavailable result before launch."""
+    """Missing trusted account home invalidates native preparation before launch."""
     monkeypatch.setattr(
         "loop.execution.sandbox.macos.pwd.getpwuid",
         MagicMock(side_effect=KeyError("no account")),
@@ -790,7 +803,7 @@ def test_backend_fails_closed_when_account_home_is_unavailable(monkeypatch, tmp_
 
     result = MacOSSeatbeltBackend().run(request(tmp_path))
 
-    assert result.outcome is SandboxOutcome.UNAVAILABLE
+    assert result.outcome is SandboxOutcome.INVALID
     assert "home directory is unavailable" in result.detail
     popen.assert_not_called()
 
@@ -799,7 +812,6 @@ def test_backend_fails_closed_when_account_home_is_unavailable(monkeypatch, tmp_
 @pytest.mark.parametrize("home_case", ["valid", "wrong_owner", "missing"])
 def test_backend_validates_account_home_without_ambient_home(monkeypatch, tmp_path, home_case):
     """Trusted account lookup accepts a real home and rejects unsafe or absent homes."""
-    from types import SimpleNamespace
 
     monkeypatch.setattr(
         "loop.execution.sandbox.macos.subprocess.run",
@@ -835,7 +847,7 @@ def test_backend_validates_account_home_without_ambient_home(monkeypatch, tmp_pa
         assert result.outcome is SandboxOutcome.COMPLETED
         popen.assert_called_once()
     else:
-        assert result.outcome is SandboxOutcome.UNAVAILABLE
+        assert result.outcome is SandboxOutcome.INVALID
         assert "home directory" in result.detail
         popen.assert_not_called()
 
@@ -901,7 +913,7 @@ def test_backend_grants_only_safe_python_environment_config(monkeypatch, tmp_pat
         assert f'(literal "{config}")' in popen.call_args.args[0][2]
         assert f'(subpath "{external}")' not in popen.call_args.args[0][2]
     else:
-        assert result.outcome is SandboxOutcome.UNAVAILABLE
+        assert result.outcome is SandboxOutcome.INVALID
         assert "Unsafe Python environment configuration" in result.detail
         popen.assert_not_called()
 
@@ -1269,7 +1281,7 @@ def test_backend_validates_darwin_compiler_cache(monkeypatch, tmp_path, case):
         assert result.outcome is SandboxOutcome.COMPLETED
         assert "xcrun_db" in popen.call_args.args[0][2]
     else:
-        assert result.outcome is SandboxOutcome.UNAVAILABLE
+        assert result.outcome is SandboxOutcome.INVALID
         popen.assert_not_called()
 
 
@@ -1289,7 +1301,7 @@ def test_backend_reuses_trusted_darwin_temp_path_but_revalidates_entries(monkeyp
     backend = MacOSSeatbeltBackend()
     assert backend.run(approved).outcome is SandboxOutcome.COMPLETED
     (user_temp / "xcrun_db-new").mkdir()
-    assert backend.run(approved).outcome is SandboxOutcome.UNAVAILABLE
+    assert backend.run(approved).outcome is SandboxOutcome.INVALID
 
     assert run.call_count == 2
     launch.assert_called_once()
@@ -1401,7 +1413,7 @@ def test_backend_rejects_hardlinked_read_root_even_when_read_only(tmp_path, root
         )
     )
 
-    assert result.outcome is SandboxOutcome.UNAVAILABLE
+    assert result.outcome is SandboxOutcome.INVALID
     assert "hardlinked file" in result.detail
 
 
@@ -1420,7 +1432,7 @@ def test_backend_rejects_protected_directory_as_read_root(tmp_path, root_kind, n
             write_roots=(),
         )
     )
-    assert result.outcome is SandboxOutcome.UNAVAILABLE
+    assert result.outcome is SandboxOutcome.INVALID
     assert "Protected directory cannot be a read root" in result.detail
 
 
@@ -1487,7 +1499,8 @@ def test_backend_revalidates_identity_around_launcher(monkeypatch, tmp_path, sta
     )
     monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
     result = MacOSSeatbeltBackend().run(value)
-    assert "path or deadline" in result.detail
+    assert result.outcome is SandboxOutcome.STALE
+    assert "path identity changed" in result.detail
     popen.assert_not_called()
 
 
@@ -1566,5 +1579,7 @@ def test_backend_classifies_child_capture_failures(monkeypatch, tmp_path, proces
     monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(request(tmp_path))
     assert result.outcome is outcome
+    if process.stdout is None:
+        assert result.possible_effects
     if isinstance(process.wait_error, subprocess.TimeoutExpired):
         assert result.stdout == "ok"

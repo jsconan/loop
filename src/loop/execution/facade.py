@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -378,6 +378,7 @@ class CommandExecutionService:
             request,
             context.tool_name,
             prelaunch_failure=prelaunch_failure,
+            execution_timeout=context.settings.command_timeout,
         )
         if attempt.result is None:
             return Problem(
@@ -389,10 +390,11 @@ class CommandExecutionService:
         result = attempt.result
         boundary = "sandbox"
         if attempt.offer is not None and context.interaction is not None:
-            retry_request = replace(
-                request, deadline=time.monotonic() + context.settings.command_timeout
+            retry = coordinator.retry_host_command(
+                attempt.offer,
+                request,
+                execution_timeout=context.settings.command_timeout,
             )
-            retry = coordinator.retry_host_command(attempt.offer, retry_request)
             if retry is not None:
                 result = retry
                 boundary = "host"

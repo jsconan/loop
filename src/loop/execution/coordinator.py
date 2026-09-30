@@ -6,7 +6,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -272,6 +272,7 @@ class CommandExecutionCoordinator:
         tool_id: str,
         *,
         prelaunch_failure: str | None = None,
+        execution_timeout: float | None = None,
     ) -> CommandAttempt:
         """Run an authorized request or offer retry for a typed prelaunch failure.
 
@@ -280,6 +281,8 @@ class CommandExecutionCoordinator:
             tool_id (str): Registered execution tool identity used for permission evaluation.
             prelaunch_failure (str | None): Startup capability failure to return without invoking
                 the backend, after authorization and path validation.
+            execution_timeout (float | None): Execution budget in seconds to start after approval.
+                Defaults to preserving the caller's absolute deadline.
 
         Returns:
             CommandAttempt: Sandboxed result and optional unexecuted host offer.
@@ -288,13 +291,23 @@ class CommandExecutionCoordinator:
             request, tool_id=tool_id, interaction=self._interaction
         ):
             return CommandAttempt(None, None)
-        if not request.paths_are_current() or time.monotonic() >= request.deadline:
+        if execution_timeout is not None:
+            request = replace(request, deadline=time.monotonic() + execution_timeout)
+        if not request.paths_are_current():
             result = CommandProcessResult(
-                SandboxOutcome.UNAVAILABLE,
-                detail="Approved directory identity changed or the deadline expired before launch.",
+                SandboxOutcome.STALE,
+                detail="Approved path identity changed before launch.",
+            )
+        elif time.monotonic() >= request.deadline:
+            result = CommandProcessResult(
+                SandboxOutcome.TIMED_OUT, detail="Command deadline expired before launch."
             )
         elif prelaunch_failure is not None:
-            result = CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail=prelaunch_failure)
+            result = CommandProcessResult(
+                SandboxOutcome.UNAVAILABLE,
+                detail=prelaunch_failure,
+                failure_context="Native sandbox capability check failed.",
+            )
         else:
             result = self._backend.run(request)
         telemetry_audit(
@@ -318,7 +331,11 @@ class CommandExecutionCoordinator:
             request,
             result,
             self._permissions.host_retry_prompt(
-                request.source, result.outcome.value, result.exit_code, result.possible_effects
+                request.source,
+                result.outcome.value,
+                result.exit_code,
+                result.possible_effects,
+                result.failure_context,
             ),
         )
         self._offers[offer.token] = offer
@@ -336,12 +353,16 @@ class CommandExecutionCoordinator:
         self,
         offer: HostCommandOffer,
         current_request: SandboxRequest,
+        *,
+        execution_timeout: float | None = None,
     ) -> CommandProcessResult | None:
         """Approve an unchanged offer and launch at most one host process.
 
         Args:
             offer (HostCommandOffer): Previously issued, unused host retry offer.
             current_request (SandboxRequest): Freshly resolved command context at approval time.
+            execution_timeout (float | None): Execution budget in seconds to start after host
+                approval. Defaults to preserving the caller's absolute deadline.
 
         Returns:
             CommandProcessResult | None: Host result after approval, or None when no launch occurs.
@@ -392,6 +413,10 @@ class CommandExecutionCoordinator:
                 offer_id=offer.token,
             )
             return None
+        if execution_timeout is not None:
+            current_request = replace(
+                current_request, deadline=time.monotonic() + execution_timeout
+            )
         if (
             not current_request.paths_are_current()
             or time.monotonic() >= current_request.deadline

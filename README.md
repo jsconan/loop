@@ -715,9 +715,14 @@ reports therefore run without workspace write permission. A missing or stale vir
 may still fail read-only `uv run`; commands that update it or retain `.coverage`, HTML reports,
 or snapshots use the default workspace write grant. Loop recognizes common direct destructive
 and Git-changing shell forms for fresh approval, but cannot infer every effect of arbitrary shell
-source. Recognized forms include removal, shell overwrite redirection, destination-bearing
-`cp`, `mv`, `install`, and `tee`, `dd of=`, and `sed` or `perl` in-place editing. These
-forms ask even when the destination might be new. The approved workspace is readable input to sandboxed commands, including
+source. Recognized forms include removal, output redirection to unproven destinations,
+destination-bearing `cp`, `mv`, `install`, and `tee`, `dd of=`, and `sed` or `perl` in-place editing. These
+forms ask even when the destination might be new. Descriptor duplication/closure and literal
+`/dev/null` output do not need destructive review. Literal output destinations within a bound
+managed temporary root are also exempt, including translated `/tmp` paths; shared host temporary
+paths and unresolved expansions such as `$TMPDIR/report` are not automatically exempt. Every
+redirect is checked independently, including append and read/write redirects.
+The approved workspace is readable input to sandboxed commands, including
 `.env` files and Git configuration. A command may print that data into model-visible output even
 when offline and write restricted. The macOS policy denies reads under `.ssh`, `.aws`, `.gnupg`,
 `.config`, `.loop`, and `Library` directories inside the workspace, approved extra read roots,
@@ -771,7 +776,12 @@ and the runtime dependencies declared by its bounded installation receipt, inclu
 separate support-file grant. Symlinks
 to private files outside granted roots remain denied. General local IPC and output to the model
 are separate disclosure surfaces, so this mode is not a secret-isolation guarantee. A Seatbelt
-setup or launch failure produces a typed sandbox failure and a separate, warned host retry offer.
+capability or OS preparation/launch failure can produce a separate, warned host retry offer.
+Unsafe preflight validation and changed authorization identities fail closed without a host offer.
+Expired preparation or execution budgets are timeouts and never offer host execution. The public
+command timeout starts after sandbox approval; a separately approved host attempt starts its own
+budget after host approval. Path, alias, and executable identities are revalidated after each
+decision, and native preparation and execution share that bounded budget.
 When a started shell exits nonzero after an OS denial was observed, Loop preserves the shell's
 exit code and output and reports the denial separately. A host retry is offered only when bounded
 child output also reports a related permission failure; a read-only workspace-write denial never
@@ -784,8 +794,8 @@ matches records to each command's random attempt tag. A bounded post-exit log qu
 as a fallback. A nonzero exit or `EPERM` text alone never produces a host retry offer. If macOS
 does not deliver a verified record, a real denial can appear as an ordinary nonzero exit.
 An extra-access approval shows the command and a plain-language reason, without local path mappings.
-The host retry prompt shows the original command, the observed failure or uncertain denial,
-and the risk of running without filesystem or network restrictions. Internal paths and
+The host retry prompt shows the original command, a path-free explanation of the failed native
+stage or uncertain denial, and the risk of running without filesystem or network restrictions. Internal paths and
 environment details remain bound to the retry but are not shown in the prompt.
 
 ## Built-in tools

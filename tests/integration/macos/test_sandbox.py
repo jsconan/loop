@@ -70,7 +70,7 @@ def test_native_hardlink_preflight_preserves_outside_inode(backend, native_works
     outside = native_workspace.parent / "outside" / "write"
     (native_workspace / "hardlink").hardlink_to(outside)
     result = execute(backend, native_workspace, "printf changed > hardlink")
-    assert result.outcome is SandboxOutcome.UNAVAILABLE
+    assert result.outcome is SandboxOutcome.INVALID
     assert outside.read_text(encoding="utf-8") == "preserve-outside"
 
 
