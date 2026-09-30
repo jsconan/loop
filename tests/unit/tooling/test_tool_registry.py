@@ -34,6 +34,7 @@ from loop import (
     resolve_executable,
     run_command,
 )
+from loop.constants import MAX_TOOL_RESULT_BYTES
 from loop.execution import CommandExecutionService
 from loop.execution.coordinator import LocalHostCommandExecutor
 from loop.execution.sandbox import CommandProcessResult, SandboxOutcome
@@ -1295,7 +1296,8 @@ def test_denied_command_virtualizes_offer_and_cached_output(tmp_path, monkeypatc
     backend = Mock()
     backend.run.return_value = CommandProcessResult(
         SandboxOutcome.DENIED,
-        stdout=(str(tmp_path) + "/output\n") * 600,
+        stdout=(str(tmp_path) + "/output\n")
+        * (MAX_TOOL_RESULT_BYTES // len("/workspace/output\n") + 1),
         detail=f"Denied {tmp_path}/.ssh/fake",
     )
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
@@ -1309,7 +1311,7 @@ def test_denied_command_virtualizes_offer_and_cached_output(tmp_path, monkeypatc
     )
 
     problem = json.loads(output)["problem"]
-    assert problem["code"] == "sandbox.denied"
+    assert problem["code"] == "sandbox.denied", problem
     assert str(tmp_path) not in output
     assert "/workspace/.ssh/fake" in problem["metadata"]["host_offer"]
     assert any(str(tmp_path) in call.args[0] for call in interaction.info.call_args_list)

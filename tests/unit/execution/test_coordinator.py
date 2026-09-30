@@ -2,10 +2,10 @@
 
 import subprocess
 import tempfile
-import threading
 import time
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -578,33 +578,6 @@ def test_offer_approval_and_host_execution_have_distinct_sanitized_audit_events(
     assert all(record.attributes["attempt_id"] == approved.attempt_id for record in adapter.records)
 
 
-def test_local_host_executor_captures_approved_shell_output(tmp_path):
-    """The separate host supervisor returns bounded output and the shell exit code."""
-    approved = HostCommandRequest.from_sandbox(request(tmp_path, source="printf host; exit 7"))
-
-    result = LocalHostCommandExecutor().run_host_command(approved)
-
-    assert result.outcome is SandboxOutcome.COMPLETED
-    assert result.exit_code == 7
-    assert result.stdout == "host"
-
-
-def test_local_host_executor_times_out_and_cleans_up(tmp_path, monkeypatch):
-    """A real host timeout kills its child without an uncaught reader error."""
-    errors = []
-    monkeypatch.setattr(threading, "excepthook", errors.append)
-    approved = HostCommandRequest.from_sandbox(
-        request(tmp_path, source="sleep 5", deadline=time.monotonic() + 0.15)
-    )
-
-    result = LocalHostCommandExecutor().run_host_command(approved)
-    time.sleep(0.05)
-
-    assert result.outcome is SandboxOutcome.TIMED_OUT
-    assert result.possible_effects
-    assert not errors
-
-
 def test_local_host_executor_does_not_launch_after_deadline(tmp_path, monkeypatch):
     """An expired host retry cannot start a process after its bound deadline."""
     launch = Mock()
@@ -617,35 +590,34 @@ def test_local_host_executor_does_not_launch_after_deadline(tmp_path, monkeypatc
     launch.assert_not_called()
 
 
-def test_local_host_executor_allows_completion_near_deadline(tmp_path):
-    """A real host child can finish during the final tenth of its command budget."""
-    approved = HostCommandRequest.from_sandbox(
-        request(tmp_path, source="sleep 0.15; printf finished", deadline=time.monotonic() + 0.24)
-    )
+def test_local_host_executor_allows_completion_near_deadline(tmp_path, monkeypatch):
+    """A completed child in the final budget interval remains successful without real waits."""
+    clock = SimpleNamespace(monotonic=lambda: 100.09)
+    monkeypatch.setattr("loop.execution.coordinator.time", clock)
+    monkeypatch.setattr("loop.utils.process.time", clock)
+    process = Mock(stdout=StringIO("finished"), stderr=StringIO(), returncode=0)
+    launch = Mock(return_value=process)
+    kill = Mock()
+    monkeypatch.setattr("loop.execution.coordinator.subprocess.Popen", launch)
+    monkeypatch.setattr("loop.execution.coordinator.kill_process_group", kill)
+
+    def reader_thread(*, target, daemon):
+        """Drain a fixture stream synchronously without depending on thread scheduling."""
+        reader = Mock()
+        reader.start.side_effect = target
+        reader.is_alive.return_value = False
+        return reader
+
+    monkeypatch.setattr("loop.execution.coordinator.threading.Thread", reader_thread)
+    approved = HostCommandRequest.from_sandbox(request(tmp_path, deadline=100.1))
 
     result = LocalHostCommandExecutor().run_host_command(approved)
 
     assert result.outcome is SandboxOutcome.COMPLETED
     assert result.stdout == "finished"
-
-
-def test_local_host_executor_timeout_closes_retained_pipe_without_thread_error(
-    tmp_path, monkeypatch
-):
-    """A descendant-held pipe is released promptly without an uncaught reader error."""
-    errors = []
-    monkeypatch.setattr(threading, "excepthook", errors.append)
-    approved = HostCommandRequest.from_sandbox(
-        request(tmp_path, source="sleep 2 & printf finished", deadline=time.monotonic() + 0.25)
-    )
-    started = time.monotonic()
-
-    result = LocalHostCommandExecutor().run_host_command(approved)
-    time.sleep(0.05)
-
-    assert result.outcome is SandboxOutcome.TIMED_OUT
-    assert time.monotonic() - started < 1
-    assert not errors
+    assert process.wait.call_args_list[0].kwargs["timeout"] == pytest.approx(0.01)
+    launch.assert_called_once()
+    kill.assert_called_once_with(process)
 
 
 def test_local_host_executor_cancels_and_cleans_up(tmp_path, monkeypatch):

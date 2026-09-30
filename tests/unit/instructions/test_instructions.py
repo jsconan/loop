@@ -16,7 +16,11 @@ from loop import (
 )
 
 TEST_POLICY = AgentInstructions("Test policy.", "test", "tests")
-TEST_AGENT = Agent(AgentIdentity("Test Agent"), TEST_POLICY)
+
+
+def configured_agent():
+    """Create fresh agent state inside the test's isolated environment."""
+    return Agent(AgentIdentity("Test Agent"), TEST_POLICY)
 
 
 def configured_manager(**kwargs) -> InstructionsManager:
@@ -31,7 +35,7 @@ def configured_discovered(directory: Path, **kwargs) -> InstructionsManager:
 
 def prepared(manager: InstructionsManager) -> str:
     """Prepare model-visible instructions for the explicit test agent."""
-    return manager.prepare(TEST_AGENT).content
+    return manager.prepare(configured_agent()).content
 
 
 def test_manager_requires_an_explicit_agent_for_each_snapshot():
@@ -39,16 +43,16 @@ def test_manager_requires_an_explicit_agent_for_each_snapshot():
     manager = InstructionsManager()
     other = Agent("Other", TEST_POLICY)
 
-    first = manager.prepare(TEST_AGENT)
+    first = manager.prepare(configured_agent())
     second = manager.prepare(other)
-    snapshot = manager.snapshot(TEST_AGENT)
+    snapshot = manager.snapshot(configured_agent())
 
     assert 'name="Test Agent"' in first.content
     assert 'name="Other"' in second.content
     assert 'name="Test Agent"' not in second.content
     assert snapshot.content == first.content
     with pytest.raises(ValueError, match="Prepared instructions exceed"):
-        InstructionsManager(max_bytes=2).snapshot(TEST_AGENT)
+        InstructionsManager(max_bytes=2).snapshot(configured_agent())
 
 
 def write_skill(directory: Path, name: str, body: str = "Follow the workflow.") -> Skill:
@@ -104,7 +108,7 @@ def test_manager_prioritizes_referenced_skill_metadata_without_activation(tmp_pa
     manager = configured_manager(skill_manager=SkillManager([first, second]))
 
     manager.set_skill_catalog_priorities(("second", "missing", "second"))
-    snapshot = manager.prepare(TEST_AGENT)
+    snapshot = manager.prepare(configured_agent())
     instructions = snapshot.content
     catalog = next(
         section.content for section in snapshot.sections if section.kind == "skill_catalog"
@@ -129,7 +133,7 @@ def test_manager_rejects_catalog_priorities_that_exceed_the_instruction_budget(t
     )
     generation = manager.generation
 
-    accepted = manager.set_skill_catalog_priorities(("unicode",), TEST_AGENT)
+    accepted = manager.set_skill_catalog_priorities(("unicode",), configured_agent())
 
     assert accepted is False
     assert "<name>ascii</name>" in manager.instructions
@@ -149,7 +153,7 @@ def test_manager_refreshes_before_validating_catalog_priorities(tmp_path):
     agents.write_text("New rules." * 20, encoding="utf-8")
     baseline = configured_discovered(tmp_path, skill_manager=SkillManager(skills))
     prioritized = configured_discovered(tmp_path, skill_manager=SkillManager(skills))
-    assert prioritized.set_skill_catalog_priorities(("unicode",), TEST_AGENT) is True
+    assert prioritized.set_skill_catalog_priorities(("unicode",), configured_agent()) is True
     limit = len(prepared(prioritized).encode("utf-8")) - 1
     assert len(prepared(baseline).encode("utf-8")) <= limit
 
@@ -161,7 +165,7 @@ def test_manager_refreshes_before_validating_catalog_priorities(tmp_path):
     )
     agents.write_text("New rules." * 20, encoding="utf-8")
 
-    assert manager.set_skill_catalog_priorities(("unicode",), TEST_AGENT) is False
+    assert manager.set_skill_catalog_priorities(("unicode",), configured_agent()) is False
     assert "New rules." in manager.instructions
     assert "<name>ascii</name>" in manager.instructions
     assert "<name>unicode</name>" not in manager.instructions
@@ -182,9 +186,9 @@ def test_manager_revalidates_unchanged_catalog_priorities_for_an_agent(tmp_path)
     )
 
     assert manager.set_skill_catalog_priorities(("unicode",)) is True
-    assert manager.set_skill_catalog_priorities(("unicode",), TEST_AGENT) is False
+    assert manager.set_skill_catalog_priorities(("unicode",), configured_agent()) is False
     with pytest.raises(ValueError, match="Prepared instructions exceed"):
-        manager.prepare(TEST_AGENT)
+        manager.prepare(configured_agent())
 
 
 def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
@@ -253,7 +257,7 @@ def test_runtime_environment_is_independent_from_observed_instruction_directory(
     )
 
     manager.observe_path(observed, directory=True)
-    manager.prepare(TEST_AGENT)
+    manager.prepare(configured_agent())
 
     assert "working_directory: /workspace" in prepared(manager)
     assert manager.working_directory == observed.resolve()
@@ -295,7 +299,7 @@ def test_prepared_sections_capture_relocatable_workspace_and_external_provenance
     manager.activate_skill("local")
     manager.activate_skill("external")
 
-    sections = manager.prepare(TEST_AGENT).sections
+    sections = manager.prepare(configured_agent()).sections
     references = {
         section.source: section.reference for section in sections if section.reference is not None
     }
@@ -352,7 +356,7 @@ def test_discovery_refresh_preserves_an_explicit_skill_manager(tmp_path):
     )
     agents.write_text("x" * 100, encoding="utf-8")
     with pytest.raises(ValueError, match="Prepared instructions exceed"):
-        bounded.prepare(TEST_AGENT)
+        bounded.prepare(configured_agent())
 
 
 def test_prepare_refreshes_changed_project_instructions_without_churning_stable_state(tmp_path):
@@ -548,7 +552,7 @@ def test_refresh_deactivates_invalid_and_oversized_active_skills(tmp_path, monke
         "---\nname: review\ndescription: Use review.\n---\n\nShort again.\n",
         encoding="utf-8",
     )
-    manager.prepare(TEST_AGENT)
+    manager.prepare(configured_agent())
     manager.activate_skill("review")
     original_manager = manager.skill_manager
     original_activate = SkillManager.activate
@@ -584,7 +588,7 @@ def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path
     previous = manager.instructions
     (tmp_path / "AGENTS.md").write_text("x" * 100, encoding="utf-8")
     with pytest.raises(ValueError, match="Prepared instructions exceed"):
-        manager.prepare(TEST_AGENT)
+        manager.prepare(configured_agent())
     assert manager.instructions == previous
 
     static = configured_manager()

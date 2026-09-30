@@ -67,17 +67,20 @@ class RememberingHostInteraction(ApprovingInteraction):
 
 
 class CountingHostCommandExecutor:
-    """Count exact host requests while delegating approved runs to the real supervisor."""
+    """Record approved host requests without starting a real shell."""
 
-    _executor: LocalHostCommandExecutor
+    _executor: MagicMock
     requests: list[HostCommandRequest]
 
     def __init__(self):
-        self._executor = LocalHostCommandExecutor()
+        self._executor = MagicMock()
+        self._executor.run_host_command.return_value = CommandProcessResult(
+            SandboxOutcome.COMPLETED, exit_code=0, stdout="startup-recovery"
+        )
         self.requests = []
 
     def run_host_command(self, request: HostCommandRequest) -> CommandProcessResult:
-        """Record and execute one host request passed by the coordinator."""
+        """Record one approved host request and return the configured process result."""
         self.requests.append(request)
         return self._executor.run_host_command(request)
 
@@ -282,9 +285,23 @@ def test_resolve_executable_does_not_suggest_a_shared_temporary_parent(monkeypat
         assert roots == [str(second)]
 
 
-def test_resolve_executable_reports_system_tool_as_default_read(monkeypatch, registry):
+@pytest.fixture
+def reviewed_system_tool(tmp_path, monkeypatch):
+    """Provide a reviewed executable without depending on installed host utilities."""
+    binaries = tmp_path / "system-tools"
+    binaries.mkdir()
+    executable = binaries / "true"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binaries))
+    monkeypatch.setattr(
+        MacOSSeatbeltBackend, "system_read_roots", property(lambda self: (binaries,))
+    )
+    return executable
+
+
+def test_resolve_executable_reports_system_tool_as_default_read(registry, reviewed_system_tool):
     """A reviewed system executable needs no external read grant."""
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
     result = lookup(registry, "true")["result"]
 
@@ -651,6 +668,7 @@ def test_public_extra_read_contexts_and_protected_root_fail_closed(tmp_path):
                 instructions_manager=instructions,
             )
         )
+        assert "result" in output, output
         assert output["result"]["exit_code"] == 0
         assert expected in interaction.info.call_args.args[0]
         assert root not in interaction.info.call_args.args[0]
@@ -718,6 +736,7 @@ def test_homebrew_grants_run_without_prompt_but_manual_read_still_prompts(tmp_pa
                 interaction=interaction,
             )
         )
+        assert "result" in output, output
         assert output["result"]["exit_code"] == 0
         if expected is None:
             interaction.info.assert_not_called()
@@ -862,7 +881,7 @@ def test_external_lookup_reference_rejects_changed_target(tmp_path, monkeypatch)
         execution_service=CommandExecutionService(backend, MagicMock()),
     )
     reference = lookup(registry, "sampletool")["result"]["grant_reference"]
-    executable.unlink()
+    executable.rename(installation / "original-executable")
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o755)
     output = json.loads(
@@ -1291,7 +1310,7 @@ def test_relative_one_character_tool_requires_explicit_external_read(tmp_path, m
 
 
 def test_resolve_executable_binds_relative_lookup_cwd_and_rejects_missing_cwd(
-    tmp_path, monkeypatch, registry
+    tmp_path, registry, reviewed_system_tool
 ):
     """Executable lookup resolves workspace cwd and returns typed failures for missing cwd."""
     workspace = tmp_path / "workspace"
@@ -1300,7 +1319,6 @@ def test_resolve_executable_binds_relative_lookup_cwd_and_rejects_missing_cwd(
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
     service_context = ToolContext(
         interaction=None,

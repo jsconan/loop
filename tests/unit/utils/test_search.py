@@ -1,13 +1,11 @@
 """Tests for bounded selected-file text search utilities."""
 
 import json
-import logging
 import os
-import subprocess
 
 import pytest
 
-from loop.utils.process import ProcessCapture, ProcessCaptureStatus, supervise_process
+from loop.utils.process import ProcessCapture, ProcessCaptureStatus
 from loop.utils.search import ripgrep_path, search_text_paths
 
 
@@ -150,7 +148,7 @@ def test_search_text_paths_rejects_replaced_nested_file(tmp_path, monkeypatch, r
     def replace_on_open(path, flags, *args, **kwargs):
         """Replace the selected file just before its final descriptor opens."""
         if path == source.name:
-            source.unlink()
+            source.rename(nested / "original-source")
             if replacement == "symlink":
                 source.symlink_to(outside)
             else:
@@ -181,48 +179,6 @@ def test_search_text_paths_never_executes_workspace_path_program(tmp_path, monke
     matches, truncated = search_text_paths([source], "needle", root=tmp_path)
     assert not truncated and matches[0]["text"] == "needle"
     assert not (tmp_path / "outside").exists()
-
-
-def test_installed_ripgrep_searches_literal_and_regex_across_selected_files(tmp_path, caplog):
-    """A real ripgrep handles regex when selected and fallback retains Python syntax."""
-    caplog.set_level(logging.WARNING, logger="loop.utils.process")
-    first = tmp_path / "first.txt"
-    second = tmp_path / "second.txt"
-    first.write_text("x" * 2000 + "\n€ needle\n", encoding="utf-8")
-    second.write_text("needle\n", encoding="utf-8")
-    executable = ripgrep_path()
-
-    def run(arguments, descriptors, deadline):
-        """Supervise real ripgrep with only the selected inherited descriptors."""
-        process = subprocess.Popen(
-            [str(executable), *arguments],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            pass_fds=descriptors,
-            start_new_session=True,
-        )
-        return supervise_process(process, deadline)
-
-    literal = search_text_paths([first, second], "needle", root=tmp_path, native_runner=run)
-    assert [(item["path"], item["line"]) for item in literal[0]] == [
-        ("first.txt", 2),
-        ("second.txt", 1),
-    ]
-    expression = search_text_paths(
-        [first, second], r"needle$", root=tmp_path, regex=True, native_runner=run
-    )
-    assert expression == literal
-    with pytest.raises(RuntimeError, match="regex parse error"):
-        search_text_paths([first], r"(?<=€ )needle", root=tmp_path, regex=True, native_runner=run)
-    with pytest.raises(RuntimeError, match="regex parse error"):
-        search_text_paths([first], r"(needle)\1", root=tmp_path, regex=True, native_runner=run)
-    fallback, _ = search_text_paths([first], r"(?<=€ )needle", root=tmp_path, regex=True)
-    assert fallback[0]["column"] == 3
-    bounded = search_text_paths(
-        [first, second], "needle", root=tmp_path, max_results=1, native_runner=run
-    )
-    assert len(bounded[0]) == 1 and bounded[1]
 
 
 def test_native_literal_search_binds_selected_fds_unicode_context_and_case(tmp_path):

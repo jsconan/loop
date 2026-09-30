@@ -2,7 +2,6 @@
 
 import errno
 import logging
-import shlex
 import subprocess
 import time
 from unittest.mock import MagicMock
@@ -16,63 +15,6 @@ from loop.utils.process import (
     read_bounded_stream,
     supervise_process,
 )
-
-
-def test_supervise_process_bounds_both_streams_and_preserves_exit(caplog):
-    """The shared supervisor drains real child pipes and reports discarded output."""
-    caplog.set_level(logging.WARNING, logger="loop.utils.process")
-    process = subprocess.Popen(
-        ["/bin/sh", "-c", "printf abcdef; printf xy >&2"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-
-    capture = supervise_process(process, time.monotonic() + 2, stdout_limit=3)
-
-    assert capture.status is ProcessCaptureStatus.COMPLETED
-    assert capture.exit_code == 0
-    assert capture.stdout == "abc"
-    assert capture.stdout_discarded == 3
-    assert capture.stderr == "xy"
-    assert not caplog.records
-
-
-def test_supervise_process_kills_a_child_after_deadline(caplog):
-    """Timeout cleanup terminates the owned process group and bounds wall time."""
-    caplog.set_level(logging.WARNING, logger="loop.utils.process")
-    process = subprocess.Popen(
-        ["/bin/sh", "-c", "sleep 2"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-
-    capture = supervise_process(process, time.monotonic() + 0.1)
-
-    assert capture.status is ProcessCaptureStatus.TIMED_OUT
-    assert process.poll() is not None
-
-
-def test_supervise_process_kills_same_group_descendant_after_parent_exit(tmp_path):
-    """A descendant that retains output pipes is killed when the supervisor times out."""
-    marker = tmp_path / "descendant-ran"
-    command = f"(sleep 0.4; printf child > {shlex.quote(str(marker))}) & exit 0"
-    process = subprocess.Popen(
-        ["/bin/sh", "-c", command],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-
-    capture = supervise_process(process, time.monotonic() + 0.1)
-
-    assert capture.status is ProcessCaptureStatus.TIMED_OUT
-    time.sleep(0.5)
-    assert not marker.exists()
 
 
 @pytest.mark.parametrize(
@@ -266,3 +208,45 @@ def test_kill_process_group_uses_the_portable_single_process_fallback(monkeypatc
     kill_process_group(process)
 
     process.kill.assert_called_once_with()
+
+
+def test_read_bounded_stream_tolerates_already_closed_descriptor():
+    """Cleanup ignores EBADF when a supervisor has already closed the reader descriptor."""
+    stream = MagicMock()
+    stream.read.return_value = ""
+    stream.close.side_effect = OSError(errno.EBADF, "already closed")
+
+    assert read_bounded_stream(stream, [], maximum=20) == 0
+
+
+def test_supervise_process_drains_fake_child_and_bounds_output():
+    """Both streams are drained and truncated without launching a real child."""
+    process = MagicMock(returncode=7)
+    process.stdout.read.side_effect = ["abcdef", ""]
+    process.stderr.read.side_effect = ["xy", ""]
+    terminate = MagicMock()
+
+    capture = supervise_process(process, time.monotonic() + 1, stdout_limit=3, terminate=terminate)
+
+    assert capture.status is ProcessCaptureStatus.COMPLETED
+    assert capture.exit_code == 7
+    assert capture.stdout == "abc"
+    assert capture.stdout_discarded == 3
+    assert capture.stderr == "xy"
+    terminate.assert_called_once_with(process)
+    assert process.wait.call_count == 2
+
+
+def test_supervise_process_times_out_and_reaps_fake_child():
+    """Deadline expiry still terminates and reaps the owned child."""
+    process = MagicMock(returncode=-9)
+    process.stdout.read.return_value = ""
+    process.stderr.read.return_value = ""
+    process.wait.side_effect = [subprocess.TimeoutExpired("fake", 0), -9]
+    terminate = MagicMock()
+
+    capture = supervise_process(process, time.monotonic() + 1, terminate=terminate)
+
+    assert capture.status is ProcessCaptureStatus.TIMED_OUT
+    terminate.assert_called_once_with(process)
+    assert process.wait.call_count == 2

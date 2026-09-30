@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,6 +24,13 @@ from loop.utils import ProcessCapture, ProcessCaptureStatus
 @pytest.fixture(autouse=True)
 def fake_darwin_temp(monkeypatch, tmp_path, request):
     """Keep unit tests independent of the host's Darwin cache directory."""
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.platform", SimpleNamespace(system=lambda: "Darwin")
+    )
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.time",
+        SimpleNamespace(**{**vars(time), "sleep": lambda seconds: None}),
+    )
     home = tmp_path.with_name(tmp_path.name + "-home")
     home.mkdir()
     if getattr(request, "param", None) != "real_home":
@@ -282,7 +290,9 @@ def test_backend_builds_profile_and_runs_child(monkeypatch, tmp_path):
     assert argv[3:5] == ["/bin/sh", "-c"]
     assert "(allow network*)" in argv[2]
     assert popen.call_args.kwargs["close_fds"] is True
-    assert popen.call_args.kwargs["env"]["TMPDIR"].startswith("/private/")
+    assert Path(popen.call_args.kwargs["env"]["TMPDIR"]).is_relative_to(
+        Path(tempfile.gettempdir()).resolve()
+    )
 
 
 def test_backend_audits_launch_with_the_approved_attempt_id(monkeypatch, tmp_path):
@@ -608,18 +618,20 @@ def test_trusted_argv_search_stops_after_slow_helper_copy(monkeypatch, tmp_path)
     executable = tmp_path / "rg"
     executable.write_bytes(b"verified helper")
     executable.chmod(0o755)
+    clock = MagicMock(return_value=time.monotonic())
+    monkeypatch.setattr("loop.execution.sandbox.macos.time.monotonic", clock)
     original_open = os.open
 
     def slow_open(path, *args, **kwargs):
         """Delay the copied helper input in a disposable fixture."""
         if path == executable:
-            time.sleep(0.04)
+            clock.return_value += 0.04
         return original_open(path, *args, **kwargs)
 
     launch = MagicMock()
     monkeypatch.setattr(os, "open", slow_open)
     monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", launch)
-    started = time.monotonic()
+    started = clock.return_value
     result = MacOSSeatbeltBackend().run_read_only_argv(executable, (), (), started + 0.01)
     assert result.status is ProcessCaptureStatus.TIMED_OUT
     assert time.monotonic() - started < 0.5
@@ -648,18 +660,20 @@ def test_backend_deadline_during_granted_tree_walk_prevents_launch(monkeypatch, 
     """A slow granted-tree scan times out before any native command starts."""
     for index in range(10):
         (tmp_path / f"file-{index}").write_text("ordinary", encoding="utf-8")
+    clock = MagicMock(return_value=time.monotonic())
+    monkeypatch.setattr("loop.execution.sandbox.macos.time.monotonic", clock)
     original_scandir = os.scandir
 
     def slow_scandir(path):
         """Delay entry enumeration only for the granted workspace."""
         if not isinstance(path, int) and Path(path) == tmp_path:
-            time.sleep(0.04)
+            clock.return_value += 0.04
         return original_scandir(path)
 
     launch = MagicMock()
     monkeypatch.setattr(os, "scandir", slow_scandir)
     monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", launch)
-    started = time.monotonic()
+    started = clock.return_value
     result = MacOSSeatbeltBackend().run(request(tmp_path, deadline=started + 0.01))
     assert result.outcome is SandboxOutcome.TIMED_OUT
     assert time.monotonic() - started < 0.5

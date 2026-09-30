@@ -98,3 +98,19 @@ def test_darwin_selection_closes_backend_when_probe_cannot_bind(monkeypatch):
     assert "could not be prepared" in selected.capability_failure()
     native.close.assert_called_once()
     native.run.assert_not_called()
+
+
+def test_darwin_selection_constructs_builtin_backend_without_external_probe(monkeypatch):
+    """The native factory constructs the built-in adapter before its mocked qualification."""
+    monkeypatch.setattr(selection.platform, "system", lambda: "Darwin")
+    native = Mock()
+    native.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
+    factory = Mock(return_value=native)
+    monkeypatch.setattr("loop.execution.sandbox.macos.MacOSSeatbeltBackend", factory)
+
+    selected = selection.select_sandbox_backend()
+
+    factory.assert_called_once_with()
+    native.run.assert_called_once()
+    native.close.assert_called_once()
+    assert "capability probe failed" in selected.capability_failure()

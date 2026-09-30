@@ -343,7 +343,7 @@ def test_request_binds_external_read_alias_and_rejects_retargeting(tmp_path, mon
     alias.symlink_to(installation, target_is_directory=True)
     approved = request(tmp_path, read_roots=(installation,), read_aliases=(alias,))
     assert approved.paths_are_current()
-    alias.unlink()
+    alias.rename(tmp_path / "original-alias")
     assert not approved.paths_are_current()
     alias.symlink_to(installation, target_is_directory=True)
     assert not approved.paths_are_current()
@@ -384,7 +384,7 @@ def test_request_revalidates_exact_executable_before_launch(tmp_path):
     assert approved.paths_are_current()
     with pytest.raises(ValueError, match="Executable identity changed"):
         request(tmp_path, environment={"PATH": "/usr/bin:/bin"}, executable_identities=(identity,))
-    executable.unlink()
+    executable.rename(binaries / "original-executable")
     assert not approved.paths_are_current()
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o755)
@@ -519,7 +519,7 @@ def test_sandbox_results_distinguish_exit_status_from_boundary_failure():
 
 def test_sandbox_contract_has_no_host_execution_dependency():
     """Sandbox contract imports no host launcher or application retry authority."""
-    source = Path(__file__).parents[3] / "src/loop/execution/sandbox/contracts.py"
+    source = Path(__file__).parents[4] / "src/loop/execution/sandbox/contracts.py"
     tree = ast.parse(source.read_text())
     names = {
         alias.name

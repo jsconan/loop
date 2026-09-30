@@ -4,8 +4,20 @@ import importlib
 import json
 from unittest.mock import Mock
 
+import pytest
+
 from loop import BUILTIN_TOOLS, Interaction, PermissionManager, ToolRegistry
+from loop.execution.sandbox import UnavailableSandboxBackend
 from loop.tools import create_default_tool_registry
+
+
+@pytest.fixture(autouse=True)
+def isolated_host_selection(monkeypatch):
+    """Compose the catalog without probing the machine's native sandbox."""
+    monkeypatch.setattr(
+        "loop.execution.facade.select_sandbox_backend",
+        lambda: UnavailableSandboxBackend("isolated unit test"),
+    )
 
 
 def test_importing_tools_does_not_mutate_an_existing_registry():
