@@ -24,9 +24,10 @@ def backend(monkeypatch):
     monitor.register.return_value = None
     monitor.denial.return_value = None
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.SeatbeltDiagnosticService.monitor", lambda *args: monitor
+        "loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monitor",
+        lambda *args: monitor,
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos._denial_from_log", lambda *args: None)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend._denial_from_log", lambda *args: None)
     selected = select_sandbox_backend()
     if isinstance(selected, UnavailableSandboxBackend):
         pytest.skip(selected.capability_failure())

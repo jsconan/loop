@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from loop.execution.sandbox import macos
+from loop.execution.sandbox.macos import backend as macos
 
 
 class StreamProcess:

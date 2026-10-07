@@ -18,21 +18,21 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import BinaryIO, cast
 
-from ... import constants
-from ...permissions.protection import (
+from .... import constants
+from ....permissions.protection import (
     PRIVATE_READ_COMPONENTS,
     ProtectedWorkspacePaths,
     is_protected_external_read,
 )
-from ...telemetry import telemetry_audit
-from ...utils import (
+from ....telemetry import telemetry_audit
+from ....utils import (
     ProcessCapture,
     ProcessCaptureStatus,
     kill_process_group,
     read_bounded_stream,
     supervise_process,
 )
-from .contracts import CommandProcessResult, SandboxOutcome, SandboxRequest
+from ..contracts import CommandProcessResult, SandboxOutcome, SandboxRequest
 
 _LAUNCHER = "/usr/bin/sandbox-exec"
 _SHELL = "/bin/sh"

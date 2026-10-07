@@ -25,25 +25,25 @@ from loop.utils import ProcessCapture, ProcessCaptureStatus
 def fake_darwin_temp(monkeypatch, tmp_path, request):
     """Keep unit tests independent of the host's Darwin cache directory."""
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.platform", SimpleNamespace(system=lambda: "Darwin")
+        "loop.execution.sandbox.macos.backend.platform", SimpleNamespace(system=lambda: "Darwin")
     )
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.time",
+        "loop.execution.sandbox.macos.backend.time",
         SimpleNamespace(**{**vars(time), "sleep": lambda seconds: None}),
     )
     home = tmp_path.with_name(tmp_path.name + "-home")
     home.mkdir()
     if getattr(request, "param", None) != "real_home":
-        monkeypatch.setattr("loop.execution.sandbox.macos._trusted_home", lambda: home)
+        monkeypatch.setattr("loop.execution.sandbox.macos.backend._trusted_home", lambda: home)
     monitor = MagicMock()
     monitor.denial.return_value = None
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.SeatbeltDiagnosticService.monitor",
+        "loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monitor",
         lambda self, deadline: monitor,
     )
     if getattr(request, "param", True):
         monkeypatch.setattr(
-            "loop.execution.sandbox.macos.SeatbeltDiagnosticService.darwin_temp",
+            "loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.darwin_temp",
             lambda self, deadline: tmp_path,
         )
 
@@ -234,15 +234,15 @@ def run_with_log(
 
     popen = MagicMock(side_effect=launch)
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.secrets.token_hex",
+        "loop.execution.sandbox.macos.backend.secrets.token_hex",
         MagicMock(side_effect=["a" * 32, "b" * 32]),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     value = request(tmp_path)
     if expire_after_wait:
 
@@ -274,9 +274,9 @@ def test_backend_rejects_stale_initial_identity(monkeypatch, tmp_path):
 def test_backend_expired_budget_is_timeout_before_native_launch(monkeypatch, tmp_path):
     """An expired request remains a timeout without attempting native initialization."""
     value = request(tmp_path, deadline=100.0)
-    monkeypatch.setattr("loop.execution.sandbox.macos.time.monotonic", lambda: 101.0)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.time.monotonic", lambda: 101.0)
     popen = MagicMock()
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
     result = MacOSSeatbeltBackend().run(value)
     assert result.outcome is SandboxOutcome.TIMED_OUT
     assert result.detail == "Command deadline expired."
@@ -289,10 +289,10 @@ def test_backend_builds_profile_and_runs_child(monkeypatch, tmp_path):
     process = Process()
     popen = MagicMock(return_value=process)
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run", MagicMock(return_value=probe)
+        "loop.execution.sandbox.macos.backend.subprocess.run", MagicMock(return_value=probe)
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
 
     result = MacOSSeatbeltBackend().run(request(tmp_path, network=True))
 
@@ -312,11 +312,11 @@ def test_backend_audits_launch_with_the_approved_attempt_id(monkeypatch, tmp_pat
     """Native launch records correlate to the same approved request without shell text."""
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     approved = request(tmp_path, source="printf private-command")
     adapter = MemoryTelemetryAdapter()
     telemetry = Telemetry(adapter, flush_seconds=0.01)
@@ -340,11 +340,11 @@ def test_backend_reads_only_alias_symlink_and_runs_translated_source(monkeypatch
     alias.symlink_to(tmp_path, target_is_directory=True)
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     value = request(
         tmp_path,
         source="cat /workspace/file",
@@ -369,11 +369,11 @@ def test_backend_granted_git_metadata_keeps_nested_git_protected(monkeypatch, tm
     git.mkdir()
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(request(tmp_path, write_roots=(tmp_path, git)))
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
@@ -384,11 +384,11 @@ def test_backend_allows_approved_fresh_git_metadata_only_at_workspace_root(monke
     """A missing top-level Git directory can be created without opening nested metadata."""
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(request(tmp_path, git_create=True))
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
@@ -400,11 +400,11 @@ def test_backend_read_only_profile_has_no_workspace_write_grant(monkeypatch, tmp
     """The OS profile denies workspace writes for an auto-approved read request."""
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(request(tmp_path, write_roots=()))
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
@@ -431,11 +431,11 @@ def test_backend_protects_instruction_files_even_with_workspace_write_grant(monk
     """Native write policy carves instructions and skills out of writable workspace roots."""
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
 
     assert MacOSSeatbeltBackend().run(request(tmp_path)).outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
@@ -450,11 +450,11 @@ def test_backend_protects_configured_instruction_name_at_every_depth(monkeypatch
     """A custom instruction basename is anchored and escaped in the native deny policy."""
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
 
     bound = request(tmp_path, protected_instruction_names=("POLICY+.md",))
     assert MacOSSeatbeltBackend().run(bound).outcome is SandboxOutcome.COMPLETED
@@ -472,11 +472,11 @@ def test_backend_denies_private_reads_inside_workspace_and_extra_roots(monkeypat
     extra.mkdir()
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
 
     result = MacOSSeatbeltBackend().run(request(workspace, read_roots=(extra,)))
 
@@ -507,11 +507,11 @@ def test_backend_guards_protected_entries_and_their_ancestors_against_rename(mon
     ordinary.mkdir()
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
 
     result = MacOSSeatbeltBackend().run(request(tmp_path))
 
@@ -530,11 +530,11 @@ def test_backend_limits_baseline_reads_to_system_managed_roots(monkeypatch, tmp_
     """Writable installed-tool trees cannot receive recursive default reads."""
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
 
     backend = MacOSSeatbeltBackend()
     assert backend.policy_version == "macos-seatbelt-v1"
@@ -557,7 +557,9 @@ def test_backend_auto_trusts_only_receipted_managed_package_roots(monkeypatch, t
     cellar = tmp_path / "Cellar"
     package = cellar / "sample" / "1.0"
     package.mkdir(parents=True)
-    monkeypatch.setattr("loop.execution.sandbox.macos._MANAGED_TOOLCHAIN_PREFIXES", (cellar,))
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend._MANAGED_TOOLCHAIN_PREFIXES", (cellar,)
+    )
 
     assert not MacOSSeatbeltBackend.managed_tool_root(package)
     (package / "INSTALL_RECEIPT.json").write_text("{}", encoding="utf-8")
@@ -574,9 +576,9 @@ def test_trusted_argv_search_passes_only_selected_descriptors_under_read_only_po
     executable.chmod(0o755)
     popen = MagicMock()
     capture = ProcessCapture(ProcessCaptureStatus.COMPLETED, exit_code=0, stdout="matched")
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.supervise_process", lambda *_args, **_kwargs: capture
+        "loop.execution.sandbox.macos.backend.supervise_process", lambda *_args, **_kwargs: capture
     )
     backend = MacOSSeatbeltBackend()
 
@@ -599,11 +601,11 @@ def test_trusted_argv_search_fails_closed_on_expiry_tamper_and_copy_error(monkey
     executable.write_bytes(b"verified helper")
     executable.chmod(0o755)
     popen = MagicMock()
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
     backend = MacOSSeatbeltBackend()
 
     with monkeypatch.context() as scoped:
-        scoped.setattr("loop.execution.sandbox.macos.platform.system", lambda: "Linux")
+        scoped.setattr("loop.execution.sandbox.macos.backend.platform.system", lambda: "Linux")
         assert backend.run_read_only_argv(executable, (), (), time.monotonic() + 5) is None
 
     assert (
@@ -632,7 +634,7 @@ def test_trusted_argv_search_stops_after_slow_helper_copy(monkeypatch, tmp_path)
     executable.write_bytes(b"verified helper")
     executable.chmod(0o755)
     clock = MagicMock(return_value=time.monotonic())
-    monkeypatch.setattr("loop.execution.sandbox.macos.time.monotonic", clock)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.time.monotonic", clock)
     original_open = os.open
 
     def slow_open(path, *args, **kwargs):
@@ -643,7 +645,7 @@ def test_trusted_argv_search_stops_after_slow_helper_copy(monkeypatch, tmp_path)
 
     launch = MagicMock()
     monkeypatch.setattr(os, "open", slow_open)
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", launch)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", launch)
     started = clock.return_value
     result = MacOSSeatbeltBackend().run_read_only_argv(executable, (), (), started + 0.01)
     assert result.status is ProcessCaptureStatus.TIMED_OUT
@@ -659,7 +661,7 @@ def test_trusted_argv_search_rejects_symlink_and_hardlink_helpers(monkeypatch, t
     symlink = tmp_path / "symlink-rg"
     symlink.symlink_to(executable)
     launch = MagicMock()
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", launch)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", launch)
     backend = MacOSSeatbeltBackend()
     assert backend.run_read_only_argv(symlink, (), (), time.monotonic() + 5) is None
     assert backend.run_read_only_argv(tmp_path, (), (), time.monotonic() + 5) is None
@@ -674,7 +676,7 @@ def test_backend_deadline_during_granted_tree_walk_prevents_launch(monkeypatch, 
     for index in range(10):
         (tmp_path / f"file-{index}").write_text("ordinary", encoding="utf-8")
     clock = MagicMock(return_value=time.monotonic())
-    monkeypatch.setattr("loop.execution.sandbox.macos.time.monotonic", clock)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.time.monotonic", clock)
     original_scandir = os.scandir
 
     def slow_scandir(path):
@@ -685,7 +687,7 @@ def test_backend_deadline_during_granted_tree_walk_prevents_launch(monkeypatch, 
 
     launch = MagicMock()
     monkeypatch.setattr(os, "scandir", slow_scandir)
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", launch)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", launch)
     started = clock.return_value
     result = MacOSSeatbeltBackend().run(request(tmp_path, deadline=started + 0.01))
     assert result.outcome is SandboxOutcome.TIMED_OUT
@@ -697,13 +699,13 @@ def test_backend_pipe_failure_does_not_wait_past_deadline(monkeypatch, tmp_path)
     """A malformed sandbox child remains unavailable when reaping times out."""
     process = Process(stdout=None, stderr=None, wait_error=subprocess.TimeoutExpired("sh", 0))
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.Popen", MagicMock(return_value=process)
+        "loop.execution.sandbox.macos.backend.subprocess.Popen", MagicMock(return_value=process)
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(request(tmp_path))
     assert result.outcome is SandboxOutcome.UNAVAILABLE
 
@@ -728,7 +730,7 @@ def test_backend_binds_empty_and_relative_search_paths(tmp_path, path_value):
 def test_backend_omits_private_search_root(monkeypatch, tmp_path, search_root):
     """A private PATH entry does not block safe commands or gain lookup access."""
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
     home = tmp_path.with_name(tmp_path.name + "-home")
@@ -737,7 +739,7 @@ def test_backend_omits_private_search_root(monkeypatch, tmp_path, search_root):
     temporary = tmp_path / "temporary"
     temporary.mkdir()
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos._trusted_home",
+        "loop.execution.sandbox.macos.backend._trusted_home",
         lambda: home if search_root != "temporary" else temporary / "child",
     )
     selected = {
@@ -747,8 +749,8 @@ def test_backend_omits_private_search_root(monkeypatch, tmp_path, search_root):
         "darwin_tmp": Path("/private/tmp"),
     }[search_root]
     popen = MagicMock(return_value=Process())
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(
         request(tmp_path, environment={"PATH": f"{selected}:/usr/bin", "LANG": "C"})
     )
@@ -771,13 +773,13 @@ def test_backend_omits_private_search_root_through_symlink(monkeypatch, tmp_path
     alias = tmp_path / "search"
     alias.symlink_to(tmp_path.with_name(tmp_path.name + "-home"), target_is_directory=True)
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
 
     popen = MagicMock(return_value=Process())
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(
         request(tmp_path, environment={"PATH": str(alias), "LANG": "C"})
     )
@@ -795,11 +797,11 @@ def test_backend_omits_private_search_root_through_symlink(monkeypatch, tmp_path
 def test_backend_fails_closed_when_account_home_is_unavailable(monkeypatch, tmp_path):
     """Missing trusted account home invalidates native preparation before launch."""
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.pwd.getpwuid",
+        "loop.execution.sandbox.macos.backend.pwd.getpwuid",
         MagicMock(side_effect=KeyError("no account")),
     )
     popen = MagicMock()
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
 
     result = MacOSSeatbeltBackend().run(request(tmp_path))
 
@@ -814,14 +816,14 @@ def test_backend_validates_account_home_without_ambient_home(monkeypatch, tmp_pa
     """Trusted account lookup accepts a real home and rejects unsafe or absent homes."""
 
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
     home = tmp_path.with_name(tmp_path.name + "-account")
     if home_case != "missing":
         home.mkdir()
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.pwd.getpwuid",
+        "loop.execution.sandbox.macos.backend.pwd.getpwuid",
         lambda _uid: SimpleNamespace(pw_dir=str(home)),
     )
     if home_case == "wrong_owner":
@@ -838,8 +840,8 @@ def test_backend_validates_account_home_without_ambient_home(monkeypatch, tmp_pa
 
         monkeypatch.setattr(Path, "stat", changed_owner)
     popen = MagicMock(return_value=Process())
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(
         request(tmp_path, environment={"PATH": str(home), "LANG": "C"})
     )
@@ -862,12 +864,12 @@ def test_backend_external_path_grants_only_metadata_even_with_hardlink(monkeypat
     outside.write_text("fake-private")
     os.link(outside, search / "alias")
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
     popen = MagicMock(return_value=Process())
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(
         request(workspace, environment={"PATH": str(search), "LANG": "C"})
     )
@@ -900,11 +902,11 @@ def test_backend_grants_only_safe_python_environment_config(monkeypatch, tmp_pat
             os.link(config, external / "alias")
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(
         request(workspace, read_roots=(search,), environment={"PATH": str(search), "LANG": "C"})
     )
@@ -953,9 +955,11 @@ def test_backend_preserves_nonstandard_exit_after_real_denial(monkeypatch, tmp_p
 
 def test_backend_bounds_denial_log_cleanup_without_masking_shell_result(monkeypatch, tmp_path):
     """A log child that ignores termination cannot extend command cleanup indefinitely."""
-    monkeypatch.setattr("loop.execution.sandbox.macos._DENIAL_LOG_ATTEMPTS", 1)
-    monkeypatch.setattr("loop.execution.sandbox.macos._DENIAL_LOG_WAIT_SECONDS", 0.005)
-    monkeypatch.setattr("loop.execution.sandbox.macos._DENIAL_STREAM_SHUTDOWN_SECONDS", 0.01)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend._DENIAL_LOG_ATTEMPTS", 1)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend._DENIAL_LOG_WAIT_SECONDS", 0.005)
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend._DENIAL_STREAM_SHUTDOWN_SECONDS", 0.01
+    )
     log_process = LogProcess(
         running=True,
         wait_error=subprocess.TimeoutExpired("/usr/bin/log", 0.01),
@@ -985,7 +989,7 @@ def test_backend_bounds_denial_log_cleanup_without_masking_shell_result(monkeypa
 
 def test_backend_keeps_shell_result_when_log_poll_and_pipe_close_fail(monkeypatch, tmp_path):
     """Diagnostic cleanup errors cannot replace a completed shell result."""
-    monkeypatch.setattr("loop.execution.sandbox.macos._DENIAL_LOG_ATTEMPTS", 1)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend._DENIAL_LOG_ATTEMPTS", 1)
     process = PollErrorLogProcess()
 
     result, _ = run_with_log(
@@ -1131,14 +1135,16 @@ def test_backend_skips_log_inspection_after_deadline(monkeypatch, tmp_path):
 
 def test_backend_bounds_log_bytes(monkeypatch, tmp_path):
     """Oversized log output cannot grow diagnostic memory without limit."""
-    monkeypatch.setattr("loop.execution.sandbox.macos._LOG_LIMIT", 8)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend._LOG_LIMIT", 8)
     result, _ = run_with_log(monkeypatch, tmp_path, LogProcess(b"long record without newline"))
     assert result.outcome is SandboxOutcome.COMPLETED
 
 
 def test_backend_handles_log_query_without_readable_output(monkeypatch, tmp_path):
     """An idle query returns an ordinary nonzero result on its bounded timeout."""
-    monkeypatch.setattr("loop.execution.sandbox.macos.select.select", lambda *args: ([], [], []))
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.select.select", lambda *args: ([], [], [])
+    )
     result, _ = run_with_log(monkeypatch, tmp_path, LogProcess())
     assert result.outcome is SandboxOutcome.COMPLETED
 
@@ -1146,7 +1152,8 @@ def test_backend_handles_log_query_without_readable_output(monkeypatch, tmp_path
 def test_backend_preserves_result_on_log_read_error(monkeypatch, tmp_path):
     """A diagnostic read failure cannot turn an ordinary exit into a denial."""
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.select.select", MagicMock(side_effect=OSError("closed"))
+        "loop.execution.sandbox.macos.backend.select.select",
+        MagicMock(side_effect=OSError("closed")),
     )
     result, _ = run_with_log(monkeypatch, tmp_path, LogProcess())
     assert result.outcome is SandboxOutcome.COMPLETED
@@ -1251,7 +1258,9 @@ def test_backend_validates_darwin_compiler_cache(monkeypatch, tmp_path, case):
     if case in {"root_owner", "entry_owner"}:
         actual_uid = os.getuid()
         values = [actual_uid + 1] if case == "root_owner" else [actual_uid, actual_uid + 1]
-        monkeypatch.setattr("loop.execution.sandbox.macos.os.getuid", MagicMock(side_effect=values))
+        monkeypatch.setattr(
+            "loop.execution.sandbox.macos.backend.os.getuid", MagicMock(side_effect=values)
+        )
     if case == "root_changed":
         original_lstat = Path.lstat
         calls = 0
@@ -1271,11 +1280,11 @@ def test_backend_validates_darwin_compiler_cache(monkeypatch, tmp_path, case):
         monkeypatch.setattr(Path, "lstat", changed_lstat)
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stdout=str(user_temp), stderr="")),
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(request(tmp_path))
     if case == "valid":
         assert result.outcome is SandboxOutcome.COMPLETED
@@ -1293,9 +1302,9 @@ def test_backend_reuses_trusted_darwin_temp_path_but_revalidates_entries(monkeyp
     probe = MagicMock(returncode=0, stdout=str(user_temp), stderr="")
     run = MagicMock(return_value=probe)
     launch = MagicMock(return_value=Process())
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.run", run)
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", launch)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.run", run)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", launch)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     approved = request(tmp_path)
 
     backend = MacOSSeatbeltBackend()
@@ -1312,8 +1321,8 @@ def test_backend_bounds_getconf_by_remaining_deadline(monkeypatch, tmp_path):
     """A stalled compiler-cache lookup has a finite timeout and starts no shell."""
     lookup = MagicMock(side_effect=subprocess.TimeoutExpired("getconf", 0.01))
     launch = MagicMock()
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.run", lookup)
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", launch)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.run", lookup)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", launch)
     result = MacOSSeatbeltBackend().run(request(tmp_path, deadline=time.monotonic() + 0.1))
     assert result.outcome is SandboxOutcome.TIMED_OUT
     assert 0 < lookup.call_args.kwargs["timeout"] <= 0.1
@@ -1325,9 +1334,9 @@ def test_backend_rejects_bad_profile_before_script(monkeypatch, tmp_path):
     probe = MagicMock(returncode=65, stderr="bad profile")
     popen = MagicMock()
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run", MagicMock(return_value=probe)
+        "loop.execution.sandbox.macos.backend.subprocess.run", MagicMock(return_value=probe)
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
 
     result = MacOSSeatbeltBackend().run(request(tmp_path))
 
@@ -1341,9 +1350,9 @@ def test_backend_probes_parent_once_and_launches_every_profile(monkeypatch, tmp_
     probe = MagicMock(returncode=0, stderr="")
     run = MagicMock(return_value=probe)
     launch = MagicMock(side_effect=[Process(), Process()])
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.run", run)
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", launch)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.run", run)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", launch)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     approved = request(tmp_path)
     backend = MacOSSeatbeltBackend()
 
@@ -1358,7 +1367,7 @@ def test_backend_probes_parent_once_and_launches_every_profile(monkeypatch, tmp_
 def test_backend_classifies_preparation_and_probe_errors(monkeypatch, tmp_path, failure):
     """Preparation errors remain unavailable and probe expiry remains a timeout."""
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run", MagicMock(side_effect=failure)
+        "loop.execution.sandbox.macos.backend.subprocess.run", MagicMock(side_effect=failure)
     )
     result = MacOSSeatbeltBackend().run(request(tmp_path))
     assert result.outcome is (
@@ -1371,10 +1380,11 @@ def test_backend_classifies_preparation_and_probe_errors(monkeypatch, tmp_path, 
 def test_backend_cancels_before_child_launch(monkeypatch, tmp_path):
     """An interrupted readiness check never starts a shell child."""
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run", MagicMock(side_effect=KeyboardInterrupt)
+        "loop.execution.sandbox.macos.backend.subprocess.run",
+        MagicMock(side_effect=KeyboardInterrupt),
     )
     launch = MagicMock()
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", launch)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", launch)
 
     result = MacOSSeatbeltBackend().run(request(tmp_path))
 
@@ -1452,7 +1462,7 @@ def test_backend_walks_nested_directories(monkeypatch, tmp_path):
     (tmp_path / "nested").mkdir()
     (tmp_path / "regular.txt").write_text("safe")
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=65, stderr="stop")),
     )
     result = MacOSSeatbeltBackend().run(request(tmp_path))
@@ -1481,7 +1491,7 @@ def test_backend_detects_root_replacement_during_walk(monkeypatch, tmp_path):
                 tmp_path.mkdir()
             return result
 
-    monkeypatch.setattr("loop.execution.sandbox.macos.os.scandir", ReplacingScan)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.os.scandir", ReplacingScan)
     result = MacOSSeatbeltBackend().run(request(tmp_path))
     assert "changed during preflight" in result.detail
 
@@ -1495,9 +1505,9 @@ def test_backend_revalidates_identity_around_launcher(monkeypatch, tmp_path, sta
     probe = MagicMock(returncode=0, stderr="")
     popen = MagicMock()
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run", MagicMock(return_value=probe)
+        "loop.execution.sandbox.macos.backend.subprocess.run", MagicMock(return_value=probe)
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
     result = MacOSSeatbeltBackend().run(value)
     assert result.outcome is SandboxOutcome.STALE
     assert "path identity changed" in result.detail
@@ -1525,14 +1535,14 @@ def test_backend_times_out_when_capture_reader_stays_alive(monkeypatch, tmp_path
 
     process = Process()
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.Popen", MagicMock(return_value=process)
+        "loop.execution.sandbox.macos.backend.subprocess.Popen", MagicMock(return_value=process)
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.threading.Thread", StuckThread)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.threading.Thread", StuckThread)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(request(tmp_path))
     assert result.outcome is SandboxOutcome.TIMED_OUT
 
@@ -1569,14 +1579,14 @@ def test_backend_times_out_when_capture_reader_stays_alive(monkeypatch, tmp_path
 def test_backend_classifies_child_capture_failures(monkeypatch, tmp_path, process, outcome):
     """Missing pipes, nested launcher failure, and timeout each fail closed."""
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.run",
+        "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
     )
     monkeypatch.setattr(
-        "loop.execution.sandbox.macos.subprocess.Popen", MagicMock(return_value=process)
+        "loop.execution.sandbox.macos.backend.subprocess.Popen", MagicMock(return_value=process)
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos._denial_from_log", lambda *args: None)
-    monkeypatch.setattr("loop.execution.sandbox.macos.kill_process_group", MagicMock())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend._denial_from_log", lambda *args: None)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     result = MacOSSeatbeltBackend().run(request(tmp_path))
     assert result.outcome is outcome
     if process.stdout is None:
