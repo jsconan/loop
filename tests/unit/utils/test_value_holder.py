@@ -15,9 +15,22 @@ from loop.utils import (
     FloatValueHolder,
     IntValueHolder,
     PathHolder,
+    PathReference,
     StrValueHolder,
     ValueHolder,
 )
+
+
+def test_path_reference_preserves_structural_path_like_contract():
+    """Runtime reference checks require both current-value access and filesystem path methods."""
+    holder = PathHolder("first")
+    assert isinstance(holder, PathReference)
+    assert isinstance(holder, os.PathLike)
+    assert os.fspath(holder) == "first"
+    holder.set("second")
+    assert os.fspath(holder) == "second"
+    assert not isinstance(Path("second"), PathReference)
+    assert not isinstance(ValueHolder(Path("second")), PathReference)
 
 
 class PositiveIntValueHolder(IntValueHolder):

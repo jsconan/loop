@@ -23,8 +23,10 @@ class ValueReference[T](Protocol):
 
 
 @runtime_checkable
-class PathReference(ValueReference[Path], PathLike[str], Protocol):
-    """Provide the current filesystem path without exposing mutation."""
+class PathReference(ValueReference[Path], Protocol):
+    """Provide a structural path-like reference without exposing mutation."""
+
+    def __fspath__(self) -> str: ...
 
     def resolve(self, strict: bool = False) -> Path:
         """Return a resolved absolute snapshot.
