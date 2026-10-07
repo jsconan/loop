@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
@@ -200,7 +200,11 @@ def supervise_process(
     reader: Callable[..., int] = read_bounded_stream,
     thread_factory: Callable[..., threading.Thread] = threading.Thread,
 ) -> ProcessCapture:
-    """Drain two child pipes within one deadline, then kill and reap the process group.
+    """Drain bounded child output and capture the result after owned-group cleanup.
+
+    On timeout or cancellation, terminate and reap the group before taking the output
+    snapshot. Give readers a bounded cleanup interval to consume the resulting pipe EOF;
+    incomplete draining retains unknown discard counts. Never extend the execution deadline.
 
     Args:
         process (subprocess.Popen[str]): Child started in its own process group.
@@ -246,7 +250,7 @@ def supervise_process(
             thread.join(max(0, deadline - time.monotonic()))
 
         if any(thread.is_alive() for thread in readers):
-            return ProcessCapture(
+            result = ProcessCapture(
                 ProcessCaptureStatus.TIMED_OUT,
                 stdout="".join(chunks[0]),
                 stderr="".join(chunks[1]),
@@ -254,16 +258,17 @@ def supervise_process(
                 stderr_discarded=discarded[1] if not readers[1].is_alive() else None,
             )
 
-        return ProcessCapture(
-            ProcessCaptureStatus.COMPLETED,
-            exit_code=process.returncode,
-            stdout="".join(chunks[0]),
-            stderr="".join(chunks[1]),
-            stdout_discarded=discarded[0],
-            stderr_discarded=discarded[1],
-        )
+        else:
+            result = ProcessCapture(
+                ProcessCaptureStatus.COMPLETED,
+                exit_code=process.returncode,
+                stdout="".join(chunks[0]),
+                stderr="".join(chunks[1]),
+                stdout_discarded=discarded[0],
+                stderr_discarded=discarded[1],
+            )
     except subprocess.TimeoutExpired:
-        return ProcessCapture(
+        result = ProcessCapture(
             ProcessCaptureStatus.TIMED_OUT,
             stdout="".join(chunks[0]),
             stderr="".join(chunks[1]),
@@ -271,10 +276,13 @@ def supervise_process(
             stderr_discarded=None,
         )
     except KeyboardInterrupt:
-        return ProcessCapture(ProcessCaptureStatus.CANCELLED)
+        result = ProcessCapture(ProcessCaptureStatus.CANCELLED)
     finally:
         terminate(process)
         _wait_process(process)
+
+        for thread in readers:
+            thread.join(constants.COMMAND_CLEANUP_WAIT_SECONDS)
 
         for thread, stream in zip(readers, streams, strict=True):
             if thread.is_alive():
@@ -285,8 +293,13 @@ def supervise_process(
             else:
                 stream.close()
 
-        for thread in readers:
-            thread.join(constants.COMMAND_CLEANUP_WAIT_SECONDS)
+    return replace(
+        result,
+        stdout="".join(chunks[0]),
+        stderr="".join(chunks[1]),
+        stdout_discarded=discarded[0] if not readers[0].is_alive() else None,
+        stderr_discarded=discarded[1] if not readers[1].is_alive() else None,
+    )
 
 
 def _wait_process(

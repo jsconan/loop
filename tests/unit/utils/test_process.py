@@ -219,6 +219,18 @@ def test_read_bounded_stream_tolerates_already_closed_descriptor():
     assert read_bounded_stream(stream, [], maximum=20) == 0
 
 
+@pytest.mark.parametrize("missing", ["stdout", "stderr"])
+def test_supervise_process_refuses_missing_capture_pipe(missing):
+    """A missing output pipe terminates the owned process and returns unavailable."""
+    process = MagicMock(returncode=-9)
+    setattr(process, missing, None)
+    terminate = MagicMock()
+    result = supervise_process(process, 100, terminate=terminate)
+    assert result.status is ProcessCaptureStatus.UNAVAILABLE
+    terminate.assert_called_once_with(process)
+    process.wait.assert_called_once()
+
+
 def test_supervise_process_drains_fake_child_and_bounds_output():
     """Both streams are drained and truncated without launching a real child."""
     process = MagicMock(returncode=7)
@@ -250,3 +262,46 @@ def test_supervise_process_times_out_and_reaps_fake_child():
     assert capture.status is ProcessCaptureStatus.TIMED_OUT
     terminate.assert_called_once_with(process)
     assert process.wait.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "failure,status",
+    [
+        (subprocess.TimeoutExpired("owned", 1), ProcessCaptureStatus.TIMED_OUT),
+        (KeyboardInterrupt(), ProcessCaptureStatus.CANCELLED),
+    ],
+)
+def test_supervise_process_captures_buffered_output_after_termination(failure, status):
+    """Timeout and cancellation retain bounded output that becomes readable only at cleanup EOF."""
+    process = MagicMock(returncode=-9)
+    process.stdout.read.side_effect = ["ready", ""]
+    process.stderr.read.side_effect = ["error", ""]
+    process.wait.side_effect = [failure, -9]
+    terminate = MagicMock()
+
+    def thread_factory(*, target, daemon):
+        """Complete a controlled reader only when cleanup joins after owned termination."""
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+
+        def join(timeout):
+            """Release buffered data at the modeled post-termination pipe EOF."""
+            terminate.assert_called_once_with(process)
+            target()
+            thread.is_alive.return_value = False
+
+        thread.join.side_effect = join
+        return thread
+
+    result = supervise_process(
+        process,
+        100,
+        stdout_limit=3,
+        stderr_limit=2,
+        terminate=terminate,
+        thread_factory=thread_factory,
+    )
+    assert result.status is status
+    assert result.stdout == "rea" and result.stderr == "er"
+    assert result.stdout_discarded == 2 and result.stderr_discarded == 3
+    assert result.exit_code is None

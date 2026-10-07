@@ -3,6 +3,7 @@
 import logging
 import os
 import subprocess
+import sys
 import time
 
 import pytest
@@ -47,6 +48,32 @@ def test_supervise_process_kills_a_child_after_deadline(process_boundary, caplog
     assert capture.status is ProcessCaptureStatus.TIMED_OUT
     boundary.kill.assert_called_once_with(123, 9)
     assert boundary.process.wait.call_count == 2
+    assert not caplog.records
+
+
+def test_supervise_process_retains_flushed_short_output_at_timeout(caplog):
+    """A real blocking pipe reader delivers flushed short output during bounded timeout cleanup."""
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import sys,time; print('STARTED',flush=True); "
+                "print('DIAGNOSTIC',file=sys.stderr,flush=True); time.sleep(30)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    capture = supervise_process(process, time.monotonic() + 1)
+    assert capture.status is ProcessCaptureStatus.TIMED_OUT
+    assert capture.stdout == "STARTED\n"
+    assert capture.stderr == "DIAGNOSTIC\n"
+    assert capture.stdout_discarded == 0 and capture.stderr_discarded == 0
+    assert process.poll() is not None
     assert not caplog.records
 
 
