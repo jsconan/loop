@@ -115,7 +115,6 @@ from .models import (
 )
 from .normalization import normalized_key, safe_scalar
 from .path import (
-    VirtualPath,
     canonical_path,
     filter_paths_by_globs,
     find_project_root,
@@ -154,3 +153,4 @@ from .value_holder import (
     ValueHolder,
     ValueReference,
 )
+from .virtual_path import VirtualPath
