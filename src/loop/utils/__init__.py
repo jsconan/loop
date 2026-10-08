@@ -54,6 +54,7 @@ __all__ = [
     "json_encode",
     "kill_process_group",
     "list_terms",
+    "load_unique_json",
     "local_now",
     "matches_digest",
     "normalized_key",
@@ -91,7 +92,6 @@ from .content import (
     decode_content_cursor,
     encode_content_cursor,
     get_binary,
-    json_encode,
     read_bounded_text,
     register_cached_metadata,
     store_content,
@@ -102,6 +102,7 @@ from .dates import as_utc, local_now, utc_now
 from .files import is_binary_file, write_text_atomically
 from .generation import GenerationStop, GenerationWatchdog
 from .hashing import matches_digest, payload_digest, sha256_digest
+from .json import json_encode, load_unique_json
 from .models import (
     BoundedTextContent,
     CachedContentMetadata,
