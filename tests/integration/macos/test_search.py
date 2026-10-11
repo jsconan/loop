@@ -35,7 +35,7 @@ def test_public_search_preserves_unicode_and_python_regex(public_command, native
 def test_hostile_path_helper_and_outside_search_are_rejected(
     public_command, native_workspace, monkeypatch
 ):
-    """Public search never executes an arbitrary PATH helper or follows an unauthorized outside alias."""
+    """Keep public search from running arbitrary PATH helpers or outside aliases."""
     hostile = native_workspace.parent / "hostile-bin"
     hostile.mkdir()
     marker = native_workspace.parent / "hostile-ran"
@@ -55,7 +55,7 @@ def test_hostile_path_helper_and_outside_search_are_rejected(
 
 
 def test_public_search_binary_bounds_and_backreferences(public_command, native_workspace):
-    """Public search preserves Python backreferences, ignores binary files and bounds total results."""
+    """Preserve Python backreferences, skip binary files and bound search results."""
     (native_workspace / "search-first.txt").write_text("x" * 2000 + "\nneedle needle\n")
     (native_workspace / "search-second.txt").write_text("needle\n")
     (native_workspace / "search-binary.bin").write_bytes(b"\0needle\n")

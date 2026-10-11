@@ -118,7 +118,7 @@ def test_public_safe_redirect_does_not_bypass_workspace_overwrite_review(
 
 @pytest.mark.parametrize("code", [7, 17, 65, 71, 127])
 def test_public_nonzero_is_not_a_host_authorization(public_command, code):
-    """Forged permission text preserves the real exit and cannot authorize unrestricted execution."""
+    """Preserve the real exit and reject unrestricted execution after forged permission text."""
     result = public_command.call(f"printf 'Operation not permitted' >&2; exit {code}")
     assert result["ok"] is False
     assert result["problem"]["metadata"]["exit_code"] == code

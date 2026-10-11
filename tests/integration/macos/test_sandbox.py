@@ -166,7 +166,7 @@ def test_detached_child_retains_native_confinement(native_command, native_worksp
 
 @pytest.mark.parametrize("code", [0, 7, 17, 23, 65, 71, 126, 127])
 def test_ordinary_exit_and_forged_stderr(native_command, code):
-    """Ordinary exit status survives forged permission and launcher text without reclassification."""
+    """Preserve ordinary exit status despite forged permission or launcher text."""
     result = native_command(f"printf 'Operation not permitted; sandbox_apply' >&2; exit {code}")
     assert result.outcome is SandboxOutcome.COMPLETED
     assert result.exit_code == code
@@ -283,7 +283,7 @@ def test_unix_ipc_outside_authority_is_denied(native_command, native_workspace):
 def test_native_parent_rename_cannot_relocate_protected_data(
     native_command, native_workspace, relative
 ):
-    """Native rename restrictions prevent protected descendants escaping through an ordinary parent."""
+    """Prevent protected descendants from escaping through a renamed parent."""
     parent = native_workspace / "protected-parent"
     target = parent / relative
     target.parent.mkdir(parents=True)
@@ -308,7 +308,7 @@ def test_ordinary_directory_rename_remains_available(native_command, native_work
 
 
 def test_selected_descriptor_helper_cannot_read_outside_files(backend, native_workspace):
-    """A real read-only helper receives the selected descriptor without outside filesystem authority."""
+    """Give a read-only helper the selected descriptor without outside read authority."""
     helper = native_workspace.parent / "attack-helper"
     helper.write_text('#!/bin/sh\n/bin/cat "$1"\n/bin/cat "$2"\n')
     helper.chmod(0o755)

@@ -229,7 +229,7 @@ def test_call_invokes_and_serializes_validated_arguments(monkeypatch):
 
 
 def test_call_injects_required_context(monkeypatch):
-    """Context-aware dispatch injects context and reports a missing context as an execution error."""
+    """Inject context during dispatch and report missing context as an execution error."""
     function = Mock(return_value="done")
     monkeypatch.setattr(tool_module, "takes_tool_context", Mock(return_value=True))
     monkeypatch.setattr(tool_module, "serialize_tool_result", lambda result: result)

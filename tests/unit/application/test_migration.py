@@ -32,15 +32,20 @@ def test_migration_coordinates_owned_importers_and_copies_policy(tmp_path) -> No
     telemetry_source = legacy / "telemetry.db"
     with closing(sqlite3.connect(telemetry_source)) as connection, connection:
         connection.execute(
-            "CREATE TABLE telemetry_records(record_id TEXT PRIMARY KEY,timestamp_ns INTEGER NOT NULL,"
-            "observed_ns INTEGER NOT NULL,signal TEXT NOT NULL,event_name TEXT NOT NULL,severity TEXT,"
-            "workspace_id TEXT,session_id TEXT,message_sequence INTEGER,event_sequence INTEGER NOT NULL,"
-            "trace_id TEXT,span_id TEXT,parent_span_id TEXT,attributes TEXT NOT NULL,payload_id INTEGER,"
+            "CREATE TABLE telemetry_records(record_id TEXT PRIMARY KEY,"
+            "timestamp_ns INTEGER NOT NULL,"
+            "observed_ns INTEGER NOT NULL,signal TEXT NOT NULL,event_name TEXT NOT NULL,"
+            "severity TEXT,"
+            "workspace_id TEXT,session_id TEXT,message_sequence INTEGER,"
+            "event_sequence INTEGER NOT NULL,"
+            "trace_id TEXT,span_id TEXT,parent_span_id TEXT,attributes TEXT NOT NULL,"
+            "payload_id INTEGER,"
             "payload_sha256 TEXT,schema_version INTEGER NOT NULL)"
         )
         connection.execute(
             "INSERT INTO telemetry_records VALUES "
-            "('record',1,1,'activity','legacy','info',NULL,NULL,NULL,1,NULL,NULL,NULL,'{}',NULL,NULL,1)"
+            "('record',1,1,'activity','legacy','info',NULL,NULL,NULL,1,"
+            "NULL,NULL,NULL,'{}',NULL,NULL,1)"
         )
     (legacy / "permissions.yaml").write_text("version: 2\n", encoding="utf-8")
     (legacy / "permissions-audit.jsonl").write_text(

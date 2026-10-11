@@ -1165,7 +1165,10 @@ def test_backend_preserves_result_on_log_read_error(monkeypatch, tmp_path):
         b"not json\n",
         b"42\n",
         b'{"processID":0,"processImagePath":"/kernel","senderImagePath":null}\n',
-        b'{"processID":0,"processImagePath":"/kernel","senderImagePath":"/Sandbox.kext/Sandbox","eventMessage":42}\n',
+        (
+            b'{"processID":0,"processImagePath":"/kernel",'
+            b'"senderImagePath":"/Sandbox.kext/Sandbox","eventMessage":42}\n'
+        ),
         kernel_record("Sandbox: cat(123) deny(1) file-read-data /outside\nWRONG"),
         kernel_record(
             "Sandbox: cat(123) deny(1) file-read-data /outside\nLOOP_SBX_" + "b" * 32,

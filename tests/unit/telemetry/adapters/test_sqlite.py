@@ -73,15 +73,20 @@ def test_sqlite_adapter_imports_legacy_records_idempotently(tmp_path):
     source = tmp_path / "legacy.db"
     with closing(sqlite3.connect(source)) as connection, connection:
         connection.execute(
-            "CREATE TABLE telemetry_payloads(payload_id INTEGER PRIMARY KEY, encoding TEXT NOT NULL, "
+            "CREATE TABLE telemetry_payloads(payload_id INTEGER PRIMARY KEY, "
+            "encoding TEXT NOT NULL, "
             "size_bytes INTEGER NOT NULL, payload BLOB NOT NULL)"
         )
         connection.execute("INSERT INTO telemetry_payloads VALUES (1, 'json', 2, '{}')")
         connection.execute(
-            "CREATE TABLE telemetry_records(record_id TEXT PRIMARY KEY,timestamp_ns INTEGER NOT NULL,"
-            "observed_ns INTEGER NOT NULL,signal TEXT NOT NULL,event_name TEXT NOT NULL,severity TEXT,"
-            "workspace_id TEXT,session_id TEXT,message_sequence INTEGER,event_sequence INTEGER NOT NULL,"
-            "trace_id TEXT,span_id TEXT,parent_span_id TEXT,attributes TEXT NOT NULL,payload_id INTEGER,"
+            "CREATE TABLE telemetry_records(record_id TEXT PRIMARY KEY,"
+            "timestamp_ns INTEGER NOT NULL,"
+            "observed_ns INTEGER NOT NULL,signal TEXT NOT NULL,event_name TEXT NOT NULL,"
+            "severity TEXT,"
+            "workspace_id TEXT,session_id TEXT,message_sequence INTEGER,"
+            "event_sequence INTEGER NOT NULL,"
+            "trace_id TEXT,span_id TEXT,parent_span_id TEXT,attributes TEXT NOT NULL,"
+            "payload_id INTEGER,"
             "payload_sha256 TEXT,schema_version INTEGER NOT NULL)"
         )
         connection.execute(
@@ -115,14 +120,19 @@ def test_sqlite_adapter_rejects_malformed_legacy_sources_atomically(tmp_path):
     broken = tmp_path / "broken.db"
     with closing(sqlite3.connect(broken)) as connection, connection:
         connection.execute(
-            "CREATE TABLE telemetry_payloads(payload_id INTEGER PRIMARY KEY, encoding TEXT NOT NULL, "
+            "CREATE TABLE telemetry_payloads(payload_id INTEGER PRIMARY KEY, "
+            "encoding TEXT NOT NULL, "
             "size_bytes INTEGER NOT NULL, payload BLOB NOT NULL)"
         )
         connection.execute(
-            "CREATE TABLE telemetry_records(record_id TEXT PRIMARY KEY,timestamp_ns INTEGER NOT NULL,"
-            "observed_ns INTEGER NOT NULL,signal TEXT NOT NULL,event_name TEXT NOT NULL,severity TEXT,"
-            "workspace_id TEXT,session_id TEXT,message_sequence INTEGER,event_sequence INTEGER NOT NULL,"
-            "trace_id TEXT,span_id TEXT,parent_span_id TEXT,attributes TEXT NOT NULL,payload_id INTEGER,"
+            "CREATE TABLE telemetry_records(record_id TEXT PRIMARY KEY,"
+            "timestamp_ns INTEGER NOT NULL,"
+            "observed_ns INTEGER NOT NULL,signal TEXT NOT NULL,event_name TEXT NOT NULL,"
+            "severity TEXT,"
+            "workspace_id TEXT,session_id TEXT,message_sequence INTEGER,"
+            "event_sequence INTEGER NOT NULL,"
+            "trace_id TEXT,span_id TEXT,parent_span_id TEXT,attributes TEXT NOT NULL,"
+            "payload_id INTEGER,"
             "payload_sha256 TEXT,schema_version INTEGER NOT NULL)"
         )
         connection.executemany(

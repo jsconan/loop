@@ -124,7 +124,8 @@ def test_log_export_streams_archives_with_filters_and_force(application, tmp_pat
     paths.operational_log.write_text(
         '{"timestamp_ns":3,"level":"INFO","workspace_id":"workspace-id","event.name":"keep"}\n'
         '{"timestamp_ns":4,"level":"INFO","workspace_id":"other","event.name":"keep"}\n'
-        '{"timestamp_ns":"unknown","level":"INFO","workspace_id":"workspace-id","event.name":"keep"}\n',
+        '{"timestamp_ns":"unknown","level":"INFO",'
+        '"workspace_id":"workspace-id","event.name":"keep"}\n',
         encoding="utf-8",
     )
     target = tmp_path / "logs.jsonl"
