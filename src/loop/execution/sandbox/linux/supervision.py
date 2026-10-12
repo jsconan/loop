@@ -17,7 +17,6 @@ from ....constants import MAX_OUTPUT_CHARS
 from ....utils.process import (
     ProcessCapture,
     ProcessCaptureStatus,
-    kill_process_group,
     supervise_process,
 )
 from .admission import GenerationAdmission, admission_group
@@ -69,24 +68,28 @@ def supervise_payload(
     stopped, cancelled, failed = threading.Event(), threading.Event(), threading.Event()
 
     def watch():
-        """Terminate only the owned launcher when its authenticated client fully disconnects."""
+        """Request owned-launcher cancellation when the authenticated client disconnects."""
         try:
             poller = select.poll()
             poller.register(connection, select.POLLHUP | select.POLLERR | select.POLLNVAL)
             while not stopped.is_set():
                 if poller.poll(_CLIENT_DISCONNECT_POLL_MILLISECONDS):
                     cancelled.set()
-                    kill_process_group(process)
                     return
         except (OSError, ValueError):
             failed.set()
-            kill_process_group(process)
+            cancelled.set()
 
     watcher = threading.Thread(target=watch, daemon=True) if connection is not None else None
     if watcher is not None:
         watcher.start()
     try:
-        result = supervise_process(process, deadline, stdout_limit=MAX_OUTPUT_CHARS + 80)
+        result = supervise_process(
+            process,
+            deadline,
+            stdout_limit=MAX_OUTPUT_CHARS + 80,
+            cancel_event=cancelled,
+        )
     finally:
         stopped.set()
         if watcher is not None:

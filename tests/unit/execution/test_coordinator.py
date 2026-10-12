@@ -61,6 +61,25 @@ def coordinator(tmp_path, outcome, *, answer="approve", auto_approval=False, def
     )
 
 
+@pytest.fixture
+def process_exit_observer(monkeypatch):
+    """Report a mocked POSIX child as exited without reaping it."""
+    import loop.utils.process as process_utils
+
+    waitid = Mock(side_effect=lambda _idtype, pid, _options: SimpleNamespace(si_pid=pid))
+    boundary = SimpleNamespace(
+        name="posix",
+        P_PID=1,
+        WEXITED=1,
+        WNOHANG=2,
+        WNOWAIT=4,
+        close=process_utils.os.close,
+        waitid=waitid,
+    )
+    monkeypatch.setattr(process_utils, "os", boundary)
+    return boundary
+
+
 def test_classified_failure_only_offers_host_retry(tmp_path):
     """A classified failure offers a concise host retry without leaking bound details."""
     service, backend, host, interaction = coordinator(
@@ -691,7 +710,9 @@ def test_local_host_executor_does_not_launch_after_deadline(tmp_path, monkeypatc
     launch.assert_not_called()
 
 
-def test_local_host_executor_allows_completion_near_deadline(tmp_path, monkeypatch):
+def test_local_host_executor_allows_completion_near_deadline(
+    tmp_path, monkeypatch, process_exit_observer
+):
     """A completed child in the final budget interval remains successful without real waits."""
     clock = SimpleNamespace(monotonic=lambda: 100.09)
     monkeypatch.setattr("loop.execution.coordinator.time", clock)
@@ -716,15 +737,17 @@ def test_local_host_executor_allows_completion_near_deadline(tmp_path, monkeypat
 
     assert result.outcome is SandboxOutcome.COMPLETED
     assert result.stdout == "finished"
-    assert process.wait.call_args_list[0].kwargs["timeout"] == pytest.approx(0.01)
+    assert process.wait.called
+    assert process_exit_observer.waitid.call_count == 1
     launch.assert_called_once()
     kill.assert_called_once_with(process)
 
 
-def test_local_host_executor_cancels_and_cleans_up(tmp_path, monkeypatch):
+def test_local_host_executor_cancels_and_cleans_up(tmp_path, monkeypatch, process_exit_observer):
     """Interrupting an approved host child returns cancellation after group cleanup."""
     process = Mock(stdout=StringIO(), stderr=StringIO())
-    process.wait.side_effect = [KeyboardInterrupt(), 0]
+    process.wait.return_value = 0
+    process_exit_observer.waitid = Mock(side_effect=KeyboardInterrupt)
     kill = Mock()
     monkeypatch.setattr("loop.execution.coordinator.subprocess.Popen", lambda *a, **k: process)
     monkeypatch.setattr("loop.execution.coordinator.kill_process_group", kill)
@@ -764,7 +787,9 @@ def test_host_pipe_failure_does_not_wait_past_deadline(tmp_path, monkeypatch):
     assert result.outcome is SandboxOutcome.UNAVAILABLE
 
 
-def test_local_host_executor_detects_stuck_reader_and_bounded_cleanup(tmp_path, monkeypatch):
+def test_local_host_executor_detects_stuck_reader_and_bounded_cleanup(
+    tmp_path, monkeypatch, process_exit_observer
+):
     """A reader that outlives the deadline does not hold the host call open."""
 
     class StuckReader:

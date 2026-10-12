@@ -1,6 +1,7 @@
 """Verify public command dispatch, destructive review and native execution boundaries."""
 
 import json
+import shlex
 from unittest.mock import Mock
 
 import pytest
@@ -82,6 +83,38 @@ def test_read_only_command_writes_only_owned_scratch(public_command, native_work
     assert denied["ok"] is False
     assert not (native_workspace / ".coverage").exists()
     assert not (native_workspace / "report").exists()
+    public_command.host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("component", [".ssh", ".aws", ".gnupg", ".config", "Library", ".AWS"])
+def test_public_writable_command_cannot_change_private_workspace_entries(
+    public_command, native_workspace, component
+):
+    """Private credential components reject overwrite and creation through public execution."""
+    directory = native_workspace / component
+    directory.mkdir(exist_ok=True)
+    existing = directory / "credential"
+    existing.write_text("preserve-private-canary", encoding="utf-8")
+    created = directory / "new-entry"
+
+    overwritten = public_command.call(f"printf changed > {shlex.quote(str(existing))}")
+    created_result = public_command.call(f"printf changed > {shlex.quote(str(created))}")
+
+    assert overwritten["ok"] is False
+    assert created_result["ok"] is False
+    assert existing.read_text(encoding="utf-8") == "preserve-private-canary"
+    assert not created.exists()
+    public_command.host.run_host_command.assert_not_called()
+
+
+def test_public_writable_command_keeps_ordinary_workspace_writes_available(
+    public_command, native_workspace
+):
+    """Private-component write denials leave ordinary writable workspace files available."""
+    result = public_command.call("printf ordinary-updated > ordinary")
+
+    assert result["ok"] is True
+    assert (native_workspace / "ordinary").read_text(encoding="utf-8") == "ordinary-updated"
     public_command.host.run_host_command.assert_not_called()
 
 

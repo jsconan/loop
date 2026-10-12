@@ -107,19 +107,18 @@ def public(installation, tmp_path, request, native_directory, monkeypatch):
     yield Interaction(), workspace, generation
 
 
-def invoke(public, command, **grants):
-    """Run the actual public client outside pytest's process-local temporary-root replacement."""
+def invoke_many(public, calls):
+    """Run several public calls in one client, sharing its qualified selector probe."""
     interaction, workspace, _ = public
     client = subprocess.run(
         [sys.executable, "-I", "-B", str(Path(__file__).resolve())],
         input=json.dumps(
             {
                 "workspace": str(workspace),
-                "arguments": {
-                    "command": command,
-                    "cwd": str(workspace),
-                    **grants,
-                },
+                "calls": [
+                    {"command": command, "cwd": str(workspace), **grants}
+                    for command, grants in calls
+                ],
             }
         ),
         capture_output=True,
@@ -127,18 +126,27 @@ def invoke(public, command, **grants):
         env={
             key: value for key, value in os.environ.items() if key not in {"TMPDIR", "TMP", "TEMP"}
         },
-        check=True,
+        check=False,
         timeout=15,
+    )
+    assert client.returncode == 0, (
+        f"Installed public client exited {client.returncode}.\n"
+        f"stdout:\n{client.stdout}\nstderr:\n{client.stderr}"
     )
     assert not client.stderr, client.stderr
     value = json.loads(client.stdout)
     interaction.prompts.extend(value["prompts"])
     assert not any("without the OS sandbox" in prompt for prompt in interaction.prompts)
-    return value["result"]
+    return value["results"]
+
+
+def invoke(public, command, **grants):
+    """Run one public client call outside pytest's process-local temporary-root replacement."""
+    return invoke_many(public, [(command, grants)])[0]
 
 
 def public_client():
-    """Run a registered public call with native selection and host fallback disabled."""
+    """Run registered public calls with native selection and host fallback disabled."""
     value = json.loads(sys.stdin.read())
     backend = select_sandbox_backend()
     assert isinstance(backend, LinuxNativeBackend), backend.capability_failure()
@@ -150,14 +158,17 @@ def public_client():
         settings=ToolRuntimeSettings(command_timeout=2),
     )
     try:
-        result = json.loads(
-            registry.call(
-                "run_command",
-                json.dumps(value["arguments"]),
-                interaction=interaction,
+        results = [
+            json.loads(
+                registry.call(
+                    "run_command",
+                    json.dumps(arguments),
+                    interaction=interaction,
+                )
             )
-        )
-        print(json.dumps({"result": result, "prompts": interaction.prompts}))
+            for arguments in value["calls"]
+        ]
+        print(json.dumps({"results": results, "prompts": interaction.prompts}))
     finally:
         registry.close()
 
@@ -274,6 +285,85 @@ def test_public_read_only_command_can_create_files_in_private_scratch(public):
     assert result["result"]["exit_code"] == 0, result
     assert result["result"]["stdout"]["content"] == "SCRATCH_WRITE=ok\n"
     assert not public[0].prompts
+    require_drained(public[2])
+
+
+def test_public_writable_command_cannot_change_private_workspace_entries(public):
+    """Private entries reject overwrite and creation while an ordinary write remains available."""
+    components = (".ssh", ".aws", ".gnupg", ".config", ".loop", "Library", ".AWS")
+    targets = []
+    calls = []
+    for component in components:
+        directory = public[1] / component
+        directory.mkdir()
+        existing = directory / "credential"
+        existing.write_text("preserve-private-canary", encoding="utf-8")
+        created = directory / "new-entry"
+        targets.append((component, existing, created))
+        calls.extend(
+            ("printf changed > " + shlex.quote(str(target)), {}) for target in (existing, created)
+        )
+    calls.append(("printf writable > ordinary", {}))
+
+    results = invoke_many(public, calls)
+    for result in results[:-1]:
+        assert result["problem"]["code"] == "process.nonzero_exit", result
+        assert result["problem"]["metadata"]["exit_code"] != 0
+
+    for component, existing, created in targets:
+        assert existing.read_text(encoding="utf-8") == "preserve-private-canary", component
+        assert not created.exists(), component
+    assert results[-1]["result"]["exit_code"] == 0, results[-1]
+    assert (public[1] / "ordinary").read_text(encoding="utf-8") == "writable"
+    require_drained(public[2])
+
+
+@pytest.mark.parametrize("mode", ["existing", "create"])
+def test_public_git_write_grants_only_top_level_metadata(public, mode):
+    """Approved top-level Git writes work while nested and application controls stay denied."""
+    workspace = public[1]
+    nested_git = workspace / "nested" / ".git"
+    nested_git.mkdir(parents=True)
+    (nested_git / "config").write_text("preserve-nested-git", encoding="utf-8")
+    loop_control = workspace / ".loop" / "control"
+    loop_control.parent.mkdir()
+    loop_control.write_text("preserve-loop-control", encoding="utf-8")
+    instruction = workspace / "AGENTS.md"
+    instruction.write_text("preserve-instructions", encoding="utf-8")
+
+    if mode == "existing":
+        top_level_git = workspace / ".git"
+        top_level_git.mkdir()
+        config = top_level_git / "config"
+        config.write_text("before", encoding="utf-8")
+        allowed = "printf granted > .git/config"
+    else:
+        allowed = "git init --quiet"
+
+    controls = {
+        "nested/.git/config": "preserve-nested-git",
+        ".loop/control": "preserve-loop-control",
+        "AGENTS.md": "preserve-instructions",
+    }
+    results = invoke_many(
+        public,
+        [(allowed, {"git_write": True})]
+        + [
+            ("printf changed > " + shlex.quote(relative), {"git_write": True})
+            for relative in controls
+        ],
+    )
+    assert results[0]["result"]["exit_code"] == 0, results[0]
+    if mode == "existing":
+        assert config.read_text(encoding="utf-8") == "granted"
+    else:
+        assert (workspace / ".git" / "HEAD").is_file()
+    assert public[0].prompts
+    for denied in results[1:]:
+        assert denied["problem"]["code"] == "process.nonzero_exit", denied
+        assert denied["problem"]["metadata"]["exit_code"] != 0
+    for relative, original in controls.items():
+        assert (workspace / relative).read_text(encoding="utf-8") == original
     require_drained(public[2])
 
 

@@ -1,6 +1,5 @@
 """Exercise owned native processes in disposable workspaces."""
 
-import subprocess
 import time
 
 import pytest
@@ -46,7 +45,8 @@ def test_local_host_executor_captures_approved_shell_output(tmp_path):
 def test_local_host_executor_times_out_and_cleans_up(tmp_path, process_boundary):
     """Executor and supervisor compose deadline handling with owned group cleanup."""
     boundary = process_boundary
-    boundary.process.wait.side_effect = [subprocess.TimeoutExpired("stub", 1), -9]
+    boundary.waitid.side_effect = None
+    boundary.waitid.return_value = None
     approved = HostCommandRequest.from_sandbox(request(tmp_path, deadline=101))
 
     result = LocalHostCommandExecutor().run_host_command(approved)
@@ -54,7 +54,8 @@ def test_local_host_executor_times_out_and_cleans_up(tmp_path, process_boundary)
     assert result.outcome is SandboxOutcome.TIMED_OUT
     assert result.possible_effects
     boundary.kill.assert_called_once_with(123, 9)
-    assert boundary.process.wait.call_count == 2
+    assert boundary.process.wait.call_count == 1
+    assert boundary.waitid.call_count > 1
 
 
 def test_local_host_executor_completes_within_its_budget(tmp_path):

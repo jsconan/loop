@@ -3,7 +3,7 @@
 import io
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
@@ -40,7 +40,12 @@ def test_supervise_payload_preserves_typed_capture_after_kernel_cleanup(scope, s
     """Every common outcome returns only after the admitted domain contains the receiver alone."""
     scope.capture = ProcessCapture(status, stdout="bounded", stderr_discarded=9)
     assert linux_supervision.supervise_payload(scope.process, scope.config, 50) is scope.capture
-    scope.supervise.assert_called_once_with(scope.process, 50, stdout_limit=1_000_080)
+    scope.supervise.assert_called_once_with(
+        scope.process,
+        50,
+        stdout_limit=1_000_080,
+        cancel_event=ANY,
+    )
     assert scope.membership.call_count == 2
     scope.sleep.assert_not_called()
 
@@ -154,8 +159,6 @@ def test_supervise_payload_watches_full_disconnect_and_refuses_observation_loss(
 
     globals_target = target
     monkeypatch.setattr(linux_supervision.threading, "Thread", create)
-    killed = Mock()
-    monkeypatch.setattr(linux_supervision, "kill_process_group", killed)
     if event != "idle":
         if event == "empty":
             stopped = Mock()
@@ -179,4 +182,6 @@ def test_supervise_payload_watches_full_disconnect_and_refuses_observation_loss(
             else ProcessCaptureStatus.COMPLETED
         )
     thread.join.assert_called_once_with(1)
-    assert killed.call_count == (event in {"disconnect", "error", "value", "live"})
+    assert scope.supervise.call_args.kwargs["cancel_event"].is_set() is (
+        event in {"disconnect", "error", "value", "live"}
+    )

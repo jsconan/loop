@@ -45,12 +45,32 @@ def process_boundary(monkeypatch):
     coordinator = importlib.import_module("loop.execution.coordinator")
     kill = Mock()
     close = Mock()
-    monkeypatch.setattr(supervisor, "time", SimpleNamespace(monotonic=lambda: 100.0))
-    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: 100.0))
+    waitid = Mock(side_effect=lambda _kind, pid, _options: SimpleNamespace(si_pid=pid))
+    clock = SimpleNamespace(current=100.0)
+
+    def monotonic():
+        """Return the controlled monotonic time for deadline checks."""
+        return clock.current
+
+    def sleep(duration):
+        """Advance the controlled clock without an elapsed-time wait."""
+        clock.current += duration
+
+    clock.monotonic = monotonic
+    clock.sleep = sleep
+    monkeypatch.setattr(supervisor, "time", clock)
+    monkeypatch.setattr(coordinator, "time", clock)
     monkeypatch.setattr(coordinator.threading, "Thread", thread_factory)
     monkeypatch.setattr(coordinator.subprocess, "Popen", Mock(return_value=process))
     monkeypatch.setattr(supervisor.os, "killpg", kill)
+    monkeypatch.setattr(supervisor.os, "waitid", waitid, raising=False)
     monkeypatch.setattr(supervisor.os, "close", close)
     return SimpleNamespace(
-        process=process, threads=threads, thread_factory=thread_factory, kill=kill, close=close
+        process=process,
+        threads=threads,
+        thread_factory=thread_factory,
+        kill=kill,
+        close=close,
+        waitid=waitid,
+        clock=clock,
     )

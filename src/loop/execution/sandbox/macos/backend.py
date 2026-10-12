@@ -529,7 +529,19 @@ def _profile(
         f"^{workspace_pattern}/(.*/)?{re.escape(file)}$" for file in protection.files
     )
     protected = " ".join(f'(regex #"{pattern}")' for pattern in protected_patterns)
-    private_names = "(" + "|".join(re.escape(name) for name in PRIVATE_READ_COMPONENTS) + ")"
+    private_names = (
+        "("
+        + "|".join(
+            "".join(
+                f"[{character.lower()}{character.upper()}]"
+                if character.isalpha()
+                else re.escape(character)
+                for character in name
+            )
+            for name in PRIVATE_READ_COMPONENTS
+        )
+        + ")"
+    )
     private_roots = dict.fromkeys(
         (
             *_SYSTEM_READ_ROOTS,
@@ -584,7 +596,7 @@ def _profile(
 (allow file-write* {temp_cache})
 (allow file-write-data (require-all (path "/dev/null") (vnode-type CHARACTER-DEVICE)))
 (deny file-write* {protected} (with message "{tag}"))
-(deny file-write-unlink {private_reads} (with message "{tag}"))
+(deny file-write* {private_reads} (with message "{tag}"))
 {rename_rule}
 (deny file-write-unlink (require-all (literal {_literal(request.workspace)})
   (vnode-type DIRECTORY)) (with message "{tag}"))

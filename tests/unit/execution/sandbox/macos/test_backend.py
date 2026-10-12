@@ -25,6 +25,14 @@ from loop.utils import ProcessCapture, ProcessCaptureStatus
 def fake_darwin_temp(monkeypatch, tmp_path, request):
     """Keep unit tests independent of the host's Darwin cache directory."""
     monkeypatch.setattr(
+        "loop.utils.process.os.waitid",
+        lambda _kind, pid, _options: SimpleNamespace(si_pid=pid),
+        raising=False,
+    )
+    for name, value in (("P_PID", 1), ("WEXITED", 1), ("WNOHANG", 2), ("WNOWAIT", 4)):
+        monkeypatch.setattr("loop.utils.process.os." + name, value, raising=False)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
+    monkeypatch.setattr(
         "loop.execution.sandbox.macos.backend.platform", SimpleNamespace(system=lambda: "Darwin")
     )
     monkeypatch.setattr(
@@ -484,10 +492,12 @@ def test_backend_denies_private_reads_inside_workspace_and_extra_roots(monkeypat
     profile = popen.call_args.args[0][2]
     assert f'(subpath "{workspace}")' in profile
     assert f'(subpath "{extra}")' in profile
-    names = r"(\.ssh|\.aws|\.gnupg|\.config|\.loop|Library)"
+    names = r"(\.[sS][sS][hH]|\.[aA][wW][sS]|\.[gG][nN][uU][pP][gG]|"
+    names += r"\.[cC][oO][nN][fF][iI][gG]|\.[lL][oO][oO][pP]|[lL][iI][bB][rR][aA][rR][yY])"
     for root in (workspace, extra):
         assert f"{re.escape(str(root))}/(.*/)?{names}(/.*)?$" in profile
     assert profile.index("(deny file-read*") > profile.index("(allow file-read*")
+    assert profile.index("(deny file-write* ") > profile.index("(allow file-write* ")
 
 
 def test_backend_guards_protected_entries_and_their_ancestors_against_rename(monkeypatch, tmp_path):
@@ -520,7 +530,8 @@ def test_backend_guards_protected_entries_and_their_ancestors_against_rename(mon
     rename_rules = [
         line for line in profile.splitlines() if line.startswith("(deny file-write-unlink ")
     ]
-    assert any(r"(\.ssh|\.aws|\.gnupg|\.config|\.loop|Library)" in line for line in rename_rules)
+    private_rules = [line for line in profile.splitlines() if line.startswith("(deny file-write* ")]
+    assert any(r"(\.[sS][sS][hH]|\.[aA][wW][sS]" in line for line in private_rules)
     for protected in (nested, private_parent, private, git_parent, git):
         assert any(f'(literal "{protected}")' in line for line in rename_rules)
     assert all(f'(literal "{ordinary}")' not in line for line in rename_rules)
@@ -544,7 +555,8 @@ def test_backend_limits_baseline_reads_to_system_managed_roots(monkeypatch, tmp_
 
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
-    names = r"(\.ssh|\.aws|\.gnupg|\.config|\.loop|Library)"
+    names = r"(\.[sS][sS][hH]|\.[aA][wW][sS]|\.[gG][nN][uU][pP][gG]|"
+    names += r"\.[cC][oO][nN][fF][iI][gG]|\.[lL][oO][oO][pP]|[lL][iI][bB][rR][aA][rR][yY])"
     for root in backend.system_read_roots:
         assert f"{re.escape(str(root))}/(.*/)?{names}(/.*)?$" in profile
     assert '(subpath "/System/Library")' in profile
@@ -1591,6 +1603,24 @@ def test_backend_classifies_child_capture_failures(monkeypatch, tmp_path, proces
     )
     monkeypatch.setattr("loop.execution.sandbox.macos.backend._denial_from_log", lambda *args: None)
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
+    from loop.utils import process as process_utils
+
+    if isinstance(process.wait_error, subprocess.TimeoutExpired):
+        deadline = request(tmp_path).deadline
+        monkeypatch.setattr(process_utils.os, "waitid", lambda *_args: None, raising=False)
+        monkeypatch.setattr(
+            process_utils,
+            "time",
+            SimpleNamespace(monotonic=lambda: deadline + 1, sleep=lambda _seconds: None),
+        )
+    elif isinstance(process.wait_error, KeyboardInterrupt):
+        monkeypatch.setattr(
+            process_utils.os,
+            "waitid",
+            MagicMock(side_effect=KeyboardInterrupt()),
+            raising=False,
+        )
+        process.wait_error = None
     result = MacOSSeatbeltBackend().run(request(tmp_path))
     assert result.outcome is outcome
     if process.stdout is None:
