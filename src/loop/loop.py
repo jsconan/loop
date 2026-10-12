@@ -18,6 +18,7 @@ from .completion import (
 )
 from .configuration import ApplicationSettings
 from .errors import Problem, log_problem
+from .execution.sandbox import SandboxCommands
 from .instructions import InstructionsManager, RuntimeEnvironment, SkillCommands
 from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler
@@ -124,6 +125,8 @@ class Loop:
         compaction_threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
         prompt_on_recoverable_error: bool = True,
         max_agent_turns: int = constants.DEFAULT_AGENT_MAX_TURNS,
+        main_app: bool = False,
+        refresh_sandbox_backend: Callable[[], None] | None = None,
     ) -> Self:
         """Assemble an interactive loop with project defaults.
 
@@ -153,6 +156,10 @@ class Loop:
             compaction_threshold (float): Automatic compaction threshold.
             prompt_on_recoverable_error (bool): Whether recoverable errors prompt after retries.
             max_agent_turns (int): Maximum turns, or zero for unlimited.
+            main_app (bool): Enable direct main-app terminal management review; False
+                (default) prevents library command dispatch from elevating.
+            refresh_sandbox_backend (Callable[[], None] | None): Reselect the command execution
+                backend after approved Linux setup changes, or ``None`` when not composed.
 
         Returns:
             Loop: Fully assembled interactive application.
@@ -248,6 +255,10 @@ class Loop:
             ToolCommands(configured_tools, configured_instructions),
             ModelCommands(configured_selection),
             CompactionCommands(configured_compaction),
+            SandboxCommands(
+                main_app=main_app,
+                refresh_backend=refresh_sandbox_backend,
+            ),
         )
         configured_commands = CommandManager(
             providers=providers,

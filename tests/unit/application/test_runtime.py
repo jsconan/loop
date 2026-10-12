@@ -94,6 +94,9 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     assert tool_kwargs["settings"].command_timeout == settings.tools.command_timeout
     assert tool_kwargs["permission_manager"] is dependencies["PermissionManager"].return_value
     assert loop_kwargs["permission_manager"] is tool_kwargs["permission_manager"]
+    assert loop_kwargs["refresh_sandbox_backend"] == (
+        dependencies["CommandExecutionService"].for_host.return_value.refresh_backend
+    )
     assert loop_kwargs["working_directory"] is workspace.working_directory
     assert loop_kwargs["stream"] is settings.loop.stream
     assert loop_kwargs["temperature"] == 0.2

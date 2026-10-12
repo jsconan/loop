@@ -1281,9 +1281,7 @@ def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, 
 
 def test_denied_command_virtualizes_offer_and_cached_output(tmp_path, monkeypatch):
     """A public denial hides configured roots in every model-visible field and cache."""
-    instructions = InstructionsManager(
-        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
-    )
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, None))
     interaction = _approving_interaction()
     registry = ToolRegistry(
         [run_command],

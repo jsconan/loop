@@ -164,7 +164,7 @@ def test_initialize_creates_private_commented_defaults(tmp_path):
     assert 'api_key = "local-api-key"' in content
     assert "# context_window = <unset>" in content
     assert "[tools]" in content
-    assert "command_timeout = 30.0" in content
+    assert "command_timeout = 60.0" in content
     assert path.stat().st_mode & 0o777 == 0o600
     assert manager.load().backend.api_key.get_secret_value() == "local-api-key"
 
@@ -214,7 +214,7 @@ def test_command_timeout_requires_a_positive_duration(tmp_path):
     with pytest.raises(ValidationError):
         manager.set_session("tools.command_timeout", 0)
 
-    assert manager.effective.tools.command_timeout == 30.0
+    assert manager.effective.tools.command_timeout == 60.0
 
 
 def test_set_preserves_existing_comments(tmp_path):

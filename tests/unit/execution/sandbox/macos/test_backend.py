@@ -537,6 +537,7 @@ def test_backend_limits_baseline_reads_to_system_managed_roots(monkeypatch, tmp_
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
 
     backend = MacOSSeatbeltBackend()
+    assert backend.automatic_tool_read_roots(tmp_path, (), ()) == ()
     assert backend.policy_version == "macos-seatbelt-v1"
     assert backend.scratch_prefix == "loop-seatbelt-"
     result = backend.run(request(tmp_path))

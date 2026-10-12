@@ -1,12 +1,14 @@
 """Verify exact sandbox request identities and typed outcome boundaries."""
 
 import ast
+import json
 import tempfile
 import time
 from pathlib import Path
 
 import pytest
 
+from loop import constants
 from loop.execution.sandbox import (
     CommandProcessResult,
     DirectoryIdentity,
@@ -57,6 +59,18 @@ def test_request_binds_and_validates_active_instruction_names(tmp_path):
     for invalid in ("../REVIEW.md", "a/b.md", "a\\b.md", "", ".", "a\x00b"):
         with pytest.raises(ValueError, match="plain filenames"):
             request(tmp_path, protected_instruction_names=(invalid,))
+
+
+def test_request_binds_and_validates_file_creation_mask(tmp_path):
+    """The caller umask is retained and malformed permission masks are rejected."""
+    first = request(tmp_path, file_creation_mask=0o022)
+    second = request(tmp_path, file_creation_mask=0o077)
+
+    assert first.file_creation_mask == 0o022
+    assert first.host_command_runtime_signature() != second.host_command_runtime_signature()
+    for invalid in (True, -1, 0o1000, "022"):
+        with pytest.raises(ValueError, match="file creation mask"):
+            request(tmp_path, file_creation_mask=invalid)
 
 
 def test_sandbox_command_signature_normalizes_scratch_and_binds_scope(tmp_path):
@@ -508,6 +522,216 @@ def test_missing_git_creation_target_is_bound_until_launch(tmp_path):
         request(tmp_path, git_create=True, write_roots=())
 
 
+def test_request_wire_roundtrip_preserves_all_authority_and_correlation(tmp_path):
+    """Canonical snapshots restore exact source, grants, identities, deadline and attempt ID."""
+    approved = request(
+        tmp_path,
+        source="printf 'é\\n'",
+        execution_source="printf translated",
+        read_context="Read tools",
+        protected_instruction_names=("RULES.md",),
+    )
+    wire = approved.to_wire()
+    assert json.loads(wire)["schema"] == 1
+    restored = SandboxRequest.from_wire(wire)
+    assert restored == approved
+    assert restored.protected_paths == approved.protected_paths
+    assert restored.shell_environment() == approved.shell_environment()
+    assert restored.host_command_runtime_signature() == approved.host_command_runtime_signature()
+
+
+def test_request_wire_roundtrip_keeps_alias_and_executable_inodes(tmp_path, monkeypatch):
+    """Executable and virtual/read alias identities survive restoration without broader reads."""
+    workspace = tmp_path / "workspace"
+    tool = tmp_path / "tool"
+    private = tmp_path / "private"
+    for path in (workspace, tool, private):
+        path.mkdir(mode=0o700)
+    binary = tool / "runner"
+    binary.write_text("tool")
+    binary.chmod(0o755)
+    read_alias = workspace / "read_alias"
+    read_alias.symlink_to(tool, target_is_directory=True)
+    alias = private / "workspace"
+    alias.symlink_to(workspace, target_is_directory=True)
+    details = binary.stat()
+    approved = request(
+        workspace,
+        read_roots=(tool,),
+        environment={"PATH": str(tool)},
+        aliases=(("/workspace", alias, workspace),),
+        read_aliases=(read_alias,),
+        executable_identities=(("runner", binary, binary, details.st_dev, details.st_ino),),
+        automatic_tool_reads=(tool,),
+    )
+    assert SandboxRequest.from_wire(approved.to_wire()) == approved
+
+
+@pytest.mark.parametrize("change", ["deadline", "stale", "size"])
+def test_request_wire_encoding_refuses_unsafe_authority(tmp_path, change):
+    """Nonfinite deadlines, replaced directories and oversized snapshots refuse serialization."""
+    approved = request(
+        tmp_path,
+        deadline=float("inf") if change == "deadline" else time.monotonic() + 60,
+        source="x" * 65536 if change == "size" else "printf ok",
+    )
+    if change == "stale":
+        tmp_path.rename(tmp_path.with_name("old-wire-root"))
+        tmp_path.mkdir()
+    with pytest.raises(ValueError, match="stale|admission bound"):
+        approved.to_wire()
+
+
+@pytest.mark.parametrize(
+    "data", [None, "text", b"", b"x" * 65537, b"\xff", b"[" * 1100 + b"]" * 1100, b"{"]
+)
+def test_request_wire_invalid_bytes_refuse_before_restoration(data):
+    """Wrong type, bounds, malformed UTF-8/JSON and excessive nesting cannot restore authority."""
+    with pytest.raises(ValueError):
+        SandboxRequest.from_wire(data)
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        None,
+        [],
+        {},
+        {"schema": True, "request": {}},
+        {"schema": 2, "request": {}},
+        {"schema": 3, "request": {}},
+        {"schema": 1, "request": []},
+        {"schema": 1, "request": {}},
+    ],
+)
+def test_request_wire_unknown_or_ambiguous_schema_refuses(envelope):
+    """Only the exact version-one envelope and complete shared request fields are accepted."""
+    with pytest.raises(ValueError, match="request schema"):
+        SandboxRequest.from_wire(json.dumps(envelope).encode())
+
+
+def test_request_wire_duplicate_keys_refuse(tmp_path):
+    """Duplicate authority fields are rejected instead of choosing the last value."""
+    data = request(tmp_path).to_wire()
+    data = data.replace(b'"network":false', b'"network":false,"network":true')
+    with pytest.raises(ValueError, match="Duplicate sandbox request field"):
+        SandboxRequest.from_wire(data)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("deadline", True),
+        ("deadline", "20"),
+        ("deadline", float("inf")),
+        ("deadline", float("nan")),
+        ("network", 1),
+        ("git_create", "false"),
+        ("source", None),
+        ("source", "x\x00y"),
+        ("read_context", []),
+        ("attempt_id", "INVALID"),
+        ("attempt_id", "00000000-0000-0000-0000-00000000000A"),
+        ("file_creation_mask", True),
+        ("file_creation_mask", -1),
+        ("file_creation_mask", 0o1000),
+        ("read_roots", {}),
+        ("cwd", 1),
+        ("environment", ["PATH"]),
+        ("environment", [["PATH"]]),
+        ("environment", [["PATH", 0]]),
+        ("aliases", [["/workspace", 0, "/workspace"]]),
+        ("executable_identities", [["python", "/bin/python", "/bin/python", True, 1]]),
+        ("executable_identities", [["python", "/bin/python", "/bin/python", -1, 1]]),
+    ],
+)
+def test_request_wire_invalid_typed_fields_refuse(tmp_path, field, value):
+    """Request field types and row widths cannot be coerced into broader execution authority."""
+    envelope = json.loads(request(tmp_path).to_wire())
+    envelope["request"][field] = value
+    with pytest.raises(ValueError):
+        SandboxRequest.from_wire(json.dumps(envelope).encode())
+
+
+@pytest.mark.parametrize("change", ["directory", "snapshot", "environment", "alias"])
+def test_request_wire_changed_original_snapshot_refuses(tmp_path, change):
+    """Restoration never recaptures a new directory or normalizes changed snapshot authority."""
+    approved = request(tmp_path)
+    envelope = json.loads(approved.to_wire())
+    if change == "directory":
+        tmp_path.rename(tmp_path.with_name("original-wire-root"))
+        tmp_path.mkdir()
+    elif change == "snapshot":
+        envelope["request"]["_identities"][0]["inode"] += 1
+    elif change == "environment":
+        envelope["request"]["environment"].append(["PATH", "/usr/bin:/bin"])
+    else:
+        envelope["request"]["_alias_identities"] = [[str(tmp_path), 1, 1, str(tmp_path)]]
+    with pytest.raises(ValueError, match="snapshot differs"):
+        SandboxRequest.from_wire(json.dumps(envelope).encode())
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_request_wire_restoration_never_resets_expired_deadline(tmp_path, monkeypatch, late):
+    """The original monotonic budget applies before and after filesystem restoration."""
+    approved = request(tmp_path, deadline=20)
+    wire = approved.to_wire()
+    clock = iter([10, 20] if late else [20])
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+    from loop.execution.sandbox.contracts import SandboxRequestExpired
+
+    with pytest.raises(SandboxRequestExpired, match="restoration deadline") as failure:
+        SandboxRequest.from_wire(wire)
+    assert failure.value.request == approved
+
+
+@pytest.mark.parametrize("change", ["schema", "boolean", "identity"])
+def test_expired_request_does_not_hide_malformed_or_stale_authority(tmp_path, monkeypatch, change):
+    """Expired budgets cannot turn corrupted request authority into an authenticated timeout."""
+    approved = request(tmp_path, deadline=20)
+    envelope = json.loads(approved.to_wire())
+    if change == "schema":
+        envelope["schema"] = True
+    elif change == "boolean":
+        envelope["request"]["network"] = 1
+    else:
+        envelope["request"]["_directory_identities"] = []
+    monkeypatch.setattr(time, "monotonic", lambda: 21)
+    with pytest.raises(ValueError, match="schema|boolean|snapshot differs"):
+        SandboxRequest.from_wire(json.dumps(envelope).encode())
+
+
+def test_request_wire_preserves_private_generated_environment(tmp_path):
+    """Private scratch provenance and generated environment names remain exact after restoration."""
+    with tempfile.TemporaryDirectory(prefix="loop-wire-") as directory:
+        scratch = Path(directory).resolve()
+        approved = request(
+            tmp_path,
+            environment={"TMPDIR": str(scratch), "XDG_CACHE_HOME": str(scratch / "cache")},
+            generated_environment=("TMPDIR", "XDG_CACHE_HOME"),
+        )
+        assert SandboxRequest.from_wire(approved.to_wire()) == approved
+
+
+@pytest.mark.parametrize(
+    "name,path_value",
+    [("x" * 128, ""), ("bad/name", ""), ("tool", "x" * 16385), ("tool", ":" * 128)],
+)
+def test_executable_wire_lookup_rejects_unbounded_or_unsafe_names(tmp_path, name, path_value):
+    """Executable identities in restored requests retain bounded simple-name and PATH validation."""
+    with pytest.raises(ValueError, match="simple name|PATH is too large"):
+        resolve_host_executable(name, path_value, tmp_path)
+
+
+def test_executable_lookup_skips_nonexecutable_and_nonregular_candidates(tmp_path):
+    """A PATH entry cannot bind a directory or a nonexecutable file as command authority."""
+    (tmp_path / "tool").mkdir()
+    assert resolve_host_executable("tool", str(tmp_path), tmp_path) is None
+    (tmp_path / "tool").rmdir()
+    (tmp_path / "tool").write_text("not executable")
+    assert resolve_host_executable("tool", str(tmp_path), tmp_path) is None
+
+
 def test_sandbox_results_distinguish_exit_status_from_boundary_failure():
     """Only completed commands carry an exit code, including nonzero shell exits."""
     assert CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=17).exit_code == 17
@@ -529,3 +753,117 @@ def test_sandbox_contract_has_no_host_execution_dependency():
     }
     names.update(node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom))
     assert not any("host" in name or "application" in name for name in names)
+
+
+@pytest.mark.parametrize("outcome", list(SandboxOutcome))
+def test_result_wire_preserves_typed_outcomes_and_attempt(outcome):
+    """Each terminal outcome retains exact output, effects and its original attempt binding."""
+    attempt = "1248c892-42dc-4b68-a3fb-30d2a70a93a7"
+    result = CommandProcessResult(
+        outcome,
+        exit_code=-9 if outcome is SandboxOutcome.COMPLETED else None,
+        stdout="output\x00é😀",
+        stderr="failure\n",
+        stdout_discarded=None,
+        stderr_discarded=17,
+        possible_effects=True,
+    )
+    assert CommandProcessResult.from_wire(result.to_wire(attempt), attempt) == result
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "envelope",
+        "schema",
+        "schema_bool",
+        "attempt",
+        "result",
+        "missing",
+        "extra",
+        "outcome_type",
+        "outcome",
+        "stdout_type",
+        "stdout_bound",
+        "detail_bound",
+        "discard_type",
+        "discard_negative",
+        "discard_bound",
+        "exit_type",
+        "exit_bound",
+        "effects",
+        "inconsistent",
+    ],
+)
+def test_result_wire_rejects_ambiguous_or_unbounded_results(change):
+    """Malformed field types, bounds, attempt substitution and exit inconsistencies refuse."""
+    attempt = "1248c892-42dc-4b68-a3fb-30d2a70a93a7"
+    envelope = json.loads(CommandProcessResult(SandboxOutcome.UNAVAILABLE).to_wire(attempt))
+    value = envelope["result"]
+    if change == "envelope":
+        envelope = []
+    elif change == "schema":
+        envelope["schema"] = 2
+    elif change == "schema_bool":
+        envelope["schema"] = True
+    elif change == "attempt":
+        envelope["attempt_id"] = "other"
+    elif change == "result":
+        envelope["result"] = []
+    elif change == "missing":
+        del value["detail"]
+    elif change == "extra":
+        value["other"] = "unknown"
+    else:
+        key, replacement = {
+            "outcome_type": ("outcome", 1),
+            "outcome": ("outcome", "unknown"),
+            "stdout_type": ("stdout", []),
+            "stdout_bound": ("stdout", "x" * 1_000_001),
+            "detail_bound": ("detail", "x" * 2001),
+            "discard_type": ("stdout_discarded", True),
+            "discard_negative": ("stderr_discarded", -1),
+            "discard_bound": ("stderr_discarded", 1 << 63),
+            "exit_type": ("exit_code", True),
+            "exit_bound": ("exit_code", 1 << 31),
+            "effects": ("possible_effects", 1),
+            "inconsistent": ("exit_code", 0),
+        }[change]
+        value[key] = replacement
+    with pytest.raises(ValueError):
+        CommandProcessResult.from_wire(json.dumps(envelope).encode(), attempt)
+
+
+@pytest.mark.parametrize("data", [b"", "text", b"\xff", b'{"schema":1,"schema":1}', b"[" * 2000])
+def test_result_wire_rejects_invalid_json_and_envelope(data):
+    """Nonbytes, empty, duplicate, invalid UTF-8 and deeply nested input cannot supply a result."""
+    with pytest.raises(ValueError):
+        CommandProcessResult.from_wire(data, "1248c892-42dc-4b68-a3fb-30d2a70a93a7")
+
+
+@pytest.mark.parametrize("attempt", [1, "bad", "1248C892-42DC-4B68-A3FB-30D2A70A93A7"])
+def test_result_wire_requires_canonical_attempt_identity(attempt):
+    """The expected attempt must itself be a canonical UUID before any result is accepted."""
+    with pytest.raises(ValueError):
+        CommandProcessResult.from_wire(b"{}", attempt)
+
+
+def test_result_wire_bounds_bytes_and_maximum_unicode_output(monkeypatch):
+    """Worst-case JSON escaping fits both full character limits and the explicit wire ceiling."""
+    attempt = "1248c892-42dc-4b68-a3fb-30d2a70a93a7"
+    monkeypatch.setattr(constants, "MAX_OUTPUT_CHARS", 2)
+    monkeypatch.setattr(constants, "MAX_NATIVE_RESULT_BYTES", 24 * 2 + 131072)
+    result = CommandProcessResult(
+        SandboxOutcome.COMPLETED, exit_code=0, stdout="😀😀", stderr="😀😀"
+    )
+    assert CommandProcessResult.from_wire(result.to_wire(attempt), attempt) == result
+    with pytest.raises(ValueError, match="bounded sandbox result envelope"):
+        CommandProcessResult.from_wire(b"x" * (24 * 2 + 131073), attempt)
+
+
+def test_result_wire_encoding_refuses_changed_restoration(monkeypatch):
+    """Encoding cannot emit an envelope whose restored value differs from its source result."""
+    result = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
+    monkeypatch.setattr(CommandProcessResult, "from_wire", lambda *args: None)
+    with pytest.raises(ValueError, match="differs after encoding"):
+        result.to_wire("1248c892-42dc-4b68-a3fb-30d2a70a93a7")

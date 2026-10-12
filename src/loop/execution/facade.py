@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -20,6 +21,7 @@ from ..permissions.protection import is_protected_external_read
 from ..utils import ProcessCapture, VirtualPath, encode_content_cursor, ripgrep_path, store_content
 from .coordinator import CommandExecutionCoordinator, HostCommandExecutor, LocalHostCommandExecutor
 from .sandbox import (
+    CommandProcessResult,
     DirectoryIdentity,
     SandboxBackend,
     SandboxOutcome,
@@ -31,6 +33,19 @@ from .sandbox import (
 
 if TYPE_CHECKING:
     from ..tooling import ToolContext
+
+
+def _trusted_file_owner_ids() -> tuple[int, ...]:
+    """Return current-user and host-root IDs that retain their host meaning."""
+    current_uid = os.getuid()
+    if sys.platform == "linux":
+        try:
+            mapping = Path("/proc/self/uid_map").read_text(encoding="ascii").split()
+        except OSError:
+            return (current_uid,)
+        if mapping != ["0", "0", "4294967295"]:
+            return (current_uid,)
+    return tuple(dict.fromkeys((0, current_uid)))
 
 
 @dataclass(frozen=True)
@@ -95,6 +110,56 @@ def _stream_output(
     return result
 
 
+def _automatic_executable_identities(
+    names: tuple[str, ...], path_value: str, cwd: Path
+) -> tuple[tuple[str, Path, Path, int, int], ...]:
+    """Bind safe exact executable files found in the request's live PATH roots."""
+    roots = path_search_roots({"PATH": path_value}, cwd)
+    trusted_owners = _trusted_file_owner_ids()
+    identities = []
+    for name in dict.fromkeys(names[:128]):
+        if "/" in name:
+            continue
+        try:
+            match = resolve_host_executable(name, path_value, cwd)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if match is None:
+            continue
+        spelling, resolved = match
+        root = next(
+            (
+                canonical
+                for path, canonical in roots
+                if spelling.is_relative_to(path) and resolved.is_relative_to(canonical)
+            ),
+            None,
+        )
+        if root is None:
+            continue
+        if is_protected_external_read(spelling) or is_protected_external_read(resolved):
+            continue
+        try:
+            root_details = root.stat()
+            details = resolved.stat()
+        except OSError:
+            continue
+        if root_details.st_uid not in trusted_owners:
+            continue
+        if root_details.st_mode & 0o002:
+            continue
+        if root_details.st_mode & 0o020 and root_details.st_gid != os.getgid():
+            continue
+        if details.st_uid not in trusted_owners:
+            continue
+        if details.st_mode & 0o022:
+            continue
+        if details.st_nlink != 1:
+            continue
+        identities.append((name, spelling, resolved, details.st_dev, details.st_ino))
+    return tuple(identities)
+
+
 class CommandExecutionService:
     """Own request binding and sandbox/host execution for registered command tools.
 
@@ -111,6 +176,20 @@ class CommandExecutionService:
         self._backend = backend
         self._host_executor = host_executor
         self._executable_grants = {}
+
+    def refresh_backend(self) -> None:
+        """Reselect native authority after an approved sandbox setup change.
+
+        Rebuild the backend against the current installed generation, discard grants bound to the
+        previous backend, and close its resources after the replacement is ready.
+        """
+        replacement = select_sandbox_backend()
+        previous = self._backend
+        self._backend = replacement
+        self._executable_grants.clear()
+        close = getattr(previous, "close", None)
+        if callable(close):
+            close()
 
     @classmethod
     def for_host(cls) -> CommandExecutionService:
@@ -235,7 +314,11 @@ class CommandExecutionService:
         return result
 
     def _executable_read_roots(
-        self, reference: str, workspace: Path, path_value: str, cwd: Path
+        self,
+        reference: str,
+        workspace: Path,
+        path_value: str,
+        cwd: Path,
     ) -> tuple[Path, ...]:
         """Resolve a lookup reference only while its host identity remains current."""
         grant = self._executable_grants.get(reference)
@@ -328,7 +411,10 @@ class CommandExecutionService:
             close()
 
     def run_trusted_search(
-        self, arguments: tuple[str, ...], descriptors: tuple[int, ...], deadline: float
+        self,
+        arguments: tuple[str, ...],
+        descriptors: tuple[int, ...],
+        deadline: float,
     ) -> ProcessCapture | None:
         """Run installed ripgrep with fixed argv and selected read descriptors only.
 
@@ -339,6 +425,9 @@ class CommandExecutionService:
 
         Returns:
             ProcessCapture | None: Bounded native result, or None for safe in-process fallback.
+
+        Raises:
+            RuntimeError: Trusted runtime path authority is invalid.
         """
         runner = getattr(self._backend, "run_read_only_argv", None)
         if not callable(runner):
@@ -348,9 +437,14 @@ class CommandExecutionService:
             executable = executable.resolve(strict=True)
             if executable.stat().st_nlink != 1:
                 return None
-            trusted = any(
-                executable.is_relative_to(root) for root in self._backend.system_read_roots
-            )
+        except (OSError, RuntimeError, ValueError):
+            return None
+        try:
+            roots = self._backend.system_read_roots
+        except (OSError, ValueError) as error:
+            raise RuntimeError("Native search runtime authority is invalid.") from error
+        try:
+            trusted = any(executable.is_relative_to(root) for root in roots)
             if not trusted:
                 roots, _ = self._backend.installed_tool_roots(executable)
                 trusted = bool(roots) and all(
@@ -368,7 +462,7 @@ class CommandExecutionService:
         request: SandboxRequest,
         redact: Callable[[str], str] | None,
         *,
-        prelaunch_failure: str | None = None,
+        prelaunch_failure: CommandProcessResult | None = None,
     ) -> dict | Problem:
         """Execute one bound sandbox request and return only virtualized model-visible text."""
         coordinator = CommandExecutionCoordinator(
@@ -527,7 +621,17 @@ class CommandExecutionService:
             )
         capability_failure = getattr(self._backend, "capability_failure", None)
         failure = capability_failure() if callable(capability_failure) else None
-        prelaunch_failure = failure if isinstance(failure, str) else None
+        prelaunch_failure = (
+            failure
+            if isinstance(failure, CommandProcessResult)
+            else CommandProcessResult(
+                SandboxOutcome.UNAVAILABLE,
+                detail=failure,
+                failure_context="Native sandbox capability check failed.",
+            )
+            if isinstance(failure, str)
+            else None
+        )
         alias_stack = ExitStack()
         paths = None
         redact = None
@@ -598,13 +702,33 @@ class CommandExecutionService:
                 )
             )
             executable_identities = tuple(
-                (
-                    self._executable_grants[reference].name,
-                    self._executable_grants[reference].spelling,
-                    self._executable_grants[reference].resolved,
-                    *self._executable_grants[reference].identity,
+                dict.fromkeys(
+                    (
+                        *(
+                            (
+                                self._executable_grants[reference].name,
+                                self._executable_grants[reference].spelling,
+                                self._executable_grants[reference].resolved,
+                                *self._executable_grants[reference].identity,
+                            )
+                            for reference in dict.fromkeys(references)
+                        ),
+                        *_automatic_executable_identities(
+                            analysis.executables, path_value, command_cwd
+                        ),
+                    )
                 )
-                for reference in dict.fromkeys(references)
+            )
+            runtime_reader = getattr(type(self._backend), "automatic_tool_read_roots", None)
+            runtime_reads = (
+                runtime_reader(
+                    self._backend,
+                    workspace,
+                    path_search_roots({"PATH": path_value}, command_cwd),
+                    executable_identities,
+                )
+                if runtime_reader is not None
+                else ()
             )
             manual_reads = tuple(
                 Path(
@@ -618,8 +742,22 @@ class CommandExecutionService:
                 ).resolve(strict=True)
                 for root in read_roots or ()
             )
-            extra_reads = (*grant_reads, *manual_reads)
-            extra_reads = tuple(root for root in extra_reads if not root.is_relative_to(workspace))
+            runtime_reads = tuple(
+                root for root in runtime_reads if not root.is_relative_to(workspace)
+            )
+            extra_reads = tuple(
+                root
+                for root in dict.fromkeys((*grant_reads, *manual_reads, *runtime_reads))
+                if not root.is_relative_to(workspace)
+            )
+            automatic_reads = tuple(
+                dict.fromkeys(
+                    (
+                        *automatic_reads,
+                        *(root for root in runtime_reads if root not in manual_reads),
+                    )
+                )
+            )
             if any(is_protected_external_read(root) for root in extra_reads):
                 raise ValueError("Protected external directory cannot be a read root.")
             read_context = context.permission_manager.describe_sandbox_reads(
@@ -704,6 +842,12 @@ class CommandExecutionService:
                     value = value.replace(str(root), VirtualPath.EXTERNAL)
                 return value
 
+            file_creation_mask = 0o022
+            if sys.platform == "linux":
+                current_mask = getattr(self._backend, "file_creation_mask", None)
+                if isinstance(current_mask, int) and not isinstance(current_mask, bool):
+                    file_creation_mask = current_mask
+
             request = SandboxRequest.create(
                 source=command,
                 execution_source=translated,
@@ -732,6 +876,7 @@ class CommandExecutionService:
                     else ()
                 ).instruction_names,
                 generated_environment=generated_environment,
+                file_creation_mask=file_creation_mask,
             )
         except (OSError, ValueError) as exc:
             return Problem(

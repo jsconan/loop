@@ -2,11 +2,13 @@
 
 import fcntl
 import os
+import shutil
 import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 from weakref import WeakSet
 
 import pytest
@@ -19,6 +21,7 @@ from loop.telemetry import get_telemetry, set_telemetry
 from loop.utils import content as content_module
 
 _OUTPUT_ROOT: str | None = None
+_NATIVE_OUTPUT_ROOTS: list[str] = []
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 _REALPATH = os.path.realpath
 _ABSPATH = os.path.abspath
@@ -46,7 +49,8 @@ def _check_output(path, *, follow=True, directory=None):
         if follow
         else os.path.join(_REALPATH(os.path.dirname(absolute)), os.path.basename(absolute))
     )
-    if canonical != _OUTPUT_ROOT and not canonical.startswith(_OUTPUT_ROOT + os.sep):
+    roots = (_OUTPUT_ROOT, *_NATIVE_OUTPUT_ROOTS)
+    if not any(canonical == root or canonical.startswith(root + os.sep) for root in roots):
         raise AssertionError(f"Test output escapes disposable scratch: {canonical}")
 
 
@@ -143,6 +147,7 @@ def isolated_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(tempfile, "tempdir", str(temporary))
     monkeypatch.chdir(working)
     monkeypatch.setattr(sys.modules[__name__], "_OUTPUT_ROOT", str(root))
+    monkeypatch.setattr(sys.modules[__name__], "_NATIVE_OUTPUT_ROOTS", [])
     cache = root / "content-cache"
     cache.mkdir()
     monkeypatch.setattr(content_module, "_CACHE", SimpleNamespace(name=str(cache)))
@@ -157,6 +162,27 @@ def isolated_environment(monkeypatch, tmp_path):
     if current is not None and current is not previous:
         current.close()
     set_telemetry(previous)
+
+
+@pytest.fixture
+def native_directory(isolated_environment):
+    """Own exact disposable directories on a native filesystem while retaining output guards."""
+    directories = []
+
+    def create(parent):
+        """Register one fresh canonical child before creation and retain it through cleanup."""
+        parent = Path(parent).resolve(strict=True)
+        path = parent / ("loop-native-test-" + uuid4().hex)
+        assert not path.exists() and not path.is_symlink()
+        _NATIVE_OUTPUT_ROOTS.append(str(path))
+        path.mkdir(mode=0o700)
+        directories.append(path)
+        return path
+
+    yield create
+    for path in reversed(directories):
+        shutil.rmtree(path)
+        _NATIVE_OUTPUT_ROOTS.remove(str(path))
 
 
 @pytest.fixture(autouse=True)

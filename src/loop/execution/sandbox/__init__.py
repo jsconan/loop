@@ -4,6 +4,7 @@ __all__ = [
     "CommandProcessResult",
     "DirectoryIdentity",
     "SandboxBackend",
+    "SandboxCommands",
     "SandboxOutcome",
     "SandboxRequest",
     "UnavailableSandboxBackend",
@@ -12,6 +13,7 @@ __all__ = [
     "select_sandbox_backend",
 ]
 
+from .commands import SandboxCommands
 from .contracts import (
     CommandProcessResult,
     DirectoryIdentity,

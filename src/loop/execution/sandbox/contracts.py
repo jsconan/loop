@@ -2,19 +2,64 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import re
 import stat
 import tempfile
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass, fields, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from ... import constants
-from ...permissions import ProtectedWorkspacePaths, protected_workspace_paths
-from ...utils import VirtualPath, sha256_digest
+from ...permissions.protection import ProtectedWorkspacePaths, protected_workspace_paths
+from ...utils.hashing import sha256_digest
+from ...utils.json import load_unique_json
+from ...utils.virtual_path import VirtualPath
+
+
+def _wire_text(value: object) -> str:
+    """Reject nontext and embedded NUL before restoring any request field."""
+    if not isinstance(value, str) or "\x00" in value:
+        raise ValueError("Invalid sandbox request text field.")
+    return value
+
+
+def _wire_items(value: list, shape: tuple[type, ...]) -> tuple[tuple, ...]:
+    """Restore fixed-width text/path/integer rows from the request schema."""
+    result = []
+    for row in value:
+        if not isinstance(row, list) or len(row) != len(shape):
+            raise ValueError("Invalid sandbox request row.")
+        restored = []
+        for item, kind in zip(row, shape, strict=True):
+            if kind in (str, Path):
+                text = _wire_text(item)
+                restored.append(Path(text) if kind is Path else text)
+            else:
+                if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+                    raise ValueError("Invalid sandbox request inode identity.")
+                restored.append(item)
+        result.append(tuple(restored))
+    return tuple(result)
+
+
+class SandboxRequestExpired(TimeoutError):
+    """Retain validated request identity for bounded expiry-result delivery.
+
+    Args:
+        request (SandboxRequest): Fully restored original request; grants no execution time.
+    """
+
+    request: SandboxRequest
+
+    def __init__(self, request: SandboxRequest):
+        super().__init__("Sandbox request restoration deadline expired.")
+        self.request = request
 
 
 class SandboxOutcome(StrEnum):
@@ -99,7 +144,9 @@ def path_search_roots(environment: dict[str, str], cwd: Path) -> tuple[tuple[Pat
 
 
 def resolve_host_executable(
-    name: str, path_value: str, cwd: Path | None = None
+    name: str,
+    path_value: str,
+    cwd: Path | None = None,
 ) -> tuple[Path, Path] | None:
     """Find one named executable using the same bound PATH directories as a command.
 
@@ -167,12 +214,13 @@ class SandboxRequest:
         read_aliases (tuple[Path, ...]): Bound directory symlinks into approved read roots.
         executable_identities (tuple[tuple[str, Path, Path, int, int], ...]): Named host
             executables, their PATH spellings, canonical files, and device/inode identities.
-        automatic_tool_reads (tuple[Path, ...]): Read roots derived only from bound executable
-            references that may run within the default sandbox without an extra prompt.
+        automatic_tool_reads (tuple[Path, ...]): Read roots derived from bound executable and
+            runtime references that may run within the default sandbox without an extra prompt.
         generated_environment (tuple[str, ...]): Names of runtime-generated values strictly
             beneath the bound private scratch directory.
         protected_instruction_names (tuple[str, ...]): Instruction filenames denied native
             writes at every depth of the workspace.
+        file_creation_mask (int): Caller process umask applied before command source starts.
         attempt_id (str): Opaque identifier correlating this attempt's audit records.
     """
 
@@ -200,6 +248,7 @@ class SandboxRequest:
     automatic_tool_reads: tuple[Path, ...] = ()
     generated_environment: tuple[str, ...] = ()
     protected_instruction_names: tuple[str, ...] = ()
+    file_creation_mask: int = 0o022
 
     @property
     def protected_paths(self) -> ProtectedWorkspacePaths:
@@ -233,6 +282,7 @@ class SandboxRequest:
         automatic_tool_reads: tuple[Path, ...] = (),
         generated_environment: tuple[str, ...] = (),
         protected_instruction_names: tuple[str, ...] = (),
+        file_creation_mask: int = 0o022,
     ) -> SandboxRequest:
         """Create a request and capture every authority-bearing directory identity.
 
@@ -256,11 +306,12 @@ class SandboxRequest:
             executable_identities (tuple[tuple[str, Path, Path, int, int], ...]): Bound
                 executable names, spellings, canonical files, and device/inode identities.
             automatic_tool_reads (tuple[Path, ...]): Narrow roots supplied by validated
-                executable references, excluding manual reads and Git metadata.
+                executable/runtime references, excluding manual reads and Git metadata.
             generated_environment (tuple[str, ...]): Runtime-generated environment names whose
                 values are within private scratch and may vary between attempts.
             protected_instruction_names (tuple[str, ...]): Validated instruction basenames
                 whose workspace writes the native policy must deny.
+            file_creation_mask (int): Caller process umask applied before command source starts.
 
         Returns:
             SandboxRequest: Immutable request with bound directory identities.
@@ -273,6 +324,12 @@ class SandboxRequest:
             raise ValueError(
                 "Sandbox source, policy, workspace identity, and deadline are required."
             )
+        if (
+            not isinstance(file_creation_mask, int)
+            or isinstance(file_creation_mask, bool)
+            or not 0 <= file_creation_mask <= 0o777
+        ):
+            raise ValueError("Sandbox file creation mask is invalid.")
         protected_workspace_paths(protected_instruction_names)
         if execution_source is not None and not execution_source:
             raise ValueError("Translated sandbox source cannot be empty.")
@@ -395,6 +452,7 @@ class SandboxRequest:
             automatic_tool_reads,
             tuple(dict.fromkeys(generated_environment)),
             tuple(dict.fromkeys(protected_instruction_names)),
+            file_creation_mask,
         )
 
     def paths_are_current(self) -> bool:
@@ -459,6 +517,150 @@ class SandboxRequest:
         """
         return dict(self.environment)
 
+    def to_wire(self) -> bytes:
+        """Serialize an exact current request snapshot for authenticated local admission.
+
+        Preserve every constructor and captured identity field, including the original deadline
+        and attempt ID. This bounded canonical JSON is private transport data, never model output
+        or an authorization token. The local receiver must restore and revalidate it before setup.
+
+        Returns:
+            bytes: Version-one UTF-8 request snapshot of at most 64 KiB.
+
+        Raises:
+            ValueError: Authority is stale, the deadline is nonfinite or the snapshot is oversized.
+        """
+        if not math.isfinite(self.deadline) or not self.paths_are_current():
+            raise ValueError("Sandbox request authority is stale or its deadline is invalid.")
+        data = json.dumps(
+            {"schema": 1, "request": asdict(self)},
+            default=str,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(data) > constants.MAX_NATIVE_REQUEST_BYTES:
+            raise ValueError("Sandbox request snapshot exceeds the admission bound.")
+        return data
+
+    @classmethod
+    def from_wire(cls, data: bytes) -> SandboxRequest:
+        """Restore the shared request without recapturing changed paths as new authority.
+
+        Call only after original installed authority and ordinary peer/frame admission. Validate
+        a duplicate-free fixed version-one schema, restore constructor inputs through create,
+        retain the original canonical attempt ID and require the complete revalidated snapshot
+        to equal the transmitted snapshot. Changes to directories, aliases, PATH or executable
+        identities refuse. No source runs, grant expands, deadline resets or approval is inferred.
+
+        Args:
+            data (bytes): Private UTF-8 request snapshot received through authenticated admission,
+                nonempty and at most 64 KiB.
+
+        Returns:
+            SandboxRequest: Exact current request, with its original deadline and attempt ID.
+
+        Raises:
+            ValueError: JSON/schema/types, bounds, original snapshot or current authority differ.
+            SandboxRequestExpired: The original deadline expires; the exception retains only
+                fully validated request authority for bounded result delivery.
+            OSError: A required approved path or executable cannot be inspected.
+        """
+        if not isinstance(data, bytes) or not 0 < len(data) <= constants.MAX_NATIVE_REQUEST_BYTES:
+            raise ValueError("Invalid bounded sandbox request snapshot.")
+        try:
+            envelope = load_unique_json(
+                data.decode("utf-8"), duplicate_message="Duplicate sandbox request field."
+            )
+        except (UnicodeError, RecursionError) as error:
+            raise ValueError("Invalid sandbox request JSON.") from error
+        if (
+            not isinstance(envelope, dict)
+            or set(envelope) != {"schema", "request"}
+            or not isinstance(envelope["schema"], int)
+            or isinstance(envelope["schema"], bool)
+            or envelope["schema"] != 1
+            or not isinstance(envelope["request"], dict)
+            or set(envelope["request"]) != {field.name for field in fields(cls)}
+        ):
+            raise ValueError("Invalid sandbox request schema.")
+        value = envelope["request"]
+        deadline = value["deadline"]
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(deadline)
+        ):
+            raise ValueError("Invalid sandbox request deadline.")
+        expired = time.monotonic() >= deadline
+        text_names = ("source", "execution_source", "policy_version", "workspace_id", "attempt_id")
+        text = {name: _wire_text(value[name]) for name in text_names}
+        if str(UUID(text["attempt_id"])) != text["attempt_id"]:
+            raise ValueError("Invalid sandbox request attempt identity.")
+        if any(not isinstance(value[name], bool) for name in ("network", "git_create")):
+            raise ValueError("Invalid sandbox request boolean authority.")
+        file_creation_mask = value["file_creation_mask"]
+        if (
+            not isinstance(file_creation_mask, int)
+            or isinstance(file_creation_mask, bool)
+            or not 0 <= file_creation_mask <= 0o777
+        ):
+            raise ValueError("Invalid sandbox request file creation mask.")
+        if value["read_context"] is not None:
+            _wire_text(value["read_context"])
+        collections = (
+            "read_roots",
+            "write_roots",
+            "read_aliases",
+            "automatic_tool_reads",
+            "environment",
+            "aliases",
+            "executable_identities",
+            "generated_environment",
+            "protected_instruction_names",
+        )
+        if any(not isinstance(value[name], list) for name in collections):
+            raise ValueError("Invalid sandbox request collection.")
+        paths = {
+            name: tuple(Path(_wire_text(path)) for path in value[name])
+            for name in ("read_roots", "write_roots", "read_aliases", "automatic_tool_reads")
+        }
+        restored = cls.create(
+            source=text["source"],
+            execution_source=text["execution_source"],
+            policy_version=text["policy_version"],
+            workspace_id=text["workspace_id"],
+            cwd=Path(_wire_text(value["cwd"])),
+            workspace=Path(_wire_text(value["workspace"])),
+            **paths,
+            network=value["network"],
+            git_create=value["git_create"],
+            deadline=deadline,
+            read_context=value["read_context"],
+            environment=dict(_wire_items(value["environment"], (str, str))),
+            aliases=_wire_items(value["aliases"], (str, Path, Path)),
+            executable_identities=_wire_items(
+                value["executable_identities"], (str, Path, Path, int, int)
+            ),
+            generated_environment=tuple(
+                _wire_text(name) for name in value["generated_environment"]
+            ),
+            protected_instruction_names=tuple(
+                _wire_text(name) for name in value["protected_instruction_names"]
+            ),
+            file_creation_mask=file_creation_mask,
+        )
+        restored = replace(restored, attempt_id=text["attempt_id"])
+        canonical = json.dumps(
+            envelope, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if restored.to_wire() != canonical:
+            raise ValueError("Sandbox request snapshot differs from current authority.")
+        if expired or time.monotonic() >= deadline:
+            raise SandboxRequestExpired(restored)
+        return restored
+
     def host_command_signature(self) -> str:
         """Describe a host rule using only virtual workspace coordinates.
 
@@ -519,6 +721,7 @@ class SandboxRequest:
             self.automatic_tool_reads,
             self.git_create,
             self.protected_instruction_names,
+            self.file_creation_mask,
             tuple((virtual, target) for virtual, _, target in self.aliases),
         )
         return sha256_digest(repr(payload))
@@ -555,6 +758,7 @@ class SandboxRequest:
             self.path_roots,
             self.policy_version,
             self.git_create,
+            self.file_creation_mask,
             tuple(
                 (virtual, "workspace" if target == self.workspace else str(target))
                 for virtual, _, target in self.aliases
@@ -596,6 +800,95 @@ class CommandProcessResult:
     def __post_init__(self) -> None:
         if (self.outcome is SandboxOutcome.COMPLETED) != (self.exit_code is not None):
             raise ValueError("Only completed commands have an exit code.")
+
+    def to_wire(self, attempt_id: str) -> bytes:
+        """Encode a bounded result bound to the original command attempt.
+
+        Args:
+            attempt_id (str): Original canonical request UUID, never a replacement attempt.
+
+        Returns:
+            bytes: Version-one UTF-8 result envelope with bounded output and diagnostics.
+
+        Raises:
+            ValueError: Result fields, attempt identity or encoded size are invalid.
+        """
+        data = json.dumps(
+            {"schema": 1, "attempt_id": attempt_id, "result": asdict(self)},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        if self.from_wire(data, attempt_id) != self:
+            raise ValueError("Sandbox result differs after encoding.")
+        return data
+
+    @classmethod
+    def from_wire(cls, data: bytes, attempt_id: str) -> CommandProcessResult:
+        """Restore an exact bounded result for the original attempt without inferring a denial.
+
+        Accept only the fixed schema, JSON field types and completion/exit relationship.
+        Output retains the common supervisor's character limits; diagnostics are each at most
+        2,000 characters. Unknown discarded counts remain None. Parsing supplies no native
+        enforcement evidence or retry authority.
+
+        Args:
+            data (bytes): Nonempty UTF-8 result envelope, at most the fixed wire ceiling.
+            attempt_id (str): Original canonical request UUID expected by the ordinary client.
+
+        Returns:
+            CommandProcessResult: Exact typed result without executing or replaying source.
+
+        Raises:
+            ValueError: JSON, schema, types, bounds, attempt identity or outcome is invalid.
+        """
+        # JSON escapes each output character into at most twelve ASCII bytes (a surrogate pair).
+        if not isinstance(data, bytes) or not 0 < len(data) <= constants.MAX_NATIVE_RESULT_BYTES:
+            raise ValueError("Invalid bounded sandbox result envelope.")
+        if not isinstance(attempt_id, str) or str(UUID(attempt_id)) != attempt_id:
+            raise ValueError("Invalid sandbox result attempt identity.")
+        try:
+            envelope = load_unique_json(
+                data.decode("utf-8"), duplicate_message="Duplicate sandbox request field."
+            )
+        except (UnicodeError, RecursionError) as error:
+            raise ValueError("Invalid sandbox result JSON.") from error
+        if (
+            not isinstance(envelope, dict)
+            or set(envelope) != {"schema", "attempt_id", "result"}
+            or not isinstance(envelope["schema"], int)
+            or isinstance(envelope["schema"], bool)
+            or envelope["schema"] != 1
+            or envelope["attempt_id"] != attempt_id
+            or not isinstance(envelope["result"], dict)
+            or set(envelope["result"]) != {field.name for field in fields(cls)}
+        ):
+            raise ValueError("Invalid sandbox result schema or attempt binding.")
+        value = dict(envelope["result"])
+        if not isinstance(value["outcome"], str):
+            # Malformed wire values remain ValueError under the from_wire contract.
+            raise ValueError("Invalid sandbox result outcome.")  # noqa: TRY004
+        value["outcome"] = SandboxOutcome(value["outcome"])
+        for name in ("stdout", "stderr", "detail", "observed_denial", "failure_context"):
+            maximum = constants.MAX_OUTPUT_CHARS if name in ("stdout", "stderr") else 2000
+            if not isinstance(value[name], str) or len(value[name]) > maximum:
+                raise ValueError("Invalid bounded sandbox result text.")
+        for name in ("stdout_discarded", "stderr_discarded"):
+            if value[name] is not None and (
+                not isinstance(value[name], int)
+                or isinstance(value[name], bool)
+                or not 0 <= value[name] <= (1 << 63) - 1
+            ):
+                raise ValueError("Invalid sandbox result discarded count.")
+        if value["exit_code"] is not None and (
+            not isinstance(value["exit_code"], int)
+            or isinstance(value["exit_code"], bool)
+            or not -(1 << 31) <= value["exit_code"] < 1 << 31
+        ):
+            raise ValueError("Invalid sandbox result exit code.")
+        if not isinstance(value["possible_effects"], bool):
+            # Malformed wire values remain ValueError under the from_wire contract.
+            raise ValueError("Invalid sandbox result effects flag.")  # noqa: TRY004
+        return cls(**value)
 
 
 class SandboxBackend(Protocol):
@@ -647,6 +940,27 @@ class SandboxBackend(Protocol):
         Returns:
             tuple[tuple[Path, ...], tuple[tuple[Path, int, int, Path], ...]]: Read roots and
                 installation aliases whose identities must remain stable.
+        """
+
+    def automatic_tool_read_roots(
+        self,
+        workspace: Path,
+        path_roots: tuple[tuple[Path, Path], ...],
+        executable_identities: tuple[tuple[str, Path, Path, int, int], ...],
+    ) -> tuple[Path, ...]:
+        """Return read-only runtime roots needed by identity-bound tools without prompting.
+
+        Args:
+            workspace (Path): Canonical selected workspace.
+            path_roots (tuple[tuple[Path, Path], ...]): Bound PATH spellings and directories.
+            executable_identities (tuple[tuple[str, Path, Path, int, int], ...]): Exact names,
+                canonical files, and file identities admitted for this request.
+
+        Returns:
+            tuple[Path, ...]: Backend-verified runtime roots included in the request authority.
+
+        Raises:
+            ValueError: A discovered runtime reference is unsafe or ambiguous.
         """
 
     def run(self, request: SandboxRequest) -> CommandProcessResult:

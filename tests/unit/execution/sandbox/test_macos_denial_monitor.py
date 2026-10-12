@@ -161,7 +161,10 @@ def test_live_monitor_ranks_tagged_denials_after_incidental_event(
         process.send(
             record(
                 tag,
-                eventMessage=f"Sandbox: sh deny(1) file-read-data /Library/Preferences/Logging/missing\n{tag}",
+                eventMessage=(
+                    "Sandbox: sh deny(1) file-read-data "
+                    f"/Library/Preferences/Logging/missing\n{tag}"
+                ),
             )
         )
         assert_denial(monitor, tag, "file-read-data")

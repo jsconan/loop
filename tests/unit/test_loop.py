@@ -426,6 +426,54 @@ def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_p
     interaction.warning.assert_called_with("The backend is not reachable.")
 
 
+@pytest.mark.parametrize("main_app", [False, True])
+def test_default_loop_registers_single_sandbox_provider_with_main_app_authority(
+    tmp_path, monkeypatch, main_app
+):
+    """Linux registration supplies management dispatch with explicit main-app context."""
+    import loop.execution.sandbox.commands as sandbox_commands
+    from loop.execution.sandbox.linux import management as linux_management
+    from loop.execution.sandbox.linux import setup as linux_setup
+
+    monkeypatch.setattr(linux_management, "installation_status", Mock(return_value="Inventory"))
+    monkeypatch.setattr(sandbox_commands.platform, "system", lambda: "Linux")
+    interaction = output_interaction()
+
+    def manage(action, review, *, main_app):
+        """Model direct management consent only when the main app is authorized."""
+        return review("reviewed setup") if main_app else False
+
+    management = Mock(side_effect=manage)
+    monkeypatch.setattr(linux_setup, "manage_setup", management)
+    refresh_backend = Mock()
+    loop = Loop.create_default(
+        loop_backend(),
+        working_directory=tmp_path,
+        interaction=interaction,
+        main_app=main_app,
+        refresh_sandbox_backend=refresh_backend,
+    )
+    assert [command.name for command in loop.command_manager.commands].count("sandbox") == 1
+    loop.command_manager.call("sandbox", "uninstall")
+    assert management.call_args.kwargs == {"main_app": main_app}
+    if main_app:
+        refresh_backend.assert_called_once_with()
+    else:
+        refresh_backend.assert_not_called()
+
+
+def test_default_loop_omits_linux_management_on_macos(tmp_path, monkeypatch):
+    """A macOS app registers no Linux installation command."""
+    import loop.execution.sandbox.commands as sandbox_commands
+
+    monkeypatch.setattr(sandbox_commands.platform, "system", lambda: "Darwin")
+    loop = Loop.create_default(
+        loop_backend(), working_directory=tmp_path, interaction=output_interaction()
+    )
+
+    assert "sandbox" not in [command.name for command in loop.command_manager.commands]
+
+
 def test_run_supplies_registered_dynamic_completion_capabilities(tmp_path):
     """Interactive input receives adapters for current commands, files, skills, and tools."""
     interaction = MagicMock(spec=Interaction)

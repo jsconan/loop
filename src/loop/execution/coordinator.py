@@ -271,7 +271,7 @@ class CommandExecutionCoordinator:
         request: SandboxRequest,
         tool_id: str,
         *,
-        prelaunch_failure: str | None = None,
+        prelaunch_failure: CommandProcessResult | None = None,
         execution_timeout: float | None = None,
     ) -> CommandAttempt:
         """Run an authorized request or offer retry for a typed prelaunch failure.
@@ -279,8 +279,8 @@ class CommandExecutionCoordinator:
         Args:
             request (SandboxRequest): Exact approved command, policy, and path identities.
             tool_id (str): Registered execution tool identity used for permission evaluation.
-            prelaunch_failure (str | None): Startup capability failure to return without invoking
-                the backend, after authorization and path validation.
+            prelaunch_failure (CommandProcessResult | None): Typed startup capability failure to
+                return without invoking the backend, after authorization and path validation.
             execution_timeout (float | None): Execution budget in seconds to start after approval.
                 Defaults to preserving the caller's absolute deadline.
 
@@ -303,11 +303,7 @@ class CommandExecutionCoordinator:
                 SandboxOutcome.TIMED_OUT, detail="Command deadline expired before launch."
             )
         elif prelaunch_failure is not None:
-            result = CommandProcessResult(
-                SandboxOutcome.UNAVAILABLE,
-                detail=prelaunch_failure,
-                failure_context="Native sandbox capability check failed.",
-            )
+            result = prelaunch_failure
         else:
             result = self._backend.run(request)
         telemetry_audit(

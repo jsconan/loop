@@ -772,6 +772,26 @@ class MacOSSeatbeltBackend:
         """
         return "loop-seatbelt-"
 
+    def automatic_tool_read_roots(
+        self,
+        workspace: Path,
+        path_roots: tuple[tuple[Path, Path], ...],
+        executable_identities: tuple[tuple[str, Path, Path, int, int], ...],
+    ) -> tuple[Path, ...]:
+        """Return no extra runtime roots beyond macOS's existing profile defaults.
+
+        Args:
+            workspace (Path): Canonical selected workspace.
+            path_roots (tuple[tuple[Path, Path], ...]): Bound PATH spellings and directories.
+            executable_identities (tuple[tuple[str, Path, Path, int, int], ...]): Bound named
+                executable files and their device/inode identities.
+
+        Returns:
+            tuple[Path, ...]: Empty tuple; Seatbelt compatibility is expressed in its profile.
+        """
+        del self, workspace, path_roots, executable_identities
+        return ()
+
     @staticmethod
     def managed_tool_root(root: Path) -> bool:
         """Verify a versioned Homebrew package root with an installation receipt.

@@ -22,12 +22,13 @@ class UnavailableSandboxBackend:
     """Reject command execution when this host has no qualified native backend.
 
     Args:
-        reason (str): Actionable reason no native command boundary can be used.
+        reason (str | CommandProcessResult): Path-free capability explanation or typed integrity
+            failure; invalid/stale failures never permit a host retry.
     """
 
-    _reason: str
+    _reason: str | CommandProcessResult
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str | CommandProcessResult) -> None:
         self._reason = reason
 
     @property
@@ -57,6 +58,26 @@ class UnavailableSandboxBackend:
         """
         return "loop-sandbox-"
 
+    def automatic_tool_read_roots(
+        self,
+        workspace: Path,
+        path_roots: tuple[tuple[Path, Path], ...],
+        executable_identities: tuple[tuple[str, Path, Path, int, int], ...],
+    ) -> tuple[Path, ...]:
+        """Return no additional reads when no native policy can enforce them.
+
+        Args:
+            workspace (Path): Canonical selected workspace.
+            path_roots (tuple[tuple[Path, Path], ...]): Bound PATH spellings and directories.
+            executable_identities (tuple[tuple[str, Path, Path, int, int], ...]): Bound named
+                executable files and their device/inode identities.
+
+        Returns:
+            tuple[Path, ...]: Empty tuple because execution is unavailable.
+        """
+        del self, workspace, path_roots, executable_identities
+        return ()
+
     @staticmethod
     def managed_tool_root(root: Path) -> bool:
         """Deny automatic installed-tool reads without a native backend.
@@ -84,11 +105,11 @@ class UnavailableSandboxBackend:
         """
         return (resolved.parent,), ()
 
-    def capability_failure(self) -> str:
+    def capability_failure(self) -> str | CommandProcessResult:
         """Describe why ordinary sandboxed commands cannot start.
 
         Returns:
-            str: Sanitized, host-level sandbox availability failure.
+            str | CommandProcessResult: Sanitized availability or typed integrity failure.
         """
         return self._reason
 
@@ -99,8 +120,10 @@ class UnavailableSandboxBackend:
             request (SandboxRequest): Command that cannot be executed on this host.
 
         Returns:
-            CommandProcessResult: Unavailable boundary result.
+            CommandProcessResult: Original typed capability or integrity failure.
         """
+        if isinstance(self._reason, CommandProcessResult):
+            return self._reason
         return CommandProcessResult(
             SandboxOutcome.UNAVAILABLE,
             detail=self._reason,
@@ -109,21 +132,34 @@ class UnavailableSandboxBackend:
 
 
 def select_sandbox_backend() -> SandboxBackend:
-    """Select Seatbelt on macOS only after a native write-boundary probe.
+    """Select authenticated Linux installation or natively probed macOS confinement.
 
     Returns:
-        SandboxBackend: Probed macOS backend or a fail-closed unavailable backend.
+        SandboxBackend: Available native backend or a fail-closed unavailable backend.
     """
-    if platform.system() != "Darwin":
+    host = platform.system()
+    if host == "Linux":
+        from .linux import LinuxNativeBackend
+
+        backend = LinuxNativeBackend()
+        failure = backend.capability_failure()
+        if failure is not None:
+            return UnavailableSandboxBackend(failure)
+    elif host == "Darwin":
+        backend = _macos_backend()
+    else:
         return UnavailableSandboxBackend("No native command sandbox is qualified for this host.")
-    backend = _macos_backend()
     try:
-        with tempfile.TemporaryDirectory(prefix="loop-sandbox-probe-") as directory:
+        with (
+            tempfile.TemporaryDirectory(prefix="loop-sandbox-probe-") as directory,
+            tempfile.TemporaryDirectory(prefix=backend.scratch_prefix) as scratch_directory,
+        ):
             root = Path(directory).resolve(strict=True)
             workspace = root / "workspace"
             outside = root / "outside"
             workspace.mkdir()
             outside.mkdir()
+            scratch = Path(scratch_directory).resolve(strict=True)
             private = workspace / ".ssh"
             private.mkdir()
             (private / "id_ed25519").write_text("probe-secret", encoding="utf-8")
@@ -141,7 +177,7 @@ def select_sandbox_backend() -> SandboxBackend:
                 read_roots=(),
                 write_roots=(workspace,),
                 network=False,
-                environment={"PATH": "/usr/bin:/bin", "LANG": "C"},
+                environment={"PATH": "/usr/bin:/bin", "LANG": "C", "TMPDIR": str(scratch)},
                 policy_version=backend.policy_version,
                 deadline=time.monotonic() + 5,
                 workspace_id="native-probe",
@@ -163,6 +199,13 @@ def select_sandbox_backend() -> SandboxBackend:
             "Nested sandbox prevented native sandbox initialization."
             if "sandbox_apply" in result.detail
             else f"Native sandbox capability probe failed ({result.outcome.value})."
+        )
+    if host == "Linux":
+        return UnavailableSandboxBackend(
+            CommandProcessResult(
+                SandboxOutcome.INVALID,
+                detail=reason,
+            )
         )
     backend.close()
     return UnavailableSandboxBackend(reason)

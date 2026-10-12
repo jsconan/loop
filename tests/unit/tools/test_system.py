@@ -493,7 +493,7 @@ def test_lookup_never_grants_a_protected_external_tool(tmp_path, monkeypatch, re
 def test_external_lookup_reference_round_trips_through_public_virtual_boundary(
     tmp_path, monkeypatch
 ):
-    """A model can request a bound tool grant without seeing a host path or starting a host retry."""
+    """Request a bound tool grant without exposing a host path or starting a host retry."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     scratch = tmp_path / "scratch"
@@ -639,13 +639,11 @@ def test_public_extra_read_contexts_and_protected_root_fail_closed(tmp_path):
     """Public requests distinguish narrow and broad reads and reject protected roots prelaunch."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
     external = tmp_path / "external"
     external.mkdir()
     protected = external / ".ssh"
     protected.mkdir()
-    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, None))
     backend = MagicMock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     interaction = MagicMock()
@@ -1742,3 +1740,128 @@ def test_run_command_spills_an_oversized_backend_preview(monkeypatch, registry):
     result, _ = call(registry, "printf lots")
     assert result["stdout"]["truncated"] is True
     assert result["stdout"]["handle"]
+
+
+@pytest.mark.parametrize("initial_selection", [False, True])
+@pytest.mark.parametrize(
+    "component",
+    [
+        "helper bytes",
+        "helper mode",
+        "record",
+        "receipt",
+        "lock",
+        "code bytes",
+        "code mode",
+        "unknown inventory",
+    ],
+)
+def test_linux_integrity_failure_never_uses_host_offer_or_session_rule(
+    tmp_path, monkeypatch, initial_selection, component
+):
+    """Initial and per-command integrity failures cannot prompt, offer or reuse host authority."""
+    from loop.execution.sandbox import selection
+    from loop.execution.sandbox.linux import backend as linux
+
+    record = tmp_path / "management.json"
+    record.write_text("bound authority")
+    native = linux.LinuxNativeBackend(record)
+    monkeypatch.setattr(linux, "runtime_read_roots", lambda: ())
+    monkeypatch.setattr(linux.LinuxNativeBackend, "managed_tool_root", lambda *_: False)
+    validator = MagicMock()
+    monkeypatch.setattr(linux, "execution_authority", validator)
+    exchanged = MagicMock()
+    monkeypatch.setattr(linux, "exchange_installed_request", exchanged)
+    host = MagicMock()
+    host.run_host_command.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    permissions = PermissionManager(tmp_path)
+    interaction = RememberingHostInteraction()
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(native, host),
+    )
+
+    def unavailable(_record, payload, _deadline):
+        """Allow an explicit host session decision before introducing integrity drift."""
+        from loop.execution.sandbox import SandboxRequest
+
+        request = SandboxRequest.from_wire(payload)
+        return CommandProcessResult(SandboxOutcome.UNAVAILABLE).to_wire(request.attempt_id)
+
+    exchanged.side_effect = unavailable
+    first, problem = call(registry, "printf ordinary", cwd=str(tmp_path), interaction=interaction)
+    assert problem is None and first["boundary"] == "host"
+    assert len(permissions.host_command_rules()) == 1
+    assert interaction.host_prompts == 1
+    host.run_host_command.reset_mock()
+    exchanged.reset_mock()
+    validator.side_effect = ValueError(f"Private installed {component} authority changed.")
+    if initial_selection:
+        # New application selection must preserve invalid authority, including an existing
+        # host session rule; select under the public Linux composition route.
+        native = linux.LinuxNativeBackend(record)
+        monkeypatch.setattr(selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr("loop.execution.sandbox.linux.LinuxNativeBackend", lambda: native)
+        selected = selection.select_sandbox_backend()
+        registry = ToolRegistry(
+            BUILTIN_TOOLS,
+            permission_manager=permissions,
+            execution_service=CommandExecutionService(selected, host),
+        )
+    result, problem = call(registry, "printf ordinary", cwd=str(tmp_path), interaction=interaction)
+    assert result is None
+    assert problem["code"] == ("sandbox.invalid" if initial_selection else "sandbox.stale")
+    assert "host_offer" not in problem.get("metadata", {})
+    assert "Private installed" not in problem["detail"]
+    assert interaction.host_prompts == 1
+    host.run_host_command.assert_not_called()
+    exchanged.assert_not_called()
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+def test_linux_public_timeout_retains_capture_or_reports_unknown_loss(
+    tmp_path, monkeypatch, delivered
+):
+    """Public timeout streams retain authenticated text or honestly report unavailable capture."""
+    from loop.execution.sandbox import SandboxRequest
+    from loop.execution.sandbox.linux import backend as linux
+
+    record = tmp_path / "management.json"
+    record.write_text("bound authority")
+    monkeypatch.setattr(linux, "execution_authority", MagicMock())
+    monkeypatch.setattr(linux, "runtime_read_roots", lambda: ())
+    monkeypatch.setattr(linux.LinuxNativeBackend, "managed_tool_root", lambda *_: False)
+
+    def exchange(_record, payload, _deadline):
+        """Return timeout output after native cleanup or a failed result-delivery budget."""
+        if not delivered:
+            raise TimeoutError("delivery expired")
+        request = SandboxRequest.from_wire(payload)
+        return CommandProcessResult(
+            SandboxOutcome.TIMED_OUT,
+            stdout="distinct-out",
+            stderr="distinct-err",
+            stdout_discarded=None,
+            stderr_discarded=None,
+            possible_effects=True,
+        ).to_wire(request.attempt_id)
+
+    monkeypatch.setattr(linux, "exchange_installed_request", exchange)
+    host = MagicMock()
+    interaction = RememberingHostInteraction()
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(linux.LinuxNativeBackend(record), host),
+    )
+    result, problem = call(registry, "printf ordinary", cwd=str(tmp_path), interaction=interaction)
+    assert result is None and problem["code"] == "sandbox.timed_out"
+    assert "host_offer" not in problem.get("metadata", {})
+    for stream, text in (("stdout", "distinct-out"), ("stderr", "distinct-err")):
+        capture = problem["metadata"][stream]
+        assert capture["content"] == (text if delivered else "")
+        assert capture["capture_complete"] is False
+        assert capture["discarded_characters"] is None
+    assert interaction.host_prompts == 0
+    host.run_host_command.assert_not_called()

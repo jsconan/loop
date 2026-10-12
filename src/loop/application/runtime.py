@@ -82,6 +82,8 @@ class ApplicationRuntime:
         configuration: ConfigurationManager,
         workspace_repository: WorkspaceRepository,
         interaction: Interaction,
+        *,
+        main_app: bool = False,
     ) -> ApplicationRuntime:
         """Build a runtime from initialized workspace and application-owned references.
 
@@ -93,6 +95,8 @@ class ApplicationRuntime:
             configuration (ConfigurationManager): Persistent configuration owner.
             workspace_repository (WorkspaceRepository): Owner of workspace registry operations.
             interaction (Interaction): User interaction service.
+            main_app (bool): Enable direct main-app terminal management decisions; False
+                (default) prevents library command dispatch from elevating.
 
         Returns:
             ApplicationRuntime: Fully composed active runtime.
@@ -200,6 +204,8 @@ class ApplicationRuntime:
                 compaction_threshold=settings.loop.compaction_threshold,
                 prompt_on_recoverable_error=settings.loop.prompt_on_recoverable_error,
                 max_agent_turns=settings.loop.max_agent_turns,
+                main_app=main_app,
+                refresh_sandbox_backend=getattr(execution_service, "refresh_backend", None),
             )
             runtime = cls(
                 loop,

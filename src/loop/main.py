@@ -104,6 +104,7 @@ def _build_runtime(
         configuration,
         repository,
         interaction,
+        main_app=True,
     )
 
 

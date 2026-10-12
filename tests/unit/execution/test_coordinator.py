@@ -137,7 +137,11 @@ def test_denied_initial_permission_starts_nothing_and_offers_nothing(tmp_path):
     )
 
     attempt = service.run_sandboxed(
-        request(tmp_path), "run_command", prelaunch_failure="startup probe failed"
+        request(tmp_path),
+        "run_command",
+        prelaunch_failure=CommandProcessResult(
+            SandboxOutcome.UNAVAILABLE, detail="startup probe failed"
+        ),
     )
 
     assert attempt.result is None and attempt.offer is None
@@ -155,7 +159,11 @@ def test_policy_denial_and_headless_mode_start_nothing(tmp_path):
     )
     assert (
         service.run_sandboxed(
-            request(tmp_path), "run_command", prelaunch_failure="startup probe failed"
+            request(tmp_path),
+            "run_command",
+            prelaunch_failure=CommandProcessResult(
+                SandboxOutcome.UNAVAILABLE, detail="startup probe failed"
+            ),
         ).offer
         is None
     )
@@ -470,7 +478,11 @@ def test_auto_approval_and_changed_root_start_none(tmp_path):
         tmp_path, failure, auto_approval=True
     )
     offer = automatic.run_sandboxed(
-        approved, "run_command", prelaunch_failure="launcher missing"
+        approved,
+        "run_command",
+        prelaunch_failure=CommandProcessResult(
+            SandboxOutcome.UNAVAILABLE, detail="launcher missing"
+        ),
     ).offer
     assert automatic.retry_host_command(offer, approved) is None
     automatic_backend.run.assert_not_called()
@@ -478,7 +490,11 @@ def test_auto_approval_and_changed_root_start_none(tmp_path):
 
     service, _, host, interaction = coordinator(tmp_path, failure)
     offer = service.run_sandboxed(
-        approved, "run_command", prelaunch_failure="launcher missing"
+        approved,
+        "run_command",
+        prelaunch_failure=CommandProcessResult(
+            SandboxOutcome.UNAVAILABLE, detail="launcher missing"
+        ),
     ).offer
     tmp_path.rename(tmp_path.with_name("old-workspace"))
     tmp_path.mkdir()

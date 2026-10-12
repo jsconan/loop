@@ -602,6 +602,33 @@ def test_public_regex_search_uses_qualified_native_runner(tmp_path, monkeypatch)
     assert backend.run_read_only_argv.call_count == 2
 
 
+def test_public_search_reports_native_integrity_failure(tmp_path, monkeypatch):
+    """A failed native authority check cannot turn into a successful Python search."""
+    source = tmp_path / "source.txt"
+    source.write_text("needle\n", encoding="utf-8")
+    executable = tmp_path / "rg"
+    executable.write_text("helper", encoding="utf-8")
+    backend = MagicMock()
+    backend.system_read_roots = (tmp_path,)
+    backend.run_read_only_argv.side_effect = RuntimeError("Native search authority is invalid.")
+    host = MagicMock()
+    monkeypatch.setattr("loop.execution.facade.ripgrep_path", lambda: str(executable))
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(backend, host),
+    )
+
+    result = json.loads(
+        registry.call("search_text", json.dumps({"path": str(source), "query": "needle"}))
+    )
+
+    assert result["problem"]["code"] == "filesystem.search_failed"
+    assert "result" not in result
+    backend.run_read_only_argv.assert_called_once()
+    host.run_host_command.assert_not_called()
+
+
 def test_search_text_supports_regex_case_globs_files_and_result_limits(tmp_path, monkeypatch):
     """Regex, explicit case, inclusive globs, file roots, and global limits compose safely."""
     selected = tmp_path / "selected.py"
