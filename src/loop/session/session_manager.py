@@ -592,14 +592,7 @@ class SessionManager:
             session = self._session_store.load(session)
         if not isinstance(session, Session):
             raise ValueError("Invalid session type.")  # noqa: TRY004 - public API contract.
-        if self._workspace_id is not None and session.workspace_id not in {
-            None,
-            self._workspace_id,
-        }:
-            raise SessionWorkspaceMismatchError(
-                f"Session '{session.id}' belongs to workspace '{session.workspace_id}', "
-                f"not '{self._workspace_id}'."
-            )
+        self._validate_session_workspace(session)
         if session.workspace_id is None:
             session.workspace_id = self._workspace_id
         cache_restorations = []
@@ -663,6 +656,37 @@ class SessionManager:
                         artifact.reloadable,
                     )
         self._session = session
+
+    def load_persisted_session(self, session_id: str) -> Session:
+        """Read a persisted session without changing the active session.
+
+        Args:
+            session_id (str): Identifier of the persisted session to load.
+
+        Returns:
+            Session: Reconstructed persisted session after workspace validation.
+
+        Raises:
+            SessionNotFoundError: If the requested session does not exist.
+            UnsupportedConversationItemError: If a serialized conversation item type is not
+                supported.
+            SessionWorkspaceMismatchError: If the session belongs to another workspace.
+            ValueError: If the persisted format is invalid or unsupported.
+        """
+        session = self._session_store.load(session_id)
+        self._validate_session_workspace(session)
+        return session
+
+    def _validate_session_workspace(self, session: Session) -> None:
+        """Reject a session owned by a different workspace."""
+        if self._workspace_id is not None and session.workspace_id not in {
+            None,
+            self._workspace_id,
+        }:
+            raise SessionWorkspaceMismatchError(
+                f"Session '{session.id}' belongs to workspace '{session.workspace_id}', "
+                f"not '{self._workspace_id}'."
+            )
 
     def new_session(self) -> None:
         """Replace the active session with a fresh unpersisted session."""

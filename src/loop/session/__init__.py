@@ -24,6 +24,7 @@ __all__ = [
     "SessionCommands",
     "SessionEvent",
     "SessionExecutionConflictError",
+    "SessionExportFormat",
     "SessionInfo",
     "SessionManager",
     "SessionNameGenerator",
@@ -39,12 +40,14 @@ __all__ = [
     "ToolExecutionStartedEvent",
     "ToolRecoveryStatus",
     "UnsupportedConversationItemError",
+    "export_session",
     "initial_session_name",
     "normalize_session_name",
     "validate_session_source",
 ]
 
 from .commands import SessionCommands
+from .exporter import SessionExportFormat, export_session
 from .models import (
     SESSION_NAME_SOURCE_GENERATED,
     SESSION_NAME_SOURCE_INITIAL,

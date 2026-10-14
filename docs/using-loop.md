@@ -56,11 +56,33 @@ If Loop finds history from an incomplete run at startup or during `/resume`, it 
 
 Common session commands:
 
-- `/sessions` lists session names, IDs, update times, and message counts.
-- `/session` or `/sessions show` shows details for the current session.
+- `/sessions` lists persisted session names, IDs, update times, and message counts; `/sessions export <id> [path]` exports that session without resuming it.
+- `/session` shows details for the current session; `/session export [path]` exports only that session. `/export` exports the current session; `/export <id> [path] [format]` selects a persisted session without resuming it. For an explicit destination on the active session, use `/export destination=<path>`.
 - `/resume` selects a saved session. Name completion keeps the session ID hidden.
 - `/new` starts a new, unpersisted session.
 - `/rename [name]` gives the current session a name that automatic naming will not replace. `/session rename [name]` is an alias.
+- If `path` is omitted, Loop creates `loop-session-<session-id>.md` in the current directory; long or filesystem-unsafe IDs use a stable hash in the filename. Use `format=archive` for a self-contained ZIP; the generated filename ends in `.zip`. If the destination already exists, Loop asks a yes-or-no question and defaults to no.
+
+Markdown exports include conversation messages, tool calls and results, reasoning summaries, and timeline markers. JSON tool results are pretty-printed in JSON code blocks; other results are preserved as text. Exports omit provider-private reasoning state and captured file contents. Archive exports preserve the serialized session and include verified referenced file snapshots. Treat both formats as sensitive because they may contain conversation text and tool data; archives may also contain captured context and provider state.
+
+Archive exports are records for inspection or external processing. Loop does not currently import an archive back into its session store.
+
+Examples:
+
+```text
+/session export
+/session export format=archive
+/session export ./session.md
+/session export ./session.zip format=archive
+/export
+/export format=archive
+/export destination=./session.md
+/export <session-id>
+/export <session-id> ./saved-session.md archive
+/export <session-id> destination=./saved-session.zip format=archive
+/sessions export <session-id>
+/sessions export <session-id> ./saved-session.md format=archive
+```
 
 Other useful commands: `/use` loads a skill for later requests; `/tools` lists tools or `/tools call <tool> [arguments]` invokes one; `/skills` shows active and discoverable skills; `/call <tool> [arguments]` invokes a tool directly; `/check` checks backend and model availability. Use `/help` for command help, and `/exit` or `/quit` to stop Loop.
 

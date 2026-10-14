@@ -466,6 +466,42 @@ def test_manager_rejects_sessions_owned_by_another_workspace():
     assert manager.session is original
 
 
+def test_manager_reads_a_persisted_session_without_activating_it():
+    """Persisted-session reads validate workspace ownership and leave active state untouched."""
+    store = Mock(spec=SessionStore)
+    active = Session(id="active-id", workspace_id="workspace")
+    persisted = Session(id="stored-id", workspace_id="workspace")
+    store.load.return_value = persisted
+    manager = SessionManager(
+        session=active,
+        session_store=store,
+        workspace_id="workspace",
+    )
+
+    loaded = manager.load_persisted_session("stored-id")
+
+    assert loaded is persisted
+    assert manager.session is active
+    store.load.assert_called_once_with("stored-id")
+
+
+def test_manager_rejects_a_persisted_session_from_another_workspace():
+    """Persisted-session reads reject cross-workspace data without changing active state."""
+    store = Mock(spec=SessionStore)
+    active = Session(id="active-id", workspace_id="workspace")
+    store.load.return_value = Session(id="stored-id", workspace_id="another-workspace")
+    manager = SessionManager(
+        session=active,
+        session_store=store,
+        workspace_id="workspace",
+    )
+
+    with pytest.raises(SessionWorkspaceMismatchError, match="belongs to workspace"):
+        manager.load_persisted_session("stored-id")
+
+    assert manager.session is active
+
+
 def test_manager_replaces_the_active_session_when_loading():
     """Explicit loading replaces the active session with the stored snapshot."""
     store = Mock(spec=SessionStore)
