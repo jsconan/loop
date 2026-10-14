@@ -190,7 +190,7 @@ def test_native_literal_search_binds_selected_fds_unicode_context_and_case(tmp_p
     def run(arguments, descriptors, deadline):
         """Return ripgrep-shaped events for the selected live descriptor."""
         invocations.append((arguments, descriptors, deadline))
-        selected = f"/dev/fd/{descriptors[0]:05d}"
+        selected = f"/dev/fd/{descriptors[0]}"
         events = [
             {"type": "begin", "data": {"path": {"text": selected}}},
             {
@@ -271,7 +271,7 @@ def test_native_literal_search_falls_back_and_reports_output_limits(tmp_path):
 
     def run(_arguments, descriptors, _deadline):
         """Return one valid match followed by a bounded partial event."""
-        selected = f"/dev/fd/{descriptors[0]:05d}"
+        selected = f"/dev/fd/{descriptors[0]}"
         match = {
             "type": "match",
             "data": {
@@ -303,7 +303,7 @@ def test_native_literal_search_omits_empty_context_and_bounds_result_count(tmp_p
 
     def run(_arguments, descriptors, _deadline):
         """Return two selected-file matches without neighboring context events."""
-        selected = f"/dev/fd/{descriptors[0]:05d}"
+        selected = f"/dev/fd/{descriptors[0]}"
         events = [
             {
                 "type": "match",
@@ -345,7 +345,7 @@ def test_native_literal_search_fails_safe_on_unusable_results(tmp_path, outcome)
             return ProcessCapture(ProcessCaptureStatus.COMPLETED, exit_code=1)
         if outcome == "timeout":
             return ProcessCapture(ProcessCaptureStatus.TIMED_OUT)
-        selected = f"/dev/fd/{descriptors[0]:05d}"
+        selected = f"/dev/fd/{descriptors[0]}"
         event = {
             "type": "match",
             "data": {

@@ -250,7 +250,7 @@ def _search_native(
             )
             if context_lines:
                 arguments.extend(("--context", str(context_lines)))
-            arguments.extend(("--regexp", query, "--", *(f"/dev/fd/{fd:05d}" for fd in selected)))
+            arguments.extend(("--regexp", query, "--", *(f"/dev/fd/{fd}" for fd in selected)))
             capture = runner(tuple(arguments), tuple(selected), deadline)
             if capture is None:
                 return None

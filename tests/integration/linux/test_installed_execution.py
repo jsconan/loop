@@ -1779,7 +1779,7 @@ print(label)
         """Launch a protected system Python through the selected-descriptor native owner."""
         fd = descriptors[index]
         return backend.run_read_only_argv(
-            executable, ("-I", "-c", code, f"/dev/fd/{fd:05d}"), (fd,), time.monotonic() + 15
+            executable, ("-I", "-c", code, f"/dev/fd/{fd}"), (fd,), time.monotonic() + 15
         )
 
     def ready(index, future):

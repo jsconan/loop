@@ -367,7 +367,7 @@ class LinuxNativeBackend:
                         for fd in descriptors
                     )
                     or arguments[-len(descriptors) :]
-                    != tuple(f"/dev/fd/{fd:05d}" for fd in descriptors)
+                    != tuple(f"/dev/fd/{fd}" for fd in descriptors)
                 )
             ):
                 return None

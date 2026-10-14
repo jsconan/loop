@@ -206,11 +206,11 @@ def test_search_preserves_selected_snapshot_and_typed_outcome(selected, monkeypa
     if outcome in {SandboxOutcome.INVALID, SandboxOutcome.STALE}:
         with pytest.raises(RuntimeError, match="Native search authority"):
             backend.run_read_only_argv(
-                executable, ("--json", f"/dev/fd/{descriptor:05d}"), (descriptor,), 20
+                executable, ("--json", f"/dev/fd/{descriptor}"), (descriptor,), 20
             )
     else:
         result = backend.run_read_only_argv(
-            executable, ("--json", f"/dev/fd/{descriptor:05d}"), (descriptor,), 20
+            executable, ("--json", f"/dev/fd/{descriptor}"), (descriptor,), 20
         )
         if outcome is SandboxOutcome.UNAVAILABLE:
             assert result is None
@@ -240,7 +240,7 @@ def test_search_reuses_exact_policy_with_disjoint_selected_backing(selected, mon
     for _ in range(2):
         assert (
             backend.run_read_only_argv(
-                executable, (f"/dev/fd/{descriptor:05d}",), (descriptor,), 20
+                executable, (f"/dev/fd/{descriptor}",), (descriptor,), 20
             ).exit_code
             == 0
         )
@@ -273,7 +273,7 @@ def test_search_refuses_unsafe_inputs_or_prelaunch_failure(selected, monkeypatch
     """Unsafe descriptor authority and bounded preparation failures never expose host content."""
     backend, executable, descriptor, _source = selected
     descriptors = (descriptor,)
-    arguments = (f"/dev/fd/{descriptor:05d}",)
+    arguments = (f"/dev/fd/{descriptor}",)
     deadline = 10 if failure == "expired" else 20
     if failure == "untrusted":
         monkeypatch.setattr(backend, "managed_tool_root", lambda root: False)
