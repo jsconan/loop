@@ -14,6 +14,17 @@ from loop.execution.sandbox.linux import runtime as linux_runtime
 from .helpers import publish
 
 
+@pytest.fixture(autouse=True)
+def runtime_revision(installation):
+    """Include current native namespace semantics in each isolated retained installation."""
+    record, arguments = installation
+    path = record.parent / "loop/execution/sandbox/linux/constants.py"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(Path(linux_runtime.__file__).with_name("constants.py").read_bytes())
+    path.chmod(0o444)
+    arguments[-1]["loop/execution/sandbox/linux/constants.py"] = linux_host.bind_host_file(path)
+
+
 @pytest.mark.parametrize("change", [None, "receipt", "record"])
 def test_installed_admission_checks_original_receipt_and_late_record(
     installation, monkeypatch, change
@@ -115,7 +126,7 @@ def test_installed_transport_refuses_deadline_expiring_after_record_check(
         clock[0] = deadline
 
     authority = Mock(open_verified=Mock(side_effect=verified))
-    owner = SimpleNamespace(config=arguments[0], files=arguments[1])
+    owner = SimpleNamespace(config=arguments[0], files=arguments[1], artifacts=arguments[-1])
     receipt = {**arguments[1], "receipt": authority}
     monkeypatch.setattr(linux_runtime, "read_generation", Mock(return_value=(owner, authority)))
     monkeypatch.setattr(linux_runtime, "installation_files", Mock(return_value=receipt))
@@ -126,6 +137,40 @@ def test_installed_transport_refuses_deadline_expiring_after_record_check(
         linux_runtime.exchange_installed_request(record, b"opaque request", 50)
     exchange.assert_called_once()
     authority.open_verified.assert_called_once_with(deadline=55)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_installed_authority_refuses_incompatible_namespace_revision(
+    installation, monkeypatch, missing
+):
+    """A package upgrade cannot send new namespace semantics to an older retained receiver."""
+    record, arguments = installation
+    name = "loop/execution/sandbox/linux/constants.py"
+    if missing:
+        path = arguments[-1][name].path
+        path.unlink()
+        for parent in path.parents:
+            if parent == record.parent:
+                break
+            parent.rmdir()
+        del arguments[-1][name]
+    else:
+        path = arguments[-1][name].path
+        path.chmod(0o644)
+        path.write_bytes(b"old native revision")
+        path.chmod(0o444)
+        arguments[-1][name] = linux_host.bind_host_file(path)
+    publish(installation)
+    monkeypatch.setattr(linux_runtime.time, "monotonic", lambda: 10)
+    transport = Mock()
+    monkeypatch.setattr(linux_runtime, "exchange_request", transport)
+    for operation in (
+        lambda: linux_runtime.execution_authority(record),
+        lambda: linux_runtime.exchange_installed_request(record, b"request", 50),
+    ):
+        with pytest.raises(ValueError, match="runtime revision changed"):
+            operation()
+    transport.assert_not_called()
 
 
 @pytest.fixture
@@ -154,7 +199,11 @@ def execution(installation, monkeypatch):
     for name in ("getuid", "geteuid", "getgid", "getegid"):
         monkeypatch.setattr(linux_runtime.os, name, lambda: 1000)
     request = Mock(
-        deadline=50, attempt_id="11111111-1111-4111-8111-111111111111", environment=(), aliases=()
+        deadline=50,
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        environment=(),
+        aliases=(),
+        policy_version=linux_runtime.NATIVE_POLICY_VERSION,
     )
     request.shell_environment.return_value = {"TMPDIR": "/tmp/private"}
     request.paths_are_current.return_value = True
@@ -178,6 +227,8 @@ def execution(installation, monkeypatch):
         "namespace_arguments",
         Mock(return_value=nullcontext((("--unshare-pid",), (77,)))),
     )
+    monkeypatch.setattr(linux_runtime, "runtime_read_roots", Mock(return_value=(Path("/usr"),)))
+    monkeypatch.setattr(linux_runtime, "payload_profile", Mock(return_value="payload_profile"))
     monkeypatch.setattr(linux_runtime, "compile_payload", Mock(return_value=b"compiled"))
     monkeypatch.setattr(linux_runtime.time, "monotonic", lambda: 10)
     original_open, original_close = os.open, os.close
@@ -220,6 +271,7 @@ def execution(installation, monkeypatch):
     [
         None,
         "caller",
+        "revision",
         "scratch",
         "cache",
         "mask",
@@ -251,6 +303,8 @@ def test_execute_installed_request_authenticates_launch_and_result(execution, mo
     state = execution
     if change == "caller":
         monkeypatch.setattr(linux_runtime.os, "geteuid", lambda: 0)
+    elif change == "revision":
+        state.request.policy_version = "linux-native-unsupported"
     elif change == "scratch":
         state.request.shell_environment.return_value = {}
     elif change in {"cache", "mask", "entry", "bootstrap", "nonempty"}:
@@ -322,6 +376,7 @@ def test_execute_installed_request_authenticates_launch_and_result(execution, mo
         )
     failures = {
         "caller",
+        "revision",
         "scratch",
         "cache",
         "mask",
@@ -372,6 +427,33 @@ def test_execute_installed_request_authenticates_launch_and_result(execution, mo
         state.supervisor.assert_called_once_with(
             state.launch.return_value, state.arguments[0], 50, connection=0
         )
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_execute_installed_request_restores_alias_output_with_bounded_capture(execution, unknown):
+    """Preserve original alias spellings, numeric suffixes and loss metadata in both streams."""
+    from dataclasses import replace
+
+    state = execution
+    state.request.aliases = tuple(
+        (f"/root{index}", Path(f"/tmp/host/r{index}"), Path("/work")) for index in range(11)
+    )
+    text = "/.loop-private-paths/r10/file /.loop-private-paths/r1/file /.loop-private-paths"
+    state.supervisor.return_value = replace(
+        state.capture,
+        stdout="LOOP_PAYLOAD_" + state.request.attempt_id + "\n" + text,
+        stderr=text + "x" * 1_000_000,
+        stderr_discarded=None if unknown else 3,
+    )
+    result = linux_runtime.execute_installed_request(state.record, b"snapshot")
+    assert result.stdout == "/tmp/host/r10/file /tmp/host/r1/file /tmp/host"
+    assert result.stderr.startswith(result.stdout)
+    assert len(result.stderr) == 1_000_000
+    assert (
+        result.stderr_discarded is None
+        if unknown
+        else result.stderr_discarded == 3 + len(result.stdout)
+    )
 
 
 def test_execute_installed_request_returns_typed_path_preparation_refusal(execution):

@@ -20,12 +20,16 @@ _MAX_SETUP_CONTENT_FILES = 256
 _MAX_SETUP_ERROR_COUNT = 16
 _MAX_SETUP_ERROR_CHARS = 160
 _INITIAL_USER_NAMESPACE_UID_MAP = ("0", "0", "4294967295")
+_PROC_UID_MAP_PATH = Path("/proc/self/uid_map")
+_SYSTEM_RUNTIME_DIRECTORY = "/run"
+_PRIVATE_TEMP_DIRECTORY_MODE = 0o700
+_OWNER_READ_ONLY_FILE_MODE = 0o400
 
 
 def _validate_invocation() -> tuple[str, str, str, str, str, str, str]:
     """Require initial-host root authority and the fixed reviewed setup arguments."""
     if os.getuid() != 0 or (
-        tuple(Path("/proc/self/uid_map").read_text(encoding="ascii").split())
+        tuple(_PROC_UID_MAP_PATH.read_text(encoding="ascii").split())
         != _INITIAL_USER_NAMESPACE_UID_MAP
     ):
         raise PermissionError("Setup requires initial-host administrator authentication.")
@@ -94,14 +98,16 @@ def _invoke_reviewed_setup(
     contents: dict[str, bytes], runtime_names: list[str], arguments: tuple[str, ...]
 ) -> None:
     """Materialize the authenticated imports privately and invoke the fixed setup owner."""
-    with tempfile.TemporaryDirectory(prefix="loop-native-authenticated-", dir="/run") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix="loop-native-authenticated-", dir=_SYSTEM_RUNTIME_DIRECTORY
+    ) as temporary:
         root = Path(temporary)
         for name, value in contents.items():
             target = root / name
-            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            target.parent.mkdir(mode=_PRIVATE_TEMP_DIRECTORY_MODE, parents=True, exist_ok=True)
             with target.open("xb") as stream:
                 stream.write(value)
-                os.fchmod(stream.fileno(), 0o400)
+                os.fchmod(stream.fileno(), _OWNER_READ_ONLY_FILE_MODE)
         sys.path.insert(0, str(root))
 
         from loop.execution.sandbox.linux.setup import install_reviewed

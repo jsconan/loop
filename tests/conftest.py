@@ -109,7 +109,7 @@ def tmp_path(monkeypatch):
     parent = "/var/tmp" if Path(tempfile.gettempdir()).resolve() == Path("/tmp") else None
     with tempfile.TemporaryDirectory(prefix="loop-test-", dir=parent) as directory:
         workspace = Path(directory).resolve() / "workspace"
-        workspace.mkdir()
+        workspace.mkdir(mode=0o700)
         yield workspace
         monkeypatch.undo()
 
@@ -121,9 +121,9 @@ def isolated_environment(monkeypatch, tmp_path):
     home = root / "home"
     temporary = root / "temporary"
     working = root / "cwd"
-    working.mkdir()
-    home.mkdir()
-    temporary.mkdir()
+    working.mkdir(mode=0o700)
+    home.mkdir(mode=0o700)
+    temporary.mkdir(mode=0o700)
     for name in tuple(os.environ):
         monkeypatch.delenv(name, raising=False)
     for name, value in {
@@ -169,10 +169,12 @@ def native_directory(isolated_environment):
     """Own exact disposable directories on a native filesystem while retaining output guards."""
     directories = []
 
-    def create(parent):
+    def create(parent, *, name=None):
         """Register one fresh canonical child before creation and retain it through cleanup."""
         parent = Path(parent).resolve(strict=True)
-        path = parent / ("loop-native-test-" + uuid4().hex)
+        child_name = name or "loop-native-test-" + uuid4().hex
+        assert Path(child_name).name == child_name and child_name not in {".", ".."}
+        path = parent / child_name
         assert not path.exists() and not path.is_symlink()
         _NATIVE_OUTPUT_ROOTS.append(str(path))
         path.mkdir(mode=0o700)
@@ -181,7 +183,8 @@ def native_directory(isolated_environment):
 
     yield create
     for path in reversed(directories):
-        shutil.rmtree(path)
+        if path.exists() or path.is_symlink():
+            shutil.rmtree(path)
         _NATIVE_OUTPUT_ROOTS.remove(str(path))
 
 

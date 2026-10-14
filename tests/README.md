@@ -45,6 +45,29 @@ PYTHONDONTWRITEBYTECODE=1 uv run --no-sync pytest tests/integration -m e2e
 
 To reject unexpected Python warnings during verification, add `-W error` to a pytest command. Tests that exercise expected warnings, logged errors or exceptions must capture and assert the specific diagnostic using `pytest.warns`, `caplog` or `pytest.raises`. Do not suppress diagnostics to make a failing test pass.
 
+## Native Linux test setup
+
+Use a disposable test environment and a sandbox installation matching the package under test. Native checks must use fake data, without production credentials or external services. Missing prerequisites cause skips and do not establish enforcement.
+
+| Variable | Required setup |
+| --- | --- |
+| `LOOP_NATIVE_BWRAP` | Explicitly selected, root-protected Bubblewrap helper for `linux/test_namespace.py`. |
+| `LOOP_NATIVE_RUNTIME_FIXTURE` | Administrator-provisioned, root-owned, read-only fake-data directory under `/usr/local/share/`, named `loop-native-private-fixture-*`. |
+| `LOOP_NATIVE_SOCKET_ALIAS_DIRECTORY` | Directory owned by the test user, with mode `0700`, on the sandbox listener’s filesystem for socket-alias checks. |
+
+The runtime fixture must contain the following synthetic data. Provision it with explicit administrator authentication, and remove only that owned fixture after testing. The tests neither create nor modify it and request no extra read grant, so the runtime sandbox must enforce the private-file restrictions.
+
+| Entry | Contents |
+| --- | --- |
+| Marker file `marker` | `Loop private-runtime qualification fixture v1` followed by a newline. |
+| `.ssh/key`, `nested/.AWS/key`, `.config/key`, `.loop/key`, `Library/key` | `private-runtime-canary` |
+| Executable `.ssh/probe` | Script printing `private-runtime-canary`. |
+| `neighbor` | `ordinary-runtime-canary` |
+
+The capacity case in `linux/test_installed_execution.py` requires `LOOP_NATIVE_CAPACITY_TEST=disposable-linux-host` and an installation with unused profile slots. It fills every available slot, checks refusal at the ceiling, and verifies reuse of existing profiles. Refresh the installation before further native testing.
+
+Run `linux/test_management_lifecycle.py` separately with `pytest -s`, in a real terminal on a disposable Linux VM. Set `LOOP_NATIVE_MANAGEMENT_TEST=disposable-linux-host` and `LOOP_NATIVE_MANAGEMENT_WHEEL` to the wheel being tested. This test requires fresh consent and administrator authentication. It exercises installation, removal, live-child protection, concurrent admission, partial-state recovery, and uninstall after package removal. Keep the wheel and output directory outside the repository.
+
 ## Isolation
 
 Each case receives a fresh workspace, working directory, home, temporary directory, application storage roots and content cache. Environment variables, cache metadata, permission-manager lifecycle state and telemetry are scoped and restored. Construct mutable agents and other collaborators inside test fixtures rather than at collection time.

@@ -17,10 +17,19 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .... import constants
 from ....constants import MAX_NATIVE_POLICY_MODE_BYTES, MAX_NATIVE_PROFILE_NAME_BYTES
-from ....utils.hashing import sha256_digest
+from ....utils.virtual_path import VirtualPath
+from ..constants import TMPDIR_ENVIRONMENT_VARIABLE
+from .constants import (
+    NATIVE_PAYLOAD_MARKER_PREFIX,
+    NATIVE_SCRATCH_PATH,
+    PROC_STATUS_PATH,
+    PROC_UID_MAP_PATH,
+)
 from .host import MAX_COMPILED_BYTES, HostFile, read_policy_bytes
 from .installation import MAX_RETAINED_BYTES, generation_limits
+from .paths import payload_aliases
 
 if TYPE_CHECKING:
     from ..contracts import SandboxRequest
@@ -38,18 +47,28 @@ _PR_CAP_AMBIENT_CLEAR_ALL = 4
 _PR_SET_NO_NEW_PRIVS = 38
 
 
-def payload_profile(request: SandboxRequest) -> str:
-    """Bind a cached profile to concrete runtime authority, including private scratch spellings.
-
-    Args:
-        request (SandboxRequest): Original current authorized command request.
-
-    Returns:
-        str: Simple payload profile name binding all concrete generated paths.
-    """
-    return "payload_" + sha256_digest(
-        repr((request.host_command_runtime_signature(), request.environment, request.aliases))
-    )
+def _payload_environment(request: SandboxRequest) -> dict[str, str]:
+    """Map generated host scratch paths to the request-private namespace spelling."""
+    environment = request.shell_environment()
+    scratch_value = environment.get(TMPDIR_ENVIRONMENT_VARIABLE)
+    if scratch_value is None:
+        if request.generated_environment:
+            raise ValueError("Generated scratch environment has no TMPDIR.")
+        return environment
+    host_scratch = Path(scratch_value)
+    for name in dict.fromkeys((TMPDIR_ENVIRONMENT_VARIABLE, *request.generated_environment)):
+        value = environment.get(name)
+        if value is None:
+            raise ValueError("Generated scratch environment is incomplete.")
+        path = Path(value)
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("Generated scratch environment path is unsafe.")
+        try:
+            relative = path.relative_to(host_scratch)
+        except ValueError as error:
+            raise ValueError("Generated environment escaped private scratch.") from error
+        environment[name] = str(NATIVE_SCRATCH_PATH / relative)
+    return environment
 
 
 class CapabilityHeader(ctypes.Structure):
@@ -71,7 +90,7 @@ class CapabilityWord(ctypes.Structure):
 def _status() -> dict[str, int]:
     """Require all capability sets and NoNewPrivs from the current process status."""
     fields = {}
-    for line in Path("/proc/self/status").read_text(encoding="ascii").splitlines():
+    for line in PROC_STATUS_PATH.read_text(encoding="ascii").splitlines():
         key, _, value = line.partition(":")
         if key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs"):
             if key in fields:
@@ -134,7 +153,7 @@ def enter_bootstrap(
         OSError: Native library authority, required API or profile transition fails.
     """
     _transition_identity("payload", namespace, host_uid, namespace_level)
-    if os.getuid() != 0 or Path("/proc/self/uid_map").read_text(encoding="ascii").split() != [
+    if os.getuid() != 0 or PROC_UID_MAP_PATH.read_text(encoding="ascii").split() != [
         "0",
         str(host_uid),
         "1",
@@ -163,8 +182,7 @@ def _require_bootstrap(profile: str, namespace: str, host_uid: int, namespace_le
     security = Path("/sys/kernel/security/apparmor")
     if (
         os.getuid() != 0
-        or Path("/proc/self/uid_map").read_text(encoding="ascii").split()
-        != ["0", str(host_uid), "1"]
+        or PROC_UID_MAP_PATH.read_text(encoding="ascii").split() != ["0", str(host_uid), "1"]
         or Path("/proc/self/attr/current").read_text(encoding="ascii").strip()
         != "bootstrap (enforce)"
         or (security / ".ns_name").read_text(encoding="ascii").strip() != namespace
@@ -174,7 +192,8 @@ def _require_bootstrap(profile: str, namespace: str, host_uid: int, namespace_le
         raise ValueError("Unverified bootstrap confinement.")
 
     before = _status()
-    setup_caps = (1 << 33) | (1 << 8)  # MAC_ADMIN and SETPCAP, in this user namespace only.
+    # MAC_ADMIN and SETPCAP, in this user namespace only.
+    setup_caps = (1 << _CAP_MAC_ADMIN) | (1 << _CAP_SETPCAP)
     if (
         before["NoNewPrivs"] != 1
         or before["CapEff"] != setup_caps
@@ -293,7 +312,7 @@ def load_cached_payload(
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or metadata.st_mode & 0o222
+            or metadata.st_mode & constants.WRITE_MODE_MASK
             or metadata.st_size != len(namespace) + 1
             or os.read(descriptor, MAX_NATIVE_PROFILE_NAME_BYTES + 1)
             != (namespace + "\n").encode("ascii")
@@ -460,7 +479,7 @@ def activate_payload(
         OSError: Native authentication, admission, descriptor closure or transition fails.
     """
     security = _require_bootstrap(profile, namespace, host_uid, namespace_level)
-    if bootstrap.identity[4] > MAX_COMPILED_BYTES or lock.identity[2] & 0o222:
+    if bootstrap.identity[4] > MAX_COMPILED_BYTES or lock.identity[2] & constants.WRITE_MODE_MASK:
         raise ValueError("Invalid installed bootstrap authority.")
 
     with bootstrap.open_verified() as descriptor:
@@ -512,6 +531,7 @@ def execute_payload(
     bootstrap: HostFile,
     lock: HostFile,
     compiled_policy: bytes,
+    profile: str,
     namespace: str,
     host_uid: int,
     *,
@@ -534,6 +554,7 @@ def execute_payload(
         bootstrap (HostFile): Original compiled enforcing bootstrap authority.
         lock (HostFile): Original immutable shared cache lock.
         compiled_policy (bytes): Strict compilation for this request's derived runtime profile.
+        profile (str): Parent-derived identity of the exact canonical policy source.
         namespace (str): Original generation namespace identity.
         host_uid (int): Original ordinary host UID mapped alone to namespace zero.
         reservation (HostFile): Original installation-wide generation capacity authority.
@@ -551,9 +572,11 @@ def execute_payload(
     if not request.paths_are_current() or Path.cwd() != request.cwd:
         raise ValueError("Payload execution paths or cwd changed.")
 
-    profile = payload_profile(request)
-    environment = request.shell_environment()
-    source = request.execution_source
+    environment = _payload_environment(request)
+    source = VirtualPath.translate_shell_source(
+        request.execution_source,
+        {str(host): native for host, native, _ in payload_aliases(request)},
+    )
     activate_payload(
         apparmor,
         bootstrap,
@@ -577,7 +600,7 @@ def execute_payload(
             "-c",
             'printf "%s\\n" "$1" && exec /bin/sh -c "$2"',
             "loop-payload",
-            "LOOP_PAYLOAD_" + request.attempt_id,
+            NATIVE_PAYLOAD_MARKER_PREFIX + request.attempt_id,
             source,
         ],
         environment,

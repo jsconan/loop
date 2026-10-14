@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import pytest
 
 from loop.execution.sandbox.linux import bootstrap as linux_bootstrap
+from loop.execution.sandbox.linux.constants import NATIVE_SCRATCH_PATH
 
 
 @pytest.fixture
@@ -843,6 +844,7 @@ def test_execute_payload_requires_activation_and_original_deadline(monkeypatch, 
         aliases=(),
         file_creation_mask=0o027,
         attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+        generated_environment=(),
     )
     request.paths_are_current.return_value = failure != "stale"
     request.host_command_runtime_signature.return_value = "signature"
@@ -874,6 +876,7 @@ def test_execute_payload_requires_activation_and_original_deadline(monkeypatch, 
             "bootstrap",
             "lock",
             b"compiled",
+            "payload_profile",
             "generation",
             1000,
             reservation="budget",
@@ -885,7 +888,7 @@ def test_execute_payload_requires_activation_and_original_deadline(monkeypatch, 
             "library",
             "bootstrap",
             "lock",
-            linux_bootstrap.payload_profile(request),
+            "payload_profile",
             b"compiled",
             "generation",
             1000,
@@ -909,3 +912,104 @@ def test_execute_payload_requires_activation_and_original_deadline(monkeypatch, 
     else:
         file_mask.assert_not_called()
         replacement.assert_not_called()
+
+
+def test_execute_payload_translates_only_bound_virtual_aliases(monkeypatch):
+    """Preserve opaque quoting while selecting the request-local alias after host validation."""
+    request = Mock(
+        deadline=20,
+        cwd=Path("/work"),
+        execution_source="cat '/tmp/bound/r0/file'; printf '%s' /tmp/bound/r0-other",
+        aliases=(("/workspace", Path("/tmp/bound/r0"), Path("/work")),),
+        generated_environment=(),
+        file_creation_mask=0o022,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+    )
+    request.shell_environment.return_value = {"PATH": "/usr/bin:/bin"}
+    monkeypatch.setattr(Path, "cwd", lambda: request.cwd)
+    monkeypatch.setattr(linux_bootstrap.time, "monotonic", lambda: 10)
+    monkeypatch.setattr(linux_bootstrap, "activate_payload", Mock())
+    monkeypatch.setattr(linux_bootstrap.os, "umask", Mock())
+    replacement = Mock()
+    monkeypatch.setattr(linux_bootstrap.os, "execve", replacement)
+    with pytest.raises(RuntimeError, match="replacement unexpectedly returned"):
+        linux_bootstrap.execute_payload(
+            request,
+            "library",
+            "bootstrap",
+            "lock",
+            b"compiled",
+            "payload",
+            "generation",
+            1000,
+            reservation="budget",
+        )
+    assert (
+        replacement.call_args.args[1][-1]
+        == "cat '/.loop-private-paths/r0/file'; printf '%s' /tmp/bound/r0-other"
+    )
+
+
+def test_payload_environment_maps_generated_paths_to_namespace_scratch():
+    """All generated paths stay inside the request's unique namespace scratch mount."""
+    request = Mock(
+        generated_environment=("TMPDIR", "XDG_CACHE_HOME", "COVERAGE_FILE"),
+        shell_environment=Mock(
+            return_value={
+                "PATH": "/usr/bin:/bin",
+                "TMPDIR": "/tmp/loop-scratch-one",
+                "XDG_CACHE_HOME": "/tmp/loop-scratch-one/cache",
+                "COVERAGE_FILE": "/tmp/loop-scratch-one/.coverage",
+            }
+        ),
+    )
+
+    result = linux_bootstrap._payload_environment(request)
+
+    assert result == {
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": str(NATIVE_SCRATCH_PATH),
+        "XDG_CACHE_HOME": str(NATIVE_SCRATCH_PATH / "cache"),
+        "COVERAGE_FILE": str(NATIVE_SCRATCH_PATH / ".coverage"),
+    }
+
+
+def test_payload_environment_maps_direct_request_tmpdir():
+    """Direct Linux requests also receive only their private namespace scratch spelling."""
+    request = Mock(
+        generated_environment=(),
+        shell_environment=Mock(return_value={"PATH": "/usr/bin:/bin", "TMPDIR": "/tmp/direct"}),
+    )
+
+    assert linux_bootstrap._payload_environment(request) == {
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": str(NATIVE_SCRATCH_PATH),
+    }
+
+
+@pytest.mark.parametrize(
+    ("environment", "generated", "message"),
+    [
+        ({"COVERAGE_FILE": "/tmp/scratch/.coverage"}, ("COVERAGE_FILE",), "no TMPDIR"),
+        ({"TMPDIR": "/tmp/scratch"}, ("TMPDIR", "XDG_CACHE_HOME"), "incomplete"),
+        ({"TMPDIR": "/tmp/scratch", "COVERAGE_FILE": "relative"}, ("COVERAGE_FILE",), "unsafe"),
+        (
+            {"TMPDIR": "/tmp/scratch", "COVERAGE_FILE": "/tmp/scratch/../outside"},
+            ("COVERAGE_FILE",),
+            "unsafe",
+        ),
+        (
+            {"TMPDIR": "/tmp/scratch", "COVERAGE_FILE": "/tmp/other/.coverage"},
+            ("COVERAGE_FILE",),
+            "escaped",
+        ),
+    ],
+)
+def test_payload_environment_refuses_invalid_generated_paths(environment, generated, message):
+    """Malformed generated scratch values cannot point outside the private bind."""
+    request = Mock(
+        generated_environment=generated, shell_environment=Mock(return_value=environment)
+    )
+
+    with pytest.raises(ValueError, match=message):
+        linux_bootstrap._payload_environment(request)

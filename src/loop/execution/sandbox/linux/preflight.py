@@ -11,7 +11,23 @@ from contextlib import ExitStack
 
 from ....constants import NATIVE_MANAGEMENT_TIMEOUT_SECONDS
 from ....utils.process import ProcessCaptureStatus, supervise_process
-from .constants import SYSTEM_COMMAND_PATH, SYSTEM_LOCALE, SYSTEMCTL_PATH
+from ..constants import (
+    LC_ALL_ENVIRONMENT_VARIABLE,
+    PATH_ENVIRONMENT_VARIABLE,
+    SYSTEM_LOCALE,
+)
+from .constants import (
+    SYSTEM_COMMAND_PATH,
+    SYSTEMCTL_PATH,
+    SYSTEMD_COLORS_ENVIRONMENT_VARIABLE,
+    SYSTEMD_DROP_IN_PATHS_PROPERTY,
+    SYSTEMD_FRAGMENT_PATH_PROPERTY,
+    SYSTEMD_LOAD_STATE_PROPERTY,
+    SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY,
+    SYSTEMD_PAGER_ENVIRONMENT_VARIABLE,
+    SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+    SYSTEMD_TRANSIENT_PROPERTY,
+)
 from .host import HostFile, bind_host_file
 
 _MAX_PREFLIGHT_STDOUT_BYTES = 65_536
@@ -29,10 +45,10 @@ def _run(argv: list[str], deadline: float):
         text=True,
         cwd="/",
         env={
-            "PATH": SYSTEM_COMMAND_PATH,
-            "LC_ALL": SYSTEM_LOCALE,
-            "SYSTEMD_PAGER": "",
-            "SYSTEMD_COLORS": "0",
+            PATH_ENVIRONMENT_VARIABLE: SYSTEM_COMMAND_PATH,
+            LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+            SYSTEMD_PAGER_ENVIRONMENT_VARIABLE: "",
+            SYSTEMD_COLORS_ENVIRONMENT_VARIABLE: "0",
         },
         close_fds=True,
         start_new_session=True,
@@ -100,7 +116,7 @@ def attest_units(
             name = candidates[0]
             fragment = name
             if kind == "service" and "@" in name:
-                fragment = name.split("@", 1)[0] + "@.service"
+                fragment = name.split("@", 1)[0] + SYSTEMD_SERVICE_TEMPLATE_SUFFIX
             if (
                 re.fullmatch(r"[A-Za-z][A-Za-z0-9_@.-]{0,191}", name) is None
                 or bound.path.name != fragment
@@ -118,11 +134,11 @@ def attest_units(
                 raise ValueError("Incomplete fixed unit enforcement expectations.")
             invariant = {
                 "Id": name,
-                "LoadState": "loaded",
-                "FragmentPath": str(bound.path),
-                "DropInPaths": "",
-                "NeedDaemonReload": "no",
-                "Transient": "no",
+                SYSTEMD_LOAD_STATE_PROPERTY: "loaded",
+                SYSTEMD_FRAGMENT_PATH_PROPERTY: str(bound.path),
+                SYSTEMD_DROP_IN_PATHS_PROPERTY: "",
+                SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY: "no",
+                SYSTEMD_TRANSIENT_PROPERTY: "no",
             }
             if kind == "service":
                 invariant.update(

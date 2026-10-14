@@ -13,10 +13,27 @@ import tempfile
 import time
 from pathlib import Path
 
+from .... import constants
 from ....constants import NATIVE_FILE_READ_CHUNK_BYTES, NATIVE_INSTALLATION_DIRECTORY
 from ....utils.process import ProcessCapture, ProcessCaptureStatus
+from ..constants import (
+    COMMAND_SANDBOX_SCRATCH_PREFIX,
+    LC_ALL_ENVIRONMENT_VARIABLE,
+    MINIMAL_SYSTEM_PATH,
+    PATH_ENVIRONMENT_VARIABLE,
+    SYSTEM_LOCALE,
+    TMPDIR_ENVIRONMENT_VARIABLE,
+)
 from ..contracts import CommandProcessResult, SandboxOutcome, SandboxRequest
-from .constants import MINIMAL_NATIVE_PATH, SYSTEM_LOCALE, SYSTEM_PYTHON_PATH
+from .constants import (
+    MANAGEMENT_RECORD_NAME,
+    NATIVE_POLICY_VERSION,
+    NATIVE_RESERVATIONS_DIRECTORY_NAME,
+    NATIVE_SCRATCH_PATH,
+    PROC_STATUS_PATH,
+    SELECTED_DIRECTORY_NAME,
+    SYSTEM_PYTHON_PATH,
+)
 from .host import (
     NATIVE_LOCK_SEEDS,
     bind_host_file,
@@ -27,7 +44,7 @@ from .host import (
 from .paths import python_runtime_mounts
 from .runtime import exchange_installed_request, execution_authority
 
-_RECORD = NATIVE_INSTALLATION_DIRECTORY / "management.json"
+_RECORD = NATIVE_INSTALLATION_DIRECTORY / MANAGEMENT_RECORD_NAME
 _MAX_SELECTED_FILE_DESCRIPTOR = 4096
 _SEARCH_EXEC = """
 import fcntl,json,os,sys
@@ -116,7 +133,7 @@ class LinuxNativeBackend:
         Returns:
             str: Stable Linux policy version included in shared authorization bindings.
         """
-        return "linux-native-v1"
+        return NATIVE_POLICY_VERSION
 
     @property
     def scratch_prefix(self) -> str:
@@ -125,7 +142,7 @@ class LinuxNativeBackend:
         Returns:
             str: Prefix for ordinary private per-command scratch.
         """
-        return "loop-sandbox-"
+        return COMMAND_SANDBOX_SCRATCH_PREFIX
 
     @property
     def file_creation_mask(self) -> int:
@@ -139,7 +156,7 @@ class LinuxNativeBackend:
         """
         masks = [
             line.partition(":")[2].strip()
-            for line in Path("/proc/self/status").read_text(encoding="ascii").splitlines()
+            for line in PROC_STATUS_PATH.read_text(encoding="ascii").splitlines()
             if line.startswith("Umask:")
         ]
         if len(masks) != 1:
@@ -148,7 +165,7 @@ class LinuxNativeBackend:
             value = int(masks[0], 8)
         except ValueError as error:
             raise OSError("Linux process umask is invalid.") from error
-        if not 0 <= value <= 0o777:
+        if not 0 <= value <= constants.FILE_MODE_PERMISSION_MASK:
             raise OSError("Linux process umask is invalid.")
         return value
 
@@ -224,7 +241,7 @@ class LinuxNativeBackend:
                         raise ValueError("Aliased native installation directory.")
 
                     inventory = {path.name for path in directory.iterdir()}
-                    if inventory - {*NATIVE_LOCK_SEEDS, "reservations"}:
+                    if inventory - {*NATIVE_LOCK_SEEDS, NATIVE_RESERVATIONS_DIRECTORY_NAME}:
                         raise ValueError("Partial native installation authority.")
 
                     for name in inventory & NATIVE_LOCK_SEEDS.keys():
@@ -232,13 +249,13 @@ class LinuxNativeBackend:
                         bound = bind_host_file(directory / name)
                         with bound.open_verified() as descriptor:
                             if (
-                                bound.identity[2] & 0o222
+                                bound.identity[2] & constants.WRITE_MODE_MASK
                                 or os.pread(descriptor, len(seed) + 1, 0) != seed
                             ):
                                 raise ValueError("Changed native shared lock authority.")
 
-                    if "reservations" in inventory:
-                        reservations = directory / "reservations"
+                    if NATIVE_RESERVATIONS_DIRECTORY_NAME in inventory:
+                        reservations = directory / NATIVE_RESERVATIONS_DIRECTORY_NAME
                         if protected_path(reservations, directory=True) != reservations or any(
                             reservations.iterdir()
                         ):
@@ -355,11 +372,10 @@ class LinuxNativeBackend:
             ):
                 return None
 
-            with (
-                tempfile.TemporaryDirectory(prefix=self.scratch_prefix) as directory,
-                tempfile.TemporaryDirectory(prefix=self.scratch_prefix) as private,
-            ):
-                workspace, scratch = Path(directory).resolve(), Path(private).resolve()
+            with tempfile.TemporaryDirectory(prefix=self.scratch_prefix) as private:
+                scratch = Path(private).resolve()
+                workspace = scratch / SELECTED_DIRECTORY_NAME
+                workspace.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE)
                 selected = []
                 for number in descriptors:
                     before = os.fstat(number)
@@ -400,26 +416,33 @@ class LinuxNativeBackend:
                     ):
                         raise ValueError("Selected search input changed during snapshot.")
 
-                    selected.append((number, str(path)))
+                    selected.append(
+                        (number, str(NATIVE_SCRATCH_PATH / SELECTED_DIRECTORY_NAME / str(number)))
+                    )
 
                 helper = bind_host_file(executable)
-                source = shlex.join(
-                    [
-                        str(SYSTEM_PYTHON_PATH),
-                        "-I",
-                        "-c",
-                        _SEARCH_EXEC,
-                        json.dumps(
-                            {
-                                "files": selected,
-                                "executable": str(executable),
-                                "arguments": (
-                                    *arguments[: -len(descriptors)],
-                                    *(f"/dev/fd/{number}" for number in descriptors),
-                                ),
-                            }
-                        ),
-                    ]
+                source = (
+                    "cd "
+                    + str(NATIVE_SCRATCH_PATH / SELECTED_DIRECTORY_NAME)
+                    + " && exec "
+                    + shlex.join(
+                        [
+                            str(SYSTEM_PYTHON_PATH),
+                            "-I",
+                            "-c",
+                            _SEARCH_EXEC,
+                            json.dumps(
+                                {
+                                    "files": selected,
+                                    "executable": str(executable),
+                                    "arguments": (
+                                        *arguments[: -len(descriptors)],
+                                        *(f"/dev/fd/{number}" for number in descriptors),
+                                    ),
+                                }
+                            ),
+                        ]
+                    )
                 )
                 request = SandboxRequest.create(
                     source="selected read-only search",
@@ -430,9 +453,11 @@ class LinuxNativeBackend:
                     write_roots=(),
                     network=False,
                     environment={
-                        "PATH": str(executable.parent) + ":" + MINIMAL_NATIVE_PATH,
-                        "LC_ALL": SYSTEM_LOCALE,
-                        "TMPDIR": str(scratch),
+                        PATH_ENVIRONMENT_VARIABLE: str(executable.parent)
+                        + ":"
+                        + MINIMAL_SYSTEM_PATH,
+                        LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+                        TMPDIR_ENVIRONMENT_VARIABLE: str(scratch),
                     },
                     policy_version=self.policy_version,
                     deadline=deadline,

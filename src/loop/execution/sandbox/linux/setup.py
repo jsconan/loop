@@ -13,6 +13,7 @@ from contextlib import ExitStack
 from importlib.resources import files
 from pathlib import Path
 
+from .... import constants
 from ....constants import (
     MAX_NATIVE_SETUP_ERROR_CHARS,
     MAX_NATIVE_SETUP_ERROR_COUNT,
@@ -20,12 +21,19 @@ from ....constants import (
     NATIVE_MANAGEMENT_TIMEOUT_SECONDS,
     NATIVE_UNIT_PREFIX,
 )
+from ..constants import INITIAL_USER_NAMESPACE_UID_MAP
 from .admission import GenerationAdmission
 from .catalog import runtime_catalog
 from .constants import (
-    INITIAL_USER_NAMESPACE_UID_MAP,
+    COMPILER_LOCK_FILENAME,
+    MANAGEMENT_LOCK_FILENAME,
+    MANAGEMENT_RECORD_NAME,
+    NATIVE_RESERVATIONS_DIRECTORY_NAME,
     PROC_UID_MAP_PATH,
+    RECEIVER_FILENAME,
     SYSTEM_PYTHON_PATH,
+    SYSTEMD_SLICE_UNIT_SUFFIX,
+    UNINSTALLER_FILENAME,
 )
 from .host import NATIVE_LOCK_SEEDS, HostFile, bind_host_file, discover_tool, protected_path
 from .installation import (
@@ -56,14 +64,17 @@ def _directory(path):
     if protected_path(path.parent, directory=True) != path.parent:
         raise ValueError("Setup parent aliases other authority.")
     try:
-        path.mkdir(mode=0o755)
+        path.mkdir(mode=constants.PUBLIC_DIRECTORY_MODE)
     except FileExistsError:
         pass
     else:
-        path.chmod(0o755)
+        path.chmod(constants.PUBLIC_DIRECTORY_MODE)
     if protected_path(path, directory=True) != path:
         raise ValueError("Setup directory aliases other authority.")
-    if path.stat().st_mode & 0o555 != 0o555:
+    if (
+        path.stat().st_mode & constants.READ_ONLY_EXECUTABLE_FILE_MODE
+        != constants.READ_ONLY_EXECUTABLE_FILE_MODE
+    ):
         raise ValueError("Setup directory lacks required runtime read/traversal authority.")
 
 
@@ -109,11 +120,11 @@ def install_reviewed(
     ):
         raise ValueError("Invalid reviewed setup identity or action.")
     if action == "uninstall":
-        record = _DIRECTORY / "management.json"
+        record = _DIRECTORY / MANAGEMENT_RECORD_NAME
         if not record.exists() and not record.is_symlink():
             if record_digest:
                 raise ValueError("Reviewed uninstall authority disappeared.")
-            reservations = _DIRECTORY / "reservations"
+            reservations = _DIRECTORY / NATIVE_RESERVATIONS_DIRECTORY_NAME
             if reservations.exists() or reservations.is_symlink():
                 if protected_path(reservations, directory=True) != reservations:
                     raise ValueError("Installation capacity directory aliases other authority.")
@@ -126,29 +137,32 @@ def install_reviewed(
                     reservation = bind_host_file(retained[0])
                     generation_limits(reservation, generation)
                     validate_generation_catalog(
-                        _DIRECTORY, contents, {"loop_receiver.py", "loop_uninstall.py", "helper"}
+                        _DIRECTORY, contents, {RECEIVER_FILENAME, UNINSTALLER_FILENAME, "helper"}
                     )
                     helper = discover_tool("bwrap")
                     if hashlib.sha256(contents["helper"]).hexdigest() != helper.digest:
                         raise ValueError("Reviewed system helper changed.")
                     sources, source = runtime_policy_sources(_DIRECTORY, generation)
-                    lock = bind_host_file(_DIRECTORY / "management.lock")
-                    compiler = bind_host_file(_DIRECTORY / "compiler.lock")
+                    lock = bind_host_file(_DIRECTORY / MANAGEMENT_LOCK_FILENAME)
+                    compiler = bind_host_file(_DIRECTORY / COMPILER_LOCK_FILENAME)
                     clean_unrecorded_installation(
                         GenerationAdmission(
                             generation,
                             uid,
                             gid,
-                            _DIRECTORY / "loop_receiver.py",
+                            _DIRECTORY / RECEIVER_FILENAME,
                             HostFile(
-                                _DIRECTORY / f"{NATIVE_UNIT_PREFIX}{generation}.slice", (), ""
+                                _DIRECTORY
+                                / f"{NATIVE_UNIT_PREFIX}{generation}{SYSTEMD_SLICE_UNIT_SUFFIX}",
+                                (),
+                                "",
                             ),
                             reservation,
                         ),
                         lock,
                         compiler,
                         contents,
-                        {"loop_receiver.py", "loop_uninstall.py", "helper"},
+                        {RECEIVER_FILENAME, UNINSTALLER_FILENAME, "helper"},
                         sources,
                         source,
                         time.monotonic() + _SETUP_ACTION_TIMEOUT_SECONDS,
@@ -167,21 +181,23 @@ def install_reviewed(
                 time.monotonic() + NATIVE_MANAGEMENT_TIMEOUT_SECONDS,
             )
         return
-    placeholder = HostFile(_DIRECTORY / f"{NATIVE_UNIT_PREFIX}{generation}.slice", (), "")
+    placeholder = HostFile(
+        _DIRECTORY / f"{NATIVE_UNIT_PREFIX}{generation}{SYSTEMD_SLICE_UNIT_SUFFIX}", (), ""
+    )
     config = GenerationAdmission(
-        generation, uid, gid, _DIRECTORY / "loop_receiver.py", placeholder, placeholder
+        generation, uid, gid, _DIRECTORY / RECEIVER_FILENAME, placeholder, placeholder
     )
     slice_sources = config.unit_sources()
     validate_generation_catalog(
-        _DIRECTORY, contents, {"loop_receiver.py", "loop_uninstall.py", "helper"}
+        _DIRECTORY, contents, {RECEIVER_FILENAME, UNINSTALLER_FILENAME, "helper"}
     )
     helper = discover_tool("bwrap")
     if hashlib.sha256(contents["helper"]).hexdigest() != helper.digest:
         raise ValueError("Reviewed system helper changed.")
     sources, source = runtime_policy_sources(_DIRECTORY, generation)
-    executables = {"loop_receiver.py", "loop_uninstall.py", "helper"}
+    executables = {RECEIVER_FILENAME, UNINSTALLER_FILENAME, "helper"}
     deadline = time.monotonic() + _SETUP_ACTION_TIMEOUT_SECONDS
-    record = _DIRECTORY / "management.json"
+    record = _DIRECTORY / MANAGEMENT_RECORD_NAME
     if record.exists() or record.is_symlink():
         authority, entry = uninstall_authority(record)
         if authority.digest != record_digest:
@@ -196,20 +212,27 @@ def install_reviewed(
     for name, seed in _SEEDS.items():
         path = _DIRECTORY / name
         if not path.exists() and not path.is_symlink():
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                constants.READ_ONLY_FILE_MODE,
+            )
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(seed)
                 stream.flush()
-                os.fchmod(stream.fileno(), 0o444)
+                os.fchmod(stream.fileno(), constants.READ_ONLY_FILE_MODE)
                 os.fsync(stream.fileno())
         bound = bind_host_file(path)
         with bound.open_verified() as descriptor:
-            if bound.identity[2] & 0o222 or os.pread(descriptor, len(seed) + 1, 0) != seed:
+            if (
+                bound.identity[2] & constants.WRITE_MODE_MASK
+                or os.pread(descriptor, len(seed) + 1, 0) != seed
+            ):
                 raise ValueError("Setup shared lock differs from fixed authority.")
-    reservations = _DIRECTORY / "reservations"
+    reservations = _DIRECTORY / NATIVE_RESERVATIONS_DIRECTORY_NAME
     _directory(reservations)
-    lock = bind_host_file(_DIRECTORY / "management.lock")
-    compiler = bind_host_file(_DIRECTORY / "compiler.lock")
+    lock = bind_host_file(_DIRECTORY / MANAGEMENT_LOCK_FILENAME)
+    compiler = bind_host_file(_DIRECTORY / COMPILER_LOCK_FILENAME)
     retained = list(reservations.iterdir())
     if retained:
         if len(retained) != 1 or retained[0].name != generation:
@@ -228,7 +251,10 @@ def install_reviewed(
             source,
             deadline,
         )
-    elif {path.name for path in _DIRECTORY.iterdir()} - {*_SEEDS, "reservations"}:
+    elif {path.name for path in _DIRECTORY.iterdir()} - {
+        *_SEEDS,
+        NATIVE_RESERVATIONS_DIRECTORY_NAME,
+    }:
         raise ValueError("Install found private files without reserved authority.")
     verify_uninstalled(_DIRECTORY, deadline)
     reservation = reserve_generation(reservations, lock, generation)
@@ -278,11 +304,11 @@ def manage_setup(action: str, review: Callable[[str], bool], *, main_app: bool =
         raise OSError("Linux installation management is unavailable on this platform.")
     if action not in {"install", "uninstall"} or min(os.getuid(), os.getgid()) <= 0:
         raise ValueError("Setup requires an ordinary user and a fixed action.")
-    record = _DIRECTORY / "management.json"
+    record = _DIRECTORY / MANAGEMENT_RECORD_NAME
     has_record = record.exists() or record.is_symlink()
     original = uninstall_authority(record) if has_record else None
     generation = "native_" + uuid.uuid4().hex
-    reservations = _DIRECTORY / "reservations"
+    reservations = _DIRECTORY / NATIVE_RESERVATIONS_DIRECTORY_NAME
     if action in {"install", "uninstall"} and not has_record and reservations.exists():
         if protected_path(reservations, directory=True) != reservations:
             raise ValueError("Installation capacity directory aliases other authority.")
@@ -322,7 +348,7 @@ def manage_setup(action: str, review: Callable[[str], bool], *, main_app: bool =
         with path.open("xb") as stream:
             stream.write(data)
             stream.flush()
-            os.fchmod(stream.fileno(), 0o400)
+            os.fchmod(stream.fileno(), constants.OWNER_READ_ONLY_FILE_MODE)
         argv = [
             str(sudo.path),
             "--",
@@ -356,7 +382,7 @@ def manage_setup(action: str, review: Callable[[str], bool], *, main_app: bool =
             )
         if review(description) is not True:
             return False
-        if original and uninstall_authority(_DIRECTORY / "management.json") != original:
+        if original and uninstall_authority(_DIRECTORY / MANAGEMENT_RECORD_NAME) != original:
             raise ValueError(f"Reviewed {action} authority changed after consent.")
         with ExitStack() as pins, tempfile.TemporaryFile() as outcome:
             for bound in (sudo, python, *(original or ())):

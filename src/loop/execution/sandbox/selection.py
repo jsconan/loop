@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import shlex
+import stat
 import tempfile
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
+from ... import constants
+from .constants import (
+    COMMAND_SANDBOX_SCRATCH_PREFIX,
+    LANG_ENVIRONMENT_VARIABLE,
+    MINIMAL_SYSTEM_PATH,
+    PATH_ENVIRONMENT_VARIABLE,
+    SYSTEM_LOCALE,
+    TMPDIR_ENVIRONMENT_VARIABLE,
+)
 from .contracts import CommandProcessResult, SandboxBackend, SandboxOutcome, SandboxRequest
 
 
@@ -16,6 +28,37 @@ def _macos_backend() -> SandboxBackend:
     from .macos import MacOSSeatbeltBackend
 
     return MacOSSeatbeltBackend()
+
+
+def _linux_probe_workspace_root() -> Path:
+    """Return an owned stable Linux probe root so repeat probes reuse one policy."""
+    parent = Path(tempfile.gettempdir()).resolve(strict=True)
+    parent_mode = parent.stat()
+    private_parent = (
+        parent_mode.st_uid == os.getuid()
+        and not parent_mode.st_mode & constants.GROUP_AND_OTHER_WRITE_MODE_MASK
+    )
+    sticky_shared_parent = (
+        parent_mode.st_uid == 0
+        and bool(parent_mode.st_mode & stat.S_ISVTX)
+        and bool(parent_mode.st_mode & stat.S_IWOTH)
+    )
+    if not stat.S_ISDIR(parent_mode.st_mode) or not (private_parent or sticky_shared_parent):
+        raise OSError("Temporary parent is not private or root-owned and sticky.")
+
+    root = parent / f"loop-sandbox-probe-{os.getuid()}"
+    try:
+        root.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE)
+    except FileExistsError:
+        pass
+    root_mode = root.lstat()
+    if (
+        not stat.S_ISDIR(root_mode.st_mode)
+        or root_mode.st_uid != os.getuid()
+        or stat.S_IMODE(root_mode.st_mode) != constants.PRIVATE_DIRECTORY_MODE
+    ):
+        raise OSError("Linux probe root is not an owned private directory.")
+    return root
 
 
 class UnavailableSandboxBackend:
@@ -56,7 +99,7 @@ class UnavailableSandboxBackend:
         Returns:
             str: Private scratch-directory prefix.
         """
-        return "loop-sandbox-"
+        return COMMAND_SANDBOX_SCRATCH_PREFIX
 
     def automatic_tool_read_roots(
         self,
@@ -150,15 +193,34 @@ def select_sandbox_backend() -> SandboxBackend:
     else:
         return UnavailableSandboxBackend("No native command sandbox is qualified for this host.")
     try:
-        with (
-            tempfile.TemporaryDirectory(prefix="loop-sandbox-probe-") as directory,
-            tempfile.TemporaryDirectory(prefix=backend.scratch_prefix) as scratch_directory,
-        ):
+        with ExitStack() as directories:
+            probe_workspace_root = _linux_probe_workspace_root() if host == "Linux" else None
+            directory = directories.enter_context(
+                tempfile.TemporaryDirectory(
+                    prefix="loop-sandbox-probe-",
+                    dir=probe_workspace_root,
+                )
+            )
             root = Path(directory).resolve(strict=True)
             workspace = root / "workspace"
-            outside = root / "outside"
             workspace.mkdir()
-            outside.mkdir()
+            if probe_workspace_root is None:
+                outside = root / "outside"
+                outside.mkdir()
+                workspace_authority = workspace
+            else:
+                outside = Path(
+                    directories.enter_context(
+                        tempfile.TemporaryDirectory(
+                            prefix="loop-sandbox-outside-",
+                            dir=probe_workspace_root.parent,
+                        )
+                    )
+                ).resolve(strict=True)
+                workspace_authority = probe_workspace_root
+            scratch_directory = directories.enter_context(
+                tempfile.TemporaryDirectory(prefix=backend.scratch_prefix)
+            )
             scratch = Path(scratch_directory).resolve(strict=True)
             private = workspace / ".ssh"
             private.mkdir()
@@ -173,11 +235,15 @@ def select_sandbox_backend() -> SandboxBackend:
                     f"printf overwritten > {shlex.quote(str(canary))}"
                 ),
                 cwd=workspace,
-                workspace=workspace,
+                workspace=workspace_authority,
                 read_roots=(),
-                write_roots=(workspace,),
+                write_roots=(workspace_authority,),
                 network=False,
-                environment={"PATH": "/usr/bin:/bin", "LANG": "C", "TMPDIR": str(scratch)},
+                environment={
+                    PATH_ENVIRONMENT_VARIABLE: MINIMAL_SYSTEM_PATH,
+                    LANG_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+                    TMPDIR_ENVIRONMENT_VARIABLE: str(scratch),
+                },
                 policy_version=backend.policy_version,
                 deadline=time.monotonic() + 5,
                 workspace_id="native-probe",

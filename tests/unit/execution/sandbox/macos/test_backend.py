@@ -74,6 +74,13 @@ def request(root: Path, **changes) -> SandboxRequest:
     return SandboxRequest.create(**values)
 
 
+def regex_patterns(profile):
+    """Decode emitted Seatbelt regex strings for semantic policy assertions."""
+    return "\n".join(
+        json.loads(value) for value in re.findall(r'\(regex ("(?:\\.|[^"\\])*")\)', profile)
+    )
+
+
 class Process:
     """Provide the subprocess surface used by the backend capture loop."""
 
@@ -385,7 +392,7 @@ def test_backend_granted_git_metadata_keeps_nested_git_protected(monkeypatch, tm
     result = MacOSSeatbeltBackend().run(request(tmp_path, write_roots=(tmp_path, git)))
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
-    assert "/.+/\\.git" in profile
+    assert "/.+/\\.git" in regex_patterns(profile)
 
 
 def test_backend_allows_approved_fresh_git_metadata_only_at_workspace_root(monkeypatch, tmp_path):
@@ -400,7 +407,7 @@ def test_backend_allows_approved_fresh_git_metadata_only_at_workspace_root(monke
     result = MacOSSeatbeltBackend().run(request(tmp_path, git_create=True))
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
-    assert "/.+/\\.git" in profile
+    assert "/.+/\\.git" in regex_patterns(profile)
     assert f'"^{tmp_path}/.*[.]git(/.*)?$"' not in profile
 
 
@@ -435,6 +442,216 @@ def test_backend_rejects_scratch_without_its_own_prefix(tmp_path):
     assert "Unsafe command scratch directory" in result.detail
 
 
+@pytest.mark.parametrize("name", ['quote"name', "slash\\name", "line\nname", "name[0]+;$()"])
+def test_backend_encodes_complete_regex_strings(monkeypatch, tmp_path, name):
+    """Filesystem and instruction names stay literal inside complete policy regex strings."""
+    workspace = tmp_path / name
+    workspace.mkdir()
+    popen = MagicMock(return_value=Process())
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.subprocess.run",
+        MagicMock(return_value=MagicMock(returncode=0, stderr="")),
+    )
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    instruction_name = name.replace("\\", "-")
+    value = request(workspace, protected_instruction_names=(instruction_name,))
+    assert MacOSSeatbeltBackend().run(value).outcome is SandboxOutcome.COMPLETED
+    profile = popen.call_args.args[0][2]
+    patterns = regex_patterns(profile).splitlines() if "\n" not in name else None
+    encoded = json.dumps(
+        "^"
+        + re.escape(str(workspace))
+        + "/(.*/)?(AGENTS\\.md|SKILL\\.md|"
+        + re.escape(instruction_name)
+        + ")$"
+    )
+    assert "(regex " + encoded + ")" in profile
+    assert '(regex #"' not in profile
+    if patterns is not None:
+        assert any(re.search(pattern, str(workspace / instruction_name)) for pattern in patterns)
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_backend_grants_only_bound_external_executable_files(monkeypatch, tmp_path, symlink):
+    """Exact executable authority does not grant neighboring file or directory data."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tools = tmp_path / "tools"
+    tools.mkdir(mode=0o700)
+    executable = tools / "target"
+    executable.write_text("#!/bin/sh\nprintf exact")
+    executable.chmod(0o700)
+    spelling = tools / "tool" if symlink else executable
+    if symlink:
+        spelling.symlink_to(executable)
+    details = executable.stat()
+    value = request(
+        workspace,
+        environment={"PATH": str(tools)},
+        executable_identities=(
+            (spelling.name, spelling, executable, details.st_dev, details.st_ino),
+        ),
+    )
+    popen = MagicMock(return_value=Process())
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.subprocess.run",
+        MagicMock(return_value=MagicMock(returncode=0, stderr="")),
+    )
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    assert MacOSSeatbeltBackend().run(value).outcome is SandboxOutcome.COMPLETED
+    profile = popen.call_args.args[0][2]
+    read = next(line for line in profile.splitlines() if line.startswith("(allow file-read* "))
+    assert f'(literal "{executable}")' in read
+    assert f'(literal "{spelling}")' in read
+    assert f'(subpath "{tools}")' not in read
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "root_world",
+        "root_group",
+        "root_owner",
+        "mode",
+        "owner",
+        "hardlink",
+        "private",
+        "unmounted",
+        "inode",
+        "alias",
+    ],
+)
+def test_backend_rejects_unsafe_exact_executable_authority(monkeypatch, tmp_path, unsafe):
+    """Unsafe exact executable identity, root or file permissions refuse source launch."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tools = tmp_path / (".ssh" if unsafe == "private" else "tools")
+    tools.mkdir(mode=0o700)
+    executable = tools / "tool"
+    executable.write_text("executable")
+    executable.chmod(0o700)
+    details = executable.stat()
+    value = request(
+        workspace,
+        environment={"PATH": str(tools)},
+        executable_identities=(("tool", executable, executable, details.st_dev, details.st_ino),),
+    )
+    original_lstat, original_stat = Path.lstat, Path.stat
+
+    def observed(path, original):
+        """Expose changed metadata at the actual file or PATH-root boundary."""
+        result = original(path)
+        fields = {
+            name: getattr(result, name)
+            for name in ("st_mode", "st_uid", "st_gid", "st_dev", "st_ino", "st_nlink")
+        }
+        if path == tools:
+            if unsafe == "root_world":
+                fields["st_mode"] |= 0o002
+            if unsafe == "root_group":
+                fields.update(st_mode=fields["st_mode"] | 0o020, st_gid=os.getgid() + 1)
+            if unsafe == "root_owner":
+                fields["st_uid"] = os.getuid() + 1
+        if path == executable:
+            if unsafe == "mode":
+                fields["st_mode"] |= 0o002
+            if unsafe == "owner":
+                fields["st_uid"] = os.getuid() + 1
+            if unsafe == "hardlink":
+                fields["st_nlink"] = 2
+        return (
+            SimpleNamespace(**fields)
+            if (path == tools and unsafe.startswith("root_"))
+            or (path == executable and unsafe in {"mode", "owner", "hardlink"})
+            else result
+        )
+
+    monkeypatch.setattr(Path, "lstat", lambda path: observed(path, original_lstat))
+    monkeypatch.setattr(Path, "stat", lambda path, **kwargs: observed(path, original_stat))
+    if unsafe == "unmounted":
+        monkeypatch.setattr(
+            "loop.execution.sandbox.macos.backend._search_roots", lambda request: ()
+        )
+    if unsafe in {"inode", "alias"}:
+        original = tools / "original"
+        executable.rename(original)
+        if unsafe == "alias":
+            executable.symlink_to(original)
+        else:
+            executable.write_text("changed")
+            executable.chmod(0o700)
+    popen = MagicMock()
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    result = MacOSSeatbeltBackend().run(value)
+    assert result.outcome in {SandboxOutcome.INVALID, SandboxOutcome.STALE}
+    popen.assert_not_called()
+
+
+def test_backend_reuses_workspace_executable_read_authority(monkeypatch, tmp_path):
+    """An already readable workspace executable needs no separate exact-file grant."""
+    executable = tmp_path / "tool"
+    executable.write_text("#!/bin/sh\nprintf ok")
+    executable.chmod(0o700)
+    details = executable.stat()
+    value = request(
+        tmp_path,
+        environment={"PATH": str(tmp_path)},
+        executable_identities=(("tool", executable, executable, details.st_dev, details.st_ino),),
+    )
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.subprocess.run",
+        MagicMock(return_value=MagicMock(returncode=0, stderr="")),
+    )
+    popen = MagicMock(return_value=Process())
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    assert MacOSSeatbeltBackend().run(value).outcome is SandboxOutcome.COMPLETED
+    assert f'(subpath "{tmp_path}")' in popen.call_args.args[0][2]
+
+
+@pytest.mark.parametrize("changed", ["file_mode", "root_mode", "hardlink"])
+def test_backend_revalidates_exact_executables_after_diagnostic_start(
+    monkeypatch, tmp_path, changed
+):
+    """Metadata changes during diagnostic setup refuse a previously rendered exact grant."""
+    workspace, tools = tmp_path / "workspace", tmp_path / "tools"
+    workspace.mkdir()
+    tools.mkdir(mode=0o700)
+    executable = tools / "tool"
+    executable.write_text("executable")
+    executable.chmod(0o700)
+    details = executable.stat()
+    value = request(
+        workspace,
+        environment={"PATH": str(tools)},
+        executable_identities=(("tool", executable, executable, details.st_dev, details.st_ino),),
+    )
+    monitor = MagicMock()
+
+    def register(tag):
+        """Change only the owned executable or its root after policy construction."""
+        if changed == "file_mode":
+            executable.chmod(0o777)
+        elif changed == "root_mode":
+            tools.chmod(0o777)
+        else:
+            os.link(executable, tools / "alias")
+
+    monitor.register.side_effect = register
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monitor",
+        lambda *args: monitor,
+    )
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.subprocess.run",
+        MagicMock(return_value=MagicMock(returncode=0, stderr="")),
+    )
+    popen = MagicMock()
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    assert MacOSSeatbeltBackend().run(value).outcome is SandboxOutcome.INVALID
+    popen.assert_not_called()
+    monitor.unregister.assert_called_once()
+
+
 def test_backend_protects_instruction_files_even_with_workspace_write_grant(monkeypatch, tmp_path):
     """Native write policy carves instructions and skills out of writable workspace roots."""
     popen = MagicMock(return_value=Process())
@@ -447,10 +664,10 @@ def test_backend_protects_instruction_files_even_with_workspace_write_grant(monk
 
     assert MacOSSeatbeltBackend().run(request(tmp_path)).outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
-    assert "(AGENTS\\.md|SKILL\\.md)" in profile
-    assert "/(.*/)?\\.agents/skills(/.*)?$" in profile
-    assert "/(.*/)?\\.gitignore$" in profile
-    assert "/(.*/)?\\.agentignore$" in profile
+    assert "(AGENTS\\.md|SKILL\\.md)" in regex_patterns(profile)
+    assert "/(.*/)?\\.agents/skills(/.*)?$" in regex_patterns(profile)
+    assert "/(.*/)?\\.gitignore$" in regex_patterns(profile)
+    assert "/(.*/)?\\.agentignore$" in regex_patterns(profile)
     assert profile.index("(deny file-write* ") > profile.index("(allow file-write* ")
 
 
@@ -467,17 +684,25 @@ def test_backend_protects_configured_instruction_name_at_every_depth(monkeypatch
     bound = request(tmp_path, protected_instruction_names=("POLICY+.md",))
     assert MacOSSeatbeltBackend().run(bound).outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
-    assert r"AGENTS\.md|SKILL\.md|POLICY\+\.md" in profile
-    assert f"{re.escape(str(tmp_path))}/(.*/)?(" in profile
-    assert r"POLICY\+\.md)$" in profile
+    assert r"AGENTS\.md|SKILL\.md|POLICY\+\.md" in regex_patterns(profile)
+    assert f"{re.escape(str(tmp_path))}/(.*/)?(" in regex_patterns(profile)
+    assert r"POLICY\+\.md)$" in regex_patterns(profile)
 
 
-def test_backend_denies_private_reads_inside_workspace_and_extra_roots(monkeypatch, tmp_path):
-    """Workspace and extra read grants retain protected-path denials."""
+def test_backend_denies_private_reads_inside_every_granted_root(monkeypatch, tmp_path):
+    """Every host-data grant retains private denials while fresh command scratch is exempt."""
     workspace = tmp_path / "work"
     workspace.mkdir()
     extra = tmp_path / "extra"
     extra.mkdir()
+    writable = tmp_path / "writable"
+    writable.mkdir()
+    target = tmp_path / "alias-target"
+    target.mkdir()
+    mappings = tmp_path / "mappings"
+    mappings.mkdir(mode=0o700)
+    alias = mappings / "r0"
+    alias.symlink_to(target)
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
         "loop.execution.sandbox.macos.backend.subprocess.run",
@@ -486,7 +711,14 @@ def test_backend_denies_private_reads_inside_workspace_and_extra_roots(monkeypat
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
 
-    result = MacOSSeatbeltBackend().run(request(workspace, read_roots=(extra,)))
+    result = MacOSSeatbeltBackend().run(
+        request(
+            workspace,
+            read_roots=(extra,),
+            write_roots=(workspace, writable),
+            aliases=(("/skills/tool", alias, target),),
+        )
+    )
 
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
@@ -494,8 +726,10 @@ def test_backend_denies_private_reads_inside_workspace_and_extra_roots(monkeypat
     assert f'(subpath "{extra}")' in profile
     names = r"(\.[sS][sS][hH]|\.[aA][wW][sS]|\.[gG][nN][uU][pP][gG]|"
     names += r"\.[cC][oO][nN][fF][iI][gG]|\.[lL][oO][oO][pP]|[lL][iI][bB][rR][aA][rR][yY])"
-    for root in (workspace, extra):
-        assert f"{re.escape(str(root))}/(.*/)?{names}(/.*)?$" in profile
+    scratch = Path(popen.call_args.kwargs["env"]["TMPDIR"])
+    for root in (workspace, extra, writable, target):
+        assert f"{re.escape(str(root))}/(.*/)?{names}(/.*)?$" in regex_patterns(profile)
+    assert f"{re.escape(str(scratch))}/(.*/)?{names}(/.*)?$" not in regex_patterns(profile)
     assert profile.index("(deny file-read*") > profile.index("(allow file-read*")
     assert profile.index("(deny file-write* ") > profile.index("(allow file-write* ")
 
@@ -531,7 +765,7 @@ def test_backend_guards_protected_entries_and_their_ancestors_against_rename(mon
         line for line in profile.splitlines() if line.startswith("(deny file-write-unlink ")
     ]
     private_rules = [line for line in profile.splitlines() if line.startswith("(deny file-write* ")]
-    assert any(r"(\.[sS][sS][hH]|\.[aA][wW][sS]" in line for line in private_rules)
+    assert any(r"(\.[sS][sS][hH]|\.[aA][wW][sS]" in regex_patterns(line) for line in private_rules)
     for protected in (nested, private_parent, private, git_parent, git):
         assert any(f'(literal "{protected}")' in line for line in rename_rules)
     assert all(f'(literal "{ordinary}")' not in line for line in rename_rules)
@@ -558,7 +792,7 @@ def test_backend_limits_baseline_reads_to_system_managed_roots(monkeypatch, tmp_
     names = r"(\.[sS][sS][hH]|\.[aA][wW][sS]|\.[gG][nN][uU][pP][gG]|"
     names += r"\.[cC][oO][nN][fF][iI][gG]|\.[lL][oO][oO][pP]|[lL][iI][bB][rR][aA][rR][yY])"
     for root in backend.system_read_roots:
-        assert f"{re.escape(str(root))}/(.*/)?{names}(/.*)?$" in profile
+        assert f"{re.escape(str(root))}/(.*/)?{names}(/.*)?$" in regex_patterns(profile)
     assert '(subpath "/System/Library")' in profile
     assert '(subpath "/System")' not in profile
     for root in ("/usr", "/usr/local", "/Library", "/opt/homebrew"):
@@ -606,6 +840,41 @@ def test_trusted_argv_search_passes_only_selected_descriptors_under_read_only_po
     assert popen.call_args.kwargs["pass_fds"] == (3,)
     assert "(deny default" in argv[2]
     assert "(allow network*)" not in argv[2]
+
+
+def test_trusted_argv_search_binds_verified_package_dependencies(monkeypatch, tmp_path):
+    """Qualified helper runtime libraries remain readable without exposing selected source roots."""
+    cellar = tmp_path / "Cellar"
+    package = cellar / "ripgrep/1"
+    dependency = cellar / "pcre2/2"
+    (package / "bin").mkdir(parents=True)
+    (dependency / "lib").mkdir(parents=True)
+    (package / "INSTALL_RECEIPT.json").write_text(
+        json.dumps({"runtime_dependencies": [{"full_name": "pcre2"}]})
+    )
+    (dependency / "INSTALL_RECEIPT.json").write_text("{}")
+    (tmp_path / "opt").mkdir()
+    (tmp_path / "opt/pcre2").symlink_to(dependency)
+    executable = package / "bin/rg"
+    executable.write_bytes(b"verified helper")
+    executable.chmod(0o755)
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend._MANAGED_TOOLCHAIN_PREFIXES", (cellar,)
+    )
+    popen = MagicMock()
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    capture = ProcessCapture(ProcessCaptureStatus.COMPLETED, exit_code=0, stdout="matched")
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.supervise_process", lambda *args, **kwargs: capture
+    )
+    assert (
+        MacOSSeatbeltBackend().run_read_only_argv(executable, (), (), time.monotonic() + 5)
+        is capture
+    )
+    profile = popen.call_args.args[0][2]
+    assert f'(subpath "{dependency}")' in profile
+    assert f'(subpath "{package}")' in profile
+    assert f'(subpath "{tmp_path}")' not in profile
 
 
 def test_trusted_argv_search_fails_closed_on_expiry_tamper_and_copy_error(monkeypatch, tmp_path):
@@ -1417,9 +1686,9 @@ def test_backend_rejects_hardlinked_writable_file(tmp_path):
     assert "hardlinked file" in result.detail
 
 
-@pytest.mark.parametrize("root_kind", ["workspace", "extra"])
+@pytest.mark.parametrize("root_kind", ["workspace", "extra", "alias"])
 def test_backend_rejects_hardlinked_read_root_even_when_read_only(tmp_path, root_kind):
-    """Read-only grants cannot expose a protected inode through a hardlink alias."""
+    """Read-only roots and virtual targets cannot expose private inodes through hardlinks."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     extra = tmp_path / "extra"
@@ -1430,12 +1699,17 @@ def test_backend_rejects_hardlinked_read_root_even_when_read_only(tmp_path, root
     source = private / "id_ed25519"
     source.write_text("fake-credential")
     os.link(source, granted / "public-alias")
+    mappings = tmp_path / "mappings"
+    mappings.mkdir(mode=0o700)
+    alias = mappings / "r0"
+    alias.symlink_to(extra)
 
     result = MacOSSeatbeltBackend().run(
         request(
             workspace,
             read_roots=(extra,) if root_kind == "extra" else (),
             write_roots=(),
+            aliases=(("/skills/tool", alias, extra),) if root_kind == "alias" else (),
         )
     )
 
@@ -1443,7 +1717,7 @@ def test_backend_rejects_hardlinked_read_root_even_when_read_only(tmp_path, root
     assert "hardlinked file" in result.detail
 
 
-@pytest.mark.parametrize("root_kind", ["workspace", "extra"])
+@pytest.mark.parametrize("root_kind", ["workspace", "extra", "alias", "write"])
 @pytest.mark.parametrize("name", [".aws", ".AWS"])
 def test_backend_rejects_protected_directory_as_read_root(tmp_path, root_kind, name):
     """A protected directory selected as a grant root never becomes readable."""
@@ -1451,11 +1725,16 @@ def test_backend_rejects_protected_directory_as_read_root(tmp_path, root_kind, n
     workspace.mkdir()
     private = (workspace if root_kind == "workspace" else tmp_path) / name
     private.mkdir()
+    mappings = tmp_path / "mappings"
+    mappings.mkdir(mode=0o700)
+    alias = mappings / "r0"
+    alias.symlink_to(private)
     result = MacOSSeatbeltBackend().run(
         request(
             private if root_kind == "workspace" else workspace,
             read_roots=(private,) if root_kind == "extra" else (),
-            write_roots=(),
+            write_roots=(private,) if root_kind == "write" else (),
+            aliases=(("/skills/tool", alias, private),) if root_kind == "alias" else (),
         )
     )
     assert result.outcome is SandboxOutcome.INVALID

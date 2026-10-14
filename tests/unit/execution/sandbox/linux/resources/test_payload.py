@@ -31,6 +31,7 @@ def payload(monkeypatch, tmp_path):
     value = {
         "request": base64.b64encode(b"request").decode(),
         "compiled": base64.b64encode(b"policy").decode(),
+        "profile": "payload_profile",
         "namespace": "generation",
         "uid": 1000,
         **{role: record for role in ("apparmor", "bootstrap", "cache_lock", "reservation")},
@@ -53,7 +54,12 @@ def test_payload_enters_bound_setup_and_replaces_private_input(payload):
     module.os.dup2.assert_called_once_with(8, 0)
     module.os.close.assert_called_once_with(8)
     args = linux_bootstrap.execute_payload.call_args
-    assert args.args[0] == "restored request" and args.args[4:] == (b"policy", "generation", 1000)
+    assert args.args[0] == "restored request" and args.args[4:] == (
+        b"policy",
+        "payload_profile",
+        "generation",
+        1000,
+    )
     assert args.kwargs["reservation"].path == Path("/trusted/control")
 
 

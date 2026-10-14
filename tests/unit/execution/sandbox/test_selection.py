@@ -1,5 +1,6 @@
 """Verify host qualification selects only a working built-in sandbox."""
 
+import os
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -59,9 +60,9 @@ def test_linux_selection_requires_operational_enforcement(monkeypatch, enforced)
     def probe(request):
         """Model enforcement effects on disposable probe files without starting processes."""
         assert request.shell_environment()["TMPDIR"]
-        (request.workspace / "allowed").write_text("allowed")
+        (request.cwd / "allowed").write_text("allowed")
         if not enforced:
-            (request.workspace / "leaked").write_text("probe-secret")
+            (request.cwd / "leaked").write_text("probe-secret")
         return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=1)
 
     native.run.side_effect = probe
@@ -74,6 +75,89 @@ def test_linux_selection_requires_operational_enforcement(monkeypatch, enforced)
     else:
         assert selected.capability_failure().outcome is SandboxOutcome.INVALID
     native.run.assert_called_once()
+
+
+def test_linux_selection_reuses_stable_probe_policy_across_calls(monkeypatch, tmp_path):
+    """Keep Linux startup probes on one owned workspace policy across app restarts."""
+    monkeypatch.setattr(selection.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(selection.tempfile, "tempdir", str(tmp_path))
+    native = Mock()
+    native.scratch_prefix = "loop-sandbox-"
+    native.capability_failure.return_value = None
+
+    def probe(request):
+        """Model the allowed probe write without launching a child process."""
+        (request.cwd / "allowed").write_text("allowed")
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=1)
+
+    native.run.side_effect = probe
+    monkeypatch.setattr(
+        "loop.execution.sandbox.linux.LinuxNativeBackend", Mock(return_value=native)
+    )
+
+    first = selection.select_sandbox_backend()
+    second = selection.select_sandbox_backend()
+
+    requests = [call.args[0] for call in native.run.call_args_list]
+    assert first is native and second is native
+    assert requests[0].workspace == requests[1].workspace
+    assert requests[0].write_roots == requests[1].write_roots == (requests[0].workspace,)
+    assert requests[0].cwd != requests[1].cwd
+    assert requests[0].workspace == tmp_path / f"loop-sandbox-probe-{os.getuid()}"
+    assert list(requests[0].workspace.iterdir()) == []
+
+
+def test_linux_selection_refuses_unprotected_probe_parent(monkeypatch, tmp_path):
+    """Fail closed when a stable Linux probe root would live under a writable unsafe parent."""
+    monkeypatch.setattr(selection.platform, "system", lambda: "Linux")
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    parent.chmod(0o777)
+    monkeypatch.setattr(selection.tempfile, "tempdir", str(parent))
+    native = Mock()
+    native.scratch_prefix = "loop-sandbox-"
+    native.capability_failure.return_value = None
+    monkeypatch.setattr(
+        "loop.execution.sandbox.linux.LinuxNativeBackend", Mock(return_value=native)
+    )
+
+    selected = selection.select_sandbox_backend()
+
+    failure = selected.capability_failure()
+    assert isinstance(failure, CommandProcessResult)
+    assert failure.outcome is SandboxOutcome.INVALID
+    assert failure.detail == "Native sandbox capability probe could not be prepared."
+    native.run.assert_not_called()
+
+
+@pytest.mark.parametrize("root_kind", ["symlink", "permissions"])
+def test_linux_selection_refuses_untrusted_existing_probe_root(monkeypatch, tmp_path, root_kind):
+    """Reject a preexisting probe root that is a symlink or has broader permissions."""
+    monkeypatch.setattr(selection.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(selection.tempfile, "tempdir", str(tmp_path))
+    root = tmp_path / f"loop-sandbox-probe-{os.getuid()}"
+    if root_kind == "symlink":
+        target = tmp_path / "target"
+        target.mkdir()
+        root.symlink_to(target, target_is_directory=True)
+    else:
+        root.mkdir(mode=0o700)
+        root.chmod(0o755)
+
+    native = Mock()
+    native.scratch_prefix = "loop-sandbox-"
+    native.capability_failure.return_value = None
+    monkeypatch.setattr(
+        "loop.execution.sandbox.linux.LinuxNativeBackend", Mock(return_value=native)
+    )
+
+    selected = selection.select_sandbox_backend()
+
+    failure = selected.capability_failure()
+    assert isinstance(failure, CommandProcessResult)
+    assert failure.outcome is SandboxOutcome.INVALID
+    assert failure.detail == "Native sandbox capability probe could not be prepared."
+    native.run.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -899,7 +899,8 @@ def test_run_command_explains_external_tool_read_authority(registry):
 
     description = definition.parameters["properties"]["read_roots"]["description"]
     assert "executable and support files" in description
-    assert "PATH alone grants lookup metadata" in description
+    assert "Unused PATH entries grant lookup metadata only" in description
+    assert "that exact file without its neighbors" in description
 
 
 def test_run_command_accepts_opaque_shell_and_returns_bounded_result(monkeypatch, registry):

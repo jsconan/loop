@@ -14,17 +14,43 @@ from ....constants import (
     MAX_OUTPUT_CHARS,
     NATIVE_RESULT_DELIVERY_SECONDS,
 )
+from ....utils.hashing import sha256_digest
 from ....utils.process import ProcessCaptureStatus
+from ..constants import (
+    LC_ALL_ENVIRONMENT_VARIABLE,
+    MINIMAL_SYSTEM_PATH,
+    PATH_ENVIRONMENT_VARIABLE,
+    SYSTEM_LOCALE,
+    TMPDIR_ENVIRONMENT_VARIABLE,
+)
 from ..contracts import CommandProcessResult, SandboxOutcome, SandboxRequest
 from .admission import receive_request
-from .bootstrap import payload_profile
 from .compiler import compile_payload
-from .constants import MINIMAL_NATIVE_PATH, SYSTEM_LOCALE, SYSTEM_PYTHON_PATH
-from .host import bind_host_file, installation_files
+from .constants import (
+    CACHE_LOCK_FILENAME,
+    NATIVE_ALIAS_PATH,
+    NATIVE_PAYLOAD_MARKER_PREFIX,
+    NATIVE_POLICY_VERSION,
+    PAYLOAD_FILENAME,
+    RECEIPT_FILENAME,
+    SYSTEM_PYTHON_PATH,
+)
+from .host import bind_host_file, installation_files, runtime_read_roots
 from .namespace import namespace_arguments
+from .paths import payload_aliases
+from .policy import payload_profile
 from .records import read_generation
 from .supervision import supervise_payload
 from .transport import exchange_request
+
+
+def _require_runtime_revision(installed) -> None:
+    """Refuse retained namespace semantics from another native protocol revision."""
+    constants = installed.artifacts.get("loop/execution/sandbox/linux/constants.py")
+    if constants is None or constants.digest != sha256_digest(
+        Path(__file__).with_name("constants.py").read_bytes()
+    ):
+        raise ValueError("Installed native runtime revision changed; use checked refresh.")
 
 
 def receive_installed_request(record: Path, deadline: float) -> bytes:
@@ -47,7 +73,7 @@ def receive_installed_request(record: Path, deadline: float) -> bytes:
         OSError: Original authority cannot be read or admission is unavailable.
     """
     installed, authority = read_generation(record, deadline=deadline)
-    receipt = installation_files(record.parent / "receipt.json", deadline=deadline)
+    receipt = installation_files(record.parent / RECEIPT_FILENAME, deadline=deadline)
     if any(receipt[role] != bound for role, bound in installed.files.items()):
         raise ValueError("Receipt admission differs from original management authority.")
     payload = receive_request(installed.config, receipt, deadline)
@@ -81,7 +107,8 @@ def exchange_installed_request(record: Path, payload: bytes, deadline: float) ->
     if time.monotonic() >= deadline:
         raise TimeoutError("Installed request transport deadline expired.")
     installed, authority = read_generation(record, deadline=deadline)
-    receipt = installation_files(record.parent / "receipt.json", deadline=deadline)
+    _require_runtime_revision(installed)
+    receipt = installation_files(record.parent / RECEIPT_FILENAME, deadline=deadline)
     if any(receipt[role] != bound for role, bound in installed.files.items()):
         raise ValueError("Receipt transport differs from original management authority.")
     response = exchange_request(installed.config, receipt, payload, deadline)
@@ -121,6 +148,8 @@ def execute_installed_request(record: Path, payload: bytes) -> CommandProcessRes
         OSError: Original native authority, compilation, launch or supervision fails.
     """
     request = SandboxRequest.from_wire(payload)
+    if request.policy_version != NATIVE_POLICY_VERSION:
+        raise ValueError("Installed request has an incompatible native policy revision.")
     installed, authority = read_generation(record, deadline=request.deadline)
     if (os.getuid(), os.geteuid(), os.getgid(), os.getegid()) != (
         installed.config.uid,
@@ -129,14 +158,14 @@ def execute_installed_request(record: Path, payload: bytes) -> CommandProcessRes
         installed.config.gid,
     ):
         raise ValueError("Execution requires the fixed ordinary generation identity.")
-    scratch = request.shell_environment().get("TMPDIR")
-    cache, mask = (installed.artifacts.get(name) for name in ("cache.lock", "mask.empty"))
-    entry = installed.artifacts.get("loop_payload.py")
+    scratch = request.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE)
+    cache, mask = (installed.artifacts.get(name) for name in (CACHE_LOCK_FILENAME, "mask.empty"))
+    entry = installed.artifacts.get(PAYLOAD_FILENAME)
     if scratch is None or cache is None or mask is None or entry is None or mask.identity[4] != 0:
         raise ValueError(
             "Execution requires original trusted setup, empty mask and private scratch."
         )
-    receipt = installation_files(record.parent / "receipt.json", deadline=request.deadline)
+    receipt = installation_files(record.parent / RECEIPT_FILENAME, deadline=request.deadline)
     if any(receipt[role] != bound for role, bound in installed.files.items()):
         raise ValueError("Execution receipt differs from original management authority.")
     bootstrap = installed.artifacts.get("policies/root/bootstrap.bin")
@@ -169,12 +198,20 @@ def execute_installed_request(record: Path, payload: bytes) -> CommandProcessRes
             receipt["apparmor"],
         ):
             pins.enter_context(bound.open_verified(deadline=request.deadline))
+        runtime_roots = runtime_read_roots()
+        profile = payload_profile(request, Path(scratch), cache.path, runtime_roots)
         compiled = compile_payload(
-            request, Path(scratch), cache.path, payload_profile(request), installed.compiler_lock
+            request,
+            Path(scratch),
+            cache.path,
+            profile,
+            runtime_roots,
+            installed.compiler_lock,
         )
         value = {
             "request": base64.b64encode(payload).decode("ascii"),
             "compiled": base64.b64encode(compiled).decode("ascii"),
+            "profile": profile,
             "namespace": installed.config.generation,
             "uid": installed.config.uid,
             **{
@@ -231,12 +268,15 @@ def execute_installed_request(record: Path, payload: bytes) -> CommandProcessRes
             encoding="utf-8",
             errors="replace",
             cwd="/",
-            env={"PATH": MINIMAL_NATIVE_PATH, "LC_ALL": SYSTEM_LOCALE},
+            env={
+                PATH_ENVIRONMENT_VARIABLE: MINIMAL_SYSTEM_PATH,
+                LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+            },
             pass_fds=(*inherited, root_fd, security_fd),
             start_new_session=True,
         )
         captured = supervise_payload(process, installed.config, request.deadline, connection=0)
-    header = "LOOP_PAYLOAD_" + request.attempt_id + "\n"
+    header = NATIVE_PAYLOAD_MARKER_PREFIX + request.attempt_id + "\n"
     entered = captured.stdout.startswith(header)
     invalid_entry = not entered and captured.status not in (
         ProcessCaptureStatus.TIMED_OUT,
@@ -244,16 +284,29 @@ def execute_installed_request(record: Path, payload: bytes) -> CommandProcessRes
     )
     outcome = SandboxOutcome.INVALID if invalid_entry else SandboxOutcome(captured.status.value)
     output = captured.stdout[len(header) :] if entered else captured.stdout
+    error_output = captured.stderr
+    for host, native, _ in sorted(
+        payload_aliases(request), key=lambda item: len(str(item[1])), reverse=True
+    ):
+        output = output.replace(str(native), str(host))
+        error_output = error_output.replace(str(native), str(host))
+    if request.aliases:
+        parent = str(request.aliases[0][1].parent)
+        output = output.replace(str(NATIVE_ALIAS_PATH), parent)
+        error_output = error_output.replace(str(NATIVE_ALIAS_PATH), parent)
     extra = max(0, len(output) - MAX_OUTPUT_CHARS)
+    error_extra = max(0, len(error_output) - MAX_OUTPUT_CHARS)
     return CommandProcessResult(
         outcome,
         exit_code=captured.exit_code if outcome is SandboxOutcome.COMPLETED else None,
         stdout=output[:MAX_OUTPUT_CHARS],
-        stderr=captured.stderr,
+        stderr=error_output[:MAX_OUTPUT_CHARS],
         stdout_discarded=None
         if captured.stdout_discarded is None
         else captured.stdout_discarded + extra,
-        stderr_discarded=captured.stderr_discarded,
+        stderr_discarded=None
+        if captured.stderr_discarded is None
+        else captured.stderr_discarded + error_extra,
         detail="Trusted payload entry was not established." if invalid_entry else "",
         possible_effects=True,
         failure_context="Native trusted setup did not establish command entry."
@@ -273,7 +326,8 @@ def execution_authority(record: Path) -> None:
         OSError: Required protected installed or kernel authority is unavailable.
     """
     installed, authority = read_generation(record)
-    if not {"loop_payload.py", "policies/root/bootstrap.bin"} <= installed.artifacts.keys():
+    _require_runtime_revision(installed)
+    if not {PAYLOAD_FILENAME, "policies/root/bootstrap.bin"} <= installed.artifacts.keys():
         raise ValueError("Installed generation has no trusted payload entry.")
     with authority.open_verified():
         pass

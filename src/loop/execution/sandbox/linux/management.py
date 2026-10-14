@@ -10,6 +10,7 @@ import time
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
+from .... import constants
 from ....constants import (
     MAX_NATIVE_INSTALLATION_ENTRIES,
     MAX_NATIVE_POLICY_MODE_BYTES,
@@ -23,7 +24,30 @@ from ....constants import (
 )
 from ....utils.json import load_unique_json
 from .admission import GenerationAdmission
-from .constants import CGROUP_ROOT, SYSTEMCTL_PATH, UNSAFE_HOST_PATH_MODE_BITS
+from .constants import (
+    CACHE_LOCK_FILENAME,
+    CGROUP_ROOT,
+    COMPILER_LOCK_FILENAME,
+    MANAGEMENT_LOCK_FILENAME,
+    MANAGEMENT_RECORD_NAME,
+    NATIVE_RESERVATIONS_DIRECTORY_NAME,
+    RECEIPT_FILENAME,
+    SYSTEM_RUNTIME_DIRECTORY,
+    SYSTEMCTL_PATH,
+    SYSTEMD_ACTIVE_STATE_PROPERTY,
+    SYSTEMD_CONTROL_GROUP_PROPERTY,
+    SYSTEMD_DROP_IN_PATHS_PROPERTY,
+    SYSTEMD_FRAGMENT_PATH_PROPERTY,
+    SYSTEMD_LOAD_STATE_PROPERTY,
+    SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY,
+    SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+    SYSTEMD_SLICE_UNIT_SUFFIX,
+    SYSTEMD_SOCKET_UNIT_SUFFIX,
+    SYSTEMD_SUB_STATE_PROPERTY,
+    SYSTEMD_TRANSIENT_PROPERTY,
+    UNINSTALLER_FILENAME,
+    UNSAFE_HOST_PATH_MODE_BITS,
+)
 from .host import (
     MAX_COMPILED_BYTES,
     NATIVE_LOCK_SEEDS,
@@ -59,7 +83,6 @@ from .installation import (
 )
 from .mountinfo import read_mountinfo
 from .records import (
-    MANAGEMENT_RECORD_NAME,
     MAX_MANAGEMENT_RECORD_BYTES,
     read_generation,
 )
@@ -216,7 +239,9 @@ def publish_generation_record(
                     descriptor, bound.identity[4] + 1, 0
                 )
     contents[_RECORD] = data
-    executable = {name for name, bound in artifacts.items() if bound.identity[2] & 0o111}
+    executable = {
+        name for name, bound in artifacts.items() if bound.identity[2] & constants.EXECUTE_MODE_MASK
+    }
     staged = stage_generation_files(directory, contents, executable, lock)
     _, authority = read_generation(record)
     if staged[_RECORD] != authority:
@@ -256,8 +281,8 @@ def uninstall_authority(record: Path) -> tuple[HostFile, HostFile]:
         OSError: Protected installation authority cannot be inspected.
     """
     installed, authority = read_generation(record, partial=True)
-    entry = installed.artifacts.get("loop_uninstall.py")
-    if entry is None or not entry.identity[2] & 0o111:
+    entry = installed.artifacts.get(UNINSTALLER_FILENAME)
+    if entry is None or not entry.identity[2] & constants.EXECUTE_MODE_MASK:
         raise ValueError("Installation lacks its original exported uninstaller authority.")
     return authority, entry if entry.path.exists() else authority
 
@@ -294,7 +319,9 @@ def verify_uninstalled(root: Path, deadline: float) -> None:
     if root.exists() or root.is_symlink():
         if protected_path(root, directory=True) != root:
             raise ValueError("Installation directory aliases other authority.")
-        expected = {root / name for name in NATIVE_LOCK_SEEDS} | {root / "reservations"}
+        expected = {root / name for name in NATIVE_LOCK_SEEDS} | {
+            root / NATIVE_RESERVATIONS_DIRECTORY_NAME
+        }
         if not set(root.rglob("*")) <= expected:
             raise ValueError("Partial private installation inventory remains.")
         for name, data in NATIVE_LOCK_SEEDS.items():
@@ -304,11 +331,11 @@ def verify_uninstalled(root: Path, deadline: float) -> None:
             with bound.open_verified() as descriptor:
                 if (
                     bound.path != root / name
-                    or stat.S_IMODE(bound.identity[2]) != 0o444
+                    or stat.S_IMODE(bound.identity[2]) != constants.READ_ONLY_FILE_MODE
                     or os.pread(descriptor, len(data) + 1, 0) != data
                 ):
                     raise ValueError("Shared installation seed differs from fixed authority.")
-        reservations = root / "reservations"
+        reservations = root / NATIVE_RESERVATIONS_DIRECTORY_NAME
         if (reservations.exists() or reservations.is_symlink()) and (
             protected_path(reservations, directory=True) != reservations
             or list(reservations.iterdir())
@@ -345,9 +372,12 @@ def verify_uninstalled(root: Path, deadline: float) -> None:
     _retired_records_absent(tool, prefix, names, deadline)
     if _manager(tool, ["list-jobs", "--no-legend", "--", prefix + "*"], deadline).strip():
         raise ValueError("Loop manager jobs remain.")
-    if next(CGROUP_ROOT.glob(prefix + "*.slice"), None) is not None:
+    if next(CGROUP_ROOT.glob(prefix + "*" + SYSTEMD_SLICE_UNIT_SUFFIX), None) is not None:
         raise ValueError("Loop tracking remains.")
-    if next(Path("/run").glob(prefix + "*.socket"), None) is not None:
+    if (
+        next(SYSTEM_RUNTIME_DIRECTORY.glob(prefix + "*" + SYSTEMD_SOCKET_UNIT_SUFFIX), None)
+        is not None
+    ):
         raise ValueError("Loop listener remains.")
     policy, device = _policy_root()
     namespaces = policy / "namespaces"
@@ -438,7 +468,7 @@ def clean_unrecorded_installation(
             catalog["attachment.bin"] = attachment_bytes
         validate_generation_catalog(root, catalog, executables)
         expected = {root / name for name in catalog} | {
-            root / "receipt.json",
+            root / RECEIPT_FILENAME,
             config.reservation.path,
         }
         expected.update(
@@ -449,7 +479,7 @@ def clean_unrecorded_installation(
         )
         if protected_path(root, directory=True) != root:
             raise ValueError("Partial installation directory aliases other authority.")
-        receipt = root / "receipt.json"
+        receipt = root / RECEIPT_FILENAME
         observed = set()
         temporary_files = set()
         for count, path in enumerate(root.rglob("*"), 1):
@@ -478,7 +508,16 @@ def clean_unrecorded_installation(
                     path, limit, {receipt} if receipt_stage else set(candidates)
                 )
                 if (
-                    mode not in ({0o600, 0o444} if receipt_stage else {0o600, 0o444, 0o555})
+                    mode
+                    not in (
+                        {constants.PRIVATE_FILE_MODE, constants.READ_ONLY_FILE_MODE}
+                        if receipt_stage
+                        else {
+                            constants.PRIVATE_FILE_MODE,
+                            constants.READ_ONLY_FILE_MODE,
+                            constants.READ_ONLY_EXECUTABLE_FILE_MODE,
+                        }
+                    )
                     or not receipt_stage
                     and not any(value.startswith(data) for value in candidates.values())
                 ):
@@ -493,9 +532,16 @@ def clean_unrecorded_installation(
             if path not in observed:
                 continue
             bound = bind_host_file(path)
-            expected_mode = 0o555 if name in executables else 0o444
-            if name == "helper" and stat.S_IMODE(bound.identity[2]) == 0o444:
-                expected_mode = 0o444
+            expected_mode = (
+                constants.READ_ONLY_EXECUTABLE_FILE_MODE
+                if name in executables
+                else constants.READ_ONLY_FILE_MODE
+            )
+            if (
+                name == "helper"
+                and stat.S_IMODE(bound.identity[2]) == constants.READ_ONLY_FILE_MODE
+            ):
+                expected_mode = constants.READ_ONLY_FILE_MODE
             with bound.open_verified() as descriptor:
                 if (
                     stat.S_IMODE(bound.identity[2]) != expected_mode
@@ -506,7 +552,7 @@ def clean_unrecorded_installation(
             bound_receipt = bind_host_file(receipt)
             if (
                 bound_receipt.identity[4] > MAX_NATIVE_RECEIPT_BYTES
-                or stat.S_IMODE(bound_receipt.identity[2]) != 0o444
+                or stat.S_IMODE(bound_receipt.identity[2]) != constants.READ_ONLY_FILE_MODE
             ):
                 raise ValueError("Partial installation receipt differs from fixed file limits.")
         for path in observed:
@@ -519,7 +565,11 @@ def clean_unrecorded_installation(
             raise ValueError("Partial installation unit directory aliases other authority.")
         fragments = tuple(
             _UNIT_DIRECTORY / (unit_prefix + suffix)
-            for suffix in (".slice", ".socket", "@.service")
+            for suffix in (
+                SYSTEMD_SLICE_UNIT_SUFFIX,
+                SYSTEMD_SOCKET_UNIT_SUFFIX,
+                SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+            )
         )
         temporary_units = set(_UNIT_DIRECTORY.glob(".loop-unit-" + config.generation + "-*"))
         if (
@@ -535,7 +585,7 @@ def clean_unrecorded_installation(
                 MAX_NATIVE_UNIT_BYTES,
                 {_UNIT_DIRECTORY / unit for unit in units},
             )
-            if mode not in {0o600, 0o444} or not any(
+            if mode not in {constants.PRIVATE_FILE_MODE, constants.READ_ONLY_FILE_MODE} or not any(
                 value.encode().startswith(data) for value in units.values()
             ):
                 raise ValueError("Partial installation unit staging differs from fixed source.")
@@ -581,36 +631,47 @@ def clean_unrecorded_installation(
             deadline,
         ).strip():
             raise ValueError("Partial installation has receiver instances.")
-        _recursive_idle(CGROUP_ROOT / (unit_prefix + ".slice"), absent=True)
-        if next(CGROUP_ROOT.glob(native_prefix + "*.slice"), None) is not None:
+        _recursive_idle(CGROUP_ROOT / (unit_prefix + SYSTEMD_SLICE_UNIT_SUFFIX), absent=True)
+        if (
+            next(CGROUP_ROOT.glob(native_prefix + "*" + SYSTEMD_SLICE_UNIT_SUFFIX), None)
+            is not None
+        ):
             raise ValueError("Foreign native tracking remains.")
-        listener = Path("/run") / (unit_prefix + ".socket")
+        listener = SYSTEM_RUNTIME_DIRECTORY / (unit_prefix + SYSTEMD_SOCKET_UNIT_SUFFIX)
         if listener.exists() or listener.is_symlink():
             raise ValueError("Partial installation listener is active.")
-        if next(Path("/run").glob(native_prefix + "*.socket"), None) is not None:
+        if (
+            next(
+                SYSTEM_RUNTIME_DIRECTORY.glob(native_prefix + "*" + SYSTEMD_SOCKET_UNIT_SUFFIX),
+                None,
+            )
+            is not None
+        ):
             raise ValueError("Foreign native listener remains.")
         for fragment in fragments:
             fields = {
-                "LoadState",
-                "ActiveState",
-                "SubState",
-                "ControlGroup",
-                "FragmentPath",
-                "DropInPaths",
-                "NeedDaemonReload",
-                "Transient",
+                SYSTEMD_LOAD_STATE_PROPERTY,
+                SYSTEMD_ACTIVE_STATE_PROPERTY,
+                SYSTEMD_SUB_STATE_PROPERTY,
+                SYSTEMD_CONTROL_GROUP_PROPERTY,
+                SYSTEMD_FRAGMENT_PATH_PROPERTY,
+                SYSTEMD_DROP_IN_PATHS_PROPERTY,
+                SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY,
+                SYSTEMD_TRANSIENT_PROPERTY,
             }
             state = _retired_properties(tool, fragment.name, fields, deadline)
             if (
                 state.keys() != fields
-                or state.get("LoadState") != ("loaded" if fragment.exists() else "not-found")
-                or state.get("ActiveState") != "inactive"
-                or state.get("SubState") != "dead"
-                or state.get("ControlGroup")
-                or state.get("FragmentPath") != (str(fragment) if fragment.exists() else "")
-                or state.get("DropInPaths")
-                or state.get("NeedDaemonReload") != "no"
-                or state.get("Transient") != "no"
+                or state.get(SYSTEMD_LOAD_STATE_PROPERTY)
+                != ("loaded" if fragment.exists() else "not-found")
+                or state.get(SYSTEMD_ACTIVE_STATE_PROPERTY) != "inactive"
+                or state.get(SYSTEMD_SUB_STATE_PROPERTY) != "dead"
+                or state.get(SYSTEMD_CONTROL_GROUP_PROPERTY)
+                or state.get(SYSTEMD_FRAGMENT_PATH_PROPERTY)
+                != (str(fragment) if fragment.exists() else "")
+                or state.get(SYSTEMD_DROP_IN_PATHS_PROPERTY)
+                or state.get(SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY) != "no"
+                or state.get(SYSTEMD_TRANSIENT_PROPERTY) != "no"
             ):
                 raise ValueError("Partial installation unit remains active or changed.")
         policy, device = _policy_root()
@@ -694,7 +755,11 @@ def clean_unrecorded_installation(
                 nullcontext(),
                 tracking_absent=True,
             )
-        for suffix in (".slice", ".socket", "@.service"):
+        for suffix in (
+            SYSTEMD_SLICE_UNIT_SUFFIX,
+            SYSTEMD_SOCKET_UNIT_SUFFIX,
+            SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+        ):
             fragment = _UNIT_DIRECTORY / (unit_prefix + suffix)
             if fragment.exists() or fragment.is_symlink():
                 fragment.unlink()
@@ -702,7 +767,14 @@ def clean_unrecorded_installation(
         _retired_records_absent(
             tool,
             unit_prefix,
-            {unit_prefix + suffix for suffix in (".slice", ".socket", "@.service")},
+            {
+                unit_prefix + suffix
+                for suffix in (
+                    SYSTEMD_SLICE_UNIT_SUFFIX,
+                    SYSTEMD_SOCKET_UNIT_SUFFIX,
+                    SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+                )
+            },
             deadline,
         )
         for path in sorted(
@@ -745,10 +817,10 @@ def installation_status(*, details: bool = False) -> str:
     paths = {
         root,
         _NATIVE_RECORD,
-        root / "receipt.json",
-        root / "management.lock",
-        root / "compiler.lock",
-        root / "reservations",
+        root / RECEIPT_FILENAME,
+        root / MANAGEMENT_LOCK_FILENAME,
+        root / COMPILER_LOCK_FILENAME,
+        root / NATIVE_RESERVATIONS_DIRECTORY_NAME,
         _UNIT_DIRECTORY,
     }
     paths.update(root / name for name in runtime_member_names())
@@ -794,7 +866,7 @@ def installation_status(*, details: bool = False) -> str:
         except (OSError, ValueError, TypeError):
             inventory_complete = False
         if generation is None and not (_NATIVE_RECORD.exists() or _NATIVE_RECORD.is_symlink()):
-            reservations = root / "reservations"
+            reservations = root / NATIVE_RESERVATIONS_DIRECTORY_NAME
             try:
                 if reservations.exists() or reservations.is_symlink():
                     if protected_path(reservations, directory=True) != reservations:
@@ -812,7 +884,12 @@ def installation_status(*, details: bool = False) -> str:
     if generation is not None:
         prefix = NATIVE_UNIT_PREFIX + generation
         paths.update(
-            _UNIT_DIRECTORY / (prefix + suffix) for suffix in (".slice", ".socket", "@.service")
+            _UNIT_DIRECTORY / (prefix + suffix)
+            for suffix in (
+                SYSTEMD_SLICE_UNIT_SUFFIX,
+                SYSTEMD_SOCKET_UNIT_SUFFIX,
+                SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+            )
         )
     unit_safe = True
     try:
@@ -918,38 +995,62 @@ def _managed_settings(generation: str | None) -> list[str]:
     try:
         tool = bind_host_file(SYSTEMCTL_PATH)
         with tool.open_verified():
-            for kind, suffix in zip(kinds[:3], (".slice", ".socket", "@.service"), strict=True):
+            for kind, suffix in zip(
+                kinds[:3],
+                (
+                    SYSTEMD_SLICE_UNIT_SUFFIX,
+                    SYSTEMD_SOCKET_UNIT_SUFFIX,
+                    SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+                ),
+                strict=True,
+            ):
                 name = prefix + suffix
-                inspected = prefix + "@status.service" if suffix == "@.service" else name
+                inspected = (
+                    prefix + "@status.service"
+                    if suffix == SYSTEMD_SERVICE_TEMPLATE_SUFFIX
+                    else name
+                )
                 properties = _retired_properties(
                     tool,
                     inspected,
-                    {"LoadState", "ActiveState", "UnitFileState"},
+                    {SYSTEMD_LOAD_STATE_PROPERTY, SYSTEMD_ACTIVE_STATE_PROPERTY, "UnitFileState"},
                     time.monotonic() + _MANAGEMENT_STATUS_TIMEOUT_SECONDS,
                 )
                 state = {"loaded": "current", "not-found": "absent"}.get(
-                    properties.get("LoadState"), "unknown"
+                    properties.get(SYSTEMD_LOAD_STATE_PROPERTY), "unknown"
                 )
                 observed = {
                     field: value if re.fullmatch(r"[a-z-]{1,32}", value) else "unknown"
                     for field, value in properties.items()
                 }
-                active = "active" if suffix != "@.service" else "inactive (inspection instance)"
+                active = (
+                    "active"
+                    if suffix != SYSTEMD_SERVICE_TEMPLATE_SUFFIX
+                    else "inactive (inspection instance)"
+                )
                 enabled = "static"
                 settings.append(
                     f"  {kind}: {state}; {name}; inspected={inspected}; "
                     f"expected load=loaded active={active} "
-                    f"enablement={enabled}; observed load={observed.get('LoadState', 'unknown')} "
-                    f"active={observed.get('ActiveState', 'unknown')} "
+                    f"enablement={enabled}; observed load={observed.get(SYSTEMD_LOAD_STATE_PROPERTY, 'unknown')} "
+                    f"active={observed.get(SYSTEMD_ACTIVE_STATE_PROPERTY, 'unknown')} "
                     f"enablement={observed.get('UnitFileState', 'unknown')}"
                 )
     except (OSError, ValueError, TimeoutError):
         settings = [
             f"  {kind}: unknown; {prefix}{suffix}; expected load=loaded "
-            f"active={'inactive (inspection instance)' if suffix == '@.service' else 'active'} "
+            f"active={'inactive (inspection instance)' if suffix == SYSTEMD_SERVICE_TEMPLATE_SUFFIX else 'active'} "
             "enablement=static; "
             "observed load=unknown active=unknown enablement=unknown"
-            for kind, suffix in zip(kinds[:3], (".slice", ".socket", "@.service"), strict=True)
+            for kind, suffix in zip(
+                kinds[:3],
+                (
+                    SYSTEMD_SLICE_UNIT_SUFFIX,
+                    SYSTEMD_SOCKET_UNIT_SUFFIX,
+                    SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+                ),
+                strict=True,
+            )
         ]
     try:
         policy, device = _policy_root()
@@ -1057,7 +1158,7 @@ def _installation_cache(config, contents, executables, sources, source):
     """Validate required runtime roles and reserve generated policy/receipt catalog names."""
     receiver = config.receiver.name
     bootstrap = "loop/execution/sandbox/linux/bootstrap.py"
-    fixed = {receiver, "helper", "loop_uninstall.py", "cache.lock", bootstrap}
+    fixed = {receiver, "helper", UNINSTALLER_FILENAME, CACHE_LOCK_FILENAME, bootstrap}
     cache = {"attachment.apparmor": source}
     for relative, profiles in sources.items():
         for profile in profiles:
@@ -1065,8 +1166,8 @@ def _installation_cache(config, contents, executables, sources, source):
     cache["attachment.bin"] = b""
     if (
         not fixed <= contents.keys()
-        or not {receiver, "helper", "loop_uninstall.py"} <= executables
-        or set(contents) & {*cache, "receipt.json", _RECORD}
+        or not {receiver, "helper", UNINSTALLER_FILENAME} <= executables
+        or set(contents) & {*cache, RECEIPT_FILENAME, _RECORD}
     ):
         raise ValueError("Incomplete or conflicting installation catalog.")
     config.unit_sources()
@@ -1150,7 +1251,7 @@ def install_generation(
     )
     files = {role: published[role] for role in ("receiver", "socket_unit", "service_unit")}
     installed = provision_receipt(
-        directory / "receipt.json",
+        directory / RECEIPT_FILENAME,
         {
             "helper": artifacts["helper"].path,
             "parser": discover_tool("apparmor_parser").path,
@@ -1159,13 +1260,13 @@ def install_generation(
             "bootstrap": artifacts[bootstrap].path,
             "receiver": config.receiver,
             "compiler_lock": compiler_lock.path,
-            "cache_lock": artifacts["cache.lock"].path,
+            "cache_lock": artifacts[CACHE_LOCK_FILENAME].path,
             "socket_unit": files["socket_unit"].path,
             "service_unit": files["service_unit"].path,
         },
         lock,
     )
-    artifacts["receipt.json"] = installed["receipt"]
+    artifacts[RECEIPT_FILENAME] = installed["receipt"]
     record = publish_generation_record(
         runtime,
         files,

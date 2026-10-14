@@ -21,7 +21,7 @@ Forget and rekey require confirmation. Loop imports legacy sessions, policies, l
 
 ## See all settings
 
-The generated file contains every setting and its built-in value. Settings that can be unset, such as `context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort`, appear as commented `<unset>` entries because TOML has no null value.
+The generated file contains every setting and its built-in value. The example below shows commonly used settings. Settings that can be unset, such as `context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort`, appear as commented `<unset>` entries because TOML has no null value.
 
 ```toml
 # user config.toml
@@ -55,8 +55,8 @@ compaction_threshold = 0.8
 prompt_on_recoverable_error = true
 max_agent_turns = 25
 
-[web]
-user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+# Web requests use a browser-like user agent by default.
+# See "Web requests" below to override it.
 
 [tools]
 command_timeout = 60.0
@@ -143,7 +143,7 @@ The `loop` command accepts environment overrides for automation:
 | Reasoning effort            | `LOOP_REASONING_EFFORT`                 | unset                          |
 | Hyperparameter policy       | `OPENAI_HYPERPARAMETER_POLICY`          | `fallback`                     |
 | Web user agent              | `USER_AGENT`                            | browser-like user agent        |
-| Command timeout             | `LOOP_COMMAND_TIMEOUT`                  | `30.0`                         |
+| Command timeout             | `LOOP_COMMAND_TIMEOUT`                  | `60.0`                         |
 | Loop agent name             | `LOOP_AGENT_NAME`                       | `Loop`                         |
 | Loop model                  | `LOOP_MODEL`                            | unset                          |
 | Stream responses            | `LOOP_STREAM`                           | `true`                         |

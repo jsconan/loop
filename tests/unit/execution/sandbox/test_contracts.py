@@ -4,6 +4,7 @@ import ast
 import json
 import tempfile
 import time
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
@@ -743,7 +744,7 @@ def test_sandbox_results_distinguish_exit_status_from_boundary_failure():
 
 def test_sandbox_contract_has_no_host_execution_dependency():
     """Sandbox contract imports no host launcher or application retry authority."""
-    source = Path(__file__).parents[4] / "src/loop/execution/sandbox/contracts.py"
+    source = files("loop.execution.sandbox").joinpath("contracts.py")
     tree = ast.parse(source.read_text())
     names = {
         alias.name

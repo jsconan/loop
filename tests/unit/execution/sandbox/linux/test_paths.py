@@ -12,6 +12,7 @@ import pytest
 
 from loop.execution.sandbox.contracts import SandboxRequest
 from loop.execution.sandbox.linux import paths as linux_paths
+from loop.execution.sandbox.linux.constants import NATIVE_SCRATCH_PATH
 from loop.execution.sandbox.linux.paths import (
     bind_paths,
     mount_arguments,
@@ -942,7 +943,7 @@ def test_bind_paths_enforces_deadline_during_binding_and_before_yield(binding, m
         """Expire after path scanning at a selected binding boundary."""
         nonlocal calls
         calls += 1
-        return request.deadline if calls == {"source": 8, "recheck": 9, "yield": 11}[phase] else 0
+        return request.deadline if calls == {"source": 9, "recheck": 10, "yield": 12}[phase] else 0
 
     monkeypatch.setattr("loop.execution.sandbox.linux.paths.time.monotonic", clock)
     with (
@@ -978,7 +979,10 @@ def test_mount_arguments_preserves_grant_roles_protection_and_private_masks(bind
         protected_index = arguments.index(str(instruction))
         assert protected_index > nested_index
         assert arguments[protected_index - 2] == "--ro-bind-fd"
-        assert arguments[-2:] == ("--tmpfs", str(private))
+        assert arguments[-5:-3] == ("--dir", str(NATIVE_SCRATCH_PATH))
+        assert arguments[-3] == "--bind-fd"
+        assert arguments[-1] == str(NATIVE_SCRATCH_PATH)
+        assert int(arguments[-2]) in inherited
         assert str(private / "AGENTS.md") not in arguments
         assert set(inherited) < set(opened)
         assert workspace_fd in inherited
@@ -1047,6 +1051,71 @@ def test_large_hardlink_sets_group_at_a_shared_ancestor_when_needed(bound, tmp_p
         outside.write_text(f"module-{index}")
         os.link(outside, package / "module.py")
     assert prepare_paths(create(), scratch)[3] == (site_packages,)
+
+
+def test_scattered_hardlink_grouping_stops_when_its_deadline_expires(bound, tmp_path, monkeypatch):
+    """Expiry while classifying scattered links cannot return late mount authority."""
+    create, workspace, scratch = bound
+    monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
+    links = set()
+    for index in range(3):
+        directory = workspace / "group" / str(index)
+        directory.mkdir(parents=True)
+        outside = tmp_path / f"outside-{index}"
+        outside.write_text("canary")
+        link = directory / "linked"
+        os.link(outside, link)
+        links.add(link)
+    request = create()
+    clock = {"now": 0}
+    original = Path.is_relative_to
+
+    def relative(path, other):
+        """Let the preparation budget expire when a linked leaf is classified."""
+        result = original(path, other)
+        if path in links:
+            clock["now"] = request.deadline
+        return result
+
+    monkeypatch.setattr(Path, "is_relative_to", relative)
+    monkeypatch.setattr("loop.execution.sandbox.linux.paths.time.monotonic", lambda: clock["now"])
+    with pytest.raises(TimeoutError, match="exceeded the command deadline"):
+        prepare_paths(request, scratch)
+
+
+def test_hardlink_grouping_preserves_nested_writable_roots(bound, tmp_path, monkeypatch):
+    """A group containing another write root cannot silently make that root read-only."""
+    create, workspace, scratch = bound
+    monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
+    group = workspace / "group"
+    nested = group / "writable"
+    nested.mkdir(parents=True)
+    for index in range(3):
+        directory = group / str(index)
+        directory.mkdir()
+        outside = tmp_path / f"outside-{index}"
+        outside.write_text("canary")
+        os.link(outside, directory / "linked")
+    value = create(write_roots=(workspace, nested), read_roots=(group,))
+    with pytest.raises(ValueError, match="exceed the bounded mount limit"):
+        prepare_paths(value, scratch)
+
+
+def test_hardlink_grouping_updates_disjoint_ancestor_membership(bound, tmp_path, monkeypatch):
+    """Several narrow groups meet the cap without making their shared parent read-only."""
+    create, workspace, scratch = bound
+    monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 3)
+    leaves = []
+    for group, size in (("a", 2), ("b", 2), ("c", 1)):
+        for index in range(size):
+            directory = workspace / group / str(index)
+            directory.mkdir(parents=True)
+            outside = tmp_path / f"outside-{group}-{index}"
+            outside.write_text("canary")
+            leaf = directory / "linked"
+            os.link(outside, leaf)
+            leaves.append(leaf)
+    assert prepare_paths(create(), scratch)[3] == (workspace / "a", workspace / "b", leaves[-1])
 
 
 def test_large_root_hardlink_sets_fail_before_exceeding_mount_limit(bound, tmp_path, monkeypatch):
@@ -1161,6 +1230,70 @@ def test_mount_arguments_refuses_whole_filesystem_and_home_views(
     ):
         pytest.fail("broad host root produced mount arguments")
     assert not opened
+
+
+@pytest.mark.parametrize("reserved", ["NATIVE_SCRATCH_PATH", "NATIVE_ALIAS_PATH"])
+def test_mount_arguments_rejects_reserved_namespace_overlap(bound, monkeypatch, reserved):
+    """A request grant cannot replace or contain a private namespace destination."""
+    create, workspace, scratch = bound
+    monkeypatch.setattr(linux_paths, reserved, workspace / "private-view")
+
+    with (
+        pytest.raises(ValueError, match="namespace destination overlaps"),
+        mount_arguments(create(), scratch),
+    ):
+        pytest.fail("An overlapping mount authority was accepted")
+
+
+def test_mount_arguments_keeps_selected_workspace_read_only_in_scratch_mirror(binding):
+    """A workspace below scratch stays read-only through both pinned mount spellings."""
+    create, _, scratch, _ = binding
+    selected = scratch / "selected"
+    selected.mkdir()
+    (selected / "ordinary").write_text("selected")
+    request = create(cwd=selected, workspace=selected, write_roots=())
+    with mount_arguments(request, scratch) as (arguments, inherited):
+        for path in (selected, NATIVE_SCRATCH_PATH / "selected"):
+            index = arguments.index(str(path))
+            assert arguments[index - 2] == "--ro-bind-fd"
+            assert int(arguments[index - 1]) in inherited
+        index = arguments.index(str(NATIVE_SCRATCH_PATH))
+        assert arguments[index + 1] == "--bind-fd"
+
+
+def test_mount_arguments_mirrors_scratch_hardlinks_and_private_masks(binding, tmp_path):
+    """The stable scratch view retains read-only linked leaves and masked private entries."""
+    create, _, scratch, _ = binding
+    outside = tmp_path / "outside"
+    outside.write_text("preserve")
+    os.link(outside, scratch / "linked")
+    (scratch / ".ssh").mkdir()
+    (scratch / ".aws").write_text("private")
+    mask = tmp_path / "mask.empty"
+    mask.write_bytes(b"")
+    with (
+        mask.open("rb") as empty,
+        mount_arguments(create(), scratch, empty_mask=empty.fileno()) as (arguments, inherited),
+    ):
+        for name in ("linked", ".aws"):
+            path = NATIVE_SCRATCH_PATH / name
+            index = arguments.index(str(path))
+            assert arguments[index - 2] == "--ro-bind-fd"
+            assert int(arguments[index - 1]) in inherited
+        index = arguments.index(str(NATIVE_SCRATCH_PATH / ".ssh"))
+        assert arguments[index - 1] == "--tmpfs"
+
+
+def test_mount_arguments_maps_virtual_alias_targets_inside_scratch(binding, tmp_path):
+    """A namespace alias to private scratch cannot expose the original host spelling."""
+    create, _, scratch, _ = binding
+    parent = tmp_path / "mappings"
+    parent.mkdir(mode=0o700)
+    alias = parent / "r0"
+    alias.symlink_to(scratch)
+    request = create(aliases=(("/tmp", alias, scratch),))
+    with mount_arguments(request, scratch) as (arguments, _):
+        assert arguments[-3:] == ("--symlink", str(NATIVE_SCRATCH_PATH), "/.loop-private-paths/r0")
 
 
 @pytest.mark.parametrize("skip", [False, True])
@@ -1334,7 +1467,7 @@ def test_mount_arguments_validates_alias_targets_and_preserves_original_links(
             assert str(parent) in arguments
             index = arguments.index(str(parent))
             assert arguments[index - 2] == "--ro-bind-fd"
-            assert "--symlink" not in arguments
+            assert ("--symlink", str(external), "/.loop-private-paths/r0") == arguments[-3:]
             assert str(interior) not in arguments
         assert interior.resolve() == external
 
@@ -1394,7 +1527,11 @@ def test_mount_arguments_preserves_external_path_symlink_metadata(bound, monkeyp
     monkeypatch.setattr(os, "O_PATH", os.O_RDONLY, raising=False)
     request = create(environment={"PATH": str(alias), "TMPDIR": str(scratch)})
     with mount_arguments(request, scratch) as (arguments, _):
-        assert arguments[-3:] == ("--symlink", str(runtime), str(alias))
+        index = arguments.index("--symlink")
+        assert arguments[index : index + 3] == ("--symlink", str(runtime), str(alias))
+        assert arguments[-5:-3] == ("--dir", str(NATIVE_SCRATCH_PATH))
+        assert arguments[-3] == "--bind-fd"
+        assert arguments[-1] == str(NATIVE_SCRATCH_PATH)
 
 
 def test_mount_arguments_skips_path_roots_supplied_by_runtime_mount(bound, monkeypatch, tmp_path):

@@ -30,7 +30,6 @@ def compiler(monkeypatch):
     )
     state.render = Mock(side_effect=lambda *args, **kwargs: state.source)
     monkeypatch.setattr(linux_compiler, "payload_policy", state.render)
-    monkeypatch.setattr(linux_compiler, "runtime_read_roots", lambda: (Path("/usr"),))
     monkeypatch.setattr(linux_compiler, "compile_policy_source", state.compile)
     monkeypatch.setattr(linux_compiler.fcntl, "flock", state.flock)
     monkeypatch.setattr(linux_compiler.time, "monotonic", lambda: next(state.times))
@@ -40,7 +39,12 @@ def compiler(monkeypatch):
 def compile_request(state):
     """Prepare a current authorized payload through its public owner."""
     return linux_compiler.compile_payload(
-        state.request, Path("/scratch"), Path("/cache"), "payload", state.lock
+        state.request,
+        Path("/scratch"),
+        Path("/cache"),
+        "payload",
+        (Path("/usr"),),
+        state.lock,
     )
 
 

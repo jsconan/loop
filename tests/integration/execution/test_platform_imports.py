@@ -49,6 +49,7 @@ def test_retained_contract_import_avoids_filesystem_ignore_dependency(tmp_path):
         "utils/json.py",
         "permissions/protection.py",
         "execution/sandbox/contracts.py",
+        "execution/sandbox/constants.py",
     )
     for prefix in ("", "utils/", "permissions/", "execution/", "execution/sandbox/"):
         barrel = tmp_path / "loop" / prefix / "__init__.py"

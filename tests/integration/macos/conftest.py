@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import PermissionManager, RuntimeEnvironment, ToolRegistry
+from loop import PermissionManager, RuntimeEnvironment, Skill, SkillManager, ToolRegistry
 from loop.execution import CommandExecutionService
 from loop.execution.sandbox import SandboxRequest, UnavailableSandboxBackend, select_sandbox_backend
 from loop.instructions import InstructionsManager
@@ -38,8 +38,11 @@ def backend(monkeypatch):
 
 
 @pytest.fixture
-def native_workspace(tmp_path):
+def native_workspace(tmp_path, request):
     """Build fake control files and secrets without reading any user or project data."""
+    if getattr(request, "param", None) is not None:
+        tmp_path = tmp_path / request.param
+        tmp_path.mkdir()
     (tmp_path / ".ssh").mkdir()
     (tmp_path / ".ssh" / "id_ed25519").write_text("fake-private-canary", encoding="utf-8")
     (tmp_path / ".git").mkdir()
@@ -89,9 +92,16 @@ def public_command(backend, native_workspace):
     )
     scratch = native_workspace.parent / "instruction-scratch"
     scratch.mkdir()
+    skill_root = native_workspace.parent / "fixture-skill"
+    skill_root.mkdir()
+    skill_file = skill_root / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: fixture\ndescription: Native fixture.\n---\nRead resources.\n"
+    )
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(native_workspace, scratch),
-        agents_filenames=("AGENTS.md", "POLICY+.md"),
+        skill_manager=SkillManager([Skill("fixture", "Native fixture.", skill_file)]),
+        agents_filenames=("AGENTS.md", "POLICY+.md", 'POLICY"name.md', "POLICY\nname.md"),
     )
     registry = ToolRegistry(
         [
@@ -118,6 +128,15 @@ def public_command(backend, native_workspace):
         )
 
     try:
-        yield SimpleNamespace(call=call, host=host, interaction=interaction, registry=registry)
+        yield SimpleNamespace(
+            call=call,
+            host=host,
+            interaction=interaction,
+            registry=registry,
+            backend=backend,
+            instructions=instructions,
+            scratch=scratch,
+            skill_root=skill_root,
+        )
     finally:
         registry.close()

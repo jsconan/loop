@@ -54,6 +54,7 @@ def _enter_and_execute(request: Any, value: dict[str, Any]) -> None:
         _bound_host_file(value, "bootstrap"),
         _bound_host_file(value, "cache_lock"),
         base64.b64decode(value["compiled"], validate=True),
+        value["profile"],
         value["namespace"],
         value["uid"],
         reservation=_bound_host_file(value, "reservation"),

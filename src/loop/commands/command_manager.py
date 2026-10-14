@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
 from ..completion import CommandCompletion
-from ..errors import Problem
+from ..errors import Problem, ProblemException, log_problem
 from ..telemetry import telemetry_activity, telemetry_error
 from .command import Command, CommandRegistration, CommandsProvider
 from .context import CommandContext
 from .models import CommandArgumentError
 from .utils import takes_command_context
+
+_LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..interaction import Interaction
@@ -192,6 +195,8 @@ class CommandManager:
         Raises:
             CommandArgumentError: If argument syntax or binding is invalid and no interaction is
                 available to report it.
+            ProblemException: If a command reports a structured operational problem and no
+                interaction is available to display it.
             ValidationError: If arguments fail schema validation and no interaction is available
                 to report it.
             ValueError: If dispatch requires an unavailable interaction.
@@ -222,6 +227,8 @@ class CommandManager:
         Raises:
             CommandArgumentError: If argument syntax or binding is invalid and no
                 interaction is available to report it.
+            ProblemException: If a command reports a structured operational problem and no
+                interaction is available to display it.
             ValidationError: If arguments fail schema validation and no interaction is available
                 to report it.
             ValueError: If a slash-prefixed name is supplied or an interaction required for
@@ -257,6 +264,11 @@ class CommandManager:
             telemetry_activity("command.started", command=name)
             command.call(arguments, context)
             telemetry_activity("command.completed", command=name)
+        except ProblemException as exc:
+            log_problem(_LOGGER, exc.problem, exc)
+            if active_interaction is None:
+                raise
+            active_interaction.report(exc.problem)
         except (CommandArgumentError, ValidationError) as exc:
             telemetry_error(
                 "command.failed",

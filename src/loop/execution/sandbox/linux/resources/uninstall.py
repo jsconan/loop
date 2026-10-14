@@ -16,12 +16,13 @@ from pathlib import Path
 _MAX_MANAGEMENT_RECORD_BYTES = 65_536
 _UNSAFE_HOST_PATH_MODE_BITS = 0o6022
 _INITIAL_USER_NAMESPACE_UID_MAP = ("0", "0", "4294967295")
+_PROC_UID_MAP_PATH = Path("/proc/self/uid_map")
 
 
 def _reviewed_record_digest() -> str:
     """Require initial-host administrator authority and one reviewed record digest."""
     if os.getuid() != 0 or (
-        tuple(Path("/proc/self/uid_map").read_text(encoding="ascii").split())
+        tuple(_PROC_UID_MAP_PATH.read_text(encoding="ascii").split())
         != _INITIAL_USER_NAMESPACE_UID_MAP
     ):
         raise PermissionError("Uninstall requires initial-host administrator authentication.")

@@ -32,6 +32,13 @@ from ....utils import (
     read_bounded_stream,
     supervise_process,
 )
+from ..constants import (
+    LANG_ENVIRONMENT_VARIABLE,
+    MINIMAL_SYSTEM_PATH,
+    PATH_ENVIRONMENT_VARIABLE,
+    SYSTEM_LOCALE,
+    TMPDIR_ENVIRONMENT_VARIABLE,
+)
 from ..contracts import CommandProcessResult, SandboxOutcome, SandboxRequest
 
 _LAUNCHER = "/usr/bin/sandbox-exec"
@@ -282,6 +289,11 @@ def _literal(path: Path | str) -> str:
     return json.dumps(str(path))
 
 
+def _regex(pattern: str) -> str:
+    """Encode regex syntax as an ordinary Seatbelt string, not a raw regex literal."""
+    return f"(regex {_literal(pattern)})"
+
+
 def _check_deadline(deadline: float) -> float:
     """Return remaining preparation time or stop before the command can launch."""
     remaining = deadline - time.monotonic()
@@ -369,7 +381,7 @@ def _darwin_temp(cached: Path | None, deadline: float) -> Path:
     if (
         not stat.S_ISDIR(before.st_mode)
         or before.st_uid != os.getuid()
-        or stat.S_IMODE(before.st_mode) & 0o077
+        or stat.S_IMODE(before.st_mode) & constants.GROUP_AND_OTHER_MODE_MASK
     ):
         raise ValueError(f"Unsafe Darwin user temporary directory: {root}")
     with os.scandir(root) as entries:
@@ -454,6 +466,47 @@ def _python_environment_configs(request: SandboxRequest) -> tuple[Path, ...]:
     return tuple(configs)
 
 
+def _exact_executable_reads(request: SandboxRequest) -> tuple[Path, ...]:
+    """Validate exact external executable authority without exposing its directory."""
+    reads = (*_SYSTEM_READ_ROOTS, request.workspace, *request.read_roots)
+    paths = set()
+    for _, spelling, resolved, device, inode in request.executable_identities:
+        if any(resolved.is_relative_to(root) for root in reads):
+            continue
+        root = next(
+            (
+                canonical
+                for _, canonical in _search_roots(request)
+                if resolved.is_relative_to(canonical)
+            ),
+            None,
+        )
+        if (
+            root is None
+            or is_protected_external_read(spelling)
+            or is_protected_external_read(resolved)
+        ):
+            raise ValueError("Unsafe exact executable path.")
+        directory = root.stat()
+        details = resolved.lstat()
+        if (
+            spelling.resolve(strict=True) != resolved
+            or resolved.resolve(strict=True) != resolved
+            or not stat.S_ISREG(details.st_mode)
+            or (details.st_dev, details.st_ino) != (device, inode)
+            or directory.st_uid not in (0, os.getuid())
+            or directory.st_mode & constants.OTHER_WRITE_MODE_BIT
+            or directory.st_mode & constants.GROUP_WRITE_MODE_BIT
+            and directory.st_gid != os.getgid()
+            or details.st_uid not in (0, os.getuid())
+            or details.st_mode & constants.GROUP_AND_OTHER_WRITE_MODE_MASK
+            or details.st_nlink != 1
+        ):
+            raise ValueError("Unsafe exact executable authority.")
+        paths.update((spelling, resolved))
+    return tuple(sorted(paths))
+
+
 def _profile(
     request: SandboxRequest,
     scratch: Path,
@@ -463,7 +516,14 @@ def _profile(
     rename_anchors: tuple[Path, ...] = (),
 ) -> str:
     """Build the reviewed Seatbelt profile from bound roots only."""
-    for root in (request.workspace, *request.read_roots, *request.read_aliases):
+    for root in (
+        request.workspace,
+        *request.read_roots,
+        *request.read_aliases,
+        *request.write_roots,
+        *(target for _, _, target in request.aliases),
+        scratch,
+    ):
         if is_protected_external_read(root):
             raise ValueError(f"Protected directory cannot be a read root: {root}")
     search_roots = _search_roots(request)
@@ -492,6 +552,8 @@ def _profile(
         + " ".join(f"(literal {_literal(path)})" for path in compatibility_files)
         + " "
         + " ".join(f"(literal {_literal(alias)})" for _, alias, _ in request.aliases)
+        + " "
+        + " ".join(f"(literal {_literal(path)})" for path in _exact_executable_reads(request))
     )
     search_metadata = (
         " ".join(
@@ -501,7 +563,7 @@ def _profile(
         + " "
         + " ".join(f"(literal {_literal(path)})" for path in limited_search)
         + " "
-        + " ".join(f'(regex #"^{re.escape(str(path))}/[^/]+$")' for path in limited_search)
+        + " ".join(_regex(f"^{re.escape(str(path))}/[^/]+$") for path in limited_search)
     )
     search_metadata_rule = (
         f"(allow file-read-metadata {search_metadata})" if search_metadata.strip() else ""
@@ -528,7 +590,7 @@ def _profile(
     protected_patterns.extend(
         f"^{workspace_pattern}/(.*/)?{re.escape(file)}$" for file in protection.files
     )
-    protected = " ".join(f'(regex #"{pattern}")' for pattern in protected_patterns)
+    protected = " ".join(_regex(pattern) for pattern in protected_patterns)
     private_names = (
         "("
         + "|".join(
@@ -542,25 +604,25 @@ def _profile(
         )
         + ")"
     )
+    # Fresh command scratch contains command-created fixtures, not ambient host data.
     private_roots = dict.fromkeys(
-        (
-            *_SYSTEM_READ_ROOTS,
-            request.workspace,
-            *request.read_roots,
-            *request.read_aliases,
-            *(path for path, _ in search_roots),
-            *(real for _, real in search_roots),
+        root
+        for root in (
+            *reads,
+            *request.write_roots,
+            *search_paths,
             _trusted_home(),
         )
+        if root != scratch
     )
     private_reads = " ".join(
-        f'(regex #"^{re.escape(str(root).rstrip("/"))}/(.*/)?{private_names}(/.*)?$")'
+        _regex(f"^{re.escape(str(root).rstrip('/'))}/(.*/)?{private_names}(/.*)?$")
         for root in private_roots
     )
     temp_prefix = re.escape(str(darwin_temp))
     hex_suffix = "[0-9A-Fa-f]" * 6
     temp_rules = " ".join(
-        f'(regex #"^{pattern}$")'
+        _regex(f"^{pattern}$")
         for pattern in (
             temp_prefix + r"/xcrun_db-[A-Za-z0-9]*",
             temp_prefix + r"/[^/]*-" + hex_suffix + r"\.o",
@@ -892,7 +954,7 @@ class MacOSSeatbeltBackend:
         descriptors: tuple[int, ...],
         deadline: float,
     ) -> ProcessCapture | None:
-        """Run fixed argv under Seatbelt with only preopened content descriptors.
+        """Run fixed argv with selected content and verified installed-tool runtime reads.
 
         Args:
             executable (Path): Canonical installed helper to copy into private state.
@@ -928,20 +990,29 @@ class MacOSSeatbeltBackend:
                     while chunk := source.read(_HELPER_COPY_CHUNK_BYTES):
                         _check_deadline(deadline)
                         target.write(chunk)
-                helper.chmod(executable_details.st_mode & 0o777)
+                helper.chmod(executable_details.st_mode & constants.FILE_MODE_PERMISSION_MASK)
+                tool_roots, tool_aliases = self.installed_tool_roots(executable)
+                if not all(self.managed_tool_root(root) for root in tool_roots):
+                    tool_roots, tool_aliases = (), ()
                 request = SandboxRequest.create(
                     source="read-only argv",
                     cwd=workspace,
                     workspace=workspace,
-                    read_roots=(),
+                    read_roots=tool_roots,
+                    read_aliases=tuple(alias for alias, _, _, _ in tool_aliases),
                     write_roots=(),
                     network=False,
-                    environment={"PATH": "/usr/bin:/bin", "LANG": "C", "TMPDIR": str(scratch)},
+                    environment={
+                        PATH_ENVIRONMENT_VARIABLE: MINIMAL_SYSTEM_PATH,
+                        LANG_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+                        TMPDIR_ENVIRONMENT_VARIABLE: str(scratch),
+                    },
                     policy_version=self.policy_version,
                     deadline=deadline,
                     workspace_id="read-only-argv",
                 )
-                _walk_granted_root(workspace, deadline)
+                for root in (workspace, *tool_roots):
+                    _walk_granted_root(root, deadline)
                 if not request.paths_are_current():
                     return None
                 _check_deadline(deadline)
@@ -994,7 +1065,7 @@ class MacOSSeatbeltBackend:
         if failure := _request_failure(request):
             return failure
         try:
-            bound_scratch = request.shell_environment().get("TMPDIR")
+            bound_scratch = request.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE)
             scratch_context = (
                 nullcontext(bound_scratch)
                 if bound_scratch is not None
@@ -1006,7 +1077,7 @@ class MacOSSeatbeltBackend:
                 if (
                     not stat.S_ISDIR(details.st_mode)
                     or details.st_uid != os.getuid()
-                    or stat.S_IMODE(details.st_mode) != 0o700
+                    or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
                     or (bound_scratch is not None and str(scratch) != directory)
                     or not scratch.name.startswith(self.scratch_prefix)
                 ):
@@ -1018,6 +1089,7 @@ class MacOSSeatbeltBackend:
                         request.workspace,
                         *request.read_roots,
                         *request.write_roots,
+                        *(target for _, _, target in request.aliases),
                         scratch,
                     )
                 ):
@@ -1025,14 +1097,14 @@ class MacOSSeatbeltBackend:
                         root,
                         request.deadline,
                         rename_anchors=rename_anchors
-                        if root == request.workspace or root in request.write_roots
+                        if root in (request.workspace, scratch, *request.write_roots)
                         else None,
                         protection=request.protected_paths if root == request.workspace else None,
                     )
                 guarded_anchors = tuple(sorted(rename_anchors))
                 darwin_temp = self._diagnostics.darwin_temp(request.deadline)
                 environment = request.shell_environment()
-                environment["TMPDIR"] = str(scratch)
+                environment[TMPDIR_ENVIRONMENT_VARIABLE] = str(scratch)
                 if failure := _request_failure(request):
                     return failure
                 if not self._diagnostics.parent_verified():
@@ -1083,6 +1155,7 @@ class MacOSSeatbeltBackend:
                 try:
                     if failure := _request_failure(request):
                         return failure
+                    _exact_executable_reads(request)
                     return self._execute(request, profile, environment, tag, monitor)
                 finally:
                     monitor.unregister(tag)

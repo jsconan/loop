@@ -13,24 +13,32 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .... import constants
 from ....constants import (
     MAX_NATIVE_REQUEST_BYTES,
     MAX_NATIVE_UNIT_BYTES,
     NATIVE_ADMISSION_SOCKET_MODE,
     NATIVE_UNIT_PREFIX,
 )
+from ..constants import INITIAL_USER_NAMESPACE_UID_MAP
 from .constants import (
+    CGROUP_PROCS_FILENAME,
     CGROUP_ROOT,
-    INITIAL_USER_NAMESPACE_UID_MAP,
     NATIVE_REQUEST_MAGIC,
     PEER_CREDENTIALS_FORMAT,
     PEER_CREDENTIALS_SIZE,
+    PROC_STATUS_PATH,
     PROC_UID_MAP_PATH,
     REQUEST_LENGTH_FORMAT,
     REQUEST_LENGTH_SIZE,
     SETPRIV_PATH,
     SO_PEERCRED_OPTION_FALLBACK,
     SYSTEM_PYTHON_PATH,
+    SYSTEM_RUNTIME_DIRECTORY,
+    SYSTEMD_CONTROL_GROUP_PROPERTY,
+    SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+    SYSTEMD_SLICE_UNIT_SUFFIX,
+    SYSTEMD_SOCKET_UNIT_SUFFIX,
 )
 from .host import HostFile, bind_host_file, protected_path
 from .installation import generation_limits
@@ -43,7 +51,7 @@ _SO_DOMAIN_OPTION = getattr(socket, "SO_DOMAIN", 39)
 _SO_PEERCRED_OPTION = getattr(socket, "SO_PEERCRED", SO_PEERCRED_OPTION_FALLBACK)
 _SOCKET_BACKLOG = 16
 _SOCKET_MAX_CONNECTIONS = 32
-_RECEIVER_UMASK = 0o077
+_RECEIVER_UMASK = constants.GROUP_AND_OTHER_MODE_MASK
 
 
 @dataclass(frozen=True)
@@ -97,27 +105,28 @@ class GenerationAdmission:
             raise ValueError("Invalid fixed generation admission authority.")
 
         prefix = NATIVE_UNIT_PREFIX + self.generation
-        if self.slice_unit.path.name != prefix + ".slice":
+        if self.slice_unit.path.name != prefix + SYSTEMD_SLICE_UNIT_SUFFIX:
             raise ValueError("Generation slice fragment differs from fixed authority.")
 
         return {
-            prefix + ".slice": "[Unit]\nDescription=Loop protected generation\n[Slice]\n",
-            prefix + ".socket": (
+            prefix
+            + SYSTEMD_SLICE_UNIT_SUFFIX: "[Unit]\nDescription=Loop protected generation\n[Slice]\n",
+            prefix + SYSTEMD_SOCKET_UNIT_SUFFIX: (
                 "[Unit]\nDescription=Loop ordinary command admission\n[Socket]\n"
-                f"ListenStream=/run/{prefix}.socket\nAccept=yes\n"
+                f"ListenStream={SYSTEM_RUNTIME_DIRECTORY}/{prefix}{SYSTEMD_SOCKET_UNIT_SUFFIX}\nAccept=yes\n"
                 f"SocketUser={self.uid}\nSocketGroup={self.gid}\n"
                 f"SocketMode={NATIVE_ADMISSION_SOCKET_MODE:04o}\n"
                 f"Backlog={_SOCKET_BACKLOG}\n"
                 f"MaxConnections={_SOCKET_MAX_CONNECTIONS}\nRemoveOnStop=yes\n"
             ),
-            prefix + "@.service": (
+            prefix + SYSTEMD_SERVICE_TEMPLATE_SUFFIX: (
                 "[Unit]\nDescription=Loop protected command receiver\n[Service]\n"
                 "Type=exec\nExitType=cgroup\n"
                 f"ExecStart={SETPRIV_PATH} --reuid={self.uid} --regid={self.gid} "
                 "--clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all "
                 f"--no-new-privs {SYSTEM_PYTHON_PATH} -I -B {self.receiver}\n"
                 "User=0\nGroup=0\n"
-                f"Slice={prefix}.slice\n"
+                f"Slice={prefix}{SYSTEMD_SLICE_UNIT_SUFFIX}\n"
                 "StandardInput=socket\nStandardOutput=socket\nStandardError=journal\n"
                 "ProtectControlGroups=yes\nDelegate=no\nKillMode=control-group\n"
                 "MemoryPressureWatch=off\n"
@@ -149,8 +158,7 @@ def _tracking(config: GenerationAdmission) -> tuple[str, Path]:
         raise ValueError("Receiver must have only its fixed ordinary host identity.")
 
     status = dict(
-        line.split(":", 1)
-        for line in Path("/proc/self/status").read_text(encoding="ascii").splitlines()
+        line.split(":", 1) for line in PROC_STATUS_PATH.read_text(encoding="ascii").splitlines()
     )
     if status.get("NoNewPrivs", "").strip() != "1" or any(
         int(status.get(name, "-1"), 16) != 0
@@ -210,10 +218,14 @@ def _tracking(config: GenerationAdmission) -> tuple[str, Path]:
         if protected_path(path, directory=True) != path:
             raise ValueError("Generation cgroup ancestry is aliased.")
 
-        for name in ("cgroup.procs", "cgroup.threads", "cgroup.subtree_control"):
+        for name in (CGROUP_PROCS_FILENAME, "cgroup.threads", "cgroup.subtree_control"):
             details = (path / name).lstat()
 
-            if not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or details.st_mode & 0o022:
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != 0
+                or details.st_mode & constants.GROUP_AND_OTHER_WRITE_MODE_MASK
+            ):
                 raise ValueError("Generation membership authority is delegated.")
 
     if (group / "cgroup.type").read_text(encoding="ascii").strip() != "domain":
@@ -281,13 +293,19 @@ def receive_request(
     service, group = _tracking(config)
     prefix = NATIVE_UNIT_PREFIX + config.generation
 
-    for role, name in (("socket_unit", prefix + ".socket"), ("service_unit", prefix + "@.service")):
+    for role, name in (
+        ("socket_unit", prefix + SYSTEMD_SOCKET_UNIT_SUFFIX),
+        ("service_unit", prefix + SYSTEMD_SERVICE_TEMPLATE_SUFFIX),
+    ):
         with files[role].open_verified(deadline=deadline) as fd:
             if os.pread(fd, MAX_NATIVE_UNIT_BYTES + 1, 0) != sources[name].encode():
                 raise ValueError("Installed admission unit differs from fixed contract.")
 
     with config.slice_unit.open_verified(deadline=deadline) as fd:
-        if os.pread(fd, MAX_NATIVE_UNIT_BYTES + 1, 0) != sources[prefix + ".slice"].encode():
+        if (
+            os.pread(fd, MAX_NATIVE_UNIT_BYTES + 1, 0)
+            != sources[prefix + SYSTEMD_SLICE_UNIT_SUFFIX].encode()
+        ):
             raise ValueError("Installed generation slice differs from fixed contract.")
 
     if files["receiver"].path != config.receiver:
@@ -297,11 +315,18 @@ def receive_request(
         bind_host_file(Path(path), deadline=deadline) for path in (SETPRIV_PATH, SYSTEM_PYTHON_PATH)
     ]
 
-    command = sources[prefix + "@.service"].split("ExecStart=", 1)[1].split("\n", 1)[0]
+    command = (
+        sources[prefix + SYSTEMD_SERVICE_TEMPLATE_SUFFIX]
+        .split("ExecStart=", 1)[1]
+        .split("\n", 1)[0]
+    )
     attest_units(
         files,
         {
-            prefix + ".socket": {"Listen": f"/run/{prefix}.socket (Stream)", "Accept": "yes"},
+            prefix + SYSTEMD_SOCKET_UNIT_SUFFIX: {
+                "Listen": f"{SYSTEM_RUNTIME_DIRECTORY}/{prefix}{SYSTEMD_SOCKET_UNIT_SUFFIX} (Stream)",
+                "Accept": "yes",
+            },
             service: {
                 "ExecStart": (
                     f"{{ path={SETPRIV_PATH} ; argv[]="
@@ -312,8 +337,8 @@ def receive_request(
                 "User": "0",
                 "Group": "0",
                 "MainPID": str(os.getpid()),
-                "Slice": prefix + ".slice",
-                "ControlGroup": "/" + str(group.relative_to(CGROUP_ROOT)),
+                "Slice": prefix + SYSTEMD_SLICE_UNIT_SUFFIX,
+                SYSTEMD_CONTROL_GROUP_PROPERTY: "/" + str(group.relative_to(CGROUP_ROOT)),
                 "NoNewPrivileges": "yes",
                 "ExitType": "cgroup",
                 "MemoryPressureWatch": "off",
@@ -327,7 +352,8 @@ def receive_request(
         if (
             connection.getsockopt(socket.SOL_SOCKET, _SO_DOMAIN_OPTION) != socket.AF_UNIX
             or connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
-            or connection.getsockname() != f"/run/{prefix}.socket"
+            or connection.getsockname()
+            != f"{SYSTEM_RUNTIME_DIRECTORY}/{prefix}{SYSTEMD_SOCKET_UNIT_SUFFIX}"
         ):
             raise ValueError("Receiver descriptor is not its activated local stream.")
 

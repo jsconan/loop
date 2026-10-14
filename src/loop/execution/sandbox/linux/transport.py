@@ -12,7 +12,6 @@ import socket
 import stat
 import struct
 import time
-from pathlib import Path
 
 from ....constants import (
     MAX_NATIVE_RESULT_BYTES,
@@ -28,6 +27,10 @@ from .constants import (
     PEER_CREDENTIALS_SIZE,
     REQUEST_LENGTH_FORMAT,
     SO_PEERCRED_OPTION_FALLBACK,
+    SYSTEM_RUNTIME_DIRECTORY,
+    SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+    SYSTEMD_SLICE_UNIT_SUFFIX,
+    SYSTEMD_SOCKET_UNIT_SUFFIX,
 )
 from .host import HostFile, protected_path
 from .installation import generation_limits
@@ -53,9 +56,9 @@ def _authority(config: GenerationAdmission, files: dict[str, HostFile], deadline
         raise ValueError("Transport receiver differs from original generation authority.")
     prefix = NATIVE_UNIT_PREFIX + config.generation
     for bound, name in (
-        (config.slice_unit, prefix + ".slice"),
-        (files["socket_unit"], prefix + ".socket"),
-        (files["service_unit"], prefix + "@.service"),
+        (config.slice_unit, prefix + SYSTEMD_SLICE_UNIT_SUFFIX),
+        (files["socket_unit"], prefix + SYSTEMD_SOCKET_UNIT_SUFFIX),
+        (files["service_unit"], prefix + SYSTEMD_SERVICE_TEMPLATE_SUFFIX),
     ):
         _remaining(deadline)
         with bound.open_verified(deadline=deadline) as descriptor:
@@ -130,7 +133,9 @@ def exchange_request(
     ):
         raise ValueError("Transport requires the fixed ordinary generation identity.")
     _authority(config, files, deadline)
-    path = Path("/run") / (NATIVE_UNIT_PREFIX + config.generation + ".socket")
+    path = SYSTEM_RUNTIME_DIRECTORY / (
+        NATIVE_UNIT_PREFIX + config.generation + SYSTEMD_SOCKET_UNIT_SUFFIX
+    )
     if protected_path(path.parent, directory=True) != path.parent:
         raise ValueError("Transport socket parent is aliased.")
     original = path.lstat()

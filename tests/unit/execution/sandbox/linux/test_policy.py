@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from loop.execution.sandbox.contracts import SandboxRequest
-from loop.execution.sandbox.linux.policy import _literal, payload_policy
+from loop.execution.sandbox.linux import policy as linux_policy
+from loop.execution.sandbox.linux.policy import _literal, payload_policy, payload_profile
 
 
 @pytest.fixture
@@ -86,6 +87,96 @@ def test_payload_policy_deduplicates_only_exact_authorized_roots(bound):
     assert render(create(), scratch) == render(
         create(read_roots=(workspace,), write_roots=(workspace, workspace)), scratch
     )
+
+
+def test_payload_profile_reuses_only_identical_policy_across_fresh_scratch(bound):
+    """Fresh host scratch and command source reuse one exact stable-path policy profile."""
+    create, workspace, scratch = bound
+    second_scratch = scratch.parent / "second-scratch"
+    second_scratch.mkdir(mode=0o700)
+    cache = Path("/run/cache.lock")
+    runtime_roots = (Path("/usr"),)
+    first = create(source="printf first")
+    second = create(
+        source="printf second",
+        environment={"TMPDIR": str(second_scratch), "PATH": "/usr/bin:/bin"},
+    )
+
+    first_profile = payload_profile(first, scratch, cache, runtime_roots)
+    second_profile = payload_profile(second, second_scratch, cache, runtime_roots)
+
+    assert first_profile == second_profile
+    assert payload_policy(
+        first, scratch, cache, first_profile, runtime_roots=runtime_roots
+    ) == payload_policy(second, second_scratch, cache, second_profile, runtime_roots=runtime_roots)
+
+    extra = workspace.parent / "extra-read"
+    extra.mkdir()
+    changed = create(read_roots=(extra,))
+    assert payload_profile(changed, scratch, cache, runtime_roots) != first_profile
+
+
+def test_payload_policy_grants_stable_namespace_scratch_not_host_spelling(bound):
+    """A profile cannot read or write a command's unique host scratch path directly."""
+    create, _, scratch = bound
+    policy = render(create(), scratch)
+
+    assert str(scratch) not in policy
+    assert _literal("/.loop-private-scratch") in policy
+
+
+def test_payload_profile_reuses_virtual_alias_authority_without_host_names(bound):
+    """Fresh symlink spellings reuse policy only when their actual target grant is unchanged."""
+    create, workspace, scratch = bound
+    requests = []
+    for name in ("first", "second"):
+        parent = workspace.parent / name
+        parent.mkdir(mode=0o700)
+        alias = parent / "r0"
+        alias.symlink_to(workspace)
+        requests.append(create(aliases=(("/workspace", alias, workspace),)))
+    cache = Path("/run/cache.lock")
+    profiles = [payload_profile(request, scratch, cache, (Path("/usr"),)) for request in requests]
+    assert profiles[0] == profiles[1]
+    for request in requests:
+        policy = render(request, scratch)
+        assert _literal(str(request.aliases[0][1])) not in policy
+        assert _literal("/.loop-private-paths/r0") in policy
+    extra = workspace.parent / "other-target"
+    extra.mkdir()
+    parent = workspace.parent / "third"
+    parent.mkdir(mode=0o700)
+    alias = parent / "r0"
+    alias.symlink_to(extra)
+    changed = create(read_roots=(extra,), aliases=(("/workspace", alias, extra),))
+    assert payload_profile(changed, scratch, cache, (Path("/usr"),)) != profiles[0]
+
+
+def test_payload_profile_reuses_selected_workspace_with_fresh_private_backing(bound):
+    """Selected snapshots share stable policy while retaining distinct host directories."""
+    create, workspace, _ = bound
+    profiles = []
+    for name in ("first-search", "second-search"):
+        scratch = workspace.parent / name
+        scratch.mkdir(mode=0o700)
+        selected = scratch / "selected"
+        selected.mkdir()
+        request = create(
+            cwd=selected, workspace=selected, write_roots=(), environment={"TMPDIR": str(scratch)}
+        )
+        profiles.append(payload_profile(request, scratch, Path("/run/cache.lock"), (Path("/usr"),)))
+        assert _literal(str(selected)) not in render(request, scratch)
+        assert _literal("/.loop-private-scratch/selected") in render(request, scratch)
+    assert profiles[0] == profiles[1]
+
+
+def test_payload_profile_refuses_a_noncanonical_policy_template(bound, monkeypatch):
+    """Profile naming fails closed if the renderer omits its exact placeholder header."""
+    create, _, scratch = bound
+    monkeypatch.setattr(linux_policy, "payload_policy", lambda *_args, **_kwargs: "profile other")
+
+    with pytest.raises(ValueError, match="one exact profile name"):
+        payload_profile(create(), scratch, Path("/run/cache.lock"), (Path("/usr"),))
 
 
 def test_payload_policy_preserves_manual_reads_and_writes_separately(bound):
@@ -210,18 +301,26 @@ def test_payload_policy_git_exception_preserves_nested_git_and_other_controls(bo
     assert "{,**/}\\x41\\x47\\x45\\x4e\\x54\\x53\\x2e\\x6d\\x64" in policy
 
 
-def test_payload_policy_denies_private_names_in_granted_roots_but_not_scratch(bound):
-    """Private names stay denied in granted trees while disposable scratch remains writable."""
+def test_payload_policy_denies_private_names_in_every_granted_root(bound):
+    """Runtime and request grants protect private data without blocking new scratch fixtures."""
     create, workspace, scratch = bound
     external = workspace.parent / "external"
     external.mkdir()
-    policy = render(create(read_roots=(external,), write_roots=(workspace, external)), scratch)
-    for root in (workspace, external):
+    runtime_roots = (Path("/usr"), Path("/usr/lib64"), Path("/lib64"))
+    policy = render(
+        create(read_roots=(external,), write_roots=(workspace, external)),
+        scratch,
+        runtime_roots=runtime_roots,
+    )
+    for root in (*runtime_roots, workspace, external):
         prefix = _literal(str(root))
-        assert f'deny "{prefix}/{{,**/}}.[sS][sS][hH]" rwkl,' in policy
-        assert f'deny "{prefix}/{{,**/}}.[cC][oO][nN][fF][iI][gG]/{{,**}}" rwkl,' in policy
-    assert 'deny "/{,**/}.[sS][sS][hH]" rwkl,' not in policy
-    assert f'deny "{_literal(str(scratch))}/{{,**/}}.loop" rwkl,' not in policy
+        assert f'deny "{prefix}/{{,**/}}.[sS][sS][hH]" rwklmx,' in policy
+        assert f'deny "{prefix}/{{,**/}}.[cC][oO][nN][fF][iI][gG]/{{,**}}" rwklmx,' in policy
+    assert 'deny "/{,**/}.[sS][sS][hH]" rwklmx,' not in policy
+    assert (
+        f'deny "{_literal("/.loop-private-scratch")}/{{,**/}}.[sS][sS][hH]" rwklmx,' not in policy
+    )
+    assert _literal(str(scratch)) not in policy
 
 
 def test_payload_policy_root_workspace_preserves_protected_name_scope(bound):

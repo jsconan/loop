@@ -216,8 +216,11 @@ def test_trusted_file_owners_follow_live_user_namespace_mapping(
     assert execution_facade._trusted_file_owner_ids() == expected
 
 
-def test_run_command_binds_an_unmanaged_path_tool_as_one_exact_file(tmp_path, monkeypatch):
-    """An ordinary PATH command needs no directory read grant to launch its exact tool file."""
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_run_command_binds_an_unmanaged_path_tool_as_one_exact_file(
+    tmp_path, monkeypatch, platform
+):
+    """Each platform binds exact tool access without inferring directory reads or a custom mask."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     tools = tmp_path / "tools"
@@ -227,7 +230,7 @@ def test_run_command_binds_an_unmanaged_path_tool_as_one_exact_file(tmp_path, mo
     executable.chmod(0o755)
     details = executable.stat()
     monkeypatch.setenv("PATH", str(tools))
-    monkeypatch.setattr(execution_facade.sys, "platform", "linux")
+    monkeypatch.setattr(execution_facade.sys, "platform", platform)
     backend = Mock()
     backend.system_read_roots = ()
     backend.installed_tool_roots.side_effect = lambda path: ((path.parent,), ())

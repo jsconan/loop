@@ -30,6 +30,17 @@ from .sandbox import (
     resolve_host_executable,
     select_sandbox_backend,
 )
+from .sandbox.constants import (
+    COMMAND_SANDBOX_SCRATCH_PREFIX,
+    INITIAL_USER_NAMESPACE_UID_MAP,
+    INITIAL_USER_NAMESPACE_UID_MAP_PATH,
+    LANG_ENVIRONMENT_VARIABLE,
+    MINIMAL_SYSTEM_PATH,
+    PATH_ENVIRONMENT_VARIABLE,
+    SYSTEM_LOCALE,
+    TMPDIR_ENVIRONMENT_VARIABLE,
+    XDG_CACHE_HOME_ENVIRONMENT_VARIABLE,
+)
 
 if TYPE_CHECKING:
     from ..tooling import ToolContext
@@ -40,10 +51,10 @@ def _trusted_file_owner_ids() -> tuple[int, ...]:
     current_uid = os.getuid()
     if sys.platform == "linux":
         try:
-            mapping = Path("/proc/self/uid_map").read_text(encoding="ascii").split()
+            mapping = tuple(INITIAL_USER_NAMESPACE_UID_MAP_PATH.read_text(encoding="ascii").split())
         except OSError:
             return (current_uid,)
-        if mapping != ["0", "0", "4294967295"]:
+        if mapping != INITIAL_USER_NAMESPACE_UID_MAP:
             return (current_uid,)
     return tuple(dict.fromkeys((0, current_uid)))
 
@@ -114,7 +125,7 @@ def _automatic_executable_identities(
     names: tuple[str, ...], path_value: str, cwd: Path
 ) -> tuple[tuple[str, Path, Path, int, int], ...]:
     """Bind safe exact executable files found in the request's live PATH roots."""
-    roots = path_search_roots({"PATH": path_value}, cwd)
+    roots = path_search_roots({PATH_ENVIRONMENT_VARIABLE: path_value}, cwd)
     trusted_owners = _trusted_file_owner_ids()
     identities = []
     for name in dict.fromkeys(names[:128]):
@@ -146,13 +157,16 @@ def _automatic_executable_identities(
             continue
         if root_details.st_uid not in trusted_owners:
             continue
-        if root_details.st_mode & 0o002:
+        if root_details.st_mode & constants.OTHER_WRITE_MODE_BIT:
             continue
-        if root_details.st_mode & 0o020 and root_details.st_gid != os.getgid():
+        if (
+            root_details.st_mode & constants.GROUP_WRITE_MODE_BIT
+            and root_details.st_gid != os.getgid()
+        ):
             continue
         if details.st_uid not in trusted_owners:
             continue
-        if details.st_mode & 0o022:
+        if details.st_mode & constants.GROUP_AND_OTHER_WRITE_MODE_MASK:
             continue
         if details.st_nlink != 1:
             continue
@@ -214,7 +228,7 @@ class CommandExecutionService:
         Raises:
             ValueError: If the name or PATH cannot be searched safely.
         """
-        path_value = os.environ.get("PATH", "/usr/bin:/bin")
+        path_value = os.environ.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH)
         workspace = (
             Path(
                 context.instructions_manager.virtual_paths.resolve(VirtualPath.WORKSPACE)
@@ -377,7 +391,9 @@ class CommandExecutionService:
         """Bind verified managed tools named by a shell command or workspace PATH."""
         candidates = list(names)
         working_directory = cwd or workspace
-        for path, _ in path_search_roots({"PATH": path_value}, working_directory):
+        for path, _ in path_search_roots(
+            {PATH_ENVIRONMENT_VARIABLE: path_value}, working_directory
+        ):
             if not path.is_relative_to(workspace) or not path.is_dir():
                 continue
             try:
@@ -659,7 +675,7 @@ class CommandExecutionService:
             paths = (
                 context.instructions_manager.virtual_paths if context.instructions_manager else None
             )
-            path_value = os.environ.get("PATH", "/usr/bin:/bin")
+            path_value = os.environ.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH)
             explicit_references = (
                 (executable_grant,)
                 if isinstance(executable_grant, str)
@@ -724,7 +740,7 @@ class CommandExecutionService:
                 runtime_reader(
                     self._backend,
                     workspace,
-                    path_search_roots({"PATH": path_value}, command_cwd),
+                    path_search_roots({PATH_ENVIRONMENT_VARIABLE: path_value}, command_cwd),
                     executable_identities,
                 )
                 if runtime_reader is not None
@@ -797,15 +813,15 @@ class CommandExecutionService:
                     tempfile.TemporaryDirectory(
                         prefix=self._backend.scratch_prefix
                         if isinstance(getattr(self._backend, "scratch_prefix", None), str)
-                        else "loop-sandbox-"
+                        else COMMAND_SANDBOX_SCRATCH_PREFIX
                     )
                 )
             ).resolve(strict=True)
             environment = {
-                "PATH": path_value,
-                "LANG": "C",
-                "TMPDIR": str(scratch),
-                "XDG_CACHE_HOME": str(scratch / "cache"),
+                PATH_ENVIRONMENT_VARIABLE: path_value,
+                LANG_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+                TMPDIR_ENVIRONMENT_VARIABLE: str(scratch),
+                XDG_CACHE_HOME_ENVIRONMENT_VARIABLE: str(scratch / "cache"),
             }
             if read_only:
                 environment.update(
@@ -842,7 +858,7 @@ class CommandExecutionService:
                     value = value.replace(str(root), VirtualPath.EXTERNAL)
                 return value
 
-            file_creation_mask = 0o022
+            file_creation_mask = constants.GROUP_AND_OTHER_WRITE_MODE_MASK
             if sys.platform == "linux":
                 current_mask = getattr(self._backend, "file_creation_mask", None)
                 if isinstance(current_mask, int) and not isinstance(current_mask, bool):

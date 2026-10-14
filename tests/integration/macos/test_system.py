@@ -2,6 +2,7 @@
 
 import json
 import shlex
+import shutil
 from unittest.mock import Mock
 
 import pytest
@@ -104,6 +105,83 @@ def test_public_writable_command_cannot_change_private_workspace_entries(
     assert created_result["ok"] is False
     assert existing.read_text(encoding="utf-8") == "preserve-private-canary"
     assert not created.exists()
+    public_command.host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("role", ["workspace", "temporary", "extra", "skill"])
+@pytest.mark.parametrize("component", [".ssh", ".AWS", ".config", ".loop", "Library"])
+@pytest.mark.parametrize("read_only", [False, True])
+def test_public_granted_roots_keep_private_components_denied(
+    public_command, native_workspace, role, component, read_only
+):
+    """Canonical and virtual grants protect private content at every depth and access mode."""
+    if role == "workspace":
+        root, virtual, reads = native_workspace, "/workspace", []
+    elif role == "temporary":
+        root, virtual, reads = public_command.scratch, "/tmp", []
+    elif role == "skill":
+        public_command.instructions.activate_skill("fixture")
+        root, virtual, reads = public_command.skill_root, "/skills/fixture", []
+    else:
+        root = native_workspace.parent / "extra"
+        root.mkdir()
+        virtual, reads = str(root), [str(root)]
+    (root / "neighbor").write_text("ordinary-readable")
+    for prefix in ("", "nested/"):
+        directory = root / prefix / component
+        directory.mkdir(parents=True, exist_ok=True)
+        existing = directory / "credential"
+        existing.write_text("private-root-canary")
+        created = directory / "new-entry"
+        for spelling in dict.fromkeys((str(existing), f"{virtual}/{prefix}{component}/credential")):
+            result = public_command.call(
+                f": {shlex.quote(virtual)}; cat {shlex.quote(spelling)}; "
+                f"printf changed > {shlex.quote(spelling)}; "
+                f"printf changed > {shlex.quote(spelling.rsplit('/', 1)[0] + '/new-entry')}",
+                read_only=read_only,
+                read_roots=reads,
+            )
+            assert result["ok"] is False, result
+            assert "private-root-canary" not in json.dumps(result)
+            assert existing.read_text() == "private-root-canary"
+            assert not created.exists()
+    ordinary = public_command.call(
+        f"cat {shlex.quote(virtual + '/neighbor')}", read_only=read_only, read_roots=reads
+    )
+    assert ordinary["result"]["stdout"]["content"] == "ordinary-readable"
+    public_command.host.run_host_command.assert_not_called()
+
+
+def test_public_skill_alias_rejects_private_hardlink(public_command, native_workspace):
+    """An activated read-only skill cannot expose a private inode through a public alias."""
+    root = public_command.skill_root
+    private = root / ".ssh"
+    private.mkdir()
+    source = private / "key"
+    source.write_text("private-skill-canary")
+    (root / "public-alias").hardlink_to(source)
+    public_command.instructions.activate_skill("fixture")
+
+    result = public_command.call("cat /skills/fixture/public-alias", read_only=True)
+
+    assert result["problem"]["code"] == "sandbox.invalid", result
+    assert "private-skill-canary" not in json.dumps(result)
+    assert source.read_text() == "private-skill-canary"
+    public_command.host.run_host_command.assert_not_called()
+
+
+def test_public_private_scratch_keeps_owned_fixture_paths_writable(public_command):
+    """Fresh command scratch supports synthetic private-name fixtures without host-data access."""
+    for component in (".ssh", ".AWS", ".config", ".loop", "Library"):
+        result = public_command.call(
+            f'mkdir "$TMPDIR/nested"; mkdir "$TMPDIR/nested/{component}"; '
+            f'printf fixture > "$TMPDIR/nested/{component}/key"; '
+            f'cat "$TMPDIR/nested/{component}/key"',
+            read_only=True,
+        )
+        assert result["result"]["stdout"]["content"] == "fixture", result
+    ordinary = public_command.call('printf ordinary > "$TMPDIR/result"; cat "$TMPDIR/result"')
+    assert ordinary["result"]["stdout"]["content"] == "ordinary"
     public_command.host.run_host_command.assert_not_called()
 
 
@@ -252,3 +330,75 @@ def test_renamed_tool_keeps_native_boundary(public_command):
     assert result["ok"] is True
     assert result["result"]["boundary"] == "sandbox"
     assert result["result"]["stdout"]["content"] == "renamed"
+
+
+@pytest.mark.parametrize(
+    "native_workspace",
+    [
+        'workspace"quote',
+        "workspace\\slash",
+        "workspace\nline",
+        "workspace[0]+;$()",
+        'workspace") (allow default) ;',
+    ],
+    indirect=True,
+)
+def test_public_special_workspace_names_preserve_policy(public_command, native_workspace):
+    """Virtual paths with unusual host spellings retain protected and outside denies."""
+    allowed = public_command.call("cat /workspace/ordinary", read_only=True)
+    assert allowed["ok"] and allowed["result"]["stdout"]["content"] == "ordinary-data"
+    targets = ["AGENTS.md", 'POLICY"name.md', "POLICY\nname.md"]
+    for name in targets:
+        path = native_workspace / name
+        path.write_text("preserve-instructions")
+        denied = public_command.call(
+            "eval " + shlex.quote("printf changed > " + shlex.quote("/workspace/" + name))
+        )
+        assert not denied["ok"]
+        assert "host_offer" not in denied["problem"]["metadata"]
+        assert path.read_text() == "preserve-instructions"
+    for source in (
+        "cat /workspace/.ssh/id_ed25519",
+        "cat /workspace/external-link",
+        "eval 'printf bad > ../outside/write'",
+    ):
+        denied = public_command.call(source)
+        assert not denied["ok"]
+        assert "host_offer" not in denied["problem"]["metadata"]
+        assert "fake-private-canary" not in json.dumps(denied)
+        assert "fake-outside-canary" not in json.dumps(denied)
+    assert (native_workspace.parent / "outside/write").read_text() == "preserve-outside"
+    public_command.host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["script", "binary", "symlink"])
+def test_public_exact_path_executable_does_not_expose_siblings(
+    public_command, native_workspace, monkeypatch, kind
+):
+    """A safe exact PATH executable runs without authority over neighboring file data."""
+    tools = native_workspace.parent / 'external"tools'
+    tools.mkdir(mode=0o700)
+    executable = tools / "reviewtool"
+    if kind == "binary":
+        shutil.copyfile("/usr/bin/true", executable)
+    else:
+        executable.write_text("#!/bin/sh\nprintf exact-file-ok\n")
+    executable.chmod(0o700)
+    if kind == "symlink":
+        target = tools / "target"
+        executable.rename(target)
+        executable.symlink_to(target)
+    sibling = tools / "sibling"
+    sibling.write_text("outside-sibling-canary")
+    monkeypatch.setenv("PATH", str(tools) + ":/usr/bin:/bin")
+    for registration in ("run_command", "renamed_command"):
+        allowed = public_command.call("reviewtool", name=registration, read_only=True)
+        assert allowed["ok"] and allowed["result"]["boundary"] == "sandbox"
+        assert allowed["result"]["stdout"]["content"] == (
+            "" if kind == "binary" else "exact-file-ok"
+        )
+    public_command.interaction.prompt.assert_not_called()
+    denied = public_command.call("cat " + shlex.quote(str(sibling)), read_only=True)
+    assert not denied["ok"]
+    assert "outside-sibling-canary" not in json.dumps(denied)
+    public_command.host.run_host_command.assert_not_called()

@@ -11,6 +11,12 @@ import re
 from importlib.resources import files
 from pathlib import Path
 
+from .constants import (
+    CACHE_LOCK_FILENAME,
+    PAYLOAD_FILENAME,
+    RECEIVER_FILENAME,
+    UNINSTALLER_FILENAME,
+)
 from .host import discover_tool
 from .installation import validate_generation_catalog
 from .policy import runtime_policy_sources
@@ -23,6 +29,7 @@ _MODULES = (
     "utils/json.py",
     "permissions/protection.py",
     "execution/sandbox/contracts.py",
+    "execution/sandbox/constants.py",
     "execution/sandbox/linux/constants.py",
     "execution/sandbox/linux/host.py",
     "execution/sandbox/linux/installation.py",
@@ -50,9 +57,9 @@ _BARRELS = (
     "execution/sandbox/linux/",
 )
 _RESOURCES = {
-    "loop_receiver.py": "receiver.py",
-    "loop_uninstall.py": "uninstall.py",
-    "loop_payload.py": "payload.py",
+    RECEIVER_FILENAME: "receiver.py",
+    UNINSTALLER_FILENAME: "uninstall.py",
+    PAYLOAD_FILENAME: "payload.py",
 }
 
 
@@ -68,7 +75,7 @@ def runtime_member_names() -> tuple[str, ...]:
         *_RESOURCES,
         "helper",
         "mask.empty",
-        "cache.lock",
+        CACHE_LOCK_FILENAME,
     )
 
 
@@ -126,8 +133,8 @@ def runtime_catalog(
         raise ValueError("Authenticated helper changed during catalog read.")
 
     catalog["mask.empty"] = b""
-    catalog["cache.lock"] = (generation + "\n").encode("ascii")
-    executable = {"loop_receiver.py", "loop_uninstall.py", "helper"}
+    catalog[CACHE_LOCK_FILENAME] = (generation + "\n").encode("ascii")
+    executable = {RECEIVER_FILENAME, UNINSTALLER_FILENAME, "helper"}
     validate_generation_catalog(directory, catalog, executable)
     sources, source = runtime_policy_sources(directory, generation)
     return catalog, executable, sources, source

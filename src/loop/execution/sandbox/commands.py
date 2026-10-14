@@ -8,6 +8,7 @@ from pydantic import Field
 
 from ...commands import CommandArgumentError, CommandContext, CommandRegistration
 from ...completion import CommandCompletion, CompletionValue
+from ...errors import Problem, ProblemException
 from ...telemetry import telemetry_audit, telemetry_span
 
 
@@ -108,6 +109,7 @@ class SandboxCommands:
 
         Raises:
             CommandArgumentError: Linux management is unavailable or the arguments are invalid.
+            ProblemException: Native management is incomplete; the problem reports current state.
         """
         if platform.system() != "Linux":
             raise CommandArgumentError("Linux sandbox management is unavailable on this host.")
@@ -173,12 +175,17 @@ class SandboxCommands:
                         if not completed:
                             break
                     if failure is not None and not completed:
-                        context.interaction.info("\n".join((*outcomes, installation_status())))
                         telemetry_audit(
                             "sandbox.management.finished", action="reinstall", success=False
                         )
-                        raise CommandArgumentError(
-                            "Native reinstall incomplete; Linux remains unavailable."
+                        raise ProblemException(
+                            Problem(
+                                code="sandbox.management.incomplete",
+                                title="Native reinstall incomplete",
+                                detail="\n".join((*outcomes, installation_status())),
+                                severity="error",
+                                operation="sandbox.reinstall",
+                            )
                         ) from failure
                     if not completed:
                         context.interaction.info("\n".join((*outcomes, installation_status())))
@@ -191,13 +198,22 @@ class SandboxCommands:
             raise
         except (ValueError, OSError, ExceptionGroup) as error:
             telemetry_audit("sandbox.management.finished", action=action, success=False)
-            context.interaction.info(
-                "\n".join(f"{action.capitalize()}: {reason}" for reason in _failure_lines(error))
-                + "\n"
-                + installation_status()
-            )
-            raise CommandArgumentError(
-                f"Native {action} refused or incomplete; Linux remains unavailable."
+            raise ProblemException(
+                Problem(
+                    code="sandbox.management.incomplete",
+                    title=f"Native {action} incomplete",
+                    detail="\n".join(
+                        (
+                            *(
+                                f"{action.capitalize()}: {reason}"
+                                for reason in _failure_lines(error)
+                            ),
+                            installation_status(),
+                        )
+                    ),
+                    severity="error",
+                    operation=f"sandbox.{action}",
+                )
             ) from error
         if completed:
             telemetry_audit("sandbox.management.finished", action=action, success=True)

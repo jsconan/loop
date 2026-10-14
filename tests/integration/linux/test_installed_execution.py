@@ -1,36 +1,56 @@
 """Qualify current installed Linux timeout delivery and resistance to recursive admission."""
 
+import fcntl
 import hashlib
 import http.server
+import importlib.metadata
 import json
 import os
 import pwd
+import re
 import shlex
 import shutil
+import signal
 import socket
 import ssl
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from importlib.resources import files
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
-from loop import PermissionManager, ToolRegistry
+from loop import PermissionManager, RuntimeEnvironment, ToolRegistry
 from loop.constants import NATIVE_INSTALLATION_DIRECTORY, NATIVE_RESULT_DELIVERY_SECONDS
 from loop.execution import CommandExecutionService
-from loop.execution.sandbox import SandboxRequest, select_sandbox_backend
+from loop.execution.sandbox import SandboxOutcome, SandboxRequest, select_sandbox_backend
 from loop.execution.sandbox.linux import LinuxNativeBackend
 from loop.execution.sandbox.linux.catalog import runtime_catalog
+from loop.execution.sandbox.linux.constants import NATIVE_POLICY_VERSION, NATIVE_SCRATCH_PATH
+from loop.execution.sandbox.linux.host import bind_host_file, runtime_read_roots
+from loop.execution.sandbox.linux.installation import generation_limits
+from loop.execution.sandbox.linux.policy import payload_profile
+from loop.execution.sandbox.linux.records import read_generation
 from loop.execution.sandbox.linux.runtime import execution_authority
-from loop.tooling import ToolRuntimeSettings
-from loop.tools.system import run_command
+from loop.instructions import InstructionsManager
+from loop.permissions.audit import SQLitePermissionAudit
+from loop.tooling import ToolRegistration, ToolRuntimeSettings
+from loop.tools.files import search_text
+from loop.tools.system import resolve_executable, run_command
 
 _ALIAS_DIRECTORY = os.environ.get("LOOP_NATIVE_SOCKET_ALIAS_DIRECTORY")
+_CAPACITY_TEST_OPT_IN = os.environ.get("LOOP_NATIVE_CAPACITY_TEST") == "disposable-linux-host"
+_RUNTIME_FIXTURE = os.environ.get("LOOP_NATIVE_RUNTIME_FIXTURE")
+_RUNTIME_FIXTURE_MARKER = b"Loop private-runtime qualification fixture v1\n"
+_QUALIFICATION_UV = shutil.which("uv")
+_PUBLIC_ROOT_MARKER = b"Loop installed native qualification fixture v1\n"
 
 pytestmark = [
     pytest.mark.integration,
@@ -52,9 +72,13 @@ class Interaction:
     """Approve explicit sandbox grants and reject every host offer."""
 
     prompts: list[str]
+    infos: list[str]
+    configuration_path: Path | None
 
     def __init__(self):
         self.prompts = []
+        self.infos = []
+        self.configuration_path = None
 
     def prompt(self, message=None, **kwargs):
         """Record each permission decision and reject unintended host recovery."""
@@ -64,6 +88,7 @@ class Interaction:
 
     def info(self, message):
         """Accept the permission service's informational text."""
+        self.infos.append(str(message))
 
 
 @pytest.fixture(scope="module")
@@ -90,10 +115,99 @@ def installation():
 
 
 @pytest.fixture
-def public(installation, tmp_path, request, native_directory, monkeypatch):
-    """Own public fixtures while a real client uses the installed receiver's system scratch root."""
+def private_runtime_fixture():
+    """Require explicitly provisioned fake private data under a protected runtime tree."""
+    if not _RUNTIME_FIXTURE:
+        pytest.skip("Set LOOP_NATIVE_RUNTIME_FIXTURE to the owned private-runtime fixture")
+    root = Path(_RUNTIME_FIXTURE)
+    assert root.parent == Path("/usr/local/share")
+    assert root.name.startswith("loop-native-private-fixture-")
+    assert root.resolve(strict=True) == root
+    marker = bind_host_file(root / "marker")
+    with marker.open_verified() as descriptor:
+        assert os.pread(descriptor, len(_RUNTIME_FIXTURE_MARKER) + 1, 0) == _RUNTIME_FIXTURE_MARKER
+    return root
+
+
+@pytest.fixture(scope="module")
+def public_workspace_root():
+    """Provide stable, private fixture roots so repeated runs reuse exact native policies."""
+    parent = Path(tempfile.gettempdir()).resolve(strict=True)
+    parent_info = parent.stat()
+    private_parent = parent_info.st_uid == os.getuid() and not parent_info.st_mode & 0o022
+    sticky_shared_parent = (
+        parent_info.st_uid == 0
+        and bool(parent_info.st_mode & stat.S_ISVTX)
+        and bool(parent_info.st_mode & stat.S_IWOTH)
+    )
+    if not stat.S_ISDIR(parent_info.st_mode) or not (private_parent or sticky_shared_parent):
+        pytest.fail("Installed native qualification requires a private or sticky temporary parent")
+
+    suffix = str(os.getuid())
+    roots = (
+        parent / f"loop-native-public-{suffix}",
+        parent / f"loop-native-public-permissions-{suffix}",
+        parent / f"loop-native-public-external-{suffix}",
+    )
+    for root in roots:
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            metadata = root.lstat()
+            marker = root / ".loop-native-public-fixture"
+            assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.getuid()
+            assert stat.S_IMODE(metadata.st_mode) == 0o700
+            assert marker.is_file() and not marker.is_symlink()
+            assert marker.read_bytes() == _PUBLIC_ROOT_MARKER
+            assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+        else:
+            marker = root / ".loop-native-public-fixture"
+            marker.write_bytes(_PUBLIC_ROOT_MARKER)
+            marker.chmod(0o600)
+
+        marker = root / ".loop-native-public-fixture"
+        metadata = root.lstat()
+        assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.getuid()
+        assert stat.S_IMODE(metadata.st_mode) == 0o700
+        for child in root.iterdir():
+            if child == marker:
+                continue
+            assert child.name.startswith("loop-native-test-"), (
+                f"Unexpected qualification fixture entry: {child.name}"
+            )
+            if child.is_symlink() or not child.is_dir():
+                child.unlink()
+            else:
+                shutil.rmtree(child)
+
+    yield roots
+
+    for root in roots:
+        marker = root / ".loop-native-public-fixture"
+        for child in root.iterdir():
+            if child == marker:
+                continue
+            assert child.name.startswith("loop-native-test-"), (
+                f"Unexpected qualification fixture entry: {child.name}"
+            )
+            if child.is_symlink() or not child.is_dir():
+                child.unlink()
+            else:
+                shutil.rmtree(child)
+        marker.unlink()
+        root.rmdir()
+
+
+def _test_directory_name(node_id):
+    """Return a stable, bounded workspace component for one collected test case."""
+    return "loop-native-test-" + hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:32]
+
+
+@pytest.fixture
+def public(installation, public_workspace_root, request, native_directory, monkeypatch):
+    """Own the stable workspace fixture and isolated permission roots for one test."""
     _, generation = installation
-    workspace = tmp_path.resolve()
+    workspace_root, permissions_root, _external_root = public_workspace_root
     monkeypatch.setattr(tempfile, "tempdir", "/tmp")
     if getattr(request.node, "callspec", None) and request.node.callspec.params.get("alias"):
         assert _ALIAS_DIRECTORY, (
@@ -103,22 +217,53 @@ def public(installation, tmp_path, request, native_directory, monkeypatch):
         socket_path = Path("/run") / ("loopgen_" + generation + ".socket")
         assert parent.stat().st_uid == os.getuid() and parent.stat().st_mode & 0o777 == 0o700
         assert parent.stat().st_dev == socket_path.stat().st_dev
-        workspace = native_directory(parent)
-    yield Interaction(), workspace, generation
+        workspace = native_directory(parent, name="loop-native-test-alias")
+    else:
+        workspace = native_directory(workspace_root, name="loop-native-test-workspace")
+    permissions_directory = native_directory(
+        permissions_root,
+        name=_test_directory_name(request.node.nodeid),
+    )
+    interaction = Interaction()
+    interaction.configuration_path = permissions_directory / f"{workspace.name}.yaml"
+    yield interaction, workspace, generation
 
 
-def invoke_many(public, calls):
-    """Run several public calls in one client, sharing its qualified selector probe."""
+@pytest.fixture
+def public_registry(public):
+    """Provide isolated inputs for public tools executed by the installed native client."""
+    interaction, workspace, generation = public
+    assert interaction.configuration_path is not None
+    audit_directory = interaction.configuration_path.parent
+    audit_path = audit_directory / f"{workspace.name}-permission-audit.sqlite"
+    return interaction, workspace, generation, audit_path
+
+
+def invoke_tools(
+    public,
+    calls,
+    *,
+    audit_path=None,
+    workspace_id=None,
+    permission_workspace=None,
+    model_paths=False,
+    seconds=2,
+    expected_search_errors=0,
+):
+    """Run public tool calls in one isolated process with the installed native receiver."""
     interaction, workspace, _ = public
+    assert interaction.configuration_path is not None
     client = subprocess.run(
         [sys.executable, "-I", "-B", str(Path(__file__).resolve())],
         input=json.dumps(
             {
-                "workspace": str(workspace),
-                "calls": [
-                    {"command": command, "cwd": str(workspace), **grants}
-                    for command, grants in calls
-                ],
+                "workspace": str(permission_workspace or workspace),
+                "configuration_path": str(interaction.configuration_path),
+                "audit_path": str(audit_path) if audit_path is not None else None,
+                "workspace_id": workspace_id,
+                "calls": calls,
+                "model_paths": model_paths,
+                "seconds": seconds,
             }
         ),
         capture_output=True,
@@ -127,17 +272,40 @@ def invoke_many(public, calls):
             key: value for key, value in os.environ.items() if key not in {"TMPDIR", "TMP", "TEMP"}
         },
         check=False,
-        timeout=15,
+        timeout=max(15, seconds * len(calls) + 10),
     )
     assert client.returncode == 0, (
         f"Installed public client exited {client.returncode}.\n"
         f"stdout:\n{client.stdout}\nstderr:\n{client.stderr}"
     )
-    assert not client.stderr, client.stderr
+    if expected_search_errors:
+        assert re.fullmatch(
+            r"(?:Could not search text \[err_[a-f0-9]+\]\n){" + str(expected_search_errors) + "}",
+            client.stderr,
+        ), client.stderr
+    else:
+        assert not client.stderr, client.stderr
     value = json.loads(client.stdout)
     interaction.prompts.extend(value["prompts"])
+    interaction.infos.extend(value["infos"])
     assert not any("without the OS sandbox" in prompt for prompt in interaction.prompts)
     return value["results"]
+
+
+def invoke_many(public, calls, *, permission_workspace=None):
+    """Run several public commands in one client with their requested workspace authority."""
+    _interaction, workspace, _ = public
+    return invoke_tools(
+        public,
+        [
+            {
+                "tool": "run_command",
+                "arguments": {"command": command, "cwd": str(workspace), **grants},
+            }
+            for command, grants in calls
+        ],
+        permission_workspace=permission_workspace,
+    )
 
 
 def invoke(public, command, **grants):
@@ -145,30 +313,94 @@ def invoke(public, command, **grants):
     return invoke_many(public, [(command, grants)])[0]
 
 
+def invoke_registered(public_registry, calls):
+    """Call registered native tools together so opaque grants stay bound to one service."""
+    interaction, workspace, generation, audit_path = public_registry
+    return invoke_tools(
+        (interaction, workspace, generation),
+        calls,
+        audit_path=audit_path,
+        workspace_id="native-public-review",
+    )
+
+
+def native_request(
+    backend, workspace, scratch, source, *, read_roots=(), network=False, seconds=15, aliases=()
+):
+    """Build one short-lived request for direct installed-backend qualification."""
+    return SandboxRequest.create(
+        source=source,
+        cwd=workspace,
+        workspace=workspace,
+        read_roots=read_roots,
+        write_roots=(workspace,),
+        network=network,
+        environment={"PATH": os.environ["PATH"], "LC_ALL": "C", "TMPDIR": str(scratch)},
+        policy_version=backend.policy_version,
+        deadline=time.monotonic() + seconds,
+        workspace_id="native-installed-review",
+        aliases=aliases,
+    )
+
+
 def public_client():
-    """Run registered public calls with native selection and host fallback disabled."""
+    """Run registered public calls with authenticated native authority and no host fallback."""
     value = json.loads(sys.stdin.read())
-    backend = select_sandbox_backend()
-    assert isinstance(backend, LinuxNativeBackend), backend.capability_failure()
+    backend = LinuxNativeBackend()
+    failure = backend.capability_failure()
+    assert failure is None, failure
     interaction = Interaction()
+    instructions = None
+    if value.get("model_paths"):
+        scratch = Path(value["configuration_path"]).parent / "instruction-scratch"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        instructions = InstructionsManager(
+            runtime_environment=RuntimeEnvironment(Path(value["workspace"]), scratch)
+        )
+    permission_manager_arguments = {}
+    if value.get("audit_path") is not None:
+        permission_manager_arguments = {
+            "audit_path": value["audit_path"],
+            "workspace_id": value["workspace_id"],
+        }
     registry = ToolRegistry(
-        [run_command],
-        permission_manager=PermissionManager(Path(value["workspace"])),
+        [
+            run_command,
+            resolve_executable,
+            search_text,
+            ToolRegistration(run_command, name="renamed_command"),
+        ],
+        permission_manager=PermissionManager(
+            Path(value["workspace"]),
+            configuration_path=value["configuration_path"],
+            **permission_manager_arguments,
+        ),
         execution_service=CommandExecutionService(backend, RefusingHost()),
-        settings=ToolRuntimeSettings(command_timeout=2),
+        settings=ToolRuntimeSettings(command_timeout=value.get("seconds", 2)),
     )
     try:
-        results = [
-            json.loads(
-                registry.call(
-                    "run_command",
-                    json.dumps(arguments),
-                    interaction=interaction,
+        results = []
+        for call in value["calls"]:
+            arguments = dict(call["arguments"])
+            for name, source in call.get("argument_sources", {}).items():
+                result = results[source["result_index"]]
+                result = result.get("result", result)
+                arguments[name] = result[source["result_key"]]
+            results.append(
+                json.loads(
+                    registry.call(
+                        call["tool"],
+                        json.dumps(arguments),
+                        interaction=interaction,
+                        instructions_manager=instructions,
+                    )
                 )
             )
-            for arguments in value["calls"]
-        ]
-        print(json.dumps({"results": results, "prompts": interaction.prompts}))
+        print(
+            json.dumps(
+                {"results": results, "prompts": interaction.prompts, "infos": interaction.infos}
+            )
+        )
     finally:
         registry.close()
 
@@ -188,6 +420,160 @@ def require_drained(generation):
             return
         assert time.monotonic() < deadline, "Admitted descendants remain after delivery"
         time.sleep(0.01)
+
+
+def profile_inventory(generation):
+    """Observe enforcing kernel names and fingerprints under protected generation authority.
+
+    Raw policy exports require administrator privilege. Ordinary qualification observes the
+    kernel's readable compiled fingerprints; the protected receiver still authenticates exact
+    compiled bytes before every admission.
+    """
+    installed, authority = read_generation(NATIVE_INSTALLATION_DIRECTORY / "management.json")
+    assert installed.config.generation == generation
+    directory = Path("/sys/kernel/security/apparmor/policy/namespaces") / generation
+    with authority.open_verified():
+        details = directory.stat()
+        assert (details.st_dev, details.st_ino) == installed.namespace
+        observed = {}
+        for entry in (directory / "profiles").iterdir():
+            assert entry.stat().st_uid == 0
+            name = (entry / "name").read_text().strip()
+            assert name == "bootstrap" or re.fullmatch(r"payload_[a-f0-9]{64}", name)
+            assert (entry / "mode").read_text().strip() == "enforce"
+            fingerprint = (entry / "sha256").read_bytes().strip()
+            assert re.fullmatch(rb"[a-f0-9]{64}", fingerprint)
+            assert name not in observed
+            observed[name] = fingerprint
+        assert "bootstrap" in observed
+        return observed
+
+
+def test_public_virtual_commands_reuse_policy_and_keep_protected_paths(public, native_directory):
+    """Normal model aliases reuse exact policy and preserve renamed-tool and private boundaries."""
+    interaction, workspace, generation = public
+    (workspace / "ordinary").write_text("ordinary-data")
+    (workspace / ".ssh").mkdir()
+    secret = workspace / ".ssh/key"
+    secret.write_text("preserve-private")
+    outside = native_directory(workspace.parent, name="loop-native-test-outside")
+    (outside / "secret").write_text("outside-secret")
+    call = {
+        "tool": "run_command",
+        "arguments": {
+            "command": "cat '/workspace/ordinary'; printf '%s' /workspace",
+            "cwd": "/workspace",
+            "read_only": True,
+        },
+    }
+    (first,) = invoke_tools(public, [call], model_paths=True)
+    assert first["ok"], first
+    baseline = profile_inventory(generation)
+    renamed = {**call, "tool": "renamed_command"}
+    repeated = invoke_tools(public, [call, renamed], model_paths=True)
+    assert all(
+        result["ok"] and result["result"]["stdout"]["content"] == "ordinary-data/workspace/"
+        for result in repeated
+    ), repeated
+    assert profile_inventory(generation) == baseline
+    assert not interaction.prompts
+    denied = invoke_tools(
+        public,
+        [
+            {
+                "tool": "run_command",
+                "arguments": {
+                    "command": "cat /workspace/.ssh/key; cat ../loop-native-test-outside/secret",
+                    "cwd": "/workspace",
+                    "read_only": True,
+                },
+            },
+            {
+                "tool": "run_command",
+                "arguments": {"command": "printf bad > /workspace/.ssh/key", "cwd": "/workspace"},
+            },
+        ],
+        model_paths=True,
+    )
+    assert all(not result["ok"] for result in denied), denied
+    assert "outside-secret" not in json.dumps(denied)
+    assert secret.read_text() == "preserve-private"
+    require_drained(generation)
+
+
+def test_public_native_search_reuses_policy_and_preserves_dialect_bounds(public, monkeypatch):
+    """Trusted ripgrep handles literal/regex queries with private selected-file authority."""
+    interaction, workspace, generation = public
+    trusted = Path("/usr/bin/rg")
+    assert trusted.is_file(), "Native search qualification requires distribution ripgrep"
+    bind_host_file(trusted.resolve(strict=True))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    (workspace / "selected").write_text("first needle\nsecond needle\n")
+    calls = [
+        {"tool": "search_text", "arguments": {"path": "/workspace/selected", "query": "needle"}}
+    ]
+    (first,) = invoke_tools(public, calls, model_paths=True)
+    assert first["ok"], first
+    baseline = profile_inventory(generation)
+    literal, regex, parse_error = invoke_tools(
+        public,
+        [
+            *calls,
+            {
+                "tool": "search_text",
+                "arguments": {"path": "/workspace/selected", "query": "needle$", "regex": True},
+            },
+            {
+                "tool": "search_text",
+                "arguments": {
+                    "path": "/workspace/selected",
+                    "query": "(?<=first )needle",
+                    "regex": True,
+                },
+            },
+        ],
+        model_paths=True,
+        expected_search_errors=1,
+    )
+    assert literal["ok"] and regex["ok"], (literal, regex)
+    assert len(literal["result"]["matches"]) == len(regex["result"]["matches"]) == 2
+    assert not parse_error["ok"] and "regex parse error" in json.dumps(parse_error)
+    assert profile_inventory(generation) == baseline
+    (workspace / ".git").mkdir()
+    (workspace / ".git/key").write_text("private-canary")
+    outside_canary = interaction.configuration_path.parent / "outside-search-canary"
+    outside_canary.write_text("outside-canary")
+    (workspace / "outside-link").symlink_to(outside_canary)
+    private, outside = invoke_tools(
+        public,
+        [
+            {
+                "tool": "search_text",
+                "arguments": {"path": "/workspace/.git/key", "query": "private-canary"},
+            },
+            {
+                "tool": "search_text",
+                "arguments": {"path": "/workspace/outside-link", "query": "anything"},
+            },
+        ],
+        model_paths=True,
+    )
+    assert not private["ok"] and not outside["ok"], json.dumps((private, outside))
+    assert "outside-canary" not in json.dumps((private, outside))
+    (workspace / "selected").write_text("needle\n" * 20_000)
+    (bounded,) = invoke_tools(
+        public,
+        [
+            {
+                "tool": "search_text",
+                "arguments": {"path": "/workspace/selected", "query": "needle", "max_results": 1},
+            }
+        ],
+        model_paths=True,
+    )
+    assert bounded["ok"] and len(bounded["result"]["matches"]) == 1
+    assert bounded["result"]["truncated"]
+    require_drained(generation)
 
 
 def test_public_timeout_preserves_both_streams_and_descendant_cleanup(public):
@@ -212,11 +598,18 @@ def test_public_timeout_preserves_both_streams_and_descendant_cleanup(public):
     require_drained(public[2])
 
 
-def test_public_external_python_library_runs_from_a_hardlinked_read_root(public, tmp_path):
+def test_public_external_python_library_runs_from_a_hardlinked_read_root(
+    public, public_workspace_root, request, native_directory
+):
     """Keep cache-linked library files readable through their approved read-only root."""
-    library = tmp_path.parent / "python-library"
+    _workspace_root, _permissions_root, external_root = public_workspace_root
+    fixture = native_directory(
+        external_root,
+        name=_test_directory_name(request.node.nodeid),
+    )
+    library = fixture / "python-library"
     library.mkdir()
-    cache = tmp_path.parent / "cache.py"
+    cache = fixture / "cache.py"
     cache.write_text("value = 'copied-library'\n")
     module = library / "owned_module.py"
     module.hardlink_to(cache)
@@ -234,11 +627,11 @@ def test_public_external_python_library_runs_from_a_hardlinked_read_root(public,
     require_drained(public[2])
 
 
-def test_public_writable_workspace_hardlink_cannot_modify_outside_inode(
-    public, tmp_path, tmp_path_factory
-):
+def test_public_writable_workspace_hardlink_cannot_modify_outside_inode(public, tmp_path):
     """Writable workspaces can read hardlinked files, but their aliases cannot mutate outside."""
-    outside = tmp_path_factory.mktemp("outside-hardlink") / "outside-canary"
+    outside_directory = tmp_path.parent / "outside-hardlink"
+    outside_directory.mkdir()
+    outside = outside_directory / "outside-canary"
     outside.write_text("preserve-outside")
     alias = public[1] / "outside-alias"
     alias.hardlink_to(outside)
@@ -251,21 +644,53 @@ def test_public_writable_workspace_hardlink_cannot_modify_outside_inode(
     require_drained(public[2])
 
 
-def test_public_ls_runs_with_large_hardlinked_virtualenv(public, tmp_path_factory):
+@pytest.mark.parametrize("layout", ["dense", "scattered"])
+def test_public_ls_runs_with_large_hardlinked_virtualenv(public, native_directory, layout):
     """Keep the public list command usable when Bubblewrap needs grouped hardlink mounts."""
     library = public[1] / ".venv/site-packages/linked-package"
     library.mkdir(parents=True)
-    cache = tmp_path_factory.mktemp("virtualenv-hardlink-cache")
+    cache = native_directory(Path("/tmp"))
     for index in range(2_001):
         source = cache / f"module-{index}.py"
         source.write_text("value = 1\n")
-        (library / source.name).hardlink_to(source)
+        directory = library if layout == "dense" else library / str(index)
+        directory.mkdir(exist_ok=True)
+        (directory / source.name).hardlink_to(source)
 
     listed = invoke(public, "ls .")
     assert listed["result"]["exit_code"] == 0, listed
     written = invoke(public, "printf allowed > ordinary")
     assert written["result"]["exit_code"] == 0, written
     assert (public[1] / "ordinary").read_text() == "allowed"
+    linked = library / ("0/" if layout == "scattered" else "") / "module-0.py"
+    code = (
+        "from pathlib import Path; import errno,runpy; p=Path("
+        + repr(str(linked))
+        + "); assert p.read_text()=='value = 1\\n'; assert runpy.run_path(str(p))['value']==1;\n"
+    )
+    code += "for action in (lambda:p.write_text('bad'),lambda:p.chmod(0o600),lambda:p.unlink(),lambda:p.rename(p.with_name('moved'))):\n try: action()\n except OSError as error: assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS,errno.EBUSY)\n else: raise RuntimeError('linked inode was mutable')\n"
+    verified = invoke(public, "/usr/bin/python3 -I -c " + shlex.quote(code))
+    assert verified["ok"], verified
+    assert (cache / "module-0.py").read_text() == "value = 1\n"
+    if layout == "scattered":
+        started = time.monotonic()
+        (expired,) = invoke_tools(
+            public,
+            [
+                {
+                    "tool": "run_command",
+                    "arguments": {
+                        "command": "sleep 1; printf late > deadline-marker",
+                        "cwd": str(public[1]),
+                    },
+                }
+            ],
+            seconds=0.1,
+        )
+        assert expired["problem"]["code"] == "sandbox.timed_out", expired
+        assert "host_offer" not in expired["problem"]["metadata"]
+        assert not (public[1] / "deadline-marker").exists()
+        assert time.monotonic() - started < 0.1 + NATIVE_RESULT_DELIVERY_SECONDS + 2
     require_drained(public[2])
 
 
@@ -318,6 +743,63 @@ def test_public_writable_command_cannot_change_private_workspace_entries(public)
     require_drained(public[2])
 
 
+def test_public_runtime_roots_deny_private_data_and_executables(public, private_runtime_fixture):
+    """System runtime reads do not expose private components or execute their contents."""
+    root = private_runtime_fixture
+    relatives = (".ssh/key", "nested/.AWS/key", ".config/key", ".loop/key", "Library/key")
+    calls = [
+        ("cat " + shlex.quote(str(root / relative)), {"read_only": True}) for relative in relatives
+    ]
+    calls.append((shlex.quote(str(root / ".ssh/probe")), {"read_only": True}))
+    calls.append(("cat " + shlex.quote(str(root / "neighbor")), {"read_only": True}))
+
+    results = invoke_many(public, calls)
+
+    for result in results[:-1]:
+        assert result["problem"]["code"] == "process.nonzero_exit", result
+        assert "private-runtime-canary" not in json.dumps(result)
+    assert results[-1]["result"]["stdout"]["content"] == "ordinary-runtime-canary"
+    for relative in relatives:
+        assert (root / relative).read_text() == "private-runtime-canary"
+    require_drained(public[2])
+
+
+def test_public_scratch_keeps_new_private_fixture_paths_usable(public):
+    """Stable scratch supports command-created private-name fixtures without ambient data."""
+    calls = [
+        (
+            (
+                f'mkdir "$TMPDIR/nested"; mkdir "$TMPDIR/nested/{component}"; '
+                f'printf fixture > "$TMPDIR/nested/{component}/key"; '
+                f'cat "$TMPDIR/nested/{component}/key"'
+            ),
+            {"read_only": True},
+        )
+        for component in (".ssh", ".AWS", ".config", ".loop", "Library")
+    ]
+    calls.append(('printf ordinary > "$TMPDIR/result"; cat "$TMPDIR/result"', {"read_only": True}))
+    results = invoke_many(public, calls)
+    for result in results[:-1]:
+        assert result["result"]["stdout"]["content"] == "fixture", result
+    assert results[-1]["result"]["stdout"]["content"] == "ordinary"
+    require_drained(public[2])
+
+
+@pytest.mark.parametrize("relative", [".SSH/key", "nested/.Aws/key", ".git/.CONFIG/key"])
+def test_public_private_reads_are_case_insensitive_at_every_depth(public, relative):
+    """Keep mixed-case private credentials unreadable beneath workspace and protected roots."""
+    target = public[1] / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("private-read-canary", encoding="utf-8")
+
+    result = invoke(public, "cat " + shlex.quote(relative), read_only=True)
+
+    assert result["problem"]["code"] == "process.nonzero_exit", result
+    assert "private-read-canary" not in json.dumps(result)
+    assert target.read_text(encoding="utf-8") == "private-read-canary"
+    require_drained(public[2])
+
+
 @pytest.mark.parametrize("mode", ["existing", "create"])
 def test_public_git_write_grants_only_top_level_metadata(public, mode):
     """Approved top-level Git writes work while nested and application controls stay denied."""
@@ -352,6 +834,7 @@ def test_public_git_write_grants_only_top_level_metadata(public, mode):
             ("printf changed > " + shlex.quote(relative), {"git_write": True})
             for relative in controls
         ],
+        permission_workspace=workspace,
     )
     assert results[0]["result"]["exit_code"] == 0, results[0]
     if mode == "existing":
@@ -369,7 +852,7 @@ def test_public_git_write_grants_only_top_level_metadata(public, mode):
 
 def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(public, monkeypatch):
     """Run uv and a workspace Python entry point through the installed public tool."""
-    uv = shutil.which("uv")
+    uv = _QUALIFICATION_UV
     if uv is None:
         pytest.skip("uv is not available on the qualification PATH")
 
@@ -405,15 +888,13 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
         pytest.skip("The active CPython runtime is not user-local")
 
     interaction, workspace, _generation = public
-    alias = workspace.parent / f"{workspace.name}-python-runtime"
-    alias.symlink_to(runtime_root, target_is_directory=True)
     venv_bin = workspace / ".venv/bin"
     venv_bin.mkdir(parents=True)
-    (venv_bin / "python").symlink_to(alias / "bin" / interpreter_name)
+    (venv_bin / "python").symlink_to(interpreter)
     (workspace / ".venv/pyvenv.cfg").write_text(
         "\n".join(
             (
-                f"home = {alias / 'bin'}",
+                f"home = {configured_home}",
                 "implementation = CPython",
                 f"version_info = {metadata['version_info']}",
             )
@@ -437,22 +918,83 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
         ),
         encoding="utf-8",
     )
+    site_packages = workspace / f".venv/lib/python{version[0]}.{version[1]}/site-packages"
+    for name in (
+        "pytest",
+        "pytest-cov",
+        "coverage",
+        "pluggy",
+        "iniconfig",
+        "packaging",
+        "pygments",
+    ):
+        distribution = importlib.metadata.distribution(name)
+        for entry in distribution.files or ():
+            relative = Path(entry)
+            if relative.is_absolute() or ".." in relative.parts or relative.suffix == ".pyc":
+                continue
+            source = Path(distribution.locate_file(entry))
+            if source.is_file():
+                target = site_packages / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
     pytest_entry = venv_bin / "pytest"
     pytest_entry.write_text(
         f"#!{venv_bin / 'python'}\n"
-        "from pathlib import Path\n"
-        "import sys\n"
-        "venv = Path(__file__).parent.parent.resolve()\n"
-        "print('WORKSPACE_VENV=' + str(Path(sys.prefix).resolve() == venv))\n",
+        "import sys\nfrom pytest import console_main\nsys.exit(console_main())\n",
         encoding="utf-8",
     )
     pytest_entry.chmod(0o755)
-    monkeypatch.setenv("PATH", os.pathsep.join((str(venv_bin), os.environ["PATH"])))
-
-    result = invoke(public, "uv run pytest")
-
-    assert result.get("exit_code") == 0, result
-    assert result["stdout"]["content"] == "WORKSPACE_VENV=True\n"
+    (workspace / "sample.py").write_text("def choose(value):\n    return 1 if value else 2\n")
+    (workspace / "test_sample.py").write_text(
+        "from sample import choose\n\n\ndef test_positive():\n    assert choose(True) == 1\n"
+        "\n\ndef test_negative():\n    assert choose(False) == 2\n"
+    )
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join((str(venv_bin), str(Path(uv).parent), os.environ["PATH"]))
+    )
+    (result,) = invoke_tools(
+        public,
+        [
+            {
+                "tool": "run_command",
+                "arguments": {
+                    "command": "uv run pytest -p no:cacheprovider --cov=sample --cov-branch --cov-report=term-missing --cov-fail-under=100",
+                    "cwd": "/workspace",
+                    "read_only": True,
+                },
+            }
+        ],
+        model_paths=True,
+        seconds=20,
+    )
+    assert result["ok"], result
+    assert result["result"]["exit_code"] == 0
+    output = result["result"]["stdout"]["content"]
+    assert "2 passed" in output and "100%" in output
+    assert not (workspace / ".coverage").exists()
+    assert not interaction.prompts
+    ruff = project_venv / "bin/ruff"
+    assert ruff.is_file(), "The qualification environment needs its installed Ruff executable"
+    shutil.copyfile(ruff, venv_bin / "ruff")
+    (venv_bin / "ruff").chmod(0o755)
+    (lint,) = invoke_tools(
+        public,
+        [
+            {
+                "tool": "run_command",
+                "arguments": {
+                    "command": "uv run ruff check sample.py test_sample.py",
+                    "cwd": "/workspace",
+                    "read_only": True,
+                },
+            }
+        ],
+        model_paths=True,
+        seconds=20,
+    )
+    assert lint["ok"] and lint["result"]["exit_code"] == 0, json.dumps(lint)
+    assert not (workspace / ".ruff_cache").exists()
     assert not interaction.prompts
     require_drained(public[2])
 
@@ -499,7 +1041,7 @@ def test_payload_cannot_submit_broader_request_over_pathname_ipc(
                 write_roots=(workspace, outside),
                 network=True,
                 environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
-                policy_version="linux-native-v1",
+                policy_version=NATIVE_POLICY_VERSION,
                 deadline=time.monotonic() + 10,
                 workspace_id="recursive-admission-negative",
             )
@@ -608,158 +1150,156 @@ def test_public_system_hostname_and_default_trust_match_host(public):
     require_drained(public[2])
 
 
-def test_public_default_verified_tls_to_owned_fixture(public, native_directory):
+def test_public_default_verified_tls_to_owned_fixture(
+    public, public_workspace_root, request, native_directory
+):
     """Verify an owned HTTPS chain, hostname and offline boundary without changing host trust."""
     workspace = public[1]
-    with tempfile.TemporaryDirectory(
-        prefix="loop-owned-https-", dir=native_directory(Path("/tmp"))
-    ) as directory:
-        private = Path(directory)
-        ca = private / "ca.pem"
-        key = private / "server.key"
-        certificate = private / "server.pem"
-        extensions = private / "extensions"
-        extensions.write_text(
-            "basicConstraints=critical,CA:FALSE\n"
-            "keyUsage=critical,digitalSignature,keyEncipherment\n"
-            "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n"
+    _workspace_root, _permissions_root, external_root = public_workspace_root
+    private = native_directory(
+        external_root,
+        name=_test_directory_name(request.node.nodeid),
+    )
+    ca = private / "ca.pem"
+    key = private / "server.key"
+    certificate = private / "server.pem"
+    extensions = private / "extensions"
+    extensions.write_text(
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n"
+    )
+    commands = (
+        [
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=Loop owned fixture CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-keyout",
+            str(private / "ca.key"),
+            "-out",
+            str(ca),
+        ],
+        [
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+            str(key),
+            "-out",
+            str(private / "server.csr"),
+        ],
+        [
+            "x509",
+            "-req",
+            "-days",
+            "1",
+            "-in",
+            str(private / "server.csr"),
+            "-CA",
+            str(ca),
+            "-CAkey",
+            str(private / "ca.key"),
+            "-CAcreateserial",
+            "-extfile",
+            str(extensions),
+            "-out",
+            str(certificate),
+        ],
+    )
+    for arguments in commands:
+        subprocess.run(
+            ["/usr/bin/openssl", *arguments], capture_output=True, check=True, timeout=10
         )
-        commands = (
-            [
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-days",
-                "1",
-                "-subj",
-                "/CN=Loop owned fixture CA",
-                "-addext",
-                "basicConstraints=critical,CA:TRUE",
-                "-keyout",
-                str(private / "ca.key"),
-                "-out",
-                str(ca),
-            ],
-            [
-                "req",
-                "-new",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-subj",
-                "/CN=localhost",
-                "-keyout",
-                str(key),
-                "-out",
-                str(private / "server.csr"),
-            ],
-            [
-                "x509",
-                "-req",
-                "-days",
-                "1",
-                "-in",
-                str(private / "server.csr"),
-                "-CA",
-                str(ca),
-                "-CAkey",
-                str(private / "ca.key"),
-                "-CAcreateserial",
-                "-extfile",
-                str(extensions),
-                "-out",
-                str(certificate),
-            ],
-        )
-        for arguments in commands:
-            subprocess.run(
-                ["/usr/bin/openssl", *arguments], capture_output=True, check=True, timeout=10
+    trusted = workspace / "owned-ca.pem"
+    trusted.write_bytes(ca.read_bytes())
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        """Return fixed fixture bytes without logging request data."""
+
+        def do_GET(self):
+            """Serve the bounded owned response."""
+            body = b"loop-owned-https"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            """Discard the fixture server's ordinary access log."""
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+
+        def source(hostname):
+            """Build a default verified client for this owned fixture port."""
+            url = f"https://{hostname}:{server.server_port}/"
+            return (
+                "import hashlib,ssl,urllib.request;context=ssl.create_default_context();"
+                "assert context.check_hostname and context.verify_mode==ssl.CERT_REQUIRED;"
+                f"response=urllib.request.urlopen({url!r},context=context,timeout=1);"
+                "print(hashlib.sha256(response.read(65536)).hexdigest())"
             )
-        trusted = workspace / "owned-ca.pem"
-        trusted.write_bytes(ca.read_bytes())
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            """Return fixed fixture bytes without logging request data."""
-
-            def do_GET(self):
-                """Serve the bounded owned response."""
-                body = b"loop-owned-https"
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, format, *args):
-                """Discard the fixture server's ordinary access log."""
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certificate, key)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-
-            def source(hostname):
-                """Build a default verified client for this owned fixture port."""
-                url = f"https://{hostname}:{server.server_port}/"
-                return (
-                    "import hashlib,ssl,urllib.request;context=ssl.create_default_context();"
-                    "assert context.check_hostname and context.verify_mode==ssl.CERT_REQUIRED;"
-                    f"response=urllib.request.urlopen({url!r},context=context,timeout=1);"
-                    "print(hashlib.sha256(response.read(65536)).hexdigest())"
-                )
-
-            code = source("localhost")
-            direct = subprocess.check_output(
-                ["/usr/bin/python3", "-I", "-c", code],
-                text=True,
-                env={**os.environ, "SSL_CERT_FILE": str(trusted)},
-                timeout=5,
-            ).strip()
-            assert direct == hashlib.sha256(b"loop-owned-https").hexdigest()
-            prefix = "SSL_CERT_FILE=" + shlex.quote(str(trusted)) + " /usr/bin/python3 -I -c "
-            result = invoke(public, prefix + shlex.quote(code), network=True)
-            assert result["ok"], result
-            assert result["result"]["stdout"]["content"].strip() == direct
-            wrong_name = invoke(public, prefix + shlex.quote(source("127.0.0.1")), network=True)
-            assert not wrong_name["ok"]
-            assert (
-                "CERTIFICATE_VERIFY_FAILED"
-                in wrong_name["problem"]["metadata"]["stderr"]["content"]
-            )
-            untrusted = invoke(public, "/usr/bin/python3 -I -c " + shlex.quote(code), network=True)
-            assert not untrusted["ok"]
-            assert (
-                "CERTIFICATE_VERIFY_FAILED" in untrusted["problem"]["metadata"]["stderr"]["content"]
-            )
-            offline = invoke(public, prefix + shlex.quote(code), network=False)
-            assert not offline["ok"]
-            assert direct not in json.dumps(offline)
-            protected = invoke(public, "cat " + shlex.quote(str(key)), network=True)
-            assert not protected["ok"]
-            assert "PRIVATE KEY" not in json.dumps(protected)
-            require_drained(public[2])
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
-            assert not thread.is_alive()
+        code = source("localhost")
+        direct = subprocess.check_output(
+            ["/usr/bin/python3", "-I", "-c", code],
+            text=True,
+            env={**os.environ, "SSL_CERT_FILE": str(trusted)},
+            timeout=5,
+        ).strip()
+        assert direct == hashlib.sha256(b"loop-owned-https").hexdigest()
+        prefix = "SSL_CERT_FILE=" + shlex.quote(str(trusted)) + " /usr/bin/python3 -I -c "
+        result = invoke(public, prefix + shlex.quote(code), network=True)
+        assert result["ok"], result
+        assert result["result"]["stdout"]["content"].strip() == direct
+        wrong_name = invoke(public, prefix + shlex.quote(source("127.0.0.1")), network=True)
+        assert not wrong_name["ok"]
+        assert "CERTIFICATE_VERIFY_FAILED" in wrong_name["problem"]["metadata"]["stderr"]["content"]
+        untrusted = invoke(public, "/usr/bin/python3 -I -c " + shlex.quote(code), network=True)
+        assert not untrusted["ok"]
+        assert "CERTIFICATE_VERIFY_FAILED" in untrusted["problem"]["metadata"]["stderr"]["content"]
+        offline = invoke(public, prefix + shlex.quote(code), network=False)
+        assert not offline["ok"]
+        assert direct not in json.dumps(offline)
+        protected = invoke(public, "cat " + shlex.quote(str(key)), network=True)
+        assert not protected["ok"]
+        assert "PRIVATE KEY" not in json.dumps(protected)
+        require_drained(public[2])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
 
 
 def test_ordinary_approved_broader_request_is_executable(
-    installation, tmp_path, native_directory, monkeypatch
+    installation, public_workspace_root, request, native_directory, monkeypatch
 ):
     """Approved outside access and network requests provide a valid escalation control."""
     from loop.execution.sandbox import SandboxOutcome
 
     backend, generation = installation
-    workspace = tmp_path / "workspace"
-    outside = tmp_path / "outside"
-    workspace.mkdir()
-    outside.mkdir()
+    workspace_root, _permissions_root, _external_root = public_workspace_root
+    fixture_name = _test_directory_name(request.node.nodeid)
+    workspace = native_directory(workspace_root, name=fixture_name)
+    outside = native_directory(workspace_root, name=fixture_name + "-outside")
     (outside / "secret").write_text("broader-control")
     monkeypatch.setattr(tempfile, "tempdir", "/tmp")
     scratch = native_directory(Path("/tmp"))
@@ -796,6 +1336,661 @@ def test_ordinary_approved_broader_request_is_executable(
         with listener.accept()[0] as connection:
             assert connection.recv(8) == b"approved"
         require_drained(generation)
+
+
+def test_public_executable_lookup_and_exact_file_authority(
+    public_registry, public_workspace_root, request, native_directory, monkeypatch
+):
+    """Keep exact PATH executable authority narrow while explicit folder grants stay visible."""
+    interaction, workspace, _generation, _audit_path = public_registry
+    _workspace_root, _permissions_root, external_root = public_workspace_root
+    tool_directory = native_directory(
+        external_root,
+        name=_test_directory_name(request.node.nodeid),
+    )
+    executable = tool_directory / "owned-tool"
+    sibling = tool_directory / "sibling-secret"
+    sibling.write_text("external-sibling-canary", encoding="utf-8")
+    executable.write_text(
+        "#!/bin/sh\n"
+        f"if /usr/bin/cat {shlex.quote(str(sibling))} >/dev/null 2>&1; then\n"
+        "  printf sibling-visible\n"
+        "else\n"
+        "  printf exact-file-only\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tool_directory) + os.pathsep + os.environ["PATH"])
+
+    lookup, explicit, exact = invoke_registered(
+        public_registry,
+        [
+            {
+                "tool": "resolve_executable",
+                "arguments": {"name": executable.name, "cwd": str(workspace)},
+            },
+            {
+                "tool": "run_command",
+                "arguments": {
+                    "command": executable.name,
+                    "cwd": str(workspace),
+                    "read_only": True,
+                },
+                "argument_sources": {
+                    "executable_grant": {"result_index": 0, "result_key": "grant_reference"}
+                },
+            },
+            {
+                "tool": "run_command",
+                "arguments": {
+                    "command": executable.name,
+                    "cwd": str(workspace),
+                    "read_only": True,
+                },
+            },
+        ],
+    )
+    lookup = lookup.get("result", lookup)
+    assert lookup["sandbox_access"] == "external_read_grant_required", lookup
+    assert lookup.get("grant_reference"), lookup
+    explicit_execution = explicit.get("result", explicit)
+    assert explicit_execution.get("exit_code") == 0, explicit
+    assert explicit_execution["stdout"]["content"] == "sibling-visible"
+    exact_execution = exact.get("result", exact)
+    assert exact_execution.get("exit_code") == 0, exact
+    assert exact_execution["stdout"]["content"] == "exact-file-only"
+    assert any(
+        "Read the installed owned-tool tool folder" in message for message in interaction.infos
+    )
+    assert all(
+        str(tool_directory) not in message for message in interaction.prompts + interaction.infos
+    )
+    require_drained(public_registry[2])
+
+
+def test_public_audit_correlates_native_attempt_without_command_content(
+    public_registry,
+):
+    """Record the correlated sandbox attempt without retaining opaque shell source."""
+    _interaction, workspace, _generation, audit_path = public_registry
+    token = "audit-private-command-content-7bf0d835"
+    (result,) = invoke_registered(
+        public_registry,
+        [
+            {
+                "tool": "run_command",
+                "arguments": {
+                    "command": f"printf {token} >/dev/null",
+                    "cwd": str(workspace),
+                    "read_only": True,
+                },
+            }
+        ],
+    )
+    assert result.get("result", result).get("exit_code") == 0, result
+    exported = SQLitePermissionAudit(audit_path).export_jsonl(
+        audit_path.with_name(f"{workspace.name}-audit-export.jsonl"),
+        workspace_id="native-public-review",
+    )
+    content = exported.read_text(encoding="utf-8")
+    rows = [json.loads(line) for line in content.splitlines()]
+    assert any(
+        row["event_name"] == "sandbox.permission_scope" and row["payload"].get("attempt_id")
+        for row in rows
+    )
+    assert token not in content
+    require_drained(public_registry[2])
+
+
+def test_installed_payload_closes_inheritable_host_descriptors(
+    installation, public, native_directory
+):
+    """Close ambient host descriptors before any opaque payload can inspect them."""
+    backend, generation = installation
+    _interaction, workspace, _generation = public
+    scratch = native_directory(Path("/tmp"))
+    outside_directory = native_directory(workspace.parent)
+    outside = outside_directory / "descriptor-canary"
+    outside.write_text("host-only", encoding="utf-8")
+    with outside.open("rb") as stream:
+        descriptor = fcntl.fcntl(stream.fileno(), fcntl.F_DUPFD, 100)
+        try:
+            os.set_inheritable(descriptor, True)
+            request = native_request(
+                backend,
+                workspace,
+                scratch,
+                f"test ! -e /proc/self/fd/{descriptor}",
+            )
+            result = backend.run(request)
+        finally:
+            os.close(descriptor)
+    assert result.outcome is SandboxOutcome.COMPLETED, result
+    assert result.exit_code == 0, result
+    require_drained(generation)
+
+
+def test_installed_payload_inherits_enforcement_and_cannot_replace_its_profile(
+    installation, public, native_directory
+):
+    """Keep nested shells confined and refuse attempts to replace the active payload profile."""
+    backend, generation = installation
+    _interaction, workspace, _generation = public
+    scratch = native_directory(Path("/tmp"))
+    nested = backend.run(
+        native_request(
+            backend,
+            workspace,
+            scratch,
+            "cat /proc/self/attr/current; /bin/sh -c 'cat /proc/self/attr/current'",
+        )
+    )
+    labels = nested.stdout.splitlines()
+    assert nested.outcome is SandboxOutcome.COMPLETED, nested
+    assert nested.exit_code == 0, nested
+    assert len(labels) == 2 and labels[0] == labels[1]
+    assert "payload_" in labels[0] and labels[0].endswith("(enforce)")
+
+    code = (
+        "import ctypes;lib=ctypes.CDLL('libapparmor.so.1',use_errno=True);"
+        "lib.aa_change_profile.argtypes=[ctypes.c_char_p];"
+        "lib.aa_change_profile.restype=ctypes.c_int;"
+        "result=lib.aa_change_profile(b'unconfined');"
+        "raise OSError(ctypes.get_errno(),'Unapproved profile change denied') "
+        "if result != 0 else RuntimeError('Profile replacement unexpectedly succeeded')"
+    )
+    replacement = backend.run(
+        native_request(
+            backend,
+            workspace,
+            scratch,
+            "/usr/bin/python3 -I -c " + shlex.quote(code),
+        )
+    )
+    assert replacement.outcome is SandboxOutcome.COMPLETED, replacement
+    assert replacement.exit_code != 0
+    assert "Unapproved profile change denied" in replacement.stderr
+    require_drained(generation)
+
+
+def test_public_network_grant_keeps_udp_offline_until_approved(public):
+    """Keep UDP offline until an explicit public network grant is approved."""
+    with socket.socket(type=socket.SOCK_DGRAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.settimeout(0.2)
+        source = "/usr/bin/python3 -I -c " + shlex.quote(
+            "import socket;target=('127.0.0.1',"
+            + str(listener.getsockname()[1])
+            + ");socket.socket(type=socket.SOCK_DGRAM).sendto(b'granted',target)"
+        )
+        denied = invoke(public, source, read_only=True)
+        assert denied.get("ok") is True, denied
+        assert denied["result"]["exit_code"] == 0, denied
+        with pytest.raises(TimeoutError):
+            listener.recvfrom(32)
+
+        approved = invoke(public, source, read_only=True, network=True)
+        assert approved["result"]["exit_code"] == 0, approved
+        listener.settimeout(2)
+        assert listener.recvfrom(32)[0] == b"granted"
+    require_drained(public[2])
+
+
+def test_public_git_read_follows_linked_worktree_metadata_grant(
+    public, public_workspace_root, request, native_directory
+):
+    """Read linked-worktree metadata only through its separately named external grant."""
+    workspace = public[1]
+    _workspace_root, _permissions_root, external_root = public_workspace_root
+    repository = native_directory(
+        external_root,
+        name=_test_directory_name(request.node.nodeid),
+    )
+    linked = workspace / "linked-worktree"
+    subprocess.run(
+        ["/usr/bin/git", "init", "--quiet", "--initial-branch=main", str(repository)],
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Loop fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            str(linked),
+            "HEAD",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    metadata = repository / ".git"
+    result = invoke(
+        public,
+        "/usr/bin/git status --porcelain",
+        cwd=str(linked),
+        read_roots=[str(metadata)],
+        read_only=True,
+    )
+    assert result["result"]["exit_code"] == 0, result
+    assert result["result"]["stdout"]["content"] == ""
+    require_drained(public[2])
+
+
+def test_installed_requests_reuse_policy_without_sharing_private_scratch(
+    installation, public, native_directory
+):
+    """Reuse identical policy across isolated sequential and concurrent scratch mounts."""
+    backend, generation = installation
+    _interaction, workspace, _generation = public
+    cache_lock = NATIVE_INSTALLATION_DIRECTORY / "cache.lock"
+    runtime_roots = runtime_read_roots()
+
+    def foreign_path_checks(path):
+        """Return read/write probes for one other request's host scratch path."""
+        direct = shlex.quote(str(path))
+        traversed = shlex.quote(f"{NATIVE_SCRATCH_PATH}/../../{str(path).lstrip('/')}")
+        return "".join(
+            f"if /usr/bin/cat {candidate} >/dev/null 2>&1; then exit 31; fi; "
+            f"if printf intruder > {candidate} 2>/dev/null; then exit 32; fi; "
+            for candidate in (direct, traversed)
+        )
+
+    first_scratch = native_directory(Path("/tmp"))
+    second_scratch = native_directory(Path("/tmp"))
+
+    def aliases():
+        """Keep each request's host symlink private while binding the same workspace authority."""
+        parent = native_directory(Path("/tmp"))
+        alias = parent / "r0"
+        alias.symlink_to(workspace)
+        return (("/workspace", alias, workspace),)
+
+    first_aliases, second_aliases = aliases(), aliases()
+    first = native_request(
+        backend,
+        workspace,
+        first_scratch,
+        f"cd {shlex.quote(str(first_aliases[0][1]))}/; "
+        + 'printf first > "$TMPDIR/value"; /usr/bin/cat "$TMPDIR/value"',
+        aliases=first_aliases,
+    )
+    second_source = foreign_path_checks(first_scratch / "value") + (
+        'printf second > "$TMPDIR/value"; /usr/bin/cat "$TMPDIR/value"'
+    )
+    second = native_request(
+        backend,
+        workspace,
+        second_scratch,
+        f"cd {shlex.quote(str(second_aliases[0][1]))}/; " + second_source,
+        aliases=second_aliases,
+    )
+
+    assert payload_profile(first, first_scratch, cache_lock, runtime_roots) == payload_profile(
+        second, second_scratch, cache_lock, runtime_roots
+    )
+    first_result = backend.run(first)
+    second_result = backend.run(second)
+    assert first_result.outcome is SandboxOutcome.COMPLETED, first_result
+    assert second_result.outcome is SandboxOutcome.COMPLETED, second_result
+    assert first_result.stdout == "first"
+    assert second_result.stdout == "second"
+    assert (first_scratch / "value").read_text(encoding="utf-8") == "first"
+    assert (second_scratch / "value").read_text(encoding="utf-8") == "second"
+
+    concurrent_scratch = tuple(native_directory(Path("/tmp")) for _ in range(2))
+
+    def concurrent_request(label, own_scratch, other_scratch):
+        """Create one distinct scratch request that probes the peer's private path."""
+        peer = "right" if label == "left" else "left"
+        own_aliases = aliases()
+        source = (
+            f"cd {shlex.quote(str(own_aliases[0][1]))}/; "
+            f'printf {label} > "$TMPDIR/value"; printf ready > {label}-ready; '
+            f"while test ! -f {peer}-ready; do /usr/bin/sleep 0.01; done; "
+            + foreign_path_checks(other_scratch / "value")
+            + f"printf isolated-{label}"
+        )
+        return native_request(backend, workspace, own_scratch, source, aliases=own_aliases)
+
+    requests = (
+        concurrent_request("left", concurrent_scratch[0], concurrent_scratch[1]),
+        concurrent_request("right", concurrent_scratch[1], concurrent_scratch[0]),
+    )
+    assert payload_profile(requests[0], concurrent_scratch[0], cache_lock, runtime_roots) == (
+        payload_profile(requests[1], concurrent_scratch[1], cache_lock, runtime_roots)
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        left = executor.submit(backend.run, requests[0])
+        deadline = time.monotonic() + 5
+        ready = workspace / "left-ready"
+        while not ready.exists() and not left.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), left.result() if left.done() else "First payload did not enter"
+        right = executor.submit(backend.run, requests[1])
+        concurrent_results = (left.result(), right.result())
+    for result in concurrent_results:
+        assert result.outcome is SandboxOutcome.COMPLETED, (
+            f"{result.outcome.value}: {result.detail}; {result.failure_context}; "
+            f"exit={result.exit_code}; stderr={result.stderr!r}"
+        )
+    assert tuple(result.stdout for result in concurrent_results) == (
+        "isolated-left",
+        "isolated-right",
+    ), concurrent_results
+    assert (concurrent_scratch[0] / "value").read_text(encoding="utf-8") == "left"
+    assert (concurrent_scratch[1] / "value").read_text(encoding="utf-8") == "right"
+    require_drained(generation)
+
+
+def test_native_selected_snapshots_overlap_without_shared_access(
+    installation, public, native_directory, monkeypatch
+):
+    """Overlapping selected-file requests keep snapshots read-only and peer scratch inaccessible."""
+    backend, generation = installation
+
+    def temporary_directory(suffix=None, prefix=None, dir=None):
+        """Register the real backend's disposable scratch before its standard cleanup owns it."""
+        return str(
+            native_directory(
+                Path(dir or tempfile.gettempdir()),
+                name=(prefix or "loop-native-test-") + uuid4().hex + (suffix or ""),
+            )
+        )
+
+    monkeypatch.setattr(tempfile, "mkdtemp", temporary_directory)
+    workspace = public[1]
+    (workspace / ".ssh").mkdir()
+    unselected = workspace / ".ssh/key"
+    unselected.write_text("unselected-private-canary")
+    executable = Path("/usr/bin/python3").resolve(strict=True)
+    inputs = []
+    for label in ("left", "right"):
+        path = workspace / label
+        path.write_text(label)
+        inputs.append(path)
+    requests = []
+    original_run = backend.run
+
+    def observe(request):
+        """Observe owned preparation while delegating every request to real native enforcement."""
+        requests.append(request)
+        return original_run(request)
+
+    monkeypatch.setattr(backend, "run", observe)
+    code = (
+        "UNSELECTED="
+        + repr(str(unselected))
+        + "\n"
+        + r"""
+import json,os,time
+from pathlib import Path
+fd=int(sys.argv[1].rsplit('/',1)[1])
+label=os.read(fd,128).decode()
+try: Path(UNSELECTED).read_text()
+except OSError: pass
+else: raise RuntimeError('Unselected private source was exposed')
+scratch=Path(os.environ['TMPDIR'])
+selected=scratch/'selected'/str(fd)
+for change in (lambda: selected.write_text('bad'), lambda: selected.chmod(0o600), lambda: selected.unlink(), lambda: selected.rename(selected.with_name('moved'))):
+ try: change()
+ except OSError: pass
+ else: raise RuntimeError('Selected snapshot was writable')
+(scratch/'ready').write_text('ready')
+while not (scratch/'peer.json').exists(): time.sleep(0.01)
+peer=json.loads((scratch/'peer.json').read_text())
+for value in peer:
+ for action in (lambda: Path(value).read_bytes(), lambda: Path(value).write_text('bad')):
+  try: action()
+  except OSError: pass
+  else: raise RuntimeError('Peer state was accessible')
+print(label)
+"""
+    )
+    code = "import sys\n" + code
+    descriptors = [os.open(path, os.O_RDONLY) for path in inputs]
+
+    def run(index):
+        """Launch a protected system Python through the selected-descriptor native owner."""
+        fd = descriptors[index]
+        return backend.run_read_only_argv(
+            executable, ("-I", "-c", code, f"/dev/fd/{fd:05d}"), (fd,), time.monotonic() + 15
+        )
+
+    def ready(index, future):
+        """Require actual payload entry before admitting the next overlapping request."""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not future.done():
+            if len(requests) > index:
+                scratch = Path(requests[index].shell_environment()["TMPDIR"])
+                if (scratch / "ready").exists():
+                    return scratch
+            time.sleep(0.01)
+        pytest.fail(
+            f"Native selected-file payload did not enter: {future.result() if future.done() else 'deadline'}"
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            left = executor.submit(run, 0)
+            first = ready(0, left)
+            baseline = profile_inventory(generation)
+            right = executor.submit(run, 1)
+            second = ready(1, right)
+            for own, peer, peer_fd in (
+                (first, second, descriptors[1]),
+                (second, first, descriptors[0]),
+            ):
+                (own / "peer.json").write_text(
+                    json.dumps([str(peer / "ready"), str(peer / "selected" / str(peer_fd))])
+                )
+            results = (left.result(), right.result())
+        assert all(result is not None and result.exit_code == 0 for result in results), results
+        assert tuple(result.stdout for result in results) == ("left\n", "right\n")
+        assert profile_inventory(generation) == baseline
+        assert all(path.read_text() == label for path, label in zip(inputs, ("left", "right")))
+        assert not first.exists() and not second.exists()
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+    require_drained(generation)
+
+
+def test_native_scratch_hardlink_stays_read_only_at_both_spellings(
+    installation, public, native_directory
+):
+    """The stable scratch mirror cannot write an outside inode through a preexisting hardlink."""
+    backend, generation = installation
+    workspace = public[1]
+    scratch = native_directory(Path("/tmp"))
+    outside = workspace / "outside-scratch-link"
+    outside.write_text("preserve")
+    os.link(outside, scratch / "linked")
+    source = 'cat "$TMPDIR/linked"; if printf bad > "$TMPDIR/linked" 2>/dev/null; then exit 31; fi'
+    result = backend.run(native_request(backend, workspace, scratch, source))
+    assert result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0, result
+    assert result.stdout == "preserve" and outside.read_text() == "preserve"
+    require_drained(generation)
+
+
+def test_installed_request_disconnect_cancels_admitted_source(
+    installation, public, native_directory
+):
+    """Cancel an admitted client request and verify the tracked command is drained."""
+    backend, generation = installation
+    _interaction, workspace, _generation = public
+    scratch = native_directory(Path("/tmp"))
+    request = native_request(
+        backend,
+        workspace,
+        scratch,
+        "printf started > disconnect-marker; sleep 20",
+        seconds=30,
+    )
+    record = NATIVE_INSTALLATION_DIRECTORY / "management.json"
+    code = (
+        "from pathlib import Path;import sys;"
+        "from loop.execution.sandbox.linux import LinuxNativeBackend;"
+        "from loop.execution.sandbox.contracts import SandboxRequest;"
+        "print(LinuxNativeBackend(Path(sys.argv[1])).run("
+        "SandboxRequest.from_wire(sys.stdin.buffer.read())).outcome.value,flush=True)"
+    )
+    client = subprocess.Popen(
+        [sys.executable, "-I", "-B", "-c", code, str(record)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            key: value for key, value in os.environ.items() if key not in {"TMPDIR", "TMP", "TEMP"}
+        },
+    )
+    try:
+        assert client.stdin is not None
+        client.stdin.write(request.to_wire())
+        client.stdin.close()
+        deadline = time.monotonic() + 10
+        marker = workspace / "disconnect-marker"
+        while not marker.exists() and client.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if client.poll() is not None:
+            assert client.stdout is not None and client.stderr is not None
+            pytest.fail(
+                f"Native client exited {client.returncode} before payload entry: "
+                f"stdout={client.stdout.read()!r}; stderr={client.stderr.read()!r}"
+            )
+        assert marker.exists(), "native request did not enter its payload"
+        client.send_signal(signal.SIGINT)
+        assert client.wait(timeout=5) == 0
+        assert client.stdout is not None and client.stdout.read().strip() == b"cancelled"
+        assert client.stderr is not None and client.stderr.read() == b""
+    finally:
+        if client.poll() is None:
+            client.kill()
+            client.wait(timeout=5)
+        if client.stdout is not None:
+            client.stdout.close()
+        if client.stderr is not None:
+            client.stderr.close()
+    require_drained(generation)
+
+
+def test_compiler_contention_refuses_before_payload_entry(installation, public, native_directory):
+    """Do not execute request source while another authenticated compiler owns the lock."""
+    backend, generation = installation
+    _interaction, workspace, _generation = public
+    scratch = native_directory(Path("/tmp"))
+    marker = workspace / "compiler-contention-marker"
+    record = NATIVE_INSTALLATION_DIRECTORY / "management.json"
+    compiler = bind_host_file(record.parent / "compiler.lock")
+    with compiler.open_verified() as descriptor:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = backend.run(
+            native_request(
+                backend,
+                workspace,
+                scratch,
+                f"printf entered > {shlex.quote(str(marker))}",
+                seconds=1,
+            )
+        )
+    assert result.outcome in {SandboxOutcome.INVALID, SandboxOutcome.TIMED_OUT}, result
+    assert not marker.exists()
+    require_drained(generation)
+
+
+@pytest.mark.skipif(
+    not _CAPACITY_TEST_OPT_IN,
+    reason="Set LOOP_NATIVE_CAPACITY_TEST=disposable-linux-host to consume the installed profile cache",
+)
+def test_installed_profile_capacity_refuses_source_before_entry(
+    installation, public, native_directory
+):
+    """Refuse payload entry when the add-only installed profile cache is exhausted."""
+    backend, generation = installation
+    _interaction, workspace, _generation = public
+    installed, authority = read_generation(NATIVE_INSTALLATION_DIRECTORY / "management.json")
+    capacity, _ = generation_limits(installed.config.reservation, generation)
+
+    def inventory():
+        """Observe enforcing kernel fingerprints bound to the original installation."""
+        with authority.open_verified():
+            return profile_inventory(generation)
+
+    initial = inventory()
+    available = capacity - (len(initial) - 1)
+    assert 0 < available <= capacity, "Capacity qualification needs unused profile slots"
+    scratch = native_directory(Path("/tmp"))
+    marker = workspace / "profile-capacity-marker"
+    current = initial
+    first_extra = None
+    for index in range(available + 1):
+        extra = native_directory(
+            workspace.parent, name=f"loop-native-test-profile-capacity-read-{index}"
+        )
+        first_extra = first_extra or extra
+        marker.unlink(missing_ok=True)
+        request = native_request(
+            backend,
+            workspace,
+            scratch,
+            f"printf entered > {shlex.quote(str(marker))}",
+            read_roots=(extra,),
+        )
+        profile = payload_profile(
+            request, scratch, installed.artifacts["cache.lock"].path, runtime_read_roots()
+        )
+        assert profile not in current
+        result = backend.run(request)
+        observed = inventory()
+        if index < available:
+            assert result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0, result
+            assert marker.read_text() == "entered"
+            assert set(observed) == set(current) | {profile}
+            assert all(observed[name] == data for name, data in current.items())
+            current = observed
+        else:
+            assert len(current) == capacity + 1
+            assert result.outcome is SandboxOutcome.INVALID, result
+            assert not marker.exists()
+            assert observed == current
+    assert len(current) == capacity + 1
+    reusable = native_request(
+        backend,
+        workspace,
+        scratch,
+        f"printf reused > {shlex.quote(str(marker))}",
+        read_roots=(first_extra,),
+    )
+    result = backend.run(reusable)
+    assert result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0, result
+    assert marker.read_text() == "reused"
+    assert inventory() == current
+    require_drained(generation)
 
 
 if __name__ == "__main__":

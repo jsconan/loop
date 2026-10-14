@@ -19,17 +19,19 @@ uv run pylint src
 
 `make test` runs the portable unit suite with 100% statement and branch coverage. Integration and end-to-end checks live separately under `tests/integration/` and skip unsupported platforms. `make test-all` runs both sets. See [test organization, execution and isolation](../tests/README.md).
 
+## macOS native integration
+
+Run `tests/integration/macos/` from a terminal whose parent process permits Seatbelt initialization. Public native-search checks also need a trusted ripgrep installation on `PATH` before pytest starts; verified Homebrew installations are supported. Missing prerequisites produce skips, which do not verify native enforcement. Separate cases exercise the Python search fallback.
+
 ## Linux native integration
 
-Linux native checks require explicit host provisioning and do not install, refresh, or remove administrator authority. Without a qualified native installation, the integration suite exercises the unavailable path; skipped checks are not enforcement evidence.
+Provision the Linux sandbox explicitly through the main app before running installed execution checks. Ordinary integration tests do not install, refresh, or remove it. Use an installation matching the package being tested; incompatible installations refuse execution until refreshed. Without a working installation, the suite checks unavailable behavior and skips enforcement cases.
 
-The native test fixtures require:
+Put the test virtual environment and `uv` on `PATH`, with pytest, pytest-cov and Ruff installed, to exercise the development-tool workflows. Some checks also require explicitly provisioned fake runtime data or a directory on the sandbox listener’s filesystem. See [native Linux test setup](../tests/README.md#native-linux-test-setup) for the environment variables and fixture requirements.
 
-- `LOOP_NATIVE_BWRAP` to name an explicitly selected, root-protected Bubblewrap qualification helper for `linux/test_namespace.py`.
-- A current administrator-provisioned production installation for `linux/test_installed_execution.py`.
-- `LOOP_NATIVE_SOCKET_ALIAS_DIRECTORY` to name a private directory owned by the ordinary user, mode `0700`, on the listener's filesystem when running socket-alias cases.
+Capacity and management lifecycle checks are opt-in and require a disposable Linux host. The capacity check fills the policy cache and requires a refresh afterward. The lifecycle check installs and removes the sandbox, requires a real terminal with administrator authentication, and must run separately. Do not raise limits, broaden permissions, or omit assertions to make native checks pass.
 
-The installed execution corpus uses immutable policy profiles. A generation permits at most 29 payload profiles, including operational selection probes. Run the corpus in bounded subsets, using a fresh reviewed installation and checked uninstall between subsets; do not increase the limit or drop cases to make the corpus pass. Native qualification procedures and evidence are maintained under `plans/native-command-sandbox/`.
+## Source organization
 
 The package uses a `src` layout. Its main components are:
 

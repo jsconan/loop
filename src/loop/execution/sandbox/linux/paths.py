@@ -20,8 +20,11 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .... import constants
 from ....constants import GIT_DIRECTORY
 from ....permissions.protection import PRIVATE_READ_COMPONENTS, is_protected_external_read
+from ..constants import TMPDIR_ENVIRONMENT_VARIABLE
+from .constants import NATIVE_ALIAS_PATH, NATIVE_SCRATCH_PATH
 
 if TYPE_CHECKING:
     from ..contracts import SandboxRequest
@@ -41,6 +44,34 @@ def _check_deadline(deadline: float) -> None:
 def _directory_state(details: os.stat_result) -> tuple[int, int, int, int]:
     """Bind a scanned directory to its inode and membership-change timestamps."""
     return details.st_dev, details.st_ino, details.st_mtime_ns, details.st_ctime_ns
+
+
+def payload_path(path: Path, scratch: Path) -> Path:
+    """Map a private scratch path into its request-local namespace.
+
+    Args:
+        path (Path): Bound host path.
+        scratch (Path): This request's private host scratch directory.
+
+    Returns:
+        Path: Stable namespace path beneath scratch, or the unchanged external path.
+    """
+    return NATIVE_SCRATCH_PATH / path.relative_to(scratch) if path.is_relative_to(scratch) else path
+
+
+def payload_aliases(request: SandboxRequest) -> tuple[tuple[Path, Path, Path], ...]:
+    """Map bound virtual aliases to stable request-local symlinks.
+
+    Args:
+        request (SandboxRequest): Original bound virtual aliases and targets.
+
+    Returns:
+        tuple[tuple[Path, Path, Path], ...]: Host alias, namespace alias and original target.
+    """
+    return tuple(
+        (alias, NATIVE_ALIAS_PATH / f"r{index}", target)
+        for index, (_, alias, target) in enumerate(request.aliases)
+    )
 
 
 def python_runtime_mounts(
@@ -79,8 +110,8 @@ def python_runtime_mounts(
     if (
         not home.is_dir()
         or home_details.st_uid != os.getuid()
-        or home_details.st_mode & 0o002
-        or home_details.st_mode & 0o020
+        or home_details.st_mode & constants.OTHER_WRITE_MODE_BIT
+        or home_details.st_mode & constants.GROUP_WRITE_MODE_BIT
         and home_details.st_gid != os.getgid()
     ):
         raise ValueError("Current account home is unsafe for Python runtime binding.")
@@ -97,8 +128,8 @@ def python_runtime_mounts(
             not stat.S_ISREG(before.st_mode)
             or before.st_nlink != 1
             or before.st_uid != os.getuid()
-            or before.st_mode & 0o002
-            or before.st_mode & 0o020
+            or before.st_mode & constants.OTHER_WRITE_MODE_BIT
+            or before.st_mode & constants.GROUP_WRITE_MODE_BIT
             and before.st_gid != os.getgid()
             or before.st_size > _MAX_VENV_CONFIG_BYTES
         ):
@@ -156,7 +187,7 @@ def python_runtime_mounts(
             not canonical_home.is_dir()
             or not interpreter.is_relative_to(canonical_home)
             or not stat.S_ISREG(interpreter.stat().st_mode)
-            or not interpreter.stat().st_mode & 0o111
+            or not interpreter.stat().st_mode & constants.EXECUTE_MODE_MASK
             or not stdlib.is_dir()
             or not stdlib.resolve(strict=True).is_relative_to(runtime_root)
             or configured_home.parent.resolve(strict=True) != runtime_root
@@ -179,8 +210,8 @@ def python_runtime_mounts(
             if (
                 not stat.S_ISDIR(details.st_mode)
                 or details.st_uid not in (0, os.getuid())
-                or details.st_mode & 0o002
-                or details.st_mode & 0o020
+                or details.st_mode & constants.OTHER_WRITE_MODE_BIT
+                or details.st_mode & constants.GROUP_WRITE_MODE_BIT
                 and details.st_gid != os.getgid()
             ):
                 raise ValueError("Workspace Python runtime directory is unsafe.")
@@ -189,8 +220,8 @@ def python_runtime_mounts(
         if (
             interpreter_details.st_uid not in (0, os.getuid())
             or interpreter_details.st_nlink != 1
-            or interpreter_details.st_mode & 0o002
-            or interpreter_details.st_mode & 0o020
+            or interpreter_details.st_mode & constants.OTHER_WRITE_MODE_BIT
+            or interpreter_details.st_mode & constants.GROUP_WRITE_MODE_BIT
             and interpreter_details.st_gid != os.getgid()
         ):
             raise ValueError("Workspace Python interpreter is unsafe.")
@@ -202,43 +233,63 @@ def python_runtime_mounts(
 def _hardlink_mount_sources(
     hardlinked: dict[Path, tuple[int, int]],
     writable_roots: tuple[Path, ...],
+    deadline: float,
 ) -> tuple[Path, ...]:
     """Choose bounded read-only file or containing-directory mounts for writable hardlinks."""
-    paths = {
-        path for path in hardlinked if any(path.is_relative_to(root) for root in writable_roots)
-    }
+    paths = set()
+    for path in hardlinked:
+        _check_deadline(deadline)
+        if any(path.is_relative_to(root) for root in writable_roots):
+            paths.add(path)
     if len(paths) <= _MAX_HARDLINK_MOUNTS:
         return tuple(sorted(paths))
 
     by_parent: dict[Path, set[Path]] = {}
     for path in paths:
+        _check_deadline(deadline)
         by_parent.setdefault(path.parent, set()).add(path)
     mounts = set()
     for parent, siblings in by_parent.items():
-        if len(siblings) > 1 and parent not in writable_roots:
+        _check_deadline(deadline)
+        if len(siblings) > 1 and not any(root.is_relative_to(parent) for root in writable_roots):
             mounts.add(parent)
         else:
             mounts.update(siblings)
 
+    # Index each ancestor once; update membership when a subtree becomes one mount.
+    coverage: dict[Path, set[Path]] = {}
+    for path in mounts:
+        parent = path.parent
+        while parent not in writable_roots:
+            _check_deadline(deadline)
+            coverage.setdefault(parent, set()).add(path)
+            parent = parent.parent
     while len(mounts) > _MAX_HARDLINK_MOUNTS:
         candidates = {}
-        for path in mounts:
-            parent = path.parent
-            while parent not in writable_roots:
-                covered = {candidate for candidate in mounts if candidate.is_relative_to(parent)}
-                if len(covered) > 1:
-                    candidates[parent] = covered
-                parent = parent.parent
+        for parent, covered in coverage.items():
+            _check_deadline(deadline)
+            if len(covered) > 1 and not any(root.is_relative_to(parent) for root in writable_roots):
+                candidates[parent] = covered
         if not candidates:
             raise ValueError("Linux writable hardlinks exceed the bounded mount limit.")
-        parent = min(candidates, key=lambda path: (len(candidates[path]), -len(path.parts)))
-        mounts.difference_update(candidates[parent])
+        parent = min(
+            candidates, key=lambda path: (len(candidates[path]), -len(path.parts), str(path))
+        )
+        removed = candidates[parent].copy()
+        mounts.difference_update(removed)
         mounts.add(parent)
+        for ancestor, covered in coverage.items():
+            _check_deadline(deadline)
+            covered.difference_update(removed)
+            if parent != ancestor and parent.is_relative_to(ancestor):
+                covered.add(parent)
 
     minimal = set()
     for path in sorted(mounts, key=lambda item: (len(item.parts), str(item))):
+        _check_deadline(deadline)
         if not any(path.is_relative_to(parent) for parent in minimal if parent != path):
             minimal.add(path)
+    _check_deadline(deadline)
     return tuple(sorted(minimal))
 
 
@@ -350,10 +401,10 @@ def prepare_paths(
         raise ValueError("Linux approved path authority changed.")
     details = scratch.lstat()
     if (
-        request.shell_environment().get("TMPDIR") != str(scratch)
+        request.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE) != str(scratch)
         or not stat.S_ISDIR(details.st_mode)
         or details.st_uid != os.getuid()
-        or stat.S_IMODE(details.st_mode) != 0o700
+        or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
     ):
         raise ValueError("Linux scratch is not a bound private directory.")
     protected, private, anchors, hardlinked = set(), set(), set(), {}
@@ -384,7 +435,10 @@ def prepare_paths(
     if not request.paths_are_current():
         raise ValueError("Linux approved path authority changed.")
     _check_deadline(request.deadline)
-    read_only_mounts = _hardlink_mount_sources(hardlinked, (*request.write_roots, scratch))
+    read_only_mounts = _hardlink_mount_sources(
+        hardlinked, (*request.write_roots, scratch), request.deadline
+    )
+    _check_deadline(request.deadline)
     return (
         tuple(sorted(protected)),
         tuple(sorted(private)),
@@ -510,11 +564,15 @@ def mount_arguments(
 
     Bind approved roots at their canonical spellings, outer roots before nested roots. A path
     under any approved write root or private scratch remains writable; other roots and ancestors
-    are read-only. Apply ancestor mountpoints before protected read-only binds, then hide private
-    directories with empty tmpfs mounts and private regular files with the supplied empty inode.
-    Recreate approved aliases only outside bound roots; aliases already inside a root retain the
-    original inspected symlink. Refuse a whole filesystem or home bind and aliases whose target
-    is absent from this request view. The filename layer still protects future names.
+    are read-only. Bind the fresh host scratch at its original spelling for trusted identity
+    checks and at a stable namespace path for payload access. Apply ancestor mountpoints before
+    protected read-only binds, then hide private directories with empty tmpfs mounts and private
+    regular files with the supplied empty inode. Mirror every restrictive scratch overlay;
+    selected workspaces below scratch retain their read-only role. Preserve original alias
+    metadata for validation and recreate virtual aliases at stable, read-only namespace paths.
+    Refuse a whole filesystem or home bind and aliases whose target is absent from this request
+    view. The
+    filename layer still protects future names.
 
     The caller must authenticate the helper and immutable mask-control inode, provide reviewed
     runtime/proc/device/control mounts and namespace/network setup, enforce the filename policy,
@@ -539,8 +597,9 @@ def mount_arguments(
 
     Raises:
         ValueError: Request/source authority is unsafe or stale, a root covers the filesystem or
-            home, a skipped PATH root is not bound to the request, an alias target is outside the
-            bound view, an executable source changes, or a required mask is missing/unsafe.
+            home, a reserved namespace destination overlaps another grant, a skipped PATH root is
+            not bound to the request, an alias target is outside the bound view, an executable
+            source changes, or a required mask is missing/unsafe.
         TimeoutError: Preparation reaches the approved command deadline.
         OSError: Linux O_PATH is unavailable or source/mask descriptors cannot be inspected.
     """
@@ -570,14 +629,28 @@ def mount_arguments(
         **{alias: alias.resolve(strict=True) for alias in request.read_aliases},
         **{alias: target for _, alias, target in request.aliases},
     }
+    if any(
+        path == reserved or path.is_relative_to(reserved) or reserved.is_relative_to(path)
+        for path in (*roots, *metadata, *aliases, *aliases.values())
+        for reserved in (NATIVE_SCRATCH_PATH, NATIVE_ALIAS_PATH)
+    ):
+        raise ValueError("Reserved native namespace destination overlaps another mount.")
     if any(not any(target.is_relative_to(root) for root in roots) for target in aliases.values()):
         raise ValueError("Linux request alias target is outside the mounted view.")
     with bind_paths(request, scratch) as (inventories, descriptors), ExitStack() as owned:
         protected, private, anchors, hardlinked = inventories
-        arguments, inherited = [], set()
+        arguments, scratch_mounts, inherited = [], [], set()
+
+        def mount(option: str, descriptor: int, path: Path) -> None:
+            """Preserve each pinned mount and its scratch mirror, including restrictive overlays."""
+            arguments.extend((option, str(descriptor), str(path)))
+            native = payload_path(path, scratch)
+            if native != path:
+                scratch_mounts.extend((option, str(descriptor), str(native)))
+
         writable = (*request.write_roots, scratch)
         for path in sorted(mounted_metadata - roots):
-            arguments.extend(("--ro-bind-fd", str(descriptors[path]), str(path)))
+            mount("--ro-bind-fd", descriptors[path], path)
             inherited.add(descriptors[path])
         for path in sorted(
             roots | (set(anchors) - set(private)), key=lambda path: (len(path.parts), str(path))
@@ -586,24 +659,32 @@ def mount_arguments(
             option = (
                 "--bind-fd"
                 if any(path.is_relative_to(root) for root in writable)
+                and not (
+                    request.workspace.is_relative_to(scratch)
+                    and path.is_relative_to(request.workspace)
+                    and not any(path.is_relative_to(root) for root in request.write_roots)
+                )
                 else "--ro-bind-fd"
             )
-            arguments.extend((option, str(descriptors[path]), str(path)))
+            mount(option, descriptors[path], path)
             inherited.add(descriptors[path])
         for path in hardlinked:
             _check_deadline(request.deadline)
-            arguments.extend(("--ro-bind-fd", str(descriptors[path]), str(path)))
+            mount("--ro-bind-fd", descriptors[path], path)
             inherited.add(descriptors[path])
         for path in protected:
             _check_deadline(request.deadline)
             if not any(path.is_relative_to(mask) for mask in private):
-                arguments.extend(("--ro-bind-fd", str(descriptors[path]), str(path)))
+                mount("--ro-bind-fd", descriptors[path], path)
                 inherited.add(descriptors[path])
         mask_descriptor = None
         for path in private:
             _check_deadline(request.deadline)
             if stat.S_ISDIR(os.fstat(descriptors[path]).st_mode):
                 arguments.extend(("--tmpfs", str(path)))
+                native = payload_path(path, scratch)
+                if native != path:
+                    scratch_mounts.extend(("--tmpfs", str(native)))
             else:
                 if mask_descriptor is None:
                     if empty_mask is None:
@@ -618,13 +699,20 @@ def mount_arguments(
                         or fcntl.fcntl(mask_descriptor, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
                     ):
                         raise ValueError("Linux private file mask control inode is unsafe.")
-                arguments.extend(("--ro-bind-fd", str(mask_descriptor), str(path)))
+                mount("--ro-bind-fd", mask_descriptor, path)
                 inherited.add(mask_descriptor)
         for spelling, canonical in path_roots:
             if spelling != canonical and not any(
                 spelling.is_relative_to(root) for root in roots | metadata
             ):
                 arguments.extend(("--symlink", str(canonical), str(spelling)))
+        arguments.extend(("--dir", str(NATIVE_SCRATCH_PATH)))
+        arguments.extend(scratch_mounts)
+        inherited.add(descriptors[scratch])
+        if request.aliases:
+            arguments.extend(("--dir", str(NATIVE_ALIAS_PATH)))
+            for _, alias, target in payload_aliases(request):
+                arguments.extend(("--symlink", str(payload_path(target, scratch)), str(alias)))
         executable_mounts = set()
         for _, spelling, resolved, device, inode in request.executable_identities:
             if resolved in executable_mounts:
@@ -641,8 +729,8 @@ def mount_arguments(
             if (
                 not stat.S_ISDIR(root_details.st_mode)
                 or root_details.st_uid not in (0, os.getuid())
-                or root_details.st_mode & 0o002
-                or root_details.st_mode & 0o020
+                or root_details.st_mode & constants.OTHER_WRITE_MODE_BIT
+                or root_details.st_mode & constants.GROUP_WRITE_MODE_BIT
                 and root_details.st_gid != os.getgid()
             ):
                 raise ValueError("Linux executable PATH root is unsafe.")
@@ -664,7 +752,7 @@ def mount_arguments(
                 or (bound.st_dev, bound.st_ino) != (device, inode)
                 or bound.st_nlink != 1
                 or bound.st_uid not in (0, os.getuid())
-                or bound.st_mode & 0o022
+                or bound.st_mode & constants.GROUP_AND_OTHER_WRITE_MODE_MASK
                 or _source_state(before) != _source_state(bound)
                 or _source_state(latest) != _source_state(bound)
                 or spelling.resolve(strict=True) != resolved

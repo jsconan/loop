@@ -20,6 +20,7 @@ from ...permissions.protection import ProtectedWorkspacePaths, protected_workspa
 from ...utils.hashing import sha256_digest
 from ...utils.json import load_unique_json
 from ...utils.virtual_path import VirtualPath
+from .constants import MINIMAL_SYSTEM_PATH, PATH_ENVIRONMENT_VARIABLE, TMPDIR_ENVIRONMENT_VARIABLE
 
 
 def _wire_text(value: object) -> str:
@@ -123,7 +124,7 @@ def path_search_roots(environment: dict[str, str], cwd: Path) -> tuple[tuple[Pat
     """
     if not cwd.is_absolute():
         raise ValueError("PATH lookup requires an absolute working directory.")
-    path_value = environment.get("PATH")
+    path_value = environment.get(PATH_ENVIRONMENT_VARIABLE)
     if path_value is None:
         return ()
     roots = []
@@ -177,7 +178,9 @@ def resolve_host_executable(
         raise ValueError("Executable lookup working directory is unavailable.") from exc
     if not working_directory.is_dir():
         raise ValueError("Executable lookup working directory must be a directory.")
-    for spelling, _ in path_search_roots({"PATH": path_value}, working_directory):
+    for spelling, _ in path_search_roots(
+        {PATH_ENVIRONMENT_VARIABLE: path_value}, working_directory
+    ):
         candidate = spelling / name
         try:
             resolved = candidate.resolve(strict=True)
@@ -248,7 +251,7 @@ class SandboxRequest:
     automatic_tool_reads: tuple[Path, ...] = ()
     generated_environment: tuple[str, ...] = ()
     protected_instruction_names: tuple[str, ...] = ()
-    file_creation_mask: int = 0o022
+    file_creation_mask: int = constants.GROUP_AND_OTHER_WRITE_MODE_MASK
 
     @property
     def protected_paths(self) -> ProtectedWorkspacePaths:
@@ -282,7 +285,7 @@ class SandboxRequest:
         automatic_tool_reads: tuple[Path, ...] = (),
         generated_environment: tuple[str, ...] = (),
         protected_instruction_names: tuple[str, ...] = (),
-        file_creation_mask: int = 0o022,
+        file_creation_mask: int = constants.GROUP_AND_OTHER_WRITE_MODE_MASK,
     ) -> SandboxRequest:
         """Create a request and capture every authority-bearing directory identity.
 
@@ -327,7 +330,7 @@ class SandboxRequest:
         if (
             not isinstance(file_creation_mask, int)
             or isinstance(file_creation_mask, bool)
-            or not 0 <= file_creation_mask <= 0o777
+            or not 0 <= file_creation_mask <= constants.FILE_MODE_PERMISSION_MASK
         ):
             raise ValueError("Sandbox file creation mask is invalid.")
         protected_workspace_paths(protected_instruction_names)
@@ -344,7 +347,7 @@ class SandboxRequest:
             for name, value in environment.items()
         ):
             raise ValueError("Sandbox environment contains an invalid entry.")
-        scratch_value = environment.get("TMPDIR")
+        scratch_value = environment.get(TMPDIR_ENVIRONMENT_VARIABLE)
         if scratch_value is not None:
             scratch = Path(scratch_value)
             details = scratch.lstat()
@@ -353,7 +356,7 @@ class SandboxRequest:
                 or scratch.resolve(strict=True) != scratch
                 or not stat.S_ISDIR(details.st_mode)
                 or details.st_uid != os.getuid()
-                or stat.S_IMODE(details.st_mode) != 0o700
+                or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
                 or scratch.parent != Path(tempfile.gettempdir()).resolve(strict=True)
             ):
                 raise ValueError("Command scratch must be a private real directory.")
@@ -368,7 +371,9 @@ class SandboxRequest:
             raise ValueError("Generated command environment must remain inside private scratch.")
         path_roots = path_search_roots(environment, cwd)
         for name, spelling, resolved, device, inode in executable_identities:
-            match = resolve_host_executable(name, environment.get("PATH", "/usr/bin:/bin"), cwd)
+            match = resolve_host_executable(
+                name, environment.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH), cwd
+            )
             details = resolved.stat()
             if match != (spelling, resolved) or (details.st_dev, details.st_ino) != (device, inode):
                 raise ValueError("Executable identity changed before request binding.")
@@ -403,7 +408,7 @@ class SandboxRequest:
             alias_stat = alias.lstat()
             if (
                 parent_stat.st_uid != os.getuid()
-                or stat.S_IMODE(parent_stat.st_mode) != 0o700
+                or stat.S_IMODE(parent_stat.st_mode) != constants.PRIVATE_DIRECTORY_MODE
                 or not stat.S_ISLNK(alias_stat.st_mode)
                 or alias.resolve(strict=True) != target
             ):
@@ -465,7 +470,9 @@ class SandboxRequest:
             return False
         for name, spelling, resolved, device, inode in self.executable_identities:
             try:
-                match = resolve_host_executable(name, self.shell_environment()["PATH"], self.cwd)
+                match = resolve_host_executable(
+                    name, self.shell_environment()[PATH_ENVIRONMENT_VARIABLE], self.cwd
+                )
                 details = resolved.stat()
             except (OSError, ValueError, KeyError):
                 return False
@@ -501,7 +508,7 @@ class SandboxRequest:
             if (
                 not stat.S_ISDIR(parent.st_mode)
                 or parent.st_uid != os.getuid()
-                or stat.S_IMODE(parent.st_mode) != 0o700
+                or stat.S_IMODE(parent.st_mode) != constants.PRIVATE_DIRECTORY_MODE
                 or not stat.S_ISLNK(details.st_mode)
                 or (details.st_dev, details.st_ino) != (device, inode)
                 or resolved != target
@@ -604,7 +611,7 @@ class SandboxRequest:
         if (
             not isinstance(file_creation_mask, int)
             or isinstance(file_creation_mask, bool)
-            or not 0 <= file_creation_mask <= 0o777
+            or not 0 <= file_creation_mask <= constants.FILE_MODE_PERMISSION_MASK
         ):
             raise ValueError("Invalid sandbox request file creation mask.")
         if value["read_context"] is not None:

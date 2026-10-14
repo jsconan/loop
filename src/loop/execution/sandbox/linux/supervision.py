@@ -20,6 +20,7 @@ from ....utils.process import (
     supervise_process,
 )
 from .admission import GenerationAdmission, admission_group
+from .constants import CGROUP_PROCS_FILENAME
 
 _CLEANUP_SECONDS = 1.0
 _CLIENT_DISCONNECT_POLL_MILLISECONDS = 50
@@ -112,7 +113,7 @@ def supervise_payload(
         if any(entry.is_dir() for entry in group.iterdir()):
             raise ValueError("Admitted cleanup scope contains unexpected subgroups.")
         # This is the authoritative kernel domain membership, not a /proc PID inventory.
-        with (group / "cgroup.procs").open("rb", buffering=0) as stream:
+        with (group / CGROUP_PROCS_FILENAME).open("rb", buffering=0) as stream:
             members = stream.read(_MAX_CGROUP_MEMBERSHIP_BYTES + 1)
         values = members.splitlines()
         if (

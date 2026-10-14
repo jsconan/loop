@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 from prompt_toolkit.document import Document
 
-from loop import CommandCompletionAdapter, CompletionManager
+from loop import CommandCompletionAdapter, CompletionManager, ProblemException
 from loop.commands import CommandArgumentError, CommandContext, CommandManager
 from loop.execution.sandbox import SandboxCommands
 from loop.execution.sandbox import commands as module
@@ -113,10 +113,11 @@ def test_sandbox_uninstall_owner_refusal_reports_unavailable(commands, monkeypat
     monkeypatch.setattr(linux_setup, "manage_setup", manage)
     monkeypatch.setattr(linux_management, "installation_status", Mock(return_value="Inventory"))
     interaction = Mock()
-    with pytest.raises(CommandArgumentError, match="Linux remains unavailable"):
+    with pytest.raises(ProblemException) as caught:
         commands.sandbox(CommandContext("sandbox", interaction), "uninstall")
     interaction.confirm.assert_not_called()
-    assert interaction.info.call_args.args[0] == (
+    assert caught.value.problem.title == "Native uninstall incomplete"
+    assert caught.value.problem.detail == (
         f"Uninstall: {message if message == 'Changed authority' else 'Native management failed.'}"
         "\nInventory"
     )
@@ -143,12 +144,62 @@ def test_sandbox_install_reports_distinct_grouped_failures(commands, monkeypatch
     monkeypatch.setattr(linux_management, "installation_status", Mock(return_value="Inventory"))
     interaction = Mock()
 
-    with pytest.raises(CommandArgumentError, match="Linux remains unavailable"):
+    with pytest.raises(ProblemException) as caught:
         commands.sandbox(CommandContext("sandbox", interaction), "install")
 
-    interaction.info.assert_called_once_with(
+    assert caught.value.problem.title == "Native install incomplete"
+    assert caught.value.problem.detail == (
         "Install: activation changed\nInstall: closure failed\nInventory"
     )
+    interaction.info.assert_not_called()
+
+
+def test_sandbox_preserves_argument_errors_from_setup_owner(commands, monkeypatch):
+    """The command keeps argument and operational failures on their distinct paths."""
+    monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        linux_setup,
+        "manage_setup",
+        Mock(side_effect=CommandArgumentError("Invalid setup action.")),
+    )
+    interaction = Mock()
+
+    with pytest.raises(CommandArgumentError, match="Invalid setup action"):
+        commands.sandbox(CommandContext("sandbox", interaction), "install")
+
+    interaction.confirm.assert_not_called()
+
+
+def test_refresh_dispatch_reports_native_failure_as_an_operational_problem(monkeypatch):
+    """The public slash-command path reports setup failure without the invalid-arguments label."""
+    monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(linux_management, "installation_status", Mock(return_value="Inventory"))
+    interaction = Mock()
+    interaction.confirm.return_value = True
+
+    def manage(action, review, *, main_app):
+        """Complete the reviewed removal and fail the install step."""
+        assert main_app is True
+        if action == "install":
+            review("review install")
+            raise OSError("systemd activation refused")
+        return review("review uninstall")
+
+    monkeypatch.setattr(linux_setup, "manage_setup", manage)
+    manager = CommandManager(
+        commands=SandboxCommands(main_app=True).get_commands(),
+        interaction=interaction,
+        exit_command_names=(),
+    )
+
+    assert manager.handle_user_command("/sandbox refresh") is True
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "sandbox.management.incomplete"
+    assert problem.title == "Native reinstall incomplete"
+    assert "Install: incomplete (systemd activation refused)" in problem.detail
+    assert "Inventory" in problem.detail
+    assert interaction.confirm.call_count == 2
 
 
 @pytest.mark.parametrize("action", ["install"])
@@ -246,13 +297,17 @@ def test_reinstall_reports_both_steps_when_install_is_incomplete(monkeypatch, un
         return review("review uninstall")
 
     monkeypatch.setattr(linux_setup, "manage_setup", manage)
-    with pytest.raises(CommandArgumentError, match="Native reinstall incomplete"):
+    with pytest.raises(ProblemException) as caught:
         SandboxCommands(main_app=True).sandbox(CommandContext("sandbox", interaction), "reinstall")
 
     assert calls == ["uninstall", "install"]
-    assert interaction.info.call_args.args[0] == (
+    assert caught.value.problem.title == "Native reinstall incomplete"
+    assert caught.value.problem.detail == (
         f"Uninstall: {'incomplete (uninstall incomplete)' if uninstall_fails else 'completed'}"
         "\nInstall: incomplete (install incomplete)\nInventory"
+    )
+    assert [call.args[0] for call in interaction.info.call_args_list] == (
+        [] if uninstall_fails else ["review uninstall"]
     )
     audit.assert_any_call("sandbox.management.finished", action="reinstall", success=False)
 
@@ -275,10 +330,10 @@ def test_reinstall_reports_grouped_install_failure(monkeypatch):
     interaction = Mock()
     interaction.confirm.return_value = True
 
-    with pytest.raises(CommandArgumentError, match="Native reinstall incomplete"):
+    with pytest.raises(ProblemException) as caught:
         SandboxCommands(main_app=True).sandbox(CommandContext("sandbox", interaction), "reinstall")
 
-    interaction.info.assert_called_with(
+    assert caught.value.problem.detail == (
         "Uninstall: completed\nInstall: incomplete (policy changed)"
         "\nInstall: incomplete (closure failed)\nInventory"
     )

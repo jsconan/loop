@@ -11,6 +11,8 @@ import pytest
 
 from loop.execution.sandbox.contracts import CommandProcessResult, SandboxOutcome
 from loop.execution.sandbox.linux import backend as linux
+from loop.execution.sandbox.linux.constants import NATIVE_SCRATCH_PATH
+from loop.execution.sandbox.linux.policy import payload_profile
 from loop.utils.process import ProcessCaptureStatus
 
 
@@ -190,7 +192,10 @@ def test_search_preserves_selected_snapshot_and_typed_outcome(selected, monkeypa
         invocation = shlex.split(request.execution_source)
         selected = json.loads(invocation[-1])
         assert selected["arguments"] == ["--json", f"/dev/fd/{descriptor}"]
-        assert selected["files"] == [[descriptor, str(request.workspace / str(descriptor))]]
+        assert selected["files"] == [
+            [descriptor, str(NATIVE_SCRATCH_PATH / "selected" / str(descriptor))]
+        ]
+        assert invocation[:4] == ["cd", str(NATIVE_SCRATCH_PATH / "selected"), "&&", "exec"]
         assert request.executable_identities[0][2] == executable
         captured.append(request.workspace)
         return CommandProcessResult(
@@ -214,6 +219,34 @@ def test_search_preserves_selected_snapshot_and_typed_outcome(selected, monkeypa
             assert result.stdout == "output"
     assert os.lseek(descriptor, 0, os.SEEK_CUR) == 0
     assert all(not path.exists() for path in captured)
+
+
+def test_search_reuses_exact_policy_with_disjoint_selected_backing(selected, monkeypatch):
+    """Two native search preparations retain identical policy and different private snapshots."""
+    backend, executable, descriptor, _ = selected
+    workspaces, profiles = [], []
+
+    def run(request):
+        """Observe policy identity while the caller owns a fresh selected-file snapshot."""
+        workspaces.append(request.workspace)
+        profiles.append(
+            payload_profile(
+                request, request.workspace.parent, Path("/run/cache.lock"), (executable.parent,)
+            )
+        )
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+
+    monkeypatch.setattr(backend, "run", run)
+    for _ in range(2):
+        assert (
+            backend.run_read_only_argv(
+                executable, (f"/dev/fd/{descriptor:05d}",), (descriptor,), 20
+            ).exit_code
+            == 0
+        )
+    assert profiles[0] == profiles[1]
+    assert workspaces[0] != workspaces[1]
+    assert all(not path.exists() for path in workspaces)
 
 
 @pytest.mark.parametrize(

@@ -15,8 +15,11 @@ from loop import (
     CommandsProvider,
     CompletionValue,
     Interaction,
+    Problem,
+    ProblemException,
     command,
 )
+from loop.commands import command_manager as module
 from loop.commands.utils import get_command_arguments_model
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 
@@ -103,6 +106,37 @@ def test_command_dispatch_records_success_and_sanitized_validation_failure():
         "command.failed",
     ]
     assert "private-invalid" not in repr(adapter.records)
+
+
+@pytest.mark.parametrize("has_interaction", [False, True])
+def test_manager_reports_structured_operational_failure(monkeypatch, has_interaction):
+    """Dispatch reports operational problems without misclassifying them as bad arguments."""
+    problem = Problem(
+        code="sandbox.management.incomplete",
+        title="Native reinstall incomplete",
+        detail="Install: policy changed\nLinux execution unavailable.",
+        operation="sandbox.reinstall",
+    )
+    error = ProblemException(problem)
+    interaction = Mock(spec=Interaction) if has_interaction else None
+    log_problem = Mock()
+    monkeypatch.setattr(module, "log_problem", log_problem)
+
+    def configured() -> None:
+        """Represent one failed operational command."""
+        raise error
+
+    manager = CommandManager([CommandRegistration(configured, name="configured")], interaction)
+
+    if interaction is None:
+        with pytest.raises(ProblemException, match="Install: policy changed"):
+            manager.call("configured")
+    else:
+        manager.call("configured")
+        interaction.report.assert_called_once_with(problem)
+
+    log_problem.assert_called_once()
+    assert log_problem.call_args.args[1:] == (problem, error)
 
 
 def test_manager_registers_structural_command_providers():

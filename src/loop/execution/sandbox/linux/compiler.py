@@ -12,12 +12,12 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .... import constants
 from .host import (
     COMPILER_SECONDS,
     MAX_SOURCE_BYTES,
     HostFile,
     compile_policy_source,
-    runtime_read_roots,
 )
 from .policy import payload_policy
 
@@ -30,6 +30,7 @@ def compile_payload(
     scratch: Path,
     cache_lock: Path,
     profile: str,
+    runtime_roots: tuple[Path, ...],
     compiler_lock: HostFile,
 ) -> bytes:
     """Serialize and strictly compile a current request within fixed operational limits.
@@ -46,6 +47,8 @@ def compile_payload(
         scratch (Path): Private scratch bound as the request's TMPDIR.
         cache_lock (Path): Authenticated payload cache lock denied by the filename policy.
         profile (str): Simple payload identity accepted by the renderer.
+        runtime_roots (tuple[Path, ...]): Authenticated protected runtime directories included in
+            the canonical policy used to derive ``profile``.
         compiler_lock (HostFile): Host-authenticated installation-wide read-only lock inode.
 
     Returns:
@@ -58,13 +61,13 @@ def compile_payload(
             compilation, cancellation or output overflow prevents preparation.
     """
     source = payload_policy(
-        request, scratch, cache_lock, profile, runtime_roots=runtime_read_roots()
+        request, scratch, cache_lock, profile, runtime_roots=runtime_roots
     ).encode("utf-8")
 
     if len(source) > MAX_SOURCE_BYTES:
         raise ValueError("Payload policy source exceeds the preparation bound.")
 
-    if compiler_lock.identity[2] & 0o222:
+    if compiler_lock.identity[2] & constants.WRITE_MODE_MASK:
         raise ValueError("Compiler lock must be read-only.")
 
     deadline = min(request.deadline, time.monotonic() + COMPILER_SECONDS)

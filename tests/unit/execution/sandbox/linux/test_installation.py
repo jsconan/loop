@@ -4501,6 +4501,148 @@ def retirement(reclamation):
     return state
 
 
+@pytest.fixture
+def untracked_retirement(bound_owner, monkeypatch):
+    """Model exact absent policy and tracking with systemd's inert implicit slice."""
+    fixture = bound_owner
+    state = fixture.state
+    shutil.rmtree(state.backing / "apparmor/policy/namespaces/generation")
+    shutil.rmtree(state.attachment_entry)
+    for bound in (
+        state.config.slice_unit,
+        state.files["socket_unit"],
+        state.files["service_unit"],
+    ):
+        bound.path.unlink()
+    state.recovery_failure = ""
+    state.native_calls = []
+    state.recovery_events = []
+
+    def capture(process, *args, **kwargs):
+        """Return only the fixed absent unit state and bounded recovery inventory."""
+        argv = process.argv
+        state.native_calls.append(argv)
+        if "show" in argv:
+            name = argv[-1]
+            if name == state.config.slice_unit.path.name:
+                fields = {
+                    "Id": name,
+                    "LoadState": "loaded",
+                    "FragmentPath": "",
+                    "DropInPaths": "",
+                    "NeedDaemonReload": "no",
+                    "Transient": "no",
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "ControlGroup": "",
+                    "Delegate": "no",
+                }
+            elif name == state.files["socket_unit"].path.name:
+                fields = {
+                    "Id": name,
+                    "LoadState": "not-found",
+                    "FragmentPath": "",
+                    "DropInPaths": "",
+                    "NeedDaemonReload": "no",
+                    "Transient": "no",
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "ControlGroup": "",
+                    "Accept": "no",
+                    "RemoveOnStop": "no",
+                }
+                if state.recovery_failure == "active_socket":
+                    fields.update(
+                        LoadState="loaded",
+                        FragmentPath=str(state.files["socket_unit"].path),
+                        ActiveState="active",
+                        SubState="listening",
+                        Listen="/run/loopgen_generation.socket (Stream)",
+                    )
+            else:
+                raise AssertionError(f"Unexpected manager query: {argv!r}")
+            output = "".join(f"{key}={value}\n" for key, value in fields.items())
+        elif "list-units" in argv and argv[-1].endswith("@*.service"):
+            output = ""
+        elif "list-units" in argv and argv[-1] == "loopgen_generation*":
+            output = (
+                "loopgen_generation.unexpected\n"
+                if state.recovery_failure == "unknown_record"
+                else "loopgen_generation.slice\n"
+            )
+        elif "list-jobs" in argv:
+            output = ""
+        else:
+            raise AssertionError(f"Unexpected manager operation: {argv!r}")
+        return SimpleNamespace(
+            status=linux_installation.ProcessCaptureStatus.COMPLETED,
+            exit_code=0,
+            stdout=output,
+            stderr="",
+            stdout_discarded=0,
+            stderr_discarded=0,
+        )
+
+    def recursive_idle(group, *, absent=False):
+        """Record every absent-membership proof and optionally model a live cgroup."""
+        state.recovery_events.append(("cgroup", absent))
+        assert group.name == state.config.slice_unit.path.name
+        assert absent
+        if state.recovery_failure == "populated":
+            raise OSError("Generation is live or ambiguous; confinement retained.")
+
+    monkeypatch.setattr(linux_installation, "supervise_process", capture)
+    monkeypatch.setattr(linux_installation, "_recursive_idle", recursive_idle)
+    return fixture
+
+
+@pytest.fixture
+def absent_tracking_cleanup(bound_owner, monkeypatch):
+    """Prepare direct reclamation checks after all policy and tracking authority is absent."""
+    fixture = bound_owner
+    state = fixture.state
+    shutil.rmtree(state.backing / "apparmor/policy/namespaces/generation")
+    shutil.rmtree(state.attachment_entry)
+    for bound in (
+        state.config.slice_unit,
+        state.files["socket_unit"],
+        state.files["service_unit"],
+    ):
+        bound.path.unlink()
+    monkeypatch.setattr(
+        linux_installation,
+        "_unit_state",
+        lambda *args, **kwargs: {
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "ControlGroup": "",
+        },
+    )
+    monkeypatch.setattr(linux_installation, "_retired_instances", lambda *args, **kwargs: [])
+    monkeypatch.setattr(linux_installation, "_recursive_idle", lambda *args, **kwargs: None)
+    return fixture
+
+
+def reclaim_untracked(state, *, recovery=linux_installation.RetirementState.ATTACHMENT_REMOVED):
+    """Exercise the private finalizer with exact previously authenticated test authority."""
+    from contextlib import nullcontext
+
+    linux_installation._reclaim_generation(
+        state.config,
+        state.files,
+        state.lock,
+        state.compiler_lock,
+        state.artifacts,
+        20,
+        nullcontext(),
+        None,
+        None,
+        None,
+        recovery,
+        tracking_absent=True,
+    )
+
+
 def retire(state, *, recovery=linux_installation.RetirementState.COMPLETE):
     """Run the complete retirement through the public exclusive transaction owner."""
     linux_installation.retire_generation(
@@ -4651,6 +4793,248 @@ def test_observed_retirement_refuses_out_of_order_receiver_loss(retirement):
     with pytest.raises(ValueError, match="fixed order"):
         owner.retire(authority, 20)
     assert record.exists() and state.config.reservation.path.exists()
+
+
+def test_observed_retirement_does_not_recover_with_partial_tracking(bound_owner):
+    """Missing only some runtime fragments cannot authorize unconfined-helper withdrawal."""
+    fixture = bound_owner
+    state = fixture.state
+    shutil.rmtree(state.backing / "apparmor/policy/namespaces/generation")
+    shutil.rmtree(state.attachment_entry)
+    state.files["socket_unit"].path.unlink()
+
+    with pytest.raises(ValueError, match="Attachment absent while helper remains executable"):
+        fixture.owner.retire(fixture.record, 20)
+
+    assert stat.S_IMODE(state.helper_path.stat().st_mode) == 0o555
+    assert fixture.record.path.exists() and state.config.reservation.path.exists()
+
+
+def test_observed_retirement_recovers_absent_policy_and_tracking(untracked_retirement, monkeypatch):
+    """Withdraw an unconfined helper only after exact native authority and cgroup absence."""
+    fixture = untracked_retirement
+    state = fixture.state
+    original_fchmod = os.fchmod
+
+    def fchmod(descriptor, mode):
+        """Record helper withdrawal ordering while preserving the real mode change."""
+        state.recovery_events.append(("chmod", mode))
+        return original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(os, "fchmod", fchmod)
+    fixture.owner.retire(fixture.record, 20)
+
+    assert not fixture.record.path.exists() and not state.config.reservation.path.exists()
+    assert not state.config.receiver.exists() and not state.helper_path.exists()
+    assert all(not bound.path.exists() for bound in state.files.values())
+    assert state.recovery_events.index(("cgroup", True)) < state.recovery_events.index(
+        ("chmod", 0o444)
+    )
+    assert not any("stop" in call or "daemon-reload" in call for call in state.native_calls)
+
+
+@pytest.mark.parametrize(
+    ("failure", "error", "message"),
+    [
+        ("active_socket", ValueError, "authority changed"),
+        ("populated", OSError, "live or ambiguous"),
+        ("unknown_record", ValueError, "authority remains"),
+    ],
+)
+def test_untracked_retirement_refuses_live_or_ambiguous_authority(
+    untracked_retirement, failure, error, message
+):
+    """Do not withdraw an executable helper until every tracking absence is authenticated."""
+    fixture = untracked_retirement
+    state = fixture.state
+    state.recovery_failure = failure
+
+    with pytest.raises(error, match=message):
+        fixture.owner.retire(fixture.record, 20)
+
+    assert stat.S_IMODE(state.helper_path.stat().st_mode) == 0o555
+    assert fixture.record.path.exists() and state.config.reservation.path.exists()
+    assert state.config.receiver.exists()
+
+
+def test_missing_tracking_recovery_requires_attachment_removed_phase(absent_tracking_cleanup):
+    """Direct drain and cleanup entry points reject unrelated recovery phases."""
+    fixture = absent_tracking_cleanup
+    state = fixture.state
+
+    with (
+        pytest.raises(ValueError, match="Missing tracking recovery"),
+        linux_installation.drained_generation(
+            state.config,
+            state.files,
+            state.lock,
+            20,
+            tracking_absent=True,
+        ),
+    ):
+        pass
+    with pytest.raises(ValueError, match="Missing tracking recovery"):
+        reclaim_untracked(state, recovery=linux_installation.RetirementState.COMPLETE)
+    with pytest.raises(ValueError, match="Missing tracking recovery"):
+        linux_installation.retire_generation(
+            state.config,
+            state.files,
+            state.lock,
+            state.namespace_identity,
+            state.policies,
+            state.helper,
+            state.attachment_bytes,
+            state.attachment_source,
+            state.compiler_lock,
+            state.artifacts,
+            20,
+            tracking_absent=True,
+        )
+    assert stat.S_IMODE(state.helper_path.stat().st_mode) == 0o555
+
+
+def test_missing_tracking_recovery_requires_original_helper(absent_tracking_cleanup):
+    """Do not withdraw or reclaim when the authenticated artifact inventory lost the helper."""
+    fixture = absent_tracking_cleanup
+    state = fixture.state
+    artifacts = dict(state.artifacts)
+    artifacts.pop("helper")
+    state.artifacts = artifacts
+
+    with pytest.raises(ValueError, match="lacks original helper authority"):
+        reclaim_untracked(state)
+
+    assert stat.S_IMODE(state.helper_path.stat().st_mode) == 0o555
+    assert state.config.reservation.path.exists()
+
+
+def test_missing_tracking_recovery_obeys_deadline_before_helper_withdrawal(
+    absent_tracking_cleanup, monkeypatch
+):
+    """An expired transaction leaves the still-executable helper and capacity untouched."""
+    fixture = absent_tracking_cleanup
+    state = fixture.state
+    monkeypatch.setattr(linux_installation.time, "monotonic", lambda: 21)
+
+    with pytest.raises(TimeoutError, match="artifact removal deadline"):
+        reclaim_untracked(state)
+
+    assert stat.S_IMODE(state.helper_path.stat().st_mode) == 0o555
+    assert state.config.reservation.path.exists()
+
+
+def test_missing_tracking_recovery_revalidates_helper_before_withdrawal(
+    absent_tracking_cleanup, monkeypatch
+):
+    """A helper rebind mismatch refuses before any mode change or artifact deletion."""
+    fixture = absent_tracking_cleanup
+    state = fixture.state
+    previous = linux_installation.bind_host_file
+
+    def bind(path):
+        """Change the current helper binding presented at the withdrawal boundary."""
+        current = previous(path)
+        return replace(current, digest="0" * 64) if path == state.helper_path else current
+
+    monkeypatch.setattr(linux_installation, "bind_host_file", bind)
+    with pytest.raises(ValueError, match="helper differs from fixed authority"):
+        reclaim_untracked(state)
+
+    assert stat.S_IMODE(state.helper_path.stat().st_mode) == 0o555
+    assert state.config.reservation.path.exists()
+
+
+def test_missing_tracking_recovery_rejects_unsafe_helper_mode(absent_tracking_cleanup):
+    """Only the original executable mode or an already withdrawn helper may continue."""
+    fixture = absent_tracking_cleanup
+    state = fixture.state
+    state.helper_path.chmod(0o400)
+    state.artifacts["helper"] = linux_host.bind_host_file(state.helper_path)
+
+    with pytest.raises(ValueError, match="unsafe mode"):
+        reclaim_untracked(state)
+
+    assert stat.S_IMODE(state.helper_path.stat().st_mode) == 0o400
+    assert state.config.reservation.path.exists()
+
+
+def test_missing_tracking_recovery_accepts_already_withdrawn_helper(
+    absent_tracking_cleanup, monkeypatch
+):
+    """An interrupted safe withdrawal can retry from the exact already-inert helper inode."""
+    fixture = absent_tracking_cleanup
+    state = fixture.state
+    state.helper_path.chmod(0o444)
+    state.artifacts["helper"] = linux_host.bind_host_file(state.helper_path)
+    previous = linux_installation.bind_host_file
+    calls = 0
+
+    def bind(path):
+        """Fail the post-withdrawal rebind after accepting the already-inert source."""
+        nonlocal calls
+        current = previous(path)
+        if path == state.helper_path:
+            calls += 1
+            if calls == 2:
+                return replace(current, digest="0" * 64)
+        return current
+
+    monkeypatch.setattr(linux_installation, "bind_host_file", bind)
+    with pytest.raises(ValueError, match="changed during withdrawal"):
+        reclaim_untracked(state)
+
+    assert stat.S_IMODE(state.helper_path.stat().st_mode) == 0o444
+    assert state.config.reservation.path.exists()
+
+
+def test_missing_tracking_recovery_revalidates_withdrawn_helper(
+    absent_tracking_cleanup, monkeypatch
+):
+    """A changed helper digest after mode withdrawal retains capacity for authenticated retry."""
+    fixture = absent_tracking_cleanup
+    state = fixture.state
+    previous = linux_installation.bind_host_file
+    calls = 0
+
+    def bind(path):
+        """Change only the binding returned after the atomic helper withdrawal."""
+        nonlocal calls
+        current = previous(path)
+        if path == state.helper_path:
+            calls += 1
+            if calls == 2:
+                return replace(current, digest="0" * 64)
+        return current
+
+    monkeypatch.setattr(linux_installation, "bind_host_file", bind)
+    with pytest.raises(ValueError, match="changed during withdrawal"):
+        reclaim_untracked(state)
+
+    assert stat.S_IMODE(state.helper_path.stat().st_mode) == 0o444
+    assert state.config.reservation.path.exists()
+
+
+def test_retired_records_reject_loaded_non_slice_as_implicit(reclamation, monkeypatch):
+    """Only the already-verified implicit slice may remain loaded during missing-tracking cleanup."""
+    state = reclamation
+    result = SimpleNamespace(
+        status=linux_installation.ProcessCaptureStatus.COMPLETED,
+        exit_code=0,
+        stdout="loopgen_generation.socket\n",
+        stderr="",
+        stdout_discarded=0,
+        stderr_discarded=0,
+    )
+    monkeypatch.setattr(linux_installation, "supervise_process", lambda *args, **kwargs: result)
+
+    with pytest.raises(ValueError, match="Unexpected implicit retired manager record"):
+        linux_installation._retired_records_absent(
+            state.tool,
+            "loopgen_generation",
+            {"loopgen_generation.socket"},
+            20,
+            loaded_implicit={"loopgen_generation.socket"},
+        )
 
 
 @pytest.mark.parametrize(

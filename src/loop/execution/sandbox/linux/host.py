@@ -16,22 +16,29 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from .... import constants
 from ....constants import MAX_NATIVE_RECEIPT_BYTES, NATIVE_FILE_READ_CHUNK_BYTES
 from ....utils.json import load_unique_json
 from ....utils.process import ProcessCaptureStatus, supervise_process
-from .constants import (
+from ..constants import (
     INITIAL_USER_NAMESPACE_UID_MAP,
+    LC_ALL_ENVIRONMENT_VARIABLE,
+    PATH_ENVIRONMENT_VARIABLE,
+    SYSTEM_LOCALE,
+)
+from .constants import (
+    COMPILER_LOCK_FILENAME,
+    MANAGEMENT_LOCK_FILENAME,
     PROC_UID_MAP_PATH,
     SYSTEM_COMMAND_PATH,
-    SYSTEM_LOCALE,
     UNSAFE_HOST_PATH_MODE_BITS,
 )
 
 _SUDO_FORBIDDEN_MODE_BITS = 0o2022
 
 NATIVE_LOCK_SEEDS = {
-    "management.lock": b"Loop native management\n",
-    "compiler.lock": b"Loop native compiler\n",
+    MANAGEMENT_LOCK_FILENAME: b"Loop native management\n",
+    COMPILER_LOCK_FILENAME: b"Loop native compiler\n",
 }
 
 _MAX_HOST_FILE_BYTES = 32 * 1024 * 1024
@@ -124,7 +131,7 @@ def protected_path(path: Path, *, directory: bool = False, system_elevation: boo
     else:
         safe = stat.S_ISREG(details.st_mode) and details.st_nlink == 1
 
-    if system_elevation and not details.st_mode & 0o111:
+    if system_elevation and not details.st_mode & constants.EXECUTE_MODE_MASK:
         raise ValueError("System elevation tool is not executable.")
 
     if not safe:
@@ -242,7 +249,10 @@ def _resolver_path(path: Path, *, deadline: float | None = None) -> Path:
             details.st_uid != service_uid
             or not kind(details.st_mode)
             or details.st_mode & UNSAFE_HOST_PATH_MODE_BITS
-            or (entry == target and (details.st_nlink != 1 or details.st_mode & 0o111))
+            or (
+                entry == target
+                and (details.st_nlink != 1 or details.st_mode & constants.EXECUTE_MODE_MASK)
+            )
             or "security.capability" in os.listxattr(entry)
         ):
             raise ValueError("Unsafe system resolver service data.")
@@ -287,7 +297,10 @@ def library_candidates(stem: str, *, deadline: float | None = None) -> tuple[Pat
         text=True,
         encoding="ascii",
         errors="replace",
-        env={"PATH": SYSTEM_COMMAND_PATH, "LC_ALL": SYSTEM_LOCALE},
+        env={
+            PATH_ENVIRONMENT_VARIABLE: SYSTEM_COMMAND_PATH,
+            LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+        },
         cwd="/",
         close_fds=True,
         start_new_session=True,
@@ -544,7 +557,7 @@ def discover_tool(name: str, *, deadline: float | None = None) -> HostFile:
         path = Path(spelling)
         if path.exists():
             bound = bind_host_file(path, deadline=deadline)
-            if not bound.identity[2] & 0o111:
+            if not bound.identity[2] & constants.EXECUTE_MODE_MASK:
                 raise ValueError("Native management tool is not executable.")
             return bound
     raise OSError(f"Installed {name} is unavailable.")
@@ -649,10 +662,16 @@ def installation_files(receipt: Path, *, deadline: float | None = None) -> dict[
         if bound.digest != entry["sha256"] or bound.identity[:2] in identities:
             raise ValueError("Installed artifact differs from receipt authority.")
 
-        if role in {"helper", "parser", "limiter", "receiver"} and not bound.identity[2] & 0o111:
+        if (
+            role in {"helper", "parser", "limiter", "receiver"}
+            and not bound.identity[2] & constants.EXECUTE_MODE_MASK
+        ):
             raise ValueError("Installed entry point is not executable.")
 
-        if role in {"compiler_lock", "cache_lock"} and bound.identity[2] & 0o222:
+        if (
+            role in {"compiler_lock", "cache_lock"}
+            and bound.identity[2] & constants.WRITE_MODE_MASK
+        ):
             raise ValueError("Installed lock must be read-only.")
 
         files[role] = bound
@@ -757,7 +776,10 @@ def compile_policy_source(source: bytes, deadline: float, *, names: bool = False
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd="/",
-            env={"PATH": SYSTEM_COMMAND_PATH, "LC_ALL": SYSTEM_LOCALE},
+            env={
+                PATH_ENVIRONMENT_VARIABLE: SYSTEM_COMMAND_PATH,
+                LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+            },
             close_fds=True,
             start_new_session=True,
         )

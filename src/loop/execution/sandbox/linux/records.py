@@ -4,13 +4,14 @@ import os
 import time
 from pathlib import Path
 
+from .... import constants
 from ....constants import MAX_NATIVE_INSTALLATION_ENTRIES
 from ....utils.json import load_unique_json
 from .admission import GenerationAdmission
+from .constants import MANAGEMENT_RECORD_NAME
 from .host import HostFile, bind_host_file
 from .installation import GenerationLifecycle
 
-MANAGEMENT_RECORD_NAME = "management.json"
 MAX_MANAGEMENT_RECORD_BYTES = 65_536
 
 
@@ -62,7 +63,7 @@ def read_generation(
     if (
         record.name != MANAGEMENT_RECORD_NAME
         or authority.identity[4] > MAX_MANAGEMENT_RECORD_BYTES
-        or authority.identity[2] & 0o222
+        or authority.identity[2] & constants.WRITE_MODE_MASK
     ):
         raise ValueError("Invalid protected installation management record.")
     value = load_unique_json(data, duplicate_message="Duplicate installation management field.")
@@ -197,7 +198,8 @@ def read_generation(
                 and current_bound.identity[:2] == bound.identity[:2]
                 and current_bound.identity[3:6] == bound.identity[3:6]
                 and current_bound.digest == bound.digest
-                and current_bound.identity[2] & 0o777 == 0o444
+                and current_bound.identity[2] & constants.FILE_MODE_PERMISSION_MASK
+                == constants.READ_ONLY_FILE_MODE
                 and current_bound.identity[6] >= bound.identity[6]
             ):
                 continue

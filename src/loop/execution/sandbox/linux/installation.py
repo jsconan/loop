@@ -21,6 +21,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .... import constants
 from ....constants import (
     MAX_NATIVE_INSTALLATION_ENTRIES,
     MAX_NATIVE_POLICY_MODE_BYTES,
@@ -31,11 +32,26 @@ from ....constants import (
     NATIVE_UNIT_PREFIX,
 )
 from ....utils.process import ProcessCaptureStatus, supervise_process
+from ..constants import LC_ALL_ENVIRONMENT_VARIABLE, PATH_ENVIRONMENT_VARIABLE, SYSTEM_LOCALE
 from .constants import (
+    CGROUP_PROCS_FILENAME,
     CGROUP_ROOT,
+    MANAGEMENT_RECORD_NAME,
+    PROC_UID_MAP_PATH,
     SYSTEM_COMMAND_PATH,
-    SYSTEM_LOCALE,
+    SYSTEM_RUNTIME_DIRECTORY,
     SYSTEMCTL_PATH,
+    SYSTEMD_ACTIVE_STATE_PROPERTY,
+    SYSTEMD_CONTROL_GROUP_PROPERTY,
+    SYSTEMD_DROP_IN_PATHS_PROPERTY,
+    SYSTEMD_FRAGMENT_PATH_PROPERTY,
+    SYSTEMD_LOAD_STATE_PROPERTY,
+    SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY,
+    SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+    SYSTEMD_SLICE_UNIT_SUFFIX,
+    SYSTEMD_SOCKET_UNIT_SUFFIX,
+    SYSTEMD_SUB_STATE_PROPERTY,
+    SYSTEMD_TRANSIENT_PROPERTY,
     UNSAFE_HOST_PATH_MODE_BITS,
 )
 from .host import (
@@ -128,10 +144,10 @@ class GenerationLifecycle:
     def _retire_observed(self, record: HostFile, deadline: float) -> None:
         """Retry checked removal from the original record and current native state."""
         root = self.config.receiver.parent
-        if record.path != root / "management.json":
+        if record.path != root / MANAGEMENT_RECORD_NAME:
             raise ValueError("Invalid original management record location.")
 
-        original = {**self.artifacts, "management.json": record}
+        original = {**self.artifacts, MANAGEMENT_RECORD_NAME: record}
         order = sorted(
             (name for name in self.artifacts),
             key=lambda name: (
@@ -163,6 +179,14 @@ class GenerationLifecycle:
             if namespace.is_symlink():
                 raise ValueError("Generation namespace was replaced with an alias.")
             recovery = RetirementState.NAMESPACE_REMOVED
+        missing_tracking = not missing and all(
+            not bound.path.exists() and not bound.path.is_symlink()
+            for bound in (
+                self.config.slice_unit,
+                self.files["socket_unit"],
+                self.files["service_unit"],
+            )
+        )
         helper = self.helper
         if helper.path.exists():
             current = bind_host_file(helper.path)
@@ -171,7 +195,7 @@ class GenerationLifecycle:
                     current.identity[:2] != helper.identity[:2]
                     or current.identity[3:6] != helper.identity[3:6]
                     or current.digest != helper.digest
-                    or stat.S_IMODE(current.identity[2]) != 0o444
+                    or stat.S_IMODE(current.identity[2]) != constants.READ_ONLY_FILE_MODE
                     or current.identity[6] < helper.identity[6]
                 ):
                     raise ValueError("Withdrawn helper differs from original authority.")
@@ -182,12 +206,17 @@ class GenerationLifecycle:
                 helper,
                 identity=(
                     *helper.identity[:2],
-                    helper.identity[2] & ~0o777 | 0o444,
+                    helper.identity[2] & ~constants.FILE_MODE_PERMISSION_MASK
+                    | constants.READ_ONLY_FILE_MODE,
                     *helper.identity[3:],
                 ),
             )
         if attachment is None:
-            if helper.path.exists() and stat.S_IMODE(helper.identity[2]) != 0o444:
+            if (
+                helper.path.exists()
+                and stat.S_IMODE(helper.identity[2]) != constants.READ_ONLY_FILE_MODE
+                and not missing_tracking
+            ):
                 raise ValueError("Attachment absent while helper remains executable.")
             recovery = RetirementState.ATTACHMENT_REMOVED
         elif missing:
@@ -206,11 +235,15 @@ class GenerationLifecycle:
             (RetirementState.SOCKET_REMOVED, self.files["socket_unit"]),
             (RetirementState.TEMPLATE_REMOVED, self.files["service_unit"]),
         ):
+            if missing_tracking and attachment is None:
+                break
             if not bound.path.exists():
                 if recovery != RetirementState(phase - 1):
                     raise ValueError("Unit removal differs from the fixed order.")
                 recovery = phase
-        if recovery >= RetirementState.TRACKING_REMOVED and set(remaining) != {"management.json"}:
+        if recovery >= RetirementState.TRACKING_REMOVED and set(remaining) != {
+            MANAGEMENT_RECORD_NAME
+        }:
             raise ValueError("Artifacts remain after tracking removal.")
         if recovery >= RetirementState.SLICE_REMOVED:
             _recursive_idle(group, absent=True)
@@ -266,8 +299,10 @@ class GenerationLifecycle:
                     _manager(
                         tool, ["list-jobs", "--no-legend", "--", prefix + "*"], deadline
                     ).strip()
-                    or (Path("/run") / (prefix + ".socket")).exists()
-                    or (Path("/run") / (prefix + ".socket")).is_symlink()
+                    or (SYSTEM_RUNTIME_DIRECTORY / (prefix + SYSTEMD_SOCKET_UNIT_SUFFIX)).exists()
+                    or (
+                        SYSTEM_RUNTIME_DIRECTORY / (prefix + SYSTEMD_SOCKET_UNIT_SUFFIX)
+                    ).is_symlink()
                     or list(self.config.reservation.path.parent.iterdir())
                 ):
                     raise ValueError("Retired native authority remains after capacity release.")
@@ -301,6 +336,7 @@ class GenerationLifecycle:
             remaining,
             deadline,
             recovery=recovery,
+            tracking_absent=missing_tracking and attachment is None,
             empty_directories=empty_directories or None,
             cached_payloads=recovery is RetirementState.COMPLETE,
         )
@@ -315,7 +351,7 @@ _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
 @contextmanager
 def _administration(lock: HostFile) -> Generator[None, None, None]:
     """Serialize explicitly authorized initial-host-root installation operations."""
-    if os.getuid() != 0 or Path("/proc/self/uid_map").read_text(encoding="ascii").split() != [
+    if os.getuid() != 0 or PROC_UID_MAP_PATH.read_text(encoding="ascii").split() != [
         "0",
         "0",
         "4294967295",
@@ -323,7 +359,7 @@ def _administration(lock: HostFile) -> Generator[None, None, None]:
         raise PermissionError(
             "Installation preparation requires initial host administrator authority."
         )
-    if lock.identity[2] & 0o222:
+    if lock.identity[2] & constants.WRITE_MODE_MASK:
         raise ValueError("Installation lock must be read-only.")
     with lock.open_verified() as descriptor:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -374,7 +410,7 @@ def provision_receipt(receipt: Path, files: dict[str, Path], lock: HostFile) -> 
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(json.dumps(record, sort_keys=True).encode("ascii"))
                 stream.flush()
-                os.fchmod(stream.fileno(), 0o444)
+                os.fchmod(stream.fileno(), constants.READ_ONLY_FILE_MODE)
                 os.fsync(stream.fileno())
             installation_files(staging)
             # link is an atomic no-replace publication of complete bytes; remove our temporary
@@ -480,7 +516,12 @@ def stage_generation_files(
             if (
                 bound.path != path
                 or bound.identity[0] != root.st_dev
-                or stat.S_IMODE(bound.identity[2]) != (0o555 if name in executables else 0o444)
+                or stat.S_IMODE(bound.identity[2])
+                != (
+                    constants.READ_ONLY_EXECUTABLE_FILE_MODE
+                    if name in executables
+                    else constants.READ_ONLY_FILE_MODE
+                )
                 or bound.digest != hashlib.sha256(contents[name]).hexdigest()
             ):
                 raise ValueError("Generation file differs from fixed immutable authority.")
@@ -502,7 +543,7 @@ def stage_generation_files(
         identities = {}
         for parent in sorted(parents, key=lambda path: len(path.parts)):
             if not parent.exists():
-                parent.mkdir(mode=0o755)
+                parent.mkdir(mode=constants.PUBLIC_DIRECTORY_MODE)
             if (
                 protected_path(parent, directory=True) != parent
                 or parent.lstat().st_dev != root.st_dev
@@ -525,7 +566,12 @@ def stage_generation_files(
                     with os.fdopen(descriptor, "wb") as stream:
                         stream.write(data)
                         stream.flush()
-                        os.fchmod(stream.fileno(), 0o555 if name in executables else 0o444)
+                        os.fchmod(
+                            stream.fileno(),
+                            constants.READ_ONLY_EXECUTABLE_FILE_MODE
+                            if name in executables
+                            else constants.READ_ONLY_FILE_MODE,
+                        )
                         os.fsync(stream.fileno())
                     os.link(staging, path, follow_symlinks=False)
                 finally:
@@ -572,7 +618,7 @@ def generation_limits(
     expected = f"{generation}\n{_GENERATION_PROFILES}\n{_GENERATION_BYTES}\n".encode("ascii")
     if (
         _NAME.fullmatch(generation) is None
-        or reservation.identity[2] & 0o222
+        or reservation.identity[2] & constants.WRITE_MODE_MASK
         or reservation.identity[4] != len(expected)
     ):
         raise ValueError("Invalid generation capacity authority.")
@@ -629,7 +675,7 @@ def reserve_generation(directory: Path, lock: HostFile, generation: str) -> Host
         descriptor = os.open(
             directory / generation,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o444,
+            constants.READ_ONLY_FILE_MODE,
         )
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(
@@ -687,12 +733,18 @@ def _provision_generation_units(config: "GenerationAdmission", lock: HostFile, s
     with scope, ExitStack() as pins:
         generation_limits(config.reservation, config.generation)
         receiver = bind_host_file(config.receiver)
-        if receiver.path != config.receiver or stat.S_IMODE(receiver.identity[2]) != 0o555:
+        if (
+            receiver.path != config.receiver
+            or stat.S_IMODE(receiver.identity[2]) != constants.READ_ONLY_EXECUTABLE_FILE_MODE
+        ):
             raise ValueError("Generation receiver must be canonical and immutable executable.")
-        if stat.S_IMODE(config.slice_unit.identity[2]) != 0o444:
+        if stat.S_IMODE(config.slice_unit.identity[2]) != constants.READ_ONLY_FILE_MODE:
             raise ValueError("Staged generation slice must be immutable.")
         staged = pins.enter_context(config.slice_unit.open_verified())
-        if os.pread(staged, MAX_NATIVE_UNIT_BYTES + 1, 0) != sources[prefix + ".slice"].encode():
+        if (
+            os.pread(staged, MAX_NATIVE_UNIT_BYTES + 1, 0)
+            != sources[prefix + SYSTEMD_SLICE_UNIT_SUFFIX].encode()
+        ):
             raise ValueError("Staged generation slice differs from fixed source.")
         for bound in (receiver, config.reservation):
             pins.enter_context(bound.open_verified())
@@ -713,7 +765,7 @@ def _provision_generation_units(config: "GenerationAdmission", lock: HostFile, s
                 bound = bind_host_file(path)
                 if (
                     bound.path != path
-                    or stat.S_IMODE(bound.identity[2]) != 0o444
+                    or stat.S_IMODE(bound.identity[2]) != constants.READ_ONLY_FILE_MODE
                     or bound.digest != hashlib.sha256(source.encode()).hexdigest()
                 ):
                     raise ValueError("Runtime fragment differs from fixed immutable source.")
@@ -721,9 +773,9 @@ def _provision_generation_units(config: "GenerationAdmission", lock: HostFile, s
                 pins.enter_context(bound.open_verified())
         result = {"receiver": receiver}
         for role, suffix in (
-            ("slice_unit", ".slice"),
-            ("socket_unit", ".socket"),
-            ("service_unit", "@.service"),
+            ("slice_unit", SYSTEMD_SLICE_UNIT_SUFFIX),
+            ("socket_unit", SYSTEMD_SOCKET_UNIT_SUFFIX),
+            ("service_unit", SYSTEMD_SERVICE_TEMPLATE_SUFFIX),
         ):
             name = prefix + suffix
             path = directory / name
@@ -736,7 +788,7 @@ def _provision_generation_units(config: "GenerationAdmission", lock: HostFile, s
                     with os.fdopen(descriptor, "wb") as stream:
                         stream.write(sources[name].encode())
                         stream.flush()
-                        os.fchmod(stream.fileno(), 0o444)
+                        os.fchmod(stream.fileno(), constants.READ_ONLY_FILE_MODE)
                         os.fsync(stream.fileno())
                     os.link(staging, path, follow_symlinks=False)
                 finally:
@@ -760,7 +812,10 @@ def _manager(tool: HostFile, arguments: list[str], deadline: float) -> str:
             stderr=subprocess.PIPE,
             text=True,
             cwd="/",
-            env={"PATH": SYSTEM_COMMAND_PATH, "LC_ALL": SYSTEM_LOCALE},
+            env={
+                PATH_ENVIRONMENT_VARIABLE: SYSTEM_COMMAND_PATH,
+                LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+            },
             close_fds=True,
             start_new_session=True,
         )
@@ -791,30 +846,45 @@ def _unit_state(
     """Authenticate fixed loaded authority or a known removed slice or socket."""
     wanted = {
         "Id": unit.path.name,
-        "LoadState": "loaded",
-        "FragmentPath": str(unit.path),
-        "DropInPaths": "",
-        "NeedDaemonReload": "no",
-        "Transient": "no",
+        SYSTEMD_LOAD_STATE_PROPERTY: "loaded",
+        SYSTEMD_FRAGMENT_PATH_PROPERTY: str(unit.path),
+        SYSTEMD_DROP_IN_PATHS_PROPERTY: "",
+        SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY: "no",
+        SYSTEMD_TRANSIENT_PROPERTY: "no",
     }
-    fields = {"ActiveState", "SubState", "ControlGroup"}
-    if unit.path.suffix == ".slice":
+    fields = {
+        SYSTEMD_ACTIVE_STATE_PROPERTY,
+        SYSTEMD_SUB_STATE_PROPERTY,
+        SYSTEMD_CONTROL_GROUP_PROPERTY,
+    }
+    if unit.path.suffix == SYSTEMD_SLICE_UNIT_SUFFIX:
         wanted["Delegate"] = "no"
     else:
         wanted.update(
-            Accept="yes", RemoveOnStop="yes", Listen="/run/" + unit.path.name + " (Stream)"
+            Accept="yes",
+            RemoveOnStop="yes",
+            Listen=f"{SYSTEM_RUNTIME_DIRECTORY}/{unit.path.name} (Stream)",
         )
     if removed:
         parent = protected_path(unit.path.parent, directory=True)
-        _removed_artifact(unit, unit.path, parent.lstat().st_dev, 0o444)
+        _removed_artifact(unit, unit.path, parent.lstat().st_dev, constants.READ_ONLY_FILE_MODE)
         wanted.update(
-            FragmentPath="",
-            ActiveState="inactive",
-            SubState="dead",
-            ControlGroup="",
+            {
+                SYSTEMD_FRAGMENT_PATH_PROPERTY: "",
+                SYSTEMD_ACTIVE_STATE_PROPERTY: "inactive",
+                SYSTEMD_SUB_STATE_PROPERTY: "dead",
+                SYSTEMD_CONTROL_GROUP_PROPERTY: "",
+            }
         )
-    if removed and unit.path.suffix == ".socket":
-        wanted.update(LoadState="not-found", Accept="no", RemoveOnStop="no", Listen="")
+    if removed and unit.path.suffix == SYSTEMD_SOCKET_UNIT_SUFFIX:
+        wanted.update(
+            {
+                SYSTEMD_LOAD_STATE_PROPERTY: "not-found",
+                "Accept": "no",
+                "RemoveOnStop": "no",
+                "Listen": "",
+            }
+        )
     output = _manager(
         tool,
         [
@@ -834,7 +904,7 @@ def _unit_state(
         actual[key] = value
     # systemd omits an empty Listen array even with --all. Permit only that serialization for
     # an explicitly removed socket; not-found authority and all other fields remain mandatory.
-    if removed and unit.path.suffix == ".socket" and "Listen" not in actual:
+    if removed and unit.path.suffix == SYSTEMD_SOCKET_UNIT_SUFFIX and "Listen" not in actual:
         actual["Listen"] = ""
     if actual.keys() != fields | wanted.keys() or any(
         actual[key] != value for key, value in wanted.items()
@@ -871,13 +941,17 @@ def _recursive_idle(group: Path, *, absent: bool = False) -> None:
         for name in (
             "cgroup.events",
             "cgroup.type",
-            "cgroup.procs",
+            CGROUP_PROCS_FILENAME,
             "cgroup.threads",
             "cgroup.subtree_control",
         ):
             path = group / name
             details = path.lstat()
-            if not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or details.st_mode & 0o022:
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != 0
+                or details.st_mode & constants.GROUP_AND_OTHER_WRITE_MODE_MASK
+            ):
                 raise ValueError("Delegated generation tracking authority.")
         if (group / "cgroup.type").read_text(encoding="ascii") != "domain\n":
             raise ValueError("Generation tracking is not a process domain.")
@@ -918,6 +992,7 @@ def drained_generation(
     *,
     removed_receiver: HostFile | None = None,
     recovery: RetirementState = RetirementState.COMPLETE,
+    tracking_absent: bool = False,
 ) -> Generator[None, None, None]:
     """Close authenticated admission and hold the installation lock over an idle generation.
 
@@ -930,6 +1005,9 @@ def drained_generation(
         removed_receiver (HostFile | None): Trusted fixed 0555 receiver binding authenticated before
             known deletion; None (default) requires an intact receiver. Must equal
             files["receiver"].
+        tracking_absent (bool): Permit recovery only when all three original unit fragments are
+            already absent; the manager and whole-root cgroup checks must independently prove no
+            listener, job, instance, or tracked process remains.
 
     Yields:
         None: Exclusive closed-admission idle scope, valid only while the context is held.
@@ -941,7 +1019,13 @@ def drained_generation(
         OSError: Contention, native failure or live/ambiguous membership prevents drain.
     """
     with _drained_generation(
-        config, files, lock, deadline, removed_receiver=removed_receiver, recovery=recovery
+        config,
+        files,
+        lock,
+        deadline,
+        removed_receiver=removed_receiver,
+        recovery=recovery,
+        tracking_absent=tracking_absent,
     ):
         yield
 
@@ -955,6 +1039,7 @@ def _drained_generation(
     *,
     removed_receiver: HostFile | None = None,
     recovery: RetirementState = RetirementState.COMPLETE,
+    tracking_absent: bool = False,
     scope=None,
 ) -> Generator[None, None, None]:
     """Close authenticated admission and hold the installation lock over an idle generation.
@@ -968,6 +1053,9 @@ def _drained_generation(
         removed_receiver (HostFile | None): Trusted fixed 0555 receiver binding authenticated before
             known deletion; None (default) requires an intact receiver. Must equal
             files["receiver"].
+        tracking_absent (bool): Permit recovery only when all three original unit fragments are
+            already absent; the manager and whole-root cgroup checks must independently prove no
+            listener, job, instance, or tracked process remains.
 
     Yields:
         None: Exclusive closed-admission idle scope, valid only while the context is held.
@@ -981,27 +1069,31 @@ def _drained_generation(
     if not isinstance(recovery, RetirementState):
         # Keep malformed lifecycle phase inputs under the established ValueError contract.
         raise ValueError("Invalid explicit retirement state.")  # noqa: TRY004
+    if tracking_absent and recovery is not RetirementState.ATTACHMENT_REMOVED:
+        raise ValueError("Missing tracking recovery requires absent policy authority.")
     tracking_removed = recovery >= RetirementState.TRACKING_REMOVED
-    slice_removed = recovery >= RetirementState.SLICE_REMOVED
-    socket_removed = recovery >= RetirementState.SOCKET_REMOVED
-    template_removed = recovery >= RetirementState.TEMPLATE_REMOVED
+    slice_removed = recovery >= RetirementState.SLICE_REMOVED or tracking_absent
+    socket_removed = recovery >= RetirementState.SOCKET_REMOVED or tracking_absent
+    template_removed = recovery >= RetirementState.TEMPLATE_REMOVED or tracking_absent
 
     deadline = min(deadline, time.monotonic() + NATIVE_MANAGEMENT_TIMEOUT_SECONDS)
-    if slice_removed and (removed_receiver is None):
+    if slice_removed and removed_receiver is None and not tracking_absent:
         raise ValueError(
             "Known removed slice requires explicit stopped tracking and receiver binding."
         )
     sources = config.unit_sources()
     if template_removed and (
         files.get("service_unit") is None
-        or files["service_unit"].path.name != NATIVE_UNIT_PREFIX + config.generation + "@.service"
+        or files["service_unit"].path.name
+        != NATIVE_UNIT_PREFIX + config.generation + SYSTEMD_SERVICE_TEMPLATE_SUFFIX
         or files["service_unit"].digest
         != hashlib.sha256(sources[files["service_unit"].path.name].encode()).hexdigest()
     ):
         raise ValueError("Known removed template differs from fixed source.")
     if socket_removed and (
         files.get("socket_unit") is None
-        or files["socket_unit"].path.name != NATIVE_UNIT_PREFIX + config.generation + ".socket"
+        or files["socket_unit"].path.name
+        != NATIVE_UNIT_PREFIX + config.generation + SYSTEMD_SOCKET_UNIT_SUFFIX
         or files["socket_unit"].digest
         != hashlib.sha256(sources[files["socket_unit"].path.name].encode()).hexdigest()
     ):
@@ -1018,8 +1110,17 @@ def _drained_generation(
             if files.get("receiver") != removed_receiver:
                 raise ValueError("Removed receiver differs from fixed drain authority.")
             root = protected_path(config.receiver.parent, directory=True)
-            _removed_artifact(removed_receiver, config.receiver, root.lstat().st_dev, 0o555)
-        roles = {"slice_unit": ".slice", "socket_unit": ".socket", "service_unit": "@.service"}
+            _removed_artifact(
+                removed_receiver,
+                config.receiver,
+                root.lstat().st_dev,
+                constants.READ_ONLY_EXECUTABLE_FILE_MODE,
+            )
+        roles = {
+            "slice_unit": SYSTEMD_SLICE_UNIT_SUFFIX,
+            "socket_unit": SYSTEMD_SOCKET_UNIT_SUFFIX,
+            "service_unit": SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
+        }
         for role, bound in {"slice_unit": config.slice_unit, **files}.items():
             if (
                 role == "receiver"
@@ -1046,32 +1147,35 @@ def _drained_generation(
         socket = files["socket_unit"]
         _unit_state(tool, socket, deadline, removed=socket_removed)
         _unit_state(tool, config.slice_unit, deadline, removed=slice_removed)
-        if tracking_removed:
-            if removed_receiver is None:
+        if tracking_removed or tracking_absent:
+            if removed_receiver is None and not tracking_absent:
                 raise ValueError("Retired tracking requires known removed receiver authority.")
         else:
             _manager(tool, ["stop", "--", socket.path.name], deadline)
         unit_state = _unit_state(tool, socket, deadline, removed=socket_removed)
         if (
-            unit_state["ActiveState"] != "inactive"
-            or unit_state["SubState"] != "dead"
-            or unit_state["ControlGroup"]
+            unit_state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "inactive"
+            or unit_state[SYSTEMD_SUB_STATE_PROPERTY] != "dead"
+            or unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY]
         ):
             raise ValueError("Generation listener closure is unverified.")
-        listener = Path("/run") / socket.path.with_suffix(".socket").name
+        listener = (
+            SYSTEM_RUNTIME_DIRECTORY / socket.path.with_suffix(SYSTEMD_SOCKET_UNIT_SUFFIX).name
+        )
         if listener.exists() or listener.is_symlink():
             raise ValueError("Generation listener remains after closure.")
         unit_state = _unit_state(tool, config.slice_unit, deadline, removed=slice_removed)
         group = CGROUP_ROOT / config.slice_unit.path.name
-        if tracking_removed:
+        if tracking_removed or tracking_absent:
             if (
-                unit_state["ControlGroup"]
-                or unit_state["ActiveState"] != "inactive"
-                or unit_state["SubState"] != "dead"
+                unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY]
+                or unit_state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "inactive"
+                or unit_state[SYSTEMD_SUB_STATE_PROPERTY] != "dead"
             ):
                 raise ValueError("Retired generation tracking state is unsafe; capacity retained.")
         elif (
-            unit_state["ControlGroup"] != "/" + group.name or unit_state["ActiveState"] != "active"
+            unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY] != "/" + group.name
+            or unit_state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "active"
         ):
             raise ValueError("Generation tracking is missing or inactive; confinement retained.")
         if _manager(
@@ -1080,7 +1184,7 @@ def _drained_generation(
             deadline,
         ).strip():
             raise ValueError("Pending generation activation; confinement retained.")
-        _recursive_idle(group, absent=tracking_removed)
+        _recursive_idle(group, absent=tracking_removed or tracking_absent)
         for bound in (lock, config.reservation, config.slice_unit, tool, *files.values()):
             if bound != removed_receiver and not (
                 slice_removed
@@ -1092,13 +1196,30 @@ def _drained_generation(
             ):
                 inputs.enter_context(bound.open_verified())
         if removed_receiver is not None:
-            _removed_artifact(removed_receiver, config.receiver, root.lstat().st_dev, 0o555)
+            _removed_artifact(
+                removed_receiver,
+                config.receiver,
+                root.lstat().st_dev,
+                constants.READ_ONLY_EXECUTABLE_FILE_MODE,
+            )
         if slice_removed:
             _unit_state(tool, config.slice_unit, deadline, removed=True)
         if socket_removed:
             _unit_state(tool, socket, deadline, removed=True)
         if template_removed:
             _retired_instances(tool, config, files["service_unit"], deadline, removed=True)
+        if tracking_absent:
+            _retired_records_absent(
+                tool,
+                NATIVE_UNIT_PREFIX + config.generation,
+                {
+                    config.slice_unit.path.name,
+                    socket.path.name,
+                    files["service_unit"].path.name,
+                },
+                deadline,
+                loaded_implicit={config.slice_unit.path.name},
+            )
         if time.monotonic() >= deadline:
             raise TimeoutError("Generation drain deadline expired.")
         yield
@@ -1412,7 +1533,7 @@ def _attachment_authority(config, lock, helper, compiled, source, compiler_lock)
         or not isinstance(source, bytes)
         or not 0 < len(source) <= MAX_SOURCE_BYTES
         or not source.startswith(headers)
-        or compiler_lock.identity[2] & 0o222
+        or compiler_lock.identity[2] & constants.WRITE_MODE_MASK
         or compiler_lock.identity[:2] == lock.identity[:2]
         or not isinstance(compiled, bytes)
         or not 0 < len(compiled) <= MAX_COMPILED_BYTES
@@ -1535,7 +1656,7 @@ def _remove_generation_attachment(
 
                 def withdraw():
                     """Withdraw and synchronize only the originally pinned helper inode."""
-                    os.fchmod(descriptor, 0o444)
+                    os.fchmod(descriptor, constants.READ_ONLY_FILE_MODE)
                     os.fsync(descriptor)
 
                 withdraw()
@@ -1543,7 +1664,7 @@ def _remove_generation_attachment(
                 if (
                     rebound.identity[:2] != helper.identity[:2]
                     or rebound.digest != helper.digest
-                    or stat.S_IMODE(rebound.identity[2]) != 0o444
+                    or stat.S_IMODE(rebound.identity[2]) != constants.READ_ONLY_FILE_MODE
                 ):
                     raise ValueError("Generation helper changed during withdrawal.")
                 _recursive_idle(
@@ -1619,7 +1740,7 @@ def load_generation_policy(
     name = _attachment_authority(
         config, lock, helper, b"pending compilation", source, compiler_lock
     )
-    if stat.S_IMODE(helper.identity[2]) != 0o555:
+    if stat.S_IMODE(helper.identity[2]) != constants.READ_ONLY_EXECUTABLE_FILE_MODE:
         raise ValueError("Policy loading requires fixed immutable generation authority.")
     deadline = min(deadline, time.monotonic() + NATIVE_MANAGEMENT_TIMEOUT_SECONDS)
     with _administration(lock), ExitStack() as pins:
@@ -1740,7 +1861,7 @@ def activate_generation(
     deadline = min(deadline, time.monotonic() + NATIVE_MANAGEMENT_TIMEOUT_SECONDS)
     name = _attachment_authority(config, lock, helper, compiled, source, compiler_lock)
     with _administration(lock), ExitStack() as pins:
-        if stat.S_IMODE(helper.identity[2]) != 0o555:
+        if stat.S_IMODE(helper.identity[2]) != constants.READ_ONLY_EXECUTABLE_FILE_MODE:
             raise ValueError("Activation requires an immutable executable helper.")
         pins.enter_context(helper.open_verified())
         compiler = pins.enter_context(compiler_lock.open_verified())
@@ -1761,12 +1882,12 @@ def activate_generation(
         socket = published["socket_unit"]
         _unit_state(tool, socket, deadline)
         _manager(tool, ["stop", "--", socket.path.name], deadline)
-        listener = Path("/run") / socket.path.name
+        listener = SYSTEM_RUNTIME_DIRECTORY / socket.path.name
         unit_state = _unit_state(tool, socket, deadline)
         if (
-            unit_state["ActiveState"] != "inactive"
-            or unit_state["SubState"] != "dead"
-            or unit_state["ControlGroup"]
+            unit_state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "inactive"
+            or unit_state[SYSTEMD_SUB_STATE_PROPERTY] != "dead"
+            or unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY]
             or listener.exists()
             or listener.is_symlink()
         ):
@@ -1775,7 +1896,7 @@ def activate_generation(
             "# "
             + str(published["service_unit"].path)
             + "\n"
-            + runtime.unit_sources()[name + "@.service"]
+            + runtime.unit_sources()[name + SYSTEMD_SERVICE_TEMPLATE_SUFFIX]
         ):
             raise ValueError("Loaded service template differs from fixed authority.")
         _retired_instances(tool, runtime, published["service_unit"], deadline)
@@ -1783,11 +1904,17 @@ def activate_generation(
             raise ValueError("Pending generation activation; confinement retained.")
         unit_state = _unit_state(tool, runtime.slice_unit, deadline)
         group = CGROUP_ROOT / runtime.slice_unit.path.name
-        if unit_state["ActiveState"] == "inactive" and not unit_state["ControlGroup"]:
+        if (
+            unit_state[SYSTEMD_ACTIVE_STATE_PROPERTY] == "inactive"
+            and not unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY]
+        ):
             _recursive_idle(group, absent=True)
             _manager(tool, ["start", "--", runtime.slice_unit.path.name], deadline)
         unit_state = _unit_state(tool, runtime.slice_unit, deadline)
-        if unit_state["ActiveState"] != "active" or unit_state["ControlGroup"] != "/" + group.name:
+        if (
+            unit_state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "active"
+            or unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY] != "/" + group.name
+        ):
             raise ValueError("Generation tracking is missing or inactive; confinement retained.")
         _recursive_idle(group)
         _policy_tree(config.generation, namespace_identity, policies)
@@ -1807,19 +1934,22 @@ def activate_generation(
             unit_state = _unit_state(tool, socket, deadline)
             details = listener.lstat()
             if (
-                unit_state["ActiveState"] != "active"
-                or unit_state["SubState"] != "listening"
+                unit_state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "active"
+                or unit_state[SYSTEMD_SUB_STATE_PROPERTY] != "listening"
                 or not stat.S_ISSOCK(details.st_mode)
-                or stat.S_IMODE(details.st_mode) != 0o600
+                or stat.S_IMODE(details.st_mode) != constants.PRIVATE_FILE_MODE
                 or (details.st_uid, details.st_gid) != (runtime.uid, runtime.gid)
             ):
                 raise ValueError("Activated generation listener differs from fixed authority.")
             socket_group = (CGROUP_ROOT / "system.slice") / socket.path.name
-            if unit_state["ControlGroup"] not in ("", "/system.slice/" + socket.path.name):
+            if unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY] not in (
+                "",
+                "/system.slice/" + socket.path.name,
+            ):
                 raise ValueError(
                     "Activated generation listener tracking differs from fixed authority."
                 )
-            _recursive_idle(socket_group, absent=not unit_state["ControlGroup"])
+            _recursive_idle(socket_group, absent=not unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY])
             for bound in (
                 lock,
                 compiler_lock,
@@ -1838,9 +1968,9 @@ def activate_generation(
                 _manager(tool, ["stop", "--", socket.path.name], cleanup_deadline)
                 closed = _unit_state(tool, socket, cleanup_deadline)
                 if (
-                    closed["ActiveState"] != "inactive"
-                    or closed["SubState"] != "dead"
-                    or closed["ControlGroup"]
+                    closed[SYSTEMD_ACTIVE_STATE_PROPERTY] != "inactive"
+                    or closed[SYSTEMD_SUB_STATE_PROPERTY] != "dead"
+                    or closed[SYSTEMD_CONTROL_GROUP_PROPERTY]
                     or listener.exists()
                     or listener.is_symlink()
                 ):
@@ -1889,7 +2019,9 @@ def _retired_instances(
     ).splitlines()
     if removed:
         parent = protected_path(service.path.parent, directory=True)
-        _removed_artifact(service, service.path, parent.lstat().st_dev, 0o444)
+        _removed_artifact(
+            service, service.path, parent.lstat().st_dev, constants.READ_ONLY_FILE_MODE
+        )
         if lines:
             raise ValueError(
                 "Removed service template still has instance records; capacity retained."
@@ -1909,31 +2041,41 @@ def _retired_instances(
         name = fields[0]
         wanted = {
             "Id": name,
-            "LoadState": "loaded",
-            "FragmentPath": str(service.path),
-            "DropInPaths": "",
-            "NeedDaemonReload": "no",
-            "Transient": "no",
+            SYSTEMD_LOAD_STATE_PROPERTY: "loaded",
+            SYSTEMD_FRAGMENT_PATH_PROPERTY: str(service.path),
+            SYSTEMD_DROP_IN_PATHS_PROPERTY: "",
+            SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY: "no",
+            SYSTEMD_TRANSIENT_PROPERTY: "no",
             "MainPID": "0",
             "ControlPID": "0",
-            "ControlGroup": "",
-            "Slice": prefix + ".slice",
+            SYSTEMD_CONTROL_GROUP_PROPERTY: "",
+            "Slice": prefix + SYSTEMD_SLICE_UNIT_SUFFIX,
             "Delegate": "no",
             "ExitType": "cgroup",
         }
-        actual = _retired_properties(tool, name, wanted.keys() | {"ActiveState"}, deadline)
+        actual = _retired_properties(
+            tool, name, wanted.keys() | {SYSTEMD_ACTIVE_STATE_PROPERTY}, deadline
+        )
         if (
-            actual.keys() != wanted.keys() | {"ActiveState"}
+            actual.keys() != wanted.keys() | {SYSTEMD_ACTIVE_STATE_PROPERTY}
             or any(actual[key] != value for key, value in wanted.items())
-            or actual["ActiveState"] not in {"inactive", "failed"}
+            or actual[SYSTEMD_ACTIVE_STATE_PROPERTY] not in {"inactive", "failed"}
         ):
             raise ValueError("Retired service authority differs; capacity retained.")
         names.append(name)
     return names
 
 
-def _retired_records_absent(tool: HostFile, prefix: str, known: set[str], deadline: float) -> None:
-    """Allow only known inert not-found records after authenticated fragment removal/reload."""
+def _retired_records_absent(
+    tool: HostFile,
+    prefix: str,
+    known: set[str],
+    deadline: float,
+    *,
+    loaded_implicit: set[str] | None = None,
+) -> None:
+    """Allow only known inert records, with implicit slices separately attested by the caller."""
+    loaded_implicit = loaded_implicit or set()
     lines = _manager(
         tool, ["list-units", "--all", "--plain", "--no-legend", "--", prefix + "*"], deadline
     ).splitlines()
@@ -1944,15 +2086,19 @@ def _retired_records_absent(tool: HostFile, prefix: str, known: set[str], deadli
             raise ValueError("Retired generation authority remains; capacity retained.")
         name = fields[0]
         seen.add(name)
+        if name in loaded_implicit:
+            if not name.endswith(SYSTEMD_SLICE_UNIT_SUFFIX):
+                raise ValueError("Unexpected implicit retired manager record; capacity retained.")
+            continue
         wanted = {
             "Id": name,
-            "LoadState": "not-found",
-            "FragmentPath": "",
-            "DropInPaths": "",
-            "NeedDaemonReload": "no",
-            "Transient": "no",
-            "ActiveState": "inactive",
-            "ControlGroup": "",
+            SYSTEMD_LOAD_STATE_PROPERTY: "not-found",
+            SYSTEMD_FRAGMENT_PATH_PROPERTY: "",
+            SYSTEMD_DROP_IN_PATHS_PROPERTY: "",
+            SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY: "no",
+            SYSTEMD_TRANSIENT_PROPERTY: "no",
+            SYSTEMD_ACTIVE_STATE_PROPERTY: "inactive",
+            SYSTEMD_CONTROL_GROUP_PROPERTY: "",
         }
         if name.endswith(".service"):
             wanted.update(MainPID="0", ControlPID="0")
@@ -2040,25 +2186,35 @@ def _reclaim_generation(
     removed_helper: HostFile | None,
     removed_receiver: HostFile | None,
     recovery: RetirementState,
+    tracking_absent: bool = False,
 ) -> None:
     """Apply checked removal within the caller-owned exclusive drain scope."""
+    if tracking_absent and recovery is not RetirementState.ATTACHMENT_REMOVED:
+        raise ValueError("Missing tracking recovery requires absent policy authority.")
     tracking_removed = recovery >= RetirementState.TRACKING_REMOVED
-    slice_removed = recovery >= RetirementState.SLICE_REMOVED
-    socket_removed = recovery >= RetirementState.SOCKET_REMOVED
-    template_removed = recovery >= RetirementState.TEMPLATE_REMOVED
+    slice_removed = recovery >= RetirementState.SLICE_REMOVED or tracking_absent
+    socket_removed = recovery >= RetirementState.SOCKET_REMOVED or tracking_absent
+    template_removed = recovery >= RetirementState.TEMPLATE_REMOVED or tracking_absent
 
     root = config.receiver.parent
-    retained_record = artifacts.get("management.json")
-    if retained_record is not None and retained_record.path != root / "management.json":
+    retained_record = artifacts.get(MANAGEMENT_RECORD_NAME)
+    if retained_record is not None and retained_record.path != root / MANAGEMENT_RECORD_NAME:
         raise ValueError("Invalid retained management record authority.")
     if (
         set(files) != {"socket_unit", "service_unit", "receiver"}
         or len(artifacts) > MAX_NATIVE_INSTALLATION_ENTRIES
-        or tracking_removed
-        and (removed_receiver is None or set(artifacts) - {"management.json"} or empty_directories)
+        or (
+            tracking_removed
+            and not tracking_absent
+            and (
+                removed_receiver is None
+                or set(artifacts) - {MANAGEMENT_RECORD_NAME}
+                or empty_directories
+            )
+        )
         or (not artifacts and removed_receiver is None)
         or len(empty_directories or {}) > MAX_NATIVE_INSTALLATION_ENTRIES
-        or compiler_lock.identity[2] & 0o222
+        or compiler_lock.identity[2] & constants.WRITE_MODE_MASK
         or compiler_lock.identity[:2] == lock.identity[:2]
         or config.reservation.path.name != config.generation
     ):
@@ -2100,8 +2256,39 @@ def _reclaim_generation(
             raise ValueError("Aliased generation artifact directory.")
         root_device = root.lstat().st_dev
         helper = root / "helper"
+        if tracking_absent:
+            _unit_state(tool, config.slice_unit, deadline, removed=True)
+            _unit_state(tool, files["socket_unit"], deadline, removed=True)
+            _retired_instances(tool, config, files["service_unit"], deadline, removed=True)
+            _recursive_idle(CGROUP_ROOT / config.slice_unit.path.name, absent=True)
+            original_helper = artifacts.get("helper")
+            if original_helper is None or original_helper.path != helper:
+                raise ValueError("Missing tracking recovery lacks original helper authority.")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Generation artifact removal deadline expired; capacity retained."
+                )
+            with original_helper.open_verified() as descriptor:
+                if bind_host_file(helper) != original_helper:
+                    raise ValueError("Generation helper differs from fixed authority.")
+                mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+                if mode == constants.READ_ONLY_EXECUTABLE_FILE_MODE:
+                    os.fchmod(descriptor, constants.READ_ONLY_FILE_MODE)
+                    os.fsync(descriptor)
+                elif mode != constants.READ_ONLY_FILE_MODE:
+                    raise ValueError("Generation helper has unsafe mode; capacity retained.")
+            withdrawn = bind_host_file(helper)
+            if (
+                withdrawn.identity[:2] != original_helper.identity[:2]
+                or withdrawn.identity[3:6] != original_helper.identity[3:6]
+                or withdrawn.digest != original_helper.digest
+                or stat.S_IMODE(withdrawn.identity[2]) != constants.READ_ONLY_FILE_MODE
+                or withdrawn.identity[6] < original_helper.identity[6]
+            ):
+                raise ValueError("Generation helper changed during withdrawal; capacity retained.")
+            artifacts = {**artifacts, "helper": withdrawn}
         if removed_helper is not None:
-            _removed_artifact(removed_helper, helper, root_device, 0o444)
+            _removed_artifact(removed_helper, helper, root_device, constants.READ_ONLY_FILE_MODE)
             if "helper" in artifacts:
                 raise ValueError("Invalid known removed helper authority; capacity retained.")
         if removed_receiver is not None:
@@ -2109,7 +2296,12 @@ def _reclaim_generation(
                 raise ValueError(
                     "Removed receiver requires known removed helper and fixed binding."
                 )
-            _removed_artifact(removed_receiver, config.receiver, root_device, 0o555)
+            _removed_artifact(
+                removed_receiver,
+                config.receiver,
+                root_device,
+                constants.READ_ONLY_EXECUTABLE_FILE_MODE,
+            )
         expected = {bound.path for bound in preserved if bound.path.is_relative_to(root)}
         targets = []
         for name, bound in artifacts.items():
@@ -2121,7 +2313,7 @@ def _reclaim_generation(
                 or ".." in Path(name).parts
                 or path == root
                 or bound.path != path
-                or bound.identity[2] & 0o222
+                or bound.identity[2] & constants.WRITE_MODE_MASK
                 or bound.path in {item.path for item in preserved}
             ):
                 raise ValueError("Invalid generation artifact authority.")
@@ -2129,7 +2321,7 @@ def _reclaim_generation(
             if bind_host_file(path) != bound:
                 raise ValueError("Generation artifact changed; capacity retained.")
             expected.add(path)
-            if name != "management.json":
+            if name != MANAGEMENT_RECORD_NAME:
                 targets.append(bound)
         required = {helper, config.receiver}
         if removed_helper is not None:
@@ -2137,7 +2329,8 @@ def _reclaim_generation(
         if removed_receiver is not None:
             required.remove(config.receiver)
         if required - {bound.path for bound in targets} or (
-            removed_helper is None and stat.S_IMODE(helper.lstat().st_mode) != 0o444
+            removed_helper is None
+            and stat.S_IMODE(helper.lstat().st_mode) != constants.READ_ONLY_FILE_MODE
         ):
             raise ValueError("Generation helper is not withdrawn; capacity retained.")
         directories = set()
@@ -2243,16 +2436,16 @@ def _reclaim_generation(
             if bound is not None:
                 bound.path.unlink()
         group = CGROUP_ROOT / config.slice_unit.path.name
-        if tracking_removed:
+        if tracking_removed or tracking_absent:
             _recursive_idle(group, absent=True)
         else:
             _recursive_idle(group)
             _manager(tool, ["stop", "--", config.slice_unit.path.name], deadline)
         slice_state = _unit_state(tool, config.slice_unit, deadline, removed=slice_removed)
         if (
-            slice_state["ActiveState"] != "inactive"
-            or slice_state["SubState"] != "dead"
-            or slice_state["ControlGroup"]
+            slice_state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "inactive"
+            or slice_state[SYSTEMD_SUB_STATE_PROPERTY] != "dead"
+            or slice_state[SYSTEMD_CONTROL_GROUP_PROPERTY]
             or group.exists()
             or group.is_symlink()
         ):
@@ -2274,15 +2467,27 @@ def _reclaim_generation(
             if bind_host_file(bound.path) != bound:
                 raise ValueError("Generation fragment changed before removal; capacity retained.")
             bound.path.unlink()
-        _manager(tool, ["daemon-reload"], deadline)
+        if not tracking_absent:
+            _manager(tool, ["daemon-reload"], deadline)
         if instances:
             _manager(tool, ["reset-failed", "--", *instances], deadline)
-        _retired_records_absent(
-            tool, prefix, {bound.path.name for bound in units} | set(instances), deadline
-        )
+        known_records = {bound.path.name for bound in units} | set(instances)
+        if tracking_absent:
+            _unit_state(tool, config.slice_unit, deadline, removed=True)
+            _unit_state(tool, files["socket_unit"], deadline, removed=True)
+            _retired_instances(tool, config, files["service_unit"], deadline, removed=True)
+            _retired_records_absent(
+                tool,
+                prefix,
+                known_records,
+                deadline,
+                loaded_implicit={config.slice_unit.path.name},
+            )
+        else:
+            _retired_records_absent(tool, prefix, known_records, deadline)
         if (
             _manager(tool, ["list-jobs", "--no-legend", "--", prefix + "*"], deadline).strip()
-            or (Path("/run") / (prefix + ".socket")).exists()
+            or (SYSTEM_RUNTIME_DIRECTORY / (prefix + SYSTEMD_SOCKET_UNIT_SUFFIX)).exists()
             or any(bound.path.exists() or bound.path.is_symlink() for bound in (*targets, *units))
             or helper.exists()
             or helper.is_symlink()
@@ -2292,7 +2497,7 @@ def _reclaim_generation(
             or _attachment_entry(policy, device, prefix) is not None
         ):
             raise ValueError("Retired generation authority remains; capacity retained.")
-        if tracking_removed:
+        if tracking_removed or tracking_absent:
             _recursive_idle(group, absent=True)
         generation_limits(config.reservation, config.generation)
         pinned.enter_context(lock.open_verified())
@@ -2322,12 +2527,12 @@ def _reclaim_generation(
                     fd = os.open(
                         config.reservation.path,
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        0o444,
+                        constants.READ_ONLY_FILE_MODE,
                     )
                     with os.fdopen(fd, "wb") as stream:
                         stream.write(record)
                         stream.flush()
-                        os.fchmod(stream.fileno(), 0o444)
+                        os.fchmod(stream.fileno(), constants.READ_ONLY_FILE_MODE)
                         os.fsync(stream.fileno())
                 raise
 
@@ -2353,6 +2558,7 @@ def retire_generation(
     deadline: float,
     *,
     recovery: RetirementState = RetirementState.COMPLETE,
+    tracking_absent: bool = False,
     empty_directories: dict[str, tuple[int, int]] | None = None,
     cached_payloads: bool = False,
 ) -> None:
@@ -2373,6 +2579,9 @@ def retire_generation(
         artifacts (dict[str, HostFile]): Complete trusted relative generation artifact inventory.
         deadline (float): Absolute monotonic budget capped to five seconds.
         recovery (RetirementState): Trusted completed removal prefix; defaults to COMPLETE.
+        tracking_absent (bool): Recover only when the original socket, service template and slice
+            fragments are all absent and the manager and whole-root cgroup checks prove no live
+            authority remains. This is valid only with absent policy and ATTACHMENT_REMOVED state.
         empty_directories (dict[str, tuple[int, int]] | None): Trusted relative empty cache
             directory
             names bound to device/inode; None (default) allows only file-derived directories.
@@ -2390,6 +2599,8 @@ def retire_generation(
     if not isinstance(recovery, RetirementState):
         # Keep malformed lifecycle phase inputs under the established ValueError contract.
         raise ValueError("Invalid explicit retirement state.")  # noqa: TRY004
+    if tracking_absent and recovery is not RetirementState.ATTACHMENT_REMOVED:
+        raise ValueError("Missing tracking recovery requires absent policy authority.")
     if recovery < RetirementState.HELPER_REMOVED and artifacts.get("helper") != helper:
         raise ValueError("Retirement inventory lacks original helper authority.")
     removed_receiver = (
@@ -2404,6 +2615,7 @@ def retire_generation(
         deadline,
         removed_receiver=removed_receiver,
         recovery=recovery,
+        tracking_absent=tracking_absent,
     ):
         if recovery is RetirementState.COMPLETE and cached_payloads:
             policies = generation_policy_cache(
@@ -2425,14 +2637,14 @@ def retire_generation(
                 deadline,
                 nullcontext(),
             )
-        if recovery >= RetirementState.HELPER_REMOVED:
+        if tracking_absent or recovery >= RetirementState.HELPER_REMOVED:
             withdrawn = helper
         else:
             withdrawn = bind_host_file(helper.path)
             if (
                 withdrawn.identity[:2] != helper.identity[:2]
                 or withdrawn.digest != helper.digest
-                or stat.S_IMODE(withdrawn.identity[2]) != 0o444
+                or stat.S_IMODE(withdrawn.identity[2]) != constants.READ_ONLY_FILE_MODE
             ):
                 raise ValueError("Retirement helper changed after withdrawal; capacity retained.")
         _reclaim_generation(
@@ -2441,7 +2653,7 @@ def retire_generation(
             lock,
             compiler_lock,
             artifacts
-            if recovery >= RetirementState.HELPER_REMOVED
+            if tracking_absent or recovery >= RetirementState.HELPER_REMOVED
             else {**artifacts, "helper": withdrawn},
             deadline,
             nullcontext(),
@@ -2449,4 +2661,5 @@ def retire_generation(
             withdrawn if recovery >= RetirementState.HELPER_REMOVED else None,
             removed_receiver,
             recovery,
+            tracking_absent,
         )

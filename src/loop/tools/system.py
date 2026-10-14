@@ -95,7 +95,8 @@ def run_command(
             description="Extra host or virtual directories to read inside the sandbox. "
             "Installed tools outside reviewed system roots need a grant for their executable "
             "and support files; use resolve_executable and executable_grant when host paths "
-            "are private. PATH alone grants lookup metadata."
+            "are private. Unused PATH entries grant lookup metadata only; a safe executable "
+            "named directly may receive access to that exact file without its neighbors."
         ),
     ] = None,
     executable_grant: Annotated[
