@@ -1443,13 +1443,78 @@ class OpenAIBackend(Backend):
             context_tokens=usage.output_tokens,
         )
 
+    def prepare_context(self, context: Iterable[ModelContextItem]) -> list[ModelContextItem]:
+        """Apply input policy to file-bearing context without changing source identities.
+
+        Reference metadata retains its immutable digest and byte offsets. Transformed references
+        are marked redacted; transformed tool text cannot establish byte-identical coverage.
+        Remaining transport fields are filtered when preparing the provider request.
+
+        Args:
+            context (Iterable[ModelContextItem]): Canonical conversation items to prepare.
+
+        Returns:
+            list[ModelContextItem]: Prepared copies suitable for generation and observation.
+
+        Raises:
+            ValueError: If an unredacted reference payload disagrees with its source range.
+        """
+        prepared = []
+        for item in context:
+            if isinstance(item, Message):
+                item = item.model_copy(
+                    update={"context": tuple(self._prepared_reference(ref) for ref in item.context)}
+                )
+            elif isinstance(item, ToolCall):
+                arguments = self._prepared_tool_text(item.arguments)
+                item = item.model_copy(
+                    update={
+                        "arguments": arguments,
+                        "arguments_redacted": item.arguments_redacted
+                        or arguments != item.arguments,
+                    }
+                )
+            elif isinstance(item, ToolResult):
+                item = item.model_copy(
+                    update={"output": self._prepared_tool_text(item.output, read_result=True)}
+                )
+            prepared.append(item)
+        return prepared
+
+    def _prepared_tool_text(self, value: str, *, read_result: bool = False) -> str:
+        """Filter decoded JSON and assignment text, flagging only changed source content."""
+        try:
+            original = json.loads(value)
+        except json.JSONDecodeError:
+            return self._model_input_policy.apply(value)
+        prepared = self._model_input_policy.apply(original)
+        output = json.dumps(prepared, ensure_ascii=False) if prepared != original else value
+        output = self._model_input_policy.apply(output)
+        if not read_result or output == value:
+            return output
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return output
+        before = original.get("result") if isinstance(original, dict) else None
+        after = payload.get("result") if isinstance(payload, dict) else None
+        if (
+            isinstance(before, dict)
+            and isinstance(after, dict)
+            and "content" in before
+            and before["content"] != after.get("content")
+        ):
+            after["payload_redacted"] = True
+            output = json.dumps(payload, ensure_ascii=False)
+        return output
+
     def _serialize_input(  # pylint: disable=redefined-builtin
         self, input: str | Iterable[ModelContextItem]
     ) -> str | list[OpenAIInputItemParam]:
         """Translate conversation items into OpenAI-compatible request items."""
         if isinstance(input, str):
             return input
-        return [self._serialize_item(item) for item in input]
+        return [self._serialize_item(item) for item in self.prepare_context(input)]
 
     def _attachment_message(self, reference: ContextReference) -> dict[str, Any]:
         """Translate one file snapshot into a backend-compatible content part."""
@@ -1505,6 +1570,7 @@ class OpenAIBackend(Backend):
         The sanitized payload is a transport representation of the same source-byte range. Its
         length must not replace the immutable artifact's size, prefix boundary, digest, or cursor.
         """
+        self._validate_reference_payload(reference)
         if not isinstance(reference.content, str):
             return reference
         sanitized = self._model_input_policy.apply(reference.content)
@@ -1530,9 +1596,7 @@ class OpenAIBackend(Backend):
         """Translate one conversation message and its explicit context."""
         if not item.context:
             return OpenAIMessageParam(role=item.role, content=item.content)
-        for reference in item.context:
-            self._validate_reference_payload(reference)
-        references = tuple(self._prepared_reference(reference) for reference in item.context)
+        references = item.context
         content = [
             OpenAIInputTextParam(type="input_text", text=item.content),
             OpenAIInputTextParam(
@@ -1613,13 +1677,19 @@ class OpenAIBackend(Backend):
 
     @staticmethod
     def _validate_reference_payload(reference: ContextReference) -> None:
-        """Reject a transport payload that disagrees with its declared source range."""
+        """Validate source ranges and unredacted payload lengths before input-policy filtering.
+
+        Redacted payload lengths may differ from the canonical source range they represent.
+        """
         payload = get_binary(reference.content)
         if not 0 <= reference.payload_start_bytes <= reference.included_bytes:
             raise ValueError(
                 f"Referenced snapshot '{reference.path}' has an invalid payload range."
             )
-        if len(payload) != reference.included_bytes - reference.payload_start_bytes:
+        if (
+            not reference.payload_redacted
+            and len(payload) != reference.included_bytes - reference.payload_start_bytes
+        ):
             raise ValueError(
                 f"Referenced snapshot '{reference.path}' does not match its included bytes range."
             )

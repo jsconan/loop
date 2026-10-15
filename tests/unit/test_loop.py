@@ -71,6 +71,7 @@ def loop_backend(**attributes):
     defaults = {
         "default_model": "default-model",
         "get_context_window": lambda _model: None,
+        "prepare_context": list,
     }
     return SimpleNamespace(**(defaults | attributes))
 
@@ -330,7 +331,7 @@ def test_loop_accepts_an_explicitly_assembled_runtime(tmp_path):
     mention_manager = Mock()
     instructions = InstructionsManager()
     permissions = Mock()
-    backend = Mock()
+    backend = Mock(prepare_context=Mock(side_effect=list))
     runner = Mock(
         agent=agent,
         backend=backend,
@@ -452,7 +453,7 @@ def test_loop_rejects_an_invalid_compaction_threshold(tmp_path):
 def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_path, monkeypatch):
     """Model commands reuse a fresh catalog and report failures once its cache expires."""
     interaction = MagicMock(spec=Interaction)
-    backend = Mock(default_model="default-model")
+    backend = Mock(default_model="default-model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = 8192
     backend.get_models.return_value = [ModelInfo(id="selected-model")]
     now = [0.0]
@@ -498,7 +499,7 @@ def test_default_loop_registers_single_sandbox_provider_with_main_app_authority(
 
     management = Mock(side_effect=manage)
     monkeypatch.setattr(linux_setup, "manage_setup", management)
-    refresh_backend = Mock()
+    refresh_backend = Mock(prepare_context=Mock(side_effect=list))
     loop = Loop.create_default(
         loop_backend(),
         working_directory=tmp_path,
@@ -725,7 +726,7 @@ def test_resumed_missing_model_uses_existing_query_fallback(tmp_path):
     store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     store.save(Session(id="internal-id", model="missing"))
     sessions = SessionManager(interaction=interaction, session_store=store)
-    backend = Mock(default_model="default-model")
+    backend = Mock(default_model="default-model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_models.return_value = [ModelInfo(id="replacement")]
     backend.get_response.side_effect = [
@@ -781,7 +782,7 @@ def test_run_attaches_files_but_treats_skill_mentions_as_non_mutating_hints(tmp_
         skill_manager=SkillManager([Skill("review", "Review code.", location)]),
         working_directory=tmp_path,
     )
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
@@ -841,7 +842,7 @@ def test_run_warns_when_a_skill_hint_cannot_fit_the_instruction_budget(tmp_path)
     instructions = InstructionsManager(
         skill_manager=SkillManager(skills), max_bytes=instruction_limit
     )
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
@@ -871,7 +872,7 @@ def test_run_reports_a_skill_hint_instruction_refresh_failure(tmp_path):
     instructions = InstructionsManager(
         skill_manager=SkillManager([skill]), working_directory=tmp_path
     )
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     interaction = output_interaction()
     interaction.prompt.side_effect = ["Use $review", False]
 
@@ -903,7 +904,7 @@ def test_run_reports_a_skill_hint_cleanup_failure_without_masking_completion(tmp
         else (_ for _ in ()).throw(UnicodeError("invalid project instructions"))
     )
     instructions.set_skill_catalog_priorities = set_priorities
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
@@ -924,7 +925,7 @@ def test_run_reports_a_skill_hint_cleanup_failure_without_masking_completion(tmp
 
 def test_run_reports_each_attached_reference_and_local_remainder(tmp_path):
     """Every attached reference reports its included bytes and any local remainder."""
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
@@ -969,7 +970,7 @@ def test_default_loop_persists_lazy_mentions_through_the_session_store(tmp_path)
     """Default mention wiring stores large snapshots outside serialized message content."""
     content = "x" * (constants.MAX_REFERENCE_PREVIEW_BYTES + 1)
     (tmp_path / "large.txt").write_text(content, encoding="utf-8")
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
@@ -993,7 +994,7 @@ def test_run_preserves_binary_mentions_and_queries_the_backend(tmp_path):
     """Binary mentions reach the backend as immutable byte snapshots."""
     path = tmp_path / "binary.bin"
     path.write_bytes(b"bad\0data")
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     interaction = output_interaction()
     interaction.prompt.side_effect = ["Read @binary.bin", False]
     backend.get_context_window.return_value = None
@@ -1012,7 +1013,7 @@ def test_run_reports_invalid_mentions_without_mutating_or_querying(tmp_path):
     """Mention resolution failures return to input without storing a partial user turn."""
     path = tmp_path / "too-large.bin"
     path.write_bytes(b"x" * (constants.MAX_FETCH_BYTES + 1))
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.side_effect = ["Read @too-large.bin", False]
     loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
@@ -1036,7 +1037,7 @@ def test_run_retries_an_exhausted_recoverable_failure(tmp_path):
         request_id="request-1",
         retry_after=2.5,
     )
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.side_effect = [error, [ResponseCompleted(answer="done")]]
     interaction = output_interaction()
@@ -1069,7 +1070,7 @@ def test_run_describes_partial_output_before_retrying(tmp_path):
         operation="stream_response",
         response_started=True,
     )
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.side_effect = [error, [ResponseCompleted()]]
     interaction = output_interaction()
@@ -1086,7 +1087,7 @@ def test_run_declines_or_disables_recoverable_retries(tmp_path):
     """Declined and disabled recovery report retained usage without assistant output."""
     for enabled in (True, False):
         error = BackendConnectionError("offline", provider="openai", operation="create_response")
-        backend = Mock(default_model="model")
+        backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
         backend.get_context_window.return_value = None
         backend.get_response.side_effect = error
         interaction = output_interaction()
@@ -1129,7 +1130,7 @@ def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):
     error = BackendAuthenticationError(
         "invalid key", provider="openai", operation="create_response", status_code=401
     )
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.side_effect = error
     interaction = output_interaction()
@@ -1149,7 +1150,7 @@ def test_run_selects_an_available_model_after_not_found(tmp_path):
         "model missing", provider="openai", operation="create_response", status_code=404
     )
     models = [ModelInfo(id="first"), ModelInfo(id="second")]
-    backend = Mock(default_model="missing")
+    backend = Mock(default_model="missing", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_models.return_value = models
     backend.get_response.side_effect = [error, [ResponseCompleted(model="second")]]
@@ -1172,7 +1173,7 @@ def test_run_selects_an_available_model_after_not_found(tmp_path):
 def test_run_re_prompts_when_user_selects_same_failed_model(tmp_path):
     """The fallback selector re-prompts when the user selects the already-failed model."""
     error = BackendNotFoundError("missing", provider="openai", operation="create_response")
-    backend = Mock(default_model="missing")
+    backend = Mock(default_model="missing", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_models.return_value = [ModelInfo(id="second"), ModelInfo(id="missing")]
     backend.get_response.side_effect = [error, [ResponseCompleted()], [ResponseCompleted()]]
@@ -1197,7 +1198,7 @@ def test_run_re_prompts_when_user_selects_same_failed_model(tmp_path):
 def test_run_accepts_same_failed_model_on_confirm(tmp_path):
     """Selecting the failed model and confirming accepts it, breaking immediately."""
     error = BackendNotFoundError("missing", provider="openai", operation="create_response")
-    backend = Mock(default_model="missing")
+    backend = Mock(default_model="missing", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_models.return_value = [ModelInfo(id="second"), ModelInfo(id="missing")]
     backend.get_response.side_effect = [error, [ResponseCompleted()]]
@@ -1225,7 +1226,7 @@ def test_run_accepts_same_failed_model_on_confirm(tmp_path):
 def test_run_stops_model_fallback_when_discovery_fails(tmp_path, models):
     """Unavailable or empty model discovery returns safely to the conversation prompt."""
     missing = BackendNotFoundError("missing", provider="openai", operation="create_response")
-    backend = Mock(default_model="missing")
+    backend = Mock(default_model="missing", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.side_effect = missing
     if isinstance(models, Exception):
@@ -1249,7 +1250,7 @@ def test_run_stops_model_fallback_when_discovery_fails(tmp_path, models):
 def test_run_can_stop_model_selection(tmp_path):
     """Declining the shared singleton choice prompt abandons the failed response turn."""
     missing = BackendNotFoundError("missing", provider="openai", operation="create_response")
-    backend = Mock(default_model="missing")
+    backend = Mock(default_model="missing", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_models.return_value = [ModelInfo(id="replacement")]
     backend.get_response.side_effect = missing
@@ -1268,7 +1269,7 @@ def test_run_can_stop_model_selection(tmp_path):
 def test_run_accepts_the_only_available_model_after_not_found(tmp_path):
     """Selecting the sole discovered model retries the response with that model."""
     missing = BackendNotFoundError("missing", provider="openai", operation="create_response")
-    backend = Mock(default_model="missing")
+    backend = Mock(default_model="missing", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_models.return_value = [ModelInfo(id="replacement")]
     backend.get_response.side_effect = [missing, [ResponseCompleted(model="replacement")]]
@@ -1286,7 +1287,7 @@ def test_run_accepts_the_only_available_model_after_not_found(tmp_path):
 def test_run_can_exit_multi_model_fallback_selection(tmp_path):
     """Exiting a multi-model fallback selector abandons only the failed response turn."""
     missing = BackendNotFoundError("missing", provider="openai", operation="create_response")
-    backend = Mock(default_model="missing")
+    backend = Mock(default_model="missing", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_models.return_value = [ModelInfo(id="first"), ModelInfo(id="second")]
     backend.get_response.side_effect = missing
@@ -1308,7 +1309,7 @@ def test_loop_uses_an_injected_mention_registry(tmp_path):
     instructions = InstructionsManager(skill_manager=SkillManager([skill]))
     set_priorities = Mock(wraps=instructions.set_skill_catalog_priorities)
     instructions.set_skill_catalog_priorities = set_priorities
-    backend = MagicMock(default_model="model")
+    backend = MagicMock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
     interaction = output_interaction()
@@ -1336,7 +1337,7 @@ def test_loop_leaves_skill_hints_unchanged_after_an_injected_mention_failure(tmp
     instructions = InstructionsManager()
     set_priorities = Mock(wraps=instructions.set_skill_catalog_priorities)
     instructions.set_skill_catalog_priorities = set_priorities
-    backend = MagicMock(default_model="model")
+    backend = MagicMock(default_model="model", prepare_context=Mock(side_effect=list))
     interaction = output_interaction()
     interaction.prompt.side_effect = ["Custom $reference", False]
 
@@ -1387,7 +1388,7 @@ def test_loops_share_local_conversation_context(tmp_path):
         messages=[Message(role="user", content="hello")], tokens=12, model="served-model"
     )
     first = Loop.create_default(backend=loop_backend(), session=session, working_directory=tmp_path)
-    second_backend = Mock(default_model="other-model")
+    second_backend = Mock(default_model="other-model", prepare_context=Mock(side_effect=list))
     second_backend.get_response.return_value = [ResponseCompleted()]
     second = Loop.create_default(
         backend=second_backend, session=session, working_directory=tmp_path, stream=True
@@ -1626,7 +1627,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
     second.mkdir()
     (first / "AGENTS.md").write_text("First rules.", encoding="utf-8")
     (second / "AGENTS.md").write_text("Second rules.", encoding="utf-8")
-    backend = Mock(default_model="default-model")
+    backend = Mock(default_model="default-model", prepare_context=Mock(side_effect=list))
     backend.get_response.return_value = [ResponseCompleted()]
     loop = Loop.create_default(
         backend=backend,
@@ -1646,7 +1647,7 @@ def test_query_refreshes_instructions_and_explicit_working_directory(tmp_path):
 def test_query_composes_recovery_guidance_without_replacing_active_instructions(tmp_path):
     """A recovery query preserves project instructions through the manager-owned mode."""
     (tmp_path / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
-    backend = Mock(default_model="default-model")
+    backend = Mock(default_model="default-model", prepare_context=Mock(side_effect=list))
     backend.get_response.return_value = [ResponseCompleted()]
     loop = Loop.create_default(backend=backend, working_directory=tmp_path)
 
@@ -1659,7 +1660,7 @@ def test_query_composes_recovery_guidance_without_replacing_active_instructions(
 
 def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
     """A query persists model context capacity without hidden tokenization calls."""
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = 128000
     backend.get_response.return_value = [ResponseCompleted()]
     (tmp_path / "AGENTS.md").write_text("Project rules.", encoding="utf-8")
@@ -1678,7 +1679,7 @@ def test_query_does_not_request_model_metadata_or_tokenization(tmp_path):
 
 def test_shared_backend_receives_each_loops_agent_scoped_tools(tmp_path):
     """Loops sharing one backend expose only their own tool definitions on each request."""
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = None
     backend.get_response.return_value = [ResponseCompleted()]
 
@@ -1861,7 +1862,7 @@ def test_skill_activation_updates_instructions_for_the_immediate_requery(tmp_pat
         encoding="utf-8",
     )
     registry = ToolRegistry([activate_skill])
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_response.return_value = [ResponseCompleted()]
     manager = SkillManager([Skill("review", "Review code.", location)])
     instructions_manager = InstructionsManager(skill_manager=manager)
@@ -1902,7 +1903,7 @@ def test_skill_activation_is_persisted_with_its_tool_result(tmp_path):
         "---\nname: review\ndescription: Review code.\n---\n\nReview.", encoding="utf-8"
     )
     registry = ToolRegistry([activate_skill])
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     sessions = SessionManager(session_store=store)
     manager = InstructionsManager(
@@ -1940,7 +1941,7 @@ def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_p
         encoding="utf-8",
     )
     registry = ToolRegistry([manage_skills])
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     backend.get_response.return_value = [ResponseCompleted()]
     manager = SkillManager([Skill("review", "Review code.", location)])
     instructions_manager = InstructionsManager(skill_manager=manager)
@@ -1971,7 +1972,7 @@ def test_skill_deactivation_updates_instructions_for_the_immediate_requery(tmp_p
 
 
 def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
-    """The runner records a tool result, requeries, reports usage, and exits."""
+    """The runner freezes each request, records the final answer, reports usage, and exits."""
     registry = ToolRegistry()
 
     @tool
@@ -1981,7 +1982,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
 
     registry.register(echo)
     call = ToolCall(call_id="call", name="echo", arguments='{"text":"done"}', id="fc")
-    backend = Mock(default_model="requested-model")
+    backend = Mock(default_model="requested-model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = 1000
     backend.get_response.side_effect = [
         [
@@ -2010,12 +2011,12 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
     loop.run()
 
     second_input = backend.get_response.call_args_list[1].kwargs["input"]
-    assert second_input[:3] == [
+    assert second_input == [
         Message(role="user", content="hello"),
         call,
         ToolResult(call_id="call", output='{"ok": true, "result": "done"}'),
     ]
-    assert second_input[-1] == Message(role="assistant", content="done")
+    assert loop.messages[-1] == Message(role="assistant", content="done")
     interaction.answer_delta.assert_called_once_with("done")
     assert interaction.response_context.call_count == 2
     interaction.run_metrics.assert_called_once()
@@ -2045,7 +2046,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
 
 def test_run_keeps_handled_commands_out_of_model_history(tmp_path):
     """The runner skips every command consumed by its command manager."""
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.side_effect = ["/help", "/missing", False]
 
@@ -2059,7 +2060,7 @@ def test_run_keeps_handled_commands_out_of_model_history(tmp_path):
 @pytest.mark.parametrize("command", ["/exit", "/quit"])
 def test_run_exit_commands_end_the_conversation(command, tmp_path):
     """Predefined slash exit commands terminate without a backend request."""
-    backend = Mock(default_model="model")
+    backend = Mock(default_model="model", prepare_context=Mock(side_effect=list))
     interaction = MagicMock(spec=Interaction)
     interaction.prompt.return_value = command
 

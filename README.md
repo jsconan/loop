@@ -14,6 +14,7 @@ The project defaults to a local server at `http://localhost:8000/v1` running `nv
 - A decorator-based registry for synchronous and asynchronous Python tools
 - Built-in tools for filesystem access, shell commands, and the current date and time
 - Confirmation for file writes, destructive workspace commands, Git changes, and commands that expand the default workspace sandbox
+- File edits checked against the source snapshots supplied to the model, with reread warnings when files change during generation
 - Hierarchical project instructions from `AGENTS.md` files
 - Progressive discovery and activation of Agent Skills from `SKILL.md` files
 

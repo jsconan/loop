@@ -3,9 +3,11 @@
 import base64
 import binascii
 import json
+import os
 from atexit import register
 from codecs import getincrementaldecoder
 from collections.abc import Iterable
+from hashlib import file_digest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import RLock
@@ -381,6 +383,7 @@ def read_bounded_text(
     max_lines: int | None = None,
     max_bytes: int = constants.MAX_TOOL_CONTENT_BYTES,
     preserve_line_boundaries: bool = False,
+    include_version: bool = False,
 ) -> BoundedTextContent:
     """Read a UTF-8 text range subject to independent byte and line ceilings.
 
@@ -395,18 +398,25 @@ def read_bounded_text(
         max_bytes (int): Requested encoded byte ceiling, capped by the application hard limit.
         preserve_line_boundaries (bool): Whether line-oriented reads stop before consuming a
             partial line. Defaults to ``False`` for byte-resumable consumers.
+        include_version (bool): Whether to hash the complete source through the read descriptor
+            and reject changes during capture. Defaults to ``False``.
 
     Returns:
-        BoundedTextContent: Text, exact byte range, and continuation metadata.
+        BoundedTextContent: Text, exact byte range, continuation metadata, and the complete source
+            digest when ``include_version`` is enabled.
 
     Raises:
         ValueError: If ranges are invalid, both starting modes are selected, the offset splits a
-            UTF-8 character, or selected content is not UTF-8 text.
+            UTF-8 character, selected content is not UTF-8 text, or a versioned source changes.
     """
     start_byte, start_line = _validate_boundaries(start_byte, start_line, max_lines, max_bytes)
 
+    version = None
     size = path.stat().st_size
     with path.open("rb") as stream:
+        before = os.fstat(stream.fileno()) if include_version else None
+        if before is not None:
+            size = before.st_size
         probe = stream.read(min(size, _SCAN_CHUNK_BYTES))
         if b"\0" in probe:
             raise ValueError("Content appears to be binary.")
@@ -457,6 +467,16 @@ def read_bounded_text(
             end -= omitted
             content = encoded.decode("utf-8")
         more = end < size
+        if before is not None:
+            stream.seek(0)
+            version = f"sha256:{file_digest(stream, 'sha256').hexdigest()}"
+            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if any(
+                getattr(before, field) != getattr(current, field)
+                for current in (os.fstat(stream.fileno()), path.stat())
+                for field in fields
+            ):
+                raise ValueError("File changed while reading; read it again before editing.")
 
     result = BoundedTextContent(
         content=content,
@@ -466,6 +486,8 @@ def read_bounded_text(
         included_bytes=len(encoded),
         truncated=more,
     )
+    if version is not None:
+        result["version"] = version
     if start_line is not None:
         result["start_line"] = current_line
         if content:

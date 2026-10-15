@@ -2,6 +2,7 @@
 
 __all__ = [
     "TOOL_READY",
+    "FileObservations",
     "Tool",
     "ToolCommands",
     "ToolContext",
@@ -25,6 +26,7 @@ __all__ = [
 
 from .commands import ToolCommands
 from .context import ToolContext
+from .file_observations import FileObservations
 from .models import (
     TOOL_READY,
     ToolPreflight,

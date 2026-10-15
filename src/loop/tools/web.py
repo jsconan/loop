@@ -327,7 +327,7 @@ def read_cached_content(
         start_byte = decode_content_cursor(cursor, handle) if cursor is not None else None
         if start_byte is not None and start_byte > path.stat().st_size:
             raise ValueError("Cached content cursor is beyond the end of the content.")
-        return _cached_result(
+        result = _cached_result(
             handle,
             source,
             read_bounded_text(
@@ -338,6 +338,8 @@ def read_cached_content(
                 max_bytes=max_bytes,
             ),
         )
+        context.record_cached_read(handle)
+        return result
     except ProblemException as exc:
         return exc.problem
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except

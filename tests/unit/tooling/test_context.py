@@ -18,6 +18,24 @@ def test_confirm_delegates_to_the_interaction():
     interaction.confirm.assert_called_once_with("Continue?", default=True)
 
 
+def test_file_receipts_record_exact_versions_absence_and_cached_capabilities(tmp_path):
+    """Invocation receipts stay independent and preserve source identity for registry wrapping."""
+    context = ToolContext(None, "files")
+    source = tmp_path / "file.txt"
+    context.record_file_read(source, "sha256:read")
+    assert context.read_versions == {str(source): "sha256:read"}
+    context.record_file_read(source, None)
+    context.record_cached_read("snapshot-handle")
+    assert context.read_versions == {str(source): None, "snapshot-handle": None}
+    context.record_file_version(source, "written")
+    assert context.file_versions[str(source)].startswith("sha256:")
+    context.record_file_removal(source)
+    assert context.file_versions == {str(source): None}
+    other = ToolContext(None, "files")
+    assert other.read_versions == {}
+    assert other.file_versions == {}
+
+
 def test_instruction_observations_delegate_only_when_a_manager_is_available(tmp_path):
     """Context observations remain optional and forward each supported event."""
     interaction = Mock(spec=Interaction)

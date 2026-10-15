@@ -34,6 +34,7 @@ from ..permissions import (
 )
 from ..utils import VirtualPath, callable_name
 from .context import ToolContext
+from .file_observations import FileObservations
 from .models import (
     ToolPreflight,
     ToolRegistrationError,
@@ -347,6 +348,7 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
+        file_observations: FileObservations | None = None,
     ) -> str:
         """Dispatch a synchronous tool call by registered name.
 
@@ -362,6 +364,8 @@ class ToolRegistry:
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
             execution_started (Callable[[], None] | None): Callback invoked immediately before
                 the validated and authorized tool function runs.
+            file_observations (FileObservations | None): Frozen view supplied to this generation,
+                or ``None`` for standalone dispatch without model context.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -377,6 +381,7 @@ class ToolRegistry:
             permission_manager=permission_manager,
             call_id=call_id,
             execution_started=execution_started,
+            file_observations=file_observations,
         )
         return output
 
@@ -390,6 +395,7 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
+        file_observations: FileObservations | None = None,
     ) -> tuple[str, float]:
         """Dispatch a tool and measure only its function execution.
 
@@ -402,6 +408,8 @@ class ToolRegistry:
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
             execution_started (Callable[[], None] | None): Callback invoked immediately before
                 the validated and authorized tool function runs.
+            file_observations (FileObservations | None): Frozen view supplied to this generation,
+                or ``None`` for standalone dispatch without model context.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds. Validation
@@ -425,6 +433,7 @@ class ToolRegistry:
             interaction,
             active_permissions,
             instructions_manager,
+            file_observations,
         )
         if planning_error is not None:
             return self._model_result(planning_error, instructions_manager, tool), 0
@@ -441,7 +450,12 @@ class ToolRegistry:
             execution_started()
         started = perf_counter()
         output = tool.call(plan.arguments, context)
-        return self._model_result(output, instructions_manager, tool), perf_counter() - started
+        return self._model_result(
+            output,
+            instructions_manager,
+            tool,
+            context,
+        ), perf_counter() - started
 
     async def call_async(
         self,
@@ -453,6 +467,7 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
+        file_observations: FileObservations | None = None,
     ) -> str:
         """Dispatch an asynchronous or synchronous tool call by registered name.
 
@@ -468,6 +483,8 @@ class ToolRegistry:
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
             execution_started (Callable[[], None] | None): Callback invoked immediately before
                 the validated and authorized tool function runs.
+            file_observations (FileObservations | None): Frozen view supplied to this generation,
+                or ``None`` for standalone dispatch without model context.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -483,6 +500,7 @@ class ToolRegistry:
             permission_manager=permission_manager,
             call_id=call_id,
             execution_started=execution_started,
+            file_observations=file_observations,
         )
         return output
 
@@ -496,6 +514,7 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
+        file_observations: FileObservations | None = None,
     ) -> tuple[str, float]:
         """Dispatch a tool asynchronously and measure only its function execution.
 
@@ -508,6 +527,8 @@ class ToolRegistry:
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
             execution_started (Callable[[], None] | None): Callback invoked immediately before
                 the validated and authorized tool function runs.
+            file_observations (FileObservations | None): Frozen view supplied to this generation,
+                or ``None`` for standalone dispatch without model context.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds. Validation
@@ -531,6 +552,7 @@ class ToolRegistry:
             interaction,
             active_permissions,
             instructions_manager,
+            file_observations,
         )
         if planning_error is not None:
             return self._model_result(planning_error, instructions_manager, tool), 0
@@ -547,7 +569,12 @@ class ToolRegistry:
             execution_started()
         started = perf_counter()
         output = await tool.call_async(plan.arguments, context)
-        return self._model_result(output, instructions_manager, tool), perf_counter() - started
+        return self._model_result(
+            output,
+            instructions_manager,
+            tool,
+            context,
+        ), perf_counter() - started
 
     def command(
         self,
@@ -612,7 +639,7 @@ class ToolRegistry:
         )
         result = tool.execute(plan.arguments, context)
         return ToolExecutionResult(
-            self._model_result(result.output, instructions_manager, tool),
+            self._model_result(result.output, instructions_manager, tool, context),
             result.presentation,
         )
 
@@ -621,8 +648,19 @@ class ToolRegistry:
         output: str,
         instructions_manager: InstructionsManager | None,
         tool: Tool,
+        context: ToolContext | None = None,
     ) -> str:
-        """Minimize structured result paths on both the model and command invocation routes."""
+        """Minimize result paths and attach trusted file read and mutation receipts."""
+        if context is not None and (context.file_versions or context.read_versions):
+            value = json.loads(output)
+            if value.get("ok") is True and context.file_versions:
+                value["file_versions"] = context.file_versions
+            if context.read_versions and (
+                value.get("ok") is True
+                or value.get("problem", {}).get("code") == "filesystem.path_missing"
+            ):
+                value["read_versions"] = context.read_versions
+            output = json.dumps(value, ensure_ascii=False)
         if instructions_manager is None:
             return output
         try:
@@ -652,6 +690,7 @@ class ToolRegistry:
         interaction: Interaction | None,
         permission_manager: PermissionManager,
         instructions_manager: InstructionsManager | None = None,
+        file_observations: FileObservations | None = None,
     ) -> tuple[OperationPlan | None, str | None]:
         """Resolve and authorize every phase of one operation plan."""
         try:
@@ -663,6 +702,21 @@ class ToolRegistry:
                 boundary_denial = permission_manager.check_boundaries(plan.boundary_operations)
                 if boundary_denial is not None:
                     return None, self._denied_problem(tool, boundary_denial.reason)
+                if file_observations is not None:
+                    absence_receipts = {}
+                    conflict = file_observations.check(
+                        plan.boundary_operations + plan.operations,
+                        plan.arguments,
+                        authorized_reads=prerequisites,
+                        absence_receipts=absence_receipts,
+                    )
+                    if conflict is not None:
+                        output = serialize_tool_problem(conflict)
+                        if absence_receipts:
+                            value = json.loads(output)
+                            value["read_versions"] = absence_receipts
+                            output = json.dumps(value, ensure_ascii=False)
+                        return None, output
                 denied = self._authorize(
                     tool,
                     plan.operations,
@@ -918,6 +972,7 @@ class ToolRegistryView:
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
+        file_observations: FileObservations | None = None,
     ) -> tuple[str, float]:
         """Dispatch through the owning registry and measure tool execution.
 
@@ -929,6 +984,8 @@ class ToolRegistryView:
             permission_manager (PermissionManager | None): Invocation permission policy.
             call_id (str | None): Stable model request identifier.
             execution_started (Callable[[], None] | None): Callback run before tool execution.
+            file_observations (FileObservations | None): Frozen view supplied to this generation,
+                or ``None`` for standalone dispatch without model context.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds.
@@ -941,4 +998,5 @@ class ToolRegistryView:
             permission_manager=permission_manager,
             call_id=call_id,
             execution_started=execution_started,
+            file_observations=file_observations,
         )

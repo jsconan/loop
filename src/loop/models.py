@@ -491,6 +491,8 @@ class ToolCall(ConversationItemModel):
         call_id (str): Identifier used to associate the call with its result.
         name (str): Registered tool name.
         arguments (str): JSON-encoded tool arguments.
+        arguments_redacted (bool): Whether prepared arguments differ from canonical arguments.
+            This transient flag is excluded from durable serialization and defaults to ``False``.
         id (str | None): Response item identifier when available.
         metadata (ResponseMetadata | None): Metadata for the provider response that produced the
             request.
@@ -499,6 +501,7 @@ class ToolCall(ConversationItemModel):
     call_id: str
     name: str
     arguments: str
+    arguments_redacted: bool = Field(default=False, exclude=True)
     id: str | None = None
 
 

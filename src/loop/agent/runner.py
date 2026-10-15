@@ -28,6 +28,7 @@ from ..models import (
 from ..permissions import PermissionManager
 from ..session import SessionManager, SessionRecoveryState
 from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
+from ..tooling.file_observations import FileObservations
 from ..tooling.utils import serialize_tool_problem
 from ..utils import PathReference, utc_now
 from .agent import Agent
@@ -73,6 +74,7 @@ class AgentRunner:
     _debug: bool
     _max_turns: int
     _prompt_on_recoverable_error: bool
+    _file_observations: FileObservations | None
 
     def __init__(
         self,
@@ -106,6 +108,7 @@ class AgentRunner:
         self._debug = debug
         self._max_turns = max_turns
         self._prompt_on_recoverable_error = prompt_on_recoverable_error
+        self._file_observations = None
 
     @property
     def agent(self) -> Agent:
@@ -320,6 +323,16 @@ class AgentRunner:
                 tools=[],
             )
 
+        self._file_observations = FileObservations.for_recovery(
+            self._session_manager.model_context,
+            self._instructions_manager.virtual_paths,
+            (
+                pending.call
+                for pending in state.pending_calls
+                if pending.status != "result_available"
+            ),
+            prepare_context=self._backend.prepare_context,
+        )
         executions = []
         for pending in state.pending_calls:
             if pending.status == "result_available":
@@ -464,10 +477,17 @@ class AgentRunner:
             instructions_manager=instructions,
             permission_manager=self._permission_manager,
             call_id=tool_call.call_id,
+            **(
+                {"file_observations": self._file_observations}
+                if self._file_observations is not None
+                else {}
+            ),
             execution_started=lambda call_id=tool_call.call_id: (
                 self._session_manager.record_tool_execution_started(call_id)
             ),
         )
+        if self._file_observations is not None:
+            self._file_observations.observe_result(tool_call, tool_result, include_reads=False)
         telemetry_trace_event(
             "tool.response",
             payload={"call_id": tool_call.call_id, "output": tool_result},
@@ -541,8 +561,13 @@ class AgentRunner:
         self._compaction.compact_if_needed(snapshot)
         started_at = perf_counter()
         first_chunk_at = None
+        model_context = self._backend.prepare_context(self._session_manager.model_context)
+        self._file_observations = FileObservations(
+            model_context,
+            self._instructions_manager.virtual_paths,
+        )
         events = self._backend.get_response(
-            input=self._session_manager.model_context,
+            input=model_context,
             instructions=snapshot.content,
             stream=self._stream,
             model=selected_model,

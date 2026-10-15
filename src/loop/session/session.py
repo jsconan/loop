@@ -319,7 +319,7 @@ class Session:
 
         suffix = self.messages[completed_items:]
         calls = [item for item in suffix if isinstance(item, ToolCall)]
-        results = {item.call_id for item in suffix if isinstance(item, ToolResult)}
+        results = self._resolved_call_indices(suffix)
         if not calls:
             if any(isinstance(item, Message) and item.role == "assistant" for item in suffix):
                 return SessionRecoveryState(action="finalize_run")
@@ -328,16 +328,14 @@ class Session:
         presented_indices = {
             event.item_index for event in self.events if isinstance(event, ConversationItemEvent)
         }
-        started = {
-            event.call_id for event in self.events if isinstance(event, ToolExecutionStartedEvent)
-        }
+        started = self._unresolved_execution_ids()
         pending = []
         for offset, item in enumerate(suffix):
             if not isinstance(item, ToolCall):
                 continue
             call = item
             index = completed_items + offset
-            if call.call_id in results:
+            if offset in results:
                 status = "result_available"
             elif call.call_id in started or index in presented_indices:
                 status = "outcome_unknown"
@@ -355,6 +353,32 @@ class Session:
         else:
             action = "query_model"
         return SessionRecoveryState(action=action, pending_calls=tuple(pending))
+
+    @staticmethod
+    def _resolved_call_indices(items: list[ConversationItem]) -> set[int]:
+        """Match each result to its preceding call occurrence, allowing reused provider IDs."""
+        results = set()
+        unmatched_results = {}
+        for offset in range(len(items) - 1, -1, -1):
+            item = items[offset]
+            if isinstance(item, ToolResult):
+                unmatched_results[item.call_id] = unmatched_results.get(item.call_id, 0) + 1
+            elif isinstance(item, ToolCall) and unmatched_results.get(item.call_id, 0):
+                results.add(offset)
+                unmatched_results[item.call_id] -= 1
+        return results
+
+    def _unresolved_execution_ids(self) -> set[str]:
+        """Keep execution markers only until their tool or run is durably resolved."""
+        started = set()
+        for event in self.events:
+            if isinstance(event, ToolExecutionStartedEvent):
+                started.add(event.call_id)
+            elif isinstance(event, ToolExecutionCompletedEvent):
+                started.discard(event.call_id)
+            elif isinstance(event, RunCompletedEvent):
+                started.clear()
+        return started
 
     @staticmethod
     def _get_message(message: ConversationItem) -> ConversationItem:

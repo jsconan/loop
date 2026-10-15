@@ -1,6 +1,7 @@
 """Tests for bounded text ranges and out-of-context content caching."""
 
 import json
+from hashlib import file_digest
 
 import pytest
 
@@ -299,3 +300,33 @@ def test_bounded_text_handles_lines_beyond_eof_and_embedded_binary_data(tmp_path
     assert beyond["end_line"] == 1
     with pytest.raises(ValueError, match="binary"):
         read_bounded_text(binary, start_byte=8_192, start_line=None)
+
+
+@pytest.mark.parametrize("include_version", [False, True])
+def test_bounded_reads_include_source_versions_only_when_requested(tmp_path, include_version):
+    """A partial UTF-8 page includes the complete source identity when requested."""
+    source = tmp_path / "source.txt"
+    source.write_text("visible\nnot returned\n", encoding="utf-8")
+    result = read_bounded_text(source, max_lines=1, include_version=include_version)
+
+    assert result["content"] == "visible\n"
+    if include_version:
+        assert result["version"] == content_digest("visible\nnot returned\n")
+    else:
+        assert "version" not in result
+    assert result["truncated"] is True
+
+
+def test_versioned_reads_reject_changes_during_snapshot_capture(tmp_path, monkeypatch):
+    """Content cannot be paired with a digest captured after a concurrent save."""
+    source = tmp_path / "source.txt"
+    source.write_text("before", encoding="utf-8")
+
+    def changed_digest(stream, algorithm):
+        """Change the source after reading its bounded text and before hashing it."""
+        source.write_text("after", encoding="utf-8")
+        return file_digest(stream, algorithm)
+
+    monkeypatch.setattr("loop.utils.content.file_digest", changed_digest)
+    with pytest.raises(ValueError, match="File changed while reading; read it again"):
+        read_bounded_text(source, include_version=True)

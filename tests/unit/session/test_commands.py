@@ -120,9 +120,7 @@ def test_sessions_export_completes_persisted_ids_after_the_export_action():
         completer.get_completions(Document("/sessions export saved-session "), Mock())
     )
     sessions_positional_formats = list(
-        completer.get_completions(
-            Document("/sessions export saved-session output.md "), Mock()
-        )
+        completer.get_completions(Document("/sessions export saved-session output.md "), Mock())
     )
     sessions_formats = list(
         completer.get_completions(Document("/sessions export saved-session format="), Mock())

@@ -224,9 +224,7 @@ class ApplicationRuntime:
             loop.register_command_provider(
                 ApplicationCommands(paths, workspace_paths, workspace.id)
             )
-            loop.register_command_provider(
-                WorkspaceCommands(workspace, workspace_repository)
-            )
+            loop.register_command_provider(WorkspaceCommands(workspace, workspace_repository))
             previous_telemetry = get_telemetry()
             set_telemetry(telemetry)
             cleanup_callbacks.append(lambda: cls._restore_telemetry(telemetry, previous_telemetry))

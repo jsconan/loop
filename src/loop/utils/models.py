@@ -44,6 +44,7 @@ class BoundedTextContent(TypedDict):
     end_byte: int
     included_bytes: int
     truncated: bool
+    version: NotRequired[str]
     truncation_reason: NotRequired[Literal["bytes", "lines", "line_too_long"]]
     start_line: NotRequired[int]
     end_line: NotRequired[int]

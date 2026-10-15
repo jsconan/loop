@@ -20,6 +20,16 @@ def test_openai_adapter_satisfies_the_complete_backend_contract():
     assert isinstance(OpenAIBackend(), Backend)
 
 
+def test_default_context_preparation_preserves_canonical_items():
+    """Backends without source transformations preserve item identity in a fresh context list."""
+    message = Message(role="user", content="source")
+    context = [message]
+    prepared = Backend.prepare_context(OpenAIBackend(), iter(context))
+    assert prepared == context
+    assert prepared is not context
+    assert prepared[0] is message
+
+
 def test_default_backend_compaction_returns_a_portable_continuation_checkpoint():
     """Backends without native compaction summarize context through their response contract."""
     backend = OpenAIBackend()

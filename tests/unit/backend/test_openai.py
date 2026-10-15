@@ -2303,6 +2303,144 @@ def test_user_context_sends_only_an_unseen_reference_suffix_with_its_source_offs
     assert content[2]["text"].endswith("\nefgh\n```")
 
 
+def test_context_preparation_is_idempotent_and_preserves_source_and_history_metadata():
+    """Prepared file-bearing fields expose redactions without mutating stored canonical history."""
+    secret = "abcdefghijklmnop"
+    reference = ContextReference(
+        kind="file",
+        path="file.txt",
+        content=secret,
+        size_bytes=len(secret),
+        included_bytes=len(secret),
+        truncated=False,
+        version="sha256:original",
+    )
+    context = [
+        Message(role="user", content="edit", context=(reference,)),
+        ToolCall(call_id="call", name="write_text_file", arguments=json.dumps({"content": secret})),
+        ToolResult(call_id="call", output=json.dumps({"ok": True, "result": {"content": secret}})),
+        Reasoning(content="context"),
+    ]
+    backend = OpenAIBackend(api_key=secret)
+    prepared = backend.prepare_context(context)
+    assert backend.prepare_context(prepared) == prepared
+    assert prepared[0].context[0].payload_redacted is True
+    assert prepared[0].context[0].content == "<redacted:secret>"
+    assert prepared[0].context[0].version == reference.version
+    assert prepared[0].context[0].included_bytes == len(secret)
+    assert prepared[0].context[0].size_bytes == len(secret)
+    assert prepared[1].call_id == prepared[2].call_id == "call"
+    assert secret not in prepared[1].arguments
+    assert prepared[1].arguments_redacted is True
+    assert context[1].arguments_redacted is False
+    assert secret not in prepared[2].output
+    assert json.loads(prepared[2].output)["result"]["payload_redacted"] is True
+    assert prepared[3] is context[3]
+    assert context[0].context[0].content == secret
+    assert context[0].context[0].payload_redacted is False
+    assert secret in context[1].arguments
+    assert secret in context[2].output
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "abcdefghijklmnop",
+        '"abcdefghijklmnop"',
+        '{"result":"abcdefghijklmnop"}',
+        '{"result":{"other":"abcdefghijklmnop"}}',
+    ],
+)
+def test_context_preparation_preserves_redacted_non_file_tool_outputs(output):
+    """Policy preparation tolerates non-JSON and non-file envelopes without inventing file flags."""
+    item = ToolResult(call_id="call", output=output)
+    prepared = OpenAIBackend(api_key="abcdefghijklmnop").prepare_context([item])[0]
+    assert "abcdefghijklmnop" not in prepared.output
+    assert "payload_redacted" not in prepared.output
+    assert item.output == output
+
+
+@pytest.mark.parametrize("secret", ["é" * 16, 'registered\\credential"value'])
+def test_context_preparation_redacts_json_escaped_credentials(secret):
+    """Decoded tool text is filtered even when JSON escaping hides the registered credential."""
+    backend = OpenAIBackend(api_key=secret)
+    call = ToolCall(
+        call_id="call", name="write_text_file", arguments=json.dumps({"content": secret})
+    )
+    result = ToolResult(
+        call_id="call", output=json.dumps({"ok": True, "result": {"content": secret}})
+    )
+    prepared = backend.prepare_context([call, result])
+    assert json.loads(prepared[0].arguments)["content"] == "<redacted:secret>"
+    assert prepared[0].arguments_redacted is True
+    assert json.loads(prepared[1].output)["result"] == {
+        "content": "<redacted:secret>",
+        "payload_redacted": True,
+    }
+    assert backend.prepare_context(prepared) == prepared
+    assert json.loads(call.arguments)["content"] == secret
+    assert json.loads(result.output)["result"]["content"] == secret
+
+
+def test_context_preparation_does_not_hide_unchanged_source_after_metadata_redaction():
+    """Redacting diagnostic metadata does not erase byte-identical source content coverage."""
+    secret = "abcdefghijklmnop"
+    result = ToolResult(
+        call_id="call",
+        output=json.dumps(
+            {
+                "ok": True,
+                "message": secret,
+                "result": {"content": "safe source", "version": "sha256:original"},
+            }
+        ),
+    )
+    prepared = OpenAIBackend(api_key=secret).prepare_context([result])[0]
+    payload = json.loads(prepared.output)
+    assert payload["message"] == "<redacted:secret>"
+    assert payload["result"] == {"content": "safe source", "version": "sha256:original"}
+
+
+def test_context_preparation_preserves_weak_credential_assignment_detection():
+    """Decoded filtering retains the serialized assignment context needed for weak credentials."""
+    call = ToolCall(call_id="call", name="demo", arguments='{"password":"short"}')
+    result = ToolResult(
+        call_id="call", output=json.dumps({"ok": True, "result": {"content": "password=short"}})
+    )
+    backend = OpenAIBackend(api_key="short")
+    prepared = backend.prepare_context([call, result])
+    assert json.loads(prepared[0].arguments) == {"password": "<redacted:secret>"}
+    assert json.loads(prepared[1].output)["result"] == {
+        "content": "password=<redacted:secret>",
+        "payload_redacted": True,
+    }
+    assert backend.prepare_context(prepared) == prepared
+
+
+@pytest.mark.parametrize("metadata_only", [False, True])
+def test_context_preparation_handles_redaction_spanning_json_fields(metadata_only):
+    """Credential blocks spanning fields stay redacted when result fields disappear or become opaque."""
+    output = json.dumps(
+        {
+            "start": "-----BEGIN PRIVATE KEY-----",
+            "result": {"content": "safe source"},
+            "end": "-----END PRIVATE KEY-----",
+        }
+        if metadata_only
+        else {
+            "result": {"content": "-----BEGIN PRIVATE KEY-----"},
+            "other": "-----END PRIVATE KEY-----",
+        }
+    )
+    item = ToolResult(call_id="call", output=output)
+    backend = OpenAIBackend()
+    prepared = backend.prepare_context([item])[0]
+    assert "PRIVATE KEY" not in prepared.output
+    assert "<redacted:secret>" in prepared.output
+    assert backend.prepare_context([prepared]) == [prepared]
+    assert item.output == output
+
+
 def test_redacted_user_context_declares_its_transport_payload_length():
     """Sanitized reference bytes are labelled separately from their source range."""
     sdk = Mock()

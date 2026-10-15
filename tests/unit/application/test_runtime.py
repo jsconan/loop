@@ -80,7 +80,9 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     )
 
     active_loop = dependencies["Loop"].create_default.return_value
-    assert [type(item.args[0]) for item in active_loop.register_command_provider.call_args_list] == [
+    assert [
+        type(item.args[0]) for item in active_loop.register_command_provider.call_args_list
+    ] == [
         ConfigurationCommands,
         ApplicationCommands,
         WorkspaceCommands,

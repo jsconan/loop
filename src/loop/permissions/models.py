@@ -306,7 +306,8 @@ class OperationPlan(BaseModel):
         prerequisite_operations (Operations): Earlier inspection effects completed
             before this executable phase was produced.
         boundary_operations (Operations): Future effects whose non-overridable
-            boundaries must be checked before prerequisite inspection.
+            boundaries and model-observation preconditions must be checked before
+            prerequisite inspection or further planning.
         continuation (Callable[[], OperationPlan] | None): Authorized inspection continuation
             producing the next phase, or ``None`` when this plan is executable.
     """

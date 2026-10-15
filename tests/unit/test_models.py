@@ -84,6 +84,16 @@ def test_models_serialize_nested_values_to_python_and_json() -> None:
     assert json.loads(response.model_dump_json()) == expected
 
 
+def test_tool_argument_redaction_is_transient() -> None:
+    """Prepared argument visibility stays local and does not change durable tool-call records."""
+    call = ToolCall(call_id="call", name="demo", arguments="{}", arguments_redacted=True)
+    assert call.arguments_redacted is True
+    expected = {"call_id": "call", "name": "demo", "arguments": "{}", "id": None}
+    assert call.model_dump() == expected
+    assert json.loads(call.model_dump_json()) == expected
+    assert ToolCall.model_validate(expected).arguments_redacted is False
+
+
 def test_conversation_items_expose_optional_response_metadata() -> None:
     """Every conversation item can retain response-level usage without changing local inputs."""
     metadata = ResponseMetadata(

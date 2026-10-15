@@ -25,6 +25,7 @@ from loop.tools.files import delete_path as delete_path_tool
 from loop.tools.files import edit_text_file as edit_text_file_tool
 from loop.tools.files import list_folder as list_folder_tool
 from loop.tools.files import write_text_file as write_text_file_tool
+from loop.utils import content_digest
 from loop.utils.process import ProcessCapture, ProcessCaptureStatus
 
 tool_registry: ToolRegistry
@@ -358,6 +359,7 @@ def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads
     result = json.loads(read_text_file(str(populated)))
     assert result == {
         "path": str(populated),
+        "version": content_digest("hello"),
         "content": "hello",
         "size_bytes": 5,
         "start_byte": 0,
@@ -367,11 +369,26 @@ def test_read_text_file_returns_content_and_reports_empty_binary_or_failed_reads
         "start_line": 1,
         "end_line": 1,
     }
-    assert read_text_file(str(empty)) == f"File '{empty}' is empty."
+    empty_result = json.loads(read_text_file(str(empty)))
+    assert empty_result["content"] == ""
+    assert empty_result["version"] == content_digest("")
+    assert empty_result["size_bytes"] == 0
     assert problem(read_text_file(str(binary)))["code"] == "filesystem.binary_file"
     assert (
-        problem(read_text_file(str(tmp_path / "missing.txt")))["code"] == "filesystem.read_failed"
+        problem(read_text_file(str(tmp_path / "missing.txt")))["code"] == "filesystem.path_missing"
     )
+
+
+def test_read_text_file_reports_unexpected_io_failures(tmp_path, monkeypatch, caplog):
+    """Unexpected read errors retain the failed-read diagnostic and are logged once."""
+    reader = MagicMock(side_effect=OSError("read unavailable"))
+    monkeypatch.setattr("loop.tools.files.read_bounded_text", reader)
+    result = problem(read_text_file(str(tmp_path / "source.txt")))
+    assert result["code"] == "filesystem.read_failed"
+    assert "read unavailable" in result["detail"]
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "ERROR"
+    assert "Could not read file" in caplog.records[0].message
 
 
 def test_read_text_file_allows_explicit_reads_of_ignored_files(tmp_path, monkeypatch):

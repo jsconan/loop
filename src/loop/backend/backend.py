@@ -92,6 +92,22 @@ class Backend(ABC):
             raise ValueError("No model was selected and the backend has no default model.")
         return selected_model
 
+    def prepare_context(self, context: Iterable[ModelContextItem]) -> list[ModelContextItem]:
+        """Prepare file-bearing context for generation and snapshot observation.
+
+        Backends that transform source text must expose those transformations here while
+        preserving source identities and marking transformed references and tool arguments as
+        redacted. Read-result content must likewise retain a ``payload_redacted`` flag.
+        The default implementation preserves every item.
+
+        Args:
+            context (Iterable[ModelContextItem]): Canonical conversation items to prepare.
+
+        Returns:
+            list[ModelContextItem]: Prepared items without modifying the supplied history.
+        """
+        return list(context)
+
     @property
     @abstractmethod
     def context_window(self) -> int | None:

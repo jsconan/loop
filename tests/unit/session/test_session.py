@@ -332,6 +332,64 @@ def test_session_recovery_uses_complete_history_after_a_compaction():
     assert state.pending_calls[0].call == call
 
 
+def test_recovery_does_not_reuse_an_earlier_result_for_a_repeated_call_id():
+    """Results acknowledge their own call occurrence, even when identifiers repeat later."""
+    session = Session()
+    previous = ToolCall(call_id="reused", name="edit_text_file", arguments='{"content":"old"}')
+    pending = ToolCall(call_id="reused", name="edit_text_file", arguments='{"content":"new"}')
+    session.add_message(
+        Response(answer="", reasoning="", items=(previous,), tool_calls=(previous,))
+    )
+    session.add_message(ToolResult(call_id="reused", output="done"))
+    session.add_message(Response(answer="", reasoning="", items=(pending,), tool_calls=(pending,)))
+    state = session.recovery_state()
+    assert state.action == "execute_tools"
+    assert [item.status for item in state.pending_calls] == ["result_available", "not_started"]
+
+
+@pytest.mark.parametrize("completion", ["tool", "run"])
+def test_recovery_does_not_reuse_resolved_execution_markers(completion):
+    """Resolved execution starts cannot mark a later occurrence of the same identifier uncertain."""
+    session = Session()
+    call = ToolCall(call_id="reused", name="demo", arguments="{}")
+    session.add_message(Response(answer="", reasoning="", items=(call,), tool_calls=(call,)))
+    stamp = datetime(2026, 8, 26, tzinfo=UTC)
+    session.events.append(
+        ToolExecutionStartedEvent(id="started", created_at=stamp, call_id="reused")
+    )
+    session.add_message(ToolResult(call_id="reused", output="done"))
+    if completion == "tool":
+        session.events.append(
+            ToolExecutionCompletedEvent(
+                id="completed",
+                created_at=stamp,
+                call_id="reused",
+                succeeded=True,
+                duration_seconds=0,
+            )
+        )
+    else:
+        session.events.append(
+            RunCompletedEvent(
+                id="run",
+                created_at=stamp,
+                started_at=stamp,
+                stop_reason="completed",
+                metrics=RunMetrics(
+                    active_duration_seconds=0,
+                    model_duration_seconds=0,
+                    tool_duration_seconds=0,
+                    item_count=len(session.messages),
+                    message_count=0,
+                ),
+            )
+        )
+    session.add_message(Response(answer="", reasoning="", items=(call,), tool_calls=(call,)))
+    state = session.recovery_state()
+    assert state.action == "execute_tools"
+    assert state.pending_calls[-1].status == "not_started"
+
+
 def test_session_round_trips_and_validates_tool_execution_lifecycle_events():
     """Tool lifecycle checkpoints survive persistence and must reference known calls."""
     call = ToolCall(call_id="call", name="demo", arguments="{}")

@@ -304,7 +304,7 @@ def _edit_plan(arguments: dict[str, object]) -> OperationPlan:
 
 
 def _finish_edit_plan(arguments: dict[str, object]) -> OperationPlan:
-    """Inspect an authorized edit target and produce its exact mutation capability."""
+    """Capture the authorized edit source before validating model-supplied anchors."""
     path = _mutation_path(Path(str(arguments["path"])))
     resource = str(path)
     normalized = {**arguments, "path": resource}
@@ -314,29 +314,43 @@ def _finish_edit_plan(arguments: dict[str, object]) -> OperationPlan:
                 "filesystem.path_not_file", f"Path '{path}' is not an existing regular file."
             )
         entry, original_bytes = _read_regular_entry(path, ".")
-        try:
-            original = original_bytes.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise _edit_problem(
-                "filesystem.binary_file",
-                f"File '{path}' is not valid UTF-8 text and cannot be edited with this tool.",
-            ) from exc
-        updated, _ = _edited_content(
-            original,
-            str(arguments["old_content"]),
-            str(arguments["new_content"]),
-            bool(arguments["replace_all"]),
-        )
     except OSError as exc:
         raise _edit_problem("filesystem.edit_failed", str(exc)) from exc
 
+    target = _target_from_entry(resource, entry)
     return OperationPlan(
         arguments=normalized,
+        boundary_operations=(_mutation_operation(Action.FILESYSTEM_REPLACE, target),),
+        continuation=lambda: _edit_preview_plan(normalized, target, original_bytes),
+    )
+
+
+def _edit_preview_plan(
+    arguments: dict[str, object],
+    target: FileTarget,
+    original_bytes: bytes,
+) -> OperationPlan:
+    """Validate an edit and prepare consent only after its source preconditions are checked."""
+    try:
+        original = original_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _edit_problem(
+            "filesystem.binary_file",
+            f"File '{target.path}' is not valid UTF-8 text and cannot be edited with this tool.",
+        ) from exc
+    updated, _ = _edited_content(
+        original,
+        str(arguments["old_content"]),
+        str(arguments["new_content"]),
+        bool(arguments["replace_all"]),
+    )
+    return OperationPlan(
+        arguments=arguments,
         operations=(
             _mutation_operation(
                 Action.FILESYSTEM_REPLACE,
-                _target_from_entry(str(path), entry),
-                reason=f"Proposed changes:\n{format_content_diff(original, updated, resource)}",
+                target,
+                reason=f"Proposed changes:\n{format_content_diff(original, updated, target.path)}",
             ),
         ),
     )
@@ -637,13 +651,10 @@ def read_text_file(
             le=constants.MAX_TOOL_CONTENT_BYTES,
         ),
     ] = constants.MAX_TOOL_CONTENT_BYTES,
-) -> FileContentResult | str | Problem:
-    """Read a bounded, resumable portion of a UTF-8 text file."""
+) -> FileContentResult | Problem:
+    """Read a bounded UTF-8 text range with its complete source version."""
     try:
         file_path = Path(path)
-        if file_path.stat().st_size == 0:
-            context.observe_file(path)
-            return f"File '{context.display_path(path)}' is empty."
         result = FileContentResult(
             path=path,
             **read_bounded_text(
@@ -652,10 +663,21 @@ def read_text_file(
                 max_lines=max_lines,
                 max_bytes=max_bytes,
                 preserve_line_boundaries=True,
+                include_version=True,
             ),
         )
+        context.record_file_read(file_path, result["version"])
         context.observe_file(path)
         return result
+    except FileNotFoundError:
+        context.record_file_read(Path(path), None)
+        return Problem(
+            code="filesystem.path_missing",
+            title="File does not exist",
+            severity="warning",
+            detail=f"File '{context.display_path(path)}' does not exist.",
+            operation="read_text_file",
+        )
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
         if str(exc) == "Content appears to be binary.":
             return Problem(
@@ -815,6 +837,7 @@ def write_text_file(
             expected_parent_device=planned.expected_parent_device,
             expected_parent_inode=planned.expected_parent_inode,
         )
+        context.record_file_version(Path(planned.path), content)
         context.observe_file(target)
         context.invalidate_instructions(target)
         return f"Successfully wrote to file '{context.display_path(path)}'."
@@ -877,6 +900,8 @@ def edit_text_file(
             expected_parent_device=planned.expected_parent_device,
             expected_parent_inode=planned.expected_parent_inode,
         )
+        context.record_file_read(target, f"sha256:{planned.expected_digest}")
+        context.record_file_version(target, updated)
         context.observe_file(target)
         context.invalidate_instructions(target)
         noun = "replacement" if replacement_count == 1 else "replacements"
@@ -929,6 +954,7 @@ def delete_path(
             if not _matches_target(target, planned):
                 raise RuntimeError("The target changed after approval; deletion was cancelled.")
             target.unlink()
+            context.record_file_removal(target)
         else:
             raise RuntimeError("Authorized deletion capability has an unsupported target kind.")
         context.invalidate_instructions(target)

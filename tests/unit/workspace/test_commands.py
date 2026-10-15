@@ -55,9 +55,7 @@ def test_workspace_command_completion_shows_arguments_for_selected_operations(co
     actions = manager.get_completions(Document("/workspace "), Mock())
     attach = manager.get_completions(Document("/workspace attach "), Mock())
     attach_ids = manager.get_completions(Document("/workspace attach workspace_id="), Mock())
-    attach_after_name = manager.get_completions(
-        Document("/workspace attach project "), Mock()
-    )
+    attach_after_name = manager.get_completions(Document("/workspace attach project "), Mock())
     rename = manager.get_completions(Document("/workspace rename "), Mock())
     forget = manager.get_completions(Document("/workspace forget "), Mock())
     show = manager.get_completions(Document("/workspace show "), Mock())

@@ -13,7 +13,9 @@ import pytest
 from loop import (
     Action,
     ApprovalChoice,
+    ContextReference,
     Decision,
+    Message,
     NetworkTarget,
     Operation,
     OperationPlan,
@@ -27,12 +29,15 @@ from loop import (
     RuntimeEnvironment,
     SessionTarget,
     Tool,
+    ToolCall,
+    ToolResult,
     ToolResultPresentation,
     ToolResultPresentationSpec,
     delete_path,
     read_text_file,
     resolve_executable,
     run_command,
+    write_text_file,
 )
 from loop.constants import MAX_TOOL_RESULT_BYTES
 from loop.execution import CommandExecutionService
@@ -41,9 +46,10 @@ from loop.execution.sandbox import CommandProcessResult, SandboxOutcome
 from loop.execution.sandbox.macos import MacOSSeatbeltBackend
 from loop.instructions import InstructionsManager
 from loop.interaction import Interaction
-from loop.permissions import CommandAnalysis
+from loop.permissions import CommandAnalysis, PermissionRule
 from loop.permissions.protection import protected_workspace_paths
 from loop.tooling import (
+    FileObservations,
     ToolContext,
     ToolPreflightResult,
     ToolRegistration,
@@ -54,7 +60,7 @@ from loop.tooling import (
     ToolStatus,
 )
 from loop.tooling import tool as declare_tool
-from loop.utils import cached_path
+from loop.utils import VirtualPath, cached_path, content_digest
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
 
@@ -116,6 +122,152 @@ def test_registry_closes_its_execution_service():
     ToolRegistry(execution_service=service).close()
     service.close.assert_called_once()
     ToolRegistry().close()
+
+
+def test_failed_mutations_do_not_publish_committed_file_versions(tmp_path):
+    """An unsuccessful tool result cannot refresh the model's file observations."""
+
+    @declare_tool()
+    def failed_write(context: ToolContext) -> Problem:
+        """Report a failed mutation after collecting a provisional content version."""
+        context.record_file_version(tmp_path / "file.txt", "provisional")
+        return Problem(code="filesystem.write_failed", title="Write failed", detail="not committed")
+
+    output = json.loads(ToolRegistry([failed_write]).call("failed_write", "{}"))
+    assert output["ok"] is False
+    assert "file_versions" not in output
+
+
+@pytest.mark.parametrize(
+    "code,published", [("filesystem.path_missing", True), ("filesystem.read_failed", False)]
+)
+def test_read_receipts_attest_only_to_success_or_explicit_absence(tmp_path, code, published):
+    """Failed reads cannot refresh file state except for a verified missing source."""
+
+    @declare_tool()
+    def failed_read(context: ToolContext) -> Problem:
+        """Report a missing source or a failure after attempting a read."""
+        context.record_file_read(tmp_path / "file.txt", None)
+        return Problem(code=code, title="Could not read file", detail="unavailable")
+
+    output = json.loads(ToolRegistry([failed_read]).call("failed_read", "{}"))
+    assert output["ok"] is False
+    assert ("read_versions" in output) is published
+    if published:
+        assert output["read_versions"] == {str(tmp_path / "file.txt"): None}
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_async_dispatch_rejects_stale_file_context_before_approval(tmp_path, deleted):
+    """Asynchronous dispatch uses the same source observation gate as synchronous agent tools."""
+    target = tmp_path / "file.txt"
+    if not deleted:
+        target.write_text("user edit", encoding="utf-8")
+    observations = FileObservations(
+        [
+            Message(
+                role="user",
+                content="edit",
+                context=(
+                    ContextReference(
+                        kind="file",
+                        path="file.txt",
+                        content="old",
+                        size_bytes=3,
+                        included_bytes=3,
+                        truncated=False,
+                        version=content_digest("old"),
+                    ),
+                ),
+            )
+        ],
+        VirtualPath(tmp_path),
+    )
+    permissions = PermissionManager(tmp_path)
+    permissions.request_permission = Mock()
+    registry = ToolRegistry([write_text_file], permission_manager=permissions)
+    output = json.loads(
+        asyncio.run(
+            registry.call_async(
+                "write_text_file",
+                json.dumps({"path": str(target), "content": "model edit"}),
+                file_observations=observations,
+            )
+        )
+    )
+
+    assert output["problem"]["code"] == "filesystem.stale_context"
+    if deleted:
+        assert output["read_versions"] == {"/workspace/file.txt": None}
+        assert not target.exists()
+    else:
+        assert "read_versions" not in output
+        assert target.read_text(encoding="utf-8") == "user edit"
+    permissions.request_permission.assert_not_called()
+
+
+@pytest.mark.parametrize("denial", ["read", "boundary", "creation"])
+def test_deletion_receipts_preserve_inspection_and_creation_authorization(tmp_path, denial):
+    """Absence receipts require authorized inspection and never grant creation or boundary access."""
+    relative = ".git/file.txt" if denial == "boundary" else "file.txt"
+    target = tmp_path / relative
+    original = Message(
+        role="user",
+        content="edit",
+        context=(
+            ContextReference(
+                kind="file",
+                path=relative,
+                content="old",
+                size_bytes=3,
+                included_bytes=3,
+                truncated=False,
+                version=content_digest("old"),
+            ),
+        ),
+    )
+    paths = VirtualPath(tmp_path)
+    observations = FileObservations([original], paths)
+    permissions = PermissionManager(
+        tmp_path,
+        configuration=PermissionConfiguration(
+            rules=[
+                PermissionRule(
+                    decision=Decision.DENY,
+                    action=(
+                        Action.FILESYSTEM_READ if denial == "read" else Action.FILESYSTEM_CREATE
+                    ),
+                )
+            ]
+        ),
+    )
+    permissions.request_permission = Mock()
+    registry = ToolRegistry([write_text_file], permission_manager=permissions)
+    call = ToolCall(
+        call_id="write",
+        name="write_text_file",
+        arguments=json.dumps({"path": str(target), "content": "model"}),
+    )
+    output = registry.call(call.name, call.arguments, file_observations=observations)
+    if denial == "creation":
+        assert json.loads(output)["read_versions"] == {"/workspace/file.txt": None}
+        assert json.loads(output)["problem"]["code"] == "filesystem.stale_context"
+        refreshed = FileObservations(
+            [original, call, ToolResult(call_id=call.call_id, output=output)], paths
+        )
+        assert (
+            json.loads(registry.call(call.name, call.arguments, file_observations=observations))[
+                "problem"
+            ]["code"]
+            == "filesystem.stale_context"
+        )
+        output = registry.call(call.name, call.arguments, file_observations=refreshed)
+    payload = json.loads(output)
+    assert payload["problem"]["code"] == "tool.denied"
+    assert "read_versions" not in payload
+    assert "file_versions" not in payload
+    assert not target.exists()
+    permissions.request_permission.assert_not_called()
 
 
 def test_constructor_registers_in_order_and_exposes_sorted_snapshots():
@@ -598,6 +750,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
         permission_manager=permission_manager,
         call_id="call-123",
         execution_started=execution_started,
+        file_observations=None,
     )
 
 

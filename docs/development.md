@@ -33,6 +33,8 @@ Capacity and management lifecycle checks are opt-in and require a disposable Lin
 
 ## Source organization
 
+Backends expose `prepare_context` so generation and file observations share the same prepared source text. The default preserves context items. Adapters that transform source text must preserve immutable source metadata and mark transformed reference or read-result payloads with `payload_redacted` and transformed tool arguments with `arguments_redacted`. These flags are transient; canonical session history remains unchanged. Interrupted-batch recovery prepares only the preceding generation context and replays completed own mutations using their original arguments.
+
 The package uses a `src` layout. Its main components are:
 
 ```text

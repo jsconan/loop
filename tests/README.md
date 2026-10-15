@@ -8,6 +8,7 @@ The test suites separate portable module behavior from operating-system and depe
 - `integration/` exercises native boundaries in disposable workspaces. Shared process and search checks live under `execution/` and `utils/`; platform-specific checks live under `macos/` and `linux/`.
 - The fresh-process platform import check verifies that loading the app does not import the other operating system's sandbox implementation.
 - Public dispatch through permissions and execution is additionally marked `e2e`.
+- Agent runner cases simulate saves during model generation and exercise stale-edit recovery, partial reads, same-batch rereads, and isolated session observations. Tooling cases verify snapshot versions, visible byte coverage, trusted read receipts, immutable cached continuations, deletion and recreation, and interrupted batch recovery.
 
 Platform markers skip unsupported operating systems before native setup. macOS enforcement checks require a parent process that can initialize Seatbelt. Linux native enforcement requires explicit host provisioning; public execution checks exercise unavailable behavior without a qualified installation. Native ripgrep checks skip when the optional executable is absent. See [Linux native integration prerequisites](../docs/development.md#linux-native-integration) before running those checks; skips do not establish enforcement.
 
