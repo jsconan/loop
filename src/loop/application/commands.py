@@ -7,12 +7,62 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
-from ..completion import CommandCompletion, CompletionValue
+from ..completion import (
+    CommandCompletion,
+    CompletionValue,
+    SchemaCompletionProviderRegistration,
+)
 from ..permissions import SQLitePermissionAudit
 from .paths import ApplicationPaths, WorkspacePaths
+
+
+class LogExportArguments(BaseModel):
+    """Describe arguments accepted by application log exports.
+
+    Args:
+        destination (str | None): New JSONL export path.
+        workspace_id (str | None): Workspace filter.
+        start_ns (int | None): Inclusive start timestamp.
+        end_ns (int | None): Inclusive end timestamp.
+        severity (str | None): Log severity filter.
+        event_name (str | None): Event-name filter.
+        force (bool): Allow replacing an export file.
+    """
+
+    destination: Annotated[str | None, Field(description="New JSONL export path.")] = None
+    workspace_id: Annotated[str | None, Field(description="Workspace filter.")] = None
+    start_ns: Annotated[int | None, Field(description="Inclusive start timestamp.")] = None
+    end_ns: Annotated[int | None, Field(description="Inclusive end timestamp.")] = None
+    severity: Annotated[str | None, Field(description="Log severity filter.")] = None
+    event_name: Annotated[str | None, Field(description="Event-name filter.")] = None
+    force: Annotated[bool, Field(description="Allow replacing an export file.")] = False
+
+
+class AuditExportArguments(BaseModel):
+    """Describe arguments accepted by permission-audit exports.
+
+    Args:
+        destination (str | None): New JSONL export path.
+        workspace_id (str | None): Workspace filter.
+        start_ns (int | None): Inclusive start timestamp.
+        end_ns (int | None): Inclusive end timestamp.
+        event_name (str | None): Event-name filter.
+        session_id (str | None): Audit session filter.
+        decision (str | None): Audit decision filter.
+        force (bool): Allow replacing an export file.
+    """
+
+    destination: Annotated[str | None, Field(description="New JSONL export path.")] = None
+    workspace_id: Annotated[str | None, Field(description="Workspace filter.")] = None
+    start_ns: Annotated[int | None, Field(description="Inclusive start timestamp.")] = None
+    end_ns: Annotated[int | None, Field(description="Inclusive end timestamp.")] = None
+    event_name: Annotated[str | None, Field(description="Event-name filter.")] = None
+    session_id: Annotated[str | None, Field(description="Audit session filter.")] = None
+    decision: Annotated[str | None, Field(description="Audit decision filter.")] = None
+    force: Annotated[bool, Field(description="Allow replacing an export file.")] = False
 
 
 class ApplicationCommands:
@@ -55,13 +105,28 @@ class ApplicationCommands:
                         CompletionValue("logs", "Export application logs."),
                     ),
                     children={
-                        "dirs": CommandCompletion(),
-                        "audit": CommandCompletion(),
-                        "logs": CommandCompletion(),
+                        action: CommandCompletion(schema_provider="application_arguments")
+                        for action in ("dirs", "audit", "logs")
                     },
                 ),
             ),
         )
+
+    def get_completion_providers(self) -> tuple[SchemaCompletionProviderRegistration, ...]:
+        """Return action-specific export argument schemas.
+
+        Returns:
+            tuple[SchemaCompletionProviderRegistration, ...]: The application argument schema.
+        """
+        return (SchemaCompletionProviderRegistration("application_arguments", self._arguments),)
+
+    @staticmethod
+    def _arguments(tokens: tuple[str, ...]) -> type[BaseModel] | None:
+        """Return only the argument schema for the selected application action."""
+        return {
+            ("logs",): LogExportArguments,
+            ("audit",): AuditExportArguments,
+        }.get(tokens)
 
     def app(
         self,

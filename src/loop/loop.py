@@ -8,7 +8,7 @@ from typing import Self
 from . import constants
 from .agent import Agent, AgentRunner, AgentRunResult
 from .backend import Backend, GenerationHyperparameters
-from .commands import CommandManager
+from .commands import CommandManager, CommandsProvider
 from .compaction import CompactionCommands, ContextCompaction
 from .completion import (
     CommandCompletionAdapter,
@@ -307,6 +307,16 @@ class Loop:
             CommandManager: Active command manager.
         """
         return self._command_manager
+
+    def register_command_provider(self, provider: CommandsProvider) -> None:
+        """Register a command provider for dispatch and contextual completion.
+
+        Args:
+            provider (CommandsProvider): Provider whose commands and completion sources should be
+                added to this loop.
+        """
+        self._command_manager.register_provider(provider)
+        self._completion_manager.register_command_provider(provider)
 
     @property
     def permission_manager(self) -> PermissionManager:

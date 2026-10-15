@@ -6,6 +6,7 @@ from unittest.mock import Mock
 from prompt_toolkit.document import Document
 
 from loop import CompletionAdapter, CompletionManager, CompletionMatch, CompletionValue
+from loop.instructions import InstructionsManager, SkillCommands
 
 
 class StaticAdapter(CompletionAdapter):
@@ -118,6 +119,13 @@ def test_manager_preserves_explicit_provider_order():
     manager = CompletionManager((StaticAdapter(CompletionMatch("", "", "/"), values),))
 
     assert [result.text for result in complete(manager)] == ["/newer-id", "/older-id"]
+
+
+def test_command_provider_registration_skips_unrelated_adapters():
+    """Command completion sources are ignored when no command adapter is registered."""
+    manager = CompletionManager((StaticAdapter(None),))
+
+    manager.register_command_provider(SkillCommands(InstructionsManager()))
 
 
 def test_manager_isolates_inactive_and_failed_adapters_and_filters_nonmatches():

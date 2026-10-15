@@ -2,15 +2,62 @@
 
 from __future__ import annotations
 
+import shlex
 import threading
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
-from ..completion import CommandCompletion, CompletionValue
+from ..completion import (
+    CommandCompletion,
+    CompletionProviderRegistration,
+    CompletionValue,
+    SchemaCompletionProviderRegistration,
+)
 from .models import Workspace, WorkspaceSwitchRequested
 from .repository import WorkspaceRepository
+
+
+class WorkspaceAttachArguments(BaseModel):
+    """Describe arguments accepted when attaching a workspace location.
+
+    Args:
+        name (str): Existing workspace directory to attach.
+        workspace_id (str | None): Existing workspace identity to associate, or ``None`` to create
+            an identity for the location.
+    """
+
+    name: Annotated[str, Field(description="Existing workspace directory to attach.")]
+    workspace_id: Annotated[
+        str | None,
+        Field(description="Existing workspace identity to associate."),
+        CommandCompletion(provider="workspace_ids"),
+    ] = None
+
+
+class WorkspaceReferenceArguments(BaseModel):
+    """Describe the workspace path or identity accepted by registry operations.
+
+    Args:
+        name (str): Active workspace path or identity.
+    """
+
+    name: Annotated[
+        str,
+        Field(description="Active workspace path or identity."),
+        CommandCompletion(provider="workspace_references"),
+    ]
+
+
+class WorkspaceRenameArguments(BaseModel):
+    """Describe the new workspace name accepted by rename.
+
+    Args:
+        name (str): New human-readable workspace name.
+    """
+
+    name: Annotated[str, Field(description="New human-readable workspace name.")]
 
 
 class WorkspaceCommands:
@@ -56,7 +103,7 @@ class WorkspaceCommands:
                         )
                     ),
                     children={
-                        action: CommandCompletion()
+                        action: CommandCompletion(schema_provider="workspace_arguments")
                         for action in (
                             "attach",
                             "forget",
@@ -70,6 +117,56 @@ class WorkspaceCommands:
                 ),
             ),
         )
+
+    def get_completion_providers(
+        self,
+    ) -> tuple[CompletionProviderRegistration | SchemaCompletionProviderRegistration, ...]:
+        """Return workspace value and action-specific argument completion sources.
+
+        Returns:
+            tuple[CompletionProviderRegistration | SchemaCompletionProviderRegistration, ...]:
+                Current workspace IDs, locations and argument schemas.
+        """
+        return (
+            CompletionProviderRegistration("workspace_ids", self._workspace_ids),
+            CompletionProviderRegistration("workspace_references", self._workspace_references),
+            SchemaCompletionProviderRegistration("workspace_arguments", self._workspace_arguments),
+        )
+
+    def _workspace_ids(self) -> tuple[CompletionValue, ...]:
+        """Return active workspace identities for attach completion."""
+        return tuple(
+            CompletionValue(workspace.id, f"{workspace.name}: {workspace.root}")
+            for workspace in self._repository.list()
+            if workspace.id is not None
+        )
+
+    def _workspace_references(self) -> tuple[CompletionValue, ...]:
+        """Return active workspace identities and paths for registry operations."""
+        values = []
+        for workspace in self._repository.list():
+            if workspace.id is not None:
+                values.append(CompletionValue(workspace.id, f"{workspace.name}: {workspace.root}"))
+            path = str(workspace.root)
+            values.append(
+                CompletionValue(
+                    shlex.quote(path),
+                    f"Workspace path: {workspace.name}",
+                    display=path,
+                )
+            )
+        return tuple(values)
+
+    @staticmethod
+    def _workspace_arguments(tokens: tuple[str, ...]) -> type[BaseModel] | None:
+        """Return only the argument schema for the selected workspace operation."""
+        if tokens == ("attach",):
+            return WorkspaceAttachArguments
+        if tokens == ("rename",):
+            return WorkspaceRenameArguments
+        if tokens in {("forget",), ("rekey",), ("switch",)}:
+            return WorkspaceReferenceArguments
+        return None
 
     # pylint: disable-next=too-many-branches
     def workspace(

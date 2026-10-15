@@ -9,10 +9,11 @@ import pytest
 
 import loop.application.runtime as runtime_module
 from loop.application import ApplicationPaths
+from loop.application.commands import ApplicationCommands
 from loop.application.runtime import ApplicationRuntime
-from loop.configuration import ApplicationSettings
+from loop.configuration import ApplicationSettings, ConfigurationCommands
 from loop.telemetry import SQLiteTelemetryAdapter, Telemetry
-from loop.workspace import Workspace
+from loop.workspace import Workspace, WorkspaceCommands
 
 
 @pytest.fixture
@@ -43,7 +44,6 @@ def dependencies(monkeypatch):
     result = {name: Mock(return_value=Mock()) for name in names}
     loop = Mock()
     active_loop = Mock()
-    active_loop.command_manager = Mock()
     loop.create_default.return_value = active_loop
     result["Loop"] = loop
     for name in (
@@ -78,6 +78,13 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     runtime = ApplicationRuntime.create(
         workspace, paths, workspace_paths, settings, configuration, repository, interaction
     )
+
+    active_loop = dependencies["Loop"].create_default.return_value
+    assert [type(item.args[0]) for item in active_loop.register_command_provider.call_args_list] == [
+        ConfigurationCommands,
+        ApplicationCommands,
+        WorkspaceCommands,
+    ]
 
     logging_path = dependencies["configure_operational_logging"].call_args.args[0]
     assert logging_path == paths.operational_log
@@ -314,7 +321,7 @@ def test_command_failure_closes_all_acquired_resources(dependencies, assembled):
     """Command-registration failure closes sessions, telemetry, backend, and logging."""
     workspace, paths, workspace_paths, settings = assembled
     active_loop = dependencies["Loop"].create_default.return_value
-    active_loop.command_manager.register_all.side_effect = RuntimeError("commands failed")
+    active_loop.register_command_provider.side_effect = RuntimeError("commands failed")
 
     with pytest.raises(RuntimeError, match="commands failed"):
         ApplicationRuntime.create(
@@ -378,8 +385,8 @@ def test_publication_follows_complete_command_registration(dependencies, assembl
     """Telemetry becomes global only after every command group is registered."""
     workspace, paths, workspace_paths, settings = assembled
     events = []
-    dependencies["Loop"].create_default.return_value.command_manager.register_all.side_effect = (
-        lambda commands: events.append(("register", commands))
+    dependencies["Loop"].create_default.return_value.register_command_provider.side_effect = (
+        lambda provider: events.append(("register", provider))
     )
     dependencies["set_telemetry"].side_effect = lambda value: events.append(("publish", value))
 

@@ -214,18 +214,18 @@ class ApplicationRuntime:
                 logging_handler=logging_handler,
                 cleanup_callbacks=cleanup_callbacks,
             )
-            loop.command_manager.register_all(
+            loop.register_command_provider(
                 ConfigurationCommands(
                     configuration,
                     runtime.apply_configuration,
                     runtime.apply_configuration_changes,
-                ).get_commands()
+                )
             )
-            loop.command_manager.register_all(
-                ApplicationCommands(paths, workspace_paths, workspace.id).get_commands()
+            loop.register_command_provider(
+                ApplicationCommands(paths, workspace_paths, workspace.id)
             )
-            loop.command_manager.register_all(
-                WorkspaceCommands(workspace, workspace_repository).get_commands()
+            loop.register_command_provider(
+                WorkspaceCommands(workspace, workspace_repository)
             )
             previous_telemetry = get_telemetry()
             set_telemetry(telemetry)

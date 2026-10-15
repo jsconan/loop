@@ -2,12 +2,31 @@
 
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
-from ..completion import CommandCompletion, CompletionProviderRegistration, CompletionValue
+from ..completion import (
+    CommandCompletion,
+    CompletionProviderRegistration,
+    CompletionValue,
+    SchemaCompletionProviderRegistration,
+)
 from .instructions import InstructionsManager
 from .models import SkillOperationError
+
+
+class SkillNameArguments(BaseModel):
+    """Describe the skill name accepted by activation and deactivation.
+
+    Args:
+        name (str): Exact discovered skill name.
+    """
+
+    name: Annotated[
+        str,
+        Field(description="Exact discovered skill name."),
+        CommandCompletion(provider="skills"),
+    ]
 
 
 class SkillCommands:
@@ -40,8 +59,8 @@ class SkillCommands:
                         ),
                     ),
                     children={
-                        "activate": CommandCompletion(provider="skills"),
-                        "deactivate": CommandCompletion(provider="skills"),
+                        action: CommandCompletion(schema_provider="skill_arguments")
+                        for action in ("activate", "deactivate", "deactivate-all")
                     },
                 ),
             ),
@@ -52,13 +71,24 @@ class SkillCommands:
             ),
         )
 
-    def get_completion_providers(self) -> tuple[CompletionProviderRegistration, ...]:
-        """Return dynamic skill completion sources.
+    def get_completion_providers(
+        self,
+    ) -> tuple[CompletionProviderRegistration | SchemaCompletionProviderRegistration, ...]:
+        """Return dynamic skill values and the selected-action argument schema.
 
         Returns:
-            tuple[CompletionProviderRegistration, ...]: Named skill completion source.
+            tuple[CompletionProviderRegistration | SchemaCompletionProviderRegistration, ...]:
+                Skill names and their action-specific argument schema.
         """
-        return (CompletionProviderRegistration("skills", self._skill_values),)
+        return (
+            CompletionProviderRegistration("skills", self._skill_values),
+            SchemaCompletionProviderRegistration("skill_arguments", self._skill_arguments),
+        )
+
+    @staticmethod
+    def _skill_arguments(tokens: tuple[str, ...]) -> type[BaseModel] | None:
+        """Return the skill-name schema after activate or deactivate is selected."""
+        return SkillNameArguments if tokens in {("activate",), ("deactivate",)} else None
 
     def _skill_values(self) -> tuple[CompletionValue, ...]:
         """Return currently discovered skills."""

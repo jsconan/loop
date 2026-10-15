@@ -5,11 +5,92 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Annotated, Literal
 
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
-from ..completion import CommandCompletion, CompletionValue
+from ..completion import (
+    CommandCompletion,
+    CompletionProviderRegistration,
+    CompletionValue,
+    SchemaCompletionProviderRegistration,
+)
 from .manager import ApplicationSettings, ConfigurationManager
+
+
+class ConfigurationGetArguments(BaseModel):
+    """Describe the path accepted by configuration get.
+
+    Args:
+        path (str): Public configuration path to display.
+    """
+
+    path: Annotated[
+        str,
+        Field(description="Public configuration path to display."),
+        CommandCompletion(provider="configuration_public_entries"),
+    ]
+
+
+class ConfigurationSetArguments(BaseModel):
+    """Describe arguments accepted by configuration set.
+
+    Args:
+        path (str): Public configuration path to update.
+        value (str): New setting value.
+        scope (Literal["session", "user", "workspace"] | None): Override scope, or ``None`` to
+            choose interactively.
+    """
+
+    path: Annotated[
+        str,
+        Field(description="Public configuration path to update."),
+        CommandCompletion(provider="configuration_public_entries"),
+    ]
+    value: Annotated[str, Field(description="New setting value.")]
+    scope: Annotated[
+        Literal["session", "user", "workspace"] | None,
+        Field(description="Override scope, or omit it to choose interactively."),
+    ] = None
+
+
+class ConfigurationSecretArguments(BaseModel):
+    """Describe arguments accepted by configuration secret.
+
+    Args:
+        path (str): Secret configuration path to update.
+        scope (Literal["session", "user", "workspace"] | None): Override scope, or ``None`` to
+            choose interactively.
+    """
+
+    path: Annotated[
+        str,
+        Field(description="Secret configuration path to update."),
+        CommandCompletion(provider="configuration_secret_entries"),
+    ]
+    scope: Annotated[
+        Literal["session", "user", "workspace"] | None,
+        Field(description="Override scope, or omit it to choose interactively."),
+    ] = None
+
+
+class ConfigurationResetArguments(BaseModel):
+    """Describe arguments accepted by configuration reset.
+
+    Args:
+        path (str | None): Configuration path, or ``None`` to reset every entry.
+        scope (Literal["session", "user", "workspace"] | None): Override scope, or ``None`` to
+            choose interactively.
+    """
+
+    path: Annotated[
+        str | None,
+        Field(description="Configuration path, or omit to reset every entry."),
+        CommandCompletion(provider="configuration_all_entries"),
+    ] = None
+    scope: Annotated[
+        Literal["session", "user", "workspace"] | None,
+        Field(description="Override scope, or omit it to choose interactively."),
+    ] = None
 
 
 class ConfigurationCommands:
@@ -45,27 +126,6 @@ class ConfigurationCommands:
         Returns:
             tuple[CommandRegistration, ...]: The ``/config`` command.
         """
-        entry_completion = CommandCompletion(provider=self._public_entry_values)
-        scope_completion = CommandCompletion(
-            values=(
-                CompletionValue("scope=user", "Save for this user."),
-                CompletionValue("scope=workspace", "Save for this workspace."),
-                CompletionValue("scope=session", "Apply only for this session."),
-            )
-        )
-        set_entry_completion = CommandCompletion(
-            provider=self._public_entry_values,
-            next=CommandCompletion(next=scope_completion),
-        )
-        secret_completion = CommandCompletion(
-            provider=self._secret_entry_values,
-            next=scope_completion,
-        )
-        reset_completion = CommandCompletion(
-            values=scope_completion.values,
-            provider=self._all_entry_values,
-            next=scope_completion,
-        )
         return (
             CommandRegistration(
                 self.config,
@@ -79,14 +139,47 @@ class ConfigurationCommands:
                         CompletionValue("reload", "Reload configuration files from disk."),
                     ),
                     children={
-                        "get": entry_completion,
-                        "set": set_entry_completion,
-                        "secret": secret_completion,
-                        "reset": reset_completion,
+                        "get": CommandCompletion(schema_provider="configuration_arguments"),
+                        "set": CommandCompletion(schema_provider="configuration_arguments"),
+                        "secret": CommandCompletion(schema_provider="configuration_arguments"),
+                        "reset": CommandCompletion(schema_provider="configuration_arguments"),
+                        "reload": CommandCompletion(schema_provider="configuration_arguments"),
                     },
                 ),
             ),
         )
+
+    def get_completion_providers(
+        self,
+    ) -> tuple[CompletionProviderRegistration | SchemaCompletionProviderRegistration, ...]:
+        """Return dynamic configuration values and action-specific argument schemas.
+
+        Returns:
+            tuple[CompletionProviderRegistration | SchemaCompletionProviderRegistration, ...]:
+                Current setting paths and configuration argument schemas.
+        """
+        return (
+            CompletionProviderRegistration(
+                "configuration_public_entries", self._public_entry_values
+            ),
+            CompletionProviderRegistration("configuration_all_entries", self._all_entry_values),
+            CompletionProviderRegistration(
+                "configuration_secret_entries", self._secret_entry_values
+            ),
+            SchemaCompletionProviderRegistration(
+                "configuration_arguments", self._configuration_arguments
+            ),
+        )
+
+    @staticmethod
+    def _configuration_arguments(tokens: tuple[str, ...]) -> type[BaseModel] | None:
+        """Return the argument schema for the selected configuration operation."""
+        return {
+            ("get",): ConfigurationGetArguments,
+            ("set",): ConfigurationSetArguments,
+            ("secret",): ConfigurationSecretArguments,
+            ("reset",): ConfigurationResetArguments,
+        }.get(tokens)
 
     def _public_entry_values(self) -> tuple[CompletionValue, ...]:
         """Return dynamically current non-secret configuration paths for completion."""

@@ -92,7 +92,7 @@ def test_schema_completion_infers_enum_literal_union_and_boolean_values():
 
     assert [item.text for item in complete(completer, "/mode work")] == ["workspace_write"]
     assert [item.text for item in complete(completer, "/level h")] == ["high"]
-    assert [item.text for item in complete(completer, "/enabled ")] == ["false", "true", "value="]
+    assert [item.text for item in complete(completer, "/enabled ")] == ["false", "true"]
 
 
 def test_schema_completion_accepts_annotated_dynamic_metadata():
@@ -104,14 +104,15 @@ def test_schema_completion_accepts_annotated_dynamic_metadata():
 
     completer = command_completer(command_for(load))
 
+    assert [item.text for item in complete(completer, "/load ")] == ["session-two"]
     assert [item.text for item in complete(completer, "/load two")] == ["session-two"]
     assert [item.text for item in complete(completer, "/load session_id=two")] == [
         "session_id=session-two"
     ]
 
 
-def test_schema_completion_offers_named_fields_and_tracks_positional_binding():
-    """Schema completion offers remaining fields and values after mixed bindings."""
+def test_schema_completion_omits_current_field_name_when_values_exist():
+    """Schema completion avoids duplicate names for positional values."""
 
     def text(value: str) -> None:
         """Accept text."""
@@ -122,9 +123,9 @@ def test_schema_completion_offers_named_fields_and_tracks_positional_binding():
     completer = command_completer(command_for(text), command_for(pair))
 
     assert [item.text for item in complete(completer, "/text ")] == ["value="]
-    assert [item.text for item in complete(completer, "/pair ")] == ["a", "first=", "second="]
-    assert [item.text for item in complete(completer, "/pair a ")] == ["b", "second="]
-    assert [item.text for item in complete(completer, "/pair second=b ")] == ["a", "first="]
+    assert [item.text for item in complete(completer, "/pair ")] == ["a", "second="]
+    assert [item.text for item in complete(completer, "/pair a ")] == ["b"]
+    assert [item.text for item in complete(completer, "/pair second=b ")] == ["a"]
     assert [item.text for item in complete(completer, "/pair second=")] == ["second=b"]
     assert complete(completer, "/pair unknown=a ") == []
     assert complete(completer, "/pair first=a first=") == []
@@ -199,6 +200,44 @@ def test_nested_command_completion_switches_to_a_selected_dynamic_schema():
         providers={"tools": lambda: (CompletionValue("selected"),)},
     )
     assert complete(direct, "/invoke selected ")
+
+
+def test_nested_schema_completion_preserves_arguments_after_multiple_routing_tokens():
+    """Selected dynamic schemas receive the raw arguments after every routing token."""
+
+    def invoke(action: str) -> None:
+        """Invoke one selected tool."""
+
+    def selected(count: int, mode: Literal["fast", "safe"] = "safe") -> None:
+        """Accept selected-tool arguments."""
+
+    grammar = CommandCompletion(
+        children={
+            "call": CommandCompletion(
+                provider="tools", next=CommandCompletion(schema_provider="tool_arguments")
+            )
+        }
+    )
+    completer = command_completer(
+        command_for(invoke, completion=grammar),
+        providers={"tools": lambda: (CompletionValue("selected"),)},
+        schema_providers={
+            "tool_arguments": lambda tokens: (
+                get_command_arguments_model(selected, "selected")
+                if tokens == ("call", "selected")
+                else None
+            )
+        },
+    )
+
+    assert [item.text for item in complete(completer, "/invoke call selected 2 ")] == [
+        "fast",
+        "safe",
+    ]
+    assert [item.text for item in complete(completer, "/invoke call selected 2 mode=f")] == [
+        "mode=fast",
+        "mode=safe",
+    ]
 
 
 def test_command_adapter_validates_named_provider_registrations():

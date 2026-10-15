@@ -1,5 +1,6 @@
 """Verify centralized workspace registry commands."""
 
+import shlex
 from unittest.mock import Mock
 
 import pytest
@@ -40,13 +41,31 @@ def test_workspace_commands_show_list_and_rename_active_workspace(commands):
     assert commands.get_commands()[0].name == "workspace"
 
 
-def test_workspace_command_completion_uses_positional_operations(commands):
-    """Workspace completion offers operations without inaccurate named parameters."""
-    manager = CompletionManager((CommandCompletionAdapter(lambda: commands.get_commands()),))
+def test_workspace_command_completion_shows_arguments_for_selected_operations(commands):
+    """Workspace completion reveals only the selected operation's arguments and values."""
+    manager = CompletionManager(
+        (
+            CommandCompletionAdapter(
+                lambda: commands.get_commands(),
+                providers=(commands,),
+            ),
+        )
+    )
 
-    values = manager.get_completions(Document("/workspace "), Mock())
+    actions = manager.get_completions(Document("/workspace "), Mock())
+    attach = manager.get_completions(Document("/workspace attach "), Mock())
+    attach_ids = manager.get_completions(Document("/workspace attach workspace_id="), Mock())
+    attach_after_name = manager.get_completions(
+        Document("/workspace attach project "), Mock()
+    )
+    rename = manager.get_completions(Document("/workspace rename "), Mock())
+    forget = manager.get_completions(Document("/workspace forget "), Mock())
+    show = manager.get_completions(Document("/workspace show "), Mock())
+    completion_sources = commands.get_completion_providers()
+    workspace_id = completion_sources[0].provider()[0].value
+    workspace_references = {value.value for value in completion_sources[1].provider()}
 
-    assert [value.text for value in values] == [
+    assert {value.text for value in actions} == {
         "attach",
         "forget",
         "list",
@@ -54,7 +73,13 @@ def test_workspace_command_completion_uses_positional_operations(commands):
         "rename",
         "show",
         "switch",
-    ]
+    }
+    assert {value.text for value in attach} == {"name=", "workspace_id="}
+    assert {value.text for value in attach_ids} == {f"workspace_id={workspace_id}"}
+    assert {value.text for value in attach_after_name} == {workspace_id}
+    assert {value.text for value in rename} == {"name="}
+    assert {value.text for value in forget} == workspace_references
+    assert list(show) == []
 
 
 def test_workspace_commands_reject_invalid_names_and_arguments(commands):
@@ -113,6 +138,34 @@ def test_workspace_attach_forwards_an_explicit_existing_identity(tmp_path):
     _commands.workspace(context, "attach", str(tmp_path), "chosen")
 
     repository.attach.assert_called_once_with(str(tmp_path), "chosen")
+
+
+def test_workspace_completion_skips_locations_without_persisted_identity(tmp_path):
+    """Workspace completion omits an ID candidate when a location has no identity."""
+    active = Workspace(tmp_path, tmp_path, "active", "Active", "directory", 1, 1)
+    repository = Mock()
+    repository.list.return_value = (Workspace.discover(tmp_path),)
+    commands = WorkspaceCommands(active, repository)
+    providers = commands.get_completion_providers()
+
+    assert providers[0].provider() == ()
+    assert {value.value for value in providers[1].provider()} == {str(tmp_path.resolve())}
+
+
+def test_workspace_path_completion_quotes_paths_with_spaces(tmp_path):
+    """Workspace path candidates preserve spaces when inserted into command input."""
+    root = tmp_path / "Project Root"
+    root.mkdir()
+    workspace = Workspace(root, root, "workspace-id", "Project Root", "directory", 1, 1)
+    repository = Mock()
+    repository.list.return_value = (workspace,)
+    commands = WorkspaceCommands(workspace, repository)
+    references = commands.get_completion_providers()[1].provider()
+
+    path = next(value for value in references if value.description.startswith("Workspace path:"))
+
+    assert path.value == shlex.quote(str(root.resolve()))
+    assert path.display == str(root.resolve())
 
 
 def test_workspace_switch_resolves_target_before_signalling_rebuild(commands, tmp_path):

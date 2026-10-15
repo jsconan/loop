@@ -395,8 +395,11 @@ def test_config_completion_excludes_secret_paths_from_get_and_set(tmp_path):
     """Get and set complete only non-secret schema-derived configuration paths."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    commands = CommandManager(providers=(ConfigurationCommands(configuration, Mock()),))
-    completion = CompletionManager((CommandCompletionAdapter(lambda: commands.commands),))
+    provider = ConfigurationCommands(configuration, Mock())
+    commands = CommandManager(providers=(provider,))
+    completion = CompletionManager(
+        (CommandCompletionAdapter(lambda: commands.commands, providers=(provider,)),)
+    )
 
     values = list(completion.get_completions(Document("/config get loop.d"), Mock()))
 
@@ -410,8 +413,11 @@ def test_config_secret_completion_suggests_only_secret_paths(tmp_path):
     """The secret action completes the entries that require masked input."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    commands = CommandManager(providers=(ConfigurationCommands(configuration, Mock()),))
-    completion = CompletionManager((CommandCompletionAdapter(lambda: commands.commands),))
+    provider = ConfigurationCommands(configuration, Mock())
+    commands = CommandManager(providers=(provider,))
+    completion = CompletionManager(
+        (CommandCompletionAdapter(lambda: commands.commands, providers=(provider,)),)
+    )
 
     values = list(completion.get_completions(Document("/config secret backend.a"), Mock()))
 
@@ -422,11 +428,17 @@ def test_config_completion_suggests_scope_values_after_edit_arguments(tmp_path):
     """Editable operations complete explicit session and workspace scope arguments."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    commands = CommandManager(providers=(ConfigurationCommands(configuration, Mock()),))
-    completion = CompletionManager((CommandCompletionAdapter(lambda: commands.commands),))
+    provider = ConfigurationCommands(configuration, Mock())
+    commands = CommandManager(providers=(provider,))
+    completion = CompletionManager(
+        (CommandCompletionAdapter(lambda: commands.commands, providers=(provider,)),)
+    )
 
     values = list(
         completion.get_completions(Document("/config set loop.debug false scope="), Mock())
+    )
+    positional_values = list(
+        completion.get_completions(Document("/config set loop.debug false "), Mock())
     )
 
     assert [value.text for value in values] == [
@@ -434,14 +446,18 @@ def test_config_completion_suggests_scope_values_after_edit_arguments(tmp_path):
         "scope=user",
         "scope=workspace",
     ]
+    assert {value.text for value in positional_values} == {"session", "user", "workspace"}
 
 
 def test_config_reset_completion_suggests_scope_without_a_path(tmp_path):
     """Reset-all completion includes the session and workspace scope arguments."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    commands = CommandManager(providers=(ConfigurationCommands(configuration, Mock()),))
-    completion = CompletionManager((CommandCompletionAdapter(lambda: commands.commands),))
+    provider = ConfigurationCommands(configuration, Mock())
+    commands = CommandManager(providers=(provider,))
+    completion = CompletionManager(
+        (CommandCompletionAdapter(lambda: commands.commands, providers=(provider,)),)
+    )
 
     values = list(completion.get_completions(Document("/config reset scope="), Mock()))
 
@@ -456,8 +472,11 @@ def test_config_reset_completion_suggests_scope_after_a_path(tmp_path):
     """Single-entry reset completion includes the session and workspace scope arguments."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    commands = CommandManager(providers=(ConfigurationCommands(configuration, Mock()),))
-    completion = CompletionManager((CommandCompletionAdapter(lambda: commands.commands),))
+    provider = ConfigurationCommands(configuration, Mock())
+    commands = CommandManager(providers=(provider,))
+    completion = CompletionManager(
+        (CommandCompletionAdapter(lambda: commands.commands, providers=(provider,)),)
+    )
 
     values = list(completion.get_completions(Document("/config reset loop.debug scope="), Mock()))
 
@@ -466,3 +485,42 @@ def test_config_reset_completion_suggests_scope_after_a_path(tmp_path):
         "scope=user",
         "scope=workspace",
     ]
+
+
+def test_config_completion_lists_arguments_for_selected_operation(tmp_path):
+    """Configuration completion shows values and remaining names for the chosen action."""
+    configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    configuration.load()
+    provider = ConfigurationCommands(configuration, Mock())
+    commands = CommandManager(providers=(provider,))
+    completion = CompletionManager(
+        (CommandCompletionAdapter(lambda: commands.commands, providers=(provider,)),)
+    )
+
+    actions = list(completion.get_completions(Document("/config "), Mock()))
+    get_arguments = list(completion.get_completions(Document("/config get "), Mock()))
+    set_arguments = list(completion.get_completions(Document("/config set "), Mock()))
+    secret_arguments = list(completion.get_completions(Document("/config secret "), Mock()))
+    reset_arguments = list(completion.get_completions(Document("/config reset "), Mock()))
+    reload_arguments = list(completion.get_completions(Document("/config reload "), Mock()))
+
+    assert {value.text for value in actions} == {"get", "set", "secret", "reset", "reload"}
+    assert {value.text for value in get_arguments} >= {"loop.debug"}
+    assert "path=" not in {value.text for value in get_arguments}
+    assert "backend.api_key" not in {value.text for value in get_arguments}
+    assert "path=" not in {value.text for value in set_arguments}
+    assert {value.text for value in set_arguments} >= {
+        "value=",
+        "scope=",
+        "loop.debug",
+    }
+    assert "backend.api_key" not in {value.text for value in set_arguments}
+    assert {value.text for value in secret_arguments} >= {"scope=", "backend.api_key"}
+    assert "path=" not in {value.text for value in secret_arguments}
+    assert "value=" not in {value.text for value in secret_arguments}
+    assert "path=" not in {value.text for value in reset_arguments}
+    assert {value.text for value in reset_arguments} >= {
+        "scope=",
+        "backend.api_key",
+    }
+    assert list(reload_arguments) == []

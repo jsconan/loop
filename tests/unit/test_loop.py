@@ -51,11 +51,14 @@ from loop import (
     manage_skills,
     tool,
 )
-from loop.configuration import ApplicationSettings
+from loop.application import ApplicationPaths
+from loop.application.commands import ApplicationCommands
+from loop.configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
 from loop.permissions import PermissionLoadFailure
 from loop.session import GeneratedSessionName
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.utils import PathHolder, content_identity
+from loop.workspace import Workspace, WorkspaceCommands
 
 
 def function_call() -> ToolCall:
@@ -112,6 +115,56 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.session.model == "requested-model"
     assert loop.session.messages == []
     assert loop.model == "requested-model"
+
+
+def test_runtime_command_providers_keep_contextual_completion_in_the_active_loop(tmp_path):
+    """Runtime and built-in command providers retain values in the active completer."""
+    interaction = output_interaction()
+    interaction.prompt.return_value = False
+    skill = Skill("review", "Review code.", tmp_path / "skills" / "review" / "SKILL.md")
+    instructions = InstructionsManager(skill_manager=SkillManager([skill]))
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        instructions_manager=instructions,
+        working_directory=tmp_path,
+    )
+    configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    configuration.load()
+    loop.register_command_provider(ConfigurationCommands(configuration, Mock()))
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    loop.register_command_provider(
+        ApplicationCommands(paths, paths.for_workspace("workspace-id", tmp_path), "workspace-id")
+    )
+    workspace = Workspace(tmp_path, tmp_path, "workspace-id", "Project", "directory", 1, 1)
+    repository = Mock()
+    repository.list.return_value = (workspace,)
+    loop.register_command_provider(WorkspaceCommands(workspace, repository))
+
+    loop.run()
+
+    completer = interaction.prompt.call_args.kwargs["completer"]
+    config_arguments = {
+        item.text for item in completer.get_completions(Document("/config get "), Mock())
+    }
+    app_arguments = {
+        item.text for item in completer.get_completions(Document("/app logs "), Mock())
+    }
+    workspace_arguments = {
+        item.text for item in completer.get_completions(Document("/workspace forget "), Mock())
+    }
+    skill_arguments = {
+        item.text for item in completer.get_completions(Document("/skills activate "), Mock())
+    }
+
+    command_names = {command.name for command in loop.command_manager.commands}
+    assert {"config", "app", "workspace"} <= command_names
+    assert "loop.debug" in config_arguments
+    assert "path=" not in config_arguments
+    assert {"destination=", "workspace_id=", "force="} <= app_arguments
+    assert "workspace-id" in workspace_arguments
+    assert "name=" not in workspace_arguments
+    assert skill_arguments == {"review"}
 
 
 def test_loop_replaces_shared_backend(tmp_path):

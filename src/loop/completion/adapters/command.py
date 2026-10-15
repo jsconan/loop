@@ -169,8 +169,8 @@ class CommandCompletionAdapter(CompletionAdapter):
                 model = provider(tuple(consumed))
                 if model is None:
                     return None
-                parts = arguments.split(maxsplit=1)
-                remaining = parts[1] if len(consumed) == 1 and len(parts) == 2 else ""
+                parts = arguments.split(maxsplit=len(consumed))
+                remaining = parts[len(consumed)] if len(parts) > len(consumed) else ""
                 return self._match_model_arguments(model, remaining, before)
         return CompletionMatch(fragment, fragment, state=node)
 
@@ -241,13 +241,14 @@ class CommandCompletionAdapter(CompletionAdapter):
         remaining = [field_name for field_name in fields if field_name not in assigned]
         if not remaining:
             return None
+        grammar = self._field_completion(fields[remaining[0]])
+        positional_values = self._grammar_values(grammar) if grammar is not None else ()
         values = [
             CompletionValue(f"{field_name}=", fields[field_name].description or "parameter")
-            for field_name in remaining
+            for index, field_name in enumerate(remaining)
+            if index != 0 or not positional_values
         ]
-        grammar = self._field_completion(fields[remaining[0]])
-        if grammar is not None:
-            values.extend(self._grammar_values(grammar))
+        values.extend(positional_values)
         return CompletionMatch(fragment, fragment, state=tuple(values))
 
     @staticmethod

@@ -5,7 +5,9 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from prompt_toolkit.document import Document
 
+from loop import CommandCompletionAdapter, CompletionManager
 from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.commands import CommandArgumentError, CommandContext
@@ -106,6 +108,48 @@ def test_application_commands_validate_arguments_and_empty_log(application, tmp_
     target = tmp_path / "empty.log"
     commands.app(context, "logs", str(target))
     assert target.read_bytes() == b""
+
+
+def test_application_completion_lists_only_arguments_for_selected_export(application):
+    """Application completion shows export parameters after their action is selected."""
+    commands, _ = application
+    completion = CompletionManager(
+        (
+            CommandCompletionAdapter(
+                lambda: commands.get_commands(),
+                providers=(commands,),
+            ),
+        )
+    )
+
+    actions = completion.get_completions(Document("/app "), Mock())
+    directories = completion.get_completions(Document("/app dirs "), Mock())
+    logs = completion.get_completions(Document("/app logs "), Mock())
+    log_force = completion.get_completions(Document("/app logs force="), Mock())
+    audit = completion.get_completions(Document("/app audit "), Mock())
+
+    assert {value.text for value in actions} == {"dirs", "audit", "logs"}
+    assert list(directories) == []
+    assert {value.text for value in logs} == {
+        "destination=",
+        "workspace_id=",
+        "start_ns=",
+        "end_ns=",
+        "severity=",
+        "event_name=",
+        "force=",
+    }
+    assert {value.text for value in log_force} == {"force=true", "force=false"}
+    assert {value.text for value in audit} == {
+        "destination=",
+        "workspace_id=",
+        "start_ns=",
+        "end_ns=",
+        "event_name=",
+        "session_id=",
+        "decision=",
+        "force=",
+    }
 
 
 def test_log_export_streams_archives_with_filters_and_force(application, tmp_path):

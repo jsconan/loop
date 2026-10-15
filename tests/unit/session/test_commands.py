@@ -106,6 +106,9 @@ def test_sessions_export_completes_persisted_ids_after_the_export_action():
     session_actions = list(completer.get_completions(Document("/session ex"), Mock()))
     sessions_actions = list(completer.get_completions(Document("/sessions ex"), Mock()))
     session_parameters = list(completer.get_completions(Document("/session export "), Mock()))
+    session_positional_formats = list(
+        completer.get_completions(Document("/session export output.md "), Mock())
+    )
     session_formats = list(completer.get_completions(Document("/session export format="), Mock()))
     export_session_ids = list(completer.get_completions(Document("/export "), Mock()))
     export_parameters = list(completer.get_completions(Document("/export saved-session "), Mock()))
@@ -115,6 +118,11 @@ def test_sessions_export_completes_persisted_ids_after_the_export_action():
     sessions_start = list(completer.get_completions(Document("/sessions export "), Mock()))
     sessions_parameters = list(
         completer.get_completions(Document("/sessions export saved-session "), Mock())
+    )
+    sessions_positional_formats = list(
+        completer.get_completions(
+            Document("/sessions export saved-session output.md "), Mock()
+        )
     )
     sessions_formats = list(
         completer.get_completions(Document("/sessions export saved-session format="), Mock())
@@ -136,7 +144,15 @@ def test_sessions_export_completes_persisted_ids_after_the_export_action():
         "format=archive",
         "format=markdown",
     }
-    assert next(completion.text for completion in export_session_ids) == "saved-session"
+    assert {completion.text for completion in session_positional_formats} == {
+        "archive",
+        "markdown",
+    }
+    assert {completion.text for completion in export_session_ids} == {
+        "saved-session",
+        "destination=",
+        "format=",
+    }
     assert {completion.text for completion in export_parameters} == {"destination=", "format="}
     assert {completion.text for completion in export_formats} == {
         "format=archive",
@@ -144,11 +160,14 @@ def test_sessions_export_completes_persisted_ids_after_the_export_action():
     }
     assert {completion.text for completion in sessions_start} == {
         "saved-session",
-        "session_id=",
         "destination=",
         "format=",
     }
     assert {completion.text for completion in sessions_parameters} == {"destination=", "format="}
+    assert {completion.text for completion in sessions_positional_formats} == {
+        "archive",
+        "markdown",
+    }
     assert {completion.text for completion in sessions_formats} == {
         "format=archive",
         "format=markdown",

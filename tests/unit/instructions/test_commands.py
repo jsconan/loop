@@ -1,8 +1,20 @@
 """Tests for skill-owned user commands."""
 
+from pathlib import Path
 from unittest.mock import Mock
 
-from loop import Agent, CommandManager, InstructionsManager, Interaction, Skill, SkillManager
+from prompt_toolkit.document import Document
+
+from loop import (
+    Agent,
+    CommandCompletionAdapter,
+    CommandManager,
+    CompletionManager,
+    InstructionsManager,
+    Interaction,
+    Skill,
+    SkillManager,
+)
 from loop.instructions import SkillCommands
 
 
@@ -74,6 +86,36 @@ def test_skill_commands_deactivate_all_loaded_skills(tmp_path):
     assert "Second instructions." not in instructions.instructions
     assert interaction.info.call_args_list[-2].args[0] == "Deactivated 2 skill(s)."
     assert interaction.info.call_args_list[-1].args[0] == "No skills are currently loaded."
+
+
+def test_skill_completion_offers_names_without_duplicate_parameter(tmp_path):
+    """Skill completion offers matching names without a redundant field suggestion."""
+    provider = SkillCommands(
+        InstructionsManager(
+            skill_manager=SkillManager(
+                [Skill("review", "Review code.", Path(tmp_path / "SKILL.md"))]
+            )
+        )
+    )
+    commands = CommandManager(providers=(provider,))
+    completion = CompletionManager(
+        (
+            CommandCompletionAdapter(
+                lambda: commands.commands,
+                providers=(provider,),
+            ),
+        )
+    )
+
+    actions = completion.get_completions(Document("/skills "), Mock())
+    activation = completion.get_completions(Document("/skills activate "), Mock())
+    deactivation = completion.get_completions(Document("/skills deactivate "), Mock())
+    bulk = completion.get_completions(Document("/skills deactivate-all "), Mock())
+
+    assert {value.text for value in actions} == {"activate", "deactivate", "deactivate-all"}
+    assert {value.text for value in activation} == {"review"}
+    assert {value.text for value in deactivation} == {"review"}
+    assert list(bulk) == []
 
 
 def test_skill_commands_report_invalid_arguments_and_lifecycle_failures():
