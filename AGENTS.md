@@ -13,7 +13,7 @@
 - Declare instance attributes, including their type hints, at class level; initialize their values in `__init__`. Do not combine declaration and initialization in the constructor body.
 - For bug fixes, identify the root cause and inspect callers of the code being changed. Fix the shared cause once when appropriate rather than patching only the reported symptom.
 - Keep changes surgical: match the surrounding style, avoid unrelated refactors or formatting, and remove only imports or code made unused by the current change. Mention unrelated dead code rather than deleting it.
-- Do not trade away trust-boundary validation, data-loss prevention, security, accessibility, or behavior explicitly required by the request in pursuit of a smaller diff.
+- Do not introduce regressions in existing supported features or public behavior. Do not weaken or remove trust-boundary validation, authorization, security controls, accessibility, or data-loss prevention to reduce a diff or simplify an implementation.
 - When deliberately accepting a known limitation, document its ceiling and the condition or path for replacing it.
 
 ### Verification
