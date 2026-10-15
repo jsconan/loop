@@ -16,13 +16,14 @@ from loop.model_selection.commands import ModelCommands
 
 
 def test_model_commands_list_show_and_select_available_models():
-    """Commands present the catalog and update a valid active selection."""
+    """Commands list optional context data and select available models."""
     interaction = Mock(spec=Interaction)
     selection = Mock(spec=ModelSelection)
     selection.selected = None
     selection.available.return_value = [
         ModelInfo(id="model-a", context_window="10"),
         ModelInfo(id="model-b", context_window="20"),
+        ModelInfo(id="model-c"),
     ]
     provider = ModelCommands(selection)
     manager = CommandManager(interaction=interaction)
@@ -36,6 +37,7 @@ def test_model_commands_list_show_and_select_available_models():
         [
             SimpleNamespace(id="model-a", context_window="10 tokens"),
             SimpleNamespace(id="model-b", context_window="20 tokens"),
+            SimpleNamespace(id="model-c", context_window="Not reported"),
         ],
         title="Available models:",
         columns=("id", "context_window"),
@@ -47,6 +49,7 @@ def test_model_commands_list_show_and_select_available_models():
     assert [(value.value, value.description) for value in completion.provider()] == [
         ("model-a", "10 tokens"),
         ("model-b", "20 tokens"),
+        ("model-c", "Not reported"),
     ]
 
 

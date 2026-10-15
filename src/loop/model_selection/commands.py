@@ -55,7 +55,12 @@ class ModelCommands:
     def _model_values(self) -> tuple[CompletionValue, ...]:
         """Return models currently available from the backend."""
         return tuple(
-            CompletionValue(model.id, f"{model.context_window:,} tokens")
+            CompletionValue(
+                model.id,
+                f"{model.context_window:,} tokens"
+                if model.context_window is not None
+                else "Not reported",
+            )
             for model in self._available()
         )
 
