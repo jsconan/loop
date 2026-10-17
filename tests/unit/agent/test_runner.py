@@ -12,6 +12,7 @@ from openai.types.responses import ResponseFunctionToolCall
 
 from loop import (
     BUILTIN_TOOLS,
+    AnswerDelta,
     ApprovalChoice,
     BackendConnectionError,
     BackendRepetitionError,
@@ -24,6 +25,7 @@ from loop import (
     Response,
     ResponseCompleted,
     ResponseMetrics,
+    RunControl,
     RuntimeEnvironment,
     Session,
     SessionExecutionConflictError,
@@ -45,7 +47,13 @@ from loop.utils import PathHolder
 
 
 def agent_runner(
-    *, responses=None, max_turns=25, backend=None, options=None, instructions_manager=None
+    *,
+    responses=None,
+    max_turns=25,
+    backend=None,
+    options=None,
+    instructions_manager=None,
+    run_control=None,
 ):
     """Build a runner with isolated execution collaborators."""
     backend = backend or Mock()
@@ -82,13 +90,14 @@ def agent_runner(
         debug=options["debug"],
         max_turns=options["max_turns"],
         prompt_on_recoverable_error=options["prompt"],
+        run_control=run_control,
     )
     if responses is not None:
         runner.query = Mock(side_effect=responses)
     return runner, session_manager, interaction
 
 
-def file_runner(tmp_path, backend, *, registry=None, sessions=None):
+def file_runner(tmp_path, backend, *, registry=None, sessions=None, run_control=None):
     """Build a real file-tool runtime with deterministic model and interaction boundaries."""
     if isinstance(backend, Mock):
         backend.prepare_context.side_effect = list
@@ -114,6 +123,7 @@ def file_runner(tmp_path, backend, *, registry=None, sessions=None):
         Mock(),
         interaction,
         PathHolder(tmp_path),
+        run_control=run_control,
     )
 
 
@@ -1364,3 +1374,112 @@ def test_runner_declines_after_a_confirmed_safety_window():
     assert len(result.metrics.model_calls) == 4
     assert sessions.add_response.call_count == 4
     assert interaction.confirm.call_count == 2
+
+
+def test_stopped_runner_does_not_query_or_begin_recovery():
+    """A cooperative stop prevents new model work and recovery approvals."""
+    control = RunControl()
+    control.stop()
+    runner, sessions, interaction = agent_runner(run_control=control)
+
+    with pytest.raises(KeyboardInterrupt):
+        runner.run()
+    with pytest.raises(KeyboardInterrupt):
+        runner.recover_session()
+
+    runner.backend.get_response.assert_not_called()
+    sessions.record_run.assert_not_called()
+    interaction.confirm.assert_not_called()
+
+
+def test_runner_checks_cancellation_after_compaction(tmp_path):
+    """Cancelling during compaction prevents the following model request."""
+    control = RunControl()
+    backend = Mock()
+    runner = file_runner(tmp_path, backend, run_control=control)
+    runner.compaction.compact_if_needed.side_effect = lambda _snapshot: control.stop()
+
+    with pytest.raises(KeyboardInterrupt):
+        runner.query()
+
+    backend.get_response.assert_not_called()
+
+
+def test_cancelled_response_closes_its_source_and_preserves_recovery(tmp_path):
+    """A stopped partial response closes transport and never enters canonical session history."""
+    control = RunControl()
+    closed = Mock()
+
+    def events():
+        """Request cancellation between a displayed delta and terminal completion."""
+        try:
+            yield AnswerDelta(text="partial")
+            control.stop()
+            yield ResponseCompleted(answer="discarded")
+        finally:
+            closed()
+
+    backend = Mock()
+    backend.get_response.return_value = events()
+    runner = file_runner(tmp_path, backend, run_control=control)
+    runner.session_manager.add_user_message("question")
+
+    with pytest.raises(KeyboardInterrupt):
+        runner.run()
+
+    closed.assert_called_once_with()
+    assert [item.content for item in runner.session_manager.messages] == ["question"]
+    assert runner.session_manager.recovery_state.action == "query_model"
+    with runner.session_manager.execution():
+        assert runner.session_manager.session.id
+
+
+def test_cancellation_after_authorization_prevents_the_tool_execution_boundary():
+    """A stopped approved operation cannot record a start or invoke its function."""
+    control = RunControl()
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    runner, sessions, _interaction = agent_runner(
+        responses=[Response(answer="", reasoning="", tool_calls=(call,))],
+        run_control=control,
+    )
+    effects = []
+
+    def dispatch(_name, _arguments, **kwargs):
+        """Stop after planning and approval but before the registry starts execution."""
+        control.stop()
+        kwargs["execution_started"]()
+        effects.append("executed")
+        return '{"ok":true}', 0
+
+    runner.agent.tools.call_with_timing.side_effect = dispatch
+
+    with pytest.raises(KeyboardInterrupt):
+        runner.run()
+
+    assert effects == []
+    sessions.record_tool_execution_started.assert_not_called()
+    sessions.add_tool_call.assert_not_called()
+
+
+def test_controlled_retry_wait_is_cancellable(caplog):
+    """Recoverable failures retain their diagnostic while retry waits use the stop signal."""
+    control = Mock(spec=RunControl)
+    control.wait.side_effect = KeyboardInterrupt
+    runner, _sessions, interaction = agent_runner(
+        responses=[
+            BackendConnectionError(
+                "private failure", provider="test", operation="query", retry_after=2.5
+            )
+        ],
+        run_control=control,
+    )
+    interaction.confirm.return_value = True
+
+    with pytest.raises(KeyboardInterrupt):
+        runner.run()
+
+    control.wait.assert_called_once_with(2.5)
+    assert [getattr(record, "error.type", None) for record in caplog.records] == [
+        "backend.request_failed"
+    ]
+    assert "private failure" not in caplog.text

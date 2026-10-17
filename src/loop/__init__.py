@@ -135,6 +135,7 @@ __all__ = [
     "ResponsePresenter",
     "RetentionPolicy",
     "RunCompletedEvent",
+    "RunControl",
     "RunMetrics",
     "RuntimeEnvironment",
     "SQLiteSessionStore",
@@ -143,6 +144,7 @@ __all__ = [
     "SerializedMessage",
     "SerializedSession",
     "Session",
+    "SessionController",
     "SessionEvent",
     "SessionExecutionConflictError",
     "SessionExportFormat",
@@ -279,6 +281,8 @@ from .completion import (
 )
 from .configuration import ConfigurationManager
 from .constants import OMIT, Omit
+from .control import RunControl
+from .conversation import SessionController
 from .errors import Problem, ProblemException, log_problem
 from .instructions import (
     AgentInstructionsSource,

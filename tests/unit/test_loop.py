@@ -1,9 +1,11 @@
 """Tests for normalized response handling and conversation orchestration."""
 
+import asyncio
 import json
 from contextlib import nullcontext
+from threading import Event
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, Mock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 from prompt_toolkit.document import Document
@@ -21,6 +23,7 @@ from loop import (
     BackendServerError,
     CompactionContextItem,
     CompactionResult,
+    ConsoleInteraction,
     ContextReference,
     GenerationHyperparameters,
     InstructionsManager,
@@ -36,6 +39,7 @@ from loop import (
     ResponseCompleted,
     RuntimeEnvironment,
     Session,
+    SessionController,
     SessionManager,
     ShutdownRequested,
     Skill,
@@ -55,7 +59,7 @@ from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
 from loop.permissions import PermissionLoadFailure
-from loop.session import GeneratedSessionName
+from loop.session import GeneratedSessionName, LocalSessionNameGenerator
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.utils import PathHolder, content_identity
 from loop.workspace import Workspace, WorkspaceCommands
@@ -2175,3 +2179,122 @@ def test_query_rejects_missing_model_selection(tmp_path):
         Loop.create_default(backend=backend, working_directory=tmp_path).agent_runner.query()
 
     backend.get_response.assert_not_called()
+
+
+@pytest.mark.parametrize("new_session", [False, True])
+def test_mailbox_input_preserves_conversation_order_and_telemetry_context(
+    tmp_path, monkeypatch, new_session
+):
+    """Queued messages and session changes run serially and retain their own correlation."""
+    monkeypatch.setattr(
+        "loop.conversation.controller.patch_stdout", lambda **_kwargs: nullcontext()
+    )
+    source = MagicMock(spec=ConsoleInteraction)
+    source.response_context.side_effect = nullcontext
+    controller = SessionController(source)
+    release = Event()
+    queries = []
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    sessions = SessionManager(
+        interaction=controller.interaction, session_store=store, workspace_id="workspace"
+    )
+
+    async def scenario():
+        """Submit a second request while the first backend operation is suspended."""
+        inputs = asyncio.Queue()
+        started, queued, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        metrics = []
+
+        async def read(*_args, **_kwargs):
+            """Read only explicitly submitted ordinary user messages."""
+            return await inputs.get()
+
+        source.prompt_async = AsyncMock(side_effect=read)
+
+        def output(message=""):
+            """Expose backend blocking and queue acceptance at their UI boundaries."""
+            if message == "backend working":
+                started.set()
+            elif message.startswith("Queued input"):
+                queued.set()
+
+        def run_metrics(value):
+            """Observe completion only after canonical response and run metrics are saved."""
+            metrics.append(value)
+            if len(metrics) == 2:
+                completed.set()
+
+        def get_response(**kwargs):
+            """Return ordered canonical responses while controlling the first network boundary."""
+            queries.append(kwargs["input"])
+            if len(queries) == 1:
+                controller.interaction.info("backend working")
+                release.wait()
+            answer = f"answer {len(queries)}"
+            return [
+                AnswerCompleted(text=answer),
+                ResponseCompleted(
+                    answer=answer,
+                    items=(Message(role="assistant", content=answer),),
+                ),
+            ]
+
+        source.info.side_effect = output
+        source.run_metrics.side_effect = run_metrics
+        loop = Loop.create_default(
+            backend=loop_backend(get_response=get_response),
+            interaction=controller.interaction,
+            run_control=controller.control,
+            working_directory=tmp_path,
+            session_manager=sessions,
+            session_name_generator=LocalSessionNameGenerator(),
+        )
+        task = asyncio.create_task(controller.run(lambda receive: loop.run(input_source=receive)))
+        try:
+            inputs.put_nowait("first private request")
+            await started.wait()
+            if new_session:
+                inputs.put_nowait("/new")
+            inputs.put_nowait("second private request")
+            await queued.wait()
+            assert len(queries) == 1
+            release.set()
+            await completed.wait()
+            inputs.put_nowait("/exit")
+            await task
+            return loop
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        loop = asyncio.run(scenario())
+    finally:
+        try:
+            assert telemetry.close(1)
+        finally:
+            set_telemetry(None)
+
+    expected = ["second private request", "answer 2"]
+    if not new_session:
+        expected = ["first private request", "answer 1", *expected]
+    assert [item.content for item in loop.messages] == expected
+    accepted = [record for record in adapter.records if record.event_name == "message.accepted"]
+    assert [record.message_sequence for record in accepted] == [0, 0 if new_session else 1]
+    assert accepted[-1].session_id == loop.session.id
+    if new_session:
+        assert accepted[0].session_id != loop.session.id
+        assert [item.content for item in store.load(accepted[0].session_id).messages] == [
+            "first private request",
+            "answer 1",
+        ]
+        assert [item.content for item in queries[-1]] == ["second private request"]
+    else:
+        assert accepted[0].session_id == loop.session.id
+    assert all(record.trace_id is not None for record in accepted)
+    activity = [repr(record) for record in adapter.records if record.signal == "activity"]
+    assert all("private request" not in record for record in activity)

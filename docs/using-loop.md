@@ -18,9 +18,13 @@ loop
 
 Enter a message at the `You:` prompt. To stop, enter `/exit`, `/quit`, or `q`.
 
-The interactive CLI processes one submitted request at a time. The Python interfaces described
-below also support asynchronous input and response collection for applications that coordinate
-their own tasks.
+The editor stays available while the agent works. Submitted messages and commands queue in order; each request finishes before the next begins. `/status` immediately reports whether Loop is idle, working, or waiting for a response, along with the number of queued inputs.
+
+When a tool, command, or recovery operation asks a question, press Enter on an empty editor or use `/respond` to open that question's input prompt. Text already queued for the conversation never becomes an approval. An unsent editor draft stays intact when a question arrives. Startup questions appear before ordinary conversation input begins.
+
+Up to 16 inputs may wait behind active work. A full queue explicitly rejects further inputs. Queued inputs remain in memory until execution begins; attached paths are resolved and snapshotted at that point. Exit, execution failure, and workspace replacement cancel unexecuted inputs and report their count. A queued input does not survive an application crash.
+
+Exit stops admission and cancels pending questions. Loop closes an interrupted model stream and checks cancellation before new model requests and tool execution, then waits for owned work to settle before releasing its services. Active synchronous operations finish under their existing deadlines; unbounded custom tools can delay shutdown indefinitely. Such tools must impose their own deadlines. Immediate cancellation of arbitrary tools requires a cancellable execution contract rather than terminating their worker thread.
 
 ### Commands and completion
 
@@ -29,6 +33,8 @@ Terminal completion is available while typing. Use `/` for commands and their kn
 Command arguments use shell-like quoting and may be supplied by position, by name, or both, for example `/command first-value count=3 enabled=true`. Each value is decoded independently and then validated against the command function's annotated parameter model. Command completion offers remaining `name=` parameters and infers values for `Enum`, `Literal`, optional finite, and boolean annotations. A command can declare a dynamic domain with `Annotated`, for example `Annotated[str, CommandCompletion(provider=session_values)]` for a zero-argument session-value provider.
 
 Library authors can extend completion with `CompletionManager` and `CompletionAdapter`. Use `MarkerCompletionAdapter` for another marker, or implement `CompletionAdapter` for a custom keyword grammar. Each adapter owns its value source and activation rules.
+
+Live completion sources are available while the conversation is idle. Completion is suspended during active execution so it cannot read changing session, policy, or instruction state.
 
 ### Mention files and skills
 
@@ -223,6 +229,28 @@ sessions = SessionManager(interaction=console)
 async with aclosing(backend.get_response_async(input="Explain the result.", stream=True)) as events:
     response = await sessions.response_async(events)
 ```
+
+### Responsive conversation execution
+
+`SessionController` runs a synchronous conversation on one execution thread while its asyncio loop owns UI input and presentation. Build the conversation with the controller's `interaction` and `control`, and use the supplied mailbox reader for ordinary conversation input:
+
+```python
+from loop import ConsoleInteraction, Loop, SessionController
+
+
+async def chat(backend):
+    controller = SessionController(ConsoleInteraction())
+    conversation = Loop.create_default(
+        backend,
+        interaction=controller.interaction,
+        run_control=controller.control,
+    )
+    await controller.run(lambda receive: conversation.run(input_source=receive))
+```
+
+Each controller runs once. `stop()` can request shutdown from the UI or another thread; `running` stays true until owned execution has settled. Do not directly mutate conversation services while it runs. Synchronous interaction adapters continue to use the existing direct `Loop.run()` path. `ApplicationRuntime` selects mailbox execution when its UI implements `AsyncInteractionInput` and refuses to close services while execution is active.
+
+`Interaction.terminal_context()` reserves stdin for operations that read the terminal directly, such as administrator authentication. Synchronous adapters need no handoff. The mailbox UI asks for an explicit handoff, suspends its editor, and restores it after the scope exits. Questions inside that scope still use their normal explicit confirmation; handing over the terminal does not grant permission for an operation.
 
 ## Context-aware tools
 

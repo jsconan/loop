@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Mapping
 from types import TracebackType
@@ -9,9 +10,10 @@ from typing import Self
 
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
+from ..conversation import SessionController
 from ..execution import CommandExecutionService
 from ..instructions import InstructionsManager
-from ..interaction import Interaction
+from ..interaction import AsyncInteractionInput, Interaction
 from ..loop import Loop
 from ..permissions import PermissionManager
 from ..session import SessionManager, SQLiteSessionStore
@@ -40,6 +42,8 @@ class ApplicationRuntime:
         logging_handler (logging.Handler | None): Owned process-global log handler.
         cleanup_callbacks (list[Callable[[], object]] | None): Acquired-resource cleanup actions in
             acquisition order. Defaults to telemetry and optional logging cleanup.
+        session_controller (SessionController | None): Optional responsive conversation owner.
+            Defaults to the synchronous loop for legacy interaction adapters.
     """
 
     _loop: Loop
@@ -48,6 +52,7 @@ class ApplicationRuntime:
     _logging_handler: logging.Handler | None
     _cleanup_callbacks: list[Callable[[], object]]
     _closed: bool
+    _session_controller: SessionController | None
 
     def __init__(
         self,
@@ -57,8 +62,10 @@ class ApplicationRuntime:
         *,
         logging_handler: logging.Handler | None = None,
         cleanup_callbacks: list[Callable[[], object]] | None = None,
+        session_controller: SessionController | None = None,
     ) -> None:
         self._loop = loop
+        self._session_controller = session_controller
         self._telemetry = telemetry
         self._shutdown_timeout = shutdown_timeout
         self._logging_handler = logging_handler
@@ -106,6 +113,14 @@ class ApplicationRuntime:
         """
         if workspace.id is None:
             raise ValueError("Application runtime requires an initialized workspace.")
+        session_controller = (
+            SessionController(interaction)
+            if isinstance(interaction, AsyncInteractionInput)
+            else None
+        )
+        active_interaction = (
+            session_controller.interaction if session_controller is not None else interaction
+        )
         cleanup_callbacks = []
         try:
             root_logger = logging.getLogger()
@@ -157,13 +172,13 @@ class ApplicationRuntime:
                 user_configuration_path=paths.user_permissions,
                 audit_path=paths.permissions_audit,
                 workspace_id=workspace.id,
-                interaction=interaction,
+                interaction=active_interaction,
             )
             cls._track_close(permission_manager, cleanup_callbacks)
             execution_service = CommandExecutionService.for_host()
             execution_tracked = cls._track_close(execution_service, cleanup_callbacks)
             tool_registry = create_default_tool_registry(
-                interaction=interaction,
+                interaction=active_interaction,
                 permission_manager=permission_manager,
                 settings=ToolRuntimeSettings(
                     user_agent=settings.web.user_agent,
@@ -176,7 +191,7 @@ class ApplicationRuntime:
             cls._track_close(tool_registry, cleanup_callbacks)
             loop = Loop.create_default(
                 backend,
-                interaction=interaction,
+                interaction=active_interaction,
                 tool_registry=tool_registry,
                 working_directory=workspace.working_directory,
                 instructions_manager=InstructionsManager.discover(
@@ -186,7 +201,7 @@ class ApplicationRuntime:
                 ),
                 permission_manager=permission_manager,
                 session_manager=SessionManager(
-                    interaction=interaction,
+                    interaction=active_interaction,
                     session_store=session_store,
                     workspace_id=workspace.id,
                 ),
@@ -204,6 +219,7 @@ class ApplicationRuntime:
                 compaction_threshold=settings.loop.compaction_threshold,
                 prompt_on_recoverable_error=settings.loop.prompt_on_recoverable_error,
                 max_agent_turns=settings.loop.max_agent_turns,
+                run_control=session_controller.control if session_controller is not None else None,
                 main_app=main_app,
                 refresh_sandbox_backend=getattr(execution_service, "refresh_backend", None),
             )
@@ -213,6 +229,7 @@ class ApplicationRuntime:
                 settings.telemetry.shutdown_timeout,
                 logging_handler=logging_handler,
                 cleanup_callbacks=cleanup_callbacks,
+                session_controller=session_controller,
             )
             loop.register_command_provider(
                 ConfigurationCommands(
@@ -246,8 +263,24 @@ class ApplicationRuntime:
         self.close()
 
     def run(self) -> None:
-        """Run the composed interactive loop."""
-        self._loop.run()
+        """Run the composed loop with responsive input when the UI supports it.
+
+        Raises:
+            RuntimeError: If a mailbox controller is reused or an event loop is already running.
+            BaseException: If the conversation or UI fails after owned execution settles.
+        """
+        if self._session_controller is None:
+            self._loop.run()
+        else:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                raise RuntimeError("Synchronous runtime.run() cannot run inside an event loop.")
+            asyncio.run(
+                self._session_controller.run(lambda receive: self._loop.run(input_source=receive))
+            )
 
     def apply_configuration(self, path: str, settings: ApplicationSettings) -> str:
         """Apply one validated configuration change to the active runtime.
@@ -315,16 +348,23 @@ class ApplicationRuntime:
         )
 
     def stop(self) -> None:
-        """Record an interrupted application shutdown."""
+        """Request graceful conversation shutdown and record the interruption."""
+        if self._session_controller is not None:
+            self._session_controller.stop()
         telemetry_activity("application.stopping", severity="info", reason="interrupted")
 
     def close(self) -> None:
         """Record shutdown and deterministically release every owned resource.
 
         Raises:
+            RuntimeError: If conversation execution has not yet settled.
             TimeoutError: If telemetry cannot flush and shut down within its configured timeout.
             BaseException: The first resource-specific cleanup failure after all cleanup is tried.
         """
+        if self._session_controller is not None and self._session_controller.running:
+            raise RuntimeError(
+                "Wait for conversation execution to settle before closing the runtime."
+            )
         if self._closed:
             return
         self._closed = True

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import ExitStack
 from datetime import datetime
 from time import perf_counter, sleep
 
 from .. import constants
 from ..backend import Backend, BackendError, BackendNotFoundError, BackendRepetitionError
 from ..compaction import ContextCompaction
+from ..control import RunControl
 from ..errors import Problem, log_problem
 from ..instructions import InstructionBudgetExceededError, InstructionsManager
 from ..interaction import Interaction
@@ -56,6 +58,8 @@ class AgentRunner:
             the turn limit (unlimited). Defaults to ``25``.
         prompt_on_recoverable_error (bool): Whether exhausted recoverable backend failures should
             be offered to the user for another attempt.
+        run_control (RunControl | None): Optional cooperative stop signal. Active synchronous tools
+            settle before execution observes cancellation at its next safe boundary.
 
     Raises:
         ValueError: If ``max_turns`` is negative.
@@ -75,6 +79,7 @@ class AgentRunner:
     _max_turns: int
     _prompt_on_recoverable_error: bool
     _file_observations: FileObservations | None
+    _run_control: RunControl | None
 
     def __init__(
         self,
@@ -92,6 +97,7 @@ class AgentRunner:
         debug: bool = False,
         max_turns: int = constants.DEFAULT_AGENT_MAX_TURNS,
         prompt_on_recoverable_error: bool = True,
+        run_control: RunControl | None = None,
     ) -> None:
         if max_turns < 0:
             raise ValueError("Agent max turns must be non-negative.")
@@ -108,6 +114,7 @@ class AgentRunner:
         self._debug = debug
         self._max_turns = max_turns
         self._prompt_on_recoverable_error = prompt_on_recoverable_error
+        self._run_control = run_control
         self._file_observations = None
 
     @property
@@ -282,6 +289,10 @@ class AgentRunner:
 
         Returns:
             AgentRunResult: Final response, completed turn count, and termination reason.
+
+        Raises:
+            KeyboardInterrupt: If the configured control requests a stop.
+            SessionExecutionConflictError: If another owner is executing this logical session.
         """
         with self._session_manager.execution(), telemetry_span():
             telemetry_activity("agent.run.started", component="agent_runner")
@@ -299,7 +310,12 @@ class AgentRunner:
 
         Returns:
             AgentRecoveryStatus: Recovered run result and whether unresolved recovery remains.
+
+        Raises:
+            KeyboardInterrupt: If the configured control requests a stop.
+            SessionExecutionConflictError: If another owner is executing this logical session.
         """
+        self._checkpoint()
         state = self._session_manager.recovery_state
         if state is None:
             return AgentRecoveryStatus(pending=False)
@@ -394,6 +410,7 @@ class AgentRunner:
                     tools=tools,
                 )
             tools.extend(executions)
+            self._checkpoint()
 
             if 0 < self._max_turns <= turns_since_confirmation:
                 prompt = (
@@ -427,6 +444,8 @@ class AgentRunner:
 
         Raises:
             ValueError: If a requested tool call is not present in canonical session context.
+            KeyboardInterrupt: If the configured control requests a stop.
+            SessionExecutionConflictError: If another owner is executing this logical session.
         """
         if not response.tool_calls:
             return ()
@@ -459,6 +478,7 @@ class AgentRunner:
         present: bool,
     ) -> ToolExecutionMetrics:
         """Execute, trace, and persist one tool request inside its correlation span."""
+        self._checkpoint()
         telemetry_trace_event(
             "tool.request",
             payload={
@@ -470,6 +490,12 @@ class AgentRunner:
         if present:
             self._session_manager.add_tool_call_event(tool_call.call_id)
         self._interaction.tool_call(tool_call.name, tool_call.arguments)
+
+        def execution_started() -> None:
+            """Honor a stop after approval and before recording the execution boundary."""
+            self._checkpoint()
+            self._session_manager.record_tool_execution_started(tool_call.call_id)
+
         tool_result, duration = self._agent.tools.call_with_timing(
             tool_call.name,
             tool_call.arguments,
@@ -482,9 +508,7 @@ class AgentRunner:
                 if self._file_observations is not None
                 else {}
             ),
-            execution_started=lambda call_id=tool_call.call_id: (
-                self._session_manager.record_tool_execution_started(call_id)
-            ),
+            execution_started=execution_started,
         )
         if self._file_observations is not None:
             self._file_observations.observe_result(tool_call, tool_result, include_reads=False)
@@ -545,12 +569,14 @@ class AgentRunner:
         Raises:
             BackendError: If the backend cannot produce a complete response.
             ValueError: If neither the selection nor backend provides a model.
+            KeyboardInterrupt: If the configured control requests a stop.
         """
         with telemetry_span():
             return self._query()
 
     def _query(self, recovery: str | None = None) -> Response:
         """Request and collect one response inside the active model-operation span."""
+        self._checkpoint()
         selected_model = self._model_selection.effective
         snapshot = self._instructions_manager.prepare(self._agent, recovery=recovery)
         self._session_manager.update_instruction_state(
@@ -559,6 +585,7 @@ class AgentRunner:
         )
         self._model_selection.synchronize_session()
         self._compaction.compact_if_needed(snapshot)
+        self._checkpoint()
         started_at = perf_counter()
         first_chunk_at = None
         model_context = self._backend.prepare_context(self._session_manager.model_context)
@@ -578,13 +605,20 @@ class AgentRunner:
         def measured_events():
             nonlocal first_chunk_at
             for event in events:
+                self._checkpoint()
                 if first_chunk_at is None:
                     first_chunk_at = perf_counter()
                 yield event
 
-        response = self._session_manager.response(
-            measured_events(), debug=self._debug, interaction=self._interaction
-        )
+        with ExitStack() as resources:
+            close_stream = getattr(events, "close", None)
+            if callable(close_stream):
+                resources.callback(close_stream)
+            response = self._session_manager.response(
+                measured_events(),
+                debug=self._debug,
+                interaction=self._interaction,
+            )
         completed_at = perf_counter()
         response.metrics = ResponseMetrics(
             duration_seconds=completed_at - started_at,
@@ -643,6 +677,7 @@ class AgentRunner:
         """Request one response while escalating exhausted failures to the user."""
         recovery = None
         while True:
+            self._checkpoint()
             try:
                 if recovery is None:
                     return self.query()
@@ -688,7 +723,15 @@ class AgentRunner:
                 if error.retry_after is not None and error.retry_after > 0:
                     delay = min(error.retry_after, 60.0)
                     self._interaction.info(f"Retrying in {delay:g} seconds...")
-                    sleep(delay)
+                    if self._run_control is None:
+                        sleep(delay)
+                    else:
+                        self._run_control.wait(delay)
+
+    def _checkpoint(self) -> None:
+        """Honor optional cooperative stop requests before a new execution boundary."""
+        if self._run_control is not None:
+            self._run_control.checkpoint()
 
     def _report_backend_error(self, error: BackendError) -> None:
         """Display a normalized backend failure and useful diagnostic identifiers."""

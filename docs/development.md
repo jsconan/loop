@@ -45,6 +45,8 @@ src/loop/commands/      User-command definitions and dispatch
 src/loop/compaction/    Context compaction
 src/loop/completion/    Declarative completion models, adapters, and aggregation
 src/loop/configuration/ Configuration management, models, and commands
+src/loop/control.py     Cooperative stop checkpoints and retry waits
+src/loop/conversation/  Serialized execution owner, input mailbox, and UI dispatch
 src/loop/constants.py   Shared application constants
 src/loop/errors.py      Application-wide problem reporting
 src/loop/interaction/   Input/output interfaces, console input, and response presentation
@@ -63,3 +65,9 @@ src/loop/tools/         Built-in tool implementations
 src/loop/utils/         Common utilities
 src/loop/workspace/     Workspace discovery, identity, catalog, and commands
 ```
+
+## Conversation ownership
+
+The responsive runtime has one execution thread for conversation services and one asyncio UI owner. Acknowledged calls keep presentation on the UI thread, and a bounded mailbox applies backpressure to output producers. Conversation inputs have a separate bounded queue; questions and approvals use their own result futures and never read that queue. A terminal scope suspends the ordinary editor before direct administrator authentication.
+
+Completion providers share an ownership gate with execution and only inspect live state while the execution owner is waiting for input. Stop requests revoke pending input, prevent new model and tool boundaries, close response streams, and drain interaction before resources are closed. Tool results that have already completed are persisted before the next stop checkpoint. Native command supervisors retain their existing deadlines and descendant cleanup. Arbitrary synchronous tools must provide their own bounded execution; Python threads are not forcibly terminated.

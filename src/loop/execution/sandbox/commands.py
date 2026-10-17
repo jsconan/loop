@@ -144,11 +144,12 @@ class SandboxCommands:
             nonlocal setup_approved
             setup_approved = False
             try:
-                return manage_setup(
-                    operation,
-                    lambda description: review(description, operation),
-                    main_app=self._main_app,
-                )
+                with context.interaction.terminal_context():
+                    return manage_setup(
+                        operation,
+                        lambda description: review(description, operation),
+                        main_app=self._main_app,
+                    )
             finally:
                 if setup_approved and self._refresh_backend is not None:
                     self._refresh_backend()

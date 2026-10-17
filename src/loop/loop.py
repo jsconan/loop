@@ -17,6 +17,7 @@ from .completion import (
     MarkerCompletionAdapter,
 )
 from .configuration import ApplicationSettings
+from .control import RunControl
 from .errors import Problem, log_problem
 from .execution.sandbox import SandboxCommands
 from .instructions import InstructionsManager, RuntimeEnvironment, SkillCommands
@@ -54,6 +55,8 @@ class Loop:
             default owned by this loop. Defaults to ``False`` for explicitly assembled loops.
         skill_hints_enabled (bool): Whether ``$skill`` references prioritize matching metadata for
             one default-configured request. Defaults to ``False`` for explicitly assembled loops.
+        run_control (RunControl | None): Optional stop signal to prevent automatic naming after
+            interruption. Defaults to no external stop signal.
 
     """
 
@@ -70,6 +73,7 @@ class Loop:
     _agent_runner: AgentRunner
     _owns_session_name_generator: bool
     _skill_hints_enabled: bool
+    _run_control: RunControl | None
 
     def __init__(
         self,
@@ -82,6 +86,7 @@ class Loop:
         working_directory: Path | PathReference,
         owns_session_name_generator: bool = False,
         skill_hints_enabled: bool = False,
+        run_control: RunControl | None = None,
     ) -> None:
         self._agent_runner = agent_runner
         self._agent = agent_runner.agent
@@ -94,6 +99,7 @@ class Loop:
         self._session_name_generator = session_name_generator
         self._owns_session_name_generator = owns_session_name_generator
         self._skill_hints_enabled = skill_hints_enabled
+        self._run_control = run_control
         self._mention_manager = mention_manager
         self._instructions_manager = agent_runner.instructions_manager
         self._permission_manager = agent_runner.permission_manager
@@ -125,6 +131,7 @@ class Loop:
         compaction_threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
         prompt_on_recoverable_error: bool = True,
         max_agent_turns: int = constants.DEFAULT_AGENT_MAX_TURNS,
+        run_control: RunControl | None = None,
         main_app: bool = False,
         refresh_sandbox_backend: Callable[[], None] | None = None,
     ) -> Self:
@@ -156,6 +163,8 @@ class Loop:
             compaction_threshold (float): Automatic compaction threshold.
             prompt_on_recoverable_error (bool): Whether recoverable errors prompt after retries.
             max_agent_turns (int): Maximum turns, or zero for unlimited.
+            run_control (RunControl | None): Optional cooperative stop signal for model and tool
+                boundaries. Defaults to no external cancellation signal.
             main_app (bool): Enable direct main-app terminal management review; False
                 (default) prevents library command dispatch from elevating.
             refresh_sandbox_backend (Callable[[], None] | None): Reselect the command execution
@@ -246,6 +255,7 @@ class Loop:
             stream=stream,
             debug=debug,
             max_turns=max_agent_turns,
+            run_control=run_control,
             prompt_on_recoverable_error=prompt_on_recoverable_error,
         )
         providers = (
@@ -297,6 +307,7 @@ class Loop:
             working_directory=directory_reference,
             owns_session_name_generator=owns_name_generator,
             skill_hints_enabled=skill_hints_enabled,
+            run_control=run_control,
         )
 
     @property
@@ -550,11 +561,26 @@ class Loop:
         """
         self._model_selection.restore(model)
 
-    def run(self):
-        """Run the conversation until the user requests to exit."""
+    def run(self, *, input_source: Callable[[CompletionManager], object] | None = None) -> None:
+        """Run the conversation until the user requests to exit.
+
+        Args:
+            input_source (Callable[[CompletionManager], object] | None): Optional mailbox reader
+                for ordinary conversation input. It receives the live completion manager and
+                returns text or ``False`` to exit. Nested prompts still use the interaction.
+                Defaults to synchronous interaction prompts.
+
+        Raises:
+            KeyboardInterrupt: If the configured stop signal interrupts agent execution.
+            WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
+        """
         recovery_pending = self._recover_session()
         while not self._command_manager.exit_requested:
-            user_input = self._interaction.prompt(completer=self._completion_manager)
+            user_input = (
+                self._interaction.prompt(completer=self._completion_manager)
+                if input_source is None
+                else input_source(self._completion_manager)
+            )
             if user_input is False:
                 break
             session = self.session
@@ -654,6 +680,8 @@ class Loop:
         if result.stop_reason != "completed":
             return
 
+        if self._run_control is not None:
+            self._run_control.checkpoint()
         if self._session_manager.session.has_initial_name():
             self._session_manager.generate_session_name(self._session_name_generator)
 

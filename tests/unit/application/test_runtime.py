@@ -1,13 +1,15 @@
 """Verify application runtime composition and shutdown."""
 
+import asyncio
 import gc
 import logging
 import warnings
-from unittest.mock import Mock, call
+from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
 
 import loop.application.runtime as runtime_module
+from loop import ConsoleInteraction
 from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.application.runtime import ApplicationRuntime
@@ -494,3 +496,81 @@ def test_context_close_releases_real_sqlite_connection_without_resource_warning(
         gc.collect()
 
     assert not [warning for warning in caught if warning.category is ResourceWarning]
+
+
+def test_async_runtime_binds_all_services_to_its_controller(dependencies, assembled, monkeypatch):
+    """Async UIs use one mailbox and stop control across the complete service graph."""
+    workspace, paths, workspace_paths, settings = assembled
+    source = MagicMock(spec=ConsoleInteraction)
+    controller = Mock()
+    controller.running = False
+    receive = Mock()
+
+    async def run(conversation):
+        """Execute the runtime callback through its supplied ordinary-input reader."""
+        conversation(receive)
+
+    controller.run = AsyncMock(side_effect=run)
+    create = Mock(return_value=controller)
+    monkeypatch.setattr(runtime_module, "SessionController", create)
+    runtime = ApplicationRuntime.create(
+        workspace,
+        paths,
+        workspace_paths,
+        settings,
+        Mock(),
+        Mock(),
+        source,
+    )
+    active = dependencies["Loop"].create_default.return_value
+    try:
+        runtime.run()
+        runtime.stop()
+    finally:
+        runtime.close()
+
+    create.assert_called_once_with(source)
+    for dependency in ("PermissionManager", "SessionManager", "create_default_tool_registry"):
+        assert dependencies[dependency].call_args.kwargs["interaction"] is controller.interaction
+    assert (
+        dependencies["Loop"].create_default.call_args.kwargs["interaction"]
+        is controller.interaction
+    )
+    assert dependencies["Loop"].create_default.call_args.kwargs["run_control"] is controller.control
+    active.run.assert_called_once_with(input_source=receive)
+    controller.stop.assert_called_once_with()
+    controller.run.assert_awaited_once()
+
+
+def test_runtime_refuses_to_close_services_while_execution_is_active():
+    """Owned resources stay live until conversation execution has settled."""
+    controller = Mock(running=True)
+    resource = Mock()
+    runtime = ApplicationRuntime(
+        Mock(), Mock(), 1, cleanup_callbacks=[resource], session_controller=controller
+    )
+
+    with pytest.raises(RuntimeError, match="settle before closing"):
+        runtime.close()
+    resource.assert_not_called()
+    controller.running = False
+    runtime.close()
+    resource.assert_called_once_with()
+
+
+def test_runtime_rejects_nested_event_loops_before_creating_a_conversation_coroutine():
+    """An invalid synchronous entry point cannot leak an unawaited controller coroutine."""
+    controller = Mock(running=False)
+    controller.run = AsyncMock()
+    runtime = ApplicationRuntime(
+        Mock(), Mock(), 1, cleanup_callbacks=[], session_controller=controller
+    )
+
+    async def scenario():
+        """Attempt the synchronous wrapper from an already running event loop."""
+        with pytest.raises(RuntimeError, match="cannot run inside an event loop"):
+            runtime.run()
+
+    asyncio.run(scenario())
+    runtime.close()
+    controller.run.assert_not_called()

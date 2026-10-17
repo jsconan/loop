@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
-from contextlib import AbstractContextManager
+from collections.abc import Generator, Iterable, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 from prompt_toolkit.completion import Completer
@@ -363,3 +363,15 @@ class InteractionOutput(ABC):
 
 class Interaction(InteractionInput, InteractionOutput):
     """Combine synchronous input and output for existing interaction adapters."""
+
+    @contextmanager
+    def terminal_context(self) -> Generator[None]:
+        """Reserve exclusive terminal access for a directly interactive operation.
+
+        Synchronous adapters need no handoff. Mailbox adapters suspend the ordinary editor
+        before entering this scope, preserving explicit consent and direct authentication.
+
+        Yields:
+            None: Control while the operation owns terminal input.
+        """
+        yield
