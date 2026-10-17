@@ -1,10 +1,11 @@
 """Tests for terminal-backed user interaction."""
 
+import asyncio
 import json
 import sys
 import termios
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from prompt_toolkit.completion import CompleteEvent, DummyCompleter
@@ -367,6 +368,146 @@ def test_prompt_returns_false_when_the_prompt_is_interrupted(error):
     session.prompt.side_effect = error
 
     assert ConsoleInteraction(session=session).prompt() is False
+
+
+def test_prompt_async_forwards_native_async_input_options():
+    """Async input preserves masking and completion without invoking blocking input."""
+    session = Mock()
+    session.prompt_async = AsyncMock(return_value="  answer  \n")
+    completer = DummyCompleter()
+
+    assert (
+        asyncio.run(
+            ConsoleInteraction(session=session).prompt_async(
+                "Question:", completer=completer, secret=True
+            )
+        )
+        == "answer"
+    )
+    session.prompt_async.assert_awaited_once_with(
+        "Question: ", completer=completer, complete_in_thread=True, is_password=True
+    )
+    session.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("answers", "options", "expected", "warnings"),
+    [
+        (["  ", "answer"], {}, "answer", ["Please enter a message!"]),
+        ([""], {"default": False}, False, []),
+        ([""], {"default": "default"}, "default", []),
+        ([" Q "], {}, False, []),
+        ([" EXIT "], {"exit_commands": "exit"}, False, []),
+        ([" QUIT "], {"exit_commands": ("EXIT", "QUIT")}, False, []),
+        (["q"], {"exit_commands": None}, "q", []),
+        (["answer"], {"message": ""}, "answer", []),
+        (["2"], {"choices": {"first": "First", "second": "Second"}}, "second", []),
+        (["SECOND"], {"choices": {"first": "First", "second": "Second"}}, "second", []),
+        (["B"], {"choices": ["first", "second"], "index": ["a", "b"]}, "second", []),
+        (
+            ["unknown", "first"],
+            {"choices": ["first", "second"]},
+            "first",
+            ["Select one of the listed choices by index or value."],
+        ),
+    ],
+)
+def test_prompt_async_preserves_input_interpretation(
+    answers, options, expected, warnings, monkeypatch
+):
+    """Async reads retain choice constraints, retry warnings, defaults, and exit handling."""
+    session = Mock()
+    session.prompt_async = AsyncMock(side_effect=answers)
+    warning = Mock()
+    monkeypatch.setattr(ConsoleInteraction, "warning", warning)
+    interaction = ConsoleInteraction(session=session, choices_session=session)
+
+    assert asyncio.run(interaction.prompt_async(**options)) == expected
+    assert session.prompt_async.await_count == len(answers)
+    assert warning.call_args_list == [call(message) for message in warnings]
+    session.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_prompt_async_confirms_a_single_choice_asynchronously(approved, monkeypatch):
+    """Singleton catalogs await explicit confirmation without opening a blocking prompt."""
+    confirmation = AsyncMock(return_value=approved)
+    monkeypatch.setattr(ConsoleInteraction, "confirm_async", confirmation)
+    session = Mock()
+    session.prompt_async = AsyncMock()
+    interaction = ConsoleInteraction(choices_session=session)
+
+    result = asyncio.run(interaction.prompt_async(choices={"id": "Only choice"}))
+
+    assert result == ("id" if approved else False)
+    confirmation.assert_awaited_once_with("Use 'Only choice'?", default=False)
+    session.prompt_async.assert_not_awaited()
+    session.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, EOFError])
+def test_prompt_async_returns_false_for_terminal_interruption(error):
+    """Terminal interruption and end-of-file preserve the existing exit sentinel."""
+    session = Mock()
+    session.prompt_async = AsyncMock(side_effect=error)
+
+    assert asyncio.run(ConsoleInteraction(session=session).prompt_async()) is False
+    session.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"index": {}}, "index requires choices"),
+        ({"choices": []}, "choices cannot be empty"),
+        ({"choices": ["first", "second"], "index": ["a", "q"]}, "exit commands"),
+        ({"choices": ["only"], "completer": DummyCompleter()}, "choices cannot be combined"),
+    ],
+)
+def test_prompt_async_rejects_invalid_choices_before_reading(options, message):
+    """Async input uses the same unambiguous choice validation as synchronous input."""
+    session = Mock()
+    session.prompt_async = AsyncMock()
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(
+            ConsoleInteraction(session=session, choices_session=session).prompt_async(**options)
+        )
+
+    session.prompt_async.assert_not_awaited()
+    session.prompt.assert_not_called()
+
+
+def test_prompt_async_allows_output_and_can_be_cancelled_while_waiting(capsys):
+    """Waiting for async input leaves output usable and propagates task cancellation."""
+    session = Mock()
+    interaction = ConsoleInteraction(session=session, markdown=False)
+
+    async def scenario():
+        """Suspend terminal input deterministically before cancellation."""
+        waiting = asyncio.Event()
+
+        async def read(*_args, **_kwargs):
+            """Wait for cancellation at the native async input boundary."""
+            waiting.set()
+            await asyncio.Event().wait()
+
+        session.prompt_async = AsyncMock(side_effect=read)
+        task = asyncio.create_task(interaction.prompt_async())
+        try:
+            await waiting.wait()
+            interaction.answer("Still working")
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert "Still working" in capsys.readouterr().out
+    session.prompt.assert_not_called()
 
 
 def test_user_message_has_a_console_presentation(capsys):
@@ -1156,3 +1297,67 @@ def test_confirm_reads_input_when_the_terminal_cannot_be_flushed(monkeypatch):
 
     assert ConsoleInteraction(console=console).confirm("Continue?") is True
     ask.assert_called_once_with("Continue?", default=False, console=console)
+
+
+@pytest.mark.parametrize(
+    ("answer", "default", "expected"),
+    [
+        ("Y", False, True),
+        ("yes", False, True),
+        ("N", True, False),
+        ("no", True, False),
+        ("", False, False),
+        ("", True, True),
+    ],
+)
+def test_confirm_async_requires_an_explicit_choice_or_its_default(answer, default, expected):
+    """Async confirmation preserves explicit yes/no aliases and the empty-input default."""
+    session = Mock()
+    session.prompt_async = AsyncMock(return_value=answer)
+
+    assert (
+        asyncio.run(
+            ConsoleInteraction(choices_session=session).confirm_async("Continue?", default=default)
+        )
+        is expected
+    )
+    session.prompt_async.assert_awaited_once()
+    session.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, EOFError])
+def test_confirm_async_declines_when_terminal_input_is_interrupted(error):
+    """An interrupted async approval never grants permission, even with a true default."""
+    session = Mock()
+    session.prompt_async = AsyncMock(side_effect=error)
+
+    assert (
+        asyncio.run(
+            ConsoleInteraction(choices_session=session).confirm_async("Continue?", default=True)
+        )
+        is False
+    )
+
+
+def test_confirm_async_flushes_typeahead_before_reading_a_fresh_decision(monkeypatch):
+    """Async approval discards pending terminal input before reading the exact new prompt."""
+    events = []
+    stdin = Mock()
+    stdin.isatty.return_value = True
+    stdin.fileno.return_value = 42
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(termios, "tcflush", lambda fd, queue: events.append(("flush", fd, queue)))
+    session = Mock()
+
+    async def read(*_args, **_kwargs):
+        """Record the approval read after the terminal queue has been flushed."""
+        events.append("read")
+        return "yes"
+
+    session.prompt_async = AsyncMock(side_effect=read)
+
+    assert (
+        asyncio.run(ConsoleInteraction(choices_session=session).confirm_async("Continue?")) is True
+    )
+    assert events == [("flush", 42, termios.TCIFLUSH), "read"]
+    session.prompt.assert_not_called()

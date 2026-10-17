@@ -16,6 +16,7 @@ __all__ = [
     "AnswerDelta",
     "ApplicationRuntime",
     "ApprovalChoice",
+    "AsyncInteractionInput",
     "AuthorizationResult",
     "Backend",
     "BackendAuthenticationError",
@@ -74,6 +75,8 @@ __all__ = [
     "InstructionSnapshot",
     "InstructionsManager",
     "Interaction",
+    "InteractionInput",
+    "InteractionOutput",
     "LoadedAgentInstructions",
     "Loop",
     "MarkerCompletionAdapter",
@@ -124,10 +127,12 @@ __all__ = [
     "ReasoningEffort",
     "RepetitionDetection",
     "Response",
+    "ResponseCollector",
     "ResponseCompleted",
     "ResponseEvent",
     "ResponseMetadata",
     "ResponseMetrics",
+    "ResponsePresenter",
     "RetentionPolicy",
     "RunCompletedEvent",
     "RunMetrics",
@@ -286,7 +291,14 @@ from .instructions import (
     Skill,
     SkillManager,
 )
-from .interaction import ConsoleInteraction, Interaction
+from .interaction import (
+    AsyncInteractionInput,
+    ConsoleInteraction,
+    Interaction,
+    InteractionInput,
+    InteractionOutput,
+    ResponsePresenter,
+)
 from .loop import Loop
 from .mentions import (
     MentionHandler,
@@ -374,6 +386,7 @@ from .permissions import (
     SessionTarget,
     UserPermissionConfiguration,
 )
+from .response import ResponseCollector
 from .session import (
     BackendSessionNameGenerator,
     Compaction,

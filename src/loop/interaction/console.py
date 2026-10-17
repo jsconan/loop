@@ -7,6 +7,7 @@ import sys
 import termios
 from collections.abc import Generator, Iterable, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import islice
 from pprint import pformat
 from typing import Any, Literal
@@ -35,7 +36,7 @@ from ..models import (
     ToolResultPresentationSpec,
 )
 from ..utils import ChoiceItem, choice_items, format_tool_call_arguments
-from .interaction import Interaction
+from .interaction import AsyncInteractionInput, Interaction
 from .models import ListMarker
 
 
@@ -85,7 +86,18 @@ class MarkdownStream:
         return sum(len(line) for line in lines[:final_start])
 
 
-class ConsoleInteraction(Interaction):
+@dataclass(frozen=True)
+class ConsolePrompt:
+    """Keep validated prompt state shared by synchronous and asynchronous readers."""
+
+    session: PromptSession[str]
+    message: str
+    completer: Completer | None
+    choices: tuple[ChoiceItem, ...] | None
+    exit_commands: tuple[str, ...]
+
+
+class ConsoleInteraction(Interaction, AsyncInteractionInput):
     """Interact with a user through a rich, editable process terminal.
 
     Args:
@@ -181,7 +193,6 @@ class ConsoleInteraction(Interaction):
         )
         self._plain_stream_has_output |= bool(delta)
 
-    # pylint: disable-next=too-many-branches
     def prompt(
         self,
         message: str | None = None,
@@ -194,7 +205,7 @@ class ConsoleInteraction(Interaction):
     ) -> object | False:
         """Prompt for a non-empty user message or an exit command.
 
-        The choice, completion, cancellation, and default-input paths deliberately share one loop.
+        Choice validation and input interpretation are shared with asynchronous prompts.
 
         Args:
             message (str | None): Prompt message displayed before reading input.
@@ -221,77 +232,159 @@ class ConsoleInteraction(Interaction):
             ValueError: If ``choices`` or ``index`` are invalid, or choices are used with a custom
                 ``completer``.
         """
+        prompt = self._prepare_prompt(message, completer, exit_commands, choices, index)
+        if prompt.choices is not None and len(prompt.choices) == 1:
+            choice = prompt.choices[0]
+            self.info(f"\nOnly one choice available: {choice.name}")
+            approved = self.confirm(f"Use '{choice.name}'?", default=False)
+            return choice.value if approved else False
+        while True:
+            try:
+                text = prompt.session.prompt(
+                    prompt.message,
+                    completer=prompt.completer,
+                    complete_in_thread=True,
+                    is_password=secret,
+                )
+            except (KeyboardInterrupt, EOFError):
+                return False
+            accepted, value = self._prompt_value(prompt, text, default)
+            if accepted:
+                return value
+
+    async def prompt_async(
+        self,
+        message: str | None = None,
+        completer: Completer | None = None,
+        exit_commands: str | Iterable[str] | None = "q",
+        choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
+        index: Iterable[str] | Mapping[object, str] | None = None,
+        default: object | None = None,
+        secret: bool = False,
+    ) -> object | False:
+        """Read a user message without blocking the event loop.
+
+        Preserve synchronous prompt choices, completion, defaults, and exit behavior.
+        Task cancellation propagates to the caller; terminal interruption returns ``False``.
+
+        Args:
+            message (str | None): Prompt message displayed before reading input.
+                Defaults to ``None`` for the default prompt.
+            completer (Completer | None): Optional input completer. Defaults to no completion.
+            exit_commands (str | Iterable[str] | None): Optional list of exit terms that end the
+                prompt. Defaults to ``"q"``.
+            choices (Iterable[str | ChoiceItem] | Mapping[object, str] | None): Optional selectable
+                values. Mapping keys are returned while their values are displayed and accepted as
+                input. One choice is confirmed directly, two through nine are shown as a numbered
+                list, and larger catalogs are arranged in columns. Defaults to ``None``.
+            index (Iterable[str] | Mapping[object, str] | None): Optional selection indexes to
+                display alongside each choice. If omitted, indexes are automatically generated as
+                numeric indexes. Defaults to ``None``.
+            default (object | None): Value returned for empty input, or ``None`` to require
+                non-empty input. Defaults to ``None``.
+            secret (bool): Whether entered text is masked. Defaults to ``False``.
+
+        Returns:
+            object | False: The selected value or entered message, or ``False`` when the user
+            requests to exit.
+
+        Raises:
+            ValueError: If ``choices`` or ``index`` are invalid, or choices are used with a custom
+                ``completer``.
+            asyncio.CancelledError: If the input task is cancelled.
+        """
+        prompt = self._prepare_prompt(message, completer, exit_commands, choices, index)
+        if prompt.choices is not None and len(prompt.choices) == 1:
+            choice = prompt.choices[0]
+            self.info(f"\nOnly one choice available: {choice.name}")
+            approved = await self.confirm_async(f"Use '{choice.name}'?", default=False)
+            return choice.value if approved else False
+        while True:
+            try:
+                text = await prompt.session.prompt_async(
+                    prompt.message,
+                    completer=prompt.completer,
+                    complete_in_thread=True,
+                    is_password=secret,
+                )
+            except (KeyboardInterrupt, EOFError):
+                return False
+            accepted, value = self._prompt_value(prompt, text, default)
+            if accepted:
+                return value
+
+    def _prepare_prompt(
+        self,
+        message: str | None,
+        completer: Completer | None,
+        exit_commands: str | Iterable[str] | None,
+        choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None,
+        index: Iterable[str] | Mapping[object, str] | None,
+    ) -> ConsolePrompt:
+        """Validate input choices and prepare their shared terminal presentation."""
         if index is not None and choices is None:
             raise ValueError("index requires choices.")
         normalized_choices = choice_items(choices, index=index) if choices is not None else None
-        choice_index = (
-            {choice.index.casefold(): choice.value for choice in normalized_choices}
-            if normalized_choices is not None
-            else None
-        )
         if isinstance(exit_commands, str):
-            exit_commands = exit_commands.strip()
-            if exit_commands:
-                exit_commands = (exit_commands.casefold(),)
-        elif exit_commands:
-            exit_commands = tuple(
-                command.strip().casefold() for command in exit_commands if command.strip()
-            )
-        if not exit_commands:
-            exit_commands = ()
-        if choice_index is not None and set(choice_index) & set(exit_commands):
+            exit_commands = (exit_commands,)
+        exits = tuple(
+            command.strip().casefold() for command in exit_commands or () if command.strip()
+        )
+        if normalized_choices is not None and {
+            choice.index.casefold() for choice in normalized_choices
+        } & set(exits):
             raise ValueError("selection indexes cannot conflict with exit commands.")
         session = self._session
         if normalized_choices is not None:
             session = self._choices_session
             if completer is not None:
                 raise ValueError("choices cannot be combined with a custom completer.")
-            if len(normalized_choices) == 1:
-                choice = normalized_choices[0]
-                self.info(f"\nOnly one choice available: {choice.name}")
-                return (
-                    choice.value if self.confirm(f"Use '{choice.name}'?", default=False) else False
+            if len(normalized_choices) > 1:
+                displayed_choices = {choice.value: choice.label for choice in normalized_choices}
+                if len(normalized_choices) < constants.COLUMNS_THRESHOLD:
+                    self.list(displayed_choices)
+                else:
+                    self.columns(displayed_choices)
+                completer = WordCompleter(
+                    [choice.name for choice in normalized_choices],
+                    ignore_case=True,
+                    sentence=True,
+                    match_middle=True,
                 )
-            displayed_choices = {choice.value: choice.label for choice in normalized_choices}
-            if len(normalized_choices) < constants.COLUMNS_THRESHOLD:
-                self.list(displayed_choices)
-            else:
-                self.columns(displayed_choices)
-            completer = WordCompleter(
-                [choice.name for choice in normalized_choices],
-                ignore_case=True,
-                sentence=True,
-                match_middle=True,
-            )
         if message is None:
             message = "\nYou:"
         message = str(message).rstrip()
-        while True:
-            try:
-                user_input = session.prompt(
-                    f"{message} " if message else "",
-                    completer=completer,
-                    complete_in_thread=True,
-                    is_password=secret,
-                ).strip()
-            except (KeyboardInterrupt, EOFError):
-                return False
-            if not user_input:
-                if default is not None:
-                    return default
-                self.warning("Please enter a message!")
-                continue
-            if user_input.casefold() in exit_commands:
-                return False
-            if normalized_choices is not None:
-                if user_input.casefold() in choice_index:
-                    return choice_index[user_input.casefold()]
-                for choice in normalized_choices:
-                    if user_input.casefold() == choice.name.casefold():
-                        return choice.value
-                self.warning("Select one of the listed choices by index or value.")
-                continue
-            return user_input
+        return ConsolePrompt(
+            session=session,
+            message=f"{message} " if message else "",
+            completer=completer,
+            choices=normalized_choices,
+            exit_commands=exits,
+        )
+
+    def _prompt_value(
+        self,
+        prompt: ConsolePrompt,
+        text: str,
+        default: object | None,
+    ) -> tuple[bool, object]:
+        """Interpret terminal input and report whether the prompt has been satisfied."""
+        user_input = text.strip()
+        if not user_input:
+            if default is not None:
+                return True, default
+            self.warning("Please enter a message!")
+            return False, None
+        normalized_input = user_input.casefold()
+        if normalized_input in prompt.exit_commands:
+            return True, False
+        if prompt.choices is not None:
+            for choice in prompt.choices:
+                if normalized_input in (choice.index.casefold(), choice.name.casefold()):
+                    return True, choice.value
+            self.warning("Select one of the listed choices by index or value.")
+            return False, None
+        return True, user_input
 
     def user(self, message: str) -> None:
         """Write a completed user message to the terminal.
@@ -755,6 +848,34 @@ class ConsoleInteraction(Interaction):
         """
         self._discard_pending_terminal_input()
         return Confirm.ask(message, default=default, console=self._console)
+
+    async def confirm_async(self, message: str, *, default: bool = False) -> bool:
+        """Request an explicit yes-or-no answer without blocking the event loop.
+
+        Discard pending terminal input before asking, as synchronous confirmation does. Empty
+        input uses the stated default; interruption or end-of-file declines the operation.
+
+        Args:
+            message (str): Confirmation question to display.
+            default (bool): Answer to use for empty input. Defaults to ``False``.
+
+        Returns:
+            bool: Whether the user approved the operation.
+
+        Raises:
+            asyncio.CancelledError: If the input task is cancelled.
+        """
+        self._discard_pending_terminal_input()
+        return (
+            await self.prompt_async(
+                message,
+                choices={True: "Yes", False: "No"},
+                index=("y", "n"),
+                default=default,
+                exit_commands=(),
+            )
+            is True
+        )
 
     @staticmethod
     def _discard_pending_terminal_input() -> None:

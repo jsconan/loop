@@ -3,7 +3,7 @@
 import json
 import logging
 from asyncio import current_task
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import AsyncIterable, Callable, Generator, Iterable
 from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from dataclasses import fields
@@ -11,14 +11,11 @@ from datetime import datetime
 from threading import Lock, get_ident
 from uuid import uuid7
 
-from ..backend.errors import BackendResponseError
 from ..errors import Problem, log_problem
 from ..instructions.models import CapturedInstruction
-from ..interaction import ConsoleInteraction, Interaction
+from ..interaction import ConsoleInteraction, Interaction, InteractionOutput, ResponsePresenter
 from ..models import (
     AgentRunStopReason,
-    AnswerCompleted,
-    AnswerDelta,
     CompactionResult,
     ContentArtifact,
     ContextReference,
@@ -27,18 +24,14 @@ from ..models import (
     ModelAssignment,
     ModelContextItem,
     Reasoning,
-    ReasoningCompleted,
-    ReasoningDelta,
     Response,
-    ResponseCompleted,
     ResponseEvent,
     RunMetrics,
     ToolCall,
-    ToolCallCompleted,
     ToolResult,
-    Usage,
 )
 from ..permissions import AuthorizationResult
+from ..response import ResponseCollector
 from ..telemetry import (
     TelemetryContext,
     telemetry_activity,
@@ -229,105 +222,71 @@ class SessionManager:
         events: Iterable[ResponseEvent],
         *,
         debug: bool = False,
-        interaction: Interaction | None = None,
+        interaction: InteractionOutput | None = None,
     ) -> Response:
         """Display and collect normalized response events.
 
+        Collection leaves session history and persistence unchanged. The event producer owns
+        stream cleanup on failure.
+
         Args:
             events (Iterable[ResponseEvent]): Response events to display and collect.
-            debug (bool): Whether to display every raw response event.
-            interaction (Interaction | None): Presentation override. Defaults to the configured
-                interaction.
+            debug (bool): Whether to display every raw response event. Defaults to ``False``.
+            interaction (InteractionOutput | None): Presentation override. Defaults to the
+                configured interaction.
 
         Returns:
             Response: The collected answer, reasoning, tool calls, items, usage, and model.
 
         Raises:
-            BackendResponseError: If the event sequence has no completion or more than one.
+            BackendResponseError: If completion is missing or any event follows completion.
         """
         output = interaction or self._interaction
-        reasoning = ""
-        answer = ""
-        tool_calls = []
-        items = ()
-        usage = None
-        model = None
-        structured_output = None
-        completed = False
-        response_observed = False
-        reasoning_started = False
-        answer_started = False
-
+        collector = ResponseCollector()
+        presenter = ResponsePresenter(output)
         with output.response_context():
             for event in events:
                 if debug:
                     output.debug(event)
+                collector.add(event)
+                presenter.present(event)
+        return collector.finish()
 
-                if completed:
-                    reason = (
-                        "more than one response completion"
-                        if isinstance(event, ResponseCompleted)
-                        else "an event after response completion"
-                    )
-                    raise BackendResponseError(
-                        f"Backend emitted {reason}.",
-                        provider="backend",
-                        operation="collect_response",
-                        response_started=True,
-                    )
+    async def response_async(
+        self,
+        events: AsyncIterable[ResponseEvent],
+        *,
+        debug: bool = False,
+        interaction: InteractionOutput | None = None,
+    ) -> Response:
+        """Present and collect an asynchronous normalized response stream.
 
-                if isinstance(event, ReasoningDelta):
-                    response_observed = True
-                    output.reasoning_delta(event.text)
-                    reasoning_started = True
-                    continue
-                if isinstance(event, AnswerDelta):
-                    response_observed = True
-                    output.answer_delta(event.text)
-                    answer_started = True
-                    continue
-                if isinstance(event, ReasoningCompleted):
-                    response_observed = True
-                    reasoning = event.text
-                    if not reasoning_started:
-                        output.reasoning(event.text)
-                    continue
-                if isinstance(event, AnswerCompleted):
-                    response_observed = True
-                    answer = event.text
-                    if not answer_started:
-                        output.answer(event.text)
-                    continue
-                if isinstance(event, ToolCallCompleted):
-                    response_observed = True
-                    tool_calls.append(event.call)
-                    continue
-                if isinstance(event, ResponseCompleted):
-                    completed = True
-                    items = event.items
-                    usage = event.usage
-                    model = event.model
-                    answer = event.answer
-                    reasoning = event.reasoning
-                    structured_output = event.structured_output
+        Collection does not mutate or persist the session. The event producer retains ownership
+        of its stream and must close it on failure or cancellation.
 
-        if not completed:
-            raise BackendResponseError(
-                "Backend response ended without an explicit completion.",
-                provider="backend",
-                operation="collect_response",
-                response_started=response_observed,
-            )
+        Args:
+            events (AsyncIterable[ResponseEvent]): Response events in backend order.
+            debug (bool): Whether to display every raw response event. Defaults to ``False``.
+            interaction (InteractionOutput | None): Output override. Defaults to the configured
+                interaction.
 
-        return Response(
-            answer=answer,
-            reasoning=reasoning,
-            tool_calls=tuple(tool_calls),
-            items=items,
-            usage=usage or Usage(),
-            model=model,
-            structured_output=structured_output,
-        )
+        Returns:
+            Response: Authoritative final content, tool calls, items, usage, and model.
+
+        Raises:
+            BackendResponseError: If completion is missing or any event follows completion.
+            asyncio.CancelledError: If the collecting task is cancelled.
+        """
+        output = interaction or self._interaction
+        collector = ResponseCollector()
+        presenter = ResponsePresenter(output)
+        with output.response_context():
+            async for event in events:
+                if debug:
+                    output.debug(event)
+                collector.add(event)
+                presenter.present(event)
+        return collector.finish()
 
     def replay(self, *, interaction: Interaction | None = None) -> None:
         """Display the active session timeline in its original durable order.

@@ -18,6 +18,10 @@ loop
 
 Enter a message at the `You:` prompt. To stop, enter `/exit`, `/quit`, or `q`.
 
+The interactive CLI processes one submitted request at a time. The Python interfaces described
+below also support asynchronous input and response collection for applications that coordinate
+their own tasks.
+
 ### Commands and completion
 
 Terminal completion is available while typing. Use `/` for commands and their known values, `@` for visible files and directories relative to the working directory, and `$` for discovered skill names. Matching is case-insensitive and accepts fragments at the beginning, middle, or end. File completion respects `.gitignore` and `.agentignore`; `/permissions` completes operations, scopes, decisions, limits, registered tools, and current rule identifiers.
@@ -169,6 +173,55 @@ async def main() -> None:
 
 
 asyncio.run(main())
+```
+
+### Input, presentation, and response collection
+
+`InteractionInput` defines synchronous prompts and confirmation. `InteractionOutput` defines
+presentation without reading input. `Interaction` combines both interfaces for existing adapters;
+the separate `AsyncInteractionInput` capability defines asynchronous prompts and confirmation.
+`ConsoleInteraction` implements all of them. Its `prompt_async()` and `confirm_async()` methods
+use native asynchronous terminal input with the same choices, completion, masking, defaults,
+and exit handling as synchronous prompts. Task cancellation propagates; terminal interruption
+or end-of-file returns `False`. Interrupted asynchronous confirmation declines the operation.
+Only one task should read a terminal's input at a time.
+
+`ResponseCollector` validates normalized backend events without a UI or session store. Feed it
+events with `add()`, exhaust the source, then call `finish()`:
+
+```python
+from loop import ResponseCollector
+
+collector = ResponseCollector()
+for event in backend.get_response(input="Explain the result."):
+    collector.add(event)
+response = collector.finish()
+```
+
+The explicit `ResponseCompleted` event supplies authoritative final text and metadata. Missing
+completion, duplicate completion, and any event after completion raise `BackendResponseError`.
+Unknown extension events before completion are ignored. Partial text is never returned as a
+completed response.
+
+`ResponsePresenter` renders accepted events through an `InteractionOutput`, suppressing repeated
+completed text for channels that already streamed. Create one presenter per response, use the
+output's `response_context()` to finalize rendering on success or failure, and validate each
+event with the collector before presenting it.
+
+`SessionManager.response()` coordinates collection and presentation for a synchronous iterable;
+`response_async()` does the same for an asynchronous iterable. Both accept an output-only
+`interaction` override, finalize presentation on failure or cancellation, and leave session
+history and persistence unchanged. The event producer owns stream cleanup; use `aclosing()`
+when consuming an asynchronous generator. Inside an async function:
+
+```python
+from contextlib import aclosing
+from loop import ConsoleInteraction, SessionManager
+
+console = ConsoleInteraction()
+sessions = SessionManager(interaction=console)
+async with aclosing(backend.get_response_async(input="Explain the result.", stream=True)) as events:
+    response = await sessions.response_async(events)
 ```
 
 ## Context-aware tools

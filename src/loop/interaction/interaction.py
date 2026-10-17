@@ -16,16 +16,8 @@ from ..utils import ChoiceItem
 from .models import ListMarker
 
 
-class Interaction(ABC):
-    """Provide semantically classified user interaction independently of a UI."""
-
-    @abstractmethod
-    def response_context(self) -> AbstractContextManager[None]:
-        """Create a presentation scope for one model response.
-
-        Returns:
-            AbstractContextManager[None]: Scope that finalizes response presentation on exit.
-        """
+class InteractionInput(ABC):
+    """Read user messages and explicit confirmations independently of presentation."""
 
     @abstractmethod
     def prompt(
@@ -64,6 +56,89 @@ class Interaction(ABC):
         Raises:
             ValueError: If choices or their selection indexes are invalid, or choices cannot be
                 combined with the supplied completer.
+        """
+
+    @abstractmethod
+    def confirm(self, message: str, *, default: bool = False) -> bool:
+        """Ask the user to approve an operation.
+
+        Args:
+            message (str): Confirmation question to display.
+            default (bool): Answer to use when the user enters no response.
+
+        Returns:
+            bool: Whether the user approved the operation.
+        """
+
+
+class AsyncInteractionInput(ABC):
+    """Provide optional native asynchronous input without changing synchronous adapters."""
+
+    @abstractmethod
+    async def prompt_async(
+        self,
+        message: str | None = None,
+        completer: Completer | None = None,
+        exit_commands: str | Iterable[str] | None = None,
+        choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
+        index: Iterable[str] | Mapping[object, str] | None = None,
+        default: object | None = None,
+        secret: bool = False,
+    ) -> object | False:
+        """Read user input without blocking the event loop.
+
+        Args:
+            message (str | None): Prompt message displayed before reading input.
+                Defaults to ``None``.
+            completer (Completer | None): Optional input completer. Defaults to no completion.
+            exit_commands (str | Iterable[str] | None): Optional list of exit terms that end the
+                prompt. Defaults to ``None``.
+            choices (Iterable[str | ChoiceItem] | Mapping[object, str] | None): Optional selectable
+                values. Mapping keys are returned while mapping values become displayed names.
+                Implementations may adapt their presentation to the catalog size. Defaults to
+                ``None``.
+            index (Iterable[str] | Mapping[object, str] | None): Optional indexes to display and
+                accept alongside choices. Defaults to automatic numeric indexes.
+            default (object | None): Value returned for empty input, or ``None`` to require
+                non-empty input. Defaults to ``None``.
+            secret (bool): Whether entered text must be masked by the interaction. Defaults to
+                ``False``.
+
+        Returns:
+            object | False: The selected value or stripped text entered by the user, or ``False``
+            when the user requests to exit.
+
+        Raises:
+            ValueError: If choices or their selection indexes are invalid, or choices cannot be
+                combined with the supplied completer.
+            asyncio.CancelledError: If the input task is cancelled.
+        """
+
+    @abstractmethod
+    async def confirm_async(self, message: str, *, default: bool = False) -> bool:
+        """Request approval without blocking the event loop.
+
+        Args:
+            message (str): Confirmation question to display.
+            default (bool): Answer to use when the user enters no response.
+
+        Returns:
+            bool: Whether the user approved the operation.
+
+        Raises:
+            asyncio.CancelledError: If the input task is cancelled.
+        """
+
+
+class InteractionOutput(ABC):
+    """Present user-visible output without reading input."""
+
+    @abstractmethod
+    def response_context(self) -> AbstractContextManager[None]:
+        """Create a presentation scope for one model response.
+
+        Returns:
+            AbstractContextManager[None]: Scope that finalizes response presentation on exit.
         """
 
     @abstractmethod
@@ -285,14 +360,6 @@ class Interaction(ABC):
     def conversation_ended(self) -> None:
         """Display that the conversation has ended."""
 
-    @abstractmethod
-    def confirm(self, message: str, *, default: bool = False) -> bool:
-        """Ask the user to approve an operation.
 
-        Args:
-            message (str): Confirmation question to display.
-            default (bool): Answer to use when the user enters no response.
-
-        Returns:
-            bool: Whether the user approved the operation.
-        """
+class Interaction(InteractionInput, InteractionOutput):
+    """Combine synchronous input and output for existing interaction adapters."""

@@ -47,13 +47,14 @@ src/loop/completion/    Declarative completion models, adapters, and aggregation
 src/loop/configuration/ Configuration management, models, and commands
 src/loop/constants.py   Shared application constants
 src/loop/errors.py      Application-wide problem reporting
-src/loop/interaction/   User interaction interfaces
+src/loop/interaction/   Input/output interfaces, console input, and response presentation
 src/loop/loop.py        Interactive conversation loop and streaming configuration
 src/loop/main.py        Application entry point and composition root
 src/loop/mentions/      User-mention resolution
 src/loop/model_selection/ Active model selection and model commands
 src/loop/models.py      Conversation and response models
 src/loop/permissions/   Permission capabilities, requests, and policy management
+src/loop/response.py    UI-independent normalized response collection and validation
 src/loop/session/       Session persistence contracts and implementations
 src/loop/telemetry/     Telemetry and operational logging
 src/loop/instructions/  Base agent policy, Agent Skills, catalog, and instruction management

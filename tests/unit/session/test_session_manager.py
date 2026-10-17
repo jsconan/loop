@@ -1,8 +1,9 @@
 """Tests for session coordination and persistence."""
 
+import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import aclosing, nullcontext
 from datetime import UTC, datetime
 from threading import Barrier, Event
 from types import SimpleNamespace
@@ -48,7 +49,7 @@ from loop import (
     Usage,
 )
 from loop.instructions import CapturedInstruction
-from loop.interaction import Interaction
+from loop.interaction import Interaction, InteractionOutput
 from loop.session import (
     PermissionEvent,
     RunCompletedEvent,
@@ -191,10 +192,30 @@ def test_manager_rejects_corrupt_reference_bytes_from_a_supplied_session():
     assert store.load_reference(version) is None
 
 
-def test_manager_response_uses_terminal_text_and_an_interaction_override():
+@pytest.fixture(params=["sync", "async"])
+def collect_response(request):
+    """Exercise identical presentation and validation contracts for both stream types."""
+
+    def collect(manager, events, **kwargs):
+        """Collect a supplied event sequence through the selected public entry point."""
+        if request.param == "sync":
+            return manager.response(events, **kwargs)
+
+        async def stream():
+            """Yield events through an asynchronous backend boundary."""
+            for event in events:
+                yield event
+
+        return asyncio.run(manager.response_async(stream(), **kwargs))
+
+    return collect
+
+
+def test_manager_response_uses_terminal_text_and_an_interaction_override(collect_response):
     """Response collection renders events and returns authoritative terminal metadata."""
     configured = response_interaction()
-    interaction = response_interaction()
+    interaction = MagicMock(spec=InteractionOutput)
+    interaction.response_context.return_value = nullcontext()
     manager = SessionManager(interaction=configured)
     tool_call = ToolCall(call_id="call", name="tool", arguments="{}", id="fc")
     items = (
@@ -220,7 +241,7 @@ def test_manager_response_uses_terminal_text_and_an_interaction_override():
         ),
     ]
 
-    response = manager.response(events, debug=True, interaction=interaction)
+    response = collect_response(manager, events, debug=True, interaction=interaction)
 
     assert response == Response(
         answer="  hello world  ",
@@ -246,17 +267,18 @@ def test_manager_response_uses_terminal_text_and_an_interaction_override():
     configured.response_context.assert_not_called()
 
 
-def test_manager_response_displays_completed_text_with_its_configured_interaction():
+def test_manager_response_displays_completed_text_with_its_configured_interaction(collect_response):
     """Completed response text is rendered through the manager's interaction."""
     interaction = response_interaction()
     manager = SessionManager(interaction=interaction)
 
-    response = manager.response(
+    response = collect_response(
+        manager,
         [
             ReasoningCompleted(text="think"),
             AnswerCompleted(text="answer"),
             ResponseCompleted(answer="answer", reasoning="think"),
-        ]
+        ],
     )
 
     assert response == Response(answer="answer", reasoning="think")
@@ -265,26 +287,141 @@ def test_manager_response_displays_completed_text_with_its_configured_interactio
     interaction.response_context.assert_called_once_with()
 
 
-def test_manager_response_defaults_missing_metadata():
+def test_manager_response_defaults_missing_metadata(collect_response):
     """A completion without metadata returns default response values."""
     interaction = response_interaction()
     manager = SessionManager(interaction=interaction)
 
-    response = manager.response([ResponseCompleted()])
+    response = collect_response(manager, [ResponseCompleted()])
 
     assert response == Response(answer="", reasoning="")
 
 
-def test_manager_response_rejects_missing_and_duplicate_completion_events():
+def test_manager_response_rejects_missing_and_duplicate_completion_events(collect_response):
     """The shared collector accepts exactly one explicit response completion."""
     manager = SessionManager(interaction=response_interaction())
 
     with pytest.raises(BackendResponseError, match="without an explicit completion"):
-        manager.response([AnswerDelta(text="partial")])
+        collect_response(manager, [AnswerDelta(text="partial")])
     with pytest.raises(BackendResponseError, match="more than one"):
-        manager.response([ResponseCompleted(), ResponseCompleted()])
+        collect_response(manager, [ResponseCompleted(), ResponseCompleted()])
     with pytest.raises(BackendResponseError, match="event after response completion"):
-        manager.response([ResponseCompleted(), AnswerDelta(text="late")])
+        collect_response(manager, [ResponseCompleted(), AnswerDelta(text="late")])
+
+
+def test_manager_response_finalizes_presentation_on_source_failure(collect_response):
+    """Producer failures finalize output without persisting or returning partial responses."""
+    interaction = response_interaction()
+    scope = MagicMock()
+    interaction.response_context.return_value = scope
+    store = Mock(spec=SessionStore)
+    manager = SessionManager(interaction=interaction, session_store=store)
+
+    def broken_events():
+        """Expose output before the producer fails."""
+        yield AnswerDelta(text="partial")
+        raise RuntimeError("source failed")
+
+    with pytest.raises(RuntimeError, match="source failed"):
+        collect_response(manager, broken_events())
+
+    interaction.answer_delta.assert_called_once_with("partial")
+    scope.__exit__.assert_called_once()
+    assert scope.__exit__.call_args.args[0] is RuntimeError
+    assert manager.messages == []
+    store.save.assert_not_called()
+
+
+def test_manager_response_rejects_late_output_before_presenting_it(collect_response):
+    """Invalid trailing events are debugged but never rendered or executed."""
+    interaction = response_interaction()
+    scope = MagicMock()
+    interaction.response_context.return_value = scope
+    manager = SessionManager(interaction=interaction)
+    completion = ResponseCompleted(answer="final")
+    late = AnswerDelta(text="late")
+
+    with pytest.raises(BackendResponseError, match="event after response completion"):
+        collect_response(manager, [completion, late], debug=True)
+
+    assert interaction.debug.call_args_list == [call(completion), call(late)]
+    interaction.answer_delta.assert_not_called()
+    scope.__exit__.assert_called_once()
+    assert scope.__exit__.call_args.args[0] is BackendResponseError
+
+
+def test_manager_response_async_remains_responsive_while_waiting_for_events():
+    """An asynchronous stream can pause while its already accepted output remains visible."""
+    interaction = response_interaction()
+    manager = SessionManager(interaction=interaction)
+
+    async def scenario():
+        """Control the stream boundary without clocks or scheduling delays."""
+        waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def events():
+            """Suspend after partial output until another task releases the producer."""
+            yield AnswerDelta(text="partial")
+            waiting.set()
+            await release.wait()
+            yield ResponseCompleted(answer="final")
+
+        task = asyncio.create_task(manager.response_async(events()))
+        try:
+            await waiting.wait()
+            assert not task.done()
+            interaction.answer_delta.assert_called_once_with("partial")
+            release.set()
+            return await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert asyncio.run(scenario()) == Response(answer="final", reasoning="")
+    assert manager.messages == []
+
+
+def test_manager_response_async_propagates_cancellation_and_finalizes_output():
+    """Cancellation unwinds presentation and lets the producer close its owned stream."""
+    interaction = response_interaction()
+    scope = MagicMock()
+    interaction.response_context.return_value = scope
+    manager = SessionManager(interaction=interaction)
+    closed = Mock()
+
+    async def scenario():
+        """Cancel collection at a controlled suspension boundary."""
+        waiting = asyncio.Event()
+
+        async def events():
+            """Keep an active partial response until its consumer is cancelled."""
+            try:
+                yield AnswerDelta(text="partial")
+                waiting.set()
+                await asyncio.Event().wait()
+            finally:
+                closed()
+
+        async def collect():
+            """Own the producer's stream lifecycle around the collection adapter."""
+            async with aclosing(events()) as stream:
+                await manager.response_async(stream)
+
+        task = asyncio.create_task(collect())
+        try:
+            await waiting.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    closed.assert_called_once_with()
+    scope.__exit__.assert_called_once()
+    assert scope.__exit__.call_args.args[0] is asyncio.CancelledError
+    assert manager.messages == []
 
 
 def test_manager_replays_visible_session_items_in_durable_order():
