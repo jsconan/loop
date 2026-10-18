@@ -282,7 +282,10 @@ class ApplicationRuntime:
             else:
                 raise RuntimeError("Synchronous runtime.run() cannot run inside an event loop.")
             asyncio.run(
-                self._session_controller.run(lambda receive: self._loop.run(input_source=receive))
+                self._session_controller.run(
+                    lambda receive: self._loop.run(input_source=receive),
+                    route_idle_commands=True,
+                )
             )
 
     def apply_configuration(self, path: str, settings: ApplicationSettings) -> str:

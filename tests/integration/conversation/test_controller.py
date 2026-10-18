@@ -7,19 +7,22 @@ from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import DummyCompleter
+from prompt_toolkit.completion import CompleteEvent, DummyCompleter
+from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from loop import (
     AnswerCompleted,
+    CommandManager,
     ConsoleInteraction,
     Loop,
     Message,
     ResponseCompleted,
     SessionController,
 )
+from loop.configuration import ConfigurationCommands, ConfigurationManager
 from loop.session import LocalSessionNameGenerator
 
 pytestmark = pytest.mark.integration
@@ -122,38 +125,177 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
     assert controller.running is False
 
 
-def test_native_approval_preserves_the_editor_draft_and_queued_chat():
-    """An approval request does not cancel the editor or consume draft text as a decision."""
+def test_idle_config_command_opens_its_choice_prompt_immediately(tmp_path):
+    """The config scope picker opens immediately and applies its selected scope."""
+    output = StringIO()
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    with create_pipe_input() as pipe:
+        session = PromptSession(input=pipe, output=DummyOutput())
+        choices_session = PromptSession(input=pipe, output=DummyOutput())
+        source = ConsoleInteraction(
+            session=session,
+            choices_session=choices_session,
+            console=Console(file=output),
+        )
+        controller = SessionController(source)
+        choice_open = asyncio.Event()
+        selection_reported = asyncio.Event()
+        original_prompt_async = choices_session.prompt_async
+
+        async def observed_prompt_async(*args, **kwargs):
+            """Signal when the configuration question opens in the native choices editor."""
+            if args and str(args[0]).strip() == "Choose configuration scope:":
+                choice_open.set()
+            return await original_prompt_async(*args, **kwargs)
+
+        choices_session.prompt_async = observed_prompt_async
+
+        provider = ConfigurationCommands(configuration, lambda _path, _settings: "applied now")
+        manager = CommandManager(providers=(provider,), interaction=controller.interaction)
+        controller.bind_command_manager(manager)
+        original_info = source.info
+
+        def info(message=""):
+            """Render output and observe completion of the command selection."""
+            original_info(message)
+            if message.startswith("Updated loop.max_agent_turns"):
+                selection_reported.set()
+
+        source.info = info
+
+        def conversation(receive):
+            """Dispatch idle commands on the conversation owner."""
+            while (value := receive(DummyCompleter())) is not False:
+                manager.handle_user_command(value)
+
+        async def scenario():
+            """Select a choice directly after the command opens its prompt."""
+            task = asyncio.create_task(controller.run(conversation, route_idle_commands=True))
+            try:
+                pipe.send_text("/config set loop.max_agent_turns 100\n")
+                await choice_open.wait()
+                pipe.send_text("s\n")
+                await selection_reported.wait()
+                controller.stop()
+                await task
+            finally:
+                controller.stop()
+                await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(scenario())
+
+    assert configuration.effective.loop.max_agent_turns == 100
+    assert configuration.source_for("loop.max_agent_turns") == "session"
+    assert "Input requested:" not in output.getvalue()
+    assert "Save for current user" in output.getvalue()
+    assert "This session only" in output.getvalue()
+
+
+def test_active_config_command_opens_its_choice_prompt_immediately(tmp_path):
+    """An active config command selects its scope in the native choices editor."""
+    output = StringIO()
+    release = Event()
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    with create_pipe_input() as pipe:
+        session = PromptSession(input=pipe, output=DummyOutput())
+        choices_session = PromptSession(input=pipe, output=DummyOutput())
+        source = ConsoleInteraction(
+            session=session,
+            choices_session=choices_session,
+            console=Console(file=output),
+        )
+        controller = SessionController(source)
+        choice_open = asyncio.Event()
+        selection_reported = asyncio.Event()
+        working = asyncio.Event()
+        original_prompt_async = choices_session.prompt_async
+
+        async def observed_prompt_async(*args, **kwargs):
+            """Signal when the active command's native scope selector opens."""
+            if args and str(args[0]).strip() == "Choose configuration scope:":
+                choice_open.set()
+            return await original_prompt_async(*args, **kwargs)
+
+        choices_session.prompt_async = observed_prompt_async
+
+        provider = ConfigurationCommands(configuration, lambda _path, _settings: "applied now")
+        manager = CommandManager(providers=(provider,), interaction=controller.interaction)
+        controller.bind_command_manager(manager)
+        original_info = source.info
+
+        def info(message=""):
+            """Render output and observe agent activity and command completion."""
+            original_info(message)
+            if message == "agent working":
+                working.set()
+            elif message.startswith("Updated loop.max_agent_turns"):
+                selection_reported.set()
+
+        source.info = info
+
+        def conversation(receive):
+            """Keep the conversation in an active run while configuration is changed."""
+            assert receive(DummyCompleter()) == "start"
+            with controller.control.execution():
+                controller.interaction.info("agent working")
+                release.wait()
+            receive(DummyCompleter())
+
+        async def scenario():
+            """Select a scope while the active agent keeps running."""
+            task = asyncio.create_task(controller.run(conversation))
+            try:
+                pipe.send_text("start\n")
+                await working.wait()
+                pipe.send_text("/config set loop.max_agent_turns 100\n")
+                await choice_open.wait()
+                pipe.send_text("s\n")
+                await selection_reported.wait()
+                release.set()
+                controller.stop()
+                await task
+            finally:
+                release.set()
+                controller.stop()
+                await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(scenario())
+
+    assert configuration.effective.loop.max_agent_turns == 100
+    assert configuration.source_for("loop.max_agent_turns") == "session"
+    assert "Input requested:" not in output.getvalue()
+    assert "Save for current user" in output.getvalue()
+    assert "This session only" in output.getvalue()
+
+
+def test_pending_approval_uses_native_confirmation_ui_and_preserves_the_draft():
+    """A confirmation uses its native choices UI and restores the unsent chat draft."""
     output = StringIO()
     with create_pipe_input() as pipe:
         prompt = PromptSession(input=pipe, output=DummyOutput())
         choices = PromptSession(input=pipe, output=DummyOutput())
         source = ConsoleInteraction(
-            session=prompt, choices_session=choices, console=Console(file=output)
+            session=prompt,
+            choices_session=choices,
+            console=Console(file=output),
         )
         controller = SessionController(source)
         messages, approvals = [], []
+        decision_open = asyncio.Event()
 
         async def scenario():
-            """Complete a preserved draft, then explicitly open and decline approval."""
-            pending, queued, decision_open, processed = (
-                asyncio.Event(),
-                asyncio.Event(),
-                asyncio.Event(),
-                asyncio.Event(),
-            )
+            """Answer the editor approval prompt, then submit the restored chat draft."""
+            processed = asyncio.Event()
             ready, drafted = asyncio.Event(), asyncio.Event()
             ask = Event()
             original_info = source.info
 
             def info(text=""):
-                """Render output and observe request transitions on the actual UI."""
+                """Render output and observe the agent's question setup."""
                 original_info(text)
-                if text.startswith("Input requested"):
-                    pending.set()
-                elif text.startswith("Queued input"):
-                    queued.set()
-                elif text == "processed":
+                if text == "processed":
                     processed.set()
                 elif text == "ready for request":
                     ready.set()
@@ -165,7 +307,15 @@ def test_native_approval_preserves_the_editor_draft_and_queued_chat():
 
             prompt.default_buffer.on_text_changed += changed
             source.info = info
-            choices.app.pre_run_callables.append(decision_open.set)
+            original_prompt_async = choices.prompt_async
+
+            async def observed_prompt_async(*args, **kwargs):
+                """Signal when the approval question opens in the native choices editor."""
+                if args and str(args[0]).strip() == "Write?":
+                    decision_open.set()
+                return await original_prompt_async(*args, **kwargs)
+
+            choices.prompt_async = observed_prompt_async
 
             def conversation(receive):
                 """Separate queued conversation text from an explicit fresh approval."""
@@ -181,18 +331,22 @@ def test_native_approval_preserves_the_editor_draft_and_queued_chat():
             task = asyncio.create_task(controller.run(conversation))
             try:
                 pipe.send_text("start\n")
-                await ready.wait()
+                await asyncio.wait_for(ready.wait(), timeout=5)
                 pipe.send_text("unfinished draft")
-                await drafted.wait()
+                await asyncio.wait_for(drafted.wait(), timeout=5)
                 ask.set()
-                await pending.wait()
-                pipe.send_text("\n")
-                await queued.wait()
+                await asyncio.wait_for(decision_open.wait(), timeout=5)
+                completer = choices.default_buffer.completer
+                assert [
+                    completion.text
+                    for completion in completer.get_completions(Document("y"), CompleteEvent())
+                ] == ["Yes"]
+                assert "Input requested:" not in output.getvalue()
+                assert "Press Enter or use /respond" not in output.getvalue()
                 assert approvals == []
-                pipe.send_text("/respond\n")
-                await decision_open.wait()
-                pipe.send_text("n\n")
-                await processed.wait()
+                assert prompt.default_buffer.text == ""
+                pipe.send_text("n\n\n")
+                await asyncio.wait_for(processed.wait(), timeout=5)
                 pipe.send_text("/exit\n")
                 await task
             finally:

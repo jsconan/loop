@@ -74,6 +74,21 @@ class InteractionInput(ABC):
 class AsyncInteractionInput(ABC):
     """Provide optional native asynchronous input without changing synchronous adapters."""
 
+    def current_input(self) -> str | None:
+        """Return text currently being edited when the UI can inspect it.
+
+        Returns:
+            str | None: Unsubmitted editor text, or ``None`` when unavailable.
+        """
+        return None
+
+    def set_current_input(self, value: str) -> None:
+        """Replace current editor text when the UI supports preserving its draft.
+
+        Args:
+            value (str): Text to place in the editor.
+        """
+
     @abstractmethod
     async def prompt_async(
         self,
@@ -84,6 +99,7 @@ class AsyncInteractionInput(ABC):
         index: Iterable[str] | Mapping[object, str] | None = None,
         default: object | None = None,
         secret: bool = False,
+        initial: str | None = None,
     ) -> object | False:
         """Read user input without blocking the event loop.
 
@@ -103,6 +119,8 @@ class AsyncInteractionInput(ABC):
                 non-empty input. Defaults to ``None``.
             secret (bool): Whether entered text must be masked by the interaction. Defaults to
                 ``False``.
+            initial (str | None): Text to place in the editor without treating it as an answer.
+                Defaults to ``None``.
 
         Returns:
             object | False: The selected value or stripped text entered by the user, or ``False``

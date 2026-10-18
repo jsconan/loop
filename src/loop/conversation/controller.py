@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from contextvars import copy_context
 from itertools import count
 from queue import Empty, Full, PriorityQueue
 from threading import RLock, get_ident
 from typing import cast
 
-from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.completion import (
+    CompleteEvent,
+    Completer,
+    Completion,
+)
 from prompt_toolkit.document import Document
 from prompt_toolkit.patch_stdout import patch_stdout
 
@@ -126,8 +131,10 @@ class SessionController:
     _stopping: bool
     _answer_input: asyncio.Task | None
     _message_input: asyncio.Task | None
+    _command_task: asyncio.Future | None
     _discarded: int
-    _respond_requested: bool
+    _idle_command_pending: bool
+    _draft: str | None
 
     def __init__(self, interaction: Interaction) -> None:
         if not isinstance(interaction, AsyncInteractionInput):
@@ -154,8 +161,10 @@ class SessionController:
         self._stopping = False
         self._answer_input = None
         self._message_input = None
+        self._command_task = None
         self._discarded = 0
-        self._respond_requested = False
+        self._idle_command_pending = False
+        self._draft = None
 
     def bind_command_manager(self, command_manager: CommandManager) -> None:
         """Bind the loop-owned command registry for contextual dispatch and completion.
@@ -214,30 +223,45 @@ class SessionController:
         if not self._control.interrupt():
             return False
         telemetry_activity("conversation.run.interrupt_requested", component=_STATUS_COMPONENT)
-        if self._pending is not None:
-            self._pending.result.set_exception(RunInterrupted())
+        request = self._pending
+        if request is not None:
+            request.result.set_exception(RunInterrupted())
             self._pending = None
+        if self._answer_input is not None and self._loop is not None:
+            self._loop.call_soon_threadsafe(self._answer_input.cancel)
         return True
 
     def request_response(self, answer: str | None = None) -> ResponseOutcome:
-        """Open the pending input prompt or submit an answer directly.
+        """Submit a direct answer when the native prompt does not own input.
 
         Args:
-            answer (str | None): Text to submit, or ``None`` to open the dedicated input prompt.
+            answer (str | None): Text to submit, or ``None`` to keep the active native prompt.
 
         Returns:
-            ResponseOutcome: Whether an input was prompted, answered, or rejected.
+            ResponseOutcome: Whether the request was prompted, answered, or rejected.
         """
         request = self._pending
         if request is None:
             return ResponseOutcome.NO_REQUEST
         if answer is None:
-            self._respond_requested = True
             return ResponseOutcome.PROMPTED
         if request.kind == EVENT_TERMINAL:
             return ResponseOutcome.PROMPT_REQUIRED
         if request.kind == EVENT_PROMPT and request.kwargs.get("secret", False):
             return ResponseOutcome.MASKED_INPUT_REQUIRED
+        if self._answer_input is not None:
+            return ResponseOutcome.PROMPT_REQUIRED
+        if not answer.strip() and request.kind == EVENT_CONFIRM:
+            request.result.set_result(request.kwargs.get("default", False))
+            self._pending = None
+            return ResponseOutcome.ANSWERED
+        if not answer.strip() and request.kind == EVENT_PROMPT:
+            default = request.kwargs.get("default")
+            if default is None:
+                return ResponseOutcome.INVALID
+            request.result.set_result(default)
+            self._pending = None
+            return ResponseOutcome.ANSWERED
 
         if request.kind == EVENT_CONFIRM:
             choices = choice_items({True: "Yes", False: "No"}, index=("y", "n"))
@@ -395,6 +419,8 @@ class SessionController:
     async def run(
         self,
         conversation: Callable[[Callable[[Completer], object]], None],
+        *,
+        route_idle_commands: bool = False,
     ) -> None:
         """Run a conversation while accepting input and dispatching UI requests.
 
@@ -406,6 +432,10 @@ class SessionController:
             conversation (Callable[[Callable[[Completer], object]], None]): Synchronous operation
                 accepting a message reader. The reader takes a completer and returns text or
                 ``False`` on shutdown.
+            route_idle_commands (bool): Pass commands entered at an idle boundary through the
+                conversation input reader. This lets the execution owner dispatch commands that
+                may prompt; their prompts open immediately on the async UI. Defaults to ``False``
+                for standalone controllers.
 
         Raises:
             RuntimeError: If this controller has already run.
@@ -443,7 +473,7 @@ class SessionController:
                     conversation,
                 )
                 try:
-                    await self._drive(worker)
+                    await self._drive(worker, route_idle_commands=route_idle_commands)
                 except BaseException as error:
                     primary = error
                     self._stop()
@@ -453,7 +483,11 @@ class SessionController:
                             await asyncio.shield(cleanup)
                         except asyncio.CancelledError:
                             continue
-                    cleanup.result()
+                    command_failure = cleanup.result()
+                    if command_failure is not None and command_failure is not error:
+                        error.add_note(
+                            f"Command also stopped with {type(command_failure).__name__}."
+                        )
                     failure = worker.exception()
                     if failure is not None and failure is not error:
                         error.add_note(f"Conversation also stopped with {type(failure).__name__}.")
@@ -512,38 +546,89 @@ class SessionController:
         self._send(InputReady(completer, busy=True))
         return message
 
-    async def _drive(self, worker: asyncio.Future) -> None:
+    async def _drive(self, worker: asyncio.Future, *, route_idle_commands: bool) -> None:
         """Multiplex execution requests and user input without sharing domain state."""
         events = cast(asyncio.Queue, self._events)
         incoming = asyncio.create_task(events.get())
         typing = None
+        worker_done = False
         try:
             while True:
                 if (
-                    self._ready
+                    not worker_done
+                    and self._ready
                     and typing is None
                     and not self._control.stopped
                     and not self._terminal_owned
+                    and not self._idle_command_pending
+                    and self._command_task is None
                 ):
-                    typing = asyncio.create_task(
-                        self._input.prompt_async(completer=self._completer, default="")
-                    )
+                    if self._draft is not None:
+                        typing = asyncio.create_task(
+                            self._input.prompt_async(
+                                completer=self._completer,
+                                default="",
+                                initial=self._draft,
+                            )
+                        )
+                        self._draft = None
+                    else:
+                        typing = asyncio.create_task(
+                            self._input.prompt_async(completer=self._completer, default="")
+                        )
                     self._message_input = typing
-                watched = {worker, incoming}
+                watched = {incoming}
+                if not worker_done:
+                    watched.add(worker)
                 if typing is not None:
                     watched.add(typing)
+                command_task = self._command_task
+                if command_task is not None:
+                    watched.add(command_task)
                 done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
                 if incoming in done:
                     event = incoming.result()
                     incoming = asyncio.create_task(events.get())
+                    if (
+                        isinstance(event, InteractionCall)
+                        and event.kind not in {EVENT_OUTPUT, EVENT_TERMINAL_EXIT}
+                        and typing is not None
+                    ):
+                        if typing.done():
+                            submitted = typing
+                            typing = None
+                            self._message_input = None
+                            if not submitted.cancelled():
+                                await self._accept(
+                                    submitted,
+                                    route_idle_commands=route_idle_commands,
+                                )
+                        else:
+                            draft = self._input.current_input()
+                            if isinstance(draft, str):
+                                self._draft = draft
+                            self._input.set_current_input("")
+                            typing.cancel()
+                            await asyncio.gather(typing, return_exceptions=True)
+                            typing = None
+                            self._message_input = None
                     await self._deliver(event)
                 if typing is not None and typing in done:
                     submitted = typing
                     typing = None
                     self._message_input = None
-                    await self._accept(submitted)
+                    if not submitted.cancelled():
+                        await self._accept(submitted, route_idle_commands=route_idle_commands)
                 if worker in done:
                     worker.result()
+                    worker_done = True
+                if command_task is not None and command_task in done:
+                    self._command_task = None
+                    command_task.result()
+                    if cast(CommandManager, self._command_manager).exit_requested:
+                        self._stop()
+                        self._source.info("Stopping after the active operation settles...")
+                if worker_done and self._command_task is None:
                     return
         except BaseException:
             self._stop()
@@ -560,10 +645,12 @@ class SessionController:
             self._message_input = None
 
     async def _deliver(self, event: InteractionCall | InputReady) -> None:
-        """Apply one event on the UI thread or retain its separate input request."""
+        """Apply one UI event or await its blocking request through the native input surface."""
         if isinstance(event, InputReady):
             self._ready = True
             self._idle = not event.busy
+            if not event.busy:
+                self._idle_command_pending = False
             self._completer = GuardedCompleter(
                 event.completer,
                 self._gate,
@@ -579,18 +666,7 @@ class SessionController:
                 event.result.set_exception(RunInterrupted())
                 return
             self._pending = event
-            if not self._ready or self._terminal_owned:
-                await self._answer()
-            else:
-                detail = (
-                    "Exclusive terminal access requested."
-                    if event.kind == EVENT_TERMINAL
-                    else f"Input requested: {event.args[0] or 'Choose a value.'}"
-                )
-                self._source.info(
-                    detail
-                    + "\nPress Enter or use /respond [answer] to answer; other messages and commands remain queued."
-                )
+            await self._answer()
             return
         try:
             result = event.function(*event.args, **event.kwargs)
@@ -604,10 +680,10 @@ class SessionController:
             if event.kind == EVENT_TERMINAL_EXIT:
                 self._terminal_owned = False
 
-    async def _accept(self, submitted: asyncio.Task) -> None:
+    async def _accept(self, submitted: asyncio.Task, *, route_idle_commands: bool) -> None:
         """Resolve input without hiding errors, then apply controls or admit ordinary text."""
         if self._stopping:
-            if not submitted.cancelled():
+            with suppress(asyncio.CancelledError):
                 submitted.result()
             return
         value = submitted.result()
@@ -616,23 +692,31 @@ class SessionController:
             self._source.info("Stopping after the active operation settles...")
             return
         command_manager = cast(CommandManager, self._command_manager)
-        if command_manager.handle_user_command(
-            value,
-            interaction=self._source,
-        ):
-            if command_manager.exit_requested:
-                self._stop()
-                self._source.info("Stopping after the active operation settles...")
-            if self._respond_requested:
-                self._respond_requested = False
-                await self._answer()
+        if route_idle_commands and self._idle and command_manager.is_user_command(value):
+            self._idle_command_pending = self._enqueue(value)
             return
-        if value == "" and self._pending is not None:
-            await self._answer()
-        elif value == "":
+        if command_manager.is_user_command(value):
+            self._command_task = cast(asyncio.AbstractEventLoop, self._loop).run_in_executor(
+                None,
+                copy_context().run,
+                self._run_command,
+                command_manager,
+                value,
+            )
+            return
+        if value == "":
             self._source.warning("Please enter a message!")
         else:
             self._enqueue(value)
+
+    def _run_command(self, command_manager: CommandManager, value: str) -> bool:
+        """Dispatch one user command through the controller-owned interaction mailbox."""
+        try:
+            return command_manager.handle_user_command(value, interaction=self._interaction)
+        except (RunInterrupted, KeyboardInterrupt) as error:
+            if not isinstance(error, RunInterrupted) and not self._control.stopped:
+                raise
+            return True
 
     def _enqueue(
         self,
@@ -678,7 +762,8 @@ class SessionController:
         except asyncio.CancelledError:
             if not request.result.done():
                 request.result.set_exception(KeyboardInterrupt())
-            if not self._stopping:
+            interrupted = isinstance(request.result.exception(), RunInterrupted)
+            if not self._stopping and not interrupted:
                 raise
         except BaseException as error:
             request.result.set_exception(error)
@@ -714,17 +799,29 @@ class SessionController:
         self._discarded += discarded
         return discarded
 
-    async def _settle(self, worker: asyncio.Future) -> None:
-        """Drain acknowledged UI work until the execution owner releases all resources."""
+    async def _settle(self, worker: asyncio.Future) -> BaseException | None:
+        """Drain acknowledged UI work until execution and command owners release resources."""
         events = cast(asyncio.Queue, self._events)
-        while not worker.done():
+        command_failure = None
+        while not worker.done() or self._command_task is not None:
             incoming = asyncio.create_task(events.get())
             try:
-                done, _ = await asyncio.wait(
-                    {worker, incoming}, return_when=asyncio.FIRST_COMPLETED
-                )
+                watched = {incoming}
+                if not worker.done():
+                    watched.add(worker)
+                command_task = self._command_task
+                if command_task is not None:
+                    watched.add(command_task)
+                done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
                 if incoming in done:
                     await self._deliver(incoming.result())
+                if command_task is not None and command_task in done:
+                    self._command_task = None
+                    try:
+                        command_task.result()
+                    except BaseException as error:  # noqa: BLE001 - preserve the primary failure
+                        command_failure = error
             finally:
                 incoming.cancel()
                 await asyncio.gather(incoming, return_exceptions=True)
+        return command_failure

@@ -531,9 +531,10 @@ def test_async_runtime_binds_all_services_to_its_controller(dependencies, assemb
     controller.running = False
     receive = Mock()
 
-    async def run(conversation):
+    async def run(conversation, *, route_idle_commands):
         """Execute the runtime callback through its supplied ordinary-input reader."""
         conversation(receive)
+        assert route_idle_commands is True
 
     controller.run = AsyncMock(side_effect=run)
     create = Mock(return_value=controller)

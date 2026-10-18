@@ -100,17 +100,17 @@ def test_interrupt_reports_the_control_outcome(command_context, accepted, method
         (
             ResponseOutcome.INVALID,
             ("unexpected",),
-            "Choose one of the listed responses, or use /respond without an answer.",
+            "Choose one of the listed responses.",
         ),
         (
             ResponseOutcome.PROMPT_REQUIRED,
             ("Yes",),
-            "Use /respond without an answer for this request.",
+            "Answer this request in its active prompt.",
         ),
         (
             ResponseOutcome.MASKED_INPUT_REQUIRED,
             ("secret",),
-            "This request requires masked input; use /respond without an answer.",
+            "Answer this request in its masked prompt.",
         ),
     ],
 )

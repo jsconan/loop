@@ -229,6 +229,424 @@ def test_controller_rejects_inactive_and_unknown_slash_input_without_queueing(ui
     assert received == ["start", "follow-up"]
 
 
+def test_controller_routes_idle_commands_through_the_conversation_owner(ui):
+    """Idle commands can prompt through the async UI without sync prompt-toolkit calls."""
+    controller = SessionController(ui)
+    selected = []
+
+    def choose_scope(context: CommandContext) -> None:
+        """Choose a scope through the command interaction."""
+        selected.append(
+            context.interaction.prompt(
+                "Choose configuration scope:",
+                choices={"user": "Save for current user", "session": "This session only"},
+                index={"user": "u", "session": "s"},
+            )
+        )
+
+    manager = CommandManager(
+        commands=(choose_scope,),
+        interaction=controller.interaction,
+    )
+    controller.bind_command_manager(manager)
+    prompts = []
+    received = []
+    inputs = asyncio.Queue()
+
+    async def prompt(*args, **kwargs):
+        """Return deterministic editor input and a selected native prompt response."""
+        if args == ("Choose configuration scope:",):
+            prompts.append((args, kwargs))
+            return "session"
+        return await inputs.get()
+
+    async def scenario():
+        """Dispatch an idle command and open its choice prompt without another Enter."""
+        ui.prompt_async.side_effect = prompt
+        ui.prompt.side_effect = AssertionError("Synchronous UI input used during async runtime.")
+        inputs.put_nowait("/choose_scope")
+        inputs.put_nowait(False)
+
+        def conversation(receive):
+            """Dispatch commands on the conversation owner between idle reads."""
+            while (value := receive(DummyCompleter())) is not False:
+                received.append(value)
+                manager.handle_user_command(value)
+
+        task = asyncio.create_task(controller.run(conversation, route_idle_commands=True))
+        try:
+            await task
+        finally:
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert received == ["/choose_scope"]
+    assert selected == ["session"]
+    assert len(prompts) == 1
+    assert prompts[0][0] == ("Choose configuration scope:",)
+    assert prompts[0][1]["choices"] == {
+        "user": "Save for current user",
+        "session": "This session only",
+    }
+    assert prompts[0][1]["index"] == {"user": "u", "session": "s"}
+    ui.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [("prompt", "session"), ("confirm", True)],
+)
+def test_active_commands_use_native_async_blocking_interactions(ui, kind, expected):
+    """Run-active commands resolve prompts and confirmations through the native async UI."""
+    controller = SessionController(ui)
+    release = Event()
+    active, question_open, completed = (asyncio.Event() for _ in range(3))
+    answers = []
+
+    def choose(context: CommandContext) -> None:
+        """Request the configured blocking interaction from an eligible command."""
+        if kind == "prompt":
+            answer = context.interaction.prompt(
+                "Choose a scope:", choices={"session": "This session only"}
+            )
+        else:
+            answer = context.interaction.confirm("Continue?", default=False)
+        answers.append(answer)
+        context.interaction.info("command completed")
+
+    manager = CommandManager(
+        commands=(
+            CommandRegistration(choose, capabilities=frozenset({CommandCapability.RUN_ACTIVE})),
+        ),
+        interaction=controller.interaction,
+    )
+    controller.bind_command_manager(manager)
+    inputs = asyncio.Queue()
+
+    async def prompt(*args, **_kwargs):
+        """Answer the command question and wait for ordinary editor input otherwise."""
+        if kind == "prompt" and args == ("Choose a scope:",):
+            question_open.set()
+            return expected
+        return await inputs.get()
+
+    async def confirm(*_args, **_kwargs):
+        """Answer the command confirmation through the async confirmation API."""
+        question_open.set()
+        return expected
+
+    def info(message=""):
+        """Expose worker activity and command completion to the test event loop."""
+        if message == "working":
+            active.set()
+        elif message == "command completed":
+            completed.set()
+
+    ui.prompt_async.side_effect = prompt
+    ui.confirm_async.side_effect = confirm
+    ui.info.side_effect = info
+
+    def conversation(receive):
+        """Hold an active execution while the command asks its blocking question."""
+        receive(DummyCompleter())
+        with controller.control.execution():
+            controller.interaction.info("working")
+            release.wait()
+        receive(DummyCompleter())
+
+    async def scenario():
+        """Submit an active command and wait for its UI question to resolve."""
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("start")
+            await active.wait()
+            inputs.put_nowait("/choose")
+            await question_open.wait()
+            await completed.wait()
+            release.set()
+            controller.stop()
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert answers == [expected]
+    if kind == "prompt":
+        ui.prompt_async.assert_any_await(
+            "Choose a scope:",
+            completer=None,
+            choices={"session": "This session only"},
+            index=None,
+            default=None,
+            secret=False,
+        )
+        ui.confirm_async.assert_not_awaited()
+    else:
+        ui.confirm_async.assert_awaited_once_with("Continue?", default=False)
+
+
+def test_active_command_finishes_after_conversation_worker_and_keeps_prompt_open(ui):
+    """Finish an active command's prompt after its conversation worker returns."""
+    controller = SessionController(ui)
+    command_started, prompt_returned, command_release = (Event() for _ in range(3))
+    prompt_open = asyncio.Event()
+    inputs = asyncio.Queue()
+    answers = []
+
+    def choose(context: CommandContext) -> None:
+        """Wait for one choice and hold command completion until the test releases it."""
+        command_started.set()
+        answers.append(
+            context.interaction.prompt("Choose a scope:", choices={"session": "Session"})
+        )
+        prompt_returned.set()
+        command_release.wait()
+
+    manager = CommandManager(
+        commands=(
+            CommandRegistration(choose, capabilities=frozenset({CommandCapability.RUN_ACTIVE})),
+        ),
+        interaction=controller.interaction,
+    )
+    controller.bind_command_manager(manager)
+
+    async def prompt(*args, **_kwargs):
+        """Return ordinary input or wait for the blocking scope response."""
+        if args == ("Choose a scope:",):
+            prompt_open.set()
+        return await inputs.get()
+
+    ui.prompt_async.side_effect = prompt
+
+    def conversation(receive):
+        """Return when active command dispatch proves its prompt has started."""
+        receive(DummyCompleter())
+        command_started.wait()
+
+    async def scenario():
+        """Resolve the prompt after conversation execution ends, then finish the command."""
+        with controller.control.execution():
+            task = asyncio.create_task(controller.run(conversation))
+            try:
+                inputs.put_nowait("start")
+                inputs.put_nowait("/choose")
+                await prompt_open.wait()
+                inputs.put_nowait("session")
+                await asyncio.to_thread(prompt_returned.wait)
+                command_release.set()
+                await task
+            finally:
+                command_release.set()
+                controller.stop()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert answers == ["session"]
+
+
+def test_stopping_releases_an_active_command_confirmation(ui):
+    """Shutdown cancels an active command confirmation without granting approval."""
+    controller = SessionController(ui)
+    release = Event()
+    active, question_open = asyncio.Event(), asyncio.Event()
+    answers = []
+
+    def approve(context: CommandContext) -> None:
+        """Request approval through the controller mailbox."""
+        answers.append(context.interaction.confirm("Continue?", default=False))
+
+    manager = CommandManager(
+        commands=(
+            CommandRegistration(approve, capabilities=frozenset({CommandCapability.RUN_ACTIVE})),
+        ),
+        interaction=controller.interaction,
+    )
+    controller.bind_command_manager(manager)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+
+    async def confirm(*_args, **_kwargs):
+        """Keep confirmation open until controller shutdown cancels it."""
+        question_open.set()
+        await asyncio.Future()
+
+    def info(message=""):
+        """Signal when conversation execution has become active."""
+        if message == "working":
+            active.set()
+
+    ui.confirm_async.side_effect = confirm
+    ui.info.side_effect = info
+
+    def conversation(receive):
+        """Hold active execution while the confirmation command is entered."""
+        receive(DummyCompleter())
+        with controller.control.execution():
+            controller.interaction.info("working")
+            release.wait()
+
+    async def scenario():
+        """Stop after the command confirmation opens and wait for clean settlement."""
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("start")
+            await active.wait()
+            inputs.put_nowait("/approve")
+            await question_open.wait()
+            release.set()
+            controller.stop()
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert answers == []
+    ui.confirm_async.assert_awaited_once_with("Continue?", default=False)
+
+
+def test_command_dispatch_preserves_unexpected_keyboard_interrupt(ui):
+    """Propagate an unexpected interruption instead of treating it as shutdown control flow."""
+    controller = SessionController(ui)
+
+    def interrupt() -> None:
+        """Raise the keyboard interruption being handled by command dispatch."""
+        raise KeyboardInterrupt
+
+    manager = CommandManager(
+        commands=(interrupt,),
+        interaction=ui,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        controller._run_command(manager, "/interrupt")
+
+
+def test_interrupted_active_command_does_not_stop_the_controller(ui):
+    """A run interruption releases a blocking command and leaves shutdown unset."""
+    controller = SessionController(ui)
+    release = Event()
+    active, question_open = asyncio.Event(), asyncio.Event()
+
+    def approve(context: CommandContext) -> None:
+        """Request approval through the controller mailbox."""
+        context.interaction.confirm("Continue?", default=False)
+
+    manager = CommandManager(
+        commands=(
+            CommandRegistration(approve, capabilities=frozenset({CommandCapability.RUN_ACTIVE})),
+        ),
+        interaction=controller.interaction,
+    )
+    controller.bind_command_manager(manager)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+
+    async def confirm(*_args, **_kwargs):
+        """Wait until an active run interruption cancels this confirmation."""
+        question_open.set()
+        await asyncio.Future()
+
+    ui.confirm_async.side_effect = confirm
+    ui.info.side_effect = lambda message="": active.set() if message == "working" else None
+
+    def conversation(receive):
+        """Hold active execution until the confirmation request is interrupted."""
+        receive(DummyCompleter())
+        with controller.control.execution():
+            controller.interaction.info("working")
+            release.wait()
+
+    async def scenario():
+        """Interrupt the pending approval and allow both owners to settle normally."""
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("start")
+            await active.wait()
+            inputs.put_nowait("/approve")
+            await question_open.wait()
+            assert controller.request_interrupt() is True
+            release.set()
+            await task
+            assert controller.control.stopped is False
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert controller.running is False
+    ui.confirm_async.assert_awaited_once_with("Continue?", default=False)
+
+
+def test_failed_active_command_is_reported_during_controller_settlement(ui):
+    """Preserve a UI failure and note a distinct active-command failure during settlement."""
+    controller = SessionController(ui)
+    release = Event()
+    active, question_open = asyncio.Event(), asyncio.Event()
+
+    def fail(context: CommandContext) -> None:
+        """Replace an interaction failure with a command failure for cleanup reporting."""
+        try:
+            context.interaction.confirm("Continue?", default=False)
+        except RuntimeError as error:
+            raise ValueError("command failed") from error
+
+    manager = CommandManager(
+        commands=(
+            CommandRegistration(fail, capabilities=frozenset({CommandCapability.RUN_ACTIVE})),
+        ),
+        interaction=controller.interaction,
+    )
+    controller.bind_command_manager(manager)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+
+    async def confirm(*_args, **_kwargs):
+        """Release the conversation worker before reporting a simulated UI failure."""
+        question_open.set()
+        release.set()
+        raise RuntimeError("confirmation UI failed")
+
+    ui.confirm_async.side_effect = confirm
+    ui.info.side_effect = lambda message="": active.set() if message == "working" else None
+
+    def conversation(receive):
+        """Wait for the command interaction while the conversation remains active."""
+        receive(DummyCompleter())
+        with controller.control.execution():
+            controller.interaction.info("working")
+            release.wait()
+
+    async def scenario():
+        """Raise the UI failure after controller cleanup settles both owners."""
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("start")
+            await active.wait()
+            inputs.put_nowait("/fail")
+            await question_open.wait()
+            with pytest.raises(RuntimeError, match="confirmation UI failed") as error:
+                await task
+            assert any(
+                "Command also stopped with ValueError." in note for note in error.value.__notes__
+            )
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_response_command_completions_follow_the_pending_request(ui):
     """Selectable response prompts expose their accepted values through the command catalog."""
     controller = SessionController(ui)
@@ -333,15 +751,68 @@ def test_direct_response_resolves_supported_prompt_kinds(ui, kind, kwargs, answe
         assert not request.result.done()
 
 
-def test_request_response_without_value_opens_the_pending_prompt(ui):
-    """An empty response command delegates to the original masked or selectable UI prompt."""
+@pytest.mark.parametrize(
+    ("kind", "kwargs", "expected"),
+    [
+        (EVENT_CONFIRM, {}, False),
+        (EVENT_CONFIRM, {"default": True}, True),
+        (EVENT_PROMPT, {"default": "fallback"}, "fallback"),
+    ],
+)
+def test_empty_direct_response_uses_the_prompt_default(ui, kind, kwargs, expected):
+    """An empty direct answer applies a declared confirmation or prompt default."""
+    controller = SessionController(ui)
+    request = InteractionCall(function=ui.prompt, args=("Question",), kwargs=kwargs, kind=kind)
+    controller._pending = request
+
+    assert controller.request_response("") is ResponseOutcome.ANSWERED
+    assert request.result.result() == expected
+
+
+def test_empty_direct_response_without_a_default_is_rejected(ui):
+    """An empty free-form answer stays pending when the prompt has no default."""
+    controller = SessionController(ui)
+    request = InteractionCall(function=ui.prompt, args=("Question",), kwargs={}, kind=EVENT_PROMPT)
+    controller._pending = request
+
+    assert controller.request_response("") is ResponseOutcome.INVALID
+    assert controller._pending is request
+
+
+@pytest.mark.parametrize(
+    ("kind", "kwargs"),
+    [(EVENT_PROMPT, {}), (EVENT_CONFIRM, {})],
+)
+def test_direct_response_does_not_bypass_an_active_native_prompt(ui, kind, kwargs):
+    """Direct responses cannot resolve a request while its native UI owns the input."""
+    controller = SessionController(ui)
+    request = InteractionCall(function=ui.prompt, args=("Question",), kwargs=kwargs, kind=kind)
+    controller._pending = request
+
+    async def scenario():
+        """Keep a live async input task while rejecting a competing direct answer."""
+        answer_input = asyncio.get_running_loop().create_future()
+        controller._answer_input = answer_input
+        try:
+            assert controller.request_response("answer") is ResponseOutcome.PROMPT_REQUIRED
+            assert controller._pending is request
+            assert not request.result.done()
+        finally:
+            answer_input.cancel()
+            controller._answer_input = None
+
+    asyncio.run(scenario())
+
+
+def test_request_response_without_value_keeps_the_native_prompt_active(ui):
+    """A bare response request leaves an unanswered question active for its native prompt."""
     controller = SessionController(ui)
     assert controller.request_response() is ResponseOutcome.NO_REQUEST
     request = InteractionCall(function=ui.prompt, args=("Question",), kwargs={}, kind=EVENT_PROMPT)
     controller._pending = request
 
     assert controller.request_response() is ResponseOutcome.PROMPTED
-    assert controller._respond_requested is True
+    assert controller._pending is request
 
 
 def test_response_completions_handle_confirm_secret_free_text_and_invalid_choices(ui):
@@ -457,63 +928,378 @@ def test_controller_accepts_messages_and_status_during_serialized_work(ui):
     ui.conversation_ended.assert_called_once_with()
 
 
-@pytest.mark.parametrize("reply", ["", "/respond"])
-def test_controller_never_uses_queued_chat_as_an_approval(ui, reply):
-    """Only an explicit reply path reaches confirmation; queued messages remain ordinary input."""
+@pytest.mark.parametrize(
+    ("options", "answer", "expected"),
+    [
+        ({}, "a typed clarification", "a typed clarification"),
+        ({"completer": WordCompleter(["custom answer"])}, "custom answer", "custom answer"),
+        ({"exit_commands": ("quit",)}, "a typed clarification", "a typed clarification"),
+        ({"choices": {"first": "First", "second": "Second"}}, "second", "second"),
+    ],
+)
+def test_controller_uses_the_native_prompt_for_blocking_interactions(ui, options, answer, expected):
+    """Blocking questions preserve prompt options for the source's native async UI."""
     controller = SessionController(ui)
-    decisions, messages = [], []
-    ui.confirm_async.return_value = False
+    responses = []
 
     async def scenario():
-        """Queue text that resembles approval before opening the actual decision prompt."""
+        """Open a blocking question in the regular editor and submit its response."""
         inputs = asyncio.Queue()
-        pending, queued, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
-        read_inputs(ui, inputs)
+        question_visible, answered = asyncio.Event(), asyncio.Event()
 
-        def output(message=""):
-            """Observe safe progress through the separate input and approval channels."""
-            if message.startswith("Input requested"):
-                pending.set()
-            elif message.startswith("Queued input"):
-                queued.set()
-            elif message == "processed":
-                processed.set()
+        async def prompt(*args, **kwargs):
+            """Answer the blocking request while ordinary input stays in the message editor."""
+            if args == ("Choose a target?",):
+                question_visible.set()
+                return answer
+            return await inputs.get()
 
-        ui.info.side_effect = output
+        ui.prompt_async.side_effect = prompt
+
+        def info(message=""):
+            """Observe completion of the blocking request."""
+            if message == "answered":
+                answered.set()
+
+        ui.info.side_effect = info
 
         def conversation(receive):
-            """Ask for approval without draining the conversation input queue."""
-            while (message := receive(DummyCompleter())) is not False:
-                messages.append(message)
-                if message == "start":
-                    decisions.append(controller.interaction.confirm("Write the file?"))
-                else:
-                    controller.interaction.info("processed")
+            """Pause the owner on a prompt and then continue its input loop."""
+            receive(DummyCompleter())
+            responses.append(controller.interaction.prompt("Choose a target?", **options))
+            controller.interaction.info("answered")
+            receive(DummyCompleter())
 
         task = asyncio.create_task(controller.run(conversation))
         try:
             inputs.put_nowait("start")
-            await pending.wait()
-            inputs.put_nowait("yes")
-            await queued.wait()
-            ui.confirm_async.assert_not_awaited()
-            inputs.put_nowait("/status")
-            inputs.put_nowait(reply)
-            await processed.wait()
-            inputs.put_nowait(False)
+            await question_visible.wait()
+            await answered.wait()
+            inputs.put_nowait("/exit")
             await task
         finally:
             controller.stop()
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
+    assert responses == [expected]
+    question_calls = [call for call in ui.prompt_async.await_args_list if call.args]
+    assert len(question_calls) == 1
+    assert question_calls[0].args == ("Choose a target?",)
+    assert question_calls[0].kwargs["choices"] == options.get("choices")
+    assert question_calls[0].kwargs["completer"] is options.get("completer")
+    if options.get("exit_commands"):
+        assert question_calls[0].kwargs["exit_commands"] == ("quit",)
+    ui.confirm_async.assert_not_awaited()
+    ui.prompt.assert_not_called()
+
+
+def test_controller_answers_blocking_prompt_when_no_editor_task_is_active(ui):
+    """A startup question uses the source's native async prompt before chat input starts."""
+    controller = SessionController(ui)
+    ui.prompt_async.return_value = "answer"
+    responses = []
+
+    def conversation(_receive):
+        """Request clarification before opening the ordinary message editor."""
+        responses.append(controller.interaction.prompt("Clarify this value?"))
+
+    asyncio.run(controller.run(conversation))
+
+    assert responses == ["answer"]
+    ui.prompt_async.assert_awaited_once()
+    assert ui.prompt_async.await_args.args == ("Clarify this value?",)
+
+
+def test_pending_confirmation_uses_the_native_confirmation_ui(ui):
+    """A confirmation delegates unchanged to the source's native confirmation interaction."""
+    controller = SessionController(ui)
+    ui.confirm_async.return_value = False
+    decisions = []
+
+    def conversation(_receive):
+        """Ask for approval before opening the ordinary message editor."""
+        decisions.append(controller.interaction.confirm("Continue?", default=False))
+
+    asyncio.run(controller.run(conversation))
+
     assert decisions == [False]
-    assert messages == ["start", "yes"]
-    ui.confirm_async.assert_awaited_once_with("Write the file?", default=False)
-    ui.confirm.assert_not_called()
-    assert any(
-        item.args[0].startswith("Waiting for your response") for item in ui.info.call_args_list
+    ui.confirm_async.assert_awaited_once_with("Continue?", default=False)
+    ui.prompt_async.assert_not_awaited()
+
+
+def test_pending_question_preserves_choices_for_the_native_prompt(ui):
+    """Blocking choice prompts pass their choices to the source UI without rewriting them."""
+    controller = SessionController(ui)
+    responses = []
+
+    async def scenario():
+        """Resolve a selected answer through the source's regular choice prompt."""
+        inputs = asyncio.Queue()
+        question_open, answered = asyncio.Event(), asyncio.Event()
+
+        async def prompt(*args, **kwargs):
+            """Return the selected choice key through the native prompt interface."""
+            if args == ("Clarify the target?",):
+                question_open.set()
+                return "second"
+            return await inputs.get()
+
+        ui.prompt_async.side_effect = prompt
+
+        def info(message=""):
+            """Observe the completed interaction."""
+            if message == "answered":
+                answered.set()
+
+        ui.info.side_effect = info
+
+        def conversation(receive):
+            """Ask for a selected response and then return to ordinary conversation input."""
+            receive(DummyCompleter())
+            responses.append(
+                controller.interaction.prompt(
+                    "Clarify the target?", choices={"first": "First", "second": "Second"}
+                )
+            )
+            controller.interaction.info("answered")
+            receive(DummyCompleter())
+
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("start")
+            await question_open.wait()
+            await answered.wait()
+            inputs.put_nowait("/exit")
+            await task
+        finally:
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert responses == ["second"]
+    question_call = next(call for call in ui.prompt_async.await_args_list if call.args)
+    assert question_call.args == ("Clarify the target?",)
+    assert question_call.kwargs["choices"] == {"first": "First", "second": "Second"}
+    assert question_call.kwargs["completer"] is None
+
+
+def test_declining_a_pending_question_keeps_the_conversation_available(ui):
+    """Declining a native confirmation does not close the regular conversation editor."""
+    controller = SessionController(ui)
+    answers, messages = [], []
+
+    async def scenario():
+        """Decline the active request and then submit another ordinary message."""
+        inputs = asyncio.Queue()
+        question_open, continued, completed = (asyncio.Event() for _ in range(3))
+
+        async def confirm(*_args, **_kwargs):
+            """Return a negative decision through the native confirmation UI."""
+            question_open.set()
+            return False
+
+        read_inputs(ui, inputs)
+        ui.confirm_async.side_effect = confirm
+        ui.info.side_effect = lambda message="": (
+            continued.set()
+            if message == "continued"
+            else completed.set()
+            if message == "done"
+            else None
+        )
+
+        def conversation(receive):
+            """Continue reading after receiving a negative result from the interaction."""
+            receive(DummyCompleter())
+            answers.append(controller.interaction.confirm("Approve?"))
+            controller.interaction.info("continued")
+            messages.append(receive(DummyCompleter()))
+            controller.interaction.info("done")
+            receive(DummyCompleter())
+
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("start")
+            await question_open.wait()
+            await continued.wait()
+            assert controller.control.stopped is False
+            inputs.put_nowait("later")
+            await completed.wait()
+            inputs.put_nowait("/exit")
+            await task
+        finally:
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert answers == [False]
+    assert messages == ["later"]
+
+
+def test_stop_discards_input_completed_at_the_shutdown_boundary(ui):
+    """Input that finishes as shutdown begins is not admitted to conversation execution."""
+    controller = SessionController(ui)
+    messages = []
+
+    async def prompt(*_args, **_kwargs):
+        """Request shutdown immediately before returning one late editor value."""
+        controller.stop()
+        return "late input"
+
+    ui.prompt_async.side_effect = prompt
+
+    def conversation(receive):
+        """Wait for input and record the shutdown signal instead of late text."""
+        messages.append(receive(DummyCompleter()))
+
+    asyncio.run(controller.run(conversation))
+
+    assert messages == [False]
+
+
+def test_interrupt_cancels_a_modal_prompt_and_restores_the_editor_draft(ui):
+    """Interruption closes masked prompts without losing the suspended chat draft."""
+    controller = SessionController(ui)
+    messages = []
+
+    async def scenario():
+        """Interrupt a masked request and continue through the restored main editor."""
+        inputs = asyncio.Queue()
+        prompt_open, interrupted, processed = (asyncio.Event() for _ in range(3))
+        ui.current_input.return_value = "unfinished draft"
+
+        async def prompt(*_args, **kwargs):
+            """Block on the masked prompt while normal messages use the input queue."""
+            if kwargs.get("secret"):
+                prompt_open.set()
+                await asyncio.Future()
+            return await inputs.get()
+
+        ui.prompt_async.side_effect = prompt
+        ui.info.side_effect = lambda message="": (
+            interrupted.set()
+            if message == "interrupted"
+            else processed.set()
+            if message == "processed"
+            else None
+        )
+
+        def conversation(receive):
+            """Catch an interrupted secret request and accept a later chat message."""
+            receive(DummyCompleter())
+            with controller.control.execution(), pytest.raises(RunInterrupted):
+                controller.interaction.prompt("Credential:", secret=True, exit_commands=())
+            controller.interaction.info("interrupted")
+            messages.append(receive(DummyCompleter()))
+            controller.interaction.info("processed")
+            receive(DummyCompleter())
+
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("start")
+            await prompt_open.wait()
+            assert controller.request_interrupt() is True
+            await interrupted.wait()
+            inputs.put_nowait("later")
+            await processed.wait()
+            assert ui.set_current_input.call_args.args == ("",)
+            assert any(
+                call.kwargs.get("initial") == "unfinished draft"
+                for call in ui.prompt_async.await_args_list
+            )
+            inputs.put_nowait("/exit")
+            await task
+        finally:
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert messages == ["later"]
+
+
+def test_submitted_chat_remains_queued_when_a_modal_question_arrives(ui):
+    """Input completed before a blocking question is delivered stays ordinary conversation text."""
+    controller = SessionController(ui)
+    request = InteractionCall(
+        function=ui.prompt,
+        args=("Credential:",),
+        kwargs={"secret": True},
+        kind=EVENT_PROMPT,
     )
+    controller._ready = True
+    controller._completer = DummyCompleter()
+
+    async def scenario():
+        """Complete normal input and modal interaction together through the controller loop."""
+        controller._loop = asyncio.get_running_loop()
+        controller._events = asyncio.Queue()
+        controller._events.put_nowait(request)
+        inputs = []
+
+        async def prompt(*_args, **_kwargs):
+            """Return queued chat first and a masked response to the blocking request second."""
+            inputs.append("ordinary chat" if not inputs else "private response")
+            return inputs[-1]
+
+        ui.prompt_async.side_effect = prompt
+        controller.bind_command_manager(
+            CommandManager(providers=(ConversationCommands(controller),), interaction=ui)
+        )
+        worker = asyncio.ensure_future(asyncio.wrap_future(request.result))
+
+        await controller._drive(worker, route_idle_commands=False)
+
+    asyncio.run(scenario())
+    assert controller._inbox.get_nowait()[2] == "ordinary chat"
+    assert controller._pending is None
+    assert request.result.result() == "private response"
+
+
+def test_cancelled_editor_task_does_not_block_a_modal_question(ui):
+    """A cancelled editor task is ignored while its blocking interaction is answered."""
+    controller = SessionController(ui)
+    request = InteractionCall(
+        function=ui.prompt,
+        args=("Credential:",),
+        kwargs={"secret": True},
+        kind=EVENT_PROMPT,
+    )
+    controller._ready = True
+    controller._completer = DummyCompleter()
+    prompt_calls = 0
+
+    async def prompt(*_args, **_kwargs):
+        """Cancel ordinary editor input, then answer the masked interaction."""
+        nonlocal prompt_calls
+        prompt_calls += 1
+        if prompt_calls == 1:
+            raise asyncio.CancelledError
+        return "private response"
+
+    async def scenario():
+        """Deliver the modal request alongside an editor task that cancels immediately."""
+        controller._loop = asyncio.get_running_loop()
+        controller._events = asyncio.Queue()
+        controller._events.put_nowait(request)
+        ui.prompt_async.side_effect = prompt
+        controller.bind_command_manager(
+            CommandManager(providers=(ConversationCommands(controller),), interaction=ui)
+        )
+        worker = asyncio.ensure_future(asyncio.wrap_future(request.result))
+
+        await controller._drive(worker, route_idle_commands=False)
+
+    asyncio.run(scenario())
+    assert request.result.result() == "private response"
+    assert prompt_calls == 3
+    assert [call.kwargs.get("secret", False) for call in ui.prompt_async.await_args_list] == [
+        False,
+        True,
+        False,
+    ]
 
 
 def test_controller_preserves_startup_prompts_and_masked_input(ui):
@@ -614,13 +1400,17 @@ def test_controller_revokes_pending_approval_on_shutdown(ui):
     decisions = []
 
     async def scenario():
-        """Stop after the UI has announced the request but before any reply."""
+        """Stop after the native confirmation prompt opens but before the user answers."""
         inputs = asyncio.Queue()
-        pending = asyncio.Event()
+        prompted = asyncio.Event()
         read_inputs(ui, inputs)
-        ui.info.side_effect = lambda text="": (
-            pending.set() if text.startswith("Input requested") else None
-        )
+
+        async def confirm(*_args, **_kwargs):
+            """Signal that approval input opened, then wait for its cancellation."""
+            prompted.set()
+            return await inputs.get()
+
+        ui.confirm_async.side_effect = confirm
 
         def conversation(receive):
             """Request a decision from the independent approval channel."""
@@ -630,8 +1420,8 @@ def test_controller_revokes_pending_approval_on_shutdown(ui):
         task = asyncio.create_task(controller.run(conversation))
         try:
             inputs.put_nowait("start")
-            await pending.wait()
-            inputs.put_nowait("/quit")
+            await prompted.wait()
+            controller.stop()
             await task
         finally:
             controller.stop()
@@ -639,7 +1429,7 @@ def test_controller_revokes_pending_approval_on_shutdown(ui):
 
     asyncio.run(scenario())
     assert decisions == []
-    ui.confirm_async.assert_not_awaited()
+    ui.confirm_async.assert_awaited_once_with("Approve?", default=True)
 
 
 def test_controller_keeps_live_completion_reads_out_of_active_execution(ui):
@@ -760,14 +1550,12 @@ def test_controller_hands_off_exclusive_terminal_without_starting_another_editor
     async def scenario():
         """Explicitly hand off the terminal before simulating direct authentication."""
         inputs = asyncio.Queue()
-        pending, held, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        held, finished = asyncio.Event(), asyncio.Event()
         read_inputs(ui, inputs)
 
         def output(message=""):
             """Observe terminal ownership without sharing domain objects."""
-            if message.startswith("Exclusive terminal"):
-                pending.set()
-            elif message == "held":
+            if message == "held":
                 held.set()
             elif message == "released":
                 finished.set()
@@ -788,8 +1576,6 @@ def test_controller_hands_off_exclusive_terminal_without_starting_another_editor
         task = asyncio.create_task(controller.run(conversation))
         try:
             inputs.put_nowait("manage")
-            await pending.wait()
-            inputs.put_nowait("/respond")
             await held.wait()
             count = ui.prompt_async.await_count
             assert count == 2
@@ -949,6 +1735,56 @@ def test_controller_external_stop_cancels_an_active_decision_prompt(ui):
     asyncio.run(scenario())
     assert controller.running is False
     ui.conversation_ended.assert_called_once_with()
+
+
+def test_controller_external_stop_cancels_an_active_secret_prompt(ui):
+    """Shutdown cancels a masked request before releasing exclusive prompt ownership."""
+    controller = SessionController(ui)
+
+    async def scenario():
+        """Stop while a masked prompt is actively waiting for terminal input."""
+        opened = asyncio.Event()
+
+        async def answer(*_args, **kwargs):
+            """Keep the masked request open until the controller cancels its input task."""
+            if kwargs.get("secret"):
+                opened.set()
+                await asyncio.Event().wait()
+
+        ui.prompt_async.side_effect = answer
+        task = asyncio.create_task(
+            controller.run(
+                lambda _receive: controller.interaction.prompt("Credential:", secret=True)
+            )
+        )
+        try:
+            await opened.wait()
+            controller.stop()
+            await task
+        finally:
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert controller.running is False
+    assert any(call.kwargs.get("secret") for call in ui.prompt_async.await_args_list)
+
+
+@pytest.mark.parametrize("failure", [asyncio.CancelledError, ValueError])
+def test_controller_propagates_failures_from_a_masked_prompt(ui, failure):
+    """Masked prompt failures are returned to the execution owner without being swallowed."""
+    controller = SessionController(ui)
+    ui.prompt_async.side_effect = failure
+
+    with pytest.raises(failure):
+        asyncio.run(
+            controller.run(
+                lambda _receive: controller.interaction.prompt("Credential:", secret=True)
+            )
+        )
+
+    assert controller.running is False
 
 
 def test_controller_rejects_a_new_approval_requested_after_stop(ui):
@@ -1308,24 +2144,27 @@ def test_steering_precedes_followups_and_keeps_corrections_in_submission_order(u
     assert all(isinstance(value, SteeringMessage) for value in messages[1:3])
 
 
-@pytest.mark.parametrize("command", ["/interrupt", "/steer correction"])
-def test_run_interruption_revokes_pending_approval_without_ending_the_chat(ui, command):
-    """Active approvals are revoked with a scoped interrupt and are never answered by steering."""
-
+def test_run_interruption_revokes_pending_approval_without_ending_the_chat(ui):
+    """An active approval is revoked by run control and leaves the chat available."""
     controller = SessionController(ui)
     decisions, messages = [], []
 
     async def scenario():
-        """Interrupt a pending request, then verify subsequent ordinary input still works."""
+        """Interrupt the native question, then accept a fresh conversation message."""
         inputs = asyncio.Queue()
-        pending, finished, processed = (asyncio.Event() for _ in range(3))
+        prompted, finished, processed = (asyncio.Event() for _ in range(3))
         read_inputs(ui, inputs)
 
+        async def confirm(*_args, **_kwargs):
+            """Signal that approval input opened, then wait until run control cancels it."""
+            prompted.set()
+            await asyncio.Event().wait()
+
+        ui.confirm_async.side_effect = confirm
+
         def info(text=""):
-            """Observe approval and execution transitions through visible output."""
-            if text.startswith("Input requested"):
-                pending.set()
-            elif text == "interrupted":
+            """Observe the execution owner after its approval request is revoked."""
+            if text == "interrupted":
                 finished.set()
             elif text == "processed":
                 processed.set()
@@ -1345,12 +2184,11 @@ def test_run_interruption_revokes_pending_approval_without_ending_the_chat(ui, c
         task = asyncio.create_task(controller.run(conversation))
         try:
             inputs.put_nowait("first")
-            await pending.wait()
-            inputs.put_nowait(command)
+            await prompted.wait()
+            assert controller.request_interrupt() is True
             await finished.wait()
             assert controller.control.stopped is False
-            if command == "/interrupt":
-                inputs.put_nowait("later")
+            inputs.put_nowait("later")
             await processed.wait()
             inputs.put_nowait("/exit")
             await task
@@ -1360,8 +2198,8 @@ def test_run_interruption_revokes_pending_approval_without_ending_the_chat(ui, c
 
     asyncio.run(scenario())
     assert decisions == []
-    assert messages == ["later" if command == "/interrupt" else "correction"]
-    ui.confirm_async.assert_not_awaited()
+    assert messages == ["later"]
+    ui.confirm_async.assert_awaited_once_with("Approve?", default=True)
 
 
 def test_rejected_steering_does_not_interrupt_or_displace_a_full_mailbox(ui):

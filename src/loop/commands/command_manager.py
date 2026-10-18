@@ -278,14 +278,33 @@ class CommandManager:
                 to report it.
             ValueError: If dispatch requires an unavailable interaction.
         """
-        if not user_input.startswith("/"):
+        command = self._parse_user_command(user_input)
+        if command is None:
             return False
+        name, arguments = command
+        self.call(name, arguments, interaction=interaction)
+        return True
 
+    def is_user_command(self, user_input: str) -> bool:
+        """Return whether input uses the registered command syntax.
+
+        Args:
+            user_input (str): User input to classify.
+
+        Returns:
+            bool: Whether ``user_input`` is a command invocation.
+        """
+        return self._parse_user_command(user_input) is not None
+
+    @staticmethod
+    def _parse_user_command(user_input: str) -> tuple[str, str] | None:
+        """Parse command input once using the manager's command prefix."""
+        if not user_input.startswith("/"):
+            return None
         parts = user_input[1:].split(maxsplit=1)
         name = parts[0] if parts else ""
-        arguments = parts[1] if len(parts) == 2 else ""
-        self.call(name, arguments.strip(), interaction=interaction)
-        return True
+        arguments = parts[1].strip() if len(parts) == 2 else ""
+        return name, arguments
 
     def call(
         self,

@@ -134,6 +134,22 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
         self._stream = None
         self._plain_stream_has_output = False
 
+    def current_input(self) -> str:
+        """Return the current text in the normal message editor.
+
+        Returns:
+            str: Unsubmitted text currently held by the primary prompt buffer.
+        """
+        return self._session.default_buffer.text
+
+    def set_current_input(self, value: str) -> None:
+        """Replace the text currently held in the normal message editor.
+
+        Args:
+            value (str): Text to place in the primary prompt buffer.
+        """
+        self._session.default_buffer.text = value
+
     @contextmanager
     def response_context(self) -> Generator[None]:
         """Present one model response and finalize streamed output.
@@ -261,6 +277,7 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
         index: Iterable[str] | Mapping[object, str] | None = None,
         default: object | None = None,
         secret: bool = False,
+        initial: str | None = None,
     ) -> object | False:
         """Read a user message without blocking the event loop.
 
@@ -283,6 +300,8 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
             default (object | None): Value returned for empty input, or ``None`` to require
                 non-empty input. Defaults to ``None``.
             secret (bool): Whether entered text is masked. Defaults to ``False``.
+            initial (str | None): Text to place in the editor without treating it as an answer.
+                Defaults to ``None``.
 
         Returns:
             object | False: The selected value or entered message, or ``False`` when the user
@@ -306,6 +325,7 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
                     completer=prompt.completer,
                     complete_in_thread=True,
                     is_password=secret,
+                    default=initial or "",
                 )
             except (KeyboardInterrupt, EOFError):
                 return False

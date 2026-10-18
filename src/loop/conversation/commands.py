@@ -24,11 +24,11 @@ class ConversationControl(Protocol):
         """
 
     def request_response(self, answer: str | None = None) -> ResponseOutcome:
-        """Request an interactive response or submit one to the pending interaction.
+        """Submit a direct response when the native prompt does not own input.
 
         Args:
-            answer (str | None): Answer text to submit directly, or ``None`` to open the separate
-                response prompt.
+            answer (str | None): Answer text to submit directly, or ``None`` to keep the request
+                in its native prompt.
 
         Returns:
             ResponseOutcome: Whether the pending request was answered, prompted, or rejected.
@@ -120,7 +120,7 @@ class ConversationCommands:
         context: CommandContext,
         answer: Annotated[tuple[str, ...], CommandRemainder()] = (),
     ) -> None:
-        """Answer the pending interaction request or open its dedicated prompt.
+        """Submit an answer to a pending question when direct responses are available.
 
         Args:
             context (CommandContext): Interaction used to report a missing request.
@@ -132,15 +132,11 @@ class ConversationCommands:
         if outcome is ResponseOutcome.NO_REQUEST:
             context.interaction.warning("No input request is pending.")
         elif outcome is ResponseOutcome.INVALID:
-            context.interaction.warning(
-                "Choose one of the listed responses, or use /respond without an answer."
-            )
+            context.interaction.warning("Choose one of the listed responses.")
         elif outcome is ResponseOutcome.PROMPT_REQUIRED:
-            context.interaction.warning("Use /respond without an answer for this request.")
+            context.interaction.warning("Answer this request in its active prompt.")
         elif outcome is ResponseOutcome.MASKED_INPUT_REQUIRED:
-            context.interaction.warning(
-                "This request requires masked input; use /respond without an answer."
-            )
+            context.interaction.warning("Answer this request in its masked prompt.")
 
     def status(self, context: CommandContext) -> None:
         """Show conversation activity and the number of queued inputs.

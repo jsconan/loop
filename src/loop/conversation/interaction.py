@@ -113,7 +113,7 @@ class MailboxInteraction(Interaction):
         default: object | None = None,
         secret: bool = False,
     ) -> object | False:
-        """Request separate user input without consuming queued conversation messages.
+        """Request input through the source interaction's native asynchronous prompt.
 
         Args:
             message (str | None): Question to display, or ``None`` for the default prompt.
@@ -147,7 +147,7 @@ class MailboxInteraction(Interaction):
         )
 
     def confirm(self, message: str, *, default: bool = False) -> bool:
-        """Request explicit approval independently of queued conversation input.
+        """Request explicit approval through the source interaction's native confirmation UI.
 
         Args:
             message (str): Exact confirmation question.

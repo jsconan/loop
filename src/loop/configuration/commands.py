@@ -280,24 +280,15 @@ class ConfigurationCommands:
                     f"'/config {action}' cannot run while the agent is working because it may "
                     "prompt or replace active runtime settings. Wait for the run to pause."
                 )
-            if action == "set":
-                if scope is None:
+            if action == "set" and path is not None and context.capabilities is not None:
+                entry = next(
+                    (item for item in self._configuration.entries if item.path == path), None
+                )
+                if entry is not None and not entry.required_capabilities <= context.capabilities:
                     raise CommandArgumentError(
-                        "Set an explicit scope (session, user, or workspace) while the agent is "
-                        "working; interactive scope selection is unavailable during a run."
+                        f"Configuration field '{path}' cannot be changed while the agent is "
+                        "working; its owner requires an idle session."
                     )
-                if path is not None and context.capabilities is not None:
-                    entry = next(
-                        (item for item in self._configuration.entries if item.path == path), None
-                    )
-                    if (
-                        entry is not None
-                        and not entry.required_capabilities <= context.capabilities
-                    ):
-                        raise CommandArgumentError(
-                            f"Configuration field '{path}' cannot be changed while the agent is "
-                            "working; its owner requires an idle session."
-                        )
         if action is None:
             self._show(context, None)
             return

@@ -59,8 +59,8 @@ def test_safe_config_changes_apply_during_runs_and_hide_unsafe_values(tmp_path):
     )
 
 
-def test_config_run_restrictions_reject_prompting_and_runtime_replacement_operations(tmp_path):
-    """Interactive config actions need a paused run and unsafe live paths are rejected."""
+def test_config_run_restrictions_preserve_scope_prompt_and_reject_unsafe_operations(tmp_path):
+    """Scope selection remains interactive while runtime replacement operations stay blocked."""
     configuration = ConfigurationManager(tmp_path / "config.toml")
     configuration.load()
     interaction = Mock()
@@ -78,8 +78,19 @@ def test_config_run_restrictions_reject_prompting_and_runtime_replacement_operat
         )
     )
 
+    interaction.prompt.return_value = "session"
     assert manager.handle_user_command("/config set loop.debug true")
-    assert "explicit scope" in interaction.report.call_args.args[0].detail
+    interaction.prompt.assert_called_once_with(
+        "Choose configuration scope:",
+        choices={
+            "user": "Save for current user",
+            "workspace": "Save for current workspace",
+            "session": "This session only",
+            "cancel": "Cancel",
+        },
+        index={"user": "u", "workspace": "w", "session": "s", "cancel": "c"},
+    )
+    assert configuration.effective.loop.debug is True
     assert manager.handle_user_command("/config set loop.model test scope=session")
     assert "cannot be changed while the agent is working" in (
         interaction.report.call_args.args[0].detail

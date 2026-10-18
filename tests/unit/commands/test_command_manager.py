@@ -460,6 +460,9 @@ def test_handle_user_command_deserializes_arguments_and_injects_context():
 
     manager.register(inspect_context)
 
+    assert manager.is_user_command("ordinary /inspect_context") is False
+    assert manager.is_user_command("/inspect_context 3") is True
+    assert manager.is_user_command("/") is True
     assert manager.handle_user_command("ordinary /inspect_context") is False
     assert manager.handle_user_command("/inspect_context 3") is True
     assert manager.call("inspect_context", "count=4") is None

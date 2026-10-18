@@ -22,8 +22,21 @@ from loop import (
     ToolResultPresentationSpec,
     constants,
 )
-from loop.interaction import ConsoleInteraction
+from loop.interaction import AsyncInteractionInput, ConsoleInteraction
 from loop.models import Usage
+
+
+def test_primary_editor_text_can_be_read_and_replaced():
+    """The async editor adapter exposes its live primary prompt buffer."""
+    session = Mock()
+    session.default_buffer.text = "unfinished draft"
+    interaction = ConsoleInteraction(session=session)
+
+    assert interaction.current_input() == "unfinished draft"
+
+    interaction.set_current_input("")
+
+    assert session.default_buffer.text == ""
 
 
 def trimmed_rendered_lines(output: str) -> list[str]:
@@ -385,9 +398,39 @@ def test_prompt_async_forwards_native_async_input_options():
         == "answer"
     )
     session.prompt_async.assert_awaited_once_with(
-        "Question: ", completer=completer, complete_in_thread=True, is_password=True
+        "Question: ",
+        completer=completer,
+        complete_in_thread=True,
+        is_password=True,
+        default="",
     )
     session.prompt.assert_not_called()
+
+
+def test_prompt_async_restores_initial_editor_text():
+    """Restored draft text is passed to the native prompt as its initial buffer."""
+    session = Mock()
+    session.prompt_async = AsyncMock(return_value="unfinished draft")
+
+    result = asyncio.run(
+        ConsoleInteraction(session=session).prompt_async(
+            "Question:", default="fallback", initial="unfinished draft"
+        )
+    )
+
+    assert result == "unfinished draft"
+    session.prompt_async.assert_awaited_once_with(
+        "Question: ",
+        completer=None,
+        complete_in_thread=True,
+        is_password=False,
+        default="unfinished draft",
+    )
+
+
+def test_async_input_adapter_can_omit_editor_text_support():
+    """Async input adapters without editable buffers report no current text by default."""
+    assert AsyncInteractionInput.current_input(object()) is None
 
 
 @pytest.mark.parametrize(
