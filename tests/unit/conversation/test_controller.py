@@ -10,8 +10,20 @@ import pytest
 from prompt_toolkit.completion import CompleteEvent, DummyCompleter, WordCompleter
 from prompt_toolkit.document import Document
 
-from loop import ConsoleInteraction, Interaction, RunInterrupted, SessionController
+from loop import (
+    CommandCompletion,
+    CommandContext,
+    CommandManager,
+    CommandRegistration,
+    CompletionValue,
+    ConsoleInteraction,
+    Interaction,
+    RunInterrupted,
+    SessionController,
+)
+from loop.conversation import ConversationCommands
 from loop.conversation import controller as controller_module
+from loop.conversation.models import SteeringOutcome
 from loop.models import SteeringMessage
 
 
@@ -53,8 +65,131 @@ def test_controller_exposes_setup_interaction_and_a_single_execution_lifecycle(u
 
     assert controller.running is False
     controller.interaction.info("settled")
+    with pytest.raises(RuntimeError, match="Bind the command manager before running"):
+        controller.bind_command_manager(CommandManager())
     with pytest.raises(RuntimeError, match="only run once"):
         asyncio.run(controller.run(lambda _receive: None))
+
+
+def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
+    """Registered responsive controls and later argument values remain discoverable."""
+    controller = SessionController(ui)
+    manager = CommandManager(providers=(ConversationCommands(controller),), interaction=ui)
+    controller.bind_command_manager(manager)
+
+    def choose(context: CommandContext, color: str) -> None:
+        """Choose a configured color."""
+
+    manager.register(
+        CommandRegistration(
+            choose,
+            responsive=True,
+            completion=CommandCompletion(values=(CompletionValue("blue"),)),
+        )
+    )
+    manager.call("help")
+    names = [item.name for item in ui.table.call_args.args[0]]
+    assert {"help", "exit", "quit", "interrupt", "respond", "status", "steer", "choose"} <= set(
+        names
+    )
+
+    async def scenario():
+        """Read a completion request while the conversation owns active work."""
+        inputs = asyncio.Queue()
+        working, captured = asyncio.Event(), asyncio.Event()
+        release = Event()
+        busy_completions = []
+
+        async def read(*_args, **kwargs):
+            """Capture command completion before waiting for the next mailbox input."""
+            completer = kwargs["completer"]
+            completions = list(completer.get_completions(Document("/choose b"), CompleteEvent()))
+            if working.is_set():
+                busy_completions[:] = completions
+                captured.set()
+            return await inputs.get()
+
+        ui.prompt_async.side_effect = read
+
+        def conversation(receive):
+            """Hold execution ownership after accepting the initial message."""
+            receive(DummyCompleter())
+            controller.interaction.info("working")
+            release.wait()
+            receive(DummyCompleter())
+
+        ui.info.side_effect = lambda message="": working.set() if message == "working" else None
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("start")
+            await working.wait()
+            inputs.put_nowait("/status")
+            await captured.wait()
+            assert [item.text for item in busy_completions] == ["blue"]
+            release.set()
+            inputs.put_nowait(False)
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_controller_passes_serialized_and_unknown_slash_input_to_the_loop(ui):
+    """Only registered responsive commands are consumed by the controller."""
+    controller = SessionController(ui)
+    manager = CommandManager(providers=(ConversationCommands(controller),), interaction=ui)
+
+    def serialized() -> None:
+        """Represent a command owned by the conversation loop."""
+
+    manager.register(serialized)
+    controller.bind_command_manager(manager)
+    received = []
+
+    async def scenario():
+        """Submit a registered serialized command and an unknown slash message."""
+        inputs = asyncio.Queue()
+        processed = asyncio.Queue()
+        read_inputs(ui, inputs)
+        ui.info.side_effect = lambda message="": (
+            processed.put_nowait(message) if message == "processed" else None
+        )
+
+        def conversation(receive):
+            """Collect ordinary inputs for the loop's command dispatcher."""
+            for _ in range(2):
+                received.append(receive(DummyCompleter()))
+                controller.interaction.info("processed")
+
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("/serialized")
+            await processed.get()
+            inputs.put_nowait("/missing value")
+            await processed.get()
+            inputs.put_nowait(False)
+            await task
+        finally:
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert received == ["/serialized", "/missing value"]
+
+
+def test_steering_reports_when_active_control_already_rejects_interruption(ui):
+    """A stopped control refuses interruption even while its execution scope is unwinding."""
+    controller = SessionController(ui)
+
+    with controller.control.execution():
+        controller.control.stop()
+        outcome = controller.steer("correction", ui)
+
+    assert outcome is SteeringOutcome.INTERRUPT_REJECTED
 
 
 def test_controller_accepts_messages_and_status_during_serialized_work(ui):

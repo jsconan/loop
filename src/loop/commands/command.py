@@ -33,6 +33,8 @@ class Command:
         arguments_model (type[BaseModel] | None): Pydantic model used to validate arguments after
             registration, or ``None`` for a passive declaration.
         completion (CommandCompletion | None): Optional shell-like argument completion grammar.
+        responsive (bool): Whether the command may run while conversation execution is busy.
+            Defaults to ``False``.
     """
 
     function: Callable[..., None]
@@ -40,6 +42,7 @@ class Command:
     description: str | None = None
     arguments_model: type[BaseModel] | None = None
     completion: CommandCompletion | None = None
+    responsive: bool = False
 
     def registered(
         self,
@@ -47,6 +50,7 @@ class Command:
         name: str | None = None,
         description: str | None = None,
         completion: CommandCompletion | None = None,
+        responsive: bool | None = None,
     ) -> Command:
         """Return a registry-ready copy with resolved metadata and validation.
 
@@ -56,6 +60,8 @@ class Command:
                 derive it.
             completion (CommandCompletion | None): Container-specific completion grammar, or
                 ``None`` to inherit or discover one.
+            responsive (bool | None): Whether the command may run alongside conversation
+                execution, or ``None`` to inherit the declaration.
 
         Returns:
             Command: Immutable, fully resolved command for one manager.
@@ -74,6 +80,7 @@ class Command:
             completion=(
                 completion or self.completion or CommandCompletion.get_completion(self.function)
             ),
+            responsive=self.responsive if responsive is None else responsive,
             arguments_model=get_command_arguments_model(self.function, resolved_name),
         )
 
@@ -144,12 +151,15 @@ class CommandRegistration:
             it.
         completion (CommandCompletion | None): Container-specific completion grammar, or ``None``
             to inherit one declared on the function.
+        responsive (bool | None): Whether the command may run alongside conversation execution,
+            or ``None`` to inherit one declared on the function.
     """
 
     function: Callable[..., None]
     name: str | None = None
     description: str | None = None
     completion: CommandCompletion | None = None
+    responsive: bool | None = None
 
 
 class CommandsProvider(Protocol):
@@ -177,6 +187,7 @@ def command[CommandFunction: Callable[..., None]](
     name: str | None = None,
     description: str | None = None,
     completion: CommandCompletion | None = None,
+    responsive: bool = False,
 ) -> Callable[[CommandFunction], CommandFunction]: ...
 
 
@@ -187,6 +198,7 @@ def command[CommandFunction: Callable[..., None]](
     name: str | None = None,
     description: str | None = None,
     completion: CommandCompletion | None = None,
+    responsive: bool = False,
 ) -> CommandFunction | Callable[[CommandFunction], CommandFunction]:
     """Declare a function as a user command without registering it.
 
@@ -196,6 +208,8 @@ def command[CommandFunction: Callable[..., None]](
         name (str | None): Public name, defaulting to the function name at registration.
         description (str | None): Display description, defaulting to the docstring summary.
         completion (CommandCompletion | None): Optional argument completion grammar.
+        responsive (bool): Whether the command may run alongside conversation execution.
+            Defaults to ``False``.
 
     Returns:
         CommandFunction | Callable[[CommandFunction], CommandFunction]: Unchanged declared function
@@ -210,7 +224,13 @@ def command[CommandFunction: Callable[..., None]](
             raise ValueError("The function is already declared as a command.")
         Command.set_declaration(
             target,
-            Command(target, name=name, description=description, completion=completion),
+            Command(
+                target,
+                name=name,
+                description=description,
+                completion=completion,
+                responsive=responsive,
+            ),
         )
         return target
 

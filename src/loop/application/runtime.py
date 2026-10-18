@@ -10,7 +10,7 @@ from typing import Self
 
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
-from ..conversation import SessionController
+from ..conversation import ConversationCommands, SessionController
 from ..execution import CommandExecutionService
 from ..instructions import InstructionsManager
 from ..interaction import AsyncInteractionInput, Interaction
@@ -231,6 +231,9 @@ class ApplicationRuntime:
                 cleanup_callbacks=cleanup_callbacks,
                 session_controller=session_controller,
             )
+            if session_controller is not None:
+                loop.register_command_provider(ConversationCommands(session_controller))
+                session_controller.bind_command_manager(loop.command_manager)
             loop.register_command_provider(
                 ConfigurationCommands(
                     configuration,

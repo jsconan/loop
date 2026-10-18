@@ -188,6 +188,60 @@ def test_register_resolves_declared_metadata_and_registration_options():
     assert manager.commands[-1].description == "Declared description."
 
 
+def test_responsive_metadata_is_inherited_and_can_be_overridden():
+    """Command declarations and registrations preserve explicit responsive ownership."""
+    manager = CommandManager()
+
+    @command(responsive=True)
+    def inherited() -> None:
+        """Run a responsive declared command."""
+
+    def configured() -> None:
+        """Run a command with registration metadata."""
+
+    manager.register(inherited)
+    manager.register(CommandRegistration(configured, responsive=True))
+    manager.register(CommandRegistration(configured, name="serialized", responsive=True))
+
+    assert [item.name for item in manager.responsive_commands] == [
+        "help",
+        "exit",
+        "quit",
+        "inherited",
+        "configured",
+        "serialized",
+    ]
+
+    override = CommandManager()
+    override.register(CommandRegistration(configured, responsive=True), responsive=False)
+
+    assert [item.name for item in override.responsive_commands] == ["help", "exit", "quit"]
+
+
+def test_responsive_dispatch_leaves_serialized_and_unknown_commands_unconsumed():
+    """Busy dispatch invokes only known responsive commands without reporting other input."""
+    interaction = Mock(spec=Interaction)
+    calls = []
+
+    def responsive(context: CommandContext) -> None:
+        """Record responsive dispatch through the supplied interaction."""
+        assert context.interaction is interaction
+        calls.append(context.name)
+
+    def serialized() -> None:
+        """Represent work owned by the conversation loop."""
+
+    manager = CommandManager(interaction=interaction)
+    manager.register(CommandRegistration(responsive, responsive=True))
+    manager.register(serialized)
+
+    assert manager.handle_user_command("/serialized", responsive_only=True) is False
+    assert manager.handle_user_command("/missing", responsive_only=True) is False
+    assert manager.handle_user_command("/responsive", responsive_only=True) is True
+    assert calls == ["responsive"]
+    interaction.report.assert_not_called()
+
+
 def test_register_retains_explicit_and_function_declared_completion_metadata():
     """Registration carries completion grammars from options or decorated functions."""
     manager = CommandManager()

@@ -222,6 +222,7 @@ async with aclosing(backend.get_response_async(input="Explain the result.", stre
 
 ```python
 from loop import ConsoleInteraction, Loop, SessionController
+from loop.conversation import ConversationCommands
 
 
 async def chat(backend):
@@ -231,6 +232,8 @@ async def chat(backend):
         interaction=controller.interaction,
         run_control=controller.control,
     )
+    conversation.register_command_provider(ConversationCommands(controller))
+    controller.bind_command_manager(conversation.command_manager)
     await controller.run(lambda receive: conversation.run(input_source=receive))
 ```
 

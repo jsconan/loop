@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 class CommandManager:
     """Collect command declarations and route user input to their functions.
 
+    Mark only commands safe alongside active conversation work as responsive. The manager can then
+    dispatch those commands independently while leaving ordinary commands with the execution owner.
+
     Args:
         commands (Iterable[CommandRegistration | Callable[..., None]] | None): Commands
             registered after provider commands in iteration order, or ``None``.
@@ -60,6 +63,7 @@ class CommandManager:
                 self.help,
                 name="help",
                 description="Show the available commands.",
+                responsive=True,
             )
         )
         for name in exit_command_names or ():
@@ -68,6 +72,7 @@ class CommandManager:
                     self.request_exit,
                     name=name,
                     description="End the conversation.",
+                    responsive=True,
                 )
             )
         self.register_providers(providers or ())
@@ -101,6 +106,15 @@ class CommandManager:
         return tuple(self._commands.values())
 
     @property
+    def responsive_commands(self) -> tuple[Command, ...]:
+        """Return registered commands permitted during active conversation execution.
+
+        Returns:
+            tuple[Command, ...]: Commands marked responsive in registration order.
+        """
+        return tuple(command for command in self._commands.values() if command.responsive)
+
+    @property
     def exit_requested(self) -> bool:
         """Return whether a command requested conversation termination.
 
@@ -116,6 +130,7 @@ class CommandManager:
         name: str | None = None,
         description: str | None = None,
         completion: CommandCompletion | None = None,
+        responsive: bool | None = None,
     ) -> Callable[..., None]:
         """Register a command declaration or function, directly or as a decorator.
 
@@ -125,6 +140,8 @@ class CommandManager:
             name (str | None): Slash-free command name. Defaults to the function name.
             description (str | None): Display description. Defaults to the docstring summary.
             completion (CommandCompletion | None): Optional shell-like argument completion grammar.
+            responsive (bool | None): Whether the command may run during conversation execution,
+                or ``None`` to inherit its declaration. Defaults to ``None``.
 
         Raises:
             ValueError: If the command name is invalid or duplicated.
@@ -136,11 +153,13 @@ class CommandManager:
             name = name if name is not None else registration.name
             description = description if description is not None else registration.description
             completion = completion if completion is not None else registration.completion
+            responsive = responsive if responsive is not None else registration.responsive
         declaration = Command.get_declaration(function) or Command(function)
         command = declaration.registered(
             name=name,
             description=description,
             completion=completion,
+            responsive=responsive,
         )
         if (
             not command.name
@@ -182,12 +201,20 @@ class CommandManager:
         for provider in providers:
             self.register_provider(provider)
 
-    def handle_user_command(self, user_input: str, interaction: Interaction | None = None) -> bool:
+    def handle_user_command(
+        self,
+        user_input: str,
+        interaction: Interaction | None = None,
+        *,
+        responsive_only: bool = False,
+    ) -> bool:
         """Classify and dispatch slash-prefixed user input.
 
         Args:
             user_input (str): Stripped user input to classify and dispatch.
             interaction (Interaction | None): Invocation interaction overriding the default.
+            responsive_only (bool): Dispatch only commands marked responsive and leave unknown or
+                serialized commands unconsumed. Defaults to ``False``.
 
         Returns:
             bool: ``True`` when the input was consumed as a command; otherwise ``False``.
@@ -207,6 +234,9 @@ class CommandManager:
         parts = user_input[1:].split(maxsplit=1)
         name = parts[0] if parts else ""
         arguments = parts[1] if len(parts) == 2 else ""
+        command = self._commands.get(name)
+        if responsive_only and (command is None or not command.responsive):
+            return False
         self.call(name, arguments.strip(), interaction=interaction)
         return True
 

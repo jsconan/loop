@@ -14,6 +14,7 @@ from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.application.runtime import ApplicationRuntime
 from loop.configuration import ApplicationSettings, ConfigurationCommands
+from loop.conversation import ConversationCommands
 from loop.telemetry import SQLiteTelemetryAdapter, Telemetry
 from loop.workspace import Workspace, WorkspaceCommands
 
@@ -129,6 +130,30 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
         ]
     )
     dependencies["set_telemetry"].assert_called_with(None)
+
+
+def test_async_runtime_registers_and_binds_the_session_command_provider(
+    dependencies, assembled, monkeypatch
+):
+    """Async runtimes share the loop command manager with the registered controller."""
+    workspace, paths, workspace_paths, settings = assembled
+    interaction = Mock(spec=ConsoleInteraction)
+    controller = Mock()
+    controller_class = Mock(return_value=controller)
+    monkeypatch.setattr(runtime_module, "SessionController", controller_class)
+
+    runtime = ApplicationRuntime.create(
+        workspace, paths, workspace_paths, settings, Mock(), Mock(), interaction
+    )
+
+    active_loop = dependencies["Loop"].create_default.return_value
+    controller_class.assert_called_once_with(interaction)
+    assert isinstance(
+        active_loop.register_command_provider.call_args_list[0].args[0], ConversationCommands
+    )
+    controller.bind_command_manager.assert_called_once_with(active_loop.command_manager)
+    controller.running = False
+    runtime.close()
 
 
 def test_create_requires_identity_and_skips_environment_model_callback(dependencies, assembled):

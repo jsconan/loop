@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Literal
 
 from prompt_toolkit.completion import Completer
@@ -12,6 +13,28 @@ EVENT_PROMPT = "prompt"
 EVENT_CONFIRM = "confirm"
 EVENT_TERMINAL = "terminal"
 EVENT_TERMINAL_EXIT = "terminal_exit"
+
+
+@dataclass(frozen=True)
+class ConversationStatus:
+    """Snapshot the user-visible activity and queued input count.
+
+    Args:
+        state (str): Current activity shown by the conversation status command.
+        queued_inputs (int): Number of ordinary inputs waiting in the mailbox.
+    """
+
+    state: Literal["Interrupting", "Waiting for your response", "Idle", "Working"]
+    queued_inputs: int
+
+
+class SteeringOutcome(Enum):
+    """Describe whether a steering message was admitted and interrupted the active run."""
+
+    INTERRUPTED = "interrupted"
+    RUN_INACTIVE = "run_inactive"
+    INTERRUPT_REJECTED = "interrupt_rejected"
+    QUEUE_FULL = "queue_full"
 
 
 @dataclass
