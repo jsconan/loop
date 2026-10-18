@@ -5,6 +5,8 @@ description: Write, update, reorganize, diagnose, and verify isolated pytest uni
 
 # Testing
 
+Tests, including `pytest.mark.parametrize` declarations, are exempt from the source signature and call layout rule. Use the normal formatter layout there.
+
 Preserve 100% statement and branch coverage for active source code. Test supported behavior, edge cases, error paths, and branches. Never lower, bypass, exclude, or weaken coverage requirements to make checks pass. Do not test passive `__init__.py` barrel files unless they contain active behavior.
 
 ## Place tests by ownership

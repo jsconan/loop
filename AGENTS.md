@@ -24,6 +24,7 @@
 
 ### Documentation
 
+- Markdown has no line-length limit. Keep each prose paragraph on one source line; do not insert line breaks to wrap paragraphs. Preserve structural newlines in headings, lists, tables, and fenced code blocks.
 - Keep maintained documentation, including the main and test READMEs, focused on supported behavior, usage, configuration, architecture, test organization, and durable constraints. Update it when those contracts change, not after an individual development or verification run.
 - Do not put review findings, progress notes, migration history, dated verification results, test counts, host-specific benchmark results, or rollout plans in maintained documentation. Report transient evidence in the task response or an explicitly requested temporary artifact.
 - Describe limitations as product behavior. Do not replace concrete safety limits with roadmap promises, historical qualification claims, or assertions about future support.
