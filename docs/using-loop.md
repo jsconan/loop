@@ -18,13 +18,17 @@ loop
 
 Enter a message at the `You:` prompt. To stop, enter `/exit`, `/quit`, or `q`.
 
-The editor stays available while the agent works. Submitted messages and commands queue in order; each request finishes before the next begins. `/status` immediately reports whether Loop is idle, working, or waiting for a response, along with the number of queued inputs.
+The editor stays available while the agent works. Ordinary messages and commands queue in order. `/status` immediately reports whether Loop is idle, working, waiting for a response, or interrupting, along with the number of queued inputs.
+
+Use `/interrupt` to end the active agent run while keeping the conversation open. Existing queued follow-ups remain accepted and run afterward. Use `/steer <message>` to interrupt the active run and process a correction before those follow-ups. Multiple accepted corrections retain their submission order. Steering text becomes a new user message in the same session, with normal attachment snapshots and validation; a leading command prefix is treated as message text. Both controls require an active agent run. Empty steering text is rejected.
+
+Interruption acts at the next safe boundary. Partial model output is discarded, completed tool results are preserved, and remaining tool calls receive explicit interruption results instead of being executed. An uncertain external outcome stays marked unknown. Pending approval requests are revoked; corrections never grant tool permission. New work retains normal authorization, recovery, and turn-limit checks. The interrupted run is recorded as cancelled.
 
 When a tool, command, or recovery operation asks a question, press Enter on an empty editor or use `/respond` to open that question's input prompt. Text already queued for the conversation never becomes an approval. An unsent editor draft stays intact when a question arrives. Startup questions appear before ordinary conversation input begins.
 
-Up to 16 inputs may wait behind active work. A full queue explicitly rejects further inputs. Queued inputs remain in memory until execution begins; attached paths are resolved and snapshotted at that point. Exit, execution failure, and workspace replacement cancel unexecuted inputs and report their count. A queued input does not survive an application crash.
+Up to 16 inputs, including corrections, may wait behind active work. A full queue explicitly rejects further inputs; rejected steering does not interrupt the current run. Queued inputs remain in memory until execution begins; attached paths are resolved and snapshotted at that point. Exit, execution failure, and workspace replacement cancel unexecuted inputs and report their count. A queued input does not survive an application crash.
 
-Exit stops admission and cancels pending questions. Loop closes an interrupted model stream and checks cancellation before new model requests and tool execution, then waits for owned work to settle before releasing its services. Active synchronous operations finish under their existing deadlines; unbounded custom tools can delay shutdown indefinitely. Such tools must impose their own deadlines. Immediate cancellation of arbitrary tools requires a cancellable execution contract rather than terminating their worker thread.
+Exit stops admission and cancels pending questions. Loop closes an interrupted model stream and checks cancellation before new model requests and tool execution, then waits for owned work to settle before releasing its services. Blocking model reads and synchronous tools finish their current operation under existing deadlines before observing interruption or shutdown; unbounded custom tools can delay either indefinitely. Such tools must impose their own deadlines. Immediate cancellation of arbitrary tools requires a cancellable execution contract rather than terminating their worker thread.
 
 ### Commands and completion
 
@@ -183,17 +187,9 @@ asyncio.run(main())
 
 ### Input, presentation, and response collection
 
-`InteractionInput` defines synchronous prompts and confirmation. `InteractionOutput` defines
-presentation without reading input. `Interaction` combines both interfaces for existing adapters;
-the separate `AsyncInteractionInput` capability defines asynchronous prompts and confirmation.
-`ConsoleInteraction` implements all of them. Its `prompt_async()` and `confirm_async()` methods
-use native asynchronous terminal input with the same choices, completion, masking, defaults,
-and exit handling as synchronous prompts. Task cancellation propagates; terminal interruption
-or end-of-file returns `False`. Interrupted asynchronous confirmation declines the operation.
-Only one task should read a terminal's input at a time.
+`InteractionInput` defines synchronous prompts and confirmation. `InteractionOutput` defines presentation without reading input. `Interaction` combines both interfaces for existing adapters; the separate `AsyncInteractionInput` capability defines asynchronous prompts and confirmation. `ConsoleInteraction` implements all of them. Its `prompt_async()` and `confirm_async()` methods use native asynchronous terminal input with the same choices, completion, masking, defaults, and exit handling as synchronous prompts. Task cancellation propagates; terminal interruption or end-of-file returns `False`. Interrupted asynchronous confirmation declines the operation. Only one task should read a terminal's input at a time.
 
-`ResponseCollector` validates normalized backend events without a UI or session store. Feed it
-events with `add()`, exhaust the source, then call `finish()`:
+`ResponseCollector` validates normalized backend events without a UI or session store. Feed it events with `add()`, exhaust the source, then call `finish()`:
 
 ```python
 from loop import ResponseCollector
@@ -204,21 +200,11 @@ for event in backend.get_response(input="Explain the result."):
 response = collector.finish()
 ```
 
-The explicit `ResponseCompleted` event supplies authoritative final text and metadata. Missing
-completion, duplicate completion, and any event after completion raise `BackendResponseError`.
-Unknown extension events before completion are ignored. Partial text is never returned as a
-completed response.
+The explicit `ResponseCompleted` event supplies authoritative final text and metadata. Missing completion, duplicate completion, and any event after completion raise `BackendResponseError`. Unknown extension events before completion are ignored. Partial text is never returned as a completed response.
 
-`ResponsePresenter` renders accepted events through an `InteractionOutput`, suppressing repeated
-completed text for channels that already streamed. Create one presenter per response, use the
-output's `response_context()` to finalize rendering on success or failure, and validate each
-event with the collector before presenting it.
+`ResponsePresenter` renders accepted events through an `InteractionOutput`, suppressing repeated completed text for channels that already streamed. Create one presenter per response, use the output's `response_context()` to finalize rendering on success or failure, and validate each event with the collector before presenting it.
 
-`SessionManager.response()` coordinates collection and presentation for a synchronous iterable;
-`response_async()` does the same for an asynchronous iterable. Both accept an output-only
-`interaction` override, finalize presentation on failure or cancellation, and leave session
-history and persistence unchanged. The event producer owns stream cleanup; use `aclosing()`
-when consuming an asynchronous generator. Inside an async function:
+`SessionManager.response()` coordinates collection and presentation for a synchronous iterable; `response_async()` does the same for an asynchronous iterable. Both accept an output-only `interaction` override, finalize presentation on failure or cancellation, and leave session history and persistence unchanged. The event producer owns stream cleanup; use `aclosing()` when consuming an asynchronous generator. Inside an async function:
 
 ```python
 from contextlib import aclosing
@@ -248,7 +234,9 @@ async def chat(backend):
     await controller.run(lambda receive: conversation.run(input_source=receive))
 ```
 
-Each controller runs once. `stop()` can request shutdown from the UI or another thread; `running` stays true until owned execution has settled. Do not directly mutate conversation services while it runs. Synchronous interaction adapters continue to use the existing direct `Loop.run()` path. `ApplicationRuntime` selects mailbox execution when its UI implements `AsyncInteractionInput` and refuses to close services while execution is active.
+Each controller runs once. The injected `RunControl` owns a scoped interrupt for each agent run: `interrupt()` returns whether an active run accepted the signal, and `active` and `interrupted` report its state. `execution()` brackets custom interruptible work; `checkpoint()` and `wait()` raise `RunInterrupted` inside that scope. The runner converts this signal into a persisted cancelled run after settling tool results. The UI controls also revoke outstanding questions. A scoped interrupt clears on settlement; shutdown remains sticky.
+
+`stop()` can request shutdown from the UI or another thread; `running` stays true until owned execution has settled. Do not directly mutate conversation services while it runs. Synchronous interaction adapters continue to use the existing direct `Loop.run()` path. `ApplicationRuntime` selects mailbox execution when its UI implements `AsyncInteractionInput` and refuses to close services while execution is active.
 
 `Interaction.terminal_context()` reserves stdin for operations that read the terminal directly, such as administrator authentication. Synchronous adapters need no handoff. The mailbox UI asks for an explicit handoff, suspends its editor, and restores it after the scope exits. Questions inside that scope still use their normal explicit confirmation; handing over the terminal does not grant permission for an operation.
 

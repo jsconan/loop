@@ -26,6 +26,7 @@ from loop import (
     ResponseCompleted,
     ResponseMetrics,
     RunControl,
+    RunInterrupted,
     RuntimeEnvironment,
     Session,
     SessionExecutionConflictError,
@@ -1464,6 +1465,7 @@ def test_cancellation_after_authorization_prevents_the_tool_execution_boundary()
 def test_controlled_retry_wait_is_cancellable(caplog):
     """Recoverable failures retain their diagnostic while retry waits use the stop signal."""
     control = Mock(spec=RunControl)
+    control.execution.side_effect = nullcontext
     control.wait.side_effect = KeyboardInterrupt
     runner, _sessions, interaction = agent_runner(
         responses=[
@@ -1483,3 +1485,164 @@ def test_controlled_retry_wait_is_cancellable(caplog):
         "backend.request_failed"
     ]
     assert "private failure" not in caplog.text
+
+
+def test_interrupted_stream_is_closed_cancelled_and_ready_for_another_run(tmp_path):
+    """A scoped interruption discards partial output and leaves a clean durable continuation."""
+    control = RunControl()
+    closed = Mock()
+
+    def events():
+        """Interrupt after a displayed delta, before authoritative response completion."""
+        try:
+            yield AnswerDelta(text="partial")
+            assert control.interrupt() is True
+            yield ResponseCompleted(answer="discarded")
+        finally:
+            closed()
+
+    backend = Mock()
+    backend.get_response.side_effect = [events(), [ResponseCompleted(answer="corrected")]]
+    runner = file_runner(tmp_path, backend, run_control=control)
+    sessions = runner.session_manager
+    sessions.add_user_message("question")
+
+    result = runner.run()
+
+    closed.assert_called_once_with()
+    assert result.stop_reason == "cancelled"
+    assert result.turns == 0
+    assert result.final_response is None
+    assert sessions.recovery_state is None
+    assert [item.content for item in sessions.messages] == ["question"]
+    assert control.active is False
+    assert control.stopped is False
+    sessions.add_user_message("correction")
+    assert runner.run().stop_reason == "completed"
+    assert backend.get_response.call_count == 2
+
+
+def test_interruption_preserves_settled_tool_results_and_cancels_remaining_calls(
+    tmp_path, monkeypatch
+):
+    """A completed effect is saved once; later calls receive cancellation results and never run."""
+    control = RunControl()
+    target = tmp_path / "file.txt"
+    target.write_text("original", encoding="utf-8")
+    calls = tuple(
+        ToolCall(call_id=name, name="read_text_file", arguments='{"path":"/workspace/file.txt"}')
+        for name in ("first", "second")
+    )
+    backend = Mock()
+    backend.get_response.return_value = model_calls(*calls)
+    runner = file_runner(tmp_path, backend, run_control=control)
+    runner.session_manager.add_user_message("read twice")
+    dispatch = runner.agent.tools.call_with_timing
+
+    def interrupt_after_tool(*args, **kwargs):
+        """Request interruption after a tool settles but before the next invocation."""
+        result = dispatch(*args, **kwargs)
+        control.interrupt()
+        return result
+
+    wrapped = Mock(side_effect=interrupt_after_tool)
+    monkeypatch.setattr(runner.agent.tools, "call_with_timing", wrapped)
+
+    result = runner.run()
+
+    assert result.stop_reason == "cancelled"
+    assert result.turns == 1
+    assert len(result.metrics.model_calls) == 1
+    assert len(result.metrics.tools) == 1
+    assert result.metrics.tools[0].succeeded is True
+    wrapped.assert_called_once()
+    results = [item for item in runner.session_manager.messages if isinstance(item, ToolResult)]
+    assert [item.call_id for item in results] == ["first", "second"]
+    assert json.loads(results[0].output)["ok"] is True
+    assert "cancelled before execution" in results[1].output
+    assert runner.session_manager.recovery_state is None
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+@pytest.mark.parametrize("standalone", [False, True])
+def test_run_interruption_after_authorization_never_starts_the_tool(standalone):
+    """Interruption after approval preserves the pre-execution guard for run and direct calls."""
+
+    control = RunControl()
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,))
+    runner, sessions, _interaction = agent_runner(responses=[response], run_control=control)
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=call, status="outcome_unknown"),),
+    )
+    effects = []
+
+    def dispatch(_name, _arguments, **kwargs):
+        """Interrupt after authorization and before the durable execution-start callback."""
+        control.interrupt()
+        kwargs["execution_started"]()
+        effects.append("executed")
+        return '{"ok":true}', 0
+
+    runner.agent.tools.call_with_timing.side_effect = dispatch
+    if standalone:
+        with control.execution(), pytest.raises(RunInterrupted):
+            runner.handle_tool_calls(response)
+        sessions.add_tool_call.assert_not_called()
+    else:
+        assert runner.run().stop_reason == "cancelled"
+        assert "outcome is unknown" in sessions.add_tool_call.call_args.kwargs["output"]
+    assert effects == []
+    sessions.record_tool_execution_started.assert_not_called()
+
+
+def test_interrupting_an_empty_library_run_needs_no_recovery_plan(tmp_path):
+    """A direct runner can be interrupted before any conversation item exists."""
+    control = RunControl()
+
+    def events():
+        """Request interruption before the first authoritative response event."""
+        control.interrupt()
+        yield ResponseCompleted(answer="discarded")
+
+    backend = Mock()
+    backend.get_response.return_value = events()
+    runner = file_runner(tmp_path, backend, run_control=control)
+
+    assert runner.run().stop_reason == "cancelled"
+    assert runner.session_manager.messages == []
+    assert runner.session_manager.recovery_state is None
+
+
+def test_interrupting_approved_recovery_never_retries_an_uncertain_effect(tmp_path):
+    """A scoped interrupt can revoke recovery after approval while preserving unknown outcomes."""
+    control = RunControl()
+    backend = Mock()
+    runner = file_runner(tmp_path, backend, run_control=control)
+    sessions = runner.session_manager
+    call = ToolCall(call_id="uncertain", name="read_text_file", arguments="{}")
+    sessions.add_user_message("original")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.add_tool_call_event(call.call_id)
+    approvals = []
+
+    def approve(message, **_kwargs):
+        """Accept recovery, then interrupt after explicit retry approval but before execution."""
+        approvals.append(message)
+        if len(approvals) == 2:
+            assert control.interrupt() is True
+        return True
+
+    runner.interaction.confirm.side_effect = approve
+
+    recovery = runner.recover_session()
+
+    assert recovery.pending is False
+    assert recovery.result.stop_reason == "cancelled"
+    assert len(approvals) == 2
+    backend.get_response.assert_not_called()
+    results = [item for item in sessions.messages if isinstance(item, ToolResult)]
+    assert len(results) == 1
+    assert "outcome is unknown" in results[0].output
+    assert sessions.recovery_state is None

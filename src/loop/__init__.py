@@ -136,6 +136,7 @@ __all__ = [
     "RetentionPolicy",
     "RunCompletedEvent",
     "RunControl",
+    "RunInterrupted",
     "RunMetrics",
     "RuntimeEnvironment",
     "SQLiteSessionStore",
@@ -281,7 +282,7 @@ from .completion import (
 )
 from .configuration import ConfigurationManager
 from .constants import OMIT, Omit
-from .control import RunControl
+from .control import RunControl, RunInterrupted
 from .conversation import SessionController
 from .errors import Problem, ProblemException, log_problem
 from .instructions import (

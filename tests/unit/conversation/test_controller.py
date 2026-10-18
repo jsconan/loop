@@ -10,8 +10,9 @@ import pytest
 from prompt_toolkit.completion import CompleteEvent, DummyCompleter, WordCompleter
 from prompt_toolkit.document import Document
 
-from loop import ConsoleInteraction, Interaction, SessionController
+from loop import ConsoleInteraction, Interaction, RunInterrupted, SessionController
 from loop.conversation import controller as controller_module
+from loop.models import SteeringMessage
 
 
 @pytest.fixture
@@ -527,7 +528,15 @@ def test_controller_reports_blank_input_and_missing_response_requests(ui):
         """Submit idle UI controls before closing the ordinary input channel."""
         inputs = asyncio.Queue()
         read_inputs(ui, inputs)
-        for value in ("", "/respond", "/status", False):
+        for value in (
+            "",
+            "/respond",
+            "/interrupt",
+            "/steer",
+            "/steer correction",
+            "/status",
+            False,
+        ):
             inputs.put_nowait(value)
         await controller.run(lambda receive: receive(DummyCompleter()))
 
@@ -535,6 +544,9 @@ def test_controller_reports_blank_input_and_missing_response_requests(ui):
     assert [item.args[0] for item in ui.warning.call_args_list] == [
         "Please enter a message!",
         "No input request is pending.",
+        "No agent run is active.",
+        "Usage: /steer <message>",
+        "No agent run is active; send a normal message instead.",
     ]
     ui.info.assert_any_call("Idle; 0 queued inputs.")
 
@@ -880,3 +892,239 @@ def test_controller_reports_discarded_inputs_without_hiding_primary_failures(ui,
 
     asyncio.run(scenario())
     ui.warning.assert_called_once_with("Stopped; 1 queued inputs were not executed.")
+
+
+def test_steering_precedes_followups_and_keeps_corrections_in_submission_order(ui):
+    """Corrections interrupt the current scope, then retain FIFO ahead of ordinary queued text."""
+
+    controller = SessionController(ui)
+    release = Event()
+    messages = []
+
+    async def scenario():
+        """Keep the execution owner held until both corrections and status are acknowledged."""
+        inputs = asyncio.Queue()
+        working, interrupted, status, completed = (asyncio.Event() for _ in range(4))
+        read_inputs(ui, inputs)
+        requests = []
+
+        def info(text=""):
+            """Observe UI transitions without inspecting controller state."""
+            if text == "working":
+                working.set()
+            elif text.startswith("Interrupt requested"):
+                requests.append(text)
+                if len(requests) == 2:
+                    interrupted.set()
+            elif text == "Interrupting; 4 queued inputs.":
+                status.set()
+            elif text == "done":
+                completed.set()
+
+        ui.info.side_effect = info
+
+        def conversation(receive):
+            """Simulate an active tool boundary and then consume four admitted inputs."""
+            messages.append(receive(DummyCompleter()))
+            with controller.control.execution():
+                controller.interaction.info("working")
+                release.wait()
+                with pytest.raises(RunInterrupted):
+                    controller.control.checkpoint()
+            for _ in range(4):
+                messages.append(receive(DummyCompleter()))
+            controller.interaction.info("done")
+            receive(DummyCompleter())
+
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("first")
+            await working.wait()
+            for value in ("followup one", "followup two", "/steer correction", "/steer /new"):
+                inputs.put_nowait(value)
+            await interrupted.wait()
+            inputs.put_nowait("/status")
+            await status.wait()
+            release.set()
+            await completed.wait()
+            inputs.put_nowait("/exit")
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert messages == ["first", "correction", "/new", "followup one", "followup two"]
+    assert all(isinstance(value, SteeringMessage) for value in messages[1:3])
+
+
+@pytest.mark.parametrize("command", ["/interrupt", "/steer correction"])
+def test_run_interruption_revokes_pending_approval_without_ending_the_chat(ui, command):
+    """Active approvals are revoked with a scoped interrupt and are never answered by steering."""
+
+    controller = SessionController(ui)
+    decisions, messages = [], []
+
+    async def scenario():
+        """Interrupt a pending request, then verify subsequent ordinary input still works."""
+        inputs = asyncio.Queue()
+        pending, finished, processed = (asyncio.Event() for _ in range(3))
+        read_inputs(ui, inputs)
+
+        def info(text=""):
+            """Observe approval and execution transitions through visible output."""
+            if text.startswith("Input requested"):
+                pending.set()
+            elif text == "interrupted":
+                finished.set()
+            elif text == "processed":
+                processed.set()
+
+        ui.info.side_effect = info
+
+        def conversation(receive):
+            """Catch only a run interrupt and leave the reader open for another message."""
+            receive(DummyCompleter())
+            with controller.control.execution(), pytest.raises(RunInterrupted):
+                decisions.append(controller.interaction.confirm("Approve?", default=True))
+            controller.interaction.info("interrupted")
+            messages.append(receive(DummyCompleter()))
+            controller.interaction.info("processed")
+            receive(DummyCompleter())
+
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("first")
+            await pending.wait()
+            inputs.put_nowait(command)
+            await finished.wait()
+            assert controller.control.stopped is False
+            if command == "/interrupt":
+                inputs.put_nowait("later")
+            await processed.wait()
+            inputs.put_nowait("/exit")
+            await task
+        finally:
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert decisions == []
+    assert messages == ["later" if command == "/interrupt" else "correction"]
+    ui.confirm_async.assert_not_awaited()
+
+
+def test_rejected_steering_does_not_interrupt_or_displace_a_full_mailbox(ui):
+    """Capacity refusal leaves the active run and all sixteen accepted follow-ups intact."""
+    controller = SessionController(ui)
+    release = Event()
+    interrupted = []
+    received = []
+
+    async def scenario():
+        """Fill the queue behind an active scope, reject steering, then end normally."""
+        inputs = asyncio.Queue()
+        working, rejected, checked = (asyncio.Event() for _ in range(3))
+        read_inputs(ui, inputs)
+
+        def info(text=""):
+            """Expose controlled execution boundaries through UI output."""
+            if text == "working":
+                working.set()
+            elif text == "checked":
+                checked.set()
+
+        ui.info.side_effect = info
+        ui.warning.side_effect = lambda text: rejected.set() if "queue is full" in text else None
+
+        def conversation(receive):
+            """Hold active ownership until rejected admission is observable."""
+            receive(DummyCompleter())
+            with controller.control.execution():
+                controller.interaction.info("working")
+                release.wait()
+                interrupted.append(controller.control.interrupted)
+                controller.control.checkpoint()
+            for _ in range(16):
+                received.append(receive(DummyCompleter()))
+            controller.interaction.info("checked")
+
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("first")
+            await working.wait()
+            for index in range(16):
+                inputs.put_nowait(f"followup {index}")
+            inputs.put_nowait("/steer rejected")
+            await rejected.wait()
+            release.set()
+            await checked.wait()
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert interrupted == [False]
+    assert received == [f"followup {index}" for index in range(16)]
+    assert sum("queue is full" in call.args[0] for call in ui.warning.call_args_list) == 1
+
+
+@pytest.mark.parametrize("operation", ["prompt", "confirm", "terminal_context"])
+def test_interrupted_runs_cannot_open_late_questions_or_terminal_handoffs(ui, operation):
+    """A question arriving after the control is accepted is revoked before any UI is opened."""
+    controller = SessionController(ui)
+    release = Event()
+
+    async def scenario():
+        """Accept interruption while the execution owner is held before requesting UI."""
+        inputs = asyncio.Queue()
+        working, interrupted, completed = (asyncio.Event() for _ in range(3))
+        read_inputs(ui, inputs)
+
+        def info(text=""):
+            """Expose the request and interrupt ordering through UI acknowledgements."""
+            if text == "working":
+                working.set()
+            elif text.startswith("Interrupt requested"):
+                interrupted.set()
+            elif text == "completed":
+                completed.set()
+
+        ui.info.side_effect = info
+
+        def conversation(receive):
+            """Try to open a stale approval or terminal scope after interruption."""
+            receive(DummyCompleter())
+            with controller.control.execution(), pytest.raises(RunInterrupted):
+                controller.interaction.info("working")
+                release.wait()
+                if operation == "terminal_context":
+                    with controller.interaction.terminal_context():
+                        pytest.fail("Interrupted work must not obtain terminal ownership")
+                else:
+                    getattr(controller.interaction, operation)("Approve?")
+            controller.interaction.info("completed")
+            receive(DummyCompleter())
+
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("first")
+            await working.wait()
+            inputs.put_nowait("/interrupt")
+            await interrupted.wait()
+            release.set()
+            await completed.wait()
+            inputs.put_nowait("/exit")
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    ui.confirm_async.assert_not_awaited()
+    ui.terminal_context.assert_not_called()
+    assert all(not call.args for call in ui.prompt_async.call_args_list)

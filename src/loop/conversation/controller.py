@@ -6,7 +6,8 @@ import asyncio
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
-from queue import Empty, Full, Queue
+from itertools import count
+from queue import Empty, Full, PriorityQueue
 from threading import RLock, get_ident
 from typing import cast
 
@@ -14,8 +15,9 @@ from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from ..control import RunControl
+from ..control import RunControl, RunInterrupted
 from ..interaction import AsyncInteractionInput, Interaction
+from ..models import SteeringMessage
 from ..telemetry import telemetry_activity
 from .interaction import MailboxInteraction
 from .models import (
@@ -28,6 +30,8 @@ from .models import (
 )
 
 _QUEUE_CAPACITY = 16
+_STEERING_PRIORITY = 0
+_INPUT_PRIORITY = 1
 _STATUS_COMPONENT = "session_controller"
 
 
@@ -70,7 +74,9 @@ class SessionController:
     Construct conversation services with ``interaction`` and ``control`` from this controller,
     then supply their conversation operation to ``run``. All domain operations stay on one
     execution thread. The UI owns prompts, presentation, and a bounded input mailbox. Pending
-    inputs are transient until the conversation consumes them. Each controller runs once.
+    inputs are transient until the conversation consumes them. Explicit steering interrupts an
+    active run and prioritizes correction messages over ordinary follow-ups. Each controller
+    runs once.
 
     Args:
         interaction (Interaction): UI implementing ``AsyncInteractionInput`` as well as output.
@@ -83,7 +89,8 @@ class SessionController:
     _input: AsyncInteractionInput
     _interaction: MailboxInteraction
     _control: RunControl
-    _inbox: Queue
+    _inbox: PriorityQueue
+    _sequence: count
     _gate: RLock
     _loop: asyncio.AbstractEventLoop | None
     _events: asyncio.Queue | None
@@ -107,7 +114,8 @@ class SessionController:
         self._input = cast(AsyncInteractionInput, interaction)
         self._interaction = MailboxInteraction(interaction)
         self._control = RunControl()
-        self._inbox = Queue(maxsize=_QUEUE_CAPACITY)
+        self._inbox = PriorityQueue(maxsize=_QUEUE_CAPACITY)
+        self._sequence = count()
         self._gate = RLock()
         self._loop = None
         self._events = None
@@ -138,10 +146,10 @@ class SessionController:
 
     @property
     def control(self) -> RunControl:
-        """Return cooperative cancellation for the conversation's agent runner.
+        """Return shutdown and scoped interruption control for the conversation's agent runner.
 
         Returns:
-            RunControl: Stop signal shared with the serialized execution owner.
+            RunControl: Cancellation signals shared with the serialized execution owner.
         """
         return self._control
 
@@ -278,7 +286,7 @@ class SessionController:
         self._gate.release()
         try:
             self._send(InputReady(completer))
-            message = self._inbox.get()
+            _, _, message = self._inbox.get()
         finally:
             # Restore the owner's existing scope after lending the gate to completion readers.
             self._gate.acquire()
@@ -346,6 +354,9 @@ class SessionController:
             if self._control.stopped:
                 event.result.set_exception(KeyboardInterrupt())
                 return
+            if self._control.interrupted:
+                event.result.set_exception(RunInterrupted())
+                return
             self._pending = event
             if not self._ready or self._terminal_owned:
                 await self._answer()
@@ -382,9 +393,22 @@ class SessionController:
         if value is False or value in ("/exit", "/quit"):
             self._stop()
             self._source.info("Stopping after the active operation settles...")
+        elif value == "/interrupt":
+            self._interrupt()
+        elif value == "/steer" or value.startswith("/steer "):
+            text = value.removeprefix("/steer").strip()
+            if not text:
+                self._source.warning("Usage: /steer <message>")
+            elif not self._control.active:
+                self._source.warning("No agent run is active; send a normal message instead.")
+            elif self._enqueue(SteeringMessage(text), priority=_STEERING_PRIORITY):
+                # No await here: the worker needs another UI acknowledgement to start a new run.
+                self._interrupt()
         elif value == "/status":
             state = (
-                "Waiting for your response"
+                "Interrupting"
+                if self._control.interrupted
+                else "Waiting for your response"
                 if self._pending is not None
                 else ("Idle" if self._idle else "Working")
             )
@@ -397,21 +421,37 @@ class SessionController:
         elif value == "":
             self._source.warning("Please enter a message!")
         else:
-            try:
-                self._inbox.put_nowait(value)
-            except Full:
-                telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
-                self._source.warning(
-                    "Input queue is full; this input was not accepted. Try again later."
-                )
-            else:
-                telemetry_activity(
-                    "conversation.input.queued",
-                    component=_STATUS_COMPONENT,
-                    pending=self._inbox.qsize(),
-                )
-                if not self._idle:
-                    self._source.info(f"Queued input ({self._inbox.qsize()} pending).")
+            self._enqueue(value)
+
+    def _enqueue(self, value: str, *, priority: int = _INPUT_PRIORITY) -> bool:
+        """Admit bounded input without losing existing work when the mailbox is full."""
+        try:
+            self._inbox.put_nowait((priority, next(self._sequence), value))
+        except Full:
+            telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
+            self._source.warning(
+                "Input queue is full; this input was not accepted. Try again later."
+            )
+            return False
+        telemetry_activity(
+            "conversation.input.queued",
+            component=_STATUS_COMPONENT,
+            pending=self._inbox.qsize(),
+        )
+        if not self._idle:
+            self._source.info(f"Queued input ({self._inbox.qsize()} pending).")
+        return True
+
+    def _interrupt(self) -> None:
+        """Interrupt only the active run and revoke its separate pending question."""
+        if not self._control.interrupt():
+            self._source.warning("No agent run is active.")
+            return
+        telemetry_activity("conversation.run.interrupt_requested", component=_STATUS_COMPONENT)
+        if self._pending is not None:
+            self._pending.result.set_exception(RunInterrupted())
+            self._pending = None
+        self._source.info("Interrupt requested; waiting for the active operation to settle...")
 
     async def _answer(self) -> None:
         """Resolve only the explicit pending request through the UI's async input surface."""
@@ -463,7 +503,7 @@ class SessionController:
             except Empty:
                 break
             discarded += 1
-        self._inbox.put_nowait(False)
+        self._inbox.put_nowait((_INPUT_PRIORITY, next(self._sequence), False))
         self._discarded += discarded
         return discarded
 

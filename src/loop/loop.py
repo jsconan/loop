@@ -25,7 +25,7 @@ from .interaction import Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler
 from .mentions.parser import parse_mentions
 from .model_selection import ModelCommands, ModelSelection
-from .models import ConversationItem, ReasoningEffort
+from .models import ConversationItem, ReasoningEffort, SteeringMessage
 from .permissions import PermissionCommands, PermissionManager
 from .session import (
     BackendSessionNameGenerator,
@@ -568,7 +568,8 @@ class Loop:
             input_source (Callable[[CompletionManager], object] | None): Optional mailbox reader
                 for ordinary conversation input. It receives the live completion manager and
                 returns text or ``False`` to exit. Nested prompts still use the interaction.
-                Defaults to synchronous interaction prompts.
+                ``SteeringMessage`` values use normal message preparation without command
+                dispatch. Defaults to synchronous interaction prompts.
 
         Raises:
             KeyboardInterrupt: If the configured stop signal interrupts agent execution.
@@ -584,7 +585,10 @@ class Loop:
             if user_input is False:
                 break
             session = self.session
-            if self._command_manager.handle_user_command(user_input):
+            handled_command = False
+            if not isinstance(user_input, SteeringMessage):
+                handled_command = self._command_manager.handle_user_command(user_input)
+            if handled_command:
                 if self.session is not session:
                     self._model_selection.restore(self.session.model)
                     recovery_pending = self._recover_session()

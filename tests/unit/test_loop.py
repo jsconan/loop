@@ -2298,3 +2298,138 @@ def test_mailbox_input_preserves_conversation_order_and_telemetry_context(
     assert all(record.trace_id is not None for record in accepted)
     activity = [repr(record) for record in adapter.records if record.signal == "activity"]
     assert all("private request" not in record for record in activity)
+
+
+@pytest.mark.parametrize("correction", [None, "/new", "use @context.txt"])
+def test_mailbox_steers_or_interrupts_active_generation_without_losing_followups(
+    tmp_path, monkeypatch, correction
+):
+    """Controls discard unfinished generation, validate corrections, and preserve queued history."""
+    monkeypatch.setattr(
+        "loop.conversation.controller.patch_stdout", lambda **_kwargs: nullcontext()
+    )
+    (tmp_path / "context.txt").write_text("verified attachment", encoding="utf-8")
+    source = MagicMock(spec=ConsoleInteraction)
+    source.response_context.side_effect = nullcontext
+    controller = SessionController(source)
+    release = Event()
+    requests, closed, results = [], [], []
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    sessions = SessionManager(
+        interaction=controller.interaction, session_store=store, workspace_id="workspace"
+    )
+    session_id = sessions.session.id
+
+    async def scenario():
+        """Submit controls before the held transport can return its stale tool request."""
+        inputs = asyncio.Queue()
+        working, interrupted, completed = (asyncio.Event() for _ in range(3))
+        count = 2 if correction is None else 3
+
+        async def read(*_args, **_kwargs):
+            """Read ordinary text independently of agent and permission processing."""
+            return await inputs.get()
+
+        def info(text=""):
+            """Observe input acceptance while the execution owner is suspended."""
+            if text == "working":
+                working.set()
+            elif text.startswith("Interrupt requested"):
+                interrupted.set()
+
+        def metrics(value):
+            """Wait until all accepted messages have durable completion events."""
+            results.append(value)
+            if len(results) == count:
+                completed.set()
+
+        def stream():
+            """Keep a partially displayed response open until after the control is accepted."""
+            try:
+                yield AnswerDelta(text="partial answer")
+                controller.interaction.info("working")
+                release.wait()
+                stale = ToolCall(call_id="stale", name="effect", arguments="{}")
+                yield ToolCallCompleted(call=stale)
+                yield ResponseCompleted(items=(stale,))
+            finally:
+                closed.append(True)
+
+        def get_response(**kwargs):
+            """Observe real prepared model input and return deterministic complete responses."""
+            requests.append(kwargs["input"])
+            if len(requests) == 1:
+                return stream()
+            answer = f"answer {len(requests)}"
+            return [
+                ResponseCompleted(answer=answer, items=(Message(role="assistant", content=answer),))
+            ]
+
+        source.prompt_async.side_effect = read
+        source.info.side_effect = info
+        source.run_metrics.side_effect = metrics
+        loop = Loop.create_default(
+            backend=loop_backend(get_response=get_response),
+            interaction=controller.interaction,
+            run_control=controller.control,
+            working_directory=tmp_path,
+            session_manager=sessions,
+            session_name_generator=LocalSessionNameGenerator(),
+        )
+        task = asyncio.create_task(controller.run(lambda receive: loop.run(input_source=receive)))
+        try:
+            inputs.put_nowait("first private request")
+            await working.wait()
+            inputs.put_nowait("queued private followup")
+            inputs.put_nowait("/interrupt" if correction is None else f"/steer {correction}")
+            await interrupted.wait()
+            assert len(requests) == 1
+            assert controller.control.stopped is False
+            release.set()
+            await completed.wait()
+            inputs.put_nowait("/exit")
+            await task
+            return loop
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        loop = asyncio.run(scenario())
+    finally:
+        try:
+            assert telemetry.close(1)
+        finally:
+            set_telemetry(None)
+
+    assert closed == [True]
+    assert loop.session.id == session_id
+    assert sessions.recovery_state is None
+    expected = ["first private request"]
+    if correction is not None:
+        expected.extend([correction, "answer 2"])
+    expected.extend(["queued private followup", f"answer {len(requests)}"])
+    assert [item.content for item in loop.messages] == expected
+    saved = store.load(session_id)
+    assert [item.content for item in saved.messages] == expected
+    restored = SessionManager(interaction=source, session_store=store, workspace_id="workspace")
+    restored.load_session(session_id)
+    assert restored.model_context == sessions.model_context
+    completed_runs = [event for event in saved.events if event.type == "run_completed"]
+    assert [event.stop_reason for event in completed_runs] == [
+        "cancelled",
+        *(["completed"] * (len(requests) - 1)),
+    ]
+    if correction == "use @context.txt":
+        reference = requests[1][-1].context[0]
+        assert reference.content == "verified attachment"
+    accepted = [record for record in adapter.records if record.event_name == "message.accepted"]
+    assert [record.message_sequence for record in accepted] == list(range(len(requests)))
+    assert all(record.session_id == session_id and record.trace_id for record in accepted)
+    assert all(
+        "private" not in repr(record) for record in adapter.records if record.signal == "activity"
+    )

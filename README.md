@@ -7,7 +7,7 @@ The project defaults to a local server at `http://localhost:8000/v1` running `nv
 ## Features
 
 - Interactive, multi-turn conversations
-- Responsive terminal input with ordered queued requests and separate approval replies
+- Responsive terminal input with queued follow-ups, active-run steering and interruption, and separate approval replies
 - Agent-scoped instructions, tools, permissions, and bounded model/tool execution
 - Streaming response and reasoning output
 - Synchronous and asynchronous backend access

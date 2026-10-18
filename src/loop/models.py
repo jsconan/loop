@@ -32,6 +32,14 @@ type MessageRole = Literal["user", "assistant"]
 _JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE | re.DOTALL)
 
 
+class SteeringMessage(str):
+    """Carry explicit user correction text through normal message preparation, never dispatch it.
+
+    Args:
+        object (object): Text to treat as a user message even when it starts with a command prefix.
+    """
+
+
 class StructuredOutputValidationError(ValueError):
     """Report output that does not satisfy its requested structure.
 

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from time import perf_counter, sleep
 
 from .. import constants
 from ..backend import Backend, BackendError, BackendNotFoundError, BackendRepetitionError
 from ..compaction import ContextCompaction
-from ..control import RunControl
+from ..control import RunControl, RunInterrupted
 from ..errors import Problem, log_problem
 from ..instructions import InstructionBudgetExceededError, InstructionsManager
 from ..interaction import Interaction
@@ -58,8 +58,8 @@ class AgentRunner:
             the turn limit (unlimited). Defaults to ``25``.
         prompt_on_recoverable_error (bool): Whether exhausted recoverable backend failures should
             be offered to the user for another attempt.
-        run_control (RunControl | None): Optional cooperative stop signal. Active synchronous tools
-            settle before execution observes cancellation at its next safe boundary.
+        run_control (RunControl | None): Optional conversation shutdown and scoped run interrupt
+            signals. Active synchronous tools settle before cancellation is observed.
 
     Raises:
         ValueError: If ``max_turns`` is negative.
@@ -80,6 +80,7 @@ class AgentRunner:
     _prompt_on_recoverable_error: bool
     _file_observations: FileObservations | None
     _run_control: RunControl | None
+    _interrupted_tools: list[ToolExecutionMetrics] | None
 
     def __init__(
         self,
@@ -115,6 +116,7 @@ class AgentRunner:
         self._max_turns = max_turns
         self._prompt_on_recoverable_error = prompt_on_recoverable_error
         self._run_control = run_control
+        self._interrupted_tools = None
         self._file_observations = None
 
     @property
@@ -288,10 +290,12 @@ class AgentRunner:
         """Run model and tool turns until completion, cancellation, or the safety limit.
 
         Returns:
-            AgentRunResult: Final response, completed turn count, and termination reason.
+            AgentRunResult: Final response, completed turn count, and termination reason. Scoped
+                interruption settles outstanding calls and returns a cancelled result.
 
         Raises:
             KeyboardInterrupt: If the configured control requests a stop.
+            RuntimeError: If the configured control already owns another run.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
         with self._session_manager.execution(), telemetry_span():
@@ -313,6 +317,7 @@ class AgentRunner:
 
         Raises:
             KeyboardInterrupt: If the configured control requests a stop.
+            RuntimeError: If the configured control already owns another run.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
         self._checkpoint()
@@ -339,6 +344,14 @@ class AgentRunner:
                 tools=[],
             )
 
+        return self._run_from_boundary(recovery=state)
+
+    def _recover_tools(
+        self,
+        state: SessionRecoveryState,
+        tools: list[ToolExecutionMetrics],
+    ) -> None:
+        """Resolve approved recovery calls while preserving each settled tool's statistics."""
         self._file_observations = FileObservations.for_recovery(
             self._session_manager.model_context,
             self._instructions_manager.virtual_paths,
@@ -349,8 +362,8 @@ class AgentRunner:
             ),
             prepare_context=self._backend.prepare_context,
         )
-        executions = []
         for pending in state.pending_calls:
+            self._checkpoint()
             if pending.status == "result_available":
                 continue
             if pending.status == "outcome_unknown" and not self._interaction.confirm(
@@ -359,26 +372,87 @@ class AgentRunner:
             ):
                 self._persist_interrupted_tool_result(pending.call)
                 continue
-            executions.extend(
+            tools.extend(
                 self._execute_tool_calls((pending.call,), present=pending.status == "not_started")
             )
-        return self._run_from_boundary(tools=executions)
 
     def _run_from_boundary(
         self,
         *,
-        tools: list[ToolExecutionMetrics] | None = None,
+        recovery: SessionRecoveryState | None = None,
     ) -> AgentRunResult:
         """Run model turns from a fresh or recovered durable boundary."""
         total_turns = 0
         turns_since_confirmation = 0
         response = None
         calls = []
-        tools = list(tools or ())
+        tools = []
         started_at = utc_now()
-        while True:
-            response = self._query_with_recovery()
-            if response is None:
+        with self._run_control.execution() if self._run_control is not None else nullcontext():
+            self._interrupted_tools = tools
+            try:
+                if recovery is not None:
+                    self._recover_tools(recovery, tools)
+                while True:
+                    response = self._query_with_recovery()
+                    if response is None:
+                        return self._record_run_result(
+                            final_response=None,
+                            turns=total_turns,
+                            stop_reason="cancelled",
+                            started_at=started_at,
+                            calls=calls,
+                            tools=tools,
+                        )
+                    total_turns += 1
+                    turns_since_confirmation += 1
+                    calls.append(
+                        ModelCallMetrics(
+                            model=response.model,
+                            duration_seconds=response.metrics.duration_seconds,
+                            time_to_first_chunk_seconds=(
+                                response.metrics.time_to_first_chunk_seconds
+                            ),
+                            usage=response.usage,
+                        )
+                    )
+                    self._model_selection.record_response(response.model)
+                    self._session_manager.add_response(response)
+                    executions = self.handle_tool_calls(response)
+                    tools.extend(executions)
+                    self._checkpoint()
+                    if not executions:
+                        return self._record_run_result(
+                            final_response=response,
+                            turns=total_turns,
+                            stop_reason="completed",
+                            started_at=started_at,
+                            calls=calls,
+                            tools=tools,
+                        )
+                    if 0 < self._max_turns <= turns_since_confirmation:
+                        prompt = (
+                            f"Agent has reached the {self._max_turns}-turn safety limit. "
+                            "Do you want to continue?"
+                        )
+                        if self._interaction.confirm(prompt, default=False) is not True:
+                            break
+                        turns_since_confirmation = 0
+
+                self._interaction.warning(
+                    f"Agent stopped after reaching the {self._max_turns}-turn safety limit."
+                )
+                return self._record_run_result(
+                    final_response=response,
+                    turns=total_turns,
+                    stop_reason="max_turns",
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
+                )
+            except RunInterrupted:
+                self._cancel_pending_tools()
+                self._interaction.info("Run interrupted; the conversation remains open.")
                 return self._record_run_result(
                     final_response=None,
                     turns=total_turns,
@@ -387,51 +461,8 @@ class AgentRunner:
                     calls=calls,
                     tools=tools,
                 )
-            total_turns += 1
-            turns_since_confirmation += 1
-            calls.append(
-                ModelCallMetrics(
-                    model=response.model,
-                    duration_seconds=response.metrics.duration_seconds,
-                    time_to_first_chunk_seconds=response.metrics.time_to_first_chunk_seconds,
-                    usage=response.usage,
-                )
-            )
-            self._model_selection.record_response(response.model)
-            self._session_manager.add_response(response)
-            executions = self.handle_tool_calls(response)
-            if not executions:
-                return self._record_run_result(
-                    final_response=response,
-                    turns=total_turns,
-                    stop_reason="completed",
-                    started_at=started_at,
-                    calls=calls,
-                    tools=tools,
-                )
-            tools.extend(executions)
-            self._checkpoint()
-
-            if 0 < self._max_turns <= turns_since_confirmation:
-                prompt = (
-                    f"Agent has reached the {self._max_turns}-turn safety limit. "
-                    "Do you want to continue?"
-                )
-                if self._interaction.confirm(prompt, default=False) is not True:
-                    break
-                turns_since_confirmation = 0
-
-        self._interaction.warning(
-            f"Agent stopped after reaching the {self._max_turns}-turn safety limit."
-        )
-        return self._record_run_result(
-            final_response=response,
-            turns=total_turns,
-            stop_reason="max_turns",
-            started_at=started_at,
-            calls=calls,
-            tools=tools,
-        )
+            finally:
+                self._interrupted_tools = None
 
     def handle_tool_calls(self, response: Response) -> tuple[ToolExecutionMetrics, ...]:
         """Execute and persist every tool call in a model response.
@@ -445,6 +476,7 @@ class AgentRunner:
         Raises:
             ValueError: If a requested tool call is not present in canonical session context.
             KeyboardInterrupt: If the configured control requests a stop.
+            RunInterrupted: If the active execution scope has been interrupted.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
         if not response.tool_calls:
@@ -463,11 +495,20 @@ class AgentRunner:
 
         instructions = self._instructions_manager
         executions = []
-        for tool_call in tool_calls:
-            with telemetry_span():
-                executions.append(
-                    self._execute_tool_call(tool_call, instructions=instructions, present=present)
-                )
+        try:
+            for tool_call in tool_calls:
+                with telemetry_span():
+                    executions.append(
+                        self._execute_tool_call(
+                            tool_call,
+                            instructions=instructions,
+                            present=present,
+                        )
+                    )
+        except RunInterrupted:
+            if self._interrupted_tools is not None:
+                self._interrupted_tools.extend(executions)
+            raise
         return tuple(executions)
 
     def _execute_tool_call(
@@ -536,16 +577,36 @@ class AgentRunner:
             succeeded=succeeded,
         )
 
-    def _persist_interrupted_tool_result(self, call: ToolCall) -> None:
-        """Resolve one uncertain invocation without risking a duplicate side effect."""
+    def _cancel_pending_tools(self) -> None:
+        """Resolve outstanding calls without executing or automatically retrying any effects."""
+        state = self._session_manager.recovery_state
+        if state is not None:
+            for pending in state.pending_calls:
+                if pending.status != "result_available":
+                    self._persist_interrupted_tool_result(
+                        pending.call,
+                        not_started=pending.status == "not_started",
+                    )
+
+    def _persist_interrupted_tool_result(
+        self,
+        call: ToolCall,
+        *,
+        not_started: bool = False,
+    ) -> None:
+        """Resolve one cancelled or uncertain invocation without repeating side effects."""
         instructions = self._instructions_manager
         output = serialize_tool_problem(
             Problem(
                 code="tool.execution_interrupted",
                 title="Tool execution interrupted",
                 detail=(
-                    f"Tool '{call.name}' was interrupted and its external outcome is unknown. "
-                    "Do not assume the operation failed."
+                    f"Tool '{call.name}' was cancelled before execution."
+                    if not_started
+                    else (
+                        f"Tool '{call.name}' was interrupted and its external outcome is unknown. "
+                        "Do not assume the operation failed."
+                    )
                 ),
                 severity="warning",
                 operation=call.name,
@@ -570,6 +631,7 @@ class AgentRunner:
             BackendError: If the backend cannot produce a complete response.
             ValueError: If neither the selection nor backend provides a model.
             KeyboardInterrupt: If the configured control requests a stop.
+            RunInterrupted: If the active execution scope has been interrupted.
         """
         with telemetry_span():
             return self._query()
@@ -630,7 +692,7 @@ class AgentRunner:
 
     def _record_run_result(
         self,
-        final_response: Response,
+        final_response: Response | None,
         turns: int,
         stop_reason: AgentRunStopReason,
         started_at: datetime,

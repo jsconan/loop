@@ -25,8 +25,9 @@ from loop.session import LocalSessionNameGenerator
 pytestmark = pytest.mark.integration
 
 
-def test_native_input_queues_a_second_message_during_model_execution(tmp_path):
-    """A real editor remains usable while the conversation owner waits for its model."""
+@pytest.mark.parametrize("mode", ["queue", "interrupt", "steer"])
+def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode):
+    """A real editor queues follow-ups and interrupts or steers while its model is active."""
     output = StringIO()
     release = Event()
     requests = []
@@ -37,7 +38,7 @@ def test_native_input_queues_a_second_message_during_model_execution(tmp_path):
 
         async def scenario():
             """Submit follow-up input before releasing the first model operation."""
-            working, queued, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            working, queued, completed, interrupted = (asyncio.Event() for _ in range(4))
             original_info, original_metrics = source.info, source.run_metrics
             metrics = []
 
@@ -48,12 +49,14 @@ def test_native_input_queues_a_second_message_during_model_execution(tmp_path):
                     working.set()
                 elif text.startswith("Queued input"):
                     queued.set()
+                elif text.startswith("Interrupt requested"):
+                    interrupted.set()
 
             def run_metrics(value):
                 """Observe the second durable run completion before requesting shutdown."""
                 original_metrics(value)
                 metrics.append(value)
-                if len(metrics) == 2:
+                if len(metrics) == (3 if mode == "steer" else 2):
                     completed.set()
 
             def get_response(**kwargs):
@@ -93,6 +96,9 @@ def test_native_input_queues_a_second_message_during_model_execution(tmp_path):
                 pipe.send_text("second\n")
                 await queued.wait()
                 assert len(requests) == 1
+                if mode != "queue":
+                    pipe.send_text("/steer correction\n" if mode == "steer" else "/interrupt\n")
+                    await interrupted.wait()
                 release.set()
                 await completed.wait()
                 pipe.send_text("/exit\n")
@@ -105,7 +111,12 @@ def test_native_input_queues_a_second_message_during_model_execution(tmp_path):
 
         loop = asyncio.run(scenario())
 
-    assert [item.content for item in loop.messages] == ["first", "answer 1", "second", "answer 2"]
+    expected = ["first", "answer 1"] if mode == "queue" else ["first"]
+    if mode == "steer":
+        expected.extend(["correction", "answer 2"])
+    expected.extend(["second", f"answer {len(requests)}"])
+    assert [item.content for item in loop.messages] == expected
+    assert loop.session.recovery_state() is None
     assert "Queued input" in output.getvalue()
     assert "answer 2" in output.getvalue()
     assert controller.running is False
