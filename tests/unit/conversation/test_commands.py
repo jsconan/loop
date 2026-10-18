@@ -3,10 +3,20 @@
 from unittest.mock import Mock
 
 import pytest
+from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.document import Document
 
-from loop import CommandCompletion, CommandContext, Interaction
+from loop import (
+    CommandCapability,
+    CommandCompletion,
+    CommandContext,
+    CommandManager,
+    CompletionManager,
+    CompletionValue,
+    Interaction,
+)
 from loop.conversation.commands import ConversationCommands
-from loop.conversation.models import ConversationStatus, SteeringOutcome
+from loop.conversation.models import ConversationStatus, ResponseOutcome, SteeringOutcome
 
 
 @pytest.fixture
@@ -16,9 +26,10 @@ def command_context():
     return CommandContext("conversation", interaction), interaction
 
 
-def test_provider_declares_responsive_controls_with_freeform_steering():
-    """The provider registers all controls and leaves steering text free-form."""
-    provider = ConversationCommands(Mock())
+def test_provider_declares_state_capabilities_and_response_completion():
+    """The provider gates each control by conversation state and leaves steering free-form."""
+    control = Mock()
+    provider = ConversationCommands(control)
     registrations = provider.get_commands()
 
     assert [registration.function.__name__ for registration in registrations] == [
@@ -27,8 +38,39 @@ def test_provider_declares_responsive_controls_with_freeform_steering():
         "status",
         "steer",
     ]
-    assert all(registration.responsive for registration in registrations)
+    assert registrations[0].capabilities == frozenset({CommandCapability.RUN_ACTIVE})
+    assert registrations[1].capabilities == frozenset({CommandCapability.PENDING_RESPONSE})
+    assert registrations[2].capabilities == frozenset(
+        {CommandCapability.CONVERSATION_ACTIVE, CommandCapability.CONTEXT_READ}
+    )
+    assert registrations[3].capabilities == frozenset({CommandCapability.RUN_ACTIVE})
+    assert registrations[1].completion.provider == control.response_completions
     assert registrations[-1].completion == CommandCompletion()
+
+
+def test_respond_argument_completes_the_pending_response_values():
+    """The respond command suggests values provided by its active interaction request."""
+    control = Mock()
+    control.response_completions.return_value = (
+        CompletionValue("Yes", "Approve the request."),
+        CompletionValue("No", "Decline the request."),
+    )
+    manager = CommandManager(providers=(ConversationCommands(control),))
+    completion = CompletionManager((manager.completion_adapter,))
+
+    values = list(completion.get_completions(Document("/respond y"), CompleteEvent()))
+
+    assert [(value.text, value.display_meta_text) for value in values] == [
+        ("Yes", "Approve the request.")
+    ]
+
+
+def test_conversation_commands_are_absent_without_conversation_provider():
+    """A manager outside asynchronous conversation has no conversation-only commands."""
+    manager = CommandManager()
+
+    assert "respond" not in {item.name for item in manager.commands}
+    assert "interrupt" not in {item.name for item in manager.active_commands}
 
 
 @pytest.mark.parametrize(
@@ -49,19 +91,42 @@ def test_interrupt_reports_the_control_outcome(command_context, accepted, method
     getattr(interaction, method).assert_called_once_with(message)
 
 
-@pytest.mark.parametrize("pending", [False, True])
-def test_respond_reports_only_when_no_interaction_is_pending(command_context, pending):
-    """A missing interaction produces a warning while a pending one is requested."""
+@pytest.mark.parametrize(
+    ("outcome", "answer", "warning"),
+    [
+        (ResponseOutcome.NO_REQUEST, (), "No input request is pending."),
+        (ResponseOutcome.PROMPTED, (), None),
+        (ResponseOutcome.ANSWERED, ("Yes",), None),
+        (
+            ResponseOutcome.INVALID,
+            ("unexpected",),
+            "Choose one of the listed responses, or use /respond without an answer.",
+        ),
+        (
+            ResponseOutcome.PROMPT_REQUIRED,
+            ("Yes",),
+            "Use /respond without an answer for this request.",
+        ),
+        (
+            ResponseOutcome.MASKED_INPUT_REQUIRED,
+            ("secret",),
+            "This request requires masked input; use /respond without an answer.",
+        ),
+    ],
+)
+def test_respond_reports_request_outcomes(command_context, outcome, answer, warning):
+    """A response is prompted, submitted, or rejected with outcome-specific feedback."""
     context, interaction = command_context
     control = Mock()
-    control.request_response.return_value = pending
+    control.request_response.return_value = outcome
 
-    ConversationCommands(control).respond(context)
+    ConversationCommands(control).respond(context, answer)
 
-    if pending:
+    control.request_response.assert_called_once_with(" ".join(answer) if answer else None)
+    if warning is None:
         interaction.warning.assert_not_called()
     else:
-        interaction.warning.assert_called_once_with("No input request is pending.")
+        interaction.warning.assert_called_once_with(warning)
 
 
 def test_status_formats_the_controller_snapshot(command_context):

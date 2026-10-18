@@ -14,6 +14,7 @@ from ..completion import (
     CompletionValue,
     SchemaCompletionProviderRegistration,
 )
+from ..models import CommandCapability
 from .manager import ApplicationSettings, ConfigurationManager
 
 
@@ -27,7 +28,7 @@ class ConfigurationGetArguments(BaseModel):
     path: Annotated[
         str,
         Field(description="Public configuration path to display."),
-        CommandCompletion(provider="configuration_public_entries"),
+        CommandCompletion(provider="configuration_read_entries"),
     ]
 
 
@@ -130,13 +131,36 @@ class ConfigurationCommands:
             CommandRegistration(
                 self.config,
                 name="config",
+                capabilities=frozenset(
+                    {CommandCapability.CONTEXT_READ, CommandCapability.CONTEXT_UPDATE}
+                ),
                 completion=CommandCompletion(
                     values=(
-                        CompletionValue("get", "Display one configuration entry."),
-                        CompletionValue("set", "Update one configuration entry."),
-                        CompletionValue("secret", "Update one secret configuration entry."),
-                        CompletionValue("reset", "Reset one entry or every entry."),
-                        CompletionValue("reload", "Reload configuration files from disk."),
+                        CompletionValue(
+                            "get",
+                            "Display one configuration entry.",
+                            required_capabilities=frozenset({CommandCapability.CONTEXT_READ}),
+                        ),
+                        CompletionValue(
+                            "set",
+                            "Update a setting for subsequent runtime operations.",
+                            required_capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+                        ),
+                        CompletionValue(
+                            "secret",
+                            "Update one secret configuration entry.",
+                            required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                        ),
+                        CompletionValue(
+                            "reset",
+                            "Reset one entry or every entry.",
+                            required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                        ),
+                        CompletionValue(
+                            "reload",
+                            "Reload configuration files from disk.",
+                            required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                        ),
                     ),
                     children={
                         "get": CommandCompletion(schema_provider="configuration_arguments"),
@@ -162,6 +186,7 @@ class ConfigurationCommands:
             CompletionProviderRegistration(
                 "configuration_public_entries", self._public_entry_values
             ),
+            CompletionProviderRegistration("configuration_read_entries", self._read_entry_values),
             CompletionProviderRegistration("configuration_all_entries", self._all_entry_values),
             CompletionProviderRegistration(
                 "configuration_secret_entries", self._secret_entry_values
@@ -182,9 +207,25 @@ class ConfigurationCommands:
         }.get(tokens)
 
     def _public_entry_values(self) -> tuple[CompletionValue, ...]:
-        """Return dynamically current non-secret configuration paths for completion."""
+        """Return paths that are safe to update in the current execution context."""
         return tuple(
-            CompletionValue(entry.path, entry.description)
+            CompletionValue(
+                entry.path,
+                entry.description,
+                required_capabilities=entry.required_capabilities,
+            )
+            for entry in self._configuration.entries
+            if not entry.secret
+        )
+
+    def _read_entry_values(self) -> tuple[CompletionValue, ...]:
+        """Return non-secret configuration paths available for inspection during a run."""
+        return tuple(
+            CompletionValue(
+                entry.path,
+                entry.description,
+                required_capabilities=frozenset({CommandCapability.CONTEXT_READ}),
+            )
             for entry in self._configuration.entries
             if not entry.secret
         )
@@ -192,13 +233,22 @@ class ConfigurationCommands:
     def _all_entry_values(self) -> tuple[CompletionValue, ...]:
         """Return dynamically current configuration paths for reset completion."""
         return tuple(
-            CompletionValue(entry.path, entry.description) for entry in self._configuration.entries
+            CompletionValue(
+                entry.path,
+                entry.description,
+                required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+            )
+            for entry in self._configuration.entries
         )
 
     def _secret_entry_values(self) -> tuple[CompletionValue, ...]:
         """Return dynamically current secret configuration paths for completion."""
         return tuple(
-            CompletionValue(entry.path, entry.description)
+            CompletionValue(
+                entry.path,
+                entry.description,
+                required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+            )
             for entry in self._configuration.entries
             if entry.secret
         )
@@ -224,6 +274,30 @@ class ConfigurationCommands:
         ] = None,
     ) -> None:
         """Show, update, reset, or reload the application configuration."""
+        if CommandCapability.RUN_ACTIVE in (context.capabilities or frozenset()):
+            if action in {"secret", "reset", "reload"}:
+                raise CommandArgumentError(
+                    f"'/config {action}' cannot run while the agent is working because it may "
+                    "prompt or replace active runtime settings. Wait for the run to pause."
+                )
+            if action == "set":
+                if scope is None:
+                    raise CommandArgumentError(
+                        "Set an explicit scope (session, user, or workspace) while the agent is "
+                        "working; interactive scope selection is unavailable during a run."
+                    )
+                if path is not None and context.capabilities is not None:
+                    entry = next(
+                        (item for item in self._configuration.entries if item.path == path), None
+                    )
+                    if (
+                        entry is not None
+                        and not entry.required_capabilities <= context.capabilities
+                    ):
+                        raise CommandArgumentError(
+                            f"Configuration field '{path}' cannot be changed while the agent is "
+                            "working; its owner requires an idle session."
+                        )
         if action is None:
             self._show(context, None)
             return

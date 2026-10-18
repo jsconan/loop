@@ -58,6 +58,7 @@ from loop import (
 from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
+from loop.conversation import ConversationCommands
 from loop.permissions import PermissionLoadFailure
 from loop.session import GeneratedSessionName, LocalSessionNameGenerator
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
@@ -2181,11 +2182,8 @@ def test_query_rejects_missing_model_selection(tmp_path):
     backend.get_response.assert_not_called()
 
 
-@pytest.mark.parametrize("new_session", [False, True])
-def test_mailbox_input_preserves_conversation_order_and_telemetry_context(
-    tmp_path, monkeypatch, new_session
-):
-    """Queued messages and session changes run serially and retain their own correlation."""
+def test_mailbox_rejects_session_change_and_preserves_conversation_order(tmp_path, monkeypatch):
+    """A session replacement is rejected during a run while follow-up input stays ordered."""
     monkeypatch.setattr(
         "loop.conversation.controller.patch_stdout", lambda **_kwargs: nullcontext()
     )
@@ -2205,7 +2203,7 @@ def test_mailbox_input_preserves_conversation_order_and_telemetry_context(
     async def scenario():
         """Submit a second request while the first backend operation is suspended."""
         inputs = asyncio.Queue()
-        started, queued, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        started, rejected, queued, completed = (asyncio.Event() for _ in range(4))
         metrics = []
 
         async def read(*_args, **_kwargs):
@@ -2220,6 +2218,11 @@ def test_mailbox_input_preserves_conversation_order_and_telemetry_context(
                 started.set()
             elif message.startswith("Queued input"):
                 queued.set()
+
+        def warning(message):
+            """Observe rejection of session replacement while a run owns the session."""
+            if message.startswith("Command '/new' is unavailable"):
+                rejected.set()
 
         def run_metrics(value):
             """Observe completion only after canonical response and run metrics are saved."""
@@ -2243,6 +2246,7 @@ def test_mailbox_input_preserves_conversation_order_and_telemetry_context(
             ]
 
         source.info.side_effect = output
+        source.warning.side_effect = warning
         source.run_metrics.side_effect = run_metrics
         loop = Loop.create_default(
             backend=loop_backend(get_response=get_response),
@@ -2252,12 +2256,14 @@ def test_mailbox_input_preserves_conversation_order_and_telemetry_context(
             session_manager=sessions,
             session_name_generator=LocalSessionNameGenerator(),
         )
+        loop.register_command_provider(ConversationCommands(controller))
+        controller.bind_command_manager(loop.command_manager)
         task = asyncio.create_task(controller.run(lambda receive: loop.run(input_source=receive)))
         try:
             inputs.put_nowait("first private request")
             await started.wait()
-            if new_session:
-                inputs.put_nowait("/new")
+            inputs.put_nowait("/new")
+            await rejected.wait()
             inputs.put_nowait("second private request")
             await queued.wait()
             assert len(queries) == 1
@@ -2279,22 +2285,19 @@ def test_mailbox_input_preserves_conversation_order_and_telemetry_context(
         finally:
             set_telemetry(None)
 
-    expected = ["second private request", "answer 2"]
-    if not new_session:
-        expected = ["first private request", "answer 1", *expected]
+    expected = [
+        "first private request",
+        "answer 1",
+        "second private request",
+        "answer 2",
+    ]
     assert [item.content for item in loop.messages] == expected
     accepted = [record for record in adapter.records if record.event_name == "message.accepted"]
-    assert [record.message_sequence for record in accepted] == [0, 0 if new_session else 1]
+    assert [record.message_sequence for record in accepted] == [0, 1]
+    assert accepted[0].session_id == loop.session.id
     assert accepted[-1].session_id == loop.session.id
-    if new_session:
-        assert accepted[0].session_id != loop.session.id
-        assert [item.content for item in store.load(accepted[0].session_id).messages] == [
-            "first private request",
-            "answer 1",
-        ]
-        assert [item.content for item in queries[-1]] == ["second private request"]
-    else:
-        assert accepted[0].session_id == loop.session.id
+    assert [item.content for item in store.load(loop.session.id).messages] == expected
+    assert "unavailable in the current conversation state" in source.warning.call_args.args[0]
     assert all(record.trace_id is not None for record in accepted)
     activity = [repr(record) for record in adapter.records if record.signal == "activity"]
     assert all("private request" not in record for record in activity)

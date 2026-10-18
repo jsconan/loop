@@ -14,9 +14,11 @@ import sqlite3
 import stat
 import tempfile
 from atexit import register
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from fnmatch import fnmatchcase
 from pathlib import Path
+from threading import RLock
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from weakref import WeakSet
@@ -147,6 +149,7 @@ class PermissionManager:
     _workspace_id: str | None
     _command_inspection: CommandInspection
     _host_runtime_bindings: dict[str, str]
+    _policy_lock: RLock
 
     def __init__(
         self,
@@ -163,6 +166,7 @@ class PermissionManager:
         load_policy: PermissionLoadPolicy | None = None,
         command_inspection: CommandInspection | None = None,
     ) -> None:
+        self._policy_lock = RLock()
         self._command_inspection = (
             command_inspection if command_inspection is not None else CommandInspection()
         )
@@ -220,6 +224,16 @@ class PermissionManager:
     def close(self) -> None:
         """Release the manager-owned temporary directory."""
         self._temporary_directory.cleanup()
+
+    @contextmanager
+    def policy_update(self) -> Iterator[None]:
+        """Serialize one policy command with operation authorization checks.
+
+        Yields:
+            None: Exclusive access to policy state until the command completes.
+        """
+        with self._policy_lock:
+            yield
 
     def __del__(self) -> None:
         self.close()
@@ -405,6 +419,7 @@ class PermissionManager:
         source = "policy"
         approval_choice = None
         installed_rule_ids = ()
+        approval_policy_denied = False
         if policy.decision is Decision.ASK:
             if active_interaction is None:
                 decision = Decision.DENY
@@ -417,6 +432,7 @@ class PermissionManager:
                     if fresh_file_review
                     else f"{prompt_body}\nProceed?"
                 )
+                source = "user"
                 selected = self.request_permission(
                     prompt_body,
                     interaction=active_interaction,
@@ -429,6 +445,18 @@ class PermissionManager:
                     if selected is True
                     else ApprovalChoice.DENY
                 )
+                if approval_choice is not ApprovalChoice.DENY:
+                    current_policy = self.evaluate(operations)
+                    if current_policy.decision is Decision.DENY:
+                        policy = current_policy
+                        approval_choice = ApprovalChoice.DENY
+                        approval_policy_denied = True
+                        decision = Decision.DENY
+                        reason = (
+                            "The active permission policy changed to deny this operation while "
+                            "approval was pending."
+                        )
+                        source = "policy"
                 if fresh_file_review and approval_choice is not ApprovalChoice.ONCE:
                     approval_choice = ApprovalChoice.DENY
                 if approval_choice is ApprovalChoice.WORKSPACE and self._configuration_path is None:
@@ -448,17 +476,18 @@ class PermissionManager:
                         ApprovalChoice.USER,
                     }:
                         try:
-                            installed_rule_ids = self._remember_approval(
-                                operations, scope=approval_choice
-                            )
+                            with self.policy_update():
+                                installed_rule_ids = self._remember_approval(
+                                    operations, scope=approval_choice
+                                )
                         except OSError as exc:
                             decision = Decision.DENY
                             reason = f"Could not persist the approved permission policy: {exc}"
                             source = "persistence"
-                elif reason == policy.reason:
+                elif reason == policy.reason and not approval_policy_denied:
                     decision = Decision.DENY
                     reason = "Rejected by the user."
-                if source != "persistence":
+                if source not in {"persistence", "policy"}:
                     source = "user"
         result = AuthorizationResult(
             operations=operations,
@@ -1392,25 +1421,28 @@ class PermissionManager:
         Returns:
             PolicyDecision: Composed allow, ask, or deny outcome and determining sources.
         """
-        if not operations:
-            return PolicyDecision(
-                decision=Decision.ALLOW,
-                reason="The tool plan requires no authority.",
-                sources=("no_authority",),
-            )
-        decisions = tuple(self._evaluate_operation(operation) for operation in operations)
-        for selected in (Decision.DENY, Decision.ASK, Decision.ALLOW):
-            determining = tuple(item for item in decisions if item.decision is selected)
-            if determining:
+        with self._policy_lock:
+            if not operations:
                 return PolicyDecision(
-                    decision=selected,
-                    reason=(
-                        f"{len(determining)} of {len(operations)} planned operation(s) "
-                        f"require {selected.value}."
-                    ),
-                    sources=tuple(source for item in determining for source in item.sources),
+                    decision=Decision.ALLOW,
+                    reason="The tool plan requires no authority.",
+                    sources=("no_authority",),
                 )
-        raise RuntimeError("Every operation must produce a policy decision.")  # pragma: no cover
+            decisions = tuple(self._evaluate_operation(operation) for operation in operations)
+            for selected in (Decision.DENY, Decision.ASK, Decision.ALLOW):
+                determining = tuple(item for item in decisions if item.decision is selected)
+                if determining:
+                    return PolicyDecision(
+                        decision=selected,
+                        reason=(
+                            f"{len(determining)} of {len(operations)} planned operation(s) "
+                            f"require {selected.value}."
+                        ),
+                        sources=tuple(source for item in determining for source in item.sources),
+                    )
+            raise RuntimeError(
+                "Every operation must produce a policy decision."
+            )  # pragma: no cover
 
     def set_default(
         self,

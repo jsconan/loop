@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from loop.configuration import ConfigurationManager
 from loop.configuration.models import BackendSettings
+from loop.models import CommandCapability
 
 
 @pytest.mark.parametrize(
@@ -403,6 +404,10 @@ def test_file_edit_retains_environment_precedence_and_exposes_entries(tmp_path):
         "text",
         "native",
     )
+    live_update = next(item for item in manager.entries if item.path == "loop.max_agent_turns")
+    paused_update = next(item for item in manager.entries if item.path == "backend.base_url")
+    assert live_update.required_capabilities == frozenset({CommandCapability.CONTEXT_UPDATE})
+    assert paused_update.required_capabilities == frozenset({CommandCapability.SESSION_IDLE})
 
 
 def test_reset_all_stores_defaults_in_each_scope(tmp_path):

@@ -3,18 +3,23 @@
 import time
 from unittest.mock import Mock
 
+import pytest
 from prompt_toolkit.document import Document
 
 from loop import (
     Action,
     ApprovalChoice,
+    CommandCapability,
     CommandCompletionAdapter,
     CommandManager,
     CompletionManager,
     CompletionProviderRegistration,
     CompletionValue,
     Decision,
+    FileTarget,
     Interaction,
+    Operation,
+    PermissionConfiguration,
     PermissionManager,
     PermissionPreset,
     PermissionRule,
@@ -135,6 +140,168 @@ def command_manager(permissions, interaction):
     manager = CommandManager(interaction=interaction)
     manager.register_provider(PermissionCommands(permissions))
     return manager
+
+
+def test_permission_policy_changes_apply_immediately_during_runs(tmp_path):
+    """Safe policy edits serialize with checks and affect the next authorization decision."""
+    defaults = PermissionConfiguration().defaults
+    policy = PermissionConfiguration(defaults={**defaults, Action.FILESYSTEM_READ: Decision.ALLOW})
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path, configuration=policy)
+    provider = PermissionCommands(permissions)
+    manager = command_manager(permissions, interaction)
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.CONVERSATION_ACTIVE,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
+    requested = Operation(
+        tool_id="read_text_file",
+        action=Action.FILESYSTEM_READ,
+        target=FileTarget(path=str(tmp_path / "doc.txt")),
+    )
+    assert permissions.evaluate((requested,)).decision is Decision.ALLOW
+
+    assert manager.handle_user_command("/permissions default set session filesystem.read deny")
+    assert permissions.evaluate((requested,)).decision is Decision.DENY
+    interaction.prompt.assert_not_called()
+
+    tool_completions = Mock()
+    tool_completions.get_completion_providers.return_value = (
+        CompletionProviderRegistration(
+            "tools", lambda: (CompletionValue("read_text_file", "tool"),)
+        ),
+    )
+    completer = CompletionManager(
+        (
+            CommandCompletionAdapter(
+                lambda: manager.active_commands,
+                providers=(provider, tool_completions),
+                capabilities=lambda: manager.capabilities,
+            ),
+        )
+    )
+    actions = {item.text for item in complete(completer, "/permissions ")}
+    assert "reload" not in actions
+    assert "session" not in actions
+    assert {"default", "limit", "rule", "show"} <= actions
+    preset_actions = {item.text for item in complete(completer, "/permissions preset ")}
+    assert preset_actions == {"list", "show", "diff"}
+    rule_actions = {
+        item.text for item in complete(completer, "/permissions rule add session allow ")
+    }
+    assert rule_actions == {"read_text_file"}
+
+
+def test_permission_commands_reject_prompting_changes_during_runs(tmp_path):
+    """Broad rules and policy reload or replacement cannot enter synchronous prompts mid-run."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    manager = command_manager(permissions, interaction)
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
+
+    for command in (
+        "/permissions rule add session allow",
+        "/permissions rule add",
+        "/permissions reload",
+        "/permissions session reset",
+        "/permissions preset replace session basic",
+    ):
+        assert manager.handle_user_command(command)
+        assert "cannot" in interaction.report.call_args.args[0].detail
+    interaction.confirm.assert_not_called()
+
+    assert manager.handle_user_command(
+        "/permissions rule add session allow read_text_file filesystem.read /docs"
+    )
+    assert permissions.session_rules[-1].resource == "/docs"
+
+    for command in (
+        "/permissions rule list",
+        "/permissions sandbox list",
+        "/permissions host list",
+        "/permissions preset list",
+    ):
+        assert manager.handle_user_command(command)
+    interaction.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("command", "heading"),
+    [
+        ("/permissions sandbox", "Sandboxed command approvals:"),
+        ("/permissions host", "Session host command approvals:"),
+    ],
+)
+def test_bare_approval_listings_are_available_during_runs(tmp_path, command, heading):
+    """Bare sandbox and host commands list approvals without prompting during a run."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    manager = command_manager(permissions, interaction)
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
+
+    assert manager.handle_user_command(command)
+
+    interaction.info.assert_called_once()
+    assert interaction.info.call_args.args[0].startswith(heading)
+    interaction.report.assert_not_called()
+    interaction.prompt.assert_not_called()
+
+
+def test_permission_change_during_approval_prompt_overrides_stale_approval(tmp_path):
+    """A policy tightened while approval waits is rechecked before the operation is authorized."""
+    defaults = PermissionConfiguration().defaults
+    policy = PermissionConfiguration(defaults={**defaults, Action.FILESYSTEM_READ: Decision.ASK})
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path, interaction=interaction, configuration=policy)
+    manager = command_manager(permissions, interaction)
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
+    interaction.prompt.side_effect = lambda *_args, **_kwargs: (
+        manager.handle_user_command("/permissions default set session filesystem.read deny")
+        and ApprovalChoice.SESSION
+    )
+    requested = Operation(
+        tool_id="read_text_file",
+        action=Action.FILESYSTEM_READ,
+        target=FileTarget(path=str(tmp_path / "doc.txt")),
+    )
+
+    result = permissions.authorize((requested,))
+
+    assert result.decision is Decision.DENY
+    assert result.policy.decision is Decision.DENY
+    assert result.source == "policy"
+    assert "changed to deny" in result.reason
+    assert not permissions.session_rules
 
 
 def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes(tmp_path):

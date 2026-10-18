@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings
 
 from .. import constants
 from ..models import (
+    CommandCapability,
     FileInputMode,
     HyperparameterPolicy,
     ReasoningEffort,
@@ -80,11 +81,29 @@ class LoopSettings(BaseModel):
     model: str | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     reasoning_effort: ReasoningEffort | None = None
-    stream: bool = True
-    debug: bool = False
-    compaction_threshold: float = Field(default=constants.DEFAULT_COMPACTION_THRESHOLD, gt=0, le=1)
-    prompt_on_recoverable_error: bool = True
-    max_agent_turns: int = Field(default=constants.DEFAULT_AGENT_MAX_TURNS, ge=0)
+    stream: bool = Field(
+        default=True,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
+    debug: bool = Field(
+        default=False,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
+    compaction_threshold: float = Field(
+        default=constants.DEFAULT_COMPACTION_THRESHOLD,
+        gt=0,
+        le=1,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
+    prompt_on_recoverable_error: bool = Field(
+        default=True,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
+    max_agent_turns: int = Field(
+        default=constants.DEFAULT_AGENT_MAX_TURNS,
+        ge=0,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
 
 
 class WebSettings(BaseModel):
@@ -92,7 +111,10 @@ class WebSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    user_agent: str = constants.DEFAULT_USER_AGENT
+    user_agent: str = Field(
+        default=constants.DEFAULT_USER_AGENT,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
 
 
 class ToolSettings(BaseModel):
@@ -100,7 +122,11 @@ class ToolSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    command_timeout: float = Field(default=constants.DEFAULT_COMMAND_TIMEOUT, gt=0)
+    command_timeout: float = Field(
+        default=constants.DEFAULT_COMMAND_TIMEOUT,
+        gt=0,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
 
 
 class LoggingSettings(BaseModel):
@@ -155,6 +181,8 @@ class ConfigurationEntry:
         description (str): Human-readable setting description.
         choices (tuple[object, ...]): Finite allowed values, when applicable.
         secret (bool): Whether input and output must be treated as sensitive.
+        required_capabilities (frozenset[CommandCapability]): Runtime capabilities required to
+            change this setting. Defaults to requiring an idle session.
     """
 
     path: str
@@ -164,3 +192,6 @@ class ConfigurationEntry:
     description: str
     choices: tuple[object, ...]
     secret: bool
+    required_capabilities: frozenset[CommandCapability] = frozenset(
+        {CommandCapability.SESSION_IDLE}
+    )

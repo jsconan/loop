@@ -3,16 +3,21 @@
 from unittest.mock import Mock
 
 import pytest
+from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.document import Document
 from pydantic import ValidationError
 
 from loop import (
     Command,
+    CommandCapability,
     CommandCompletion,
     CommandContext,
     CommandManager,
     CommandRegistration,
     CommandRegistrationError,
     CommandsProvider,
+    CompletionManager,
+    CompletionProviderRegistration,
     CompletionValue,
     Interaction,
     Problem,
@@ -188,58 +193,167 @@ def test_register_resolves_declared_metadata_and_registration_options():
     assert manager.commands[-1].description == "Declared description."
 
 
-def test_responsive_metadata_is_inherited_and_can_be_overridden():
-    """Command declarations and registrations preserve explicit responsive ownership."""
+def test_command_capabilities_are_inherited_and_can_be_overridden():
+    """Declarations and registrations preserve explicit runtime capability requirements."""
     manager = CommandManager()
 
-    @command(responsive=True)
+    @command(capabilities=frozenset({CommandCapability.CONTEXT_READ}))
     def inherited() -> None:
-        """Run a responsive declared command."""
+        """Run a context-readable declared command."""
 
     def configured() -> None:
         """Run a command with registration metadata."""
 
     manager.register(inherited)
-    manager.register(CommandRegistration(configured, responsive=True))
-    manager.register(CommandRegistration(configured, name="serialized", responsive=True))
+    manager.register(
+        CommandRegistration(
+            configured,
+            capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+        )
+    )
+    manager.register(CommandRegistration(configured, name="serialized"))
 
-    assert [item.name for item in manager.responsive_commands] == [
-        "help",
-        "exit",
-        "quit",
-        "inherited",
-        "configured",
-        "serialized",
-    ]
+    assert manager.commands[-3].capabilities == frozenset({CommandCapability.CONTEXT_READ})
+    assert manager.commands[-2].capabilities == frozenset({CommandCapability.CONTEXT_UPDATE})
+    assert manager.commands[-1].capabilities == frozenset({CommandCapability.SESSION_IDLE})
 
     override = CommandManager()
-    override.register(CommandRegistration(configured, responsive=True), responsive=False)
+    override.register(
+        CommandRegistration(
+            configured,
+            capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+        ),
+        capabilities=frozenset({CommandCapability.CONTEXT_READ}),
+    )
 
-    assert [item.name for item in override.responsive_commands] == ["help", "exit", "quit"]
+    assert override.commands[-1].capabilities == frozenset({CommandCapability.CONTEXT_READ})
 
 
-def test_responsive_dispatch_leaves_serialized_and_unknown_commands_unconsumed():
-    """Busy dispatch invokes only known responsive commands without reporting other input."""
+def test_capabilities_filter_dispatch_and_consume_inactive_slash_commands():
+    """Active commands run immediately while inactive and unknown slash input is consumed."""
     interaction = Mock(spec=Interaction)
     calls = []
 
-    def responsive(context: CommandContext) -> None:
-        """Record responsive dispatch through the supplied interaction."""
+    def immediate(context: CommandContext) -> None:
+        """Record direct dispatch and inspect the current command catalog."""
         assert context.interaction is interaction
+        assert context.available_commands is not None
         calls.append(context.name)
 
-    def serialized() -> None:
-        """Represent work owned by the conversation loop."""
+    def idle_only() -> None:
+        """Represent a command that requires an idle session owner."""
 
     manager = CommandManager(interaction=interaction)
-    manager.register(CommandRegistration(responsive, responsive=True))
-    manager.register(serialized)
+    manager.register(
+        CommandRegistration(
+            immediate,
+            capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+        )
+    )
+    manager.register(idle_only)
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.CONVERSATION_ACTIVE,
+                CommandCapability.CONVERSATION_CONTROL,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
 
-    assert manager.handle_user_command("/serialized", responsive_only=True) is False
-    assert manager.handle_user_command("/missing", responsive_only=True) is False
-    assert manager.handle_user_command("/responsive", responsive_only=True) is True
-    assert calls == ["responsive"]
-    interaction.report.assert_not_called()
+    assert manager.handle_user_command("/idle_only") is True
+    assert manager.handle_user_command("/missing") is True
+    assert manager.handle_user_command("/immediate") is True
+    assert calls == ["immediate"]
+    interaction.warning.assert_called_once_with(
+        "Command '/idle_only' is unavailable in the current conversation state. "
+        "Type /help to see commands that can run now."
+    )
+    assert interaction.report.call_args.args[0].detail == (
+        "Unknown command '/missing'. Type /help for available commands."
+    )
+
+
+def test_help_and_completion_share_context_capability_filtering():
+    """Help and slash completion expose the same capability-filtered command catalog."""
+    interaction = Mock(spec=Interaction)
+
+    def hidden() -> None:
+        """Never display this command while active."""
+
+    def readable() -> None:
+        """Remain available to inspect the active context."""
+
+    manager = CommandManager(interaction=interaction)
+    manager.register(hidden)
+    manager.register(
+        CommandRegistration(
+            readable,
+            capabilities=frozenset({CommandCapability.CONTEXT_READ}),
+        )
+    )
+    manager.set_capability_provider(lambda: frozenset({CommandCapability.CONTEXT_READ}))
+
+    assert [item.name for item in manager.active_commands] == [
+        "help",
+        "readable",
+    ]
+    assert manager.handle_user_command("/help", interaction) is True
+    visible = [item.name for item in interaction.table.call_args.args[0]]
+    assert visible == ["help", "readable"]
+    completion = CompletionManager((manager.completion_adapter,))
+    suggestions = list(completion.get_completions(Document("/"), CompleteEvent()))
+    assert {item.text for item in suggestions} == {"/help", "/readable"}
+
+
+def test_manager_registers_provider_completion_sources():
+    """Command providers add named value sources to the manager-owned command adapter."""
+
+    class Provider:
+        def get_commands(self):
+            """Return one command using a named value source."""
+
+            def choose(value: str) -> None:
+                """Accept one completed value."""
+
+            return (
+                CommandRegistration(
+                    choose,
+                    completion=CommandCompletion(provider="choices"),
+                ),
+            )
+
+        def get_completion_providers(self):
+            """Return values referenced by the command's grammar."""
+            return (
+                CompletionProviderRegistration(
+                    "choices",
+                    lambda: (CompletionValue("blue"), CompletionValue("red")),
+                ),
+            )
+
+    manager = CommandManager(providers=(Provider(),))
+    completion = CompletionManager((manager.completion_adapter,))
+
+    suggestions = list(completion.get_completions(Document("/choose b"), CompleteEvent()))
+
+    assert [item.text for item in suggestions] == ["blue"]
+
+
+def test_inactive_command_requires_an_interaction():
+    """An inactive command requires an interaction to report its current availability."""
+
+    def unavailable() -> None:
+        """Represent an operation disabled during active execution."""
+
+    manager = CommandManager(exit_command_names=None)
+    manager.register(unavailable)
+    manager.set_capability_provider(lambda: frozenset())
+
+    with pytest.raises(ValueError, match="requires an Interaction"):
+        manager.handle_user_command("/unavailable")
 
 
 def test_register_retains_explicit_and_function_declared_completion_metadata():

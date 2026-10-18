@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, Union, get_args, get_origin
 
 from prompt_toolkit.document import Document
 
+from ...models import CommandCapabilityProvider
 from ..models import (
     CommandCompletion,
     CompletionMatch,
@@ -31,6 +32,8 @@ class CommandCompletionAdapter(CompletionAdapter):
 
     Args:
         commands (Callable[[], Iterable[Command]]): Lazy source of registered commands.
+        capabilities (CommandCapabilityProvider | None): Optional live capability source used to
+            filter argument candidates as well as command names.
         marker (str): Symbol introducing command names. Defaults to ``/``.
         providers (Iterable[object] | None): Capability providers inspected for an optional
             ``get_completion_providers()`` method during construction.
@@ -40,6 +43,7 @@ class CommandCompletionAdapter(CompletionAdapter):
     """
 
     _commands: Callable[[], Iterable[Command]]
+    _capabilities: CommandCapabilityProvider | None
     _marker: str
     _providers: dict[str, CompletionProvider]
     _schema_providers: dict[str, SchemaCompletionProvider]
@@ -49,10 +53,12 @@ class CommandCompletionAdapter(CompletionAdapter):
         commands: Callable[[], Iterable[Command]],
         marker: str = "/",
         providers: Iterable[object] | None = None,
+        capabilities: CommandCapabilityProvider | None = None,
     ) -> None:
         if len(marker) != 1 or marker.isalnum() or marker.isspace():
             raise ValueError("A completion marker must be one non-alphanumeric character.")
         self._commands = commands
+        self._capabilities = capabilities
         self._marker = marker
         self._providers = {}
         self._schema_providers = {}
@@ -205,7 +211,10 @@ class CommandCompletionAdapter(CompletionAdapter):
             provider = self._providers[provider]
         if provider is not None:
             values.extend(provider())
-        return tuple(values)
+        capabilities = self._capabilities() if self._capabilities is not None else None
+        if capabilities is None:
+            return tuple(values)
+        return tuple(value for value in values if value.required_capabilities <= capabilities)
 
     def _match_model_arguments(self, model, arguments: str, before: str) -> CompletionMatch | None:
         """Match positional or named input against a Pydantic model schema."""

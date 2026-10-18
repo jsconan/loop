@@ -3,6 +3,7 @@
 __all__ = [
     "Command",
     "CommandArgumentError",
+    "CommandCapability",
     "CommandContext",
     "CommandManager",
     "CommandRegistration",
@@ -12,6 +13,7 @@ __all__ = [
     "command",
 ]
 
+from ..models import CommandCapability
 from .command import Command, CommandRegistration, CommandsProvider, command
 from .command_manager import CommandManager
 from .context import CommandContext

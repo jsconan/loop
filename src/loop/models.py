@@ -1,4 +1,4 @@
-"""Define conversation and response models."""
+"""Define shared runtime, conversation, and response models."""
 
 from __future__ import annotations
 
@@ -30,6 +30,21 @@ type ContextReferenceKind = Literal["file", "directory"]
 type MessageRole = Literal["user", "assistant"]
 
 _JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE | re.DOTALL)
+
+
+class CommandCapability(StrEnum):
+    """Describe the runtime operations a registered command may perform."""
+
+    SESSION_IDLE = "session_idle"
+    CONTEXT_READ = "context_read"
+    CONTEXT_UPDATE = "context_update"
+    CONVERSATION_ACTIVE = "conversation_active"
+    CONVERSATION_CONTROL = "conversation_control"
+    RUN_ACTIVE = "run_active"
+    PENDING_RESPONSE = "pending_response"
+
+
+type CommandCapabilityProvider = Callable[[], frozenset[CommandCapability] | None]
 
 
 class SteeringMessage(str):

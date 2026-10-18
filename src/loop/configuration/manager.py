@@ -13,6 +13,7 @@ from filelock import FileLock
 from pydantic import SecretStr
 
 from .. import constants
+from ..models import CommandCapability
 from .models import (
     ApplicationSettings,
     ConfigurationEntry,
@@ -174,6 +175,11 @@ class ConfigurationManager:
             schema = section_type.model_json_schema()
             for field_name, field in section_type.model_fields.items():
                 path = f"{section_name}.{field_name}"
+                configured_capabilities = field.json_schema_extra or {}
+                required_capabilities = frozenset(
+                    CommandCapability(value)
+                    for value in configured_capabilities.get("required_capabilities", ())
+                )
                 current = self.get(path)
                 values.append(
                     ConfigurationEntry(
@@ -186,6 +192,9 @@ class ConfigurationManager:
                             schema["properties"][field_name], schema.get("$defs", {})
                         ),
                         secret=isinstance(current, SecretStr),
+                        required_capabilities=(
+                            required_capabilities or frozenset({CommandCapability.SESSION_IDLE})
+                        ),
                     )
                 )
         return tuple(values)

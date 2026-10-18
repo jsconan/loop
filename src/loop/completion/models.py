@@ -6,6 +6,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, Self
 
+from ..models import CommandCapability
+
 if TYPE_CHECKING:
     from pydantic import BaseModel
 
@@ -21,12 +23,15 @@ class CompletionValue:
         description (str): Optional explanation displayed beside the value.
         display (str | None): Optional label displayed instead of the inserted value.
         sort_order (int | None): Optional provider-controlled order overriding relevance sorting.
+        required_capabilities (frozenset[CommandCapability]): Runtime capabilities needed to show
+            this candidate. Defaults to no additional requirement.
     """
 
     value: str
     description: str = ""
     display: str | None = None
     sort_order: int | None = None
+    required_capabilities: frozenset[CommandCapability] = frozenset()
 
 
 type CompletionProvider = Callable[[], Iterable[CompletionValue]]

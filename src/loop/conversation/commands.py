@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Annotated, Protocol
 
 from ..commands import CommandContext, CommandRegistration, CommandRemainder
-from ..completion import CommandCompletion
-from .models import ConversationStatus, SteeringOutcome
+from ..completion import CommandCompletion, CompletionValue
+from ..models import CommandCapability
+from .models import ConversationStatus, ResponseOutcome, SteeringOutcome
 
 if TYPE_CHECKING:
     from ..interaction import Interaction
@@ -22,11 +23,23 @@ class ConversationControl(Protocol):
             bool: Whether an active run accepted the interruption request.
         """
 
-    def request_response(self) -> bool:
-        """Request a response to the currently pending interaction.
+    def request_response(self, answer: str | None = None) -> ResponseOutcome:
+        """Request an interactive response or submit one to the pending interaction.
+
+        Args:
+            answer (str | None): Answer text to submit directly, or ``None`` to open the separate
+                response prompt.
 
         Returns:
-            bool: Whether an interaction is waiting for a response.
+            ResponseOutcome: Whether the pending request was answered, prompted, or rejected.
+        """
+
+    def response_completions(self) -> tuple[CompletionValue, ...]:
+        """Return the choices accepted by the pending response request.
+
+        Returns:
+            tuple[CompletionValue, ...]: Current response values, or an empty tuple when the
+                request accepts unrestricted text or requires masked input.
         """
 
     def status_snapshot(self) -> ConversationStatus:
@@ -49,7 +62,7 @@ class ConversationControl(Protocol):
 
 
 class ConversationCommands:
-    """Register user-facing controls for a responsive conversation.
+    """Register user-facing controls for an asynchronous conversation.
 
     Args:
         control (ConversationControl): Conversation lifecycle actions used by each command.
@@ -61,19 +74,31 @@ class ConversationCommands:
         self._control = control
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
-        """Return responsive interruption, status, steering, and response commands.
+        """Return controls annotated with the conversation states that support them.
 
         Returns:
             tuple[CommandRegistration, ...]: Commands exposed by this provider.
         """
         return (
-            CommandRegistration(self.interrupt, responsive=True),
-            CommandRegistration(self.respond, responsive=True),
-            CommandRegistration(self.status, responsive=True),
+            CommandRegistration(
+                self.interrupt,
+                capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
+            ),
+            CommandRegistration(
+                self.respond,
+                completion=CommandCompletion(provider=self._control.response_completions),
+                capabilities=frozenset({CommandCapability.PENDING_RESPONSE}),
+            ),
+            CommandRegistration(
+                self.status,
+                capabilities=frozenset(
+                    {CommandCapability.CONVERSATION_ACTIVE, CommandCapability.CONTEXT_READ}
+                ),
+            ),
             CommandRegistration(
                 self.steer,
                 completion=CommandCompletion(),
-                responsive=True,
+                capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
             ),
         )
 
@@ -90,14 +115,32 @@ class ConversationCommands:
         else:
             context.interaction.warning("No agent run is active.")
 
-    def respond(self, context: CommandContext) -> None:
-        """Answer the pending interaction request.
+    def respond(
+        self,
+        context: CommandContext,
+        answer: Annotated[tuple[str, ...], CommandRemainder()] = (),
+    ) -> None:
+        """Answer the pending interaction request or open its dedicated prompt.
 
         Args:
             context (CommandContext): Interaction used to report a missing request.
+            answer (tuple[str, ...]): Optional response text, completed from the pending request's
+                selectable choices when it has any. Defaults to an empty tuple.
         """
-        if not self._control.request_response():
+        text = " ".join(answer)
+        outcome = self._control.request_response(text if text.strip() else None)
+        if outcome is ResponseOutcome.NO_REQUEST:
             context.interaction.warning("No input request is pending.")
+        elif outcome is ResponseOutcome.INVALID:
+            context.interaction.warning(
+                "Choose one of the listed responses, or use /respond without an answer."
+            )
+        elif outcome is ResponseOutcome.PROMPT_REQUIRED:
+            context.interaction.warning("Use /respond without an answer for this request.")
+        elif outcome is ResponseOutcome.MASKED_INPUT_REQUIRED:
+            context.interaction.warning(
+                "This request requires masked input; use /respond without an answer."
+            )
 
     def status(self, context: CommandContext) -> None:
         """Show conversation activity and the number of queued inputs.

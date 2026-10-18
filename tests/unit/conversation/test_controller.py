@@ -4,17 +4,19 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from threading import Event, Thread, get_ident
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from prompt_toolkit.completion import CompleteEvent, DummyCompleter, WordCompleter
 from prompt_toolkit.document import Document
 
 from loop import (
+    CommandCapability,
     CommandCompletion,
     CommandContext,
     CommandManager,
     CommandRegistration,
+    CompletionManager,
     CompletionValue,
     ConsoleInteraction,
     Interaction,
@@ -23,7 +25,14 @@ from loop import (
 )
 from loop.conversation import ConversationCommands
 from loop.conversation import controller as controller_module
-from loop.conversation.models import SteeringOutcome
+from loop.conversation.models import (
+    EVENT_CONFIRM,
+    EVENT_PROMPT,
+    EVENT_TERMINAL,
+    InteractionCall,
+    ResponseOutcome,
+    SteeringOutcome,
+)
 from loop.models import SteeringMessage
 
 
@@ -80,18 +89,25 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
     def choose(context: CommandContext, color: str) -> None:
         """Choose a configured color."""
 
+    def queued() -> None:
+        """Run after the active operation settles."""
+
+    def unavailable() -> None:
+        """Remain unavailable while the active operation is running."""
+
     manager.register(
         CommandRegistration(
             choose,
-            responsive=True,
+            capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
             completion=CommandCompletion(values=(CompletionValue("blue"),)),
         )
     )
+    manager.register(queued)
+    manager.register(unavailable)
     manager.call("help")
-    names = [item.name for item in ui.table.call_args.args[0]]
-    assert {"help", "exit", "quit", "interrupt", "respond", "status", "steer", "choose"} <= set(
-        names
-    )
+    setup_names = {item.name for item in ui.table.call_args.args[0]}
+    assert {"interrupt", "respond", "status", "steer", "choose"}.isdisjoint(setup_names)
+    assert "queued" in setup_names
 
     async def scenario():
         """Read a completion request while the conversation owns active work."""
@@ -99,6 +115,8 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
         working, captured = asyncio.Event(), asyncio.Event()
         release = Event()
         busy_completions = []
+        busy_command_completions = []
+        busy_help_names = []
 
         async def read(*_args, **kwargs):
             """Capture command completion before waiting for the next mailbox input."""
@@ -106,6 +124,9 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
             completions = list(completer.get_completions(Document("/choose b"), CompleteEvent()))
             if working.is_set():
                 busy_completions[:] = completions
+                busy_command_completions[:] = list(
+                    completer.get_completions(Document("/"), CompleteEvent())
+                )
                 captured.set()
             return await inputs.get()
 
@@ -114,8 +135,9 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
         def conversation(receive):
             """Hold execution ownership after accepting the initial message."""
             receive(DummyCompleter())
-            controller.interaction.info("working")
-            release.wait()
+            with controller.control.execution():
+                controller.interaction.info("working")
+                release.wait()
             receive(DummyCompleter())
 
         ui.info.side_effect = lambda message="": working.set() if message == "working" else None
@@ -123,9 +145,25 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
         try:
             inputs.put_nowait("start")
             await working.wait()
+            manager.handle_user_command("/help", interaction=ui)
+            busy_help_names[:] = [item.name for item in ui.table.call_args.args[0]]
             inputs.put_nowait("/status")
             await captured.wait()
             assert [item.text for item in busy_completions] == ["blue"]
+            commands = {item.text: item for item in busy_command_completions}
+            assert "/choose" in commands
+            assert "/respond" not in commands
+            assert "/queued" not in commands
+            assert "/unavailable" not in commands
+            assert set(busy_help_names) == {
+                "help",
+                "exit",
+                "quit",
+                "interrupt",
+                "status",
+                "steer",
+                "choose",
+            }
             release.set()
             inputs.put_nowait(False)
             await task
@@ -135,10 +173,11 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
+    assert "status" not in {item.name for item in manager.active_commands}
 
 
-def test_controller_passes_serialized_and_unknown_slash_input_to_the_loop(ui):
-    """Only registered responsive commands are consumed by the controller."""
+def test_controller_rejects_inactive_and_unknown_slash_input_without_queueing(ui):
+    """Inactive commands and unknown slash input are explained instead of queued as messages."""
     controller = SessionController(ui)
     manager = CommandManager(providers=(ConversationCommands(controller),), interaction=ui)
 
@@ -150,35 +189,190 @@ def test_controller_passes_serialized_and_unknown_slash_input_to_the_loop(ui):
     received = []
 
     async def scenario():
-        """Submit a registered serialized command and an unknown slash message."""
+        """Reject slash input during execution, then admit an ordinary follow-up."""
         inputs = asyncio.Queue()
-        processed = asyncio.Queue()
+        working = asyncio.Event()
+        inactive_rejected = asyncio.Event()
+        unknown_rejected = asyncio.Event()
+        release = Event()
         read_inputs(ui, inputs)
-        ui.info.side_effect = lambda message="": (
-            processed.put_nowait(message) if message == "processed" else None
-        )
+        ui.info.side_effect = lambda message="": working.set() if message == "working" else None
+        ui.warning.side_effect = lambda _message: inactive_rejected.set()
+        ui.report.side_effect = lambda _problem: unknown_rejected.set()
 
         def conversation(receive):
-            """Collect ordinary inputs for the loop's command dispatcher."""
-            for _ in range(2):
-                received.append(receive(DummyCompleter()))
-                controller.interaction.info("processed")
+            """Consume a normal input before and after an active run scope."""
+            received.append(receive(DummyCompleter()))
+            with controller.control.execution():
+                controller.interaction.info("working")
+                release.wait()
+            received.append(receive(DummyCompleter()))
 
         task = asyncio.create_task(controller.run(conversation))
         try:
+            inputs.put_nowait("start")
+            await working.wait()
             inputs.put_nowait("/serialized")
-            await processed.get()
+            await inactive_rejected.wait()
             inputs.put_nowait("/missing value")
-            await processed.get()
-            inputs.put_nowait(False)
+            await unknown_rejected.wait()
+            assert received == ["start"]
+            release.set()
+            inputs.put_nowait("follow-up")
             await task
         finally:
+            release.set()
             controller.stop()
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
+    assert received == ["start", "follow-up"]
 
-    assert received == ["/serialized", "/missing value"]
+
+def test_response_command_completions_follow_the_pending_request(ui):
+    """Selectable response prompts expose their accepted values through the command catalog."""
+    controller = SessionController(ui)
+    request = InteractionCall(
+        function=ui.prompt,
+        args=("Choose one:",),
+        kwargs={"choices": {"red": "Red", "blue": "Blue"}},
+        kind=EVENT_PROMPT,
+    )
+    controller._pending = request
+
+    assert [item.value for item in controller.response_completions()] == ["Red", "Blue"]
+    assert controller.request_response("bLuE") is ResponseOutcome.ANSWERED
+    assert request.result.result() == "blue"
+    assert controller._pending is None
+
+
+def test_command_capabilities_track_active_run_pending_response_and_settlement(ui):
+    """Conversation controls appear only while the corresponding lifecycle state exists."""
+    controller = SessionController(ui)
+    manager = CommandManager(providers=(ConversationCommands(controller),), interaction=ui)
+    controller.bind_command_manager(manager)
+
+    def names():
+        return {command.name for command in manager.active_commands}
+
+    assert {"interrupt", "respond", "status", "steer"}.isdisjoint(names())
+    controller._loop = Mock()
+    with controller.control.execution():
+        active_names = names()
+        assert {"interrupt", "status", "steer"} <= active_names
+        assert "respond" not in active_names
+        controller._pending = InteractionCall(
+            function=ui.prompt,
+            args=("Choose:",),
+            kwargs={"choices": {"yes": "Yes", "no": "No"}},
+            kind=EVENT_PROMPT,
+        )
+        assert "respond" in names()
+        completer = CompletionManager((manager.completion_adapter,))
+        completions = list(completer.get_completions(Document("/respond y"), CompleteEvent()))
+        assert [item.text for item in completions] == ["Yes"]
+    controller._pending = None
+    controller._loop = None
+    assert {"interrupt", "respond", "status", "steer"}.isdisjoint(names())
+
+
+def test_command_capabilities_during_shutdown_allow_only_inspection(ui):
+    """Shutdown keeps inspection available while refusing conversation controls and edits."""
+    controller = SessionController(ui)
+    controller._loop = Mock()
+    controller._stopping = True
+
+    assert controller.command_capabilities() == frozenset({CommandCapability.CONTEXT_READ})
+
+
+def test_response_completion_caches_one_shot_prompt_choices(ui):
+    """Completion does not consume one-shot choices before direct response validation."""
+    controller = SessionController(ui)
+    request = InteractionCall(
+        ui.prompt,
+        ("Choose one:",),
+        {"choices": (value for value in ("red", "blue"))},
+        kind=EVENT_PROMPT,
+    )
+    controller._pending = request
+
+    assert [item.value for item in controller.response_completions()] == ["red", "blue"]
+    assert controller.request_response("blue") is ResponseOutcome.ANSWERED
+    assert request.result.result() == "blue"
+
+
+@pytest.mark.parametrize(
+    ("kind", "kwargs", "answer", "outcome"),
+    [
+        (EVENT_PROMPT, {}, "A free form answer", ResponseOutcome.ANSWERED),
+        (EVENT_PROMPT, {"secret": True}, "secret", ResponseOutcome.MASKED_INPUT_REQUIRED),
+        (EVENT_TERMINAL, {}, "answer", ResponseOutcome.PROMPT_REQUIRED),
+        (EVENT_PROMPT, {"choices": ("first", "second")}, "3", ResponseOutcome.INVALID),
+        (EVENT_PROMPT, {"choices": ("first", "second")}, "2", ResponseOutcome.ANSWERED),
+        (
+            EVENT_PROMPT,
+            {"choices": ("first", "second"), "index": ("same", "same")},
+            "first",
+            ResponseOutcome.INVALID,
+        ),
+        (EVENT_CONFIRM, {}, "y", ResponseOutcome.ANSWERED),
+        (EVENT_CONFIRM, {}, "maybe", ResponseOutcome.INVALID),
+        ("unknown", {}, "answer", ResponseOutcome.PROMPT_REQUIRED),
+    ],
+)
+def test_direct_response_resolves_supported_prompt_kinds(ui, kind, kwargs, answer, outcome):
+    """Direct responses preserve free text, typed choices, and confirmation values."""
+    controller = SessionController(ui)
+    request = InteractionCall(function=ui.prompt, args=("Question",), kwargs=kwargs, kind=kind)
+    controller._pending = request
+
+    assert controller.request_response(answer) is outcome
+    if outcome is ResponseOutcome.ANSWERED:
+        assert request.result.done()
+    else:
+        assert not request.result.done()
+
+
+def test_request_response_without_value_opens_the_pending_prompt(ui):
+    """An empty response command delegates to the original masked or selectable UI prompt."""
+    controller = SessionController(ui)
+    assert controller.request_response() is ResponseOutcome.NO_REQUEST
+    request = InteractionCall(function=ui.prompt, args=("Question",), kwargs={}, kind=EVENT_PROMPT)
+    controller._pending = request
+
+    assert controller.request_response() is ResponseOutcome.PROMPTED
+    assert controller._respond_requested is True
+
+
+def test_response_completions_handle_confirm_secret_free_text_and_invalid_choices(ui):
+    """Only valid, non-secret choices are completed for pending responses."""
+    controller = SessionController(ui)
+    assert controller.response_completions() == ()
+
+    controller._pending = InteractionCall(ui.prompt, ("Confirm?",), {}, kind=EVENT_CONFIRM)
+    assert [item.value for item in controller.response_completions()] == ["Yes", "No"]
+
+    controller._pending = InteractionCall(
+        ui.prompt, ("Secret?",), {"secret": True, "choices": ("a", "b")}, kind=EVENT_PROMPT
+    )
+    assert controller.response_completions() == ()
+
+    controller._pending = InteractionCall(ui.prompt, ("Exclusive?",), {}, kind=EVENT_TERMINAL)
+    assert controller.response_completions() == ()
+
+    controller._pending = InteractionCall(ui.prompt, ("Text?",), {}, kind=EVENT_PROMPT)
+    assert controller.response_completions() == ()
+
+    controller._pending = InteractionCall(
+        ui.prompt,
+        ("Invalid choices?",),
+        {"choices": ("a", "b"), "index": ("same", "same")},
+        kind=EVENT_PROMPT,
+    )
+    assert controller.response_completions() == ()
+
+    controller._pending = InteractionCall(ui.prompt, ("Unknown?",), {}, kind="unknown")
+    assert controller.response_completions() == ()
 
 
 def test_steering_reports_when_active_control_already_rejects_interruption(ui):
@@ -190,6 +384,14 @@ def test_steering_reports_when_active_control_already_rejects_interruption(ui):
         outcome = controller.steer("correction", ui)
 
     assert outcome is SteeringOutcome.INTERRUPT_REJECTED
+
+
+def test_steering_rejects_when_no_run_is_active(ui):
+    """Steering cannot admit corrections while the run control is idle."""
+    controller = SessionController(ui)
+
+    assert controller.steer("correction", ui) is SteeringOutcome.RUN_INACTIVE
+    assert controller.status_snapshot().queued_inputs == 0
 
 
 def test_controller_accepts_messages_and_status_during_serialized_work(ui):
@@ -678,10 +880,22 @@ def test_controller_reports_blank_input_and_missing_response_requests(ui):
     asyncio.run(scenario())
     assert [item.args[0] for item in ui.warning.call_args_list] == [
         "Please enter a message!",
-        "No input request is pending.",
-        "No agent run is active.",
-        "Usage: /steer <message>",
-        "No agent run is active; send a normal message instead.",
+        (
+            "Command '/respond' is unavailable in the current conversation state. "
+            "Type /help to see commands that can run now."
+        ),
+        (
+            "Command '/interrupt' is unavailable in the current conversation state. "
+            "Type /help to see commands that can run now."
+        ),
+        (
+            "Command '/steer' is unavailable in the current conversation state. "
+            "Type /help to see commands that can run now."
+        ),
+        (
+            "Command '/steer' is unavailable in the current conversation state. "
+            "Type /help to see commands that can run now."
+        ),
     ]
     ui.info.assert_any_call("Idle; 0 queued inputs.")
 

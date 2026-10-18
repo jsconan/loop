@@ -4,6 +4,7 @@ from typing import Annotated
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration, CommandRemainder
 from ..completion import CommandCompletion, CompletionValue
+from ..models import CommandCapability
 from .manager import PermissionManager
 from .models import (
     Action,
@@ -89,6 +90,9 @@ class PermissionCommands:
                 name="permissions",
                 description="Inspect and manage workspace and session operation policy.",
                 completion=self._completion(),
+                capabilities=frozenset(
+                    {CommandCapability.CONTEXT_READ, CommandCapability.CONTEXT_UPDATE}
+                ),
             ),
         )
 
@@ -98,10 +102,49 @@ class PermissionCommands:
         arguments: Annotated[tuple[str, ...], CommandRemainder()] = (),
     ) -> None:
         """Show, explain, or change workspace and session operation policy."""
-        try:
-            self._dispatch(context, arguments)
-        except (TypeError, ValueError) as exc:
-            raise CommandArgumentError(f"{exc}\n{self._usage()}") from exc
+        with self._permission_manager.policy_update():
+            if CommandCapability.RUN_ACTIVE in (context.capabilities or frozenset()):
+                self._ensure_run_safe(context, arguments)
+            try:
+                self._dispatch(context, arguments)
+            except (TypeError, ValueError) as exc:
+                raise CommandArgumentError(f"{exc}\n{self._usage()}") from exc
+
+    @staticmethod
+    def _ensure_run_safe(context: CommandContext, arguments: tuple[str, ...]) -> None:
+        """Reject permission operations that prompt or replace broad policy state mid-run."""
+        if not arguments or arguments[0] in {"show", "explain", "help", "default", "limit"}:
+            return
+        if arguments[0] == "rule":
+            if len(arguments) > 1 and arguments[1] in {"list", "remove"}:
+                return
+            if len(arguments) >= 4 and arguments[1] == "add":
+                matchers = arguments[4:]
+                tool = matchers[0] if matchers else "*"
+                action = matchers[1] if len(matchers) > 1 else "*"
+                resource = matchers[2] if len(matchers) > 2 else "*"
+                if tool != "*" and action != "*" and resource != "*":
+                    return
+                raise CommandArgumentError(
+                    "Broad permission rules require a confirmation prompt and cannot be added "
+                    "while the agent is working. Use an exact tool, action, and resource, or "
+                    "change an action default or limit."
+                )
+        if arguments[0] in {"sandbox", "host"} and (
+            len(arguments) == 1 or arguments[1] in {"list", "remove"}
+        ):
+            return
+        if (
+            arguments[0] == "preset"
+            and len(arguments) > 1
+            and arguments[1] in {"list", "show", "diff"}
+        ):
+            return
+        action = arguments[0]
+        raise CommandArgumentError(
+            f"'/permissions {action}' cannot run while the agent is working because it may "
+            "prompt or reload the active policy. Wait for the run to pause."
+        )
 
     def _dispatch(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
         manager = self._permission_manager
@@ -434,13 +477,33 @@ class PermissionCommands:
         actions = _enum_values(Action, _ACTION_DESCRIPTIONS)
         scopes = _enum_values(PolicyScope, _SCOPE_DESCRIPTIONS)
         resource = CommandCompletion(
-            values=(CompletionValue("*", "Match every canonical resource."),)
+            values=(
+                CompletionValue(
+                    "*",
+                    "Match every canonical resource.",
+                    required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                ),
+            )
         )
         action = CommandCompletion(
-            values=(CompletionValue("*", "Match every action."), *actions), next=resource
+            values=(
+                CompletionValue(
+                    "*",
+                    "Match every action.",
+                    required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                ),
+                *actions,
+            ),
+            next=resource,
         )
         tool = CommandCompletion(
-            values=(CompletionValue("*", "Match every registered tool."),),
+            values=(
+                CompletionValue(
+                    "*",
+                    "Match every registered tool.",
+                    required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                ),
+            ),
             provider="tools",
             next=action,
         )
@@ -484,6 +547,7 @@ class PermissionCommands:
                 CompletionValue(
                     "replace",
                     "Replace only selected scoped rules after explicit confirmation.",
+                    required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
                 ),
             ),
             children={
@@ -547,19 +611,61 @@ class PermissionCommands:
         )
         return CommandCompletion(
             values=(
-                CompletionValue("show", "Show all policy layers or one selected view."),
-                CompletionValue("reload", "Reload only the workspace YAML policy."),
-                CompletionValue("session", "Manage the complete process-local policy overlay."),
-                CompletionValue("explain", "Explain one concrete effective decision."),
-                CompletionValue("default", "Manage scoped fallback decisions by action."),
-                CompletionValue("rule", "Manage workspace and session rules."),
-                CompletionValue("sandbox", "List or revoke sandbox-only command approvals."),
-                CompletionValue("host", "List or revoke recorded session host approvals."),
-                CompletionValue("limit", "Manage scoped roots, network, and process limits."),
                 CompletionValue(
-                    "preset", "Inspect or explicitly replace scoped policy defaults and rules."
+                    "show",
+                    "Show all policy layers or one selected view.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_READ}),
                 ),
-                CompletionValue("help", "Explain policy concepts and common commands."),
+                CompletionValue(
+                    "reload",
+                    "Reload only the workspace YAML policy.",
+                    required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                ),
+                CompletionValue(
+                    "session",
+                    "Manage the complete process-local policy overlay.",
+                    required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                ),
+                CompletionValue(
+                    "explain",
+                    "Explain one concrete effective decision.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_READ}),
+                ),
+                CompletionValue(
+                    "default",
+                    "Manage scoped fallback decisions by action.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+                ),
+                CompletionValue(
+                    "rule",
+                    "Manage workspace and session rules.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+                ),
+                CompletionValue(
+                    "sandbox",
+                    "List or revoke sandbox-only command approvals.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+                ),
+                CompletionValue(
+                    "host",
+                    "List or revoke recorded session host approvals.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+                ),
+                CompletionValue(
+                    "limit",
+                    "Manage scoped roots, network, and process limits.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+                ),
+                CompletionValue(
+                    "preset",
+                    "Inspect or explicitly replace scoped policy defaults and rules.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_READ}),
+                ),
+                CompletionValue(
+                    "help",
+                    "Explain policy concepts and common commands.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_READ}),
+                ),
             ),
             children={
                 "show": CommandCompletion(

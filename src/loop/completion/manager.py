@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
 
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 
 from ..telemetry import telemetry_error
-from .adapters import CommandCompletionAdapter, CompletionAdapter
+from .adapters import CompletionAdapter
 from .models import CompletionMatch, CompletionValue
-
-if TYPE_CHECKING:
-    from ..commands.command import CommandsProvider
 
 
 class CompletionManager(Completer):
@@ -46,17 +42,6 @@ class CompletionManager(Completer):
         """
         self._adapters.append(adapter)
         return adapter
-
-    def register_command_provider(self, provider: CommandsProvider) -> None:
-        """Register contextual values exposed by one command provider.
-
-        Args:
-            provider (CommandsProvider): Command provider whose completion sources should be
-                registered with every command completion adapter.
-        """
-        for adapter in self._adapters:
-            if isinstance(adapter, CommandCompletionAdapter):
-                adapter.register_provider(provider)
 
     def get_completions(self, document: Document, complete_event) -> Iterable[Completion]:
         """Yield aggregated candidates appropriate for the input before the cursor.

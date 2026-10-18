@@ -36,6 +36,7 @@ __all__ = [
     "BackendTimeoutError",
     "Command",
     "CommandArgumentError",
+    "CommandCapability",
     "CommandCompletion",
     "CommandCompletionAdapter",
     "CommandContext",
@@ -257,6 +258,7 @@ from .backend import (
 from .commands import (
     Command,
     CommandArgumentError,
+    CommandCapability,
     CommandContext,
     CommandManager,
     CommandRegistration,

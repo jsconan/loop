@@ -10,6 +10,7 @@ from typing import Protocol, overload
 from pydantic import BaseModel
 
 from ..completion import CommandCompletion
+from ..models import CommandCapability
 from ..utils import callable_name
 from .context import CommandContext
 from .models import CommandRegistrationError
@@ -33,8 +34,9 @@ class Command:
         arguments_model (type[BaseModel] | None): Pydantic model used to validate arguments after
             registration, or ``None`` for a passive declaration.
         completion (CommandCompletion | None): Optional shell-like argument completion grammar.
-        responsive (bool): Whether the command may run while conversation execution is busy.
-            Defaults to ``False``.
+        capabilities (frozenset[CommandCapability]): Runtime operations required to expose this
+            command. Defaults to ``SESSION_IDLE`` so commands without an explicit live
+            capability remain limited to an idle session.
     """
 
     function: Callable[..., None]
@@ -42,7 +44,7 @@ class Command:
     description: str | None = None
     arguments_model: type[BaseModel] | None = None
     completion: CommandCompletion | None = None
-    responsive: bool = False
+    capabilities: frozenset[CommandCapability] = frozenset({CommandCapability.SESSION_IDLE})
 
     def registered(
         self,
@@ -50,7 +52,7 @@ class Command:
         name: str | None = None,
         description: str | None = None,
         completion: CommandCompletion | None = None,
-        responsive: bool | None = None,
+        capabilities: frozenset[CommandCapability] | None = None,
     ) -> Command:
         """Return a registry-ready copy with resolved metadata and validation.
 
@@ -60,8 +62,8 @@ class Command:
                 derive it.
             completion (CommandCompletion | None): Container-specific completion grammar, or
                 ``None`` to inherit or discover one.
-            responsive (bool | None): Whether the command may run alongside conversation
-                execution, or ``None`` to inherit the declaration.
+            capabilities (frozenset[CommandCapability] | None): Context capabilities required by
+                this registration, or ``None`` to inherit the declaration.
 
         Returns:
             Command: Immutable, fully resolved command for one manager.
@@ -80,7 +82,7 @@ class Command:
             completion=(
                 completion or self.completion or CommandCompletion.get_completion(self.function)
             ),
-            responsive=self.responsive if responsive is None else responsive,
+            capabilities=self.capabilities if capabilities is None else capabilities,
             arguments_model=get_command_arguments_model(self.function, resolved_name),
         )
 
@@ -151,15 +153,15 @@ class CommandRegistration:
             it.
         completion (CommandCompletion | None): Container-specific completion grammar, or ``None``
             to inherit one declared on the function.
-        responsive (bool | None): Whether the command may run alongside conversation execution,
-            or ``None`` to inherit one declared on the function.
+        capabilities (frozenset[CommandCapability] | None): Required runtime capabilities, or
+            ``None`` to inherit those declared on the function.
     """
 
     function: Callable[..., None]
     name: str | None = None
     description: str | None = None
     completion: CommandCompletion | None = None
-    responsive: bool | None = None
+    capabilities: frozenset[CommandCapability] | None = None
 
 
 class CommandsProvider(Protocol):
@@ -187,7 +189,7 @@ def command[CommandFunction: Callable[..., None]](
     name: str | None = None,
     description: str | None = None,
     completion: CommandCompletion | None = None,
-    responsive: bool = False,
+    capabilities: frozenset[CommandCapability] | None = None,
 ) -> Callable[[CommandFunction], CommandFunction]: ...
 
 
@@ -198,7 +200,7 @@ def command[CommandFunction: Callable[..., None]](
     name: str | None = None,
     description: str | None = None,
     completion: CommandCompletion | None = None,
-    responsive: bool = False,
+    capabilities: frozenset[CommandCapability] | None = None,
 ) -> CommandFunction | Callable[[CommandFunction], CommandFunction]:
     """Declare a function as a user command without registering it.
 
@@ -208,8 +210,8 @@ def command[CommandFunction: Callable[..., None]](
         name (str | None): Public name, defaulting to the function name at registration.
         description (str | None): Display description, defaulting to the docstring summary.
         completion (CommandCompletion | None): Optional argument completion grammar.
-        responsive (bool): Whether the command may run alongside conversation execution.
-            Defaults to ``False``.
+        capabilities (frozenset[CommandCapability] | None): Required runtime capabilities, or
+            ``None`` to keep the command limited to an idle session.
 
     Returns:
         CommandFunction | Callable[[CommandFunction], CommandFunction]: Unchanged declared function
@@ -229,7 +231,11 @@ def command[CommandFunction: Callable[..., None]](
                 name=name,
                 description=description,
                 completion=completion,
-                responsive=responsive,
+                capabilities=(
+                    frozenset({CommandCapability.SESSION_IDLE})
+                    if capabilities is None
+                    else capabilities
+                ),
             ),
         )
         return target

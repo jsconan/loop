@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
-from ..completion import CommandCompletion
+from ..completion import CommandCompletion, CommandCompletionAdapter
 from ..errors import Problem, ProblemException, log_problem
+from ..models import CommandCapability, CommandCapabilityProvider
 from ..telemetry import telemetry_activity, telemetry_error
 from .command import Command, CommandRegistration, CommandsProvider
 from .context import CommandContext
@@ -25,8 +26,9 @@ if TYPE_CHECKING:
 class CommandManager:
     """Collect command declarations and route user input to their functions.
 
-    Mark only commands safe alongside active conversation work as responsive. The manager can then
-    dispatch those commands independently while leaving ordinary commands with the execution owner.
+    Commands declare the runtime capabilities they need. When a runtime context is supplied, the
+    same capability check controls dispatch, help, and completion; unavailable commands are
+    consumed with an explanation instead of being treated as conversation input.
 
     Args:
         commands (Iterable[CommandRegistration | Callable[..., None]] | None): Commands
@@ -47,6 +49,8 @@ class CommandManager:
     _commands: dict[str, Command]
     _exit_requested: bool
     _interaction: Interaction | None
+    _capability_provider: CommandCapabilityProvider | None
+    _completion_adapter: CommandCompletionAdapter
 
     def __init__(
         self,
@@ -58,12 +62,17 @@ class CommandManager:
         self._commands = {}
         self._exit_requested = False
         self._interaction = interaction
+        self._capability_provider = None
+        self._completion_adapter = CommandCompletionAdapter(
+            lambda: self.active_commands,
+            capabilities=lambda: self.capabilities,
+        )
         self.register(
             CommandRegistration(
                 self.help,
                 name="help",
                 description="Show the available commands.",
-                responsive=True,
+                capabilities=frozenset({CommandCapability.CONTEXT_READ}),
             )
         )
         for name in exit_command_names or ():
@@ -72,7 +81,7 @@ class CommandManager:
                     self.request_exit,
                     name=name,
                     description="End the conversation.",
-                    responsive=True,
+                    capabilities=frozenset({CommandCapability.CONVERSATION_CONTROL}),
                 )
             )
         self.register_providers(providers or ())
@@ -106,13 +115,56 @@ class CommandManager:
         return tuple(self._commands.values())
 
     @property
-    def responsive_commands(self) -> tuple[Command, ...]:
-        """Return registered commands permitted during active conversation execution.
+    def capabilities(self) -> frozenset[CommandCapability] | None:
+        """Return capabilities provided by the current runtime context.
 
         Returns:
-            tuple[Command, ...]: Commands marked responsive in registration order.
+            frozenset[CommandCapability] | None: Active capabilities, or ``None`` when no runtime
+                context restricts command availability.
         """
-        return tuple(command for command in self._commands.values() if command.responsive)
+        return self._capability_provider() if self._capability_provider is not None else None
+
+    @property
+    def active_commands(self) -> tuple[Command, ...]:
+        """Return commands whose required capabilities are present in the current context.
+
+        Returns:
+            tuple[Command, ...]: Available commands in registration order. Without a capability
+                provider, the complete registry is available.
+        """
+        return self._commands_for(self.capabilities)
+
+    @property
+    def completion_adapter(self) -> CommandCompletionAdapter:
+        """Return the completion source for registered commands and their providers.
+
+        Returns:
+            CommandCompletionAdapter: Adapter backed by this manager's active command catalog.
+        """
+        return self._completion_adapter
+
+    def _commands_for(
+        self,
+        capabilities: frozenset[CommandCapability] | None,
+    ) -> tuple[Command, ...]:
+        """Select commands from one capability snapshot."""
+        if capabilities is None:
+            return self.commands
+        return tuple(
+            command for command in self._commands.values() if command.capabilities <= capabilities
+        )
+
+    def set_capability_provider(
+        self,
+        provider: CommandCapabilityProvider | None,
+    ) -> None:
+        """Set the live context source used to select available commands.
+
+        Args:
+            provider (CommandCapabilityProvider | None): Source of current capabilities, or
+                ``None`` to expose every registered command.
+        """
+        self._capability_provider = provider
 
     @property
     def exit_requested(self) -> bool:
@@ -130,7 +182,7 @@ class CommandManager:
         name: str | None = None,
         description: str | None = None,
         completion: CommandCompletion | None = None,
-        responsive: bool | None = None,
+        capabilities: frozenset[CommandCapability] | None = None,
     ) -> Callable[..., None]:
         """Register a command declaration or function, directly or as a decorator.
 
@@ -140,8 +192,8 @@ class CommandManager:
             name (str | None): Slash-free command name. Defaults to the function name.
             description (str | None): Display description. Defaults to the docstring summary.
             completion (CommandCompletion | None): Optional shell-like argument completion grammar.
-            responsive (bool | None): Whether the command may run during conversation execution,
-                or ``None`` to inherit its declaration. Defaults to ``None``.
+            capabilities (frozenset[CommandCapability] | None): Required runtime capabilities, or
+                ``None`` to inherit the declaration. Defaults to ``None``.
 
         Raises:
             ValueError: If the command name is invalid or duplicated.
@@ -153,13 +205,13 @@ class CommandManager:
             name = name if name is not None else registration.name
             description = description if description is not None else registration.description
             completion = completion if completion is not None else registration.completion
-            responsive = responsive if responsive is not None else registration.responsive
+            capabilities = capabilities if capabilities is not None else registration.capabilities
         declaration = Command.get_declaration(function) or Command(function)
         command = declaration.registered(
             name=name,
             description=description,
             completion=completion,
-            responsive=responsive,
+            capabilities=capabilities,
         )
         if (
             not command.name
@@ -185,12 +237,14 @@ class CommandManager:
             self.register(command)
 
     def register_provider(self, provider: CommandsProvider) -> None:
-        """Register all commands exposed by one provider.
+        """Register commands and completion sources exposed by one provider.
 
         Args:
-            provider (CommandsProvider): Provider whose registrations should be added.
+            provider (CommandsProvider): Provider whose command and completion declarations are
+                added.
         """
         self.register_all(provider.get_commands())
+        self._completion_adapter.register_provider(provider)
 
     def register_providers(self, providers: Iterable[CommandsProvider]) -> None:
         """Register commands exposed by multiple providers in order.
@@ -205,16 +259,12 @@ class CommandManager:
         self,
         user_input: str,
         interaction: Interaction | None = None,
-        *,
-        responsive_only: bool = False,
     ) -> bool:
         """Classify and dispatch slash-prefixed user input.
 
         Args:
             user_input (str): Stripped user input to classify and dispatch.
             interaction (Interaction | None): Invocation interaction overriding the default.
-            responsive_only (bool): Dispatch only commands marked responsive and leave unknown or
-                serialized commands unconsumed. Defaults to ``False``.
 
         Returns:
             bool: ``True`` when the input was consumed as a command; otherwise ``False``.
@@ -234,9 +284,6 @@ class CommandManager:
         parts = user_input[1:].split(maxsplit=1)
         name = parts[0] if parts else ""
         arguments = parts[1] if len(parts) == 2 else ""
-        command = self._commands.get(name)
-        if responsive_only and (command is None or not command.responsive):
-            return False
         self.call(name, arguments.strip(), interaction=interaction)
         return True
 
@@ -246,6 +293,7 @@ class CommandManager:
         arguments: str = "",
         *,
         interaction: Interaction | None = None,
+        available_commands: Iterable[Command] | None = None,
     ) -> None:
         """Dispatch a command call by its slash-free registered name.
 
@@ -253,6 +301,8 @@ class CommandManager:
             name (str): Slash-free registered command name.
             arguments (str): Shell-like positional and ``name=value`` argument text.
             interaction (Interaction | None): Invocation interaction overriding the default.
+            available_commands (Iterable[Command] | None): Context-filtered catalog shown by a help
+                command invocation, or ``None`` to show the full registry.
 
         Raises:
             CommandArgumentError: If argument syntax or binding is invalid and no
@@ -267,6 +317,8 @@ class CommandManager:
         if name.startswith("/"):
             raise ValueError("Command names passed to call() must not start with '/'.")
         active_interaction = interaction if interaction is not None else self._interaction
+        capabilities = self.capabilities
+        available = self._commands_for(capabilities)
         command = self._commands.get(name)
         if command is None:
             if active_interaction is None:
@@ -282,6 +334,10 @@ class CommandManager:
             )
             return
 
+        if command not in available:
+            self._report_unavailable(name, active_interaction)
+            return
+
         context = None
         if takes_command_context(command.function):
             if active_interaction is None:
@@ -289,6 +345,10 @@ class CommandManager:
             context = CommandContext(
                 name=name,
                 interaction=active_interaction,
+                available_commands=(
+                    tuple(available_commands) if available_commands is not None else available
+                ),
+                capabilities=capabilities,
             )
         try:
             telemetry_activity("command.started", command=name)
@@ -323,7 +383,26 @@ class CommandManager:
         """Request termination of the active conversation loop."""
         self._exit_requested = True
 
+    def _report_unavailable(
+        self,
+        name: str,
+        interaction: Interaction | None,
+    ) -> None:
+        """Explain that a registered command is inactive in the current context."""
+        if interaction is None:
+            raise ValueError("Command dispatch requires an Interaction.")
+        interaction.warning(
+            f"Command '/{name}' is unavailable in the current conversation state. "
+            "Type /help to see commands that can run now."
+        )
+
     def help(self, context: CommandContext) -> None:
-        """Display the complete command catalog in alphabetical order."""
-        commands = sorted(self.commands, key=lambda command: command.name.casefold())
+        """Display the command catalog available in the current dispatch context."""
+        available_commands = (
+            context.available_commands if context.available_commands is not None else self.commands
+        )
+        commands = sorted(
+            available_commands,
+            key=lambda command: command.name.casefold(),
+        )
         context.interaction.table(commands, title="Available commands:", prefix="  /")

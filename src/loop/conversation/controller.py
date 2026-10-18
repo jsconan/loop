@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from itertools import count
@@ -16,21 +16,24 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from ..commands import CommandManager
-from ..completion import CommandCompletionAdapter, CompletionManager
+from ..completion import CompletionManager, CompletionValue
 from ..control import RunControl, RunInterrupted
 from ..interaction import AsyncInteractionInput, Interaction
-from ..models import SteeringMessage
+from ..models import CommandCapability, SteeringMessage
 from ..telemetry import telemetry_activity
+from ..utils import ChoiceItem, choice_items
 from .commands import ConversationCommands
 from .interaction import MailboxInteraction
 from .models import (
     EVENT_CONFIRM,
     EVENT_OUTPUT,
+    EVENT_PROMPT,
     EVENT_TERMINAL,
     EVENT_TERMINAL_EXIT,
     ConversationStatus,
     InputReady,
     InteractionCall,
+    ResponseOutcome,
     SteeringOutcome,
 )
 
@@ -155,7 +158,7 @@ class SessionController:
         self._respond_requested = False
 
     def bind_command_manager(self, command_manager: CommandManager) -> None:
-        """Bind the loop-owned command registry for responsive dispatch and completion.
+        """Bind the loop-owned command registry for contextual dispatch and completion.
 
         Args:
             command_manager (CommandManager): Manager containing this controller's registrations.
@@ -166,9 +169,41 @@ class SessionController:
         if self._used:
             raise RuntimeError("Bind the command manager before running the session controller.")
         self._command_manager = command_manager
-        self._command_completer = CompletionManager(
-            (CommandCompletionAdapter(lambda: command_manager.responsive_commands),)
-        )
+        command_manager.set_capability_provider(self.command_capabilities)
+        self._command_completer = CompletionManager((command_manager.completion_adapter,))
+
+    def command_capabilities(self) -> frozenset[CommandCapability]:
+        """Return commands supported by the current controller lifecycle state.
+
+        Returns:
+            frozenset[CommandCapability]: Active controller capabilities. Before startup
+                and after settlement, only session-idle and context inspection/update
+                capabilities are returned, so conversation-only controls stay hidden.
+        """
+        if not self.running:
+            return frozenset(
+                {
+                    CommandCapability.SESSION_IDLE,
+                    CommandCapability.CONTEXT_READ,
+                    CommandCapability.CONTEXT_UPDATE,
+                }
+            )
+        if self._ended or self._stopping or self._control.stopped:
+            return frozenset({CommandCapability.CONTEXT_READ})
+
+        capabilities = {
+            CommandCapability.CONVERSATION_ACTIVE,
+            CommandCapability.CONVERSATION_CONTROL,
+            CommandCapability.CONTEXT_READ,
+            CommandCapability.CONTEXT_UPDATE,
+        }
+        if self._control.active:
+            capabilities.add(CommandCapability.RUN_ACTIVE)
+        if self._pending is not None:
+            capabilities.add(CommandCapability.PENDING_RESPONSE)
+        if not self._control.active and self._pending is None:
+            capabilities.add(CommandCapability.SESSION_IDLE)
+        return frozenset(capabilities)
 
     def request_interrupt(self) -> bool:
         """Interrupt the active run and revoke its separate pending question.
@@ -184,16 +219,91 @@ class SessionController:
             self._pending = None
         return True
 
-    def request_response(self) -> bool:
-        """Request a response to the controller's pending interaction.
+    def request_response(self, answer: str | None = None) -> ResponseOutcome:
+        """Open the pending input prompt or submit an answer directly.
+
+        Args:
+            answer (str | None): Text to submit, or ``None`` to open the dedicated input prompt.
 
         Returns:
-            bool: Whether an interaction is waiting for a response.
+            ResponseOutcome: Whether an input was prompted, answered, or rejected.
         """
-        if self._pending is None:
-            return False
-        self._respond_requested = True
-        return True
+        request = self._pending
+        if request is None:
+            return ResponseOutcome.NO_REQUEST
+        if answer is None:
+            self._respond_requested = True
+            return ResponseOutcome.PROMPTED
+        if request.kind == EVENT_TERMINAL:
+            return ResponseOutcome.PROMPT_REQUIRED
+        if request.kind == EVENT_PROMPT and request.kwargs.get("secret", False):
+            return ResponseOutcome.MASKED_INPUT_REQUIRED
+
+        if request.kind == EVENT_CONFIRM:
+            choices = choice_items({True: "Yes", False: "No"}, index=("y", "n"))
+        elif request.kind == EVENT_PROMPT:
+            if request.kwargs.get("choices") is None:
+                request.result.set_result(answer)
+                self._pending = None
+                return ResponseOutcome.ANSWERED
+            try:
+                choices = self._pending_response_choices(request)
+            except ValueError:
+                return ResponseOutcome.INVALID
+        else:
+            return ResponseOutcome.PROMPT_REQUIRED
+
+        selected = answer.strip().casefold()
+        choice = next(
+            (item for item in choices if selected in {item.index.casefold(), item.name.casefold()}),
+            None,
+        )
+        if choice is None:
+            return ResponseOutcome.INVALID
+        request.result.set_result(choice.value)
+        self._pending = None
+        return ResponseOutcome.ANSWERED
+
+    def response_completions(self) -> tuple[CompletionValue, ...]:
+        """Return accepted choices for the current response request.
+
+        Returns:
+            tuple[CompletionValue, ...]: Choices accepted by the pending prompt. Empty when the
+                prompt is absent, unrestricted, secret, or requires an exclusive terminal handoff.
+        """
+        request = self._pending
+        if request is None or request.kind == EVENT_TERMINAL:
+            return ()
+        if request.kind == EVENT_CONFIRM:
+            choices = choice_items({True: "Yes", False: "No"}, index=("y", "n"))
+        elif request.kind == EVENT_PROMPT:
+            if request.kwargs.get("secret", False):
+                return ()
+            if request.kwargs.get("choices") is None:
+                return ()
+            try:
+                choices = self._pending_response_choices(request)
+            except ValueError:
+                return ()
+        else:
+            return ()
+        return tuple(
+            CompletionValue(item.name, item.description or f"Select {item.index}.")
+            for item in choices
+        )
+
+    @staticmethod
+    def _pending_response_choices(request: InteractionCall) -> tuple[ChoiceItem, ...]:
+        """Normalize pending prompt choices once for completion and direct answer handling."""
+        choices = request.kwargs["choices"]
+        if not isinstance(choices, Mapping):
+            choices = tuple(choices)
+            request.kwargs["choices"] = choices
+        index = request.kwargs.get("index")
+        if index is not None and not isinstance(index, Mapping):
+            index = tuple(index)
+            request.kwargs["index"] = index
+        return choice_items(choices, index=index)
 
     def status_snapshot(self) -> ConversationStatus:
         """Return a stable view of conversation activity and queued inputs.
@@ -479,7 +589,7 @@ class SessionController:
                 )
                 self._source.info(
                     detail
-                    + "\nPress Enter or use /respond to answer; other messages remain queued."
+                    + "\nPress Enter or use /respond [answer] to answer; other messages and commands remain queued."
                 )
             return
         try:
@@ -509,7 +619,6 @@ class SessionController:
         if command_manager.handle_user_command(
             value,
             interaction=self._source,
-            responsive_only=True,
         ):
             if command_manager.exit_requested:
                 self._stop()

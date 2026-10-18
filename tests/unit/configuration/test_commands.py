@@ -7,6 +7,116 @@ from prompt_toolkit.document import Document
 from loop.commands import CommandManager
 from loop.completion import CommandCompletionAdapter, CompletionManager
 from loop.configuration import ConfigurationCommands, ConfigurationManager
+from loop.models import CommandCapability
+
+
+def test_safe_config_changes_apply_during_runs_and_hide_unsafe_values(tmp_path):
+    """Run-safe settings apply immediately while backend changes vanish from completion."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    provider = ConfigurationCommands(configuration, Mock(return_value="applied now"))
+    interaction = Mock()
+    manager = CommandManager(providers=(provider,), interaction=interaction)
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.CONVERSATION_ACTIVE,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
+
+    config_command = next(item for item in manager.active_commands if item.name == "config")
+
+    assert config_command.name == "config"
+    assert manager.handle_user_command("/config set loop.max_agent_turns 50 scope=session")
+    assert configuration.effective.loop.max_agent_turns == 50
+    provider._apply.assert_called_once_with("loop.max_agent_turns", configuration.effective)
+
+    completion = CompletionManager(
+        (
+            CommandCompletionAdapter(
+                lambda: manager.active_commands,
+                providers=(provider,),
+                capabilities=lambda: manager.capabilities,
+            ),
+        )
+    )
+    action_values = list(completion.get_completions(Document("/config "), None))
+    setting_values = list(completion.get_completions(Document("/config set loop."), None))
+    assert {item.text for item in action_values} == {"get", "set"}
+    assert "loop.max_agent_turns" in {item.text for item in setting_values}
+    assert not any(item.text.startswith("backend.") for item in setting_values)
+    assert "tools.command_timeout" in {
+        item.text for item in completion.get_completions(Document("/config set tools."), Mock())
+    }
+
+    manager.handle_user_command("/config set backend.base_url https://new.example scope=session")
+    assert "cannot be changed while the agent is working" in (
+        interaction.report.call_args.args[0].detail
+    )
+
+
+def test_config_run_restrictions_reject_prompting_and_runtime_replacement_operations(tmp_path):
+    """Interactive config actions need a paused run and unsafe live paths are rejected."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock()
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),),
+        interaction=interaction,
+    )
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
+
+    assert manager.handle_user_command("/config set loop.debug true")
+    assert "explicit scope" in interaction.report.call_args.args[0].detail
+    assert manager.handle_user_command("/config set loop.model test scope=session")
+    assert "cannot be changed while the agent is working" in (
+        interaction.report.call_args.args[0].detail
+    )
+    assert manager.handle_user_command("/config set loop.unknown value scope=session")
+    assert "Unknown configuration field" in interaction.report.call_args.args[0].detail
+    assert manager.handle_user_command("/config reset loop.debug scope=session")
+    assert "cannot run while the agent is working" in (interaction.report.call_args.args[0].detail)
+    assert manager.handle_user_command("/config reload")
+    assert "cannot run while the agent is working" in (interaction.report.call_args.args[0].detail)
+    assert manager.handle_user_command("/config secret backend.api_key")
+    assert "cannot run while the agent is working" in (interaction.report.call_args.args[0].detail)
+    assert manager.handle_user_command("/config set scope=session")
+    assert "requires a setting path" in interaction.report.call_args.args[0].detail
+
+
+def test_config_reads_remain_available_during_agent_runs(tmp_path):
+    """Read-only configuration inspection is still dispatched during an active run."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock()
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),),
+        interaction=interaction,
+    )
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
+
+    assert manager.handle_user_command("/config get loop.debug")
+    assert [item.path for item in interaction.table.call_args.args[0]] == ["loop.debug"]
 
 
 def test_config_set_applies_a_session_override(tmp_path):

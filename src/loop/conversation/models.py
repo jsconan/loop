@@ -37,6 +37,17 @@ class SteeringOutcome(Enum):
     QUEUE_FULL = "queue_full"
 
 
+class ResponseOutcome(Enum):
+    """Describe how a pending interaction response was handled."""
+
+    NO_REQUEST = "no_request"
+    PROMPTED = "prompted"
+    ANSWERED = "answered"
+    INVALID = "invalid"
+    PROMPT_REQUIRED = "prompt_required"
+    MASKED_INPUT_REQUIRED = "masked_input_required"
+
+
 @dataclass
 class InteractionCall:
     """Carry one UI call whose execution and result belong to the UI thread.

@@ -11,7 +11,6 @@ from .backend import Backend, GenerationHyperparameters
 from .commands import CommandManager, CommandsProvider
 from .compaction import CompactionCommands, ContextCompaction
 from .completion import (
-    CommandCompletionAdapter,
     CompletionManager,
     CompletionValue,
     MarkerCompletionAdapter,
@@ -291,10 +290,7 @@ class Loop:
             )
         configured_completion = CompletionManager(
             (
-                CommandCompletionAdapter(
-                    lambda: configured_commands.commands,
-                    providers=providers,
-                ),
+                configured_commands.completion_adapter,
                 *completion_adapters,
             )
         )
@@ -327,7 +323,6 @@ class Loop:
                 added to this loop.
         """
         self._command_manager.register_provider(provider)
-        self._completion_manager.register_command_provider(provider)
 
     @property
     def permission_manager(self) -> PermissionManager:
