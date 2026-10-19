@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from .. import constants
 from ..backend import BackendError
 from ..errors import Problem, log_problem
-from ..interaction import Interaction
+from ..interaction import AsyncInteractionInput, Interaction
 from ..models import ModelAssignment, ModelInfo
 
 if TYPE_CHECKING:
@@ -140,10 +140,28 @@ class ModelSelection:
 
         Raises:
             BackendError: If the backend cannot list its models.
+            asyncio.CancelledError: If the asynchronous catalog request is cancelled.
         """
         if self._available_models is not None and monotonic() < self._available_models_expires_at:
             return self._available_models
         models = self._backend.get_models()
+        if models:
+            self._available_models = models
+            self._available_models_expires_at = monotonic() + constants.MODEL_CATALOG_CACHE_SECONDS
+        return models
+
+    async def available_async(self) -> list[ModelInfo]:
+        """Return models using the backend's asynchronous catalog operation.
+
+        Returns:
+            list[ModelInfo]: Available models, reusing a recent non-empty catalog.
+
+        Raises:
+            BackendError: If the backend cannot list its models.
+        """
+        if self._available_models is not None and monotonic() < self._available_models_expires_at:
+            return self._available_models
+        models = await self._backend.get_models_async()
         if models:
             self._available_models = models
             self._available_models_expires_at = monotonic() + constants.MODEL_CATALOG_CACHE_SECONDS
@@ -159,6 +177,32 @@ class ModelSelection:
             self._on_select(model)
         self._selected = model
         self.synchronize_session()
+
+    async def select_async(self, model: str) -> None:
+        """Select a model and asynchronously refresh its active-session context metadata.
+
+        Args:
+            model (str): Exact backend model identifier to select.
+
+        Raises:
+            BackendError: If context metadata cannot be retrieved from the backend.
+            OSError: If the configured durable preference writer fails.
+            asyncio.CancelledError: If the asynchronous context lookup is cancelled.
+        """
+        if self._on_select is not None:
+            self._on_select(model)
+        self._selected = model
+        context_window = await self._backend.get_context_window_async(model)
+        self._session_manager.assignment = ModelAssignment(
+            model=model,
+            context_window=(
+                context_window
+                if isinstance(context_window, int)
+                and not isinstance(context_window, bool)
+                and context_window > 0
+                else None
+            ),
+        )
 
     def restore(self, model: str | None) -> None:
         """Restore a session model and synchronize its available metadata.
@@ -221,6 +265,11 @@ class ModelSelection:
 
         Returns:
             bool: ``True`` when a replacement model was selected, otherwise ``False``.
+
+        Raises:
+            BackendError: If selecting the replacement cannot retrieve its context metadata.
+            OSError: If the configured durable preference writer fails.
+            asyncio.CancelledError: If model lookup or user input is cancelled.
         """
         try:
             models = self.available()
@@ -258,5 +307,62 @@ class ModelSelection:
             ):
                 break
         self.select(selection)
+        interaction.info(f"Using model: {selection}")
+        return True
+
+    async def select_fallback_async(self, interaction: Interaction) -> bool:
+        """Asynchronously replace a model rejected by the backend.
+
+        Args:
+            interaction (Interaction): Service used to show recovery choices and receive input.
+
+        Returns:
+            bool: ``True`` when a replacement model was selected, otherwise ``False``.
+        """
+        try:
+            models = await self.available_async()
+        except BackendError as error:
+            problem = Problem.from_exception(
+                error,
+                code="backend.model_listing_failed",
+                title="Could not list available models",
+                detail="The backend is not reachable.",
+                retryable=error.recoverable,
+                operation="list_models",
+            )
+            log_problem(_LOGGER, problem, error)
+            interaction.report(problem)
+            return False
+        if not models:
+            interaction.warning("The backend reported no available models.")
+            return False
+        failing_model = self.selected
+        while True:
+            prompt_kwargs = {"choices": {model.id: model.id for model in models}}
+            selection = (
+                await interaction.prompt_async(
+                    "Select a replacement model:",
+                    **prompt_kwargs,
+                )
+                if isinstance(interaction, AsyncInteractionInput)
+                else interaction.prompt("Select a replacement model:", **prompt_kwargs)
+            )
+            if selection is False:
+                return False
+            if selection != failing_model:
+                break
+            interaction.warning(
+                f"Model '{selection}' was already unavailable; the same "
+                "failure is likely to re-occur unless the backend is updated."
+            )
+            prompt = "Continue with this model, or select a different one?"
+            confirmed = (
+                await interaction.confirm_async(prompt, default=True)
+                if isinstance(interaction, AsyncInteractionInput)
+                else interaction.confirm(prompt, default=True)
+            )
+            if confirmed:
+                break
+        await self.select_async(selection)
         interaction.info(f"Using model: {selection}")
         return True

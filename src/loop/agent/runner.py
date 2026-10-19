@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -10,12 +11,17 @@ from datetime import datetime
 from time import perf_counter, sleep
 
 from .. import constants
-from ..backend import Backend, BackendError, BackendNotFoundError, BackendRepetitionError
+from ..backend import (
+    Backend,
+    BackendError,
+    BackendNotFoundError,
+    BackendRepetitionError,
+)
 from ..compaction import ContextCompaction
 from ..control import RunControl, RunInterrupted
 from ..errors import Problem, log_problem
 from ..instructions import InstructionBudgetExceededError, InstructionsManager
-from ..interaction import Interaction
+from ..interaction import AsyncInteractionInput, Interaction
 from ..model_selection import ModelSelection, ModelSelectionError
 from ..models import (
     AgentRunStopReason,
@@ -864,6 +870,79 @@ class AgentRunner:
                         sleep(delay)
                     else:
                         self._run_control.wait(delay)
+
+    async def _query_with_recovery_async(self) -> Response | None:
+        """Request an asynchronous response while preserving existing recovery decisions.
+
+        Returns:
+            Response | None: Completed response, or ``None`` when recovery is declined or
+                request preparation cannot continue.
+
+        Raises:
+            KeyboardInterrupt: If the configured control requests shutdown.
+            RunInterrupted: If the configured control interrupts the active run.
+            BackendError: If model fallback cannot retrieve updated model metadata.
+            OSError: If persisting a fallback model preference fails.
+            asyncio.CancelledError: If an async query or user interaction is cancelled.
+        """
+        recovery = None
+        while True:
+            self._checkpoint()
+            try:
+                if recovery is None:
+                    return await self.query_async()
+                with telemetry_span():
+                    return await self._query_async(recovery)
+            except BackendNotFoundError:
+                self._interaction.warning("The selected model is not available.")
+                if not await self._model_selection.select_fallback_async(self._interaction):
+                    return None
+            except (InstructionBudgetExceededError, ModelSelectionError) as error:
+                problem = Problem.from_exception(
+                    error,
+                    code="agent.query_failed",
+                    title="Could not prepare the request",
+                    detail=(
+                        "The request could not be prepared, for example because no model is "
+                        "selected or applicable instructions exceed the configured budget. "
+                        "Fix the underlying condition before sending another message."
+                    ),
+                    operation="query",
+                )
+                log_problem(_LOGGER, problem, error)
+                self._interaction.report(problem)
+                return None
+            except BackendError as error:
+                if isinstance(error, BackendRepetitionError) and recovery is None:
+                    telemetry_activity("agent.repetition_recovery", component="agent_runner")
+                    self._interaction.warning(
+                        "The model response was stopped after repetitive output. Retrying once..."
+                    )
+                    recovery = "repetition"
+                    continue
+                self._report_backend_error(error)
+                if not error.recoverable or not self._prompt_on_recoverable_error:
+                    return None
+                prompt = "Retry the complete response?"
+                if error.response_started:
+                    prompt = "Partial output was discarded. Retry the complete response?"
+                if error.retry_after is not None and error.retry_after > 0:
+                    prompt = f"{prompt[:-1]} after at least {error.retry_after:g} seconds?"
+                if not await self._confirm_async(prompt, default=False):
+                    return None
+                if error.retry_after is not None and error.retry_after > 0:
+                    delay = min(error.retry_after, 60.0)
+                    self._interaction.info(f"Retrying in {delay:g} seconds...")
+                    if self._run_control is None:
+                        await asyncio.sleep(delay)
+                    else:
+                        await self._run_control.wait_async(delay)
+
+    async def _confirm_async(self, prompt: str, *, default: bool) -> bool:
+        """Use native async confirmation when available, retaining sync adapter support."""
+        if isinstance(self._interaction, AsyncInteractionInput):
+            return await self._interaction.confirm_async(prompt, default=default)
+        return self._interaction.confirm(prompt, default=default)
 
     def _checkpoint(self) -> None:
         """Honor optional cooperative stop requests before a new execution boundary."""

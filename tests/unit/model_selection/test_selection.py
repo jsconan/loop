@@ -1,12 +1,15 @@
 """Tests for active conversation model selection."""
 
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
 from loop import (
     BackendConnectionError,
+    ConsoleInteraction,
+    Interaction,
     ModelInfo,
     ModelSelection,
     ModelSelectionError,
@@ -173,3 +176,170 @@ def test_selection_does_not_cache_empty_or_failed_model_catalogs():
         selection.available()
     assert selection.available() == []
     assert active_backend.get_models.call_count == 3
+
+
+def test_async_selection_reuses_a_recent_catalog_and_updates_context_metadata(monkeypatch):
+    """Async catalog and context requests preserve cache and assignment behavior."""
+    models = [ModelInfo(id="first"), ModelInfo(id="second")]
+    active_backend = backend(
+        get_models_async=AsyncMock(return_value=models),
+        get_context_window_async=AsyncMock(return_value=4096),
+    )
+    now = [10.0]
+    monkeypatch.setattr("loop.model_selection.selection.monotonic", lambda: now[0])
+    session_manager = SessionManager()
+    persist = Mock()
+    selection = ModelSelection(active_backend, session_manager, on_select=persist)
+
+    async def scenario():
+        """Discover a catalog twice and select a model without sync backend calls."""
+        assert await selection.available_async() == models
+        assert await selection.available_async() == models
+        await selection.select_async("second")
+
+    asyncio.run(scenario())
+
+    active_backend.get_models_async.assert_awaited_once_with()
+    active_backend.get_context_window_async.assert_awaited_once_with("second")
+    active_backend.get_models.assert_not_called()
+    active_backend.get_context_window.assert_called_once_with("default")
+    assert selection.selected == "second"
+    assert session_manager.model == "second"
+    assert session_manager.context_window == 4096
+    persist.assert_called_once_with("second")
+
+
+@pytest.mark.parametrize("context_window", [None, True, 0, -1, "4096", 4096])
+def test_async_selection_normalizes_context_window_metadata(context_window):
+    """Async selection persists only positive integer context capacities."""
+    active_backend = backend(get_context_window_async=AsyncMock(return_value=context_window))
+    session_manager = SessionManager()
+    selection = ModelSelection(active_backend, session_manager)
+
+    asyncio.run(selection.select_async("selected"))
+
+    expected = (
+        context_window
+        if isinstance(context_window, int)
+        and not isinstance(context_window, bool)
+        and context_window > 0
+        else None
+    )
+    assert session_manager.model == "selected"
+    assert session_manager.context_window == expected
+
+
+def test_async_selection_does_not_cache_empty_catalogs():
+    """An empty asynchronous catalog is queried again on the next request."""
+    active_backend = backend(get_models_async=AsyncMock(return_value=[]))
+    selection = ModelSelection(active_backend, SessionManager())
+
+    async def scenario():
+        """Request an empty catalog twice."""
+        assert await selection.available_async() == []
+        assert await selection.available_async() == []
+
+    asyncio.run(scenario())
+
+    assert active_backend.get_models_async.await_count == 2
+
+
+def test_async_fallback_prompts_and_selects_a_replacement_model():
+    """Fallback selection uses native async input and records the selected assignment."""
+    active_backend = backend(
+        get_models_async=AsyncMock(return_value=[ModelInfo(id="first"), ModelInfo(id="second")]),
+        get_context_window_async=AsyncMock(return_value=2048),
+    )
+    selection = ModelSelection(active_backend, SessionManager(), selected="unavailable")
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.prompt_async = AsyncMock(return_value="second")
+
+    result = asyncio.run(selection.select_fallback_async(interaction))
+
+    assert result is True
+    interaction.prompt_async.assert_awaited_once_with(
+        "Select a replacement model:",
+        choices={"first": "first", "second": "second"},
+    )
+    interaction.prompt.assert_not_called()
+    interaction.info.assert_called_once_with("Using model: second")
+    assert selection.selected == "second"
+
+
+def test_async_fallback_retries_the_unavailable_choice_after_confirmation():
+    """The unavailable-model warning and explicit confirmation match sync fallback behavior."""
+    active_backend = backend(
+        get_models_async=AsyncMock(return_value=[ModelInfo(id="unavailable")]),
+        get_context_window_async=AsyncMock(return_value=2048),
+    )
+    selection = ModelSelection(active_backend, SessionManager(), selected="unavailable")
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.prompt_async = AsyncMock(side_effect=["unavailable"])
+    interaction.confirm_async = AsyncMock(return_value=True)
+
+    result = asyncio.run(selection.select_fallback_async(interaction))
+
+    assert result is True
+    interaction.warning.assert_called_once_with(
+        "Model 'unavailable' was already unavailable; the same failure is likely to re-occur "
+        "unless the backend is updated."
+    )
+    interaction.confirm_async.assert_awaited_once_with(
+        "Continue with this model, or select a different one?", default=True
+    )
+    assert selection.selected == "unavailable"
+
+
+def test_async_fallback_supports_legacy_sync_interactions():
+    """Synchronous library interactions retain their prompt and confirmation contract."""
+    active_backend = backend(
+        get_models_async=AsyncMock(return_value=[ModelInfo(id="unavailable"), ModelInfo(id="new")]),
+        get_context_window_async=AsyncMock(return_value=2048),
+    )
+    selection = ModelSelection(active_backend, SessionManager(), selected="unavailable")
+    interaction = MagicMock(spec=Interaction)
+    interaction.prompt.side_effect = ["unavailable", "new"]
+    interaction.confirm.return_value = False
+
+    result = asyncio.run(selection.select_fallback_async(interaction))
+
+    assert result is True
+    assert interaction.prompt.call_count == 2
+    interaction.confirm.assert_called_once_with(
+        "Continue with this model, or select a different one?", default=True
+    )
+    assert selection.selected == "new"
+
+
+def test_async_fallback_handles_cancel_empty_and_listing_failure():
+    """Fallback declines cancelled selection, empty catalogs, and failed discovery safely."""
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.prompt_async = AsyncMock(return_value=False)
+    empty_selection = ModelSelection(
+        backend(get_models_async=AsyncMock(return_value=[])), SessionManager()
+    )
+    failed_selection = ModelSelection(
+        backend(
+            get_models_async=AsyncMock(
+                side_effect=BackendConnectionError("offline", provider="test", operation="list")
+            )
+        ),
+        SessionManager(),
+    )
+    cancelled_selection = ModelSelection(
+        backend(get_models_async=AsyncMock(return_value=[ModelInfo(id="model")])),
+        SessionManager(),
+    )
+
+    async def scenario():
+        """Exercise each non-selection exit from async fallback."""
+        return (
+            await empty_selection.select_fallback_async(interaction),
+            await failed_selection.select_fallback_async(interaction),
+            await cancelled_selection.select_fallback_async(interaction),
+        )
+
+    assert asyncio.run(scenario()) == (False, False, False)
+    interaction.warning.assert_called_once_with("The backend reported no available models.")
+    interaction.report.assert_called_once()
+    interaction.prompt_async.assert_awaited_once()

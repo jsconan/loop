@@ -1,5 +1,6 @@
 """Provide cooperative session shutdown and run interruption."""
 
+import asyncio
 from collections.abc import Generator
 from contextlib import contextmanager
 from threading import Event, Lock
@@ -22,6 +23,7 @@ class RunControl:
     _stopped: bool
     _active: bool
     _interrupted: bool
+    _async_waiters: dict[asyncio.Event, asyncio.AbstractEventLoop]
 
     def __init__(self) -> None:
         self._wake = Event()
@@ -29,6 +31,7 @@ class RunControl:
         self._stopped = False
         self._active = False
         self._interrupted = False
+        self._async_waiters = {}
 
     @property
     def stopped(self) -> bool:
@@ -65,6 +68,7 @@ class RunControl:
         with self._lock:
             self._stopped = True
             self._wake.set()
+            self._wake_async_waiters()
 
     def interrupt(self) -> bool:
         """Request interruption of the current run while keeping the conversation open.
@@ -77,6 +81,7 @@ class RunControl:
                 return False
             self._interrupted = True
             self._wake.set()
+            self._wake_async_waiters()
             return True
 
     @contextmanager
@@ -127,3 +132,38 @@ class RunControl:
         """
         self._wake.wait(seconds)
         self.checkpoint()
+
+    async def wait_async(self, seconds: float) -> None:
+        """Wait asynchronously for a retry delay or either cancellation signal.
+
+        Args:
+            seconds (float): Maximum delay in seconds.
+
+        Raises:
+            KeyboardInterrupt: If conversation shutdown was requested.
+            RunInterrupted: If the active run was interrupted.
+            asyncio.CancelledError: If the waiting task is cancelled.
+        """
+        loop = asyncio.get_running_loop()
+        wake = asyncio.Event()
+        with self._lock:
+            self._async_waiters[wake] = loop
+            if self._stopped or self._interrupted:
+                loop.call_soon(wake.set)
+        try:
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=seconds)
+            except TimeoutError:
+                pass
+            self.checkpoint()
+        finally:
+            with self._lock:
+                self._async_waiters.pop(wake, None)
+
+    def _wake_async_waiters(self) -> None:
+        """Schedule every registered async retry waiter on its owning event loop."""
+        for wake, loop in tuple(self._async_waiters.items()):
+            try:
+                loop.call_soon_threadsafe(wake.set)
+            except RuntimeError:
+                self._async_waiters.pop(wake, None)

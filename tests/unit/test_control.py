@@ -1,5 +1,7 @@
 """Verify cooperative cancellation without real retry delays."""
 
+import asyncio
+from threading import Thread
 from unittest.mock import Mock
 
 import pytest
@@ -94,3 +96,159 @@ def test_interruption_wakes_retry_waits_and_failure_releases_the_scope(monkeypat
     event.clear.assert_called_once_with()
     assert control.active is False
     control.checkpoint()
+
+
+def test_async_wait_keeps_the_event_loop_responsive_until_timeout():
+    """Async retry delays yield control to other tasks while the timer is pending."""
+
+    async def scenario():
+        """Let a heartbeat run while a retry timer expires."""
+        control = RunControl()
+        heartbeat = asyncio.Event()
+
+        async def signal():
+            """Mark that another task ran during the retry delay."""
+            await asyncio.sleep(0)
+            heartbeat.set()
+
+        await asyncio.gather(control.wait_async(0.01), signal())
+        return heartbeat.is_set(), control._async_waiters
+
+    heartbeat_ran, waiters = asyncio.run(scenario())
+
+    assert heartbeat_ran
+    assert waiters == {}
+
+
+def test_async_wait_is_woken_by_cross_thread_run_interruption():
+    """A UI-thread interruption wakes an async retry wait and preserves scoped semantics."""
+
+    async def scenario():
+        """Wait for a cross-thread cancellation signal and capture its exception type."""
+        control = RunControl()
+
+        async def wait_for_interruption():
+            """Convert the expected interruption into a normal task result."""
+            try:
+                await control.wait_async(5)
+            except RunInterrupted as error:
+                return type(error)
+            return None
+
+        with control.execution():
+            waiting = asyncio.create_task(wait_for_interruption())
+            await asyncio.sleep(0)
+            interrupt = Thread(target=control.interrupt)
+            interrupt.start()
+            result = await waiting
+            interrupt.join()
+        return result, control._async_waiters, control.active
+
+    result, waiters, active = asyncio.run(scenario())
+
+    assert result is RunInterrupted
+    assert waiters == {}
+    assert active is False
+
+
+def test_async_wait_is_woken_by_sticky_shutdown():
+    """Shutdown wakes an async waiter and remains a shutdown rather than an interrupt."""
+
+    async def scenario():
+        """Wait for shutdown and capture its exception type for the assertion."""
+        control = RunControl()
+
+        async def wait_for_shutdown():
+            """Convert the expected shutdown exception into a normal task result."""
+            try:
+                await control.wait_async(5)
+            except KeyboardInterrupt as error:
+                return type(error)
+            return None
+
+        waiting = asyncio.create_task(wait_for_shutdown())
+        await asyncio.sleep(0)
+        control.stop()
+        result = await waiting
+        return result, control._async_waiters, control.stopped
+
+    result, waiters, stopped = asyncio.run(scenario())
+
+    assert result is KeyboardInterrupt
+    assert waiters == {}
+    assert stopped is True
+
+
+def test_async_wait_checks_shutdown_set_before_registration():
+    """A pre-existing shutdown is observed without waiting for the supplied timeout."""
+
+    async def scenario():
+        """Register after shutdown and capture the existing cancellation signal."""
+        control = RunControl()
+        control.stop()
+
+        async def wait_for_shutdown():
+            """Convert the expected shutdown exception into a normal task result."""
+            try:
+                await control.wait_async(5)
+            except KeyboardInterrupt as error:
+                return type(error)
+            return None
+
+        result = await wait_for_shutdown()
+        return result, control._async_waiters
+
+    result, waiters = asyncio.run(scenario())
+
+    assert result is KeyboardInterrupt
+    assert waiters == {}
+
+
+def test_async_wait_checks_scoped_interrupt_set_before_registration():
+    """An already-requested run interrupt is observed before starting a delay."""
+
+    async def scenario():
+        """Enter an active run, request interruption, and register the async wait."""
+        control = RunControl()
+        with control.execution():
+            assert control.interrupt()
+            try:
+                await control.wait_async(5)
+            except RunInterrupted as error:
+                return type(error), control._async_waiters
+        return None, control._async_waiters
+
+    result, waiters = asyncio.run(scenario())
+
+    assert result is RunInterrupted
+    assert waiters == {}
+
+
+def test_async_wait_discards_waiter_for_a_closed_event_loop():
+    """A loop closing during shutdown cannot leave a stale cancellation registration."""
+    control = RunControl()
+    wake = asyncio.Event()
+    loop = Mock()
+    loop.call_soon_threadsafe.side_effect = RuntimeError("closed")
+    control._async_waiters[wake] = loop
+
+    control.stop()
+
+    loop.call_soon_threadsafe.assert_called_once_with(wake.set)
+    assert control._async_waiters == {}
+
+
+def test_async_wait_cancellation_unregisters_its_wakeup():
+    """Cancelling an async delay removes its event-loop registration promptly."""
+
+    async def scenario():
+        """Cancel one pending retry wait and return its registration state."""
+        control = RunControl()
+        waiting = asyncio.create_task(control.wait_async(5))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        return control._async_waiters
+
+    assert asyncio.run(scenario()) == {}
