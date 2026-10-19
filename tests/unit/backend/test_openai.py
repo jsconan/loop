@@ -899,6 +899,42 @@ def test_models_are_listed_asynchronously_from_the_backend():
     sdk.models.list.assert_awaited_once_with(timeout=2.0)
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_model_listing_reads_metadata_without_model_extra(asynchronous):
+    """Sync and async model listing retain metadata stored directly on SDK models."""
+    model = SimpleNamespace(
+        id="model",
+        max_model_len="65536",
+        supported_parameters=["temperature"],
+    )
+    sdk = Mock()
+    if asynchronous:
+        sdk.models.list = AsyncMock(return_value=iter([model]))
+        factory = "loop.backend.openai.AsyncOpenAI"
+    else:
+        sdk.models.list.return_value = iter([model])
+        factory = "loop.backend.openai.OpenAI"
+
+    with patch(factory, return_value=sdk):
+        backend = OpenAIBackend()
+        if asynchronous:
+            models = asyncio.run(backend.get_models_async())
+        else:
+            models = backend.get_models()
+
+    assert models == [
+        ModelInfo(
+            id="model",
+            context_window=65536,
+            supported_hyperparameters=("temperature",),
+        )
+    ]
+    if asynchronous:
+        sdk.models.list.assert_awaited_once_with(timeout=2.0)
+    else:
+        sdk.models.list.assert_called_once_with(timeout=2.0)
+
+
 @pytest.mark.parametrize(
     ("metadata", "supported_hyperparameters"),
     [

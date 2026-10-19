@@ -1343,13 +1343,15 @@ class OpenAIBackend(Backend):
 
     @staticmethod
     def _model_info(model: OpenAIModel) -> ModelInfo:
-        """Translate OpenAI model metadata into a model description."""
-        context_window = (model.model_extra or {}).get("max_model_len")
+        """Translate OpenAI model metadata into a model description across Pydantic versions."""
+        extra = getattr(model, "model_extra", None)
+        if extra is None:
+            extra = vars(model)
+        context_window = extra.get("max_model_len")
         try:
             context_window = int(context_window) if context_window is not None else None
         except (TypeError, ValueError):
             context_window = None
-        extra = model.model_extra or {}
         supported_hyperparameters = OpenAIBackend._declared_hyperparameters_from_extra(extra)
         return ModelInfo(
             id=model.id,
