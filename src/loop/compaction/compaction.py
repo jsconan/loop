@@ -10,6 +10,7 @@ from ..backend import Backend
 from ..instructions import PreparedInstructions
 from ..interaction import Interaction
 from ..model_selection import ModelSelection
+from ..models import CompactionResult
 from ..session import SessionManager
 from ..telemetry import telemetry_activity, telemetry_error
 from ..utils import PathHolder, PathReference
@@ -142,6 +143,27 @@ class ContextCompaction:
         """
         return self.compact(instructions=instructions) if self.needed() else False
 
+    async def compact_if_needed_async(
+        self,
+        instructions: PreparedInstructions | None = None,
+    ) -> bool:
+        """Compact asynchronously when the active context reaches its utilization threshold.
+
+        Args:
+            instructions (PreparedInstructions | None): Exact instructions prepared for the
+                surrounding model turn, or ``None`` to request a fresh explicit snapshot.
+
+        Returns:
+            bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
+
+        Raises:
+            BackendError: If the provider request or response fails.
+            ValueError: If compaction is required but no effective model is configured.
+        """
+        if not self.needed():
+            return False
+        return await self.compact_async(instructions=instructions)
+
     def compact(
         self,
         *,
@@ -162,15 +184,69 @@ class ContextCompaction:
         Raises:
             ValueError: If no effective model is configured.
         """
-        if not self.can_compact():
-            if force:
-                self._interaction.warning("There is no new session context to compact.")
-            return False
-        if not force and not self.needed():
+        if not self._can_start(force):
             return False
 
         snapshot = instructions or self._instructions()
         model = self._model_selection.effective
+        self._start(model)
+        try:
+            result = self._backend.compact(
+                self._session_manager.model_context,
+                instructions=snapshot.content,
+                model=model,
+            )
+        except NotImplementedError:
+            return self._unsupported()
+        return self._finish(result, snapshot, model)
+
+    async def compact_async(
+        self,
+        *,
+        force: bool = True,
+        instructions: PreparedInstructions | None = None,
+    ) -> bool:
+        """Asynchronously compact the active context and persist its replacement checkpoint.
+
+        Args:
+            force (bool): Whether to compact regardless of the utilization threshold. Defaults to
+                ``True`` for explicit calls.
+            instructions (PreparedInstructions | None): Exact prepared instructions to preserve,
+                or ``None`` to request a fresh explicit snapshot.
+
+        Returns:
+            bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
+
+        Raises:
+            BackendError: If the provider request or response fails.
+            ValueError: If no effective model is configured.
+        """
+        if not self._can_start(force):
+            return False
+
+        snapshot = instructions or self._instructions()
+        model = self._model_selection.effective
+        self._start(model)
+        try:
+            result = await self._backend.compact_async(
+                self._session_manager.model_context,
+                instructions=snapshot.content,
+                model=model,
+            )
+        except NotImplementedError:
+            return self._unsupported()
+        return self._finish(result, snapshot, model)
+
+    def _can_start(self, force: bool) -> bool:
+        """Return whether compaction should proceed, reporting an explicit empty request."""
+        if not self.can_compact():
+            if force:
+                self._interaction.warning("There is no new session context to compact.")
+            return False
+        return force or self.needed()
+
+    def _start(self, model: str) -> None:
+        """Synchronize the selected model and report the start of compaction."""
         self._model_selection.synchronize_session()
         self._interaction.info("Compacting session context...")
         telemetry_activity(
@@ -179,20 +255,24 @@ class ContextCompaction:
             component="compaction",
             model=model,
         )
-        try:
-            result = self._backend.compact(
-                self._session_manager.model_context,
-                instructions=snapshot.content,
-                model=model,
-            )
-        except NotImplementedError:
-            telemetry_activity(
-                "compaction.unsupported",
-                severity="warning",
-                component="compaction",
-            )
-            self._interaction.warning("The selected backend does not support context compaction.")
-            return False
+
+    def _unsupported(self) -> bool:
+        """Report that the backend does not implement compaction."""
+        telemetry_activity(
+            "compaction.unsupported",
+            severity="warning",
+            component="compaction",
+        )
+        self._interaction.warning("The selected backend does not support context compaction.")
+        return False
+
+    def _finish(
+        self,
+        result: CompactionResult | None,
+        snapshot: PreparedInstructions,
+        model: str,
+    ) -> bool:
+        """Persist a complete compacted context and report its observed token change."""
         if result is None or not result.items:
             telemetry_error(
                 "compaction.failed",

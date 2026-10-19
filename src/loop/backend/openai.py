@@ -1405,6 +1405,33 @@ class OpenAIBackend(Backend):
         except OpenAIError as error:
             raise self._translated_error(error, "compact") from error
 
+    async def compact_async(
+        self,
+        input: Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
+        *,
+        instructions: str | None,
+        model: str,
+    ) -> CompactionResult | None:
+        """Asynchronously compact active context through the Responses API.
+
+        Args:
+            input (Iterable[ModelContextItem]): Active context to replace.
+            instructions (str | None): Current instructions to preserve during compaction.
+            model (str): Model selected for the operation.
+
+        Returns:
+            CompactionResult | None: Exact provider replacement items and reported usage, or
+                ``None`` when portable fallback does not produce a summary.
+
+        Raises:
+            BackendError: If native and portable compaction fail operationally.
+            ValueError: If the backend rejects the selected model.
+        """
+        try:
+            return await self._compact_async(input, instructions=instructions, model=model)
+        except OpenAIError as error:
+            raise self._translated_error(error, "compact") from error
+
     def _compact(
         self,
         input: Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
@@ -1430,7 +1457,39 @@ class OpenAIBackend(Backend):
                 instructions=instructions,
                 model=model,
             )
-        usage = self._usage(response)
+        return self._native_compaction_result(response)
+
+    async def _compact_async(
+        self,
+        input: Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
+        *,
+        instructions: str | None,
+        model: str,
+    ) -> CompactionResult | None:
+        """Compact context asynchronously while preserving unsupported-endpoint fallback."""
+        active_context = list(input)
+        try:
+            request = self._prepared_request(
+                model=model,
+                input=self._serialize_input(active_context),
+                instructions=instructions,
+            )
+            response = await self._get_async_client().responses.compact(**request)
+            self._trace_provider_value("gen_ai.response", response)
+        except APIStatusError as error:
+            if error.status_code not in (404, 405, 501):
+                raise
+            return await super().compact_async(
+                active_context,
+                instructions=instructions,
+                model=model,
+            )
+        return self._native_compaction_result(response)
+
+    @classmethod
+    def _native_compaction_result(cls, response: object) -> CompactionResult:
+        """Convert a native compact response into durable opaque provider items."""
+        usage = cls._usage(response)
         return CompactionResult(
             items=tuple(
                 CompactionContextItem(

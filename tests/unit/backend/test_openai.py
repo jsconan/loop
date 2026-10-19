@@ -654,6 +654,93 @@ def test_native_compaction_round_trips_exact_provider_items():
     assert sdk.responses.create.call_args.kwargs["input"] == [result.items[0].data]
 
 
+def test_native_compaction_async_round_trips_exact_provider_items():
+    """Async OpenAI compaction awaits the native endpoint and preserves opaque items."""
+    item = CompactItem(type="compaction", id="cmp", encrypted_content="opaque")
+    sdk = Mock()
+    sdk.responses.compact = AsyncMock(
+        return_value=SimpleNamespace(
+            output=[item],
+            usage=SimpleNamespace(input_tokens=90, output_tokens=20, total_tokens=110),
+        )
+    )
+
+    with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+        backend = OpenAIBackend(default_model="model")
+        result = asyncio.run(
+            backend.compact_async(
+                [Message(role="user", content="hello")],
+                instructions="rules",
+                model="model",
+            )
+        )
+
+    assert result.items == (
+        CompactionContextItem(
+            provider="openai",
+            data={"type": "compaction", "id": "cmp", "encrypted_content": "opaque"},
+        ),
+    )
+    assert result.usage.total_tokens == 110
+    assert result.context_tokens == 20
+    sdk.responses.compact.assert_awaited_once()
+
+
+def test_native_async_compaction_falls_back_only_for_unsupported_endpoints():
+    """Unsupported async native endpoints use the portable async backend path."""
+    sdk = Mock()
+    sdk.responses.compact = AsyncMock(
+        side_effect=APIStatusError(
+            "missing",
+            response=httpx.Response(404, request=httpx.Request("POST", "https://example.test")),
+            body=None,
+        )
+    )
+    fallback = CompactionResult(
+        items=(CompactionContextItem(provider="loop", data={"role": "user", "content": "sum"}),)
+    )
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        patch(
+            "loop.backend.openai.Backend.compact_async",
+            new=AsyncMock(return_value=fallback),
+        ) as compact,
+    ):
+        result = asyncio.run(
+            OpenAIBackend(default_model="model").compact_async(
+                [Message(role="user", content="hello")],
+                instructions="rules",
+                model="model",
+            )
+        )
+
+    assert result is fallback
+    compact.assert_awaited_once()
+
+
+def test_native_async_compaction_propagates_operational_api_failures():
+    """Async native compaction translates server failures outside unsupported fallback cases."""
+    sdk = Mock()
+    error = APIStatusError(
+        "failed",
+        response=httpx.Response(500, request=httpx.Request("POST", "https://example.test")),
+        body=None,
+    )
+    sdk.responses.compact = AsyncMock(side_effect=error)
+
+    with (
+        patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+        pytest.raises(BackendServerError) as raised,
+    ):
+        asyncio.run(
+            OpenAIBackend(default_model="model").compact_async([], instructions=None, model="model")
+        )
+
+    assert raised.value.__cause__ is error
+    assert raised.value.operation == "compact"
+
+
 def test_native_compaction_falls_back_only_for_unsupported_endpoints():
     """Compatible servers without the compact endpoint use portable summarization."""
     sdk = Mock()

@@ -1,11 +1,12 @@
 """Tests for bounded single-agent execution."""
 
+import asyncio
 import json
 import os
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, Mock
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock
 
 import pytest
 from openai.types.responses import ResponseFunctionToolCall
@@ -1391,6 +1392,109 @@ def test_stopped_runner_does_not_query_or_begin_recovery():
     runner.backend.get_response.assert_not_called()
     sessions.record_run.assert_not_called()
     interaction.confirm.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_runner_queries_backend_asynchronously(tmp_path, streaming):
+    """Async queries collect completed backend events and preserve response timing semantics."""
+    backend = Mock()
+    runner = file_runner(tmp_path, backend)
+    runner.stream = streaming
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions = runner.session_manager
+
+    async def events():
+        """Yield normalized response events in backend order."""
+        yield AnswerDelta(text="final")
+        yield ResponseCompleted(answer="final")
+
+    backend.get_response_async.return_value = events()
+
+    async def query():
+        """Run the query while holding the session's async-task execution ownership."""
+        with sessions.execution():
+            return await runner.query_async()
+
+    response = asyncio.run(query())
+
+    assert response.answer == "final"
+    assert response.metrics is not None
+    assert (response.metrics.time_to_first_chunk_seconds is not None) is streaming
+    backend.get_response_async.assert_called_once()
+    backend.get_response.assert_not_called()
+    runner.compaction.compact_if_needed_async.assert_awaited_once()
+
+
+def test_runner_async_query_closes_backend_stream_when_cancelled(tmp_path):
+    """Cancelling async query closes its backend stream and retains no partial response."""
+    backend = Mock()
+    runner = file_runner(tmp_path, backend)
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions = runner.session_manager
+    waiting = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def events():
+        """Pause after partial output and signal when cancellation closes the stream."""
+        try:
+            yield AnswerDelta(text="partial")
+            waiting.set()
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    backend.get_response_async.return_value = events()
+
+    async def query():
+        """Cancel a query at a deterministic point in its event stream."""
+        with sessions.execution():
+            task = asyncio.create_task(runner.query_async())
+            try:
+                await waiting.wait()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(query())
+
+    assert closed.is_set()
+    assert sessions.messages == []
+    runner.interaction.answer_delta.assert_called_once_with("partial")
+
+
+def test_runner_async_query_accepts_iterators_without_close(tmp_path):
+    """Async queries accept backend iterators that do not expose a close method."""
+    backend = Mock()
+    runner = file_runner(tmp_path, backend)
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions = runner.session_manager
+
+    class EventStream:
+        """Yield normalized response events without an async close operation."""
+
+        def __init__(self):
+            self._events = iter([ResponseCompleted(answer="final")])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._events)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    backend.get_response_async.return_value = EventStream()
+
+    async def query():
+        """Run the query while holding the session's async-task execution ownership."""
+        with sessions.execution():
+            return await runner.query_async()
+
+    assert asyncio.run(query()).answer == "final"
 
 
 def test_runner_checks_cancellation_after_compaction(tmp_path):

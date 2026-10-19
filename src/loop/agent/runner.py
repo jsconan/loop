@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import ExitStack, nullcontext
+from collections.abc import AsyncIterator
+from contextlib import ExitStack, aclosing, nullcontext
 from datetime import datetime
 from time import perf_counter, sleep
 
@@ -21,6 +22,7 @@ from ..models import (
     Message,
     ModelCallMetrics,
     Response,
+    ResponseEvent,
     ResponseMetrics,
     RunMetrics,
     ToolCall,
@@ -636,6 +638,22 @@ class AgentRunner:
         with telemetry_span():
             return self._query()
 
+    async def query_async(self) -> Response:
+        """Request and collect one response through the backend's asynchronous stream.
+
+        Returns:
+            Response: Collected normalized model response.
+
+        Raises:
+            BackendError: If the backend cannot produce a complete response.
+            ValueError: If neither the selection nor backend provides a model.
+            KeyboardInterrupt: If the configured control requests a stop.
+            RunInterrupted: If the active execution scope has been interrupted.
+            asyncio.CancelledError: If the query task is cancelled.
+        """
+        with telemetry_span():
+            return await self._query_async()
+
     def _query(self, recovery: str | None = None) -> Response:
         """Request and collect one response inside the active model-operation span."""
         self._checkpoint()
@@ -681,6 +699,63 @@ class AgentRunner:
                 debug=self._debug,
                 interaction=self._interaction,
             )
+        completed_at = perf_counter()
+        response.metrics = ResponseMetrics(
+            duration_seconds=completed_at - started_at,
+            time_to_first_chunk_seconds=(
+                first_chunk_at - started_at if self._stream and first_chunk_at is not None else None
+            ),
+        )
+        return response
+
+    async def _query_async(self, recovery: str | None = None) -> Response:
+        """Collect one asynchronous response inside the active model-operation span."""
+        self._checkpoint()
+        selected_model = self._model_selection.effective
+        snapshot = self._instructions_manager.prepare(self._agent, recovery=recovery)
+        self._session_manager.update_instruction_state(
+            working_directory=str(snapshot.working_directory or self._working_directory),
+            active_skills=list(snapshot.active_skills),
+        )
+        self._model_selection.synchronize_session()
+        await self._compaction.compact_if_needed_async(snapshot)
+        self._checkpoint()
+        started_at = perf_counter()
+        first_chunk_at = None
+        model_context = self._backend.prepare_context(self._session_manager.model_context)
+        self._file_observations = FileObservations(
+            model_context,
+            self._instructions_manager.virtual_paths,
+        )
+        events = self._backend.get_response_async(
+            input=model_context,
+            instructions=snapshot.content,
+            stream=self._stream,
+            model=selected_model,
+            hyperparameters=self._agent.hyperparameters,
+            tools=self._agent.tools.definitions(),
+        )
+
+        async def measured_events() -> AsyncIterator[ResponseEvent]:
+            """Check cancellation and record first-event timing while yielding backend events."""
+            nonlocal first_chunk_at
+            async for event in events:
+                self._checkpoint()
+                if first_chunk_at is None:
+                    first_chunk_at = perf_counter()
+                yield event
+
+        async with aclosing(measured_events()) as stream:
+            try:
+                response = await self._session_manager.response_async(
+                    stream,
+                    debug=self._debug,
+                    interaction=self._interaction,
+                )
+            finally:
+                closer = getattr(events, "aclose", None)
+                if callable(closer):
+                    await closer()
         completed_at = perf_counter()
         response.metrics = ResponseMetrics(
             duration_seconds=completed_at - started_at,

@@ -1,7 +1,8 @@
 """Tests for active conversation context compaction."""
 
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -180,6 +181,100 @@ def test_compaction_persists_replacement_context_and_reports_usage():
         model="model",
     )
     interaction.info.assert_any_call("Compacted session context from 80 to 20 tokens.")
+
+
+def test_async_compaction_persists_replacement_context_after_backend_completion():
+    """Async compaction commits the owner state only after a complete backend result."""
+    result = CompactionResult(
+        items=(
+            CompactionContextItem(
+                provider="loop",
+                data={"role": "user", "content": "checkpoint"},
+            ),
+        ),
+        context_tokens=20,
+    )
+    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
+    feature, manager, backend, interaction = compaction_feature(session=session)
+    previous_context = manager.model_context
+    backend.compact_async = AsyncMock(return_value=result)
+
+    applied = asyncio.run(feature.compact_if_needed_async())
+
+    assert applied is True
+    backend.compact_async.assert_awaited_once()
+    assert backend.compact_async.call_args.args[0] == previous_context
+    assert backend.compact_async.call_args.kwargs["instructions"]
+    assert backend.compact_async.call_args.kwargs["model"] == "model"
+    assert len(session.compactions) == 1
+    interaction.info.assert_any_call("Compacting session context...")
+
+
+def test_async_compaction_skips_absent_or_unneeded_context():
+    """Async compaction honors empty-history and utilization boundaries before backend work."""
+    feature, _, backend, interaction = compaction_feature()
+
+    assert asyncio.run(feature.compact_async()) is False
+    assert asyncio.run(feature.compact_async(force=False)) is False
+    assert asyncio.run(feature.compact_if_needed_async()) is False
+    interaction.warning.assert_called_once_with("There is no new session context to compact.")
+    backend.compact_async.assert_not_awaited()
+
+    session = Session(messages=[Message(role="user", content="hello")], tokens=79)
+    feature, _, backend, interaction = compaction_feature(session=session)
+    assert asyncio.run(feature.compact_async(force=False)) is False
+    assert asyncio.run(feature.compact_if_needed_async()) is False
+    interaction.warning.assert_not_called()
+    backend.compact_async.assert_not_awaited()
+
+
+def test_async_compaction_cancellation_does_not_commit_partial_context():
+    """Cancellation during model compaction leaves the active session history unchanged."""
+    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
+    feature, _, backend, _ = compaction_feature(session=session)
+    started = asyncio.Event()
+
+    async def compact(*args, **kwargs):
+        """Pause after compaction starts so the test can cancel the operation."""
+        started.set()
+        await asyncio.Event().wait()
+
+    backend.compact_async = AsyncMock(side_effect=compact)
+
+    async def cancel_compaction():
+        """Cancel the backend request at a deterministic suspension point."""
+        task = asyncio.create_task(feature.compact_if_needed_async())
+        try:
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(cancel_compaction())
+
+    assert session.compactions == []
+    assert session.messages == [Message(role="user", content="hello")]
+
+
+@pytest.mark.parametrize("unsupported", ["error", "empty", "no_items"])
+def test_async_compaction_reports_unavailable_backend_results(unsupported):
+    """Async compaction leaves history intact when the backend cannot produce a checkpoint."""
+    result = CompactionResult(items=()) if unsupported == "no_items" else None
+    compact = AsyncMock(
+        side_effect=NotImplementedError if unsupported == "error" else None,
+        return_value=result,
+    )
+    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
+    feature, _, backend, interaction = compaction_feature(session=session)
+    backend.compact_async = compact
+
+    assert asyncio.run(feature.compact_if_needed_async()) is False
+
+    assert session.compactions == []
+    assert interaction.warning.call_args.args[0].startswith("The selected backend")
 
 
 def test_compaction_reports_success_without_remeasured_usage():
