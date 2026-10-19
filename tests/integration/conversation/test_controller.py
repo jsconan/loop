@@ -310,8 +310,8 @@ def test_pending_approval_uses_native_confirmation_ui_and_preserves_the_draft():
             original_prompt_async = choices.prompt_async
 
             async def observed_prompt_async(*args, **kwargs):
-                """Signal when the approval question opens in the native choices editor."""
-                if args and str(args[0]).strip() == "Write?":
+                """Signal when the approval question opens in the native confirmation editor."""
+                if args and str(args[0]).startswith("Write? [y/n]"):
                     decision_open.set()
                 return await original_prompt_async(*args, **kwargs)
 
@@ -340,7 +340,11 @@ def test_pending_approval_uses_native_confirmation_ui_and_preserves_the_draft():
                 assert [
                     completion.text
                     for completion in completer.get_completions(Document("y"), CompleteEvent())
-                ] == ["Yes"]
+                ] == ["yes"]
+                assert [
+                    completion.text
+                    for completion in completer.get_completions(Document("n"), CompleteEvent())
+                ] == ["no"]
                 assert "Input requested:" not in output.getvalue()
                 assert "Press Enter or use /respond" not in output.getvalue()
                 assert approvals == []

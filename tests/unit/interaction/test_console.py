@@ -1354,18 +1354,53 @@ def test_confirm_reads_input_when_the_terminal_cannot_be_flushed(monkeypatch):
     ],
 )
 def test_confirm_async_requires_an_explicit_choice_or_its_default(answer, default, expected):
-    """Async confirmation preserves explicit yes/no aliases and the empty-input default."""
+    """Async confirmation matches Rich's prompt while keeping completion and default behavior."""
     session = Mock()
     session.prompt_async = AsyncMock(return_value=answer)
+    console = Mock()
 
     assert (
         asyncio.run(
-            ConsoleInteraction(choices_session=session).confirm_async("Continue?", default=default)
+            ConsoleInteraction(console=console, choices_session=session).confirm_async(
+                "Continue?", default=default
+            )
         )
         is expected
     )
     session.prompt_async.assert_awaited_once()
+    assert session.prompt_async.call_args.args == (
+        f"Continue? [y/n] ({'y' if default else 'n'}): ",
+    )
+    completer = session.prompt_async.call_args.kwargs["completer"]
+    assert [
+        completion.text for completion in completer.get_completions(Document("y"), CompleteEvent())
+    ] == ["yes"]
+    assert [
+        completion.text for completion in completer.get_completions(Document("n"), CompleteEvent())
+    ] == ["no"]
     session.prompt.assert_not_called()
+    console.print.assert_not_called()
+
+
+def test_confirm_async_reprompts_with_rich_validation_after_an_invalid_answer():
+    """Async confirmation preserves Rich's validation message and retries the same prompt."""
+    session = Mock()
+    session.prompt_async = AsyncMock(side_effect=["maybe", "yes"])
+    console = Mock()
+
+    assert (
+        asyncio.run(
+            ConsoleInteraction(console=console, choices_session=session).confirm_async("Continue?")
+        )
+        is True
+    )
+
+    assert session.prompt_async.await_count == 2
+    assert all(
+        prompt_call.args == ("Continue? [y/n] (n): ",)
+        for prompt_call in session.prompt_async.await_args_list
+    )
+    console.print.assert_called_once_with(Confirm.validate_error_message, markup=True)
 
 
 @pytest.mark.parametrize("error", [KeyboardInterrupt, EOFError])

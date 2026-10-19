@@ -872,8 +872,9 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
     async def confirm_async(self, message: str, *, default: bool = False) -> bool:
         """Request an explicit yes-or-no answer without blocking the event loop.
 
-        Discard pending terminal input before asking, as synchronous confirmation does. Empty
-        input uses the stated default; interruption or end-of-file declines the operation.
+        Use Rich's confirmation prompt rendering with the asynchronous editor and response
+        completion. Discard pending terminal input before asking, as synchronous confirmation
+        does. Empty input uses the stated default; interruption or end-of-file declines.
 
         Args:
             message (str): Confirmation question to display.
@@ -886,16 +887,27 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
             asyncio.CancelledError: If the input task is cancelled.
         """
         self._discard_pending_terminal_input()
-        return (
-            await self.prompt_async(
-                message,
-                choices={True: "Yes", False: "No"},
-                index=("y", "n"),
-                default=default,
-                exit_commands=(),
-            )
-            is True
-        )
+        confirmation = Confirm(message, console=self._console)
+        prompt = confirmation.make_prompt(default).plain
+        completer = WordCompleter(("yes", "no"), ignore_case=True)
+        while True:
+            try:
+                answer = await self._choices_session.prompt_async(
+                    prompt,
+                    completer=completer,
+                    complete_in_thread=True,
+                    default="",
+                )
+            except (KeyboardInterrupt, EOFError):
+                return False
+            normalized_answer = answer.strip().casefold()
+            if not normalized_answer:
+                return default
+            if normalized_answer in ("y", "yes"):
+                return True
+            if normalized_answer in ("n", "no"):
+                return False
+            self._console.print(Confirm.validate_error_message, markup=True)
 
     @staticmethod
     def _discard_pending_terminal_input() -> None:
