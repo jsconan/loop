@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import pytest
 
 from loop.execution.sandbox.linux import admission as linux_admission
+from loop.execution.sandbox.linux.constants import NATIVE_CANCEL_FRAME
 
 
 @pytest.fixture
@@ -395,6 +396,47 @@ def test_receive_request_handles_fragmentation_and_exact_capacity(admission):
         b"",
     ]
     assert receive(admission) == b"a" * 65536
+
+
+def test_receive_request_accepts_open_control_channel_without_trailing_data(admission):
+    """An open control channel is peeked without Python's timeout readiness wait."""
+    connection = admission.connection
+    timeout = None
+    parts = iter([b"LOOP\x01" + struct.pack("!I", 3), b"abc"])
+
+    def settimeout(value):
+        """Model the Python timeout retained by each bounded frame read."""
+        nonlocal timeout
+        timeout = value
+
+    def setblocking(value):
+        """Model Python's timeout reset when switching socket blocking mode."""
+        settimeout(None if value else 0)
+
+    def recv(size, flags=0):
+        """An empty open socket times out unless its Python readiness wait is disabled."""
+        if flags:
+            if timeout != 0:
+                raise TimeoutError("Python socket readiness wait expired")
+            raise BlockingIOError
+        return next(parts)
+
+    connection.settimeout.side_effect = settimeout
+    connection.setblocking.side_effect = setblocking
+    connection.recv.side_effect = recv
+
+    assert receive(admission) == b"abc"
+
+
+def test_receive_request_preserves_early_cancellation_for_process_supervisor(admission):
+    """A cancel byte arriving during admission is retained for the authenticated supervisor."""
+    admission.connection.recv.side_effect = [
+        b"LOOP\x01" + struct.pack("!I", 3),
+        b"abc",
+        NATIVE_CANCEL_FRAME,
+    ]
+
+    assert receive(admission) == b"abc"
 
 
 @pytest.mark.parametrize("boundary", ["start", "read", "end"])

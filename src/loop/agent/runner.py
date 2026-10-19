@@ -848,6 +848,9 @@ class AgentRunner:
             instructions_manager=instructions,
             permission_manager=self._permission_manager,
             call_id=tool_call.call_id,
+            cancellation_event=(
+                self._run_control.cancellation_event if self._run_control is not None else None
+            ),
             **(
                 {"file_observations": self._file_observations}
                 if self._file_observations is not None
@@ -914,6 +917,9 @@ class AgentRunner:
             instructions_manager=instructions,
             permission_manager=self._permission_manager,
             call_id=tool_call.call_id,
+            cancellation_event=(
+                self._run_control.cancellation_event if self._run_control is not None else None
+            ),
             **(
                 {"file_observations": self._file_observations}
                 if self._file_observations is not None

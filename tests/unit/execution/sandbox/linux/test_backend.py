@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -112,6 +113,37 @@ def test_backend_restores_only_original_typed_result(backend, outcome, tmp_path)
     linux.exchange_installed_request.assert_called_once_with(
         tmp_path / "management.json", b"request", 20
     )
+
+
+def test_backend_propagates_cancellation_through_installed_transport(backend, tmp_path):
+    """A live cancellation signal uses the receiver control channel and cleanup acknowledgement."""
+    request = Mock(deadline=20, attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7")
+    request.to_wire.return_value = b"request"
+    result = CommandProcessResult(SandboxOutcome.CANCELLED, possible_effects=True)
+    linux.exchange_installed_request.return_value = result.to_wire(request.attempt_id)
+    cancellation_event = Event()
+
+    assert backend.run(request, cancellation_event=cancellation_event) == result
+    linux.exchange_installed_request.assert_called_once_with(
+        tmp_path / "management.json",
+        b"request",
+        20,
+        cancellation_event=cancellation_event,
+    )
+
+
+def test_backend_does_not_open_transport_for_pre_cancelled_request(backend):
+    """A run cancelled before native admission cannot send its command frame."""
+    cancellation_event = Event()
+    cancellation_event.set()
+
+    result = backend.run(
+        Mock(deadline=20),
+        cancellation_event=cancellation_event,
+    )
+
+    assert result.outcome is SandboxOutcome.CANCELLED
+    linux.exchange_installed_request.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["expired", "stale", "timeout", "cancel", "invalid", "io"])

@@ -1840,6 +1840,63 @@ def test_native_scratch_hardlink_stays_read_only_at_both_spellings(
     require_drained(generation)
 
 
+def test_installed_request_keeps_an_idle_cancellation_channel_open(
+    installation, public, native_directory
+):
+    """Admit and complete a request without requiring EOF on its cancellation channel."""
+    backend, generation = installation
+    scratch = native_directory(Path("/tmp"))
+    request = native_request(backend, public[1], scratch, "printf ready", seconds=15)
+
+    result = backend.run(request, cancellation_event=threading.Event())
+
+    assert result.outcome is SandboxOutcome.COMPLETED, result
+    assert result.exit_code == 0 and result.stdout == "ready"
+    require_drained(generation)
+
+
+@pytest.mark.parametrize("detached_descendant", [False, True])
+def test_installed_request_cancels_and_drains_admitted_source(
+    installation, public, native_directory, detached_descendant
+):
+    """An explicit cancellation byte stops running source and detached namespace descendants."""
+    backend, generation = installation
+    workspace = public[1]
+    scratch = native_directory(Path("/tmp"))
+    source = (
+        "/usr/bin/python3 -I -c "
+        + shlex.quote(
+            "import os,time\n"
+            "if os.fork() == 0:\n"
+            " os.setsid()\n"
+            " print('ready',end='',flush=True)\n"
+            " with open('cancellation-marker','w') as marker: marker.write('started')\n"
+            "time.sleep(30)\n"
+        )
+        if detached_descendant
+        else "printf ready; printf started > cancellation-marker; sleep 30"
+    )
+    request = native_request(backend, workspace, scratch, source, seconds=30)
+    cancelled = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(backend.run, request, cancellation_event=cancelled)
+        try:
+            deadline = time.monotonic() + 10
+            marker = workspace / "cancellation-marker"
+            while not marker.exists() and not future.done() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert marker.exists(), future.result() if future.done() else "No payload entry"
+            started = time.monotonic()
+            cancelled.set()
+            result = future.result(timeout=5)
+            assert time.monotonic() - started < 5
+            assert result.outcome is SandboxOutcome.CANCELLED, result
+            assert result.stdout == "ready" and result.exit_code is None
+            require_drained(generation)
+        finally:
+            cancelled.set()
+
+
 def test_installed_request_disconnect_cancels_admitted_source(
     installation, public, native_directory
 ):

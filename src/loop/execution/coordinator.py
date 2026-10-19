@@ -100,11 +100,17 @@ def _denial_supports_host_offer(request: SandboxRequest, result: CommandProcessR
 class HostCommandExecutor(Protocol):
     """Run an explicitly approved host command through the host process supervisor."""
 
-    def run_host_command(self, request: HostCommandRequest) -> CommandProcessResult:
+    def run_host_command(
+        self,
+        request: HostCommandRequest,
+        *,
+        cancellation_event: threading.Event | None = None,
+    ) -> CommandProcessResult:
         """Run one exact, separately approved host request.
 
         Args:
             request (HostCommandRequest): Exact approved command and effective environment.
+            cancellation_event (threading.Event | None): Optional signal requesting child cleanup.
 
         Returns:
             CommandProcessResult: Bounded host process result.
@@ -114,17 +120,25 @@ class HostCommandExecutor(Protocol):
 class LocalHostCommandExecutor:
     """Supervise only a separately approved, unrestricted host shell request."""
 
-    def run_host_command(self, request: HostCommandRequest) -> CommandProcessResult:
+    def run_host_command(
+        self,
+        request: HostCommandRequest,
+        *,
+        cancellation_event: threading.Event | None = None,
+    ) -> CommandProcessResult:
         """Capture one approved host process within its bound deadline.
 
         Args:
             request (HostCommandRequest): Exact host command approved by the user.
+            cancellation_event (threading.Event | None): Optional signal requesting child cleanup.
 
         Returns:
             CommandProcessResult: Bounded process output and exit or timeout outcome.
         """
         if time.monotonic() >= request.deadline:
             return CommandProcessResult(SandboxOutcome.TIMED_OUT)
+        if cancellation_event is not None and cancellation_event.is_set():
+            return CommandProcessResult(SandboxOutcome.CANCELLED)
         process = subprocess.Popen(
             ["/bin/sh", "-c", request.source],
             cwd=request.cwd,
@@ -144,6 +158,7 @@ class LocalHostCommandExecutor:
             terminate=kill_process_group,
             reader=read_bounded_stream,
             thread_factory=threading.Thread,
+            cancel_event=cancellation_event,
         )
         if capture.status is ProcessCaptureStatus.UNAVAILABLE:
             return CommandProcessResult(
@@ -273,6 +288,7 @@ class CommandExecutionCoordinator:
         *,
         prelaunch_failure: CommandProcessResult | None = None,
         execution_timeout: float | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> CommandAttempt:
         """Run an authorized request or offer retry for a typed prelaunch failure.
 
@@ -283,6 +299,7 @@ class CommandExecutionCoordinator:
                 return without invoking the backend, after authorization and path validation.
             execution_timeout (float | None): Execution budget in seconds to start after approval.
                 Defaults to preserving the caller's absolute deadline.
+            cancellation_event (threading.Event | None): Optional run cancellation signal.
 
         Returns:
             CommandAttempt: Sandboxed result and optional unexecuted host offer.
@@ -302,10 +319,16 @@ class CommandExecutionCoordinator:
             result = CommandProcessResult(
                 SandboxOutcome.TIMED_OUT, detail="Command deadline expired before launch."
             )
+        elif cancellation_event is not None and cancellation_event.is_set():
+            result = CommandProcessResult(SandboxOutcome.CANCELLED)
         elif prelaunch_failure is not None:
             result = prelaunch_failure
         else:
-            result = self._backend.run(request)
+            result = (
+                self._backend.run(request, cancellation_event=cancellation_event)
+                if cancellation_event is not None
+                else self._backend.run(request)
+            )
         telemetry_audit(
             "sandbox.completed",
             workspace_id=request.workspace_id,
@@ -351,6 +374,7 @@ class CommandExecutionCoordinator:
         current_request: SandboxRequest,
         *,
         execution_timeout: float | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> CommandProcessResult | None:
         """Approve an unchanged offer and launch at most one host process.
 
@@ -359,6 +383,7 @@ class CommandExecutionCoordinator:
             current_request (SandboxRequest): Freshly resolved command context at approval time.
             execution_timeout (float | None): Execution budget in seconds to start after host
                 approval. Defaults to preserving the caller's absolute deadline.
+            cancellation_event (threading.Event | None): Optional run cancellation signal.
 
         Returns:
             CommandProcessResult | None: Host result after approval, or None when no launch occurs.
@@ -376,6 +401,8 @@ class CommandExecutionCoordinator:
                 attempt_id=offer.request.attempt_id,
                 offer_id=offer.token,
             )
+            return None
+        if cancellation_event is not None and cancellation_event.is_set():
             return None
         if self._auto_approval or self._interaction is None:
             telemetry_audit(
@@ -401,6 +428,8 @@ class CommandExecutionCoordinator:
             )
         else:
             answer = "rule"
+        if cancellation_event is not None and cancellation_event.is_set():
+            return None
         if answer not in ({"approve", "session", "rule"} if reusable else {"approve"}):
             telemetry_audit(
                 "host_command.denied",
@@ -439,8 +468,14 @@ class CommandExecutionCoordinator:
             rule_id=rule.id if isinstance(rule, HostCommandRule) else None,
         )
         try:
-            result = self._host_executor.run_host_command(
-                HostCommandRequest.from_sandbox(current_request)
+            host_request = HostCommandRequest.from_sandbox(current_request)
+            result = (
+                self._host_executor.run_host_command(
+                    host_request,
+                    cancellation_event=cancellation_event,
+                )
+                if cancellation_event is not None
+                else self._host_executor.run_host_command(host_request)
             )
         except Exception:
             telemetry_audit(

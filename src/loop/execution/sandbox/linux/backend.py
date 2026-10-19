@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from threading import Event
 
 from .... import constants
 from ....constants import NATIVE_FILE_READ_CHUNK_BYTES, NATIVE_INSTALLATION_DIRECTORY
@@ -278,17 +279,26 @@ class LinuxNativeBackend:
         self._authority_seen = True
         return None
 
-    def run(self, request: SandboxRequest) -> CommandProcessResult:
+    def run(
+        self,
+        request: SandboxRequest,
+        *,
+        cancellation_event: Event | None = None,
+    ) -> CommandProcessResult:
         """Exchange one authorized request and restore only its original typed result.
 
         Args:
             request (SandboxRequest): Current shared request after public authorization.
+            cancellation_event (Event | None): Optional run cancellation signal. A request already
+                cancelled before native admission does not launch a receiver.
 
         Returns:
             CommandProcessResult: Bounded exact outcome; failures never retry source.
         """
         if time.monotonic() >= request.deadline:
             return CommandProcessResult(SandboxOutcome.TIMED_OUT)
+        if cancellation_event is not None and cancellation_event.is_set():
+            return CommandProcessResult(SandboxOutcome.CANCELLED)
 
         if not request.paths_are_current():
             return CommandProcessResult(
@@ -296,7 +306,15 @@ class LinuxNativeBackend:
             )
 
         try:
-            response = exchange_installed_request(self._record, request.to_wire(), request.deadline)
+            exchange_arguments = (
+                {"cancellation_event": cancellation_event} if cancellation_event is not None else {}
+            )
+            response = exchange_installed_request(
+                self._record,
+                request.to_wire(),
+                request.deadline,
+                **exchange_arguments,
+            )
             return CommandProcessResult.from_wire(response, request.attempt_id)
         except TimeoutError:
             return CommandProcessResult(

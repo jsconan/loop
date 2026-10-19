@@ -20,7 +20,7 @@ from ....utils.process import (
     supervise_process,
 )
 from .admission import GenerationAdmission, admission_group
-from .constants import CGROUP_PROCS_FILENAME
+from .constants import CGROUP_PROCS_FILENAME, NATIVE_CANCEL_FRAME
 
 _CLEANUP_SECONDS = 1.0
 _CLIENT_DISCONNECT_POLL_MILLISECONDS = 50
@@ -48,9 +48,9 @@ def supervise_payload(
         process (subprocess.Popen[str]): Owned authenticated native namespace launcher.
         config (GenerationAdmission): Original installed fixed generation admission.
         deadline (float): Absolute monotonic execution deadline after authorization.
-        connection (int | None): Admitted socket descriptor to watch for full client disconnect;
-            None leaves cancellation to the common supervisor. Request half-close is not
-            cancellation.
+        connection (int | None): Admitted socket descriptor that may carry the fixed
+            cancellation byte; a full client disconnect also cancels. ``None`` leaves
+            cancellation to the common supervisor. Request half-close is not cancellation.
 
     Returns:
         ProcessCapture: Common typed output/exit result after verified descendant absence.
@@ -69,12 +69,27 @@ def supervise_payload(
     stopped, cancelled, failed = threading.Event(), threading.Event(), threading.Event()
 
     def watch():
-        """Request owned-launcher cancellation when the authenticated client disconnects."""
+        """Cancel the owned launcher on a bound control byte or full client disconnect."""
         try:
             poller = select.poll()
-            poller.register(connection, select.POLLHUP | select.POLLERR | select.POLLNVAL)
+            disconnected = select.POLLHUP | select.POLLERR | select.POLLNVAL
+            poller.register(connection, select.POLLIN | disconnected)
             while not stopped.is_set():
-                if poller.poll(_CLIENT_DISCONNECT_POLL_MILLISECONDS):
+                events = poller.poll(_CLIENT_DISCONNECT_POLL_MILLISECONDS)
+                if not events:
+                    continue
+                mask = events[0][1]
+                if mask & select.POLLIN:
+                    control = os.read(connection, len(NATIVE_CANCEL_FRAME))
+                    if control == NATIVE_CANCEL_FRAME:
+                        cancelled.set()
+                        return
+                    if control:
+                        failed.set()
+                        cancelled.set()
+                        return
+                    poller.modify(connection, disconnected)
+                if mask & disconnected:
                     cancelled.set()
                     return
         except (OSError, ValueError):
@@ -97,8 +112,6 @@ def supervise_payload(
             watcher.join(_CLEANUP_SECONDS)
             if watcher.is_alive():
                 raise OSError("Client cancellation watcher did not stop.")
-    if failed.is_set():
-        raise OSError("Client cancellation authority could not be observed.")
     if cancelled.is_set():
         result = replace(result, status=ProcessCaptureStatus.CANCELLED, exit_code=None)
     cleanup_deadline = time.monotonic() + _CLEANUP_SECONDS
@@ -123,6 +136,8 @@ def supervise_payload(
         ):
             raise ValueError("Admitted cleanup membership is malformed or exceeds its bound.")
         if values == [str(os.getpid()).encode("ascii")]:
+            if failed.is_set():
+                raise OSError("Client cancellation authority could not be observed.")
             return result
         if time.monotonic() >= cleanup_deadline:
             raise TimeoutError("Admitted descendants remain; confinement and policy retained.")

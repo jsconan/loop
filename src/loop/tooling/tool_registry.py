@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Iterable
+from threading import Event
 from time import perf_counter
 from typing import Any
 
@@ -349,6 +350,7 @@ class ToolRegistry:
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
         file_observations: FileObservations | None = None,
+        cancellation_event: Event | None = None,
     ) -> str:
         """Dispatch a synchronous tool call by registered name.
 
@@ -366,6 +368,8 @@ class ToolRegistry:
                 the validated and authorized tool function runs.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
+            cancellation_event (Event | None): Run cancellation signal passed to context-aware
+                tools, or ``None`` for standalone dispatch.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -382,6 +386,7 @@ class ToolRegistry:
             call_id=call_id,
             execution_started=execution_started,
             file_observations=file_observations,
+            cancellation_event=cancellation_event,
         )
         return output
 
@@ -396,6 +401,7 @@ class ToolRegistry:
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
         file_observations: FileObservations | None = None,
+        cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
         """Dispatch a tool and measure only its function execution.
 
@@ -410,6 +416,8 @@ class ToolRegistry:
                 the validated and authorized tool function runs.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
+            cancellation_event (Event | None): Run cancellation signal passed to context-aware
+                tools, or ``None`` for standalone dispatch.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds. Validation
@@ -445,6 +453,7 @@ class ToolRegistry:
             prerequisite_operations=plan.prerequisite_operations,
             call_id=call_id,
             permission_manager=active_permissions,
+            cancellation_event=cancellation_event,
         )
         if execution_started is not None:
             execution_started()
@@ -468,6 +477,7 @@ class ToolRegistry:
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
         file_observations: FileObservations | None = None,
+        cancellation_event: Event | None = None,
     ) -> str:
         """Dispatch an asynchronous or synchronous tool call by registered name.
 
@@ -485,6 +495,8 @@ class ToolRegistry:
                 the validated and authorized tool function runs.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
+            cancellation_event (Event | None): Run cancellation signal passed to context-aware
+                tools, or ``None`` for standalone dispatch.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -501,6 +513,7 @@ class ToolRegistry:
             call_id=call_id,
             execution_started=execution_started,
             file_observations=file_observations,
+            cancellation_event=cancellation_event,
         )
         return output
 
@@ -515,6 +528,7 @@ class ToolRegistry:
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
         file_observations: FileObservations | None = None,
+        cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
         """Dispatch a tool asynchronously and measure only its function execution.
 
@@ -529,6 +543,8 @@ class ToolRegistry:
                 the validated and authorized tool function runs.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
+            cancellation_event (Event | None): Run cancellation signal passed to context-aware
+                tools, or ``None`` for standalone dispatch.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds. Validation
@@ -564,6 +580,7 @@ class ToolRegistry:
             prerequisite_operations=plan.prerequisite_operations,
             call_id=call_id,
             permission_manager=active_permissions,
+            cancellation_event=cancellation_event,
         )
         if execution_started is not None:
             execution_started()
@@ -952,6 +969,7 @@ class ToolRegistry:
         prerequisite_operations: Operations = (),
         call_id: str | None = None,
         permission_manager: PermissionManager | None = None,
+        cancellation_event: Event | None = None,
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""
         if interaction is None:
@@ -998,6 +1016,7 @@ class ToolRegistry:
             execution_service=self._execution_service
             if tool.execution_authorization or tool.requires_execution_service
             else None,
+            cancellation_event=cancellation_event,
         )
 
 
@@ -1068,6 +1087,7 @@ class ToolRegistryView:
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
         file_observations: FileObservations | None = None,
+        cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
         """Dispatch through the owning registry and measure tool execution.
 
@@ -1081,6 +1101,8 @@ class ToolRegistryView:
             execution_started (Callable[[], None] | None): Callback run before tool execution.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
+            cancellation_event (Event | None): Run cancellation signal passed to context-aware
+                tools, or ``None`` for standalone dispatch.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds.
@@ -1094,6 +1116,7 @@ class ToolRegistryView:
             call_id=call_id,
             execution_started=execution_started,
             file_observations=file_observations,
+            cancellation_event=cancellation_event,
         )
 
     async def call_with_timing_async(
@@ -1107,6 +1130,7 @@ class ToolRegistryView:
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
         file_observations: FileObservations | None = None,
+        cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
         """Dispatch asynchronously through the owning registry and measure tool execution.
 
@@ -1120,6 +1144,8 @@ class ToolRegistryView:
             execution_started (Callable[[], None] | None): Callback run before tool execution.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
+            cancellation_event (Event | None): Run cancellation signal passed to context-aware
+                tools, or ``None`` for standalone dispatch.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds.
@@ -1133,4 +1159,5 @@ class ToolRegistryView:
             call_id=call_id,
             execution_started=execution_started,
             file_observations=file_observations,
+            cancellation_event=cancellation_event,
         )

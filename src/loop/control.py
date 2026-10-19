@@ -15,13 +15,14 @@ class RunControl:
     """Coordinate shutdown and scoped interruption across execution and UI threads.
 
     Initialize an idle control. Shutdown stays sticky; interruption applies only to the current
-    execution scope and is cleared when it settles. Active synchronous tools finish under their
-    existing deadlines before a checkpoint observes shutdown or interruption. Steering is a
-    separate safe-boundary signal: generation and the current tool finish, while later work in the
-    same response is skipped.
+    execution scope and is cleared when it settles. Cancellation-aware process supervisors receive
+    a thread-safe event; other synchronous tools still finish under their existing deadlines.
+    Steering is a separate safe-boundary signal: generation and the current tool finish, while
+    later work in the same response is skipped.
     """
 
     _wake: Event
+    _cancellation_event: Event
     _lock: Lock
     _stopped: bool
     _active: bool
@@ -34,6 +35,7 @@ class RunControl:
 
     def __init__(self) -> None:
         self._wake = Event()
+        self._cancellation_event = Event()
         self._lock = Lock()
         self._stopped = False
         self._active = False
@@ -104,10 +106,20 @@ class RunControl:
         with self._lock:
             return self._cancelled
 
+    @property
+    def cancellation_event(self) -> Event:
+        """Return the run-scoped event set by shutdown or interruption requests.
+
+        Returns:
+            Event: Thread-safe signal for cancellable blocking operations.
+        """
+        return self._cancellation_event
+
     def stop(self) -> None:
         """Request conversation shutdown at the next safe boundary."""
         with self._lock:
             self._stopped = True
+            self._cancellation_event.set()
             if self._active:
                 self._cancelled = False
             self._wake.set()
@@ -124,6 +136,7 @@ class RunControl:
             if not self._active or self._stopped:
                 return False
             self._interrupted = True
+            self._cancellation_event.set()
             self._cancelled = False
             self._wake.set()
             self._wake_async_waiters()
@@ -186,6 +199,7 @@ class RunControl:
                 self._async_task = None
                 if not self._stopped:
                     self._wake.clear()
+                    self._cancellation_event.clear()
 
     def checkpoint(self) -> None:
         """Observe shutdown before a scoped interrupt at a safe execution boundary.

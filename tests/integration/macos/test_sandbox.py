@@ -4,9 +4,11 @@ import os
 import shlex
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from loop.control import RunControl
 from loop.execution.sandbox import SandboxOutcome, SandboxRequest
 
 pytestmark = [pytest.mark.integration, pytest.mark.macos]
@@ -36,6 +38,52 @@ def test_native_commands_preserve_output_and_nonzero_exit(backend, native_worksp
     assert result.exit_code == 7
     assert result.stdout == "output"
     assert result.stderr == "error"
+
+
+@pytest.mark.parametrize("action", ["interrupt", "stop"])
+@pytest.mark.parametrize("retained_pipe", [False, True])
+def test_native_cancellation_drains_running_commands_and_retained_pipes(
+    backend, native_workspace, action, retained_pipe
+):
+    """Run interruption and shutdown promptly clean up native children and captured output."""
+    source = (
+        "sleep 30 & printf ready; printf started > cancellation-marker"
+        if retained_pipe
+        else "printf ready; printf started > cancellation-marker; sleep 30"
+    )
+    request = SandboxRequest.create(
+        source=source,
+        cwd=native_workspace,
+        workspace=native_workspace,
+        read_roots=(),
+        write_roots=(native_workspace,),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin", "LANG": "C"},
+        policy_version=backend.policy_version,
+        deadline=time.monotonic() + 30,
+        workspace_id="isolated-native-test",
+    )
+    control = RunControl()
+    with control.execution(), ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            backend.run, request, cancellation_event=control.cancellation_event
+        )
+        try:
+            marker = native_workspace / "cancellation-marker"
+            deadline = time.monotonic() + 10
+            while not marker.exists() and not future.done() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert marker.exists(), future.result() if future.done() else "No payload entry"
+            started = time.monotonic()
+            getattr(control, action)()
+            result = future.result(timeout=5)
+            assert time.monotonic() - started < 5
+            assert result.outcome is SandboxOutcome.CANCELLED, result
+            assert result.stdout == "ready" and result.exit_code is None
+        finally:
+            control.interrupt()
+    assert control.cancelled
+    assert control.cancellation_event.is_set() == (action == "stop")
 
 
 @pytest.mark.parametrize("target", [".ssh/id_ed25519", "external-link"])

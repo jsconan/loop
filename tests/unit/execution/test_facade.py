@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock
 
@@ -109,10 +110,12 @@ def test_public_command_budget_starts_after_sandbox_approval(tmp_path, monkeypat
         "run_command",
         operations=(operation,),
         permission_manager=PermissionManager(tmp_path),
+        cancellation_event=Event(),
     )
     result = service.run_command(context, "printf text >victim")
     assert result["boundary"] == "sandbox"
     assert backend.run.call_args.args[0].deadline == 303.0
+    assert backend.run.call_args.kwargs["cancellation_event"] is context.cancellation_event
     host.run_host_command.assert_not_called()
 
 

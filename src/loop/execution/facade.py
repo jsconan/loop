@@ -489,6 +489,7 @@ class CommandExecutionService:
             context.tool_name,
             prelaunch_failure=prelaunch_failure,
             execution_timeout=context.settings.command_timeout,
+            cancellation_event=context.cancellation_event,
         )
         if attempt.result is None:
             return Problem(
@@ -504,6 +505,7 @@ class CommandExecutionService:
                 attempt.offer,
                 request,
                 execution_timeout=context.settings.command_timeout,
+                cancellation_event=context.cancellation_event,
             )
             if retry is not None:
                 result = retry

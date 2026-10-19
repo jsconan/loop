@@ -2000,6 +2000,72 @@ def test_async_controller_waits_for_owned_work_after_repeated_cancellation(ui):
     assert controller.running is False
 
 
+def test_async_controller_settles_a_command_after_conversation_completion(ui, monkeypatch):
+    """Cancellation awaits a pending command even when the conversation owner already finished."""
+    controller = SessionController(ui)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+
+    async def scenario():
+        """Control owner and command completion independently at their public async boundaries."""
+        loop = asyncio.get_running_loop()
+        started, command_started, finish_owner, owner_finished, settling = (
+            asyncio.Event() for _ in range(5)
+        )
+        pending = loop.create_future()
+        owner = None
+
+        def execute(*args):
+            """Represent a still-running command at the native executor boundary."""
+            command_started.set()
+            return pending
+
+        monkeypatch.setattr(loop, "run_in_executor", execute)
+        original_wait = asyncio.wait
+
+        async def observe_wait(futures, **kwargs):
+            """Expose command cleanup after the cancelled driver releases its completed owner."""
+            if task.cancelling() and pending in futures:
+                assert owner.done()
+                settling.set()
+            return await original_wait(futures, **kwargs)
+
+        monkeypatch.setattr(controller_module.asyncio, "wait", observe_wait)
+
+        async def conversation(receive):
+            """Finish ordinary conversation work while command cleanup remains pending."""
+            nonlocal owner
+            owner = asyncio.current_task()
+            assert await receive(DummyCompleter()) == "hello"
+            started.set()
+            await finish_owner.wait()
+            owner_finished.set()
+
+        task = asyncio.create_task(controller.run_async(conversation))
+        try:
+            await inputs.put("hello")
+            await started.wait()
+            await inputs.put("/help")
+            await command_started.wait()
+            finish_owner.set()
+            await owner_finished.wait()
+            task.cancel()
+            await settling.wait()
+            assert not task.done()
+            pending.set_result(True)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            finish_owner.set()
+            if not pending.done():
+                pending.set_result(True)
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert controller.running is False
+
+
 def test_async_controller_preserves_primary_and_secondary_failures(ui):
     """UI, command, and conversation failures remain visible with the primary error first."""
     controller = SessionController(ui)

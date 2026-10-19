@@ -5,6 +5,7 @@ import stat
 import struct
 from contextlib import nullcontext
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,6 +13,7 @@ import pytest
 
 from loop.execution.sandbox.linux import transport as linux_transport
 from loop.execution.sandbox.linux.admission import GenerationAdmission
+from loop.execution.sandbox.linux.constants import NATIVE_CANCEL_FRAME
 
 
 @pytest.fixture
@@ -84,6 +86,49 @@ def test_transport_preserves_frame_halfclose_and_bounded_response(transport):
         (15,),
     ]
     assert connection.recv.call_count == 3
+
+
+def test_transport_waits_for_cleanup_ack_after_sending_cancellation(transport):
+    """A cancellable client retains the reply channel through server-side process cleanup."""
+    config, files, connection, *_ = transport
+    cancellation_event = Event()
+    blocks = [b"cleanup-confirmed", b""]
+    receive_count = 0
+
+    def receive(_size):
+        """Request cancellation during the response wait, then return the cleanup result."""
+        nonlocal receive_count
+        if receive_count == 0:
+            receive_count += 1
+            raise TimeoutError
+        if not cancellation_event.is_set():
+            cancellation_event.set()
+            raise TimeoutError
+        return blocks.pop(0)
+
+    connection.recv.side_effect = receive
+
+    result = linux_transport.exchange_request(
+        config,
+        files,
+        b"private request",
+        20,
+        cancellation_event=cancellation_event,
+    )
+
+    assert result == b"cleanup-confirmed"
+    assert connection.sendall.call_args_list[0].args[0].endswith(b"private request")
+    assert connection.sendall.call_args_list[1].args == (NATIVE_CANCEL_FRAME,)
+    connection.shutdown.assert_not_called()
+
+
+def test_transport_keeps_legacy_timeout_behavior_without_a_cancel_event(transport):
+    """A timeout from a non-cancellable transport remains an ordinary typed timeout."""
+    config, files, connection, *_ = transport
+    connection.recv.side_effect = TimeoutError("transport wait expired")
+
+    with pytest.raises(TimeoutError, match="transport wait expired"):
+        linux_transport.exchange_request(config, files, b"request", 20)
 
 
 @pytest.mark.parametrize("payload", [None, "text", b"", b"x" * 65537])

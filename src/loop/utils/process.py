@@ -371,7 +371,8 @@ def supervise_process(
     Observe leader exit without reaping it, then terminate and reap the group before taking the
     output snapshot. This keeps the process-group identity pinned through cleanup. Give readers
     a bounded cleanup interval to consume the resulting pipe EOF; incomplete draining retains
-    unknown discard counts. Never extend the execution deadline.
+    unknown discard counts. Observe cancellation while draining inherited pipes after leader
+    exit, and never extend the execution deadline.
 
     Args:
         process (subprocess.Popen[str]): Child started in its own process group.
@@ -430,9 +431,18 @@ def supervise_process(
             )
         else:
             for thread in readers:
-                thread.join(max(0, deadline - time.monotonic()))
+                if cancel_event is None:
+                    thread.join(max(0, deadline - time.monotonic()))
+                else:
+                    while thread.is_alive() and not cancel_event.is_set():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        thread.join(min(remaining, _PROCESS_WAIT_POLL_SECONDS))
 
-            if any(thread.is_alive() for thread in readers):
+            if cancel_event is not None and cancel_event.is_set():
+                result = ProcessCapture(ProcessCaptureStatus.CANCELLED)
+            elif any(thread.is_alive() for thread in readers):
                 result = ProcessCapture(
                     ProcessCaptureStatus.TIMED_OUT,
                     stdout="".join(chunks[0]),

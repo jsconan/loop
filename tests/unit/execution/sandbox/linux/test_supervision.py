@@ -1,6 +1,7 @@
 """Verify admitted namespace supervision and authoritative cleanup refusal."""
 
 import io
+import select
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock
@@ -8,6 +9,7 @@ from unittest.mock import ANY, Mock
 import pytest
 
 from loop.execution.sandbox.linux import supervision as linux_supervision
+from loop.execution.sandbox.linux.constants import NATIVE_CANCEL_FRAME
 from loop.utils.process import ProcessCapture, ProcessCaptureStatus
 
 
@@ -185,3 +187,85 @@ def test_supervise_payload_watches_full_disconnect_and_refuses_observation_loss(
     assert scope.supervise.call_args.kwargs["cancel_event"].is_set() is (
         event in {"disconnect", "error", "value", "live"}
     )
+
+
+def test_supervise_payload_cancels_on_bound_control_and_confirms_cleanup(scope, monkeypatch):
+    """A valid control byte kills the owned process and waits for kernel cleanup evidence."""
+    poller = Mock()
+    poller.poll.return_value = [(0, select.POLLIN)]
+    monkeypatch.setattr(linux_supervision.select, "poll", lambda: poller)
+    monkeypatch.setattr(linux_supervision.os, "read", lambda *_: NATIVE_CANCEL_FRAME)
+
+    def create(*, target: object, daemon):
+        """Run the watcher deterministically in the fixture thread."""
+        thread = Mock()
+        thread.start.side_effect = target
+        thread.is_alive.return_value = False
+        return thread
+
+    monkeypatch.setattr(linux_supervision.threading, "Thread", create)
+
+    result = linux_supervision.supervise_payload(scope.process, scope.config, 50, connection=0)
+
+    assert result.status is ProcessCaptureStatus.CANCELLED
+    assert scope.supervise.call_args.kwargs["cancel_event"].is_set()
+    assert scope.membership.call_count == 2
+
+
+def test_supervise_payload_treats_request_half_close_as_normal(scope, monkeypatch):
+    """A legacy request half-close disables control reads without cancelling the child."""
+    poller = Mock()
+    poller.poll.side_effect = [[(0, select.POLLIN)], []]
+    monkeypatch.setattr(linux_supervision.select, "poll", lambda: poller)
+    monkeypatch.setattr(linux_supervision.os, "read", lambda *_: b"")
+    stopped = Mock()
+    stopped.is_set.side_effect = [False, False, True]
+    monkeypatch.setattr(
+        linux_supervision.threading,
+        "Event",
+        Mock(
+            side_effect=[
+                stopped,
+                Mock(is_set=Mock(return_value=False)),
+                Mock(is_set=Mock(return_value=False)),
+            ]
+        ),
+    )
+
+    def create(*, target: object, daemon):
+        """Run the watcher deterministically in the fixture thread."""
+        thread = Mock()
+        thread.start.side_effect = target
+        thread.is_alive.return_value = False
+        return thread
+
+    monkeypatch.setattr(linux_supervision.threading, "Thread", create)
+
+    result = linux_supervision.supervise_payload(scope.process, scope.config, 50, connection=0)
+
+    assert result.status is ProcessCaptureStatus.COMPLETED
+    assert poller.modify.call_args.args == (0, select.POLLHUP | select.POLLERR | select.POLLNVAL)
+    assert scope.supervise.call_args.kwargs["cancel_event"].is_set() is False
+
+
+def test_supervise_payload_rejects_unrecognized_control_after_cleanup(scope, monkeypatch):
+    """Unexpected socket bytes cancel execution and cannot bypass descendant verification."""
+    poller = Mock()
+    poller.poll.return_value = [(0, select.POLLIN)]
+    monkeypatch.setattr(linux_supervision.select, "poll", lambda: poller)
+    monkeypatch.setattr(linux_supervision.os, "read", lambda *_: b"X")
+
+    def create(*, target: object, daemon):
+        """Run the watcher deterministically in the fixture thread."""
+        thread = Mock()
+        thread.start.side_effect = target
+        thread.is_alive.return_value = False
+        return thread
+
+    monkeypatch.setattr(linux_supervision.threading, "Thread", create)
+
+    with pytest.raises(OSError, match="cancellation authority"):
+        linux_supervision.supervise_payload(scope.process, scope.config, 50, connection=0)
+
+    assert scope.supervise.call_args.kwargs["cancel_event"].is_set()
+    assert scope.membership.call_count == 2

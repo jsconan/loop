@@ -24,6 +24,7 @@ from ..constants import INITIAL_USER_NAMESPACE_UID_MAP
 from .constants import (
     CGROUP_PROCS_FILENAME,
     CGROUP_ROOT,
+    NATIVE_CANCEL_FRAME,
     NATIVE_REQUEST_MAGIC,
     PEER_CREDENTIALS_FORMAT,
     PEER_CREDENTIALS_SIZE,
@@ -267,8 +268,11 @@ def receive_request(
     launching command code. Authenticate kernel membership, installed unit bytes and actual
     loaded socket/concrete-service properties before touching client data. Peers must match the
     installer-selected ordinary UID/GID; PIDs are diagnostic identity, never migration targets.
-    The frame is LOOP/version-one, a four-byte big-endian length, nonempty opaque bytes and EOF.
-    No descriptor-receiving API is used. Revalidate membership and installed authority after EOF.
+    The frame is LOOP/version-one, a four-byte big-endian length, and nonempty opaque bytes.
+    A cancellable client may keep the write side open for one supervisor control byte after the
+    request body; that byte remains for the process supervisor to consume. Other immediately
+    trailing bytes fail closed. No descriptor-receiving API is used. Revalidate membership and
+    installed authority after the request body.
     This transport grant supplies no filesystem, network, policy or command authorization.
 
     Args:
@@ -385,8 +389,13 @@ def receive_request(
             raise ValueError("Invalid admission frame header or length.")
 
         payload = read_exact(length)
-        connection.settimeout(_remaining(deadline))
-        if connection.recv(1):
+        # MSG_DONTWAIT alone still lets Python wait for the preceding read's timeout.
+        connection.setblocking(False)
+        try:
+            trailing = connection.recv(1, socket.MSG_PEEK)
+        except BlockingIOError:
+            trailing = b""
+        if trailing and trailing != NATIVE_CANCEL_FRAME:
             raise ValueError("Trailing admission frame bytes.")
 
     if _tracking(config) != (service, group):

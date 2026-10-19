@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
 from typing import TYPE_CHECKING
 
 from ..errors import Problem, ProblemException
@@ -48,6 +49,8 @@ class ToolContext:
             complete inspected source versions, including the source of a committed edit, or
             ``None`` for observed absence; cache handles map to
             ``None`` and retain their existing immutable reference identity.
+        cancellation_event (Event | None): Run-scoped signal set when shutdown or interruption
+            requests cancellation, or ``None`` for standalone tool dispatch.
     """
 
     interaction: Interaction | None
@@ -62,6 +65,7 @@ class ToolContext:
     execution_service: CommandExecutionService | None = None
     file_versions: dict[str, str | None] = field(default_factory=dict)
     read_versions: dict[str, str | None] = field(default_factory=dict)
+    cancellation_event: Event | None = None
 
     def record_file_read(self, path: Path, version: str | None) -> None:
         """Attest to the source version actually inspected by a file reader.

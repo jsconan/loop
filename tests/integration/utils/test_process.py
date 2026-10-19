@@ -6,6 +6,7 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -78,6 +79,47 @@ def test_supervise_process_retains_flushed_short_output_at_timeout(caplog):
     assert capture.stderr == "DIAGNOSTIC\n"
     assert capture.stdout_discarded == 0 and capture.stderr_discarded == 0
     assert process.poll() is not None
+    assert not caplog.records
+
+
+def test_supervise_process_cancels_retained_pipes_after_leader_exit(caplog):
+    """Real inherited pipes are drained after prompt cancellation and owned group cleanup."""
+    cancelled = threading.Event()
+    process = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 30 & printf ready; printf error >&2"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+    def thread_factory(**kwargs):
+        """Use real readers and request cancellation at their first post-exit join."""
+        thread = threading.Thread(**kwargs)
+        original_join = thread.join
+
+        def join(timeout):
+            """Cancel after the leader is observed exiting, before a retained pipe drains."""
+            cancelled.set()
+            original_join(timeout)
+
+        thread.join = join
+        return thread
+
+    started = time.monotonic()
+    capture = supervise_process(
+        process,
+        started + 10,
+        thread_factory=thread_factory,
+        cancel_event=cancelled,
+    )
+
+    assert capture.status is ProcessCaptureStatus.CANCELLED
+    assert time.monotonic() - started < 5
+    assert capture.stdout == "ready" and capture.stderr == "error"
+    assert capture.stdout_discarded == capture.stderr_discarded == 0
+    assert capture.exit_code is None and process.returncode is not None
+    assert process.stdout.closed and process.stderr.closed
     assert not caplog.records
 
 

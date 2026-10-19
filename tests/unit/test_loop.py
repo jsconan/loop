@@ -2462,6 +2462,7 @@ def test_handle_tool_calls_delegates_session_updates(tmp_path):
         instructions_manager=loop.instructions_manager,
         permission_manager=loop.permission_manager,
         call_id="call_123",
+        cancellation_event=None,
         execution_started=ANY,
     )
     assert loop.permission_manager.recorder is session_manager

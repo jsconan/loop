@@ -10,6 +10,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from threading import Event
 
 from ... import constants
 from .constants import (
@@ -156,11 +157,17 @@ class UnavailableSandboxBackend:
         """
         return self._reason
 
-    def run(self, request: SandboxRequest) -> CommandProcessResult:
+    def run(
+        self,
+        request: SandboxRequest,
+        *,
+        cancellation_event: Event | None = None,
+    ) -> CommandProcessResult:
         """Return a typed failure without launching a child.
 
         Args:
             request (SandboxRequest): Command that cannot be executed on this host.
+            cancellation_event (Event | None): Optional run cancellation signal.
 
         Returns:
             CommandProcessResult: Original typed capability or integrity failure.

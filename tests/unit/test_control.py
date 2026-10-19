@@ -20,6 +20,7 @@ def test_control_stays_stopped_after_a_stop_request():
     control.stop()
 
     assert control.stopped is True
+    assert control.cancellation_event.is_set()
     with pytest.raises(KeyboardInterrupt):
         control.checkpoint()
 
@@ -55,6 +56,7 @@ def test_interrupt_is_scoped_and_never_latches_onto_an_idle_or_later_run():
         assert control.interrupt() is True
         assert control.interrupted is True
         assert control.cancelling is True
+        assert control.cancellation_event.is_set()
         assert control.stopped is False
         with pytest.raises(RunInterrupted):
             control.checkpoint()
@@ -65,6 +67,7 @@ def test_interrupt_is_scoped_and_never_latches_onto_an_idle_or_later_run():
     assert control.interrupted is False
     assert control.cancelling is False
     assert control.cancelled is True
+    assert not control.cancellation_event.is_set()
     with control.execution():
         assert control.cancelled is False
         control.checkpoint()
@@ -94,6 +97,7 @@ def test_steering_admission_is_scoped_to_an_active_run(active, stopped, admitted
     assert result is expected
     assert bool(called) is (active and not stopped)
     assert control.steering_pending is expected
+    assert control.cancellation_event.is_set() is stopped
     if active:
         scope.__exit__(None, None, None)
         assert control.steering_pending is False
@@ -196,16 +200,22 @@ def test_async_cancel_schedule_failure_keeps_scoped_interruption():
 
 def test_interruption_wakes_retry_waits_and_failure_releases_the_scope(monkeypatch):
     """Retry waits observe run interruption without real delays or poisoning the next run."""
-    event = Mock()
-    monkeypatch.setattr(control_module, "Event", Mock(return_value=event))
+    wake_event, cancellation_event = Mock(), Mock()
+    monkeypatch.setattr(
+        control_module,
+        "Event",
+        Mock(side_effect=[wake_event, cancellation_event]),
+    )
     control = RunControl()
     with pytest.raises(RunInterrupted), control.execution():
         control.interrupt()
         control.wait(5)
 
-    event.set.assert_called_once_with()
-    event.wait.assert_called_once_with(5)
-    event.clear.assert_called_once_with()
+    wake_event.set.assert_called_once_with()
+    cancellation_event.set.assert_called_once_with()
+    wake_event.wait.assert_called_once_with(5)
+    wake_event.clear.assert_called_once_with()
+    cancellation_event.clear.assert_called_once_with()
     assert control.active is False
     control.checkpoint()
 

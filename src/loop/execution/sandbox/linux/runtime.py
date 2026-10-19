@@ -8,6 +8,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from threading import Event
 
 from ....constants import (
     MAX_NATIVE_SETUP_BYTES,
@@ -82,7 +83,13 @@ def receive_installed_request(record: Path, deadline: float) -> bytes:
     return payload
 
 
-def exchange_installed_request(record: Path, payload: bytes, deadline: float) -> bytes:
+def exchange_installed_request(
+    record: Path,
+    payload: bytes,
+    deadline: float,
+    *,
+    cancellation_event: Event | None = None,
+) -> bytes:
     """Exchange one opaque request under the original complete installation authority.
 
     Authenticate all saved runtime artifacts and require the receipt roles to match the
@@ -95,6 +102,8 @@ def exchange_installed_request(record: Path, payload: bytes, deadline: float) ->
         payload (bytes): Already authorized nonempty opaque request, at most 64 KiB.
         deadline (float): Original absolute monotonic execution deadline; result cleanup/delivery
             has a fixed additional five-second interval.
+        cancellation_event (Event | None): Optional run signal passed through the authenticated
+            transport, which waits for receiver cleanup before returning its result.
 
     Returns:
         bytes: Authenticated bounded attempt-bound native result envelope.
@@ -111,7 +120,16 @@ def exchange_installed_request(record: Path, payload: bytes, deadline: float) ->
     receipt = installation_files(record.parent / RECEIPT_FILENAME, deadline=deadline)
     if any(receipt[role] != bound for role, bound in installed.files.items()):
         raise ValueError("Receipt transport differs from original management authority.")
-    response = exchange_request(installed.config, receipt, payload, deadline)
+    exchange_arguments = (
+        {"cancellation_event": cancellation_event} if cancellation_event is not None else {}
+    )
+    response = exchange_request(
+        installed.config,
+        receipt,
+        payload,
+        deadline,
+        **exchange_arguments,
+    )
     delivery_deadline = deadline + NATIVE_RESULT_DELIVERY_SECONDS
     if time.monotonic() >= delivery_deadline:
         raise TimeoutError("Installed request transport deadline expired.")

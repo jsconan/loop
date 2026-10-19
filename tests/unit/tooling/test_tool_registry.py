@@ -6,6 +6,7 @@ import io
 import json
 from functools import partial
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -730,6 +731,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
     instructions_manager.virtual_paths.metadata.side_effect = lambda value: value
     instructions_manager.virtual_paths.redact.side_effect = lambda value: value
     permission_manager = Mock(spec=PermissionManager)
+    cancellation_event = Event()
 
     assert view.definitions() is definitions
     assert (
@@ -741,6 +743,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
             permission_manager=permission_manager,
             call_id="call-123",
             execution_started=execution_started,
+            cancellation_event=cancellation_event,
         )
         == timed_result
     )
@@ -754,6 +757,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
         call_id="call-123",
         execution_started=execution_started,
         file_observations=None,
+        cancellation_event=cancellation_event,
     )
     assert (
         asyncio.run(
@@ -765,6 +769,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
                 permission_manager=permission_manager,
                 call_id="async-call-456",
                 execution_started=execution_started,
+                cancellation_event=cancellation_event,
             )
         )
         == timed_result
@@ -778,6 +783,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
         call_id="async-call-456",
         execution_started=execution_started,
         file_observations=None,
+        cancellation_event=cancellation_event,
     )
 
 
@@ -827,6 +833,46 @@ def test_registry_passes_replaced_runtime_settings_to_tool_context():
 
     assert result_value(registry.call("inspect_settings", "{}")) == "custom-agent"
     assert seen == [ToolRuntimeSettings(user_agent="custom-agent")]
+
+
+def test_registry_passes_run_cancellation_to_tool_context():
+    """Context-aware tools receive the run-owned cancellation event by identity."""
+    cancellation_event = Event()
+    registry = ToolRegistry()
+    seen = []
+
+    @declare_tool
+    def inspect_cancellation(context: ToolContext) -> str:
+        """Record whether the active tool can observe run cancellation."""
+        seen.append(context.cancellation_event)
+        return "ready"
+
+    registry.register(inspect_cancellation)
+    registry.call_with_timing("inspect_cancellation", "{}", cancellation_event=cancellation_event)
+
+    assert seen == [cancellation_event]
+
+
+def test_async_registry_passes_run_cancellation_to_tool_context():
+    """Async context-aware tools receive the same run-owned cancellation event."""
+    cancellation_event = Event()
+    registry = ToolRegistry()
+    seen = []
+
+    @declare_tool
+    async def inspect_cancellation(context: ToolContext) -> str:
+        """Record whether the active async tool can observe run cancellation."""
+        seen.append(context.cancellation_event)
+        return "ready"
+
+    registry.register(inspect_cancellation)
+    asyncio.run(
+        registry.call_with_timing_async(
+            "inspect_cancellation", "{}", cancellation_event=cancellation_event
+        )
+    )
+
+    assert seen == [cancellation_event]
 
 
 def test_registry_shares_mutated_runtime_settings_with_later_calls():

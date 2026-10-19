@@ -5,6 +5,7 @@ import tempfile
 import time
 from io import StringIO
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -448,6 +449,107 @@ def test_host_retry_requires_fresh_one_off_approval_and_runs_once(tmp_path):
     host.run_host_command.assert_called_once()
 
 
+def test_coordinator_passes_run_cancellation_to_both_process_boundaries(tmp_path):
+    """Cancellation reaches the sandbox attempt and any separately approved host retry."""
+    cancellation_event = Event()
+    denied = CommandProcessResult(SandboxOutcome.DENIED, detail="policy denial")
+    service, backend, host, _interaction = coordinator(tmp_path, denied)
+    approved = request(tmp_path)
+
+    attempt = service.run_sandboxed(
+        approved,
+        "run_command",
+        cancellation_event=cancellation_event,
+    )
+    assert attempt.offer is not None
+    backend.run.assert_called_once_with(approved, cancellation_event=cancellation_event)
+    assert (
+        service.retry_host_command(
+            attempt.offer,
+            approved,
+            cancellation_event=cancellation_event,
+        )
+        == "host-result"
+    )
+    host.run_host_command.assert_called_once_with(
+        HostCommandRequest.from_sandbox(approved),
+        cancellation_event=cancellation_event,
+    )
+
+
+def test_coordinator_cancellation_before_sandbox_launch_has_no_effects(tmp_path):
+    """A cancellation arriving after approval but before launch starts no sandbox process."""
+    cancellation_event = Event()
+    cancellation_event.set()
+    service, backend, _host, _interaction = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    )
+
+    attempt = service.run_sandboxed(
+        request(tmp_path),
+        "run_command",
+        cancellation_event=cancellation_event,
+    )
+
+    assert attempt.result is not None
+    assert attempt.result.outcome is SandboxOutcome.CANCELLED
+    assert attempt.result.possible_effects is False
+    assert attempt.offer is None
+    backend.run.assert_not_called()
+
+
+def test_cancelled_host_retry_never_opens_the_approval_prompt(tmp_path):
+    """A host retry cancelled before input cannot consume or exercise an old offer."""
+    service, _backend, host, interaction = coordinator(
+        tmp_path,
+        CommandProcessResult(SandboxOutcome.DENIED, detail="policy denial"),
+    )
+    approved = request(tmp_path)
+    offer = service.run_sandboxed(approved, "run_command").offer
+    interaction.prompt.reset_mock()
+    cancellation_event = Event()
+    cancellation_event.set()
+
+    assert (
+        service.retry_host_command(
+            offer,
+            approved,
+            cancellation_event=cancellation_event,
+        )
+        is None
+    )
+    interaction.prompt.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+def test_host_retry_cancelled_during_approval_never_launches(tmp_path):
+    """A reply received after cancellation cannot authorize the separately bound host run."""
+    service, _backend, host, interaction = coordinator(
+        tmp_path,
+        CommandProcessResult(SandboxOutcome.DENIED, detail="policy denial"),
+    )
+    approved = request(tmp_path)
+    offer = service.run_sandboxed(approved, "run_command").offer
+    cancellation_event = Event()
+
+    def cancel_while_prompting(*_args, **_kwargs):
+        """Model an interrupt racing with an affirmative approval reply."""
+        cancellation_event.set()
+        return "approve"
+
+    interaction.prompt.side_effect = cancel_while_prompting
+
+    assert (
+        service.retry_host_command(
+            offer,
+            approved,
+            cancellation_event=cancellation_event,
+        )
+        is None
+    )
+    host.run_host_command.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -758,6 +860,44 @@ def test_local_host_executor_cancels_and_cleans_up(tmp_path, monkeypatch, proces
 
     assert result.outcome is SandboxOutcome.CANCELLED
     kill.assert_called_once_with(process)
+
+
+def test_local_host_executor_passes_cancellation_to_process_supervisor(tmp_path, monkeypatch):
+    """Host supervision receives the run signal and reports its cleaned cancellation result."""
+    from loop.utils.process import ProcessCapture, ProcessCaptureStatus
+
+    cancellation_event = Event()
+    process = Mock(stdout=StringIO(), stderr=StringIO())
+    capture = ProcessCapture(ProcessCaptureStatus.CANCELLED, stdout="partial", exit_code=None)
+    supervise = Mock(return_value=capture)
+    monkeypatch.setattr("loop.execution.coordinator.subprocess.Popen", lambda *a, **k: process)
+    monkeypatch.setattr("loop.execution.coordinator.supervise_process", supervise)
+
+    result = LocalHostCommandExecutor().run_host_command(
+        HostCommandRequest.from_sandbox(request(tmp_path)),
+        cancellation_event=cancellation_event,
+    )
+
+    assert result.outcome is SandboxOutcome.CANCELLED
+    assert result.possible_effects is True
+    assert supervise.call_args.kwargs["cancel_event"] is cancellation_event
+
+
+def test_local_host_executor_skips_spawn_for_pre_cancelled_request(tmp_path, monkeypatch):
+    """A host executor called after cancellation never starts the approved shell."""
+    cancellation_event = Event()
+    cancellation_event.set()
+    launch = Mock()
+    monkeypatch.setattr("loop.execution.coordinator.subprocess.Popen", launch)
+
+    result = LocalHostCommandExecutor().run_host_command(
+        HostCommandRequest.from_sandbox(request(tmp_path)),
+        cancellation_event=cancellation_event,
+    )
+
+    assert result.outcome is SandboxOutcome.CANCELLED
+    assert result.possible_effects is False
+    launch.assert_not_called()
 
 
 def test_local_host_executor_fails_if_child_pipes_are_missing(tmp_path, monkeypatch):

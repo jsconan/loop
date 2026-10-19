@@ -3,6 +3,7 @@
 import os
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock
 
 import pytest
@@ -108,6 +109,36 @@ def test_installed_transport_retains_original_receipt_record_and_deadline(
             == b"unavailable response"
         )
         exchanged.assert_called_once_with(arguments[0], receipt, b"opaque request", 50)
+
+
+def test_installed_transport_forwards_cancellation_after_authenticating_authority(
+    installation, monkeypatch
+):
+    """Cancellation reaches the socket only after the original installation is revalidated."""
+    record, arguments = installation
+    publish(installation)
+    receipt = {**arguments[1], "receipt": linux_host.bind_host_file(record)}
+    monkeypatch.setattr(linux_runtime, "installation_files", Mock(return_value=receipt))
+    monkeypatch.setattr(linux_runtime.time, "monotonic", lambda: 10)
+    exchanged = Mock(return_value=b"cleanup result")
+    monkeypatch.setattr(linux_runtime, "exchange_request", exchanged)
+    cancellation_event = Event()
+
+    result = linux_runtime.exchange_installed_request(
+        record,
+        b"opaque request",
+        50,
+        cancellation_event=cancellation_event,
+    )
+
+    assert result == b"cleanup result"
+    exchanged.assert_called_once_with(
+        arguments[0],
+        receipt,
+        b"opaque request",
+        50,
+        cancellation_event=cancellation_event,
+    )
 
 
 def test_installed_transport_refuses_deadline_expiring_after_record_check(

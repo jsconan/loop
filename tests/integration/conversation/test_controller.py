@@ -15,6 +15,7 @@ from rich.console import Console
 
 from loop import (
     AnswerCompleted,
+    CommandContext,
     CommandManager,
     ConsoleInteraction,
     Loop,
@@ -26,6 +27,70 @@ from loop.configuration import ConfigurationCommands, ConfigurationManager
 from loop.session import LocalSessionNameGenerator
 
 pytestmark = pytest.mark.integration
+
+
+def test_async_loop_commands_can_reserve_the_native_terminal(tmp_path):
+    """An idle synchronous command hands off the terminal while its async loop awaits it."""
+    output = StringIO()
+    with create_pipe_input() as pipe:
+        prompt = PromptSession(input=pipe, output=DummyOutput())
+        source = ConsoleInteraction(session=prompt, console=Console(file=output), markdown=False)
+        controller = SessionController(source)
+        loop = Loop.create_default(
+            SimpleNamespace(default_model="fixture", get_context_window=lambda _model: None),
+            interaction=controller.interaction,
+            run_control=controller.control,
+            working_directory=tmp_path,
+            session_name_generator=LocalSessionNameGenerator(),
+        )
+        controller.bind_command_manager(loop.command_manager)
+
+        def terminal_probe(context: CommandContext) -> None:
+            """Reserve and release terminal input without privileged or external operations."""
+            with context.interaction.terminal_context():
+                context.interaction.info("terminal reserved")
+            context.interaction.info("terminal released")
+
+        loop.command_manager.register(terminal_probe)
+
+        async def scenario():
+            """Dispatch through the actual async loop and stop after terminal ownership returns."""
+            completed = asyncio.Event()
+            original_info = source.info
+
+            def info(message=""):
+                """Render output and observe the terminal's release on its UI owner."""
+                original_info(message)
+                if message == "terminal released":
+                    completed.set()
+
+            source.info = info
+            task = asyncio.create_task(
+                controller.run_async(
+                    lambda receive: loop.run_async(input_source=receive),
+                    route_idle_commands=True,
+                )
+            )
+            ready = asyncio.create_task(completed.wait())
+            try:
+                pipe.send_text("/terminal_probe\n")
+                done, _ = await asyncio.wait(
+                    {task, ready}, timeout=5, return_when=asyncio.FIRST_COMPLETED
+                )
+                if task in done:
+                    await task
+                assert completed.is_set(), "Terminal command did not finish"
+                pipe.send_text("/exit\n")
+                await asyncio.wait_for(task, timeout=5)
+            finally:
+                controller.stop()
+                ready.cancel()
+                await asyncio.gather(task, ready, return_exceptions=True)
+
+        asyncio.run(scenario())
+
+    assert "terminal reserved" in output.getvalue()
+    assert "terminal released" in output.getvalue()
 
 
 @pytest.mark.parametrize("mode", ["queue", "interrupt", "steer", "default-steer"])

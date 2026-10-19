@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -72,6 +73,31 @@ def request(root: Path, **changes) -> SandboxRequest:
     }
     values.update(changes)
     return SandboxRequest.create(**values)
+
+
+def test_backend_and_final_launch_gate_honor_pre_cancelled_request(monkeypatch, tmp_path):
+    """Cancellation during preparation or just before spawn prevents a child launch."""
+    cancellation_event = Event()
+    cancellation_event.set()
+    launch = MagicMock()
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", launch)
+
+    result = MacOSSeatbeltBackend().run(
+        request(tmp_path),
+        cancellation_event=cancellation_event,
+    )
+    final_gate = MacOSSeatbeltBackend._execute(
+        request(tmp_path),
+        "",
+        {},
+        "",
+        None,
+        cancellation_event=cancellation_event,
+    )
+
+    assert result.outcome is SandboxOutcome.CANCELLED
+    assert final_gate.outcome is SandboxOutcome.CANCELLED
+    launch.assert_not_called()
 
 
 def regex_patterns(profile):

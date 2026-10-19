@@ -694,7 +694,7 @@ class Loop:
             session = self.session
             handled_command = False
             if not isinstance(user_input, SteeringMessage):
-                handled_command = self._command_manager.handle_user_command(user_input)
+                handled_command = await self._command_manager.handle_user_command_async(user_input)
             if handled_command:
                 if self.session is not session:
                     self._model_selection.restore(self.session.model)

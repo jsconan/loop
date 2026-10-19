@@ -1,5 +1,6 @@
 """Tests for user-command registration and dispatch."""
 
+import asyncio
 from unittest.mock import Mock
 
 import pytest
@@ -467,6 +468,112 @@ def test_handle_user_command_deserializes_arguments_and_injects_context():
     assert manager.handle_user_command("/inspect_context 3") is True
     assert manager.call("inspect_context", "count=4") is None
     assert calls == [("inspect_context", 3), ("inspect_context", 4)]
+
+
+def test_handle_user_command_async_awaits_dispatch_and_preserves_interaction(monkeypatch):
+    """Async commands use awaited worker dispatch while ordinary text needs no worker."""
+    interaction = Mock(spec=Interaction)
+    manager = CommandManager()
+    observed = []
+    workers = []
+
+    def probe(context: CommandContext) -> None:
+        """Record the interaction supplied to this command."""
+        observed.append(context.interaction)
+
+    manager.register(probe)
+
+    def dispatch(loop, executor, function, *args):
+        """Execute the controlled worker boundary without creating a thread."""
+        workers.append(args)
+        future = loop.create_future()
+        future.set_result(function(*args))
+        return future
+
+    monkeypatch.setattr(asyncio.BaseEventLoop, "run_in_executor", dispatch)
+    assert asyncio.run(manager.handle_user_command_async("hello", interaction)) is False
+    assert observed == workers == []
+    assert asyncio.run(manager.handle_user_command_async("/probe", interaction)) is True
+    assert observed == [interaction]
+    assert workers == [(manager.handle_user_command, "/probe", interaction)]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_handle_user_command_async_settles_after_repeated_cancellation(monkeypatch, failure):
+    """Cancelled dispatch retains command ownership until cleanup and preserves cancellation."""
+    manager = CommandManager()
+
+    async def scenario():
+        """Cancel twice while a controlled worker still owns command cleanup."""
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def dispatch(*args):
+            """Hold the command until cleanup is released, optionally exposing its failure."""
+            started.set()
+            await release.wait()
+            if failure:
+                raise RuntimeError("command failed")
+            return True
+
+        monkeypatch.setattr(
+            asyncio.get_running_loop(),
+            "run_in_executor",
+            lambda *args: asyncio.create_task(dispatch()),
+        )
+        task = asyncio.create_task(manager.handle_user_command_async("/probe"))
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await task
+        if failure:
+            assert captured.value.__notes__ == ["Command also stopped with RuntimeError."]
+
+    asyncio.run(scenario())
+
+
+def test_handle_user_command_async_preserves_completed_command_cancellation(monkeypatch):
+    """Cancellation arriving with command completion still propagates to its owner."""
+    manager = CommandManager()
+
+    async def scenario():
+        """Finish the worker as its awaiting owner receives cancellation."""
+        owner = asyncio.current_task()
+
+        async def dispatch(*args):
+            """Request caller cancellation immediately before reporting command completion."""
+            owner.cancel()
+            return True
+
+        monkeypatch.setattr(
+            asyncio.get_running_loop(),
+            "run_in_executor",
+            lambda *args: asyncio.create_task(dispatch()),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await manager.handle_user_command_async("/probe")
+
+    asyncio.run(scenario())
+
+
+def test_handle_user_command_async_preserves_worker_keyboard_interrupt(monkeypatch):
+    """A worker interruption reaches its awaiting owner without escaping an auxiliary task."""
+    manager = CommandManager()
+
+    async def scenario():
+        """Expose an interrupted executor future at the native worker boundary."""
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()
+        pending.set_exception(KeyboardInterrupt())
+        monkeypatch.setattr(loop, "run_in_executor", lambda *args: pending)
+        with pytest.raises(KeyboardInterrupt):
+            await manager.handle_user_command_async("/probe")
+
+    asyncio.run(scenario())
 
 
 def test_handle_user_command_reports_invalid_and_unknown_commands():

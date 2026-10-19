@@ -522,6 +522,115 @@ def test_supervise_process_cancels_before_reaping_the_group_leader(process_os):
     process.wait.assert_called_once()
 
 
+@pytest.mark.parametrize("cancel_reader", [0, 1])
+def test_supervise_process_cancels_while_descendants_retain_pipes(
+    monkeypatch, process_os, cancel_reader
+):
+    """Cancellation interrupts pipe draining after leader exit and retains cleanup output."""
+    clock = SimpleNamespace(current=10.0)
+    monkeypatch.setattr("loop.utils.process.time.monotonic", lambda: clock.current)
+    process = MagicMock(pid=123, returncode=0)
+    process.stdout.read.side_effect = ["ready", ""]
+    process.stderr.read.side_effect = ["error", ""]
+    cancelled = threading.Event()
+    terminate = MagicMock(side_effect=lambda owned: owned.wait.assert_not_called())
+    readers = []
+
+    def thread_factory(*, target, daemon):
+        """Keep the selected pipe open until group cleanup releases its EOF."""
+        index = len(readers)
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+
+        def join(timeout):
+            """Request cancellation during a bounded join, then drain after termination."""
+            if not thread.is_alive():
+                return
+            if index < cancel_reader or terminate.called:
+                target()
+                thread.is_alive.return_value = False
+            else:
+                clock.current += timeout
+                cancelled.set()
+
+        thread.join.side_effect = join
+        readers.append(thread)
+        return thread
+
+    capture = supervise_process(
+        process,
+        100,
+        terminate=terminate,
+        thread_factory=thread_factory,
+        cancel_event=cancelled,
+    )
+
+    assert capture.status is ProcessCaptureStatus.CANCELLED
+    assert clock.current < 11
+    assert capture.stdout == "ready" and capture.stderr == "error"
+    assert capture.stdout_discarded == capture.stderr_discarded == 0
+    assert capture.exit_code is None
+    terminate.assert_called_once_with(process)
+    process.wait.assert_called_once()
+    process_os.waitid.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("complete", ProcessCaptureStatus.COMPLETED),
+        ("deadline", ProcessCaptureStatus.TIMED_OUT),
+        ("cancel-on-exit", ProcessCaptureStatus.CANCELLED),
+    ],
+)
+def test_supervise_process_bounds_cancellable_draining_after_leader_exit(
+    monkeypatch, process_os, mode, expected
+):
+    """Cancellable draining preserves completion, deadlines and cancellation at leader exit."""
+    clock = SimpleNamespace(current=10.0)
+    monkeypatch.setattr("loop.utils.process.time.monotonic", lambda: clock.current)
+    process = MagicMock(pid=123, returncode=0)
+    process.stdout.read.side_effect = ["ready", ""]
+    process.stderr.read.side_effect = ["error", ""]
+    cancelled = threading.Event()
+    terminate = MagicMock()
+    if mode == "cancel-on-exit":
+        process_os.waitid.side_effect = lambda *args: cancelled.set() or SimpleNamespace(si_pid=123)
+
+    def thread_factory(*, target, daemon):
+        """Model reader completion or a retained pipe under a controlled clock."""
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+
+        def join(timeout):
+            """Advance a retained pipe's wait or finish reading available output once."""
+            if thread.is_alive():
+                if mode == "complete" or terminate.called:
+                    target()
+                    thread.is_alive.return_value = False
+                else:
+                    clock.current += timeout
+
+        thread.join.side_effect = join
+        return thread
+
+    capture = supervise_process(
+        process,
+        10.025,
+        terminate=terminate,
+        thread_factory=thread_factory,
+        cancel_event=cancelled,
+    )
+
+    assert capture.status is expected
+    assert capture.stdout == "ready" and capture.stderr == "error"
+    assert capture.stdout_discarded == capture.stderr_discarded == 0
+    assert capture.exit_code == (0 if mode == "complete" else None)
+    assert clock.current <= 10.025
+    terminate.assert_called_once_with(process)
+    process.wait.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("cancelled", "expected"),
     [

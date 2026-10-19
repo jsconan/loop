@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Iterable
+from contextvars import copy_context
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
@@ -284,6 +286,54 @@ class CommandManager:
         name, arguments = command
         self.call(name, arguments, interaction=interaction)
         return True
+
+    async def handle_user_command_async(
+        self,
+        user_input: str,
+        interaction: Interaction | None = None,
+    ) -> bool:
+        """Await synchronous command dispatch without blocking its async interaction owner.
+
+        Dispatch one command in a worker while its caller awaits completion. Cancellation waits
+        for the command to settle before returning ownership, including repeated cancellation.
+        Ordinary conversation input returns immediately without starting a worker.
+
+        Args:
+            user_input (str): Stripped user input to classify and dispatch.
+            interaction (Interaction | None): Invocation interaction overriding the default.
+
+        Returns:
+            bool: Whether the input was consumed as a command.
+
+        Raises:
+            asyncio.CancelledError: After owned command cleanup when the caller is cancelled.
+            KeyboardInterrupt: A synchronous command interrupts its execution.
+            CommandArgumentError: Argument syntax or binding is invalid without an interaction.
+            ProblemException: A command reports a problem without an interaction to display it.
+            ValidationError: Arguments fail schema validation without a reporting interaction.
+            ValueError: Dispatch requires an unavailable interaction.
+        """
+        if not self.is_user_command(user_input):
+            return False
+        pending = asyncio.get_running_loop().run_in_executor(
+            None,
+            copy_context().run,
+            self.handle_user_command,
+            user_input,
+            interaction,
+        )
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError as error:
+            while not pending.done():
+                try:
+                    await asyncio.wait({pending})
+                except asyncio.CancelledError:
+                    continue
+            failure = pending.exception()
+            if failure is not None:
+                error.add_note(f"Command also stopped with {type(failure).__name__}.")
+            raise
 
     def is_user_command(self, user_input: str) -> bool:
         """Return whether input uses the registered command syntax.

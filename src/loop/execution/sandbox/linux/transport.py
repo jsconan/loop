@@ -12,6 +12,7 @@ import socket
 import stat
 import struct
 import time
+from threading import Event
 
 from ....constants import (
     MAX_NATIVE_RESULT_BYTES,
@@ -22,6 +23,7 @@ from ....constants import (
 )
 from .admission import MAX_FRAME_BYTES, GenerationAdmission
 from .constants import (
+    NATIVE_CANCEL_FRAME,
     NATIVE_REQUEST_MAGIC,
     PEER_CREDENTIALS_FORMAT,
     PEER_CREDENTIALS_SIZE,
@@ -90,13 +92,16 @@ def exchange_request(
     files: dict[str, HostFile],
     payload: bytes,
     deadline: float,
+    *,
+    cancellation_event: Event | None = None,
 ) -> bytes:
     """Send one bounded opaque request to the original protected generation listener.
 
     Call from the ordinary client after authorization, using installation authority supplied
     by the management owner. Authenticate exact unit bytes, fixed local socket ownership and
     inode, and the root systemd listener peer before transmitting any content. Send the existing
-    version-one admission frame and half-close, then read a bounded response through EOF.
+    version-one admission frame and read a bounded response through EOF. Cancellable clients keep
+    the write side open for one supervisor control byte and wait for the receiver's cleanup result.
     Revalidate installed and socket authority before returning. Do not retry: EOF, cancellation,
     a deadline or transport error does not establish whether command effects occurred.
 
@@ -111,6 +116,8 @@ def exchange_request(
         deadline (float): Absolute monotonic execution budget for connection and send; response
             delivery
             has a fixed additional five-second cleanup/delivery interval.
+        cancellation_event (Event | None): Optional thread-safe run cancellation signal. When set,
+            the client requests process cancellation and waits for the receiver's cleanup result.
 
     Returns:
         bytes: Nonempty response within MAX_NATIVE_RESULT_BYTES, without interpretation or
@@ -163,14 +170,29 @@ def exchange_request(
         connection.sendall(
             NATIVE_REQUEST_MAGIC + struct.pack(REQUEST_LENGTH_FORMAT, len(payload)) + payload
         )
-        connection.shutdown(socket.SHUT_WR)
+        if cancellation_event is None:
+            connection.shutdown(socket.SHUT_WR)
         delivery_deadline = deadline + NATIVE_RESULT_DELIVERY_SECONDS
         response = bytearray()
+        cancel_sent = False
         while True:
-            connection.settimeout(_remaining(delivery_deadline))
-            block = connection.recv(
-                min(_RESPONSE_READ_CHUNK_BYTES, MAX_NATIVE_RESULT_BYTES + 1 - len(response))
+            remaining = _remaining(delivery_deadline)
+            connection.settimeout(
+                min(remaining, 0.05)
+                if cancellation_event is not None and not response and not cancel_sent
+                else remaining
             )
+            try:
+                block = connection.recv(
+                    min(_RESPONSE_READ_CHUNK_BYTES, MAX_NATIVE_RESULT_BYTES + 1 - len(response))
+                )
+            except TimeoutError:
+                if cancellation_event is None:
+                    raise
+                if cancellation_event.is_set() and not response and not cancel_sent:
+                    connection.sendall(NATIVE_CANCEL_FRAME)
+                    cancel_sent = True
+                continue
             if not block:
                 break
             response.extend(block)

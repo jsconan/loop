@@ -1089,6 +1089,7 @@ def test_runner_recovers_unstarted_tools_before_requerying():
         instructions_manager=runner.instructions_manager,
         permission_manager=runner.permission_manager,
         call_id="call",
+        cancellation_event=None,
         execution_started=ANY,
         file_observations=ANY,
     )
@@ -1903,6 +1904,7 @@ def test_async_tool_execution_preserves_boundary_records_and_outcomes(
     call = ToolCall(call_id="call", name="effect", arguments="{}")
     observations = Mock(spec=FileObservations) if observe else None
     runner._file_observations = observations
+    runner._run_control = RunControl()
     runner.agent.tools.call_with_timing_async = AsyncMock(return_value=(output, 0.25))
 
     result = asyncio.run(
@@ -1914,6 +1916,7 @@ def test_async_tool_execution_preserves_boundary_records_and_outcomes(
     )
 
     kwargs = runner.agent.tools.call_with_timing_async.await_args.kwargs
+    assert kwargs["cancellation_event"] is runner._run_control.cancellation_event
     kwargs["execution_started"]()
     assert result.succeeded is succeeded
     assert result.duration_seconds == 0.25

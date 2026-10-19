@@ -1047,11 +1047,17 @@ class MacOSSeatbeltBackend:
         except (OSError, ValueError):
             return None
 
-    def run(self, request: SandboxRequest) -> CommandProcessResult:
+    def run(
+        self,
+        request: SandboxRequest,
+        *,
+        cancellation_event: threading.Event | None = None,
+    ) -> CommandProcessResult:
         """Run one bound shell request, failing closed on preparation or launch errors.
 
         Args:
             request (SandboxRequest): Approved shell source and operating-system authority.
+            cancellation_event (threading.Event | None): Optional signal requesting child cleanup.
 
         Returns:
             CommandProcessResult: Bounded output and exit status or a typed boundary failure.
@@ -1062,6 +1068,8 @@ class MacOSSeatbeltBackend:
                 detail="Unsupported macOS policy.",
                 failure_context="No compatible native sandbox policy is available.",
             )
+        if cancellation_event is not None and cancellation_event.is_set():
+            return CommandProcessResult(SandboxOutcome.CANCELLED)
         if failure := _request_failure(request):
             return failure
         try:
@@ -1156,7 +1164,14 @@ class MacOSSeatbeltBackend:
                     if failure := _request_failure(request):
                         return failure
                     _exact_executable_reads(request)
-                    return self._execute(request, profile, environment, tag, monitor)
+                    return self._execute(
+                        request,
+                        profile,
+                        environment,
+                        tag,
+                        monitor,
+                        cancellation_event=cancellation_event,
+                    )
                 finally:
                     monitor.unregister(tag)
         except (TimeoutError, subprocess.TimeoutExpired) as exc:
@@ -1179,8 +1194,12 @@ class MacOSSeatbeltBackend:
         environment: dict[str, str],
         tag: str,
         monitor: DenialMonitor,
+        *,
+        cancellation_event: threading.Event | None = None,
     ) -> CommandProcessResult:
         """Capture both child streams with bounded storage and a single deadline."""
+        if cancellation_event is not None and cancellation_event.is_set():
+            return CommandProcessResult(SandboxOutcome.CANCELLED)
         started = time.strftime("%Y-%m-%d %H:%M:%S%z", time.localtime())
         telemetry_audit(
             "sandbox.launching",
@@ -1221,6 +1240,7 @@ class MacOSSeatbeltBackend:
             terminate=kill_process_group,
             reader=read_bounded_stream,
             thread_factory=threading.Thread,
+            cancel_event=cancellation_event,
         )
         if capture.status is ProcessCaptureStatus.UNAVAILABLE:
             return CommandProcessResult(

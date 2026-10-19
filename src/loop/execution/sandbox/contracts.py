@@ -12,6 +12,7 @@ import time
 from dataclasses import asdict, dataclass, fields, replace
 from enum import StrEnum
 from pathlib import Path
+from threading import Event
 from typing import Protocol
 from uuid import UUID, uuid4
 
@@ -970,11 +971,17 @@ class SandboxBackend(Protocol):
             ValueError: A discovered runtime reference is unsafe or ambiguous.
         """
 
-    def run(self, request: SandboxRequest) -> CommandProcessResult:
+    def run(
+        self,
+        request: SandboxRequest,
+        *,
+        cancellation_event: Event | None = None,
+    ) -> CommandProcessResult:
         """Run one approved request or return a typed sandbox failure.
 
         Args:
             request (SandboxRequest): Exact authorized command and policy.
+            cancellation_event (Event | None): Optional request to stop and clean up its process.
 
         Returns:
             CommandProcessResult: Captured completion or classified boundary outcome.
