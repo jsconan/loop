@@ -1,7 +1,7 @@
 """Run an interactive conversation with an LLM backend."""
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Self
 
@@ -20,7 +20,7 @@ from .control import RunControl
 from .errors import Problem, log_problem
 from .execution.sandbox import SandboxCommands
 from .instructions import InstructionsManager, RuntimeEnvironment, SkillCommands
-from .interaction import Interaction
+from .interaction import AsyncInteractionInput, Interaction
 from .mentions import MentionManager, ProjectPathMentionHandler
 from .mentions.parser import parse_mentions
 from .model_selection import ModelCommands, ModelSelection
@@ -567,8 +567,13 @@ class Loop:
                 dispatch. Defaults to synchronous interaction prompts.
 
         Raises:
+            TypeError: If an agent run or recovered run has no completion metrics.
             KeyboardInterrupt: If the configured stop signal interrupts agent execution.
             WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
+            CancelledError: If the caller cancels the async conversation task.
+
+        Returns:
+            None: After the conversation has ended.
         """
         recovery_pending = self._recover_session()
         while not self._command_manager.exit_requested:
@@ -657,6 +662,113 @@ class Loop:
 
         self._interaction.conversation_ended()
 
+    async def run_async(
+        self,
+        *,
+        input_source: Callable[[CompletionManager], Awaitable[object]] | None = None,
+    ) -> None:
+        """Run conversation orchestration through async input and agent operations.
+
+        Args:
+            input_source (Callable[[CompletionManager], Awaitable[object]] | None): Optional
+                awaitable mailbox reader for ordinary conversation input. It receives the live
+                completion manager and returns text or ``False`` to exit. Defaults to the
+                interaction's async prompt when supported, then its synchronous prompt.
+
+        Raises:
+            KeyboardInterrupt: If the configured stop signal interrupts agent execution.
+            WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
+        """
+        recovery_pending = await self._recover_session_async()
+        while not self._command_manager.exit_requested:
+            if input_source is not None:
+                user_input = await input_source(self._completion_manager)
+            elif isinstance(self._interaction, AsyncInteractionInput):
+                user_input = await self._interaction.prompt_async(
+                    completer=self._completion_manager
+                )
+            else:
+                user_input = self._interaction.prompt(completer=self._completion_manager)
+            if user_input is False:
+                break
+            session = self.session
+            handled_command = False
+            if not isinstance(user_input, SteeringMessage):
+                handled_command = self._command_manager.handle_user_command(user_input)
+            if handled_command:
+                if self.session is not session:
+                    self._model_selection.restore(self.session.model)
+                    recovery_pending = await self._recover_session_async()
+                continue
+            if recovery_pending:
+                self._interaction.warning(
+                    "Recover the interrupted run or start a new session before sending a message."
+                )
+                continue
+            if self._skill_hints_enabled:
+                try:
+                    skill_mentions = tuple(
+                        dict.fromkeys(
+                            mention.value
+                            for mention in parse_mentions(
+                                user_input,
+                                {"$": self._instructions_manager.skill_manager.names},
+                            )
+                        )
+                    )
+                    if not self._instructions_manager.set_skill_catalog_priorities(
+                        skill_mentions, self._agent
+                    ):
+                        self._interaction.warning(
+                            "Referenced skill metadata could not fit in the instruction budget; "
+                            "use activate_skill to load a skill."
+                        )
+                except (OSError, UnicodeError, ValueError) as error:
+                    problem = Problem.from_exception(
+                        error,
+                        code="skill_hint.preparation_failed",
+                        title="Could not prepare skill hint",
+                        operation="prepare_skill_hint",
+                    )
+                    log_problem(_LOGGER, problem, error)
+                    self._interaction.report(problem)
+                    continue
+            try:
+                context = self._mention_manager.resolve(user_input)
+            except (OSError, UnicodeError, ValueError) as error:
+                problem = Problem.from_exception(
+                    error,
+                    code="mention.resolution_failed",
+                    title="Could not resolve mention",
+                    operation="resolve_mention",
+                )
+                log_problem(_LOGGER, problem, error)
+                self._interaction.report(problem)
+                if self._skill_hints_enabled:
+                    self._clear_skill_catalog_priorities()
+                continue
+            try:
+                with self._session_manager.next_message_span():
+                    for reference in context:
+                        included = reference.included_bytes
+                        size = reference.size_bytes
+                        if included < size:
+                            self._interaction.info(
+                                f"Attached {reference.path}: {included} of {size} bytes"
+                                "; additional content stays local until read."
+                            )
+                        else:
+                            self._interaction.info(f"Attached {reference.path}: {included} bytes.")
+                    telemetry_activity("message.accepted", component="session_manager")
+                    self._session_manager.add_user_message(user_input, context=context)
+                    result = await self._agent_runner.run_async()
+                    self._complete_agent_run(result)
+            finally:
+                if self._skill_hints_enabled:
+                    self._clear_skill_catalog_priorities()
+
+        self._interaction.conversation_ended()
+
     def _clear_skill_catalog_priorities(self) -> None:
         """Clear request-scoped skill priorities without masking the preceding outcome."""
         try:
@@ -687,6 +799,14 @@ class Loop:
     def _recover_session(self) -> bool:
         """Recover a previously interrupted run, if any."""
         recovery = self._agent_runner.recover_session()
+        recovery_pending = recovery.pending
+        if recovery.result is not None:
+            self._complete_agent_run(recovery.result)
+        return recovery_pending
+
+    async def _recover_session_async(self) -> bool:
+        """Recover an interrupted run through async permission and recovery prompts."""
+        recovery = await self._agent_runner.recover_session_async()
         recovery_pending = recovery.pending
         if recovery.result is not None:
             self._complete_agent_run(recovery.result)

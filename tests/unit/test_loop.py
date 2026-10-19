@@ -37,6 +37,7 @@ from loop import (
     PermissionPreset,
     Response,
     ResponseCompleted,
+    RunMetrics,
     RuntimeEnvironment,
     Session,
     SessionController,
@@ -59,6 +60,7 @@ from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
 from loop.conversation import ConversationCommands
+from loop.models import SteeringMessage
 from loop.permissions import PermissionLoadFailure
 from loop.session import GeneratedSessionName, LocalSessionNameGenerator
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
@@ -1128,6 +1130,353 @@ def test_run_rejects_a_runner_result_without_metrics(tmp_path):
 
     with pytest.raises(TypeError, match="completion metrics"):
         loop.run()
+
+
+def test_run_async_uses_async_input_and_agent_orchestration(tmp_path):
+    """Async loop entry reads through native input and never calls the sync runner."""
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.response_context.return_value = nullcontext()
+    interaction.prompt_async = AsyncMock(side_effect=["hello", False])
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._skill_hints_enabled = False
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    loop.agent_runner.run = Mock(side_effect=AssertionError("sync runner used"))
+    loop.agent_runner.run_async = AsyncMock(
+        return_value=AgentRunResult(
+            final_response=None,
+            turns=0,
+            stop_reason="cancelled",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+
+    asyncio.run(loop.run_async())
+
+    assert loop.messages == [Message(role="user", content="hello")]
+    assert interaction.prompt_async.await_count == 2
+    assert all(
+        prompt.kwargs["completer"] is loop._completion_manager
+        for prompt in interaction.prompt_async.await_args_list
+    )
+    loop.agent_runner.run_async.assert_awaited_once_with()
+    interaction.conversation_ended.assert_called_once_with()
+
+
+def test_run_async_accepts_an_awaitable_input_source_and_preserves_steering(tmp_path):
+    """Explicit steering text bypasses command dispatch on the async path."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    loop.agent_runner.run_async = AsyncMock(
+        return_value=AgentRunResult(
+            final_response=None,
+            turns=0,
+            stop_reason="cancelled",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+    values = iter((SteeringMessage("/exit"), False))
+
+    async def read_input(_completer):
+        """Return a steering message, then finish the async input stream."""
+        return next(values)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    assert loop.messages == [Message(role="user", content="/exit")]
+    loop.agent_runner.run_async.assert_awaited_once_with()
+
+
+def test_run_async_falls_back_to_synchronous_prompt_for_legacy_interactions(tmp_path):
+    """Async orchestration retains synchronous interaction adapters."""
+    interaction = output_interaction()
+    interaction.prompt.return_value = False
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+
+    asyncio.run(loop.run_async())
+
+    interaction.prompt.assert_called_once_with(completer=loop._completion_manager)
+    interaction.conversation_ended.assert_called_once_with()
+
+
+def test_run_async_keeps_handled_commands_in_the_current_session(tmp_path):
+    """Handled commands that retain their session do not trigger recovery again."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._skill_hints_enabled = False
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+
+    def probe():
+        """Handle one command without changing the current session."""
+
+    loop.command_manager.register(probe)
+    values = iter(("/probe", False))
+
+    async def read_input(_completer):
+        """Return a handled command, then end the conversation."""
+        return next(values)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    loop.agent_runner.recover_session_async.assert_awaited_once_with()
+
+
+def test_run_async_skips_input_after_exit_was_requested(tmp_path):
+    """An already requested exit still finalizes the conversation once."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    loop.command_manager.request_exit()
+
+    asyncio.run(loop.run_async())
+
+    interaction.prompt.assert_not_called()
+    interaction.conversation_ended.assert_called_once_with()
+
+
+def test_run_async_recovers_session_changes_and_blocks_messages_when_recovery_is_pending(
+    tmp_path,
+):
+    """New sessions re-run async recovery and pending recovery blocks ordinary messages."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    recovered = AgentRunResult(
+        final_response=None,
+        turns=0,
+        stop_reason="cancelled",
+        metrics=RunMetrics(
+            active_duration_seconds=0,
+            model_duration_seconds=0,
+            tool_duration_seconds=0,
+            message_count=0,
+            item_count=0,
+        ),
+    )
+    loop.agent_runner.recover_session_async = AsyncMock(
+        side_effect=[
+            SimpleNamespace(pending=False, result=recovered),
+            SimpleNamespace(pending=True, result=None),
+        ]
+    )
+    loop.agent_runner.run_async = AsyncMock()
+    values = iter(("/new", "hello", False))
+
+    async def read_input(_completer):
+        """Feed the new-session command and an input blocked by pending recovery."""
+        return next(values)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    assert loop.agent_runner.recover_session_async.await_count == 2
+    loop.agent_runner.run_async.assert_not_awaited()
+    interaction.run_metrics.assert_called_once_with(recovered.metrics)
+    interaction.warning.assert_called_once_with(
+        "Recover the interrupted run or start a new session before sending a message."
+    )
+
+
+def test_run_async_handles_skill_priorities_and_attached_reference_sizes(tmp_path):
+    """Async message preparation retains skill hints and attachment size notices."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._skill_hints_enabled = True
+    instructions = Mock()
+    instructions.skill_manager.names = ("guide",)
+    instructions.set_skill_catalog_priorities.return_value = True
+    loop._instructions_manager = instructions
+    references = [
+        ContextReference(
+            kind="file",
+            path="small.txt",
+            content="text",
+            included_bytes=4,
+            size_bytes=4,
+            truncated=False,
+        ),
+        ContextReference(
+            kind="file",
+            path="large.txt",
+            content="te",
+            included_bytes=2,
+            size_bytes=4,
+            truncated=True,
+        ),
+    ]
+    loop._mention_manager.resolve = Mock(return_value=references)
+    loop._session_manager.add_user_message = Mock()
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    loop.agent_runner.run_async = AsyncMock(
+        return_value=AgentRunResult(
+            final_response=None,
+            turns=0,
+            stop_reason="cancelled",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+    values = iter(("$guide", False))
+
+    async def read_input(_completer):
+        """Return a skill mention, then end the input stream."""
+        return next(values)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    instructions.set_skill_catalog_priorities.assert_has_calls(
+        [call(("guide",), loop.agent), call(())]
+    )
+    assert interaction.info.call_args_list[:2] == [
+        call("Attached small.txt: 4 bytes."),
+        call("Attached large.txt: 2 of 4 bytes; additional content stays local until read."),
+    ]
+
+
+def test_run_async_warns_when_skill_metadata_does_not_fit(tmp_path):
+    """A rejected skill hint warns but still runs the requested message."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._skill_hints_enabled = True
+    instructions = Mock()
+    instructions.skill_manager.names = ("guide",)
+    instructions.set_skill_catalog_priorities.return_value = False
+    loop._instructions_manager = instructions
+    loop._mention_manager.resolve = Mock(return_value=[])
+    loop._session_manager.add_user_message = Mock()
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    loop.agent_runner.run_async = AsyncMock(
+        return_value=AgentRunResult(
+            final_response=None,
+            turns=0,
+            stop_reason="cancelled",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+    values = iter(("$guide", False))
+
+    async def read_input(_completer):
+        """Return one skill reference, then finish the input stream."""
+        return next(values)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    interaction.warning.assert_called_once_with(
+        "Referenced skill metadata could not fit in the instruction budget; "
+        "use activate_skill to load a skill."
+    )
+    loop.agent_runner.run_async.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize(
+    ("failure", "skill_hints_enabled"),
+    [("priority", True), ("mention", True), ("mention", False)],
+)
+def test_run_async_reports_message_preparation_failures(tmp_path, failure, skill_hints_enabled):
+    """Async preparation errors report safely and keep the conversation available."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._skill_hints_enabled = skill_hints_enabled
+    instructions = Mock()
+    instructions.skill_manager.names = ("guide",)
+    instructions.set_skill_catalog_priorities.side_effect = (
+        ValueError("priority") if failure == "priority" else None
+    )
+    loop._instructions_manager = instructions
+    if failure == "mention":
+        loop._mention_manager.resolve = Mock(side_effect=OSError("mention"))
+    loop.agent_runner.run_async = AsyncMock()
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    values = iter(("$guide", False))
+
+    async def read_input(_completer):
+        """Return one preparation input, then end the conversation."""
+        return next(values)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    interaction.report.assert_called_once()
+    assert loop.agent_runner.run_async.await_count == 0
+    if failure == "mention" and skill_hints_enabled:
+        instructions.set_skill_catalog_priorities.assert_has_calls(
+            [call(("guide",), loop.agent), call(())]
+        )
+    elif failure == "mention":
+        instructions.set_skill_catalog_priorities.assert_not_called()
 
 
 def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):

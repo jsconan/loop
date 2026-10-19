@@ -317,6 +317,30 @@ class AgentRunner:
             )
             return result
 
+    async def run_async(self) -> AgentRunResult:
+        """Run model and tool turns through native asynchronous operations.
+
+        Returns:
+            AgentRunResult: Final response, completed turn count, and termination reason. Scoped
+                interruption settles outstanding calls and returns a cancelled result.
+
+        Raises:
+            KeyboardInterrupt: If the configured control requests a stop.
+            RuntimeError: If the configured control already owns another run.
+            SessionExecutionConflictError: If another owner is executing this logical session.
+            asyncio.CancelledError: If the owning async task is cancelled.
+        """
+        with self._session_manager.execution(), telemetry_span():
+            telemetry_activity("agent.run.started", component="agent_runner")
+            result = await self._run_from_boundary_async()
+            telemetry_activity(
+                "agent.run.completed",
+                component="agent_runner",
+                stop_reason=result.stop_reason,
+                turns=result.turns,
+            )
+            return result
+
     def recover_session(self) -> AgentRecoveryStatus:
         """Execute an approved recovery plan for the active session.
 
@@ -340,6 +364,30 @@ class AgentRunner:
         with self._session_manager.execution():
             return AgentRecoveryStatus(pending=False, result=self._recover(state))
 
+    async def recover_session_async(self) -> AgentRecoveryStatus:
+        """Execute an approved recovery plan using asynchronous interaction and tools.
+
+        Returns:
+            AgentRecoveryStatus: Recovered run result and whether unresolved recovery remains.
+
+        Raises:
+            KeyboardInterrupt: If the configured control requests a stop.
+            RunInterrupted: If the configured control interrupts recovery.
+            SessionExecutionConflictError: If another owner is executing this logical session.
+            asyncio.CancelledError: If the recovery task is cancelled.
+        """
+        self._checkpoint()
+        state = self._session_manager.recovery_state
+        if state is None:
+            return AgentRecoveryStatus(pending=False)
+        if not await self._confirm_async(
+            "This session stopped during an agent run. Recover and continue it?",
+            default=False,
+        ):
+            return AgentRecoveryStatus(pending=True)
+        with self._session_manager.execution():
+            return AgentRecoveryStatus(pending=False, result=await self._recover_async(state))
+
     def _recover(self, state: SessionRecoveryState) -> AgentRunResult:
         """Continue one approved recovery plan from its durable execution boundary."""
         if state.action == "finalize_run":
@@ -353,6 +401,20 @@ class AgentRunner:
             )
 
         return self._run_from_boundary(recovery=state)
+
+    async def _recover_async(self, state: SessionRecoveryState) -> AgentRunResult:
+        """Continue one approved recovery plan through asynchronous operations."""
+        if state.action == "finalize_run":
+            return self._record_run_result(
+                final_response=None,
+                turns=0,
+                stop_reason="completed",
+                started_at=utc_now(),
+                calls=[],
+                tools=[],
+            )
+
+        return await self._run_from_boundary_async(recovery=state)
 
     def _recover_tools(
         self,
@@ -382,6 +444,38 @@ class AgentRunner:
                 continue
             tools.extend(
                 self._execute_tool_calls((pending.call,), present=pending.status == "not_started")
+            )
+
+    async def _recover_tools_async(
+        self,
+        state: SessionRecoveryState,
+        tools: list[ToolExecutionMetrics],
+    ) -> None:
+        """Resolve approved recovery calls without retrying unknown outcomes silently."""
+        self._file_observations = FileObservations.for_recovery(
+            self._session_manager.model_context,
+            self._instructions_manager.virtual_paths,
+            (
+                pending.call
+                for pending in state.pending_calls
+                if pending.status != "result_available"
+            ),
+            prepare_context=self._backend.prepare_context,
+        )
+        for pending in state.pending_calls:
+            self._checkpoint()
+            if pending.status == "result_available":
+                continue
+            if pending.status == "outcome_unknown" and not await self._confirm_async(
+                f"Tool '{pending.call.name}' may already have run. Retry it?",
+                default=False,
+            ):
+                self._persist_interrupted_tool_result(pending.call)
+                continue
+            tools.extend(
+                await self._execute_tool_calls_async(
+                    (pending.call,), present=pending.status == "not_started"
+                )
             )
 
     def _run_from_boundary(
@@ -472,6 +566,94 @@ class AgentRunner:
             finally:
                 self._interrupted_tools = None
 
+    async def _run_from_boundary_async(
+        self,
+        *,
+        recovery: SessionRecoveryState | None = None,
+    ) -> AgentRunResult:
+        """Run model turns from a fresh or recovered boundary using async operations."""
+        total_turns = 0
+        turns_since_confirmation = 0
+        response = None
+        calls = []
+        tools = []
+        started_at = utc_now()
+        with self._run_control.execution() if self._run_control is not None else nullcontext():
+            self._interrupted_tools = tools
+            try:
+                if recovery is not None:
+                    await self._recover_tools_async(recovery, tools)
+                while True:
+                    response = await self._query_with_recovery_async()
+                    if response is None:
+                        return self._record_run_result(
+                            final_response=None,
+                            turns=total_turns,
+                            stop_reason="cancelled",
+                            started_at=started_at,
+                            calls=calls,
+                            tools=tools,
+                        )
+                    total_turns += 1
+                    turns_since_confirmation += 1
+                    calls.append(
+                        ModelCallMetrics(
+                            model=response.model,
+                            duration_seconds=response.metrics.duration_seconds,
+                            time_to_first_chunk_seconds=(
+                                response.metrics.time_to_first_chunk_seconds
+                            ),
+                            usage=response.usage,
+                        )
+                    )
+                    self._model_selection.record_response(response.model)
+                    self._session_manager.add_response(response)
+                    executions = await self.handle_tool_calls_async(response)
+                    tools.extend(executions)
+                    self._checkpoint()
+                    if not executions:
+                        return self._record_run_result(
+                            final_response=response,
+                            turns=total_turns,
+                            stop_reason="completed",
+                            started_at=started_at,
+                            calls=calls,
+                            tools=tools,
+                        )
+                    if 0 < self._max_turns <= turns_since_confirmation:
+                        prompt = (
+                            f"Agent has reached the {self._max_turns}-turn safety limit. "
+                            "Do you want to continue?"
+                        )
+                        if not await self._confirm_async(prompt, default=False):
+                            break
+                        turns_since_confirmation = 0
+
+                self._interaction.warning(
+                    f"Agent stopped after reaching the {self._max_turns}-turn safety limit."
+                )
+                return self._record_run_result(
+                    final_response=response,
+                    turns=total_turns,
+                    stop_reason="max_turns",
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
+                )
+            except RunInterrupted:
+                self._cancel_pending_tools()
+                self._interaction.info("Run interrupted; the conversation remains open.")
+                return self._record_run_result(
+                    final_response=None,
+                    turns=total_turns,
+                    stop_reason="cancelled",
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
+                )
+            finally:
+                self._interrupted_tools = None
+
     def handle_tool_calls(self, response: Response) -> tuple[ToolExecutionMetrics, ...]:
         """Execute and persist every tool call in a model response.
 
@@ -493,6 +675,28 @@ class AgentRunner:
         with self._session_manager.execution():
             return self._execute_tool_calls(response.tool_calls, present=True)
 
+    async def handle_tool_calls_async(self, response: Response) -> tuple[ToolExecutionMetrics, ...]:
+        """Execute and persist tool calls from a model response asynchronously.
+
+        Args:
+            response (Response): Model response containing zero or more tool calls.
+
+        Returns:
+            tuple[ToolExecutionMetrics, ...]: Timing and outcome for every handled tool call.
+
+        Raises:
+            ValueError: If a requested tool call is not present in canonical session context.
+            KeyboardInterrupt: If the configured control requests a stop.
+            RunInterrupted: If the active execution scope has been interrupted.
+            SessionExecutionConflictError: If another owner is executing this logical session.
+            asyncio.CancelledError: If an asynchronous tool call is cancelled.
+        """
+        if not response.tool_calls:
+            return ()
+
+        with self._session_manager.execution():
+            return await self._execute_tool_calls_async(response.tool_calls, present=True)
+
     def _execute_tool_calls(
         self,
         tool_calls: tuple[ToolCall, ...],
@@ -500,7 +704,6 @@ class AgentRunner:
         present: bool,
     ) -> tuple[ToolExecutionMetrics, ...]:
         """Execute and persist canonical tool requests from one durable boundary."""
-
         instructions = self._instructions_manager
         executions = []
         try:
@@ -514,6 +717,35 @@ class AgentRunner:
                         )
                     )
         except RunInterrupted:
+            if self._interrupted_tools is not None:
+                self._interrupted_tools.extend(executions)
+            raise
+        return tuple(executions)
+
+    async def _execute_tool_calls_async(
+        self,
+        tool_calls: tuple[ToolCall, ...],
+        *,
+        present: bool,
+    ) -> tuple[ToolExecutionMetrics, ...]:
+        """Execute tool requests sequentially through async registry dispatch."""
+        instructions = self._instructions_manager
+        executions = []
+        try:
+            for tool_call in tool_calls:
+                with telemetry_span():
+                    executions.append(
+                        await self._execute_tool_call_async(
+                            tool_call,
+                            instructions=instructions,
+                            present=present,
+                        )
+                    )
+        except RunInterrupted:
+            if self._interrupted_tools is not None:
+                self._interrupted_tools.extend(executions)
+            raise
+        except asyncio.CancelledError:
             if self._interrupted_tools is not None:
                 self._interrupted_tools.extend(executions)
             raise
@@ -546,6 +778,72 @@ class AgentRunner:
             self._session_manager.record_tool_execution_started(tool_call.call_id)
 
         tool_result, duration = self._agent.tools.call_with_timing(
+            tool_call.name,
+            tool_call.arguments,
+            interaction=self._interaction,
+            instructions_manager=instructions,
+            permission_manager=self._permission_manager,
+            call_id=tool_call.call_id,
+            **(
+                {"file_observations": self._file_observations}
+                if self._file_observations is not None
+                else {}
+            ),
+            execution_started=execution_started,
+        )
+        if self._file_observations is not None:
+            self._file_observations.observe_result(tool_call, tool_result, include_reads=False)
+        telemetry_trace_event(
+            "tool.response",
+            payload={"call_id": tool_call.call_id, "output": tool_result},
+            duration_seconds=duration,
+        )
+        try:
+            payload = json.loads(tool_result)
+        except json.JSONDecodeError:
+            payload = None
+        succeeded = isinstance(payload, dict) and payload.get("ok") is True
+        self._session_manager.add_tool_call(
+            call_id=tool_call.call_id,
+            output=tool_result,
+            working_directory=str(instructions.working_directory or self._working_directory),
+            active_skills=instructions.active_skill_identities,
+            succeeded=succeeded,
+            duration_seconds=duration,
+        )
+        return ToolExecutionMetrics(
+            name=tool_call.name,
+            duration_seconds=duration,
+            succeeded=succeeded,
+        )
+
+    async def _execute_tool_call_async(
+        self,
+        tool_call: ToolCall,
+        *,
+        instructions: InstructionsManager,
+        present: bool,
+    ) -> ToolExecutionMetrics:
+        """Execute, trace, and persist one tool request through async dispatch."""
+        self._checkpoint()
+        telemetry_trace_event(
+            "tool.request",
+            payload={
+                "call_id": tool_call.call_id,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+            },
+        )
+        if present:
+            self._session_manager.add_tool_call_event(tool_call.call_id)
+        self._interaction.tool_call(tool_call.name, tool_call.arguments)
+
+        def execution_started() -> None:
+            """Honor a stop after approval before recording the execution boundary."""
+            self._checkpoint()
+            self._session_manager.record_tool_execution_started(tool_call.call_id)
+
+        tool_result, duration = await self._agent.tools.call_with_timing_async(
             tool_call.name,
             tool_call.arguments,
             interaction=self._interaction,

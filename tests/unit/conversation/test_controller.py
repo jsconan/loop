@@ -3,6 +3,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from queue import Empty, PriorityQueue
 from threading import Event, Thread, get_ident
 from unittest.mock import MagicMock, Mock
 
@@ -1613,6 +1614,384 @@ def test_controller_rejects_blocking_mailbox_calls_from_its_ui_thread(ui):
         assert ready.is_set()
 
     asyncio.run(scenario())
+
+
+def test_async_controller_keeps_conversation_on_ui_loop_and_routes_approval(ui):
+    """Async work can await a separate approval while the UI driver owns input."""
+    controller = SessionController(ui)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+    ui.confirm_async.return_value = True
+    owner_thread = []
+
+    async def conversation(receive):
+        """Read admitted input, then request approval through the controller mailbox."""
+        owner_thread.append(get_ident())
+        assert await receive(DummyCompleter()) == "hello"
+        assert await controller.interaction.confirm_async("Approve operation?") is True
+        controller.interaction.info("approved")
+
+    ui_thread = get_ident()
+
+    async def scenario():
+        """Run the async owner and submit its first ordinary message."""
+        task = asyncio.create_task(controller.run_async(conversation))
+        await asyncio.sleep(0)
+        await inputs.put("hello")
+        await task
+
+    asyncio.run(scenario())
+
+    assert owner_thread == [ui_thread]
+    ui.confirm_async.assert_awaited_once_with("Approve operation?", default=False)
+    ui.info.assert_any_call("approved")
+    assert controller.running is False
+
+
+def test_async_controller_processes_status_while_conversation_is_suspended(ui):
+    """A read-only control command remains available during async work."""
+    controller = SessionController(ui)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+    working, status_seen, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    displayed = []
+
+    def record_info(message=""):
+        """Capture output and signal only after the status response is displayed."""
+        displayed.append(message)
+        if message.endswith("queued inputs."):
+            status_seen.set()
+
+    ui.info.side_effect = record_info
+
+    async def conversation(receive):
+        """Wait at an async operation boundary after consuming its initiating message."""
+        assert await receive(DummyCompleter()) == "hello"
+        working.set()
+        await release.wait()
+
+    async def scenario():
+        """Keep the agent suspended while the UI executes its status command."""
+        task = asyncio.create_task(controller.run_async(conversation))
+        await asyncio.sleep(0)
+        await inputs.put("hello")
+        await working.wait()
+        await inputs.put("/status")
+        await status_seen.wait()
+        release.set()
+        await task
+
+    asyncio.run(scenario())
+
+    assert any(message.endswith("queued inputs.") for message in displayed)
+
+
+def test_async_controller_rejects_reuse_and_suppresses_requested_keyboard_interrupt(ui):
+    """The async controller remains single-use and normalizes stopped input reads."""
+    controller = SessionController(ui)
+    controller.stop()
+
+    async def conversation(receive):
+        """Observe the stop sentinel without running another operation."""
+        assert await receive(DummyCompleter()) is False
+
+    async def scenario():
+        """Run once after stop, then verify the single-use lifecycle guard."""
+        await controller.run_async(conversation)
+        with pytest.raises(RuntimeError, match="only run once"):
+            await controller.run_async(conversation)
+
+    asyncio.run(scenario())
+
+    ui.conversation_ended.assert_called_once_with()
+
+
+def test_async_controller_wakes_a_pending_receive_when_stopped(ui):
+    """A stop request wakes the async mailbox reader and rejects a later message."""
+    controller = SessionController(ui)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+    input_prompted = asyncio.Event()
+
+    async def prompt(*args, **kwargs):
+        """Signal that the owner is waiting for admitted input."""
+        input_prompted.set()
+        return await inputs.get()
+
+    ui.prompt_async.side_effect = prompt
+
+    async def conversation(receive):
+        """Wait for a message that the stop request replaces with its sentinel."""
+        assert await receive(DummyCompleter()) is False
+
+    async def scenario():
+        """Request shutdown only after the async receive is waiting."""
+        task = asyncio.create_task(controller.run_async(conversation))
+        await input_prompted.wait()
+        controller.stop()
+        await task
+
+    asyncio.run(scenario())
+
+    assert controller.control.stopped is True
+
+
+def test_async_controller_rechecks_queue_after_a_racing_admission(ui):
+    """A queued input arriving at the clear-and-wait boundary is not lost."""
+    controller = SessionController(ui)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+
+    class RacingQueue(PriorityQueue):
+        """Force one empty read followed by a visible queued input."""
+
+        _first_read: bool
+
+        def __init__(self):
+            """Initialize a pre-admitted message and one synthetic read race."""
+            super().__init__()
+            self._first_read = True
+            self.put((1, 0, "raced"))
+
+        def get_nowait(self):
+            """Return an empty result once so the receiver checks the queue again."""
+            if self._first_read:
+                self._first_read = False
+                raise Empty
+            return super().get_nowait()
+
+        def empty(self):
+            """Expose the raced message immediately after the synthetic empty result."""
+            if not self._first_read:
+                return False
+            return super().empty()
+
+    controller._inbox = RacingQueue()
+    received = []
+
+    async def conversation(receive):
+        """Read the input admitted just before the mailbox wait."""
+        received.append(await receive(DummyCompleter()))
+
+    asyncio.run(controller.run_async(conversation))
+
+    assert received == ["raced"]
+
+
+def test_async_controller_handles_inline_output_and_rejects_sync_input(ui):
+    """Async owners present output inline and cannot issue blocking UI input calls."""
+    controller = SessionController(ui)
+    ui.info.side_effect = ValueError("display failed")
+    terminal_exit = InteractionCall(lambda: None, (), {}, kind="terminal_exit")
+    controller._terminal_owned = True
+
+    async def conversation(_receive):
+        """Exercise inline output failure, terminal cleanup, and sync-input rejection."""
+        with pytest.raises(ValueError, match="display failed"):
+            controller._send(InteractionCall(ui.info, ("bad",), {}))
+        with pytest.raises(RuntimeError, match="Synchronous mailbox input"):
+            controller._send(InteractionCall(ui.confirm, ("Approve?",), {}, kind=EVENT_CONFIRM))
+        controller._send(terminal_exit)
+
+    asyncio.run(controller.run_async(conversation))
+
+    assert terminal_exit.result.result() is None
+    assert controller._terminal_owned is False
+
+
+def test_async_controller_settles_failures_and_reports_discarded_input(ui):
+    """Execution failures remain primary while queue-reporting errors are attached."""
+    controller = SessionController(ui)
+    controller._inbox.put((1, 0, "queued"))
+    ui.warning.side_effect = OSError("warning failed")
+
+    async def conversation(_receive):
+        """Fail the async owner after the controller has started it."""
+        raise RuntimeError("operation failed")
+
+    with pytest.raises(RuntimeError, match="operation failed") as error:
+        asyncio.run(controller.run_async(conversation))
+
+    assert any(
+        "Queue cancellation reporting also failed with OSError" in note
+        for note in error.value.__notes__
+    )
+    assert controller.running is False
+
+
+def test_async_controller_propagates_unsolicited_keyboard_interrupt(ui):
+    """Keyboard interrupts remain visible unless the controller requested shutdown."""
+    controller = SessionController(ui)
+
+    async def conversation(_receive):
+        """Raise an unsolicited interrupt from the conversation owner."""
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(controller.run_async(conversation))
+
+
+def test_async_controller_waits_for_owned_work_after_repeated_cancellation(ui):
+    """A second cancellation cannot abandon async work still owned by the controller."""
+    controller = SessionController(ui)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+    operation_started, cleanup_started, release = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    settle = controller._settle
+
+    async def observe_settlement(worker):
+        """Expose the cleanup boundary before delegating to the real settlement loop."""
+        cleanup_started.set()
+        return await settle(worker)
+
+    controller._settle = observe_settlement
+
+    async def conversation(receive):
+        """Keep owned work active until the test releases it."""
+        assert await receive(DummyCompleter()) == "hello"
+        operation_started.set()
+        await release.wait()
+
+    async def scenario():
+        """Cancel twice while cleanup waits, then allow the operation to settle."""
+        await inputs.put("hello")
+        task = asyncio.create_task(controller.run_async(conversation))
+        await operation_started.wait()
+        task.cancel()
+        await cleanup_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert controller.running is False
+
+
+def test_async_controller_preserves_primary_and_secondary_failures(ui):
+    """UI, command, and conversation failures remain visible with the primary error first."""
+    controller = SessionController(ui)
+    command_failure = RuntimeError("command failed")
+
+    async def fail_after_owner(worker, *, route_idle_commands):
+        """Wait for the conversation failure, then report a separate UI failure."""
+        await asyncio.gather(worker, return_exceptions=True)
+        raise ValueError("driver failed")
+
+    async def settle_with_command_failure(_worker):
+        """Return a late command failure for the controller to attach."""
+        return command_failure
+
+    async def conversation(_receive):
+        """Fail the conversation owner independently of the UI driver."""
+        raise OSError("conversation failed")
+
+    controller._drive = fail_after_owner
+    controller._settle = settle_with_command_failure
+
+    with pytest.raises(ValueError, match="driver failed") as error:
+        asyncio.run(controller.run_async(conversation))
+
+    assert any("Command also stopped with RuntimeError" in note for note in error.value.__notes__)
+    assert any("Conversation also stopped with OSError" in note for note in error.value.__notes__)
+
+
+def test_async_controller_reports_discarded_input_failure_without_primary_error(ui):
+    """A failure reporting discarded queued input surfaces after normal settlement."""
+    controller = SessionController(ui)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+    ui.warning.side_effect = OSError("warning failed")
+    started, stopping = asyncio.Event(), asyncio.Event()
+
+    def observe_info(message=""):
+        """Signal when the UI accepted its terminal-exit response."""
+        if message.startswith("Stopping after"):
+            stopping.set()
+
+    ui.info.side_effect = observe_info
+
+    async def conversation(receive):
+        """Wait for UI exit while a previously queued input is discarded."""
+        assert await receive(DummyCompleter()) == "hello"
+        controller._inbox.put((1, 0, "queued"))
+        started.set()
+        await stopping.wait()
+
+    async def scenario():
+        """Submit a message, then exit while the owner is doing asynchronous work."""
+        task = asyncio.create_task(controller.run_async(conversation))
+        await inputs.put("hello")
+        await started.wait()
+        await inputs.put(False)
+        with pytest.raises(OSError, match="warning failed"):
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_async_controller_stop_without_start_and_requested_keyboard_interrupt(ui):
+    """Stop-before-start wakes no foreign loop and suppresses its owned interrupt."""
+    controller = SessionController(ui)
+    assert controller._stop() == 0
+
+    async def conversation(_receive):
+        """Raise an interrupt after shutdown has already been requested."""
+        raise KeyboardInterrupt
+
+    asyncio.run(controller.run_async(conversation))
+
+    ui.conversation_ended.assert_called_once_with()
+
+
+def test_async_controller_stop_signals_from_a_foreign_thread_identity(ui):
+    """The stop signal uses thread-safe scheduling when the caller is not the UI owner."""
+    controller = SessionController(ui)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+    input_prompted = asyncio.Event()
+
+    async def prompt(*args, **kwargs):
+        """Signal that the conversation owner is waiting for a message."""
+        input_prompted.set()
+        return await inputs.get()
+
+    ui.prompt_async.side_effect = prompt
+
+    async def conversation(receive):
+        """Wait for the stop sentinel."""
+        assert await receive(DummyCompleter()) is False
+
+    async def scenario():
+        """Exercise the thread-safe input wakeup while remaining on one event loop."""
+        task = asyncio.create_task(controller.run_async(conversation))
+        await input_prompted.wait()
+        controller._ui_thread = -1
+        controller._stop()
+        await task
+
+    asyncio.run(scenario())
+
+
+def test_async_controller_marks_inline_conversation_end_as_delivered(ui):
+    """An inline conversation-ended event is not emitted twice after shutdown."""
+    controller = SessionController(ui)
+    controller.stop()
+
+    async def conversation(_receive):
+        """Deliver the terminal event through the async owner's UI thread."""
+        controller.interaction.conversation_ended()
+
+    asyncio.run(controller.run_async(conversation))
+
+    ui.conversation_ended.assert_called_once_with()
 
 
 def test_controller_preserves_output_failures_at_the_execution_boundary(ui):

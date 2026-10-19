@@ -281,11 +281,24 @@ class ApplicationRuntime:
                 pass
             else:
                 raise RuntimeError("Synchronous runtime.run() cannot run inside an event loop.")
-            asyncio.run(
-                self._session_controller.run(
-                    lambda receive: self._loop.run(input_source=receive),
-                    route_idle_commands=True,
-                )
+            asyncio.run(self.run_async())
+
+    async def run_async(self) -> None:
+        """Run the composed application through its async loop and session controller.
+
+        Raises:
+            RuntimeError: If the session controller has already run.
+            BaseException: If the conversation or UI fails after owned execution settles.
+
+        Returns:
+            None: After the conversation and its owned operations have settled.
+        """
+        if self._session_controller is None:
+            await self._loop.run_async()
+        else:
+            await self._session_controller.run_async(
+                lambda receive: self._loop.run_async(input_source=receive),
+                route_idle_commands=True,
             )
 
     def apply_configuration(self, path: str, settings: ApplicationSettings) -> str:

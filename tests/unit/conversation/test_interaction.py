@@ -1,11 +1,34 @@
 """Verify marshalled interaction and response-scope forwarding."""
 
-from unittest.mock import MagicMock, Mock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
-from loop import Interaction, Problem, RunMetrics, ToolResultPresentationSpec
+from loop import ConsoleInteraction, Interaction, Problem, RunMetrics, ToolResultPresentationSpec
 from loop.conversation.interaction import MailboxInteraction
+
+
+def test_mailbox_async_input_uses_the_source_when_unbound():
+    """Setup-time async prompts preserve source defaults and explicit exit terms."""
+    source = MagicMock(spec=ConsoleInteraction)
+    source.prompt_async = AsyncMock(side_effect=["answer", False])
+    source.confirm_async = AsyncMock(return_value=True)
+    interaction = MailboxInteraction(source)
+
+    async def scenario():
+        """Exercise prompt defaults and an explicit confirmation without a controller."""
+        assert await interaction.prompt_async("Question?") == "answer"
+        assert await interaction.prompt_async("Optional?", exit_commands=None) is False
+        assert await interaction.confirm_async("Approve?") is True
+
+    asyncio.run(scenario())
+
+    first_prompt = source.prompt_async.await_args_list[0]
+    second_prompt = source.prompt_async.await_args_list[1]
+    assert "exit_commands" not in first_prompt.kwargs
+    assert second_prompt.kwargs["exit_commands"] is None
+    source.confirm_async.assert_awaited_once_with("Approve?", default=False)
 
 
 @pytest.mark.parametrize(

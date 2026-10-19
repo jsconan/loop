@@ -46,7 +46,7 @@ from loop import (
     edit_text_file,
     read_text_file,
 )
-from loop.agent import Agent, AgentRunner
+from loop.agent import Agent, AgentRunner, AgentRunResult
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.tooling import FileObservations
 from loop.utils import PathHolder
@@ -1611,6 +1611,312 @@ def test_runner_async_recovery_reports_preparation_errors(tmp_path):
     assert asyncio.run(runner._query_with_recovery_async()) is None
     runner.interaction.report.assert_called_once()
     runner.interaction.confirm.assert_not_called()
+
+
+def test_runner_run_async_uses_async_query_and_completes():
+    """The async run owner collects one response and records its run metrics."""
+    runner, sessions, _interaction = agent_runner()
+    response = Response(answer="done", reasoning="")
+    runner.query_async = AsyncMock(return_value=response)
+    runner.query = Mock(side_effect=AssertionError("sync query used"))
+    runner.handle_tool_calls_async = AsyncMock(return_value=())
+
+    result = asyncio.run(runner.run_async())
+
+    assert result.final_response is response
+    assert result.turns == 1
+    assert result.stop_reason == "completed"
+    runner.query_async.assert_awaited_once_with()
+    runner.query.assert_not_called()
+    runner.handle_tool_calls_async.assert_awaited_once_with(response)
+    sessions.add_response.assert_called_once_with(response)
+    sessions.record_run.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("continue_run", "expected_reason", "expected_turns"),
+    [(False, "max_turns", 1), (True, "completed", 2)],
+)
+def test_runner_run_async_applies_turn_limit_confirmation(
+    continue_run, expected_reason, expected_turns
+):
+    """Async runs preserve the turn safety prompt and its continuation decision."""
+    call = ToolCall(call_id="call", name="echo", arguments="{}")
+    first = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    final = Response(answer="done", reasoning="")
+    runner, _sessions, interaction = agent_runner(max_turns=1)
+    runner.query_async = AsyncMock(side_effect=[first, final])
+    execution = ToolExecutionMetrics(name="echo", duration_seconds=0.1, succeeded=True)
+    runner.handle_tool_calls_async = AsyncMock(side_effect=[(execution,), ()])
+    runner._confirm_async = AsyncMock(return_value=continue_run)
+
+    result = asyncio.run(runner.run_async())
+
+    assert result.stop_reason == expected_reason
+    assert result.turns == expected_turns
+    assert runner._confirm_async.await_count == 1
+    if continue_run:
+        interaction.warning.assert_not_called()
+    else:
+        interaction.warning.assert_called_once_with(
+            "Agent stopped after reaching the 1-turn safety limit."
+        )
+
+
+def test_runner_run_async_continues_below_turn_safety_limit():
+    """Async runs continue without prompting while they remain within the turn limit."""
+    call = ToolCall(call_id="call", name="echo", arguments="{}")
+    first = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    final = Response(answer="done", reasoning="")
+    runner, _sessions, interaction = agent_runner(max_turns=2)
+    runner.query_async = AsyncMock(side_effect=[first, final])
+    execution = ToolExecutionMetrics(name="echo", duration_seconds=0.1, succeeded=True)
+    runner.handle_tool_calls_async = AsyncMock(side_effect=[(execution,), ()])
+    runner._confirm_async = AsyncMock()
+
+    result = asyncio.run(runner.run_async())
+
+    assert result.stop_reason == "completed"
+    assert result.turns == 2
+    runner._confirm_async.assert_not_awaited()
+    interaction.warning.assert_not_called()
+
+
+def test_runner_run_async_records_interruption_as_cancelled():
+    """A cooperative async interruption settles pending calls and records a cancelled run."""
+    runner, sessions, interaction = agent_runner()
+    runner.query_async = AsyncMock(side_effect=RunInterrupted())
+    runner._cancel_pending_tools = Mock()
+
+    result = asyncio.run(runner.run_async())
+
+    assert result.stop_reason == "cancelled"
+    runner._cancel_pending_tools.assert_called_once_with()
+    interaction.info.assert_called_once_with("Run interrupted; the conversation remains open.")
+    sessions.record_run.assert_called_once()
+
+
+def test_runner_run_async_stops_when_async_recovery_declines():
+    """Declining the asynchronous retry records a cancelled run without another request."""
+    runner, sessions, _interaction = agent_runner()
+    runner.query_async = AsyncMock(return_value=None)
+
+    result = asyncio.run(runner.run_async())
+
+    assert result.stop_reason == "cancelled"
+    assert result.final_response is None
+    assert result.turns == 0
+    sessions.add_response.assert_not_called()
+    sessions.record_run.assert_called_once()
+
+
+def test_runner_run_async_resolves_recovery_before_querying():
+    """A supplied recovery boundary settles its pending tool plan before the next query."""
+    runner, _sessions, _interaction = agent_runner()
+    recovery = SessionRecoveryState(action="query_model")
+    response = Response(answer="done", reasoning="")
+    runner._recover_tools_async = AsyncMock()
+    runner.query_async = AsyncMock(return_value=response)
+    runner.handle_tool_calls_async = AsyncMock(return_value=())
+
+    result = asyncio.run(runner._run_from_boundary_async(recovery=recovery))
+
+    assert result.final_response is response
+    runner._recover_tools_async.assert_awaited_once_with(recovery, ANY)
+
+
+@pytest.mark.parametrize(
+    ("status", "approval", "expected_execution", "expected_present", "expected_skip"),
+    [
+        ("result_available", None, False, None, False),
+        ("outcome_unknown", False, False, None, True),
+        ("outcome_unknown", True, True, False, False),
+        ("not_started", None, True, True, False),
+    ],
+)
+def test_async_recovery_preserves_unknown_outcome_and_pending_boundaries(
+    monkeypatch, status, approval, expected_execution, expected_present, expected_skip
+):
+    """Async recovery retries only after approval and preserves already available results."""
+    runner, _sessions, _interaction = agent_runner()
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    recovery = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=call, status=status),),
+    )
+    observations = Mock(spec=FileObservations)
+    monkeypatch.setattr(FileObservations, "for_recovery", Mock(return_value=observations))
+    runner._confirm_async = AsyncMock(return_value=approval)
+    runner._persist_interrupted_tool_result = Mock()
+    runner._execute_tool_calls_async = AsyncMock(return_value=())
+    tools = []
+
+    asyncio.run(runner._recover_tools_async(recovery, tools))
+
+    assert runner._execute_tool_calls_async.await_count == int(expected_execution)
+    if expected_execution:
+        assert runner._execute_tool_calls_async.await_args.kwargs["present"] is expected_present
+    assert runner._persist_interrupted_tool_result.call_count == int(expected_skip)
+    assert runner._confirm_async.await_count == int(status == "outcome_unknown")
+
+
+@pytest.mark.parametrize(
+    ("present", "observe", "output", "succeeded"),
+    [
+        (False, False, '{"ok":true}', True),
+        (True, True, "not-json", False),
+        (True, False, '{"ok":false}', False),
+    ],
+)
+def test_async_tool_execution_preserves_boundary_records_and_outcomes(
+    present, observe, output, succeeded
+):
+    """Async tool execution keeps start records, observations, and result metrics intact."""
+    runner, sessions, interaction = agent_runner()
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    observations = Mock(spec=FileObservations) if observe else None
+    runner._file_observations = observations
+    runner.agent.tools.call_with_timing_async = AsyncMock(return_value=(output, 0.25))
+
+    result = asyncio.run(
+        runner._execute_tool_call_async(
+            call,
+            instructions=runner.instructions_manager,
+            present=present,
+        )
+    )
+
+    kwargs = runner.agent.tools.call_with_timing_async.await_args.kwargs
+    kwargs["execution_started"]()
+    assert result.succeeded is succeeded
+    assert result.duration_seconds == 0.25
+    if present:
+        sessions.add_tool_call_event.assert_called_once_with(call.call_id)
+    else:
+        sessions.add_tool_call_event.assert_not_called()
+    sessions.record_tool_execution_started.assert_called_once_with(call.call_id)
+    sessions.add_tool_call.assert_called_once()
+    if observe:
+        observations.observe_result.assert_called_once_with(call, output, include_reads=False)
+    else:
+        assert interaction.tool_call.call_count == 1
+
+
+@pytest.mark.parametrize("interrupted_tools", [None, []])
+def test_async_tool_batch_retains_settled_metrics_when_interrupted(interrupted_tools):
+    """An interrupted async batch keeps metrics for tools that already settled."""
+    runner, _sessions, _interaction = agent_runner()
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    settled = ToolExecutionMetrics(name="effect", duration_seconds=0.1, succeeded=True)
+    runner._execute_tool_call_async = AsyncMock(side_effect=[settled, RunInterrupted()])
+    runner._interrupted_tools = interrupted_tools
+
+    with pytest.raises(RunInterrupted):
+        asyncio.run(runner._execute_tool_calls_async((call, call), present=True))
+
+    if interrupted_tools is not None:
+        assert runner._interrupted_tools == [settled]
+
+
+@pytest.mark.parametrize("interrupted_tools", [None, []])
+def test_async_tool_batch_retains_settled_metrics_when_task_is_cancelled(interrupted_tools):
+    """Task cancellation does not discard metrics for previously settled tools."""
+    runner, _sessions, _interaction = agent_runner()
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    settled = ToolExecutionMetrics(name="effect", duration_seconds=0.1, succeeded=True)
+    runner._execute_tool_call_async = AsyncMock(side_effect=[settled, asyncio.CancelledError()])
+    runner._interrupted_tools = interrupted_tools
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner._execute_tool_calls_async((call, call), present=True))
+
+    if interrupted_tools is not None:
+        assert runner._interrupted_tools == [settled]
+
+
+def test_async_tool_batch_returns_all_settled_metrics():
+    """An uninterrupted asynchronous tool batch returns results in request order."""
+    runner, _sessions, _interaction = agent_runner()
+    calls = (
+        ToolCall(call_id="first", name="effect", arguments="{}"),
+        ToolCall(call_id="second", name="effect", arguments="{}"),
+    )
+    first = ToolExecutionMetrics(name="effect", duration_seconds=0.1, succeeded=True)
+    second = ToolExecutionMetrics(name="effect", duration_seconds=0.2, succeeded=False)
+    runner._execute_tool_call_async = AsyncMock(side_effect=[first, second])
+
+    result = asyncio.run(runner._execute_tool_calls_async(calls, present=True))
+
+    assert result == (first, second)
+    assert runner._execute_tool_call_async.await_count == 2
+
+
+def test_handle_tool_calls_async_skips_empty_responses_and_owns_nonempty_execution():
+    """Async tool dispatch skips empty responses and leases nonempty calls."""
+    runner, sessions, _interaction = agent_runner()
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    runner._execute_tool_calls_async = AsyncMock(return_value=())
+
+    assert asyncio.run(runner.handle_tool_calls_async(Response(answer="done", reasoning=""))) == ()
+    runner._execute_tool_calls_async.assert_not_awaited()
+
+    assert (
+        asyncio.run(
+            runner.handle_tool_calls_async(
+                Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+            )
+        )
+        == ()
+    )
+    runner._execute_tool_calls_async.assert_awaited_once_with((call,), present=True)
+    assert sessions.execution.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("has_recovery", "approval", "expected_pending"),
+    [(False, None, False), (True, False, True), (True, True, False)],
+)
+def test_recover_session_async_preserves_approval_gate(has_recovery, approval, expected_pending):
+    """Async session recovery asks first and runs only after explicit approval."""
+    runner, sessions, _interaction = agent_runner()
+    state = SessionRecoveryState(action="finalize_run") if has_recovery else None
+    sessions.recovery_state = state
+    recovered = AgentRunResult(final_response=None, turns=0, stop_reason="completed")
+    runner._confirm_async = AsyncMock(return_value=approval)
+    runner._recover_async = AsyncMock(return_value=recovered)
+
+    result = asyncio.run(runner.recover_session_async())
+
+    assert result.pending is expected_pending
+    if has_recovery:
+        runner._confirm_async.assert_awaited_once_with(
+            "This session stopped during an agent run. Recover and continue it?",
+            default=False,
+        )
+    else:
+        runner._confirm_async.assert_not_awaited()
+    if has_recovery and approval:
+        runner._recover_async.assert_awaited_once_with(state)
+        assert result.result is recovered
+    else:
+        runner._recover_async.assert_not_awaited()
+
+
+def test_recover_async_finalizes_or_reenters_query_boundary():
+    """Async recovery either finalizes a completed run or reenters model orchestration."""
+    runner, sessions, _interaction = agent_runner()
+    completed = SessionRecoveryState(action="finalize_run")
+
+    finalized = asyncio.run(runner._recover_async(completed))
+
+    assert finalized.stop_reason == "completed"
+    sessions.record_run.assert_called_once()
+
+    recovery = SessionRecoveryState(action="query_model")
+    result = object()
+    runner._run_from_boundary_async = AsyncMock(return_value=result)
+    assert asyncio.run(runner._recover_async(recovery)) is result
+    runner._run_from_boundary_async.assert_awaited_once_with(recovery=recovery)
 
 
 def test_runner_async_query_closes_backend_stream_when_cancelled(tmp_path):

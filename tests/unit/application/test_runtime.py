@@ -156,6 +156,18 @@ def test_async_runtime_registers_and_binds_the_session_command_provider(
     runtime.close()
 
 
+def test_runtime_async_path_without_controller_awaits_loop_directly():
+    """Legacy interaction compositions can use the runtime async facade directly."""
+    loop = Mock()
+    loop.run_async = AsyncMock()
+    runtime = ApplicationRuntime(loop, Mock(), 1, cleanup_callbacks=[])
+
+    asyncio.run(runtime.run_async())
+
+    loop.run_async.assert_awaited_once_with()
+    runtime.close()
+
+
 def test_create_requires_identity_and_skips_environment_model_callback(dependencies, assembled):
     """Runtime assembly requires identity and does not persist environment-owned models."""
     workspace, paths, workspace_paths, settings = assembled
@@ -531,12 +543,12 @@ def test_async_runtime_binds_all_services_to_its_controller(dependencies, assemb
     controller.running = False
     receive = Mock()
 
-    async def run(conversation, *, route_idle_commands):
-        """Execute the runtime callback through its supplied ordinary-input reader."""
-        conversation(receive)
+    async def run_async(conversation, *, route_idle_commands):
+        """Execute the runtime callback through its supplied awaitable input reader."""
+        await conversation(receive)
         assert route_idle_commands is True
 
-    controller.run = AsyncMock(side_effect=run)
+    controller.run_async = AsyncMock(side_effect=run_async)
     create = Mock(return_value=controller)
     monkeypatch.setattr(runtime_module, "SessionController", create)
     runtime = ApplicationRuntime.create(
@@ -549,6 +561,7 @@ def test_async_runtime_binds_all_services_to_its_controller(dependencies, assemb
         source,
     )
     active = dependencies["Loop"].create_default.return_value
+    active.run_async = AsyncMock()
     try:
         runtime.run()
         runtime.stop()
@@ -563,9 +576,9 @@ def test_async_runtime_binds_all_services_to_its_controller(dependencies, assemb
         is controller.interaction
     )
     assert dependencies["Loop"].create_default.call_args.kwargs["run_control"] is controller.control
-    active.run.assert_called_once_with(input_source=receive)
+    active.run_async.assert_awaited_once_with(input_source=receive)
     controller.stop.assert_called_once_with()
-    controller.run.assert_awaited_once()
+    controller.run_async.assert_awaited_once()
 
 
 def test_runtime_refuses_to_close_services_while_execution_is_active():

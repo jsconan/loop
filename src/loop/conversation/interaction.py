@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -10,7 +10,7 @@ from prompt_toolkit.completion import Completer
 
 from .. import constants
 from ..errors import Problem
-from ..interaction import Interaction
+from ..interaction import AsyncInteractionInput, Interaction
 from ..interaction.models import ListMarker
 from ..models import RAW_TOOL_RESULT_PRESENTATION, RunMetrics, ToolResultPresentationSpec
 from ..utils import ChoiceItem
@@ -24,7 +24,7 @@ from .models import (
 )
 
 
-class MailboxInteraction(Interaction):
+class MailboxInteraction(Interaction, AsyncInteractionInput):
     """Route interaction through a controller while retaining direct setup interaction.
 
     Args:
@@ -33,19 +33,28 @@ class MailboxInteraction(Interaction):
 
     _source: Interaction
     _dispatch: Callable[[InteractionCall], Any] | None
+    _dispatch_async: Callable[[InteractionCall], Awaitable[Any]] | None
 
     def __init__(self, source: Interaction) -> None:
         self._source = source
         self._dispatch = None
+        self._dispatch_async = None
 
-    def bind(self, dispatch: Callable[[InteractionCall], Any] | None) -> None:
+    def bind(
+        self,
+        dispatch: Callable[[InteractionCall], Any] | None,
+        dispatch_async: Callable[[InteractionCall], Awaitable[Any]] | None = None,
+    ) -> None:
         """Bind active mailbox dispatch or restore direct setup interaction.
 
         Args:
             dispatch (Callable[[InteractionCall], Any] | None): Active controller dispatcher,
                 or ``None`` outside its execution lifecycle.
+            dispatch_async (Callable[[InteractionCall], Awaitable[Any]] | None): Optional async
+                dispatcher for input requests. Defaults to direct source input when unbound.
         """
         self._dispatch = dispatch
+        self._dispatch_async = dispatch_async
 
     def _call(
         self,
@@ -58,6 +67,18 @@ class MailboxInteraction(Interaction):
         if self._dispatch is None:
             return function(*args, **kwargs)
         return self._dispatch(InteractionCall(function, args, kwargs, kind))
+
+    async def _call_async(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        kind=EVENT_PROMPT,
+        **kwargs: Any,
+    ) -> Any:
+        """Request input through the controller's correlated async interaction channel."""
+        if self._dispatch_async is None:
+            return await function(*args, **kwargs)
+        return await self._dispatch_async(InteractionCall(function, args, kwargs, kind))
 
     @contextmanager
     def response_context(self) -> Generator[None]:
@@ -146,6 +167,51 @@ class MailboxInteraction(Interaction):
             **options,
         )
 
+    async def prompt_async(
+        self,
+        message: str | None = None,
+        completer: Completer | None = None,
+        exit_commands: str | Iterable[str] | None = constants.OMIT,
+        choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
+        index: Iterable[str] | Mapping[object, str] | None = None,
+        default: object | None = None,
+        secret: bool = False,
+        initial: str | None = None,
+    ) -> object | bool:
+        """Read input through the UI owner without blocking the conversation event loop.
+
+        Args:
+            message (str | None): Prompt message, or ``None`` for the default prompt.
+            completer (Completer | None): Optional completion provider.
+            exit_commands (str | Iterable[str] | None | constants.Omit): Exit terms, or omission
+                to preserve the source UI default.
+            choices (Iterable[str | ChoiceItem] | Mapping[object, str] | None): Optional choices.
+            index (Iterable[str] | Mapping[object, str] | None): Optional choice indexes.
+            default (object | None): Value returned for empty input, or ``None`` to require input.
+            secret (bool): Whether input must be masked. Defaults to ``False``.
+            initial (str | None): Initial editor text. Defaults to ``None``.
+
+        Returns:
+            object | bool: Selected value or text, or ``False`` when input requests exit.
+
+        Raises:
+            ValueError: If the prompt choices or completion options are invalid.
+            CancelledError: If the input task is cancelled.
+        """
+        options = {} if exit_commands is constants.OMIT else {"exit_commands": exit_commands}
+        return await self._call_async(
+            self._source.prompt_async,
+            message,
+            completer=completer,
+            choices=choices,
+            index=index,
+            default=default,
+            secret=secret,
+            initial=initial,
+            kind=EVENT_PROMPT,
+            **options,
+        )
+
     def confirm(self, message: str, *, default: bool = False) -> bool:
         """Request explicit approval through the source interaction's native confirmation UI.
 
@@ -160,6 +226,26 @@ class MailboxInteraction(Interaction):
             KeyboardInterrupt: If the controller stops before approval is provided.
         """
         return self._call(self._source.confirm, message, default=default, kind=EVENT_CONFIRM)
+
+    async def confirm_async(self, message: str, *, default: bool = False) -> bool:
+        """Request explicit approval through the controller's correlated async channel.
+
+        Args:
+            message (str): Exact confirmation question.
+            default (bool): Empty-input decision. Defaults to ``False``.
+
+        Returns:
+            bool: Whether the user explicitly approved the operation.
+
+        Raises:
+            CancelledError: If the confirmation task is cancelled.
+        """
+        return await self._call_async(
+            self._source.confirm_async,
+            message,
+            default=default,
+            kind=EVENT_CONFIRM,
+        )
 
     def user(self, message: str) -> None:
         """Display a completed user message.

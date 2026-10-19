@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Awaitable, Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from contextvars import copy_context
@@ -135,6 +135,8 @@ class SessionController:
     _discarded: int
     _idle_command_pending: bool
     _draft: str | None
+    _input_signal: asyncio.Event
+    _async_owner: bool
 
     def __init__(self, interaction: Interaction) -> None:
         if not isinstance(interaction, AsyncInteractionInput):
@@ -165,6 +167,8 @@ class SessionController:
         self._discarded = 0
         self._idle_command_pending = False
         self._draft = None
+        self._input_signal = asyncio.Event()
+        self._async_owner = False
 
     def bind_command_manager(self, command_manager: CommandManager) -> None:
         """Bind the loop-owned command registry for contextual dispatch and completion.
@@ -512,6 +516,93 @@ class SessionController:
         if self._control.stopped and not self._ended:
             self._source.conversation_ended()
 
+    async def run_async(
+        self,
+        conversation: Callable[[Callable[[Completer], Awaitable[object]]], Awaitable[None]],
+        *,
+        route_idle_commands: bool = False,
+    ) -> None:
+        """Run async conversation ownership on the UI event loop while accepting input.
+
+        The conversation must await its supplied message reader. Async interaction requests are
+        routed through the same UI mailbox as the synchronous controller path.
+
+        Args:
+            conversation (Callable[[Callable[[Completer], Awaitable[object]]], Awaitable[None]]):
+                Async operation receiving an awaitable ordinary-message reader.
+            route_idle_commands (bool): Pass idle-boundary commands to the conversation owner.
+                Defaults to ``False``.
+
+        Raises:
+            RuntimeError: If this controller has already run.
+            asyncio.CancelledError: After owned execution settles when this task is cancelled.
+            BaseException: If the conversation or UI fails after owned execution settles.
+
+        Returns:
+            None: After the conversation and its owned operations have settled.
+        """
+        if self._command_manager is None:
+            self.bind_command_manager(
+                CommandManager(
+                    providers=(ConversationCommands(self),),
+                    interaction=self._source,
+                )
+            )
+        if self._used:
+            raise RuntimeError("Session controller can only run once.")
+        self._used = True
+        self._loop = asyncio.get_running_loop()
+        self._ui_thread = get_ident()
+        self._events = asyncio.Queue(maxsize=1)
+        self._input_signal = asyncio.Event()
+        self._async_owner = True
+        self._interaction.bind(self._send, self._send_async)
+        telemetry_activity("conversation.started", component=_STATUS_COMPONENT)
+        primary = None
+        try:
+            with patch_stdout(raw=True):
+                worker = asyncio.create_task(self._execute_async(conversation))
+                try:
+                    await self._drive(worker, route_idle_commands=route_idle_commands)
+                except BaseException as error:
+                    primary = error
+                    self._stop()
+                    cleanup = asyncio.create_task(self._settle(worker))
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            continue
+                    command_failure = cleanup.result()
+                    if command_failure is not None and command_failure is not error:
+                        error.add_note(
+                            f"Command also stopped with {type(command_failure).__name__}."
+                        )
+                    failure = worker.exception()
+                    if failure is not None and failure is not error:
+                        error.add_note(f"Conversation also stopped with {type(failure).__name__}.")
+                    raise
+        finally:
+            self._interaction.bind(None)
+            self._async_owner = False
+            self._loop = None
+            self._ui_thread = None
+            self._events = None
+            telemetry_activity("conversation.stopped", component=_STATUS_COMPONENT)
+            if self._discarded:
+                try:
+                    self._source.warning(
+                        f"Stopped; {self._discarded} queued inputs were not executed."
+                    )
+                except Exception as error:
+                    if primary is None:
+                        raise
+                    primary.add_note(
+                        f"Queue cancellation reporting also failed with {type(error).__name__}."
+                    )
+        if self._control.stopped and not self._ended:
+            self._source.conversation_ended()
+
     def _execute(self, conversation: Callable) -> None:
         """Keep all conversation state on one owner and normalize requested interruption."""
         try:
@@ -521,14 +612,47 @@ class SessionController:
             if not self._control.stopped:
                 raise
 
+    async def _execute_async(self, conversation: Callable) -> None:
+        """Run async conversation code and normalize requested interruption."""
+        try:
+            await conversation(self._receive_async)
+        except KeyboardInterrupt:
+            if not self._control.stopped:
+                raise
+
     def _send(self, event: InteractionCall | InputReady) -> object:
         """Send one acknowledged UI request from the execution owner."""
+        if get_ident() == self._ui_thread:
+            if not self._async_owner:
+                raise RuntimeError("Mailbox interaction must run outside the UI thread.")
+            if not isinstance(event, InteractionCall) or event.kind not in {
+                EVENT_OUTPUT,
+                EVENT_TERMINAL_EXIT,
+            }:
+                raise RuntimeError("Synchronous mailbox input cannot run on the UI thread.")
+            try:
+                result = event.function(*event.args, **event.kwargs)
+            except BaseException as error:
+                event.result.set_exception(error)
+                raise
+            else:
+                event.result.set_result(result)
+                if event.function == self._source.conversation_ended:
+                    self._ended = True
+                return result
+            finally:
+                if event.kind == EVENT_TERMINAL_EXIT:
+                    self._terminal_owned = False
         loop = cast(asyncio.AbstractEventLoop, self._loop)
         events = cast(asyncio.Queue, self._events)
-        if get_ident() == self._ui_thread:
-            raise RuntimeError("Mailbox interaction must run outside the UI thread.")
         asyncio.run_coroutine_threadsafe(events.put(event), loop).result()
         return event.result.result()
+
+    async def _send_async(self, event: InteractionCall) -> object:
+        """Send and await one correlated UI request from async conversation ownership."""
+        events = cast(asyncio.Queue, self._events)
+        await events.put(event)
+        return await asyncio.wrap_future(event.result)
 
     def _receive(self, completer: Completer) -> object:
         """Release domain ownership while waiting for the next admitted input."""
@@ -544,6 +668,25 @@ class SessionController:
         if self._control.stopped:
             return False
         self._send(InputReady(completer, busy=True))
+        return message
+
+    async def _receive_async(self, completer: Completer) -> object:
+        """Await the next admitted input without blocking the UI event loop."""
+        if self._control.stopped:
+            return False
+        await self._send_async(InputReady(completer))
+        while True:
+            try:
+                _, _, message = self._inbox.get_nowait()
+                break
+            except Empty:
+                self._input_signal.clear()
+                if not self._inbox.empty():
+                    continue
+                await self._input_signal.wait()
+        if self._control.stopped:
+            return False
+        await self._send_async(InputReady(completer, busy=True))
         return message
 
     async def _drive(self, worker: asyncio.Future, *, route_idle_commands: bool) -> None:
@@ -735,6 +878,12 @@ class SessionController:
                 "Input queue is full; this input was not accepted. Try again later."
             )
             return False
+        loop = self._loop
+        if loop is not None:
+            if get_ident() == self._ui_thread:
+                self._input_signal.set()
+            else:
+                loop.call_soon_threadsafe(self._input_signal.set)
         telemetry_activity(
             "conversation.input.queued",
             component=_STATUS_COMPONENT,
@@ -796,6 +945,12 @@ class SessionController:
                 break
             discarded += 1
         self._inbox.put_nowait((_INPUT_PRIORITY, next(self._sequence), False))
+        loop = self._loop
+        if loop is not None:
+            if get_ident() == self._ui_thread:
+                self._input_signal.set()
+            else:
+                loop.call_soon_threadsafe(self._input_signal.set)
         self._discarded += discarded
         return discarded
 
