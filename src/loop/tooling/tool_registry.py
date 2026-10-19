@@ -546,7 +546,7 @@ class ToolRegistry:
         if error is not None:
             return error, 0
         active_permissions = permission_manager or self._permission_manager
-        plan, planning_error = self._authorized_plan(
+        plan, planning_error = await self._authorized_plan_async(
             tool,
             validated,
             interaction,
@@ -743,6 +743,66 @@ class ToolRegistry:
                 "tool.planning_failed", "Tool planning failed", str(exc), tool.name or "tool"
             )
 
+    async def _authorized_plan_async(
+        self,
+        tool: Tool,
+        arguments: dict[str, object],
+        interaction: Interaction | None,
+        permission_manager: PermissionManager,
+        instructions_manager: InstructionsManager | None = None,
+        file_observations: FileObservations | None = None,
+    ) -> tuple[OperationPlan | None, str | None]:
+        """Resolve and authorize every phase of one operation plan asynchronously."""
+        try:
+            if instructions_manager is not None:
+                arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
+            plan = tool.plan(arguments)
+            prerequisites = ()
+            while True:
+                boundary_denial = permission_manager.check_boundaries(plan.boundary_operations)
+                if boundary_denial is not None:
+                    return None, self._denied_problem(tool, boundary_denial.reason)
+                if file_observations is not None:
+                    absence_receipts = {}
+                    conflict = file_observations.check(
+                        plan.boundary_operations + plan.operations,
+                        plan.arguments,
+                        authorized_reads=prerequisites,
+                        absence_receipts=absence_receipts,
+                    )
+                    if conflict is not None:
+                        output = serialize_tool_problem(conflict)
+                        if absence_receipts:
+                            value = json.loads(output)
+                            value["read_versions"] = absence_receipts
+                            output = json.dumps(value, ensure_ascii=False)
+                        return None, output
+                denied = await self._authorize_async(
+                    tool,
+                    plan.operations,
+                    interaction,
+                    permission_manager,
+                    instructions_manager,
+                )
+                if denied is not None:
+                    return None, denied
+                if plan.continuation is None:
+                    return plan.model_copy(
+                        update={
+                            "prerequisite_operations": (
+                                prerequisites + plan.prerequisite_operations
+                            )
+                        }
+                    ), None
+                prerequisites += plan.operations
+                plan = tool.normalize_plan(plan.continuation())
+        except ProblemException as exc:
+            return None, serialize_tool_problem(exc.problem)
+        except (OSError, ValueError) as exc:
+            return None, self._problem(
+                "tool.planning_failed", "Tool planning failed", str(exc), tool.name or "tool"
+            )
+
     def _resolve_model_paths(
         self,
         tool: Tool,
@@ -796,26 +856,8 @@ class ToolRegistry:
     ) -> str | None:
         """Return a serialized denial or authorize the complete operation plan."""
         if tool.execution_authorization:
-            if self._execution_service is None:
-                return self._problem(
-                    "sandbox.unavailable",
-                    "Sandbox unavailable",
-                    "Native execution service is unavailable.",
-                    tool.name,
-                )
-            if not operations or any(
-                operation.action is not Action.PROCESS_EXECUTE
-                or not isinstance(operation.target, ProcessTarget)
-                or operation.target.boundary is not ProcessBoundary.SANDBOXED
-                for operation in operations
-            ):
-                return self._problem(
-                    "sandbox.unavailable",
-                    "Sandbox unavailable",
-                    "Native execution request is not bound to a sandbox.",
-                    tool.name,
-                )
-            return None
+            return self._authorization_unavailable(tool, operations)
+
         active_interaction = interaction if interaction is not None else self._interaction
         result = permission_manager.authorize(
             operations,
@@ -824,8 +866,61 @@ class ToolRegistry:
                 instructions_manager.agents_filenames if instructions_manager is not None else ()
             ),
         )
+
         if result.decision is Decision.DENY:
             return self._denied_problem(tool, result.reason)
+        return None
+
+    async def _authorize_async(
+        self,
+        tool: Tool,
+        operations: Operations,
+        interaction: Interaction | None,
+        permission_manager: PermissionManager,
+        instructions_manager: InstructionsManager | None,
+    ) -> str | None:
+        """Return a serialized denial or asynchronously authorize the complete operation plan."""
+        if tool.execution_authorization:
+            return self._authorization_unavailable(tool, operations)
+
+        active_interaction = interaction if interaction is not None else self._interaction
+        result = await permission_manager.authorize_async(
+            operations,
+            interaction=active_interaction,
+            protected_instruction_names=(
+                instructions_manager.agents_filenames if instructions_manager is not None else ()
+            ),
+        )
+
+        if result.decision is Decision.DENY:
+            return self._denied_problem(tool, result.reason)
+        return None
+
+    def _authorization_unavailable(
+        self,
+        tool: Tool,
+        operations: Operations,
+    ) -> str | None:
+        """Return a serialized problem if authorization is unavailable."""
+        if self._execution_service is None:
+            return self._problem(
+                "sandbox.unavailable",
+                "Sandbox unavailable",
+                "Native execution service is unavailable.",
+                tool.name,
+            )
+        if not operations or any(
+            operation.action is not Action.PROCESS_EXECUTE
+            or not isinstance(operation.target, ProcessTarget)
+            or operation.target.boundary is not ProcessBoundary.SANDBOXED
+            for operation in operations
+        ):
+            return self._problem(
+                "sandbox.unavailable",
+                "Sandbox unavailable",
+                "Native execution request is not bound to a sandbox.",
+                tool.name,
+            )
         return None
 
     @staticmethod

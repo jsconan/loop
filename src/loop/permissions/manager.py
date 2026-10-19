@@ -27,6 +27,7 @@ import yaml
 
 from .. import constants
 from ..errors import Problem, log_problem
+from ..interaction import AsyncInteractionInput
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import (
     ShutdownRequested,
@@ -401,6 +402,85 @@ class PermissionManager:
         Returns:
             AuthorizationResult: Policy, prompt, and effective result for the complete set.
         """
+        policy, fresh_file_review = self._authorization_policy(
+            operations, protected_instruction_names
+        )
+        active_interaction = interaction if interaction is not None else self._interaction
+        prompt = None
+        selected = None
+        headless = policy.decision is Decision.ASK and active_interaction is None
+        if policy.decision is Decision.ASK and active_interaction is not None:
+            prompt_body = self._prompt(operations)
+            prompt = self._authorization_prompt(prompt_body, fresh_file_review)
+            selected = self.request_permission(
+                prompt_body,
+                interaction=active_interaction,
+                fresh_only=fresh_file_review,
+            )
+        return self._complete_authorization(
+            operations,
+            policy,
+            fresh_file_review,
+            prompt,
+            selected,
+            headless=headless,
+            recorder=recorder,
+        )
+
+    async def authorize_async(
+        self,
+        operations: Operations,
+        *,
+        interaction: Interaction | None = None,
+        recorder: PermissionRecorder | None = None,
+        protected_instruction_names: tuple[str, ...] = (),
+    ) -> AuthorizationResult:
+        """Evaluate and approve one complete operation set without blocking native async input.
+
+        Args:
+            operations (Operations): Complete normalized effects of one tool call.
+            interaction (Interaction | None): Invocation interaction overriding the default.
+            recorder (PermissionRecorder | None): Invocation recorder overriding the default.
+            protected_instruction_names (tuple[str, ...]): Active instruction filenames that
+                require a fresh decision when a structured tool changes them.
+
+        Returns:
+            AuthorizationResult: Policy, prompt, and effective result for the complete set.
+
+        Raises:
+            asyncio.CancelledError: If the pending approval interaction is cancelled.
+        """
+        policy, fresh_file_review = self._authorization_policy(
+            operations, protected_instruction_names
+        )
+        active_interaction = interaction if interaction is not None else self._interaction
+        prompt = None
+        selected = None
+        headless = policy.decision is Decision.ASK and active_interaction is None
+        if policy.decision is Decision.ASK and active_interaction is not None:
+            prompt_body = self._prompt(operations)
+            prompt = self._authorization_prompt(prompt_body, fresh_file_review)
+            selected = await self.request_permission_async(
+                prompt_body,
+                interaction=active_interaction,
+                fresh_only=fresh_file_review,
+            )
+        return self._complete_authorization(
+            operations,
+            policy,
+            fresh_file_review,
+            prompt,
+            selected,
+            headless=headless,
+            recorder=recorder,
+        )
+
+    def _authorization_policy(
+        self,
+        operations: Operations,
+        protected_instruction_names: tuple[str, ...],
+    ) -> tuple[PolicyDecision, bool]:
+        """Evaluate policy and impose a fresh prompt for protected file changes."""
         policy = self.evaluate(operations)
         fresh_file_review = self._requires_fresh_file_review(
             operations, self.protected_instruction_names(protected_instruction_names)
@@ -412,8 +492,29 @@ class PermissionManager:
                 "or instruction change needs fresh approval.",
                 sources=("boundary:fresh_file_review",),
             )
-        active_interaction = interaction if interaction is not None else self._interaction
-        prompt = None
+        return policy, fresh_file_review
+
+    @staticmethod
+    def _authorization_prompt(prompt_body: str, fresh_file_review: bool) -> str:
+        """Add the appropriate confirmation wording to an operation description."""
+        return (
+            f"{prompt_body}\nProceed with this one file change?"
+            if fresh_file_review
+            else f"{prompt_body}\nProceed?"
+        )
+
+    def _complete_authorization(
+        self,
+        operations: Operations,
+        policy: PolicyDecision,
+        fresh_file_review: bool,
+        prompt: str | None,
+        selected: object | None,
+        *,
+        headless: bool,
+        recorder: PermissionRecorder | None,
+    ) -> AuthorizationResult:
+        """Apply an approval response, record its decision, and return the final result."""
         decision = policy.decision
         reason = policy.reason
         source = "policy"
@@ -421,23 +522,12 @@ class PermissionManager:
         installed_rule_ids = ()
         approval_policy_denied = False
         if policy.decision is Decision.ASK:
-            if active_interaction is None:
+            if headless:
                 decision = Decision.DENY
                 reason = "Approval is required but no interactive user is available."
                 source = "headless"
             else:
-                prompt_body = self._prompt(operations)
-                prompt = (
-                    f"{prompt_body}\nProceed with this one file change?"
-                    if fresh_file_review
-                    else f"{prompt_body}\nProceed?"
-                )
                 source = "user"
-                selected = self.request_permission(
-                    prompt_body,
-                    interaction=active_interaction,
-                    fresh_only=fresh_file_review,
-                )
                 approval_choice = (
                     selected
                     if isinstance(selected, ApprovalChoice)
@@ -1322,6 +1412,60 @@ class PermissionManager:
         Returns:
             ApprovalChoice: Selected denial or approval lifetime. Cancellation denies.
         """
+        choices, index = self._permission_options(fresh_only)
+        active_interaction = interaction if interaction is not None else self._interaction
+        active_interaction.info(prompt)
+        selected = active_interaction.prompt(
+            "Proceed?",
+            exit_commands=None,
+            choices=choices,
+            index=index,
+        )
+        return selected if isinstance(selected, ApprovalChoice) else ApprovalChoice.DENY
+
+    async def request_permission_async(
+        self,
+        prompt: str,
+        *,
+        interaction: Interaction | None = None,
+        fresh_only: bool = False,
+    ) -> ApprovalChoice:
+        """Request scoped approval using asynchronous input when the adapter provides it.
+
+        Args:
+            prompt (str): Complete operation description to display.
+            interaction (Interaction | None): Invocation interaction overriding the default.
+            fresh_only (bool): Offer only a one-time choice for user-managed data changes.
+
+        Returns:
+            ApprovalChoice: Selected denial or approval lifetime. Cancellation denies.
+
+        Raises:
+            asyncio.CancelledError: If native asynchronous input is cancelled.
+        """
+        choices, index = self._permission_options(fresh_only)
+        active_interaction = interaction if interaction is not None else self._interaction
+        active_interaction.info(prompt)
+        if isinstance(active_interaction, AsyncInteractionInput):
+            selected = await active_interaction.prompt_async(
+                "Proceed?",
+                exit_commands=None,
+                choices=choices,
+                index=index,
+            )
+        else:
+            selected = active_interaction.prompt(
+                "Proceed?",
+                exit_commands=None,
+                choices=choices,
+                index=index,
+            )
+        return selected if isinstance(selected, ApprovalChoice) else ApprovalChoice.DENY
+
+    def _permission_options(
+        self, fresh_only: bool
+    ) -> tuple[dict[ApprovalChoice, str], dict[ApprovalChoice, str]]:
+        """Build the supported approval choices and their terminal indexes."""
         choices = {
             ApprovalChoice.DENY: "Deny",
             ApprovalChoice.ONCE: "Allow once",
@@ -1341,15 +1485,7 @@ class PermissionManager:
         if not fresh_only and self._user_configuration_path is not None:
             choices[ApprovalChoice.USER] = "Always allow for this user"
             index[ApprovalChoice.USER] = "U"
-        active_interaction = interaction if interaction is not None else self._interaction
-        active_interaction.info(prompt)
-        selected = active_interaction.prompt(
-            "Proceed?",
-            exit_commands=None,
-            choices=choices,
-            index=index,
-        )
-        return selected if isinstance(selected, ApprovalChoice) else ApprovalChoice.DENY
+        return choices, index
 
     def _remember_approval(
         self,

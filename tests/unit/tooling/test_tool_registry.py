@@ -2,13 +2,15 @@
 
 import asyncio
 import importlib
+import io
 import json
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from rich.console import Console
 
 from loop import (
     Action,
@@ -45,7 +47,7 @@ from loop.execution.coordinator import LocalHostCommandExecutor
 from loop.execution.sandbox import CommandProcessResult, SandboxOutcome
 from loop.execution.sandbox.macos import MacOSSeatbeltBackend
 from loop.instructions import InstructionsManager
-from loop.interaction import Interaction
+from loop.interaction import ConsoleInteraction, Interaction
 from loop.permissions import CommandAnalysis, PermissionRule
 from loop.permissions.protection import protected_workspace_paths
 from loop.tooling import (
@@ -1250,6 +1252,134 @@ def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
     recorder.record_authorization.assert_called_once()
 
 
+def test_async_dispatch_keeps_event_loop_responsive_during_approval():
+    """Async tool dispatch yields while native approval is pending and runs only after it."""
+    approval_started = asyncio.Event()
+    continue_approval = asyncio.Event()
+    executed = []
+
+    async def approve(_message, **_kwargs):
+        approval_started.set()
+        await continue_approval.wait()
+        return ApprovalChoice.ONCE
+
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(side_effect=approve)
+    permissions = PermissionManager(interaction=interaction)
+
+    @declare_tool(
+        actions={Action.NETWORK_REQUEST},
+        operation_planner=planner_for(Action.NETWORK_REQUEST),
+    )
+    async def calculate(number: int) -> int:
+        """Record execution after the approval boundary."""
+        executed.append(number)
+        return number
+
+    registry = ToolRegistry([calculate], interaction=interaction, permission_manager=permissions)
+
+    async def dispatch():
+        task = asyncio.create_task(registry.call_with_timing_async("calculate", '{"number": 3}'))
+        await approval_started.wait()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert executed == []
+        continue_approval.set()
+        return await task
+
+    output, duration = asyncio.run(dispatch())
+
+    assert result_value(output) == 3
+    assert duration >= 0
+    assert executed == [3]
+    interaction.prompt_async.assert_awaited_once()
+
+
+def test_async_planning_stops_at_operation_boundaries():
+    """Async planning rejects a boundary violation before requesting permission."""
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = SimpleNamespace(reason="Outside allowed roots.")
+
+    @declare_tool(
+        actions={Action.NETWORK_REQUEST},
+        operation_planner=planner_for(Action.NETWORK_REQUEST),
+    )
+    async def calculate(number: int) -> int:
+        """Return a value after the boundary check."""
+        return number
+
+    registry = ToolRegistry([calculate], permission_manager=permissions)
+    output = asyncio.run(registry.call_async("calculate", '{"number": 3}'))
+
+    assert json.loads(output)["problem"]["code"] == "tool.denied"
+    permissions.authorize_async.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("execution_service", "operations", "expected"),
+    [
+        (None, (), "sandbox.unavailable"),
+        (
+            object(),
+            (
+                Operation(
+                    tool_id="execute",
+                    action=Action.SESSION_MUTATE,
+                    target=SessionTarget(identifier="state"),
+                ),
+            ),
+            "sandbox.unavailable",
+        ),
+        (
+            object(),
+            (
+                Operation(
+                    tool_id="execute",
+                    action=Action.PROCESS_EXECUTE,
+                    target=ProcessTarget(
+                        argv=("safe-command",),
+                        cwd="/workspace",
+                        boundary=ProcessBoundary.SANDBOXED,
+                    ),
+                ),
+            ),
+            None,
+        ),
+    ],
+)
+def test_async_execution_authorization_keeps_sandbox_boundary(
+    execution_service, operations, expected
+):
+    """Async dispatch only accepts operations authorized for the sandbox boundary."""
+
+    def process_plan(arguments):
+        """Return the arguments unchanged for direct authorization checks."""
+        return OperationPlan(arguments=arguments)
+
+    @declare_tool(
+        actions={Action.PROCESS_EXECUTE},
+        operation_planner=process_plan,
+        execution_authorization=True,
+    )
+    async def execute(context: ToolContext) -> str:
+        """Stand in for a sandbox-authorized tool."""
+        return "ok"
+
+    registry = ToolRegistry([execute])
+    registry._execution_service = execution_service
+    result = asyncio.run(
+        registry._authorize_async(
+            registry._tools["execute"],
+            operations,
+            None,
+            PermissionManager(),
+            None,
+        )
+    )
+
+    assert (json.loads(result)["problem"]["code"] if result is not None else None) == expected
+
+
 @pytest.mark.parametrize(
     ("name", "arguments", "error"),
     [
@@ -1293,6 +1423,7 @@ def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_meta
     permissions = Mock(spec=PermissionManager)
     permissions.check_boundaries.return_value = None
     permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
+    permissions.authorize_async.return_value = SimpleNamespace(decision=Decision.ALLOW)
     registry = ToolRegistry([read_text_file], permission_manager=permissions)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
@@ -1307,7 +1438,8 @@ def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_meta
     result = result_value(output)
     assert result["content"] == "useful content"
     assert result["path"] == "/workspace/é notes.txt"
-    assert str(path) in str(permissions.authorize.call_args.args[0])
+    authorization = permissions.authorize_async if asynchronous else permissions.authorize
+    assert str(path) in str(authorization.call_args.args[0])
 
 
 def test_observed_file_scope_does_not_change_command_working_directory(tmp_path, monkeypatch):

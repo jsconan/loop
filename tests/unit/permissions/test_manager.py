@@ -1,15 +1,18 @@
 """Tests for layered operation-policy evaluation, approval, and persistence."""
 
+import asyncio
+import io
 import json
 import sqlite3
 import tempfile
 import time
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import Mock, call
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 import yaml
+from rich.console import Console
 
 from loop import (
     Action,
@@ -35,6 +38,7 @@ from loop import (
     SessionTarget,
 )
 from loop.execution.sandbox import SandboxRequest
+from loop.interaction import ConsoleInteraction
 from loop.permissions import (
     CommandFinding,
     CommandInspection,
@@ -1211,6 +1215,92 @@ def test_authorization_rejection_and_recorder_override_are_atomic(tmp_path):
     override.record_authorization.assert_called_once_with(result)
     configured.record_authorization.assert_not_called()
     assert manager.recorder is configured
+
+
+def test_authorize_async_awaits_native_approval_and_records_result(tmp_path):
+    """Async authorization awaits native input before recording an approval."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.ONCE)
+    recorder = Mock()
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    result = asyncio.run(manager.authorize_async(operation_set, recorder=recorder))
+
+    assert result.decision is Decision.ALLOW
+    assert result.approval_choice is ApprovalChoice.ONCE
+    assert result.prompted
+    interaction.prompt_async.assert_awaited_once()
+    assert interaction.prompt_async.await_args.kwargs["choices"] == {
+        ApprovalChoice.DENY: "Deny",
+        ApprovalChoice.ONCE: "Allow once",
+        ApprovalChoice.SESSION: "Allow for this session",
+        ApprovalChoice.WORKSPACE: "Allow in this workspace",
+    }
+    recorder.record_authorization.assert_called_once_with(result)
+
+
+def test_authorize_async_keeps_fresh_file_changes_one_time_only(tmp_path):
+    """A fresh file review cannot install a reusable grant even from a stale response."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.SESSION)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+
+    result = asyncio.run(
+        manager.authorize_async((file_operation(Action.FILESYSTEM_REPLACE, tmp_path / "a.txt"),))
+    )
+
+    assert result.decision is Decision.DENY
+    assert result.approval_choice is ApprovalChoice.DENY
+    assert result.reason == "Rejected by the user."
+    assert interaction.prompt_async.await_args.kwargs["choices"] == {
+        ApprovalChoice.DENY: "Deny",
+        ApprovalChoice.ONCE: "Allow once",
+    }
+    assert manager.session_rules == ()
+
+
+def test_authorize_async_retains_sync_interaction_compatibility(tmp_path):
+    """Async authorization can still use a legacy synchronous interaction adapter."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = ApprovalChoice.ONCE
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    result = asyncio.run(manager.authorize_async(operation_set))
+
+    assert result.decision is Decision.ALLOW
+    interaction.prompt.assert_called_once()
+
+
+def test_authorize_async_denies_headless_and_propagates_cancellation(tmp_path):
+    """Headless approvals deny and cancelled native prompts remain cancellable."""
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+    headless = PermissionManager(tmp_path).authorize_async(operation_set)
+    result = asyncio.run(headless)
+    assert result.decision is Decision.DENY
+    assert result.source == "headless"
+
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(side_effect=asyncio.CancelledError)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(manager.authorize_async(operation_set))
 
 
 def test_session_approval_remembers_exact_batch_targets_and_deduplicates(tmp_path):
