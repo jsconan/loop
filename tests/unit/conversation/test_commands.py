@@ -37,6 +37,7 @@ def test_provider_declares_state_capabilities_and_response_completion():
         "respond",
         "status",
         "steer",
+        "queue",
     ]
     assert registrations[0].capabilities == frozenset({CommandCapability.RUN_ACTIVE})
     assert registrations[1].capabilities == frozenset({CommandCapability.PENDING_RESPONSE})
@@ -138,6 +139,32 @@ def test_status_formats_the_controller_snapshot(command_context):
     ConversationCommands(control).status(context)
 
     interaction.info.assert_called_once_with("Working; 3 queued inputs.")
+
+
+@pytest.mark.parametrize(
+    ("message", "accepted", "expected_warning"),
+    [
+        ((), None, "Usage: /queue <message>"),
+        (("after", "this"), True, None),
+        (("after",), False, "No agent run is active; send a normal message instead."),
+    ],
+)
+def test_queue_reports_admission_outcomes(command_context, message, accepted, expected_warning):
+    """Queued messages preserve their text and report empty, accepted, and rejected input."""
+    context, interaction = command_context
+    control = Mock()
+    control.queue.return_value = accepted
+
+    ConversationCommands(control).queue(context, message)
+
+    if accepted is None:
+        control.queue.assert_not_called()
+    else:
+        control.queue.assert_called_once_with(" ".join(message), interaction)
+    if expected_warning is None:
+        interaction.warning.assert_not_called()
+    else:
+        interaction.warning.assert_called_once_with(expected_warning)
 
 
 @pytest.mark.parametrize(

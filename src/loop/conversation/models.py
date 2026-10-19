@@ -21,10 +21,10 @@ class ConversationStatus:
 
     Args:
         state (str): Current activity shown by the conversation status command.
-        queued_inputs (int): Number of ordinary inputs waiting in the mailbox.
+        queued_inputs (int): Number of steering and queued inputs waiting in the mailbox.
     """
 
-    state: Literal["Interrupting", "Waiting for your response", "Idle", "Working"]
+    state: Literal["Interrupting", "Steering", "Waiting for your response", "Idle", "Working"]
     queued_inputs: int
 
 

@@ -520,9 +520,29 @@ class AgentRunner:
                     )
                     self._model_selection.record_response(response.model)
                     self._session_manager.add_response(response)
+                    if self._steering_pending():
+                        self._cancel_pending_tools()
+                        return self._record_run_result(
+                            final_response=response,
+                            turns=total_turns,
+                            stop_reason="steered",
+                            started_at=started_at,
+                            calls=calls,
+                            tools=tools,
+                        )
                     executions = self.handle_tool_calls(response)
                     tools.extend(executions)
                     self._checkpoint()
+                    if self._steering_pending():
+                        self._cancel_pending_tools()
+                        return self._record_run_result(
+                            final_response=response,
+                            turns=total_turns,
+                            stop_reason="steered",
+                            started_at=started_at,
+                            calls=calls,
+                            tools=tools,
+                        )
                     if not executions:
                         return self._record_run_result(
                             final_response=response,
@@ -608,9 +628,29 @@ class AgentRunner:
                     )
                     self._model_selection.record_response(response.model)
                     self._session_manager.add_response(response)
+                    if self._steering_pending():
+                        self._cancel_pending_tools()
+                        return self._record_run_result(
+                            final_response=response,
+                            turns=total_turns,
+                            stop_reason="steered",
+                            started_at=started_at,
+                            calls=calls,
+                            tools=tools,
+                        )
                     executions = await self.handle_tool_calls_async(response)
                     tools.extend(executions)
                     self._checkpoint()
+                    if self._steering_pending():
+                        self._cancel_pending_tools()
+                        return self._record_run_result(
+                            final_response=response,
+                            turns=total_turns,
+                            stop_reason="steered",
+                            started_at=started_at,
+                            calls=calls,
+                            tools=tools,
+                        )
                     if not executions:
                         return self._record_run_result(
                             final_response=response,
@@ -708,6 +748,8 @@ class AgentRunner:
         executions = []
         try:
             for tool_call in tool_calls:
+                if self._steering_pending():
+                    break
                 with telemetry_span():
                     executions.append(
                         self._execute_tool_call(
@@ -733,6 +775,8 @@ class AgentRunner:
         executions = []
         try:
             for tool_call in tool_calls:
+                if self._steering_pending():
+                    break
                 with telemetry_span():
                     executions.append(
                         await self._execute_tool_call_async(
@@ -1246,6 +1290,10 @@ class AgentRunner:
         """Honor optional cooperative stop requests before a new execution boundary."""
         if self._run_control is not None:
             self._run_control.checkpoint()
+
+    def _steering_pending(self) -> bool:
+        """Return whether an admitted steering message should stop new work in this run."""
+        return self._run_control is not None and self._run_control.steering_pending is True
 
     def _report_backend_error(self, error: BackendError) -> None:
         """Display a normalized backend failure and useful diagnostic identifiers."""

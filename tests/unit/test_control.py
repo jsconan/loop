@@ -66,6 +66,35 @@ def test_interrupt_is_scoped_and_never_latches_onto_an_idle_or_later_run():
         control.checkpoint()
 
 
+@pytest.mark.parametrize(
+    ("active", "stopped", "admitted", "expected"),
+    [
+        (False, False, True, False),
+        (True, True, True, False),
+        (True, False, False, False),
+        (True, False, True, True),
+    ],
+)
+def test_steering_admission_is_scoped_to_an_active_run(active, stopped, admitted, expected):
+    """Only admitted steering during a live run publishes the safe-boundary signal."""
+    control = RunControl()
+    called = []
+    scope = control.execution()
+    if active:
+        scope.__enter__()
+    if stopped:
+        control.stop()
+
+    result = control.request_steering(lambda: called.append(True) or admitted)
+
+    assert result is expected
+    assert bool(called) is (active and not stopped)
+    assert control.steering_pending is expected
+    if active:
+        scope.__exit__(None, None, None)
+        assert control.steering_pending is False
+
+
 def test_shutdown_supersedes_interruption_and_survives_execution_cleanup():
     """Settling an interrupted scope cannot clear a concurrent sticky shutdown request."""
     control = RunControl()

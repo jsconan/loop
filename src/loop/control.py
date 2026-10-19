@@ -1,7 +1,7 @@
 """Provide cooperative session shutdown and run interruption."""
 
 import asyncio
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from threading import Event, Lock
 
@@ -15,7 +15,9 @@ class RunControl:
 
     Initialize an idle control. Shutdown stays sticky; interruption applies only to the current
     execution scope and is cleared when it settles. Active synchronous tools finish under their
-    existing deadlines before a checkpoint observes either signal.
+    existing deadlines before a checkpoint observes shutdown or interruption. Steering is a
+    separate safe-boundary signal: generation and the current tool finish, while later work in the
+    same response is skipped.
     """
 
     _wake: Event
@@ -23,6 +25,7 @@ class RunControl:
     _stopped: bool
     _active: bool
     _interrupted: bool
+    _steering_pending: bool
     _async_waiters: dict[asyncio.Event, asyncio.AbstractEventLoop]
 
     def __init__(self) -> None:
@@ -31,6 +34,7 @@ class RunControl:
         self._stopped = False
         self._active = False
         self._interrupted = False
+        self._steering_pending = False
         self._async_waiters = {}
 
     @property
@@ -63,6 +67,16 @@ class RunControl:
         with self._lock:
             return self._interrupted
 
+    @property
+    def steering_pending(self) -> bool:
+        """Return whether accepted steering awaits the next safe execution boundary.
+
+        Returns:
+            bool: Whether an accepted steering message should stop further work in this run.
+        """
+        with self._lock:
+            return self._steering_pending
+
     def stop(self) -> None:
         """Request conversation shutdown at the next safe boundary."""
         with self._lock:
@@ -84,9 +98,25 @@ class RunControl:
             self._wake_async_waiters()
             return True
 
+    def request_steering(self, admit: Callable[[], bool]) -> bool:
+        """Atomically admit steering while an active run publishes its safe-boundary signal.
+
+        Args:
+            admit (Callable[[], bool]): Nonblocking mailbox admission callback. It must not
+                perform UI interaction or wait for another task.
+
+        Returns:
+            bool: Whether the active run admitted the message and recorded the signal.
+        """
+        with self._lock:
+            if not self._active or self._stopped or not admit():
+                return False
+            self._steering_pending = True
+            return True
+
     @contextmanager
     def execution(self) -> Generator[None]:
-        """Own one interruptible run and clear its interrupt after cleanup.
+        """Own one run and clear scoped interruption and steering signals after cleanup.
 
         Yields:
             None: Control while the run owns its interrupt signal.
@@ -104,6 +134,7 @@ class RunControl:
             with self._lock:
                 self._active = False
                 self._interrupted = False
+                self._steering_pending = False
                 if not self._stopped:
                     self._wake.clear()
 

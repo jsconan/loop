@@ -99,8 +99,9 @@ class SessionController:
     the same. An unbound controller builds a standalone registry from that provider when it starts.
     All domain operations stay on one execution thread. The UI owns prompts, presentation, and a
     bounded input mailbox. Pending inputs are transient until the conversation consumes them.
-    Explicit steering interrupts an active run and prioritizes correction messages over ordinary
-    follow-ups. Each controller runs once.
+    Ordinary input during an active run is admitted as steering and applied after the current
+    model response or tool settles. Explicit ``/steer`` interrupts immediately; ``/queue`` queues
+    input after the run. Each controller runs once.
 
     Args:
         interaction (Interaction): UI implementing ``AsyncInteractionInput`` as well as output.
@@ -342,6 +343,8 @@ class SessionController:
         state = (
             "Interrupting"
             if self._control.interrupted
+            else "Steering"
+            if self._control.steering_pending
             else "Waiting for your response"
             if self._pending is not None
             else ("Idle" if self._idle else "Working")
@@ -369,6 +372,20 @@ class SessionController:
         if not self.request_interrupt():
             return SteeringOutcome.INTERRUPT_REJECTED
         return SteeringOutcome.INTERRUPTED
+
+    def queue(self, message: str, interaction: Interaction) -> bool:
+        """Admit an explicit message for execution after the active run completes.
+
+        Args:
+            message (str): Text to add at ordinary queue priority.
+            interaction (Interaction): UI used to report queue admission feedback.
+
+        Returns:
+            bool: Whether the active run admitted the message.
+        """
+        if not self._control.active:
+            return False
+        return self._enqueue(SteeringMessage(message), interaction=interaction)
 
     @property
     def interaction(self) -> Interaction:
@@ -849,6 +866,8 @@ class SessionController:
             return
         if value == "":
             self._source.warning("Please enter a message!")
+        elif self._control.active:
+            self._enqueue_steering(value)
         else:
             self._enqueue(value)
 
@@ -891,6 +910,41 @@ class SessionController:
         )
         if not self._idle:
             active_interaction.info(f"Queued input ({self._inbox.qsize()} pending).")
+        return True
+
+    def _enqueue_steering(self, value: str) -> bool:
+        """Atomically queue active ordinary input as steering for the next safe boundary."""
+        message = SteeringMessage(value)
+        sequence = next(self._sequence)
+
+        def admit() -> bool:
+            """Insert without UI work while run-control admission is locked."""
+            try:
+                self._inbox.put_nowait((_STEERING_PRIORITY, sequence, message))
+            except Full:
+                return False
+            return True
+
+        if not self._control.request_steering(admit):
+            if self._control.active:
+                telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
+                self._source.warning(
+                    "Input queue is full; this input was not accepted. Try again later."
+                )
+                return False
+            return self._enqueue(value)
+        loop = self._loop
+        if loop is not None:
+            if get_ident() == self._ui_thread:
+                self._input_signal.set()
+            else:
+                loop.call_soon_threadsafe(self._input_signal.set)
+        telemetry_activity(
+            "conversation.input.queued",
+            component=_STATUS_COMPONENT,
+            pending=self._inbox.qsize(),
+        )
+        self._source.info("Steering accepted; finishing the current operation first.")
         return True
 
     async def _answer(self) -> None:

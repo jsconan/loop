@@ -60,6 +60,17 @@ class ConversationControl(Protocol):
             SteeringOutcome: Result distinguishing interruption, inactivity, and backpressure.
         """
 
+    def queue(self, message: str, interaction: Interaction) -> bool:
+        """Queue a message to run after the active agent run completes.
+
+        Args:
+            message (str): Text to add to the conversation queue.
+            interaction (Interaction): UI used to report queue admission feedback.
+
+        Returns:
+            bool: Whether the message was admitted.
+        """
+
 
 class ConversationCommands:
     """Register user-facing controls for an asynchronous conversation.
@@ -97,6 +108,11 @@ class ConversationCommands:
             ),
             CommandRegistration(
                 self.steer,
+                completion=CommandCompletion(),
+                capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
+            ),
+            CommandRegistration(
+                self.queue,
                 completion=CommandCompletion(),
                 capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
             ),
@@ -173,3 +189,21 @@ class ConversationCommands:
             context.interaction.info(
                 "Interrupt requested; waiting for the active operation to settle..."
             )
+
+    def queue(
+        self,
+        context: CommandContext,
+        message: Annotated[tuple[str, ...], CommandRemainder()] = (),
+    ) -> None:
+        """Queue a message to run after the current agent run completes.
+
+        Args:
+            context (CommandContext): Interaction used to report the queue outcome.
+            message (tuple[str, ...]): Message text split into shell tokens. Defaults to an
+                empty tuple, which reports the usage requirement.
+        """
+        text = " ".join(message)
+        if not text:
+            context.interaction.warning("Usage: /queue <message>")
+        elif not self._control.queue(text, context.interaction):
+            context.interaction.warning("No agent run is active; send a normal message instead.")

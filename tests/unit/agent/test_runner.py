@@ -1710,6 +1710,132 @@ def test_runner_run_async_stops_when_async_recovery_declines():
     sessions.record_run.assert_called_once()
 
 
+@pytest.mark.parametrize("during_tool", [False, True])
+def test_async_steering_finishes_current_work_and_resolves_unstarted_calls(during_tool):
+    """Steering preserves a complete response and settles every tool that did not start."""
+    control = RunControl()
+    first = ToolCall(call_id="first", name="effect", arguments="{}")
+    second = ToolCall(call_id="second", name="effect", arguments="{}")
+    response = Response(
+        answer="",
+        reasoning="",
+        tool_calls=(first, second),
+        items=(first, second),
+    )
+    runner, sessions, _interaction = agent_runner(run_control=control)
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(
+            PendingToolCall(
+                call=first, status="result_available" if during_tool else "not_started"
+            ),
+            PendingToolCall(call=second, status="not_started"),
+        ),
+    )
+
+    async def query():
+        """Finish generation and optionally request steering after the first tool settles."""
+        assert control.active
+        if not during_tool:
+            assert control.request_steering(lambda: True)
+        return response
+
+    async def execute(call, **_kwargs):
+        """Complete the first invocation, then publish steering before the next call starts."""
+        assert call is first
+        assert control.request_steering(lambda: True)
+        return ToolExecutionMetrics(name=call.name, duration_seconds=0.1, succeeded=True)
+
+    runner.query_async = AsyncMock(side_effect=query)
+    runner._execute_tool_call_async = AsyncMock(side_effect=execute)
+
+    result = asyncio.run(runner.run_async())
+
+    assert result.stop_reason == "steered"
+    assert result.final_response is response
+    sessions.add_response.assert_called_once_with(response)
+    if during_tool:
+        runner._execute_tool_call_async.assert_awaited_once()
+        assert result.metrics.tools == (
+            ToolExecutionMetrics(name="effect", duration_seconds=0.1, succeeded=True),
+        )
+        assert sessions.add_tool_call.call_count == 1
+        assert sessions.add_tool_call.call_args.kwargs["call_id"] == "second"
+    else:
+        runner._execute_tool_call_async.assert_not_awaited()
+        assert sessions.add_tool_call.call_count == 2
+        assert {call.kwargs["call_id"] for call in sessions.add_tool_call.call_args_list} == {
+            "first",
+            "second",
+        }
+    skipped_ids = {"second"} if during_tool else {"first", "second"}
+    skipped = (
+        call
+        for call in sessions.add_tool_call.call_args_list
+        if call.kwargs["call_id"] in skipped_ids
+    )
+    assert all(
+        json.loads(call.kwargs["output"])["problem"]["code"] == "tool.execution_interrupted"
+        for call in skipped
+    )
+    assert control.steering_pending is False
+
+
+@pytest.mark.parametrize("during_tool", [False, True])
+def test_sync_steering_finishes_current_work_and_resolves_unstarted_calls(during_tool):
+    """The synchronous compatibility runner honors the same steering boundaries."""
+    control = RunControl()
+    first = ToolCall(call_id="first", name="effect", arguments="{}")
+    second = ToolCall(call_id="second", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(first, second), items=(first, second))
+    runner, sessions, _interaction = agent_runner(run_control=control)
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(
+            PendingToolCall(
+                call=first, status="result_available" if during_tool else "not_started"
+            ),
+            PendingToolCall(call=second, status="not_started"),
+        ),
+    )
+
+    def query():
+        """Complete model generation and optionally stop before the first tool."""
+        if not during_tool:
+            assert control.request_steering(lambda: True)
+        return response
+
+    def execute(call, **_kwargs):
+        """Finish the first tool before steering prevents the second tool from starting."""
+        assert call is first
+        assert control.request_steering(lambda: True)
+        return ToolExecutionMetrics(name=call.name, duration_seconds=0.1, succeeded=True)
+
+    runner.query = Mock(side_effect=query)
+    runner._execute_tool_call = Mock(side_effect=execute)
+
+    result = runner.run()
+
+    assert result.stop_reason == "steered"
+    assert result.final_response is response
+    sessions.add_response.assert_called_once_with(response)
+    if during_tool:
+        runner._execute_tool_call.assert_called_once()
+        assert result.metrics.tools == (
+            ToolExecutionMetrics(name="effect", duration_seconds=0.1, succeeded=True),
+        )
+        assert sessions.add_tool_call.call_count == 1
+        assert sessions.add_tool_call.call_args.kwargs["call_id"] == "second"
+    else:
+        runner._execute_tool_call.assert_not_called()
+        assert sessions.add_tool_call.call_count == 2
+        assert {call.kwargs["call_id"] for call in sessions.add_tool_call.call_args_list} == {
+            "first",
+            "second",
+        }
+    assert control.steering_pending is False
+
+
 def test_runner_run_async_resolves_recovery_before_querying():
     """A supplied recovery boundary settles its pending tool plan before the next query."""
     runner, _sessions, _interaction = agent_runner()

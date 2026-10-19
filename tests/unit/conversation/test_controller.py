@@ -107,7 +107,7 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
     manager.register(unavailable)
     manager.call("help")
     setup_names = {item.name for item in ui.table.call_args.args[0]}
-    assert {"interrupt", "respond", "status", "steer", "choose"}.isdisjoint(setup_names)
+    assert {"interrupt", "respond", "status", "steer", "queue", "choose"}.isdisjoint(setup_names)
     assert "queued" in setup_names
 
     async def scenario():
@@ -163,6 +163,7 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
                 "interrupt",
                 "status",
                 "steer",
+                "queue",
                 "choose",
             }
             release.set()
@@ -674,11 +675,11 @@ def test_command_capabilities_track_active_run_pending_response_and_settlement(u
     def names():
         return {command.name for command in manager.active_commands}
 
-    assert {"interrupt", "respond", "status", "steer"}.isdisjoint(names())
+    assert {"interrupt", "respond", "status", "steer", "queue"}.isdisjoint(names())
     controller._loop = Mock()
     with controller.control.execution():
         active_names = names()
-        assert {"interrupt", "status", "steer"} <= active_names
+        assert {"interrupt", "status", "steer", "queue"} <= active_names
         assert "respond" not in active_names
         controller._pending = InteractionCall(
             function=ui.prompt,
@@ -692,7 +693,7 @@ def test_command_capabilities_track_active_run_pending_response_and_settlement(u
         assert [item.text for item in completions] == ["Yes"]
     controller._pending = None
     controller._loop = None
-    assert {"interrupt", "respond", "status", "steer"}.isdisjoint(names())
+    assert {"interrupt", "respond", "status", "steer", "queue"}.isdisjoint(names())
 
 
 def test_command_capabilities_during_shutdown_allow_only_inspection(ui):
@@ -866,6 +867,58 @@ def test_steering_rejects_when_no_run_is_active(ui):
     assert controller.status_snapshot().queued_inputs == 0
 
 
+def test_queue_requires_a_run_and_preserves_command_like_text(ui):
+    """Queued messages preserve text that resembles commands."""
+    controller = SessionController(ui)
+
+    assert controller.queue("/exit", ui) is False
+    with controller.control.execution():
+        assert controller.queue("/exit", ui) is True
+
+    priority, _sequence, message = controller._inbox.get_nowait()
+    assert priority == 1
+    assert message == SteeringMessage("/exit")
+    assert isinstance(message, SteeringMessage)
+
+
+def test_default_steering_admission_falls_back_to_ordinary_input_while_idle(ui):
+    """A steering admission racing with an idle boundary remains ordinary input."""
+    controller = SessionController(ui)
+
+    assert controller._enqueue_steering("message") is True
+
+    _priority, _sequence, message = controller._inbox.get_nowait()
+    assert message == "message"
+    assert not isinstance(message, SteeringMessage)
+
+
+def test_steering_admission_without_a_controller_loop_still_queues(ui):
+    """An active execution can admit steering before controller startup."""
+    controller = SessionController(ui)
+
+    with controller.control.execution():
+        assert controller._enqueue_steering("message") is True
+
+    _priority, _sequence, message = controller._inbox.get_nowait()
+    assert message == SteeringMessage("message")
+
+
+def test_steering_admission_from_a_non_ui_thread_wakes_the_controller_loop(ui):
+    """Cross-thread steering admission schedules its mailbox wake on the owning loop."""
+    controller = SessionController(ui)
+
+    async def scenario():
+        """Use a live loop with a distinct UI-thread marker to exercise thread-safe wakeup."""
+        controller._loop = asyncio.get_running_loop()
+        controller._ui_thread = -1
+        with controller.control.execution():
+            assert controller._enqueue_steering("message") is True
+        await asyncio.sleep(0)
+        return controller._input_signal.is_set()
+
+    assert asyncio.run(scenario()) is True
+
+
 def test_controller_accepts_messages_and_status_during_serialized_work(ui):
     """UI input remains live while execution retains one owner and processes queued inputs FIFO."""
     controller = SessionController(ui)
@@ -873,7 +926,7 @@ def test_controller_accepts_messages_and_status_during_serialized_work(ui):
     received, execution_threads, output_threads = [], [], []
 
     async def scenario():
-        """Queue follow-ups behind a controlled execution boundary."""
+        """Queue messages behind a controlled execution boundary."""
         inputs = asyncio.Queue()
         started, queued, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
         read_inputs(ui, inputs)
@@ -927,6 +980,60 @@ def test_controller_accepts_messages_and_status_during_serialized_work(ui):
     assert len(set(execution_threads)) == 1
     assert execution_threads[0] != get_ident()
     ui.conversation_ended.assert_called_once_with()
+
+
+def test_ordinary_input_during_active_run_is_deferred_steering(ui):
+    """Active ordinary input finishes the current operation, then returns as a correction."""
+    controller = SessionController(ui)
+    release = Event()
+    received = []
+
+    async def scenario():
+        """Submit a correction while an execution scope is active."""
+        inputs = asyncio.Queue()
+        working, accepted, consumed = (asyncio.Event() for _ in range(3))
+        read_inputs(ui, inputs)
+        ui.info.side_effect = lambda message="": (
+            working.set()
+            if message == "working"
+            else accepted.set()
+            if message.startswith("Steering accepted")
+            else None
+        )
+
+        def conversation(receive):
+            """Complete the current boundary without converting steering into interruption."""
+            received.append(receive(DummyCompleter()))
+            with controller.control.execution():
+                controller.interaction.info("working")
+                release.wait()
+                assert controller.control.steering_pending is True
+                assert controller.control.interrupted is False
+                controller.control.checkpoint()
+            received.append(receive(DummyCompleter()))
+            consumed.set()
+            receive(DummyCompleter())
+
+        task = asyncio.create_task(controller.run(conversation))
+        try:
+            inputs.put_nowait("first")
+            await working.wait()
+            inputs.put_nowait("correction")
+            await accepted.wait()
+            assert controller.status_snapshot().state == "Steering"
+            release.set()
+            await consumed.wait()
+            inputs.put_nowait(False)
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert received == ["first", SteeringMessage("correction")]
+    assert controller.control.steering_pending is False
 
 
 @pytest.mark.parametrize(
@@ -1367,9 +1474,10 @@ def test_controller_bounds_queued_inputs_and_reports_unexecuted_inputs_on_exit(u
         def conversation(receive):
             """Keep the execution owner busy until the test releases it."""
             messages.append(receive(DummyCompleter()))
-            controller.interaction.info("working")
-            release.wait()
-            messages.append(receive(DummyCompleter()))
+            with controller.control.execution():
+                controller.interaction.info("working")
+                release.wait()
+                messages.append(receive(DummyCompleter()))
 
         task = asyncio.create_task(controller.run(conversation))
         try:
@@ -2458,7 +2566,7 @@ def test_controller_reports_discarded_inputs_without_hiding_primary_failures(ui,
     ui.warning.assert_called_once_with("Stopped; 1 queued inputs were not executed.")
 
 
-def test_steering_precedes_followups_and_keeps_corrections_in_submission_order(ui):
+def test_steering_precedes_queued_messages_and_keeps_corrections_in_submission_order(ui):
     """Corrections interrupt the current scope, then retain FIFO ahead of ordinary queued text."""
 
     controller = SessionController(ui)
@@ -2504,7 +2612,12 @@ def test_steering_precedes_followups_and_keeps_corrections_in_submission_order(u
         try:
             inputs.put_nowait("first")
             await working.wait()
-            for value in ("followup one", "followup two", "/steer correction", "/steer /new"):
+            for value in (
+                "/queue queued one",
+                "/queue queued two",
+                "/steer correction",
+                "/steer /new",
+            ):
                 inputs.put_nowait(value)
             await interrupted.wait()
             inputs.put_nowait("/status")
@@ -2519,7 +2632,7 @@ def test_steering_precedes_followups_and_keeps_corrections_in_submission_order(u
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
-    assert messages == ["first", "correction", "/new", "followup one", "followup two"]
+    assert messages == ["first", "correction", "/new", "queued one", "queued two"]
     assert all(isinstance(value, SteeringMessage) for value in messages[1:3])
 
 
@@ -2582,7 +2695,7 @@ def test_run_interruption_revokes_pending_approval_without_ending_the_chat(ui):
 
 
 def test_rejected_steering_does_not_interrupt_or_displace_a_full_mailbox(ui):
-    """Capacity refusal leaves the active run and all sixteen accepted follow-ups intact."""
+    """Capacity refusal leaves the active run and all sixteen accepted queued messages intact."""
     controller = SessionController(ui)
     release = Event()
     interrupted = []
@@ -2621,7 +2734,7 @@ def test_rejected_steering_does_not_interrupt_or_displace_a_full_mailbox(ui):
             inputs.put_nowait("first")
             await working.wait()
             for index in range(16):
-                inputs.put_nowait(f"followup {index}")
+                inputs.put_nowait(f"/queue queued {index}")
             inputs.put_nowait("/steer rejected")
             await rejected.wait()
             release.set()
@@ -2634,7 +2747,7 @@ def test_rejected_steering_does_not_interrupt_or_displace_a_full_mailbox(ui):
 
     asyncio.run(scenario())
     assert interrupted == [False]
-    assert received == [f"followup {index}" for index in range(16)]
+    assert received == [f"queued {index}" for index in range(16)]
     assert sum("queue is full" in call.args[0] for call in ui.warning.call_args_list) == 1
 
 

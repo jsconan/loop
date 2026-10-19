@@ -2532,7 +2532,7 @@ def test_query_rejects_missing_model_selection(tmp_path):
 
 
 def test_mailbox_rejects_session_change_and_preserves_conversation_order(tmp_path, monkeypatch):
-    """A session replacement is rejected during a run while follow-up input stays ordered."""
+    """A session replacement is rejected during a run while queued input stays ordered."""
     monkeypatch.setattr(
         "loop.conversation.controller.patch_stdout", lambda **_kwargs: nullcontext()
     )
@@ -2613,7 +2613,7 @@ def test_mailbox_rejects_session_change_and_preserves_conversation_order(tmp_pat
             await started.wait()
             inputs.put_nowait("/new")
             await rejected.wait()
-            inputs.put_nowait("second private request")
+            inputs.put_nowait("/queue second private request")
             await queued.wait()
             assert len(queries) == 1
             release.set()
@@ -2653,7 +2653,7 @@ def test_mailbox_rejects_session_change_and_preserves_conversation_order(tmp_pat
 
 
 @pytest.mark.parametrize("correction", [None, "/new", "use @context.txt"])
-def test_mailbox_steers_or_interrupts_active_generation_without_losing_followups(
+def test_mailbox_steers_or_interrupts_active_generation_without_losing_queued_messages(
     tmp_path, monkeypatch, correction
 ):
     """Controls discard unfinished generation, validate corrections, and preserve queued history."""
@@ -2735,7 +2735,7 @@ def test_mailbox_steers_or_interrupts_active_generation_without_losing_followups
         try:
             inputs.put_nowait("first private request")
             await working.wait()
-            inputs.put_nowait("queued private followup")
+            inputs.put_nowait("/queue queued private message")
             inputs.put_nowait("/interrupt" if correction is None else f"/steer {correction}")
             await interrupted.wait()
             assert len(requests) == 1
@@ -2764,7 +2764,7 @@ def test_mailbox_steers_or_interrupts_active_generation_without_losing_followups
     expected = ["first private request"]
     if correction is not None:
         expected.extend([correction, "answer 2"])
-    expected.extend(["queued private followup", f"answer {len(requests)}"])
+    expected.extend(["queued private message", f"answer {len(requests)}"])
     assert [item.content for item in loop.messages] == expected
     saved = store.load(session_id)
     assert [item.content for item in saved.messages] == expected

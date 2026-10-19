@@ -788,7 +788,7 @@ class Loop:
         if result.metrics is None:
             raise TypeError("Agent run did not produce completion metrics.")
         self._interaction.run_metrics(result.metrics)
-        if result.stop_reason != "completed":
+        if result.stop_reason not in {"completed", "steered"}:
             return
 
         if self._run_control is not None:

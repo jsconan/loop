@@ -17,7 +17,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 type StructuredOutputValidator = Callable[[JsonValue], Any]
-type AgentRunStopReason = Literal["completed", "cancelled", "max_turns"]
+type AgentRunStopReason = Literal["completed", "cancelled", "max_turns", "steered"]
 type FileInputMode = Literal["text", "native"]
 type StructuredOutputMode = Literal["auto", "native", "prompt"]
 type StructuredOutputTransport = Literal["native", "prompt"]
@@ -48,7 +48,7 @@ type CommandCapabilityProvider = Callable[[], frozenset[CommandCapability] | Non
 
 
 class SteeringMessage(str):
-    """Carry explicit user correction text through normal message preparation, never dispatch it.
+    """Carry accepted conversation text through preparation without command dispatch.
 
     Args:
         object (object): Text to treat as a user message even when it starts with a command prefix.
