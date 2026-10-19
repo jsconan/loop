@@ -99,8 +99,10 @@ def log_problem(
     Args:
         logger (logging.Logger): Logger receiving the problem record.
         problem (Problem): Structured failure shared with the user or protocol consumer.
-        error (BaseException | None): Original exception supplying only its qualified type, or
-            ``None`` when the problem did not originate from an exception.
+        error (BaseException | None): Original exception supplying its qualified type and, when
+            available, the raised frame's module, function, and line. Exception text and traceback
+            contents are never recorded. Defaults to ``None`` when the problem did not originate
+            from an exception.
     """
     level = {
         "warning": logging.WARNING,
@@ -118,6 +120,9 @@ def log_problem(
                 "exception.type": f"{type(error).__module__}.{type(error).__qualname__}",
             }
         )
+        location = _exception_location(error)
+        if location is not None:
+            attributes["exception.location"] = location
     logger.log(
         level,
         "%s [%s]",
@@ -127,11 +132,31 @@ def log_problem(
     )
     telemetry = get_telemetry()
     if telemetry is not None:
+        telemetry_attributes = {
+            "operation": problem.operation,
+            "problem_instance": problem.instance,
+        }
+        if "exception.location" in attributes:
+            telemetry_attributes["exception.location"] = attributes["exception.location"]
         telemetry.error(
             "problem.reported",
             error_type=problem.code,
             severity=problem.severity,
             exception=error,
-            operation=problem.operation,
-            problem_instance=problem.instance,
+            **telemetry_attributes,
         )
+
+
+def _exception_location(error: BaseException) -> str | None:
+    """Return only the final traceback frame's module, function, and line number."""
+    traceback = error.__traceback__
+    if traceback is None:
+        return None
+    while traceback.tb_next is not None:
+        traceback = traceback.tb_next
+    frame = traceback.tb_frame
+    module = frame.f_globals.get("__name__")
+    function = frame.f_code.co_name
+    if not isinstance(module, str):
+        return None
+    return f"{module}.{function}:{traceback.tb_lineno}"

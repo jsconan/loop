@@ -44,12 +44,14 @@ def test_safe_formatter_excludes_exception_contents_and_normalizes_fields():
     record = logging.LogRecord("loop.test", logging.ERROR, __file__, 1, "Failed\nline", (), None)
     record.__dict__["error.type"] = "test.failed"
     record.__dict__["exception.type"] = "builtins.RuntimeError"
+    record.__dict__["exception.location"] = "loop.backend.openai._model_info:1347"
     record.__dict__["ignored"] = "private"
 
     value = json.loads(SafeOperationalFormatter().format(record))
 
     assert value["message"] == "Failed\\nline"
     assert value["exception.type"] == "builtins.RuntimeError"
+    assert value["exception.location"] == "loop.backend.openai._model_info:1347"
     assert "ignored" not in value
 
 

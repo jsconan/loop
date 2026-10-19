@@ -125,6 +125,7 @@ class SafeOperationalFormatter(logging.Formatter):
         "error.instance",
         "error.operation",
         "exception.type",
+        "exception.location",
         "telemetry.component",
         "telemetry.failure",
         "workspace_id",
@@ -137,7 +138,8 @@ class SafeOperationalFormatter(logging.Formatter):
             record (logging.LogRecord): Standard-library record to format.
 
         Returns:
-            str: Single-line JSON without exception contents or tracebacks.
+            str: Single-line JSON without exception contents or tracebacks. Exception-backed
+                problems may include only the raised frame's module, function, and line number.
         """
         value = {
             "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
