@@ -867,6 +867,23 @@ def test_steering_rejects_when_no_run_is_active(ui):
     assert controller.status_snapshot().queued_inputs == 0
 
 
+def test_status_reports_cancellation_in_progress_and_after_settlement(ui):
+    """Status distinguishes active cancellation cleanup from a settled cancelled run."""
+    controller = SessionController(ui)
+
+    with controller.control.execution():
+        assert controller.control.interrupt() is True
+        assert controller.status_snapshot().state == "Interrupting"
+
+    assert controller.status_snapshot().state == "Cancelled"
+
+    with controller.control.execution():
+        controller.control.stop()
+        assert controller.status_snapshot().state == "Cancelling"
+
+    assert controller.status_snapshot().state == "Cancelled"
+
+
 def test_queue_requires_a_run_and_preserves_command_like_text(ui):
     """Queued messages preserve text that resembles commands."""
     controller = SessionController(ui)

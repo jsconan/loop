@@ -24,7 +24,15 @@ class ConversationStatus:
         queued_inputs (int): Number of steering and queued inputs waiting in the mailbox.
     """
 
-    state: Literal["Interrupting", "Steering", "Waiting for your response", "Idle", "Working"]
+    state: Literal[
+        "Interrupting",
+        "Cancelling",
+        "Cancelled",
+        "Steering",
+        "Waiting for your response",
+        "Idle",
+        "Working",
+    ]
     queued_inputs: int
 
 

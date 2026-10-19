@@ -1095,3 +1095,42 @@ class ToolRegistryView:
             execution_started=execution_started,
             file_observations=file_observations,
         )
+
+    async def call_with_timing_async(
+        self,
+        name: str,
+        arguments: str,
+        *,
+        interaction: Interaction | None = None,
+        instructions_manager: InstructionsManager | None = None,
+        permission_manager: PermissionManager | None = None,
+        call_id: str | None = None,
+        execution_started: Callable[[], None] | None = None,
+        file_observations: FileObservations | None = None,
+    ) -> tuple[str, float]:
+        """Dispatch asynchronously through the owning registry and measure tool execution.
+
+        Args:
+            name (str): Registered tool name.
+            arguments (str): JSON-encoded arguments supplied by the model.
+            interaction (Interaction | None): Interaction for this invocation.
+            instructions_manager (InstructionsManager | None): Active instruction manager.
+            permission_manager (PermissionManager | None): Invocation permission policy.
+            call_id (str | None): Stable model request identifier.
+            execution_started (Callable[[], None] | None): Callback run before tool execution.
+            file_observations (FileObservations | None): Frozen view supplied to this generation,
+                or ``None`` for standalone dispatch without model context.
+
+        Returns:
+            tuple[str, float]: Serialized result and tool-function duration in seconds.
+        """
+        return await self._registry.call_with_timing_async(
+            name,
+            arguments,
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+            permission_manager=permission_manager,
+            call_id=call_id,
+            execution_started=execution_started,
+            file_observations=file_observations,
+        )

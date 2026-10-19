@@ -343,6 +343,10 @@ class SessionController:
         state = (
             "Interrupting"
             if self._control.interrupted
+            else "Cancelling"
+            if self._control.cancelling
+            else "Cancelled"
+            if self._control.cancelled
             else "Steering"
             if self._control.steering_pending
             else "Waiting for your response"

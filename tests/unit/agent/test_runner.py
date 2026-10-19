@@ -47,6 +47,7 @@ from loop import (
     read_text_file,
 )
 from loop.agent import Agent, AgentRunner, AgentRunResult
+from loop.session.models import RunCompletedEvent
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.tooling import FileObservations
 from loop.utils import PathHolder
@@ -2083,6 +2084,136 @@ def test_runner_async_query_closes_backend_stream_when_cancelled(tmp_path):
     assert closed.is_set()
     assert sessions.messages == []
     runner.interaction.answer_delta.assert_called_once_with("partial")
+
+
+@pytest.mark.parametrize("mode", ["interrupt", "stop", "external"])
+def test_controlled_async_run_cancels_stream_without_persisting_partial_response(tmp_path, mode):
+    """Control cancellation closes the stream; external task cancellation still propagates."""
+    control = RunControl()
+    backend = Mock()
+    runner = file_runner(tmp_path, backend, run_control=control)
+    runner.stream = True
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions = runner.session_manager
+    sessions.add_user_message("question")
+    waiting = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def events():
+        """Pause after a delta so each cancellation path reaches an active stream."""
+        try:
+            yield AnswerDelta(text="partial")
+            waiting.set()
+            await asyncio.Event().wait()
+            yield ResponseCompleted(answer="discarded")
+        finally:
+            closed.set()
+
+    backend.get_response_async.return_value = events()
+
+    async def scenario():
+        """Cancel the owned run or its task while model streaming is suspended."""
+        task = asyncio.create_task(runner.run_async())
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        if mode == "interrupt":
+            assert control.interrupt() is True
+        elif mode == "stop":
+            control.stop()
+        else:
+            task.cancel()
+        if mode == "external":
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return None
+        return await asyncio.wait_for(task, timeout=1)
+
+    result = asyncio.run(scenario())
+
+    assert closed.is_set()
+    assert [item.content for item in sessions.messages] == ["question"]
+    runner.interaction.answer_delta.assert_called_once_with("partial")
+    if mode == "external":
+        assert result is None
+        assert control.cancelled is False
+        assert not any(isinstance(event, RunCompletedEvent) for event in sessions.session.events)
+    else:
+        assert result is not None
+        assert result.stop_reason == "cancelled"
+        assert result.final_response is None
+        assert result.turns == 0
+        assert control.cancelled is True
+        assert [
+            event.stop_reason
+            for event in sessions.session.events
+            if isinstance(event, RunCompletedEvent)
+        ] == ["cancelled"]
+        if mode == "interrupt":
+            runner.interaction.info.assert_called_once_with(
+                "Run interrupted; the conversation remains open."
+            )
+
+
+def test_async_interruption_preserves_completed_unknown_and_unstarted_tool_outcomes(tmp_path):
+    """Cancellation keeps completed effects, marks active outcomes unknown, and skips later calls."""
+    control = RunControl()
+    backend = Mock()
+    completed = ToolCall(call_id="completed", name="completed_effect", arguments="{}")
+    active = ToolCall(call_id="active", name="active_effect", arguments="{}")
+    unstarted = ToolCall(call_id="unstarted", name="unstarted_effect", arguments="{}")
+    calls = (completed, active, unstarted)
+    registry = ToolRegistry()
+    started = asyncio.Event()
+    never_ran = []
+
+    async def completed_effect():
+        """Complete one tool effect before the active call begins."""
+        return {"ok": True}
+
+    async def active_effect():
+        """Wait until the controller interrupts this in-flight operation."""
+        started.set()
+        await asyncio.Event().wait()
+
+    async def unstarted_effect():
+        """Record an error if cancellation incorrectly starts a later tool."""
+        never_ran.append(True)
+        return {"ok": True}
+
+    registry.register(completed_effect)
+    registry.register(active_effect)
+    registry.register(unstarted_effect)
+    runner = file_runner(tmp_path, backend, registry=registry, run_control=control)
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions = runner.session_manager
+    sessions.add_user_message("perform these effects")
+
+    async def events():
+        """Return one completed model response that requests the ordered tool calls."""
+        for call in calls:
+            yield ToolCallCompleted(call=call)
+        yield ResponseCompleted(items=calls)
+
+    backend.get_response_async.return_value = events()
+
+    async def scenario():
+        """Cancel while the second tool is running, before the third may launch."""
+        task = asyncio.create_task(runner.run_async())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert control.interrupt() is True
+        return await asyncio.wait_for(task, timeout=1)
+
+    result = asyncio.run(scenario())
+    tool_results = {
+        item.call_id: json.loads(item.output)
+        for item in sessions.messages
+        if isinstance(item, ToolResult)
+    }
+
+    assert result.stop_reason == "cancelled"
+    assert never_ran == []
+    assert tool_results["completed"]["ok"] is True
+    assert "external outcome is unknown" in tool_results["active"]["problem"]["detail"]
+    assert "cancelled before execution" in tool_results["unstarted"]["problem"]["detail"]
 
 
 def test_runner_async_query_accepts_iterators_without_close(tmp_path):

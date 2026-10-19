@@ -598,7 +598,11 @@ class AgentRunner:
         calls = []
         tools = []
         started_at = utc_now()
-        with self._run_control.execution() if self._run_control is not None else nullcontext():
+        with (
+            self._run_control.execution(async_owner=True)
+            if self._run_control is not None
+            else nullcontext()
+        ):
             self._interrupted_tools = tools
             try:
                 if recovery is not None:
@@ -683,6 +687,22 @@ class AgentRunner:
             except RunInterrupted:
                 self._cancel_pending_tools()
                 self._interaction.info("Run interrupted; the conversation remains open.")
+                return self._record_run_result(
+                    final_response=None,
+                    turns=total_turns,
+                    stop_reason="cancelled",
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
+                )
+            except asyncio.CancelledError:
+                if self._run_control is None or not (
+                    self._run_control.stopped or self._run_control.interrupted
+                ):
+                    raise
+                self._cancel_pending_tools()
+                if self._run_control.interrupted and not self._run_control.stopped:
+                    self._interaction.info("Run interrupted; the conversation remains open.")
                 return self._record_run_result(
                     final_response=None,
                     turns=total_turns,

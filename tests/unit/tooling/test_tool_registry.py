@@ -716,12 +716,13 @@ def test_registry_view_exposes_the_live_registry_catalog():
 
 
 def test_registry_view_forwards_definitions_and_timed_calls():
-    """A registry view forwards definitions and every timed-call option to its registry."""
+    """A registry view forwards definitions and timed calls through both dispatch paths."""
     registry = Mock(spec=ToolRegistry)
     definitions = [Mock()]
     timed_result = ("result", 1.5)
     registry.definitions.return_value = definitions
     registry.call_with_timing.return_value = timed_result
+    registry.call_with_timing_async = AsyncMock(return_value=timed_result)
     view = ToolRegistryView(registry)
     execution_started = Mock()
     interaction = Mock(spec=Interaction)
@@ -751,6 +752,30 @@ def test_registry_view_forwards_definitions_and_timed_calls():
         instructions_manager=instructions_manager,
         permission_manager=permission_manager,
         call_id="call-123",
+        execution_started=execution_started,
+        file_observations=None,
+    )
+    assert (
+        asyncio.run(
+            view.call_with_timing_async(
+                "calculate",
+                '{"number": 3}',
+                interaction=interaction,
+                instructions_manager=instructions_manager,
+                permission_manager=permission_manager,
+                call_id="async-call-456",
+                execution_started=execution_started,
+            )
+        )
+        == timed_result
+    )
+    registry.call_with_timing_async.assert_awaited_once_with(
+        "calculate",
+        '{"number": 3}',
+        interaction=interaction,
+        instructions_manager=instructions_manager,
+        permission_manager=permission_manager,
+        call_id="async-call-456",
         execution_started=execution_started,
         file_observations=None,
     )

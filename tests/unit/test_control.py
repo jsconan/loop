@@ -54,6 +54,7 @@ def test_interrupt_is_scoped_and_never_latches_onto_an_idle_or_later_run():
         assert control.interrupt() is True
         assert control.interrupt() is True
         assert control.interrupted is True
+        assert control.cancelling is True
         assert control.stopped is False
         with pytest.raises(RunInterrupted):
             control.checkpoint()
@@ -62,7 +63,10 @@ def test_interrupt_is_scoped_and_never_latches_onto_an_idle_or_later_run():
 
     assert control.active is False
     assert control.interrupted is False
+    assert control.cancelling is False
+    assert control.cancelled is True
     with control.execution():
+        assert control.cancelled is False
         control.checkpoint()
 
 
@@ -101,14 +105,93 @@ def test_shutdown_supersedes_interruption_and_survives_execution_cleanup():
     with control.execution(), pytest.raises(KeyboardInterrupt) as raised:
         control.interrupt()
         control.stop()
+        assert control.cancelling is True
         assert control.interrupt() is False
         control.checkpoint()
 
     assert type(raised.value) is KeyboardInterrupt
     assert control.active is False
     assert control.interrupted is False
+    assert control.cancelling is False
+    assert control.cancelled is True
     assert control.stopped is True
     assert control.interrupt() is False
+
+
+@pytest.mark.parametrize("mode", ["interrupt", "stop"])
+def test_async_execution_cancels_its_owner_and_tracks_settlement(mode):
+    """Run cancellation interrupts its bound task and is recorded only after cleanup."""
+
+    async def scenario():
+        """Hold an async execution until its control requests cancellation."""
+        control = RunControl()
+        started = asyncio.Event()
+
+        async def owner():
+            """Wait inside the run scope until task cancellation is delivered."""
+            with control.execution(async_owner=True):
+                started.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(owner())
+        await started.wait()
+        assert control.cancelling is False
+        if mode == "interrupt":
+            assert control.interrupt() is True
+        else:
+            control.stop()
+        assert control.cancelling is True
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return control
+
+    control = asyncio.run(scenario())
+
+    assert control.active is False
+    assert control.cancelling is False
+    assert control.cancelled is True
+
+
+def test_async_owner_scope_rejects_entry_without_an_active_task():
+    """Async cancellation ownership requires an asyncio task rather than a loop callback."""
+
+    async def scenario():
+        """Enter an async owner scope from a callback running without a Task."""
+        control = RunControl()
+        finished = asyncio.Event()
+        failures = []
+
+        def enter_scope():
+            """Capture the missing-task validation result from the loop callback."""
+            try:
+                with control.execution(async_owner=True):
+                    pytest.fail("An event-loop callback must not own an async run.")
+            except RuntimeError as error:
+                failures.append(str(error))
+            finally:
+                finished.set()
+
+        asyncio.get_running_loop().call_soon(enter_scope)
+        await finished.wait()
+        return failures
+
+    assert asyncio.run(scenario()) == ["Async execution ownership requires an asyncio task."]
+
+
+def test_async_cancel_schedule_failure_keeps_scoped_interruption():
+    """A closing loop cannot erase the cooperative signal used by safe-boundary checks."""
+    control = RunControl()
+    loop = Mock()
+    loop.call_soon_threadsafe.side_effect = RuntimeError("closed")
+
+    with control.execution(), pytest.raises(RunInterrupted):
+        control._async_loop = loop
+        control._async_task = Mock()
+        assert control.interrupt() is True
+        control.checkpoint()
+
+    loop.call_soon_threadsafe.assert_called_once()
+    assert control.cancelled is True
 
 
 def test_interruption_wakes_retry_waits_and_failure_releases_the_scope(monkeypatch):
