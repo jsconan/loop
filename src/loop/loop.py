@@ -734,7 +734,7 @@ class Loop:
                     self._interaction.report(problem)
                     continue
             try:
-                context = self._mention_manager.resolve(user_input)
+                context = await self._mention_manager.resolve_async(user_input)
             except (OSError, UnicodeError, ValueError) as error:
                 problem = Problem.from_exception(
                     error,
@@ -762,7 +762,7 @@ class Loop:
                     telemetry_activity("message.accepted", component="session_manager")
                     self._session_manager.add_user_message(user_input, context=context)
                     result = await self._agent_runner.run_async()
-                    self._complete_agent_run(result)
+                    await self._complete_agent_run_async(result)
             finally:
                 if self._skill_hints_enabled:
                     self._clear_skill_catalog_priorities()
@@ -796,6 +796,19 @@ class Loop:
         if self._session_manager.session.has_initial_name():
             self._session_manager.generate_session_name(self._session_name_generator)
 
+    async def _complete_agent_run_async(self, result: AgentRunResult) -> None:
+        """Present run metrics and finish session naming through async model APIs."""
+        if result.metrics is None:
+            raise TypeError("Agent run did not produce completion metrics.")
+        self._interaction.run_metrics(result.metrics)
+        if result.stop_reason not in {"completed", "steered"}:
+            return
+
+        if self._run_control is not None:
+            self._run_control.checkpoint()
+        if self._session_manager.session.has_initial_name():
+            await self._session_manager.generate_session_name_async(self._session_name_generator)
+
     def _recover_session(self) -> bool:
         """Recover a previously interrupted run, if any."""
         recovery = self._agent_runner.recover_session()
@@ -809,5 +822,5 @@ class Loop:
         recovery = await self._agent_runner.recover_session_async()
         recovery_pending = recovery.pending
         if recovery.result is not None:
-            self._complete_agent_run(recovery.result)
+            await self._complete_agent_run_async(recovery.result)
         return recovery_pending

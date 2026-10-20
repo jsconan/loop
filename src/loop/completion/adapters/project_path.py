@@ -1,5 +1,6 @@
 """Complete visible project paths after a marker."""
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -53,19 +54,41 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         now = time.monotonic()
         if root == self._cached_root and now < self._cached_until:
             return self._cached_values
-        if not root.is_dir():
-            values = ()
-        else:
-            discovered = []
-            for path in iter_visible_paths(root, recursive=True):
-                relative = path.relative_to(root).as_posix()
-                if path.is_dir():
-                    relative += "/"
-                discovered.append(
-                    CompletionValue(relative, "directory" if path.is_dir() else "file")
-                )
-            values = tuple(discovered)
+        values = self._discover_values(root)
         self._cached_root = root
         self._cached_until = time.monotonic() + self._cache_ttl
         self._cached_values = values
         return values
+
+    async def values_async(self) -> tuple[CompletionValue, ...]:
+        """Return visible paths while doing uncached filesystem traversal in a worker.
+
+        Returns:
+            tuple[CompletionValue, ...]: Cached or newly discovered project-relative paths.
+
+        Raises:
+            OSError: The project path listing cannot be read.
+            asyncio.CancelledError: The awaiting task is cancelled.
+        """
+        root = self._working_directory.resolve()
+        now = time.monotonic()
+        if root == self._cached_root and now < self._cached_until:
+            return self._cached_values
+        values = await asyncio.to_thread(self._discover_values, root)
+        self._cached_root = root
+        self._cached_until = time.monotonic() + self._cache_ttl
+        self._cached_values = values
+        return values
+
+    @staticmethod
+    def _discover_values(root: Path) -> tuple[CompletionValue, ...]:
+        """Build a detached snapshot of visible paths under one resolved root."""
+        if not root.is_dir():
+            return ()
+        discovered = []
+        for path in iter_visible_paths(root, recursive=True):
+            relative = path.relative_to(root).as_posix()
+            if path.is_dir():
+                relative += "/"
+            discovered.append(CompletionValue(relative, "directory" if path.is_dir() else "file"))
+        return tuple(discovered)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import aclosing
 from typing import TYPE_CHECKING
 
 from .. import constants
@@ -148,13 +149,7 @@ class BackendSessionNameGenerator:
         Returns:
             str | None: Generated name, or ``None`` when the backend returned no useful title.
         """
-        prompt = json.dumps(
-            {
-                "user_message": user_message[: constants.SESSION_TITLE_CONTEXT_MAX_CHARS],
-                "assistant_message": assistant_message[: constants.SESSION_TITLE_CONTEXT_MAX_CHARS],
-            },
-            ensure_ascii=False,
-        )
+        prompt = _title_prompt(user_message, assistant_message)
         generated = None
         for event in self._backend.get_response(
             input=prompt,
@@ -167,3 +162,49 @@ class BackendSessionNameGenerator:
         if not isinstance(generated, GeneratedSessionName):
             return None
         return normalize_session_name(generated.title) or None
+
+    async def generate_async(
+        self,
+        user_message: str,
+        assistant_message: str,
+        model: str | None,
+    ) -> str | None:
+        """Generate a bounded name through the backend's asynchronous response stream.
+
+        Args:
+            user_message (str): First user message.
+            assistant_message (str): First completed assistant answer.
+            model (str | None): Conversation model, or ``None`` to use the backend default.
+
+        Returns:
+            str | None: Generated name, or ``None`` when the backend returned no useful title.
+
+        Raises:
+            asyncio.CancelledError: If the naming request is cancelled.
+        """
+        prompt = _title_prompt(user_message, assistant_message)
+        events = self._backend.get_response_async(
+            input=prompt,
+            instructions=_TITLE_INSTRUCTIONS,
+            model=model,
+            output_format=_TITLE_FORMAT,
+        )
+        generated = None
+        async with aclosing(events):
+            async for event in events:
+                if isinstance(event, ResponseCompleted):
+                    generated = event.structured_output
+        if not isinstance(generated, GeneratedSessionName):
+            return None
+        return normalize_session_name(generated.title) or None
+
+
+def _title_prompt(user_message: str, assistant_message: str) -> str:
+    """Serialize bounded exchange text for the isolated title request."""
+    return json.dumps(
+        {
+            "user_message": user_message[: constants.SESSION_TITLE_CONTEXT_MAX_CHARS],
+            "assistant_message": assistant_message[: constants.SESSION_TITLE_CONTEXT_MAX_CHARS],
+        },
+        ensure_ascii=False,
+    )

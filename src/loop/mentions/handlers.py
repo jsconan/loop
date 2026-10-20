@@ -1,8 +1,10 @@
 """Define independently injectable mention capabilities."""
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from mimetypes import guess_type
+from pathlib import Path
 
 from .. import constants
 from ..completion import (
@@ -63,6 +65,14 @@ class MentionHandler(ABC):
             Sequence[str]: Current exact mention candidates.
         """
 
+    async def candidates_async(self) -> Sequence[str]:
+        """Return candidates through the synchronous handler contract by default.
+
+        Returns:
+            Sequence[str]: Current exact mention candidates.
+        """
+        return self.candidates()
+
     @abstractmethod
     def resolve(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
         """Resolve mentioned values and perform handler-owned effects atomically.
@@ -74,6 +84,22 @@ class MentionHandler(ABC):
             tuple[ContextReference, ...]: Context contributed by this handler.
         """
 
+    async def resolve_async(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
+        """Resolve through the synchronous handler contract by default.
+
+        Args:
+            values (Sequence[str]): Mention values in source order.
+
+        Returns:
+            tuple[ContextReference, ...]: Context contributed by this handler.
+
+        Raises:
+            OSError: A handler cannot read its referenced resource.
+            UnicodeError: Referenced content is not valid UTF-8.
+            ValueError: A handler rejects a mention or cannot complete its operation.
+        """
+        return self.resolve(values)
+
     @abstractmethod
     def resolve_optional(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
         """Gracefully resolve values whose failures should leave ordinary prompt text.
@@ -84,6 +110,25 @@ class MentionHandler(ABC):
         Returns:
             tuple[ContextReference, ...]: Context contributed by successfully resolved values.
         """
+
+    async def resolve_optional_async(
+        self,
+        values: Sequence[str],
+    ) -> tuple[ContextReference, ...]:
+        """Resolve optional values through the synchronous handler contract by default.
+
+        Args:
+            values (Sequence[str]): Optional mention values in source order.
+
+        Returns:
+            tuple[ContextReference, ...]: Context contributed by successfully resolved values.
+
+        Raises:
+            OSError: A handler cannot read its referenced resource.
+            UnicodeError: Referenced content is not valid UTF-8.
+            ValueError: A handler rejects a mention or cannot complete its operation.
+        """
+        return self.resolve_optional(values)
 
 
 class ProjectPathMentionHandler(MentionHandler):
@@ -138,6 +183,19 @@ class ProjectPathMentionHandler(MentionHandler):
         """
         return tuple(value.value for value in self._completion_adapter.values())
 
+    async def candidates_async(self) -> Sequence[str]:
+        """Return current visible paths without traversing the project on the event loop.
+
+        Returns:
+            Sequence[str]: Exact file and directory candidates.
+
+        Raises:
+            OSError: The project path listing cannot be read.
+            asyncio.CancelledError: The awaiting task is cancelled.
+        """
+        values = await self._completion_adapter.values_async()
+        return tuple(value.value for value in values)
+
     def resolve(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
         """Resolve unique paths into one bounded attachment set.
 
@@ -165,6 +223,40 @@ class ProjectPathMentionHandler(MentionHandler):
         """
         return self._resolve_paths(values, ignore_invalid=True)
 
+    async def resolve_async(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
+        """Resolve paths using detached filesystem inputs and build references on the owner.
+
+        Args:
+            values (Sequence[str]): Project-relative paths in source order.
+
+        Returns:
+            tuple[ContextReference, ...]: Persistable file and directory snapshots.
+
+        Raises:
+            OSError: Referenced content cannot be read.
+            UnicodeError: Referenced content is not valid UTF-8.
+            ValueError: A path is unavailable, unsafe, unsupported, or exceeds the budget.
+            asyncio.CancelledError: The awaiting task is cancelled.
+        """
+        return await self._resolve_paths_async(values, ignore_invalid=False)
+
+    async def resolve_optional_async(
+        self,
+        values: Sequence[str],
+    ) -> tuple[ContextReference, ...]:
+        """Resolve optional Markdown paths without blocking and skip invalid destinations.
+
+        Args:
+            values (Sequence[str]): Markdown link destinations in source order.
+
+        Returns:
+            tuple[ContextReference, ...]: Snapshots for destinations that resolve safely.
+
+        Raises:
+            asyncio.CancelledError: The awaiting task is cancelled.
+        """
+        return await self._resolve_paths_async(values, ignore_invalid=True)
+
     def _resolve_paths(
         self,
         values: Sequence[str],
@@ -173,6 +265,32 @@ class ProjectPathMentionHandler(MentionHandler):
     ) -> tuple[ContextReference, ...]:
         """Resolve unique paths under one shared attachment budget."""
         root = self._working_directory.resolve()
+        sources = self._read_mentioned_paths(root, tuple(values), ignore_invalid)
+        return self._build_references(sources, ignore_invalid=ignore_invalid)
+
+    async def _resolve_paths_async(
+        self,
+        values: Sequence[str],
+        *,
+        ignore_invalid: bool,
+    ) -> tuple[ContextReference, ...]:
+        """Read with a detached root and build returned references on the owner."""
+        root = self._working_directory.resolve()
+        sources = await asyncio.to_thread(
+            self._read_mentioned_paths,
+            root,
+            tuple(values),
+            ignore_invalid,
+        )
+        return self._build_references(sources, ignore_invalid=ignore_invalid)
+
+    @staticmethod
+    def _read_mentioned_paths(
+        root: Path,
+        values: tuple[str, ...],
+        ignore_invalid: bool,
+    ) -> tuple[tuple[ContextReferenceKind, str, str | bytes], ...]:
+        """Read bounded path snapshots using only detached inputs."""
         sources = []
         resolved_paths = set()
         for value in dict.fromkeys(values):
@@ -219,6 +337,15 @@ class ProjectPathMentionHandler(MentionHandler):
                 raise
             resolved_paths.add(path)
             sources.append((kind, value, content))
+        return tuple(sources)
+
+    def _build_references(
+        self,
+        sources: tuple[tuple[ContextReferenceKind, str, str | bytes], ...],
+        *,
+        ignore_invalid: bool,
+    ) -> tuple[ContextReference, ...]:
+        """Build attachment references from detached path snapshots."""
         include_file_previews = len(sources) <= 2
         lazy_binary_sources = [
             value

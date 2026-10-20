@@ -1,5 +1,7 @@
 """Tests for project-path completion."""
 
+import asyncio
+from threading import get_ident
 from unittest.mock import Mock
 
 import pytest
@@ -46,3 +48,32 @@ def test_project_path_completion_can_disable_cache_and_rejects_negative_ttl(tmp_
     assert [item.text for item in complete(completer, "@new")] == ["@new.py"]
     with pytest.raises(ValueError, match="cannot be negative"):
         ProjectPathCompletionAdapter("@", PathHolder(tmp_path), cache_ttl=-1)
+
+
+def test_async_project_path_completion_reads_on_a_worker_and_updates_cache_on_owner(
+    monkeypatch,
+    tmp_path,
+):
+    """Async path discovery returns detached results and reuses them on the owner."""
+    source = tmp_path / "source.py"
+    source.write_text("", encoding="utf-8")
+    adapter = ProjectPathCompletionAdapter("@", PathHolder(tmp_path))
+    workers = []
+
+    def discover(root, *, recursive):
+        """Record where path enumeration runs and return one visible file."""
+        workers.append(get_ident())
+        assert root == tmp_path
+        assert recursive is True
+        return [source]
+
+    monkeypatch.setattr("loop.completion.adapters.project_path.iter_visible_paths", discover)
+    owner = get_ident()
+
+    values = asyncio.run(adapter.values_async())
+
+    assert [(item.value, item.description) for item in values] == [("source.py", "file")]
+    assert workers and workers[0] != owner
+    assert asyncio.run(adapter.values_async()) == values
+    assert adapter.values() == values
+    assert len(workers) == 1

@@ -1,6 +1,7 @@
 """Tests for dynamic mention-handler coordination."""
 
-from unittest.mock import Mock
+import asyncio
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -13,8 +14,11 @@ def handler(marker, candidates, references=(), *, accepts_markdown_links=False):
     result.marker = marker
     result.accepts_markdown_links = accepts_markdown_links
     result.candidates.return_value = candidates
+    result.candidates_async = AsyncMock(return_value=candidates)
     result.resolve.return_value = references
+    result.resolve_async = AsyncMock(return_value=references)
     result.resolve_optional.return_value = ()
+    result.resolve_optional_async = AsyncMock(return_value=())
     result.completion_adapter = Mock(spec=CompletionAdapter)
     return result
 
@@ -35,6 +39,39 @@ def test_manager_dispatches_only_exact_mentions_to_injected_handlers():
         files.completion_adapter,
         people.completion_adapter,
     )
+
+
+def test_async_manager_dispatches_required_and_optional_mentions_in_handler_order():
+    """Async handlers retain exact mention filtering and stable output order."""
+    reference = ContextReference(
+        kind="file", path="a.py", content="pass", size_bytes=4, included_bytes=4, truncated=False
+    )
+    files = handler("#", ("a.py",), (reference,), accepts_markdown_links=True)
+    people = handler("+", ("sam",))
+    manager = MentionManager((files, people))
+
+    resolved = asyncio.run(
+        manager.resolve_async("Ask +sam about #a.py and [guide](docs/guide.md).")
+    )
+
+    assert resolved == (reference,)
+    files.candidates_async.assert_awaited_once_with()
+    people.candidates_async.assert_awaited_once_with()
+    files.resolve_async.assert_awaited_once_with(("a.py",))
+    files.resolve_optional_async.assert_awaited_once_with(("docs/guide.md",))
+    people.resolve_async.assert_awaited_once_with(("sam",))
+    files.resolve.assert_not_called()
+    people.resolve.assert_not_called()
+
+
+def test_async_manager_accepts_unmentioned_handlers_and_empty_registries():
+    """Async dispatch leaves unmentioned handlers idle and accepts no registered handlers."""
+    unused = handler("#", ("a.py",))
+
+    assert asyncio.run(MentionManager((unused,)).resolve_async("plain text")) == ()
+    assert asyncio.run(MentionManager().resolve_async("#a.py")) == ()
+    unused.resolve_async.assert_not_awaited()
+    unused.resolve_optional_async.assert_not_awaited()
 
 
 def test_manager_validates_explicit_mentions_and_gracefully_dispatches_markdown_links():

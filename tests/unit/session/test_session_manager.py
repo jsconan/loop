@@ -5,9 +5,9 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing, nullcontext
 from datetime import UTC, datetime
-from threading import Barrier, Event
+from threading import Barrier, Event, get_ident
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, call, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 from uuid import uuid4
 
 import pytest
@@ -1018,6 +1018,71 @@ def test_manager_keeps_provisional_name_without_a_usable_exchange_or_generated_n
         session=Session(name="Initial", name_source="initial"), session_store=store
     )
     empty.generate_session_name(generator)
+
+
+def test_manager_generates_session_names_asynchronously_and_keeps_sync_generators_compatible():
+    """Async naming persists native results and still accepts existing synchronous generators."""
+    interaction = Mock(spec=Interaction)
+    store = Mock(spec=SessionStore)
+    session = Session(model="model-a")
+    manager = SessionManager(interaction=interaction, session=session, session_store=store)
+    manager.add_user_message("Question")
+    manager.add_message(Message(role="assistant", content="Answer"))
+    generator = Mock()
+    generator.generate_async = AsyncMock(return_value="Generated title")
+
+    asyncio.run(manager.generate_session_name_async(generator))
+
+    assert session.name == "Generated title"
+    assert session.name_source == "generated"
+    generator.generate_async.assert_awaited_once_with("Question", "Answer", "model-a")
+    generator.generate.assert_not_called()
+    interaction.info.assert_has_calls(
+        [call("Generating a session name..."), call("Session name: Generated title")]
+    )
+
+    fallback_threads = []
+
+    def generate_sync(*_args):
+        """Record the thread used for a legacy blocking generator."""
+        fallback_threads.append(get_ident())
+
+    fallback = SimpleNamespace(generate=generate_sync)
+    owner = get_ident()
+    asyncio.run(manager.generate_session_name_async(fallback))
+
+    assert fallback_threads and fallback_threads[0] != owner
+    assert session.name == "Generated title"
+
+
+def test_manager_async_name_generation_skips_incomplete_exchange_and_reports_failure(monkeypatch):
+    """Async naming skips incomplete exchanges and reports generator errors safely."""
+    interaction = Mock(spec=Interaction)
+    logger = Mock()
+    monkeypatch.setattr(session_manager_module, "_LOGGER", logger)
+    generator = Mock()
+    generator.generate_async = AsyncMock(side_effect=RuntimeError("Backend unavailable"))
+    empty = SessionManager(interaction=interaction)
+
+    asyncio.run(empty.generate_session_name_async(generator))
+
+    generator.generate_async.assert_not_awaited()
+    interaction.info.assert_has_calls(
+        [
+            call("Generating a session name..."),
+            call("No completed exchange found to generate a session name."),
+        ]
+    )
+
+    manager = SessionManager(interaction=interaction)
+    manager.add_user_message("Question")
+    manager.add_message(Message(role="assistant", content="Answer"))
+    asyncio.run(manager.generate_session_name_async(generator))
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "session.name_generation_failed"
+    assert manager.session.name != "Backend unavailable"
+    assert logger.log.call_args.kwargs["extra"]["exception.type"] == "builtins.RuntimeError"
 
 
 def test_manager_starts_a_fresh_unpersisted_session():

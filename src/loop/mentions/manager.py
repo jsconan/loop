@@ -90,3 +90,54 @@ class MentionManager:
             if optional_values:
                 references.extend(handler.resolve_optional(optional_values))
         return tuple(references)
+
+    async def resolve_async(self, content: str) -> tuple[ContextReference, ...]:
+        """Resolve mentions while awaiting handlers that isolate blocking leaf reads.
+
+        Args:
+            content (str): Submitted user text.
+
+        Returns:
+            tuple[ContextReference, ...]: Context produced by all uniquely mentioned capabilities.
+
+        Raises:
+            OSError: A handler cannot read its referenced resource.
+            UnicodeError: Referenced content is not valid UTF-8.
+            ValueError: A handler rejects a mention or cannot complete its operation.
+            asyncio.CancelledError: The awaiting task is cancelled.
+        """
+        candidates = {}
+        for handler in self._handlers:
+            candidates[handler.marker] = await handler.candidates_async()
+        mentions = parse_mentions(
+            content,
+            candidates,
+            optional_link_marker=self._link_handler.marker
+            if self._link_handler is not None
+            else None,
+        )
+        references = []
+        for handler in self._handlers:
+            values = tuple(
+                dict.fromkeys(
+                    mention.value
+                    for mention in mentions
+                    if mention.marker == handler.marker and mention.required
+                )
+            )
+            if values:
+                references.extend(await handler.resolve_async(values))
+            optional_values = tuple(
+                dict.fromkeys(
+                    mention.value
+                    for mention in mentions
+                    if (
+                        mention.marker == handler.marker
+                        and not mention.required
+                        and mention.value not in values
+                    )
+                )
+            )
+            if optional_values:
+                references.extend(await handler.resolve_optional_async(optional_values))
+        return tuple(references)

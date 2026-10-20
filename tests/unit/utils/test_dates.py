@@ -10,7 +10,7 @@ def test_as_utc_normalizes_aware_and_legacy_naive_datetimes():
     offset = timezone(timedelta(hours=2))
 
     assert as_utc(datetime(2026, 8, 28, 12, tzinfo=offset)) == datetime(2026, 8, 28, 10, tzinfo=UTC)
-    legacy_naive = datetime(2026, 8, 28, 10)  # noqa: DTZ001 - exercise legacy input.
+    legacy_naive = datetime(2026, 8, 28, 10)
     assert as_utc(legacy_naive) == datetime(2026, 8, 28, 10, tzinfo=UTC)
 
 

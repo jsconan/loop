@@ -1,7 +1,9 @@
 """Tests for built-in mention capabilities."""
 
+import asyncio
 import os
 from pathlib import Path
+from threading import get_ident
 from unittest.mock import Mock
 
 import pytest
@@ -58,7 +60,39 @@ def test_base_handler_rejects_markdown_links_by_default():
             del values
             return ()
 
-    assert DefaultMentionHandler().accepts_markdown_links is False
+    handler = DefaultMentionHandler()
+    assert handler.accepts_markdown_links is False
+    assert asyncio.run(handler.candidates_async()) == ()
+    assert asyncio.run(handler.resolve_async(("target",))) == ()
+    assert asyncio.run(handler.resolve_optional_async(("target",))) == ()
+
+
+def test_async_project_path_resolution_reads_on_a_worker_and_preserves_snapshot(
+    tmp_path, monkeypatch
+):
+    """Async path resolution returns the same immutable content snapshot off the event loop."""
+    source = tmp_path / "source.txt"
+    source.write_text("review me", encoding="utf-8")
+    handler = ProjectPathMentionHandler(PathHolder(tmp_path))
+    original_read_bytes = Path.read_bytes
+    worker_threads = []
+
+    def read_bytes(path):
+        """Record the thread that performs the detached filesystem read."""
+        if path == source:
+            worker_threads.append(get_ident())
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    owner = get_ident()
+
+    references = asyncio.run(handler.resolve_async(("source.txt",)))
+
+    assert len(references) == 1
+    assert references[0].content == "review me"
+    assert references[0].path == "source.txt"
+    assert worker_threads and worker_threads[0] != owner
+    assert asyncio.run(handler.resolve_optional_async(("missing.txt",))) == ()
 
 
 def test_project_paths_complete_after_cache_expiry_and_resolve_unique_snapshots(
@@ -349,3 +383,23 @@ def test_skill_handler_preserves_already_active_skills(tmp_path):
     assert not handler.resolve(("review", "review"))
     assert not handler.resolve_optional(("review",))
     assert instructions.active_skill_identities == [("review", str(location))]
+
+
+def test_async_skill_mention_keeps_activation_on_the_session_owner(tmp_path):
+    """Async mention handling applies skill activation on the owning event-loop thread."""
+    skill = Skill("review", "Review.", tmp_path / "review" / "SKILL.md")
+    instructions = Mock(spec=InstructionsManager)
+    instructions.skill_manager = SkillManager([skill])
+    instructions.active_skill_identities = []
+    owner = get_ident()
+    activation_threads = []
+
+    def activate(name):
+        """Record skill activation ownership and return its successful result."""
+        activation_threads.append(get_ident())
+        return {"name": name, "status": "activated", "instructions_updated": True}
+
+    instructions.activate_skill.side_effect = activate
+
+    assert asyncio.run(SkillMentionHandler(instructions).resolve_async(("review",))) == ()
+    assert activation_threads == [owner]

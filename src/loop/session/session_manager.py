@@ -2,7 +2,7 @@
 
 import json
 import logging
-from asyncio import current_task
+from asyncio import current_task, to_thread
 from collections.abc import AsyncIterable, Callable, Generator, Iterable
 from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
@@ -716,6 +716,67 @@ class SessionManager:
                 self._interaction.info("No completed exchange found to generate a session name.")
                 return
             name = generator.generate(user_message, assistant_message, self._session.model)
+            if name:
+                self._commit(
+                    lambda session: session.rename(name, source=SESSION_NAME_SOURCE_GENERATED)
+                )
+            self._interaction.info(f"Session name: {self._session.name}")
+        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            problem = Problem.from_exception(
+                error,
+                code="session.name_generation_failed",
+                title="Could not generate session name",
+                detail="Could not generate the session name.",
+                severity="warning",
+                retryable=True,
+                operation="generate_session_name",
+            )
+            log_problem(_LOGGER, problem, error)
+            self._interaction.report(problem)
+
+    async def generate_session_name_async(self, generator: SessionNameGenerator) -> None:
+        """Generate and persist a session name without blocking asynchronous model I/O.
+
+        Generators with ``generate_async`` use their native asynchronous implementation. Existing
+        synchronous generators remain supported for compatibility.
+
+        Args:
+            generator (SessionNameGenerator): Auxiliary title generation service.
+
+        Raises:
+            asyncio.CancelledError: An asynchronous generator request is cancelled.
+        """
+        self._interaction.info("Generating a session name...")
+        try:
+            user_message = next(
+                (
+                    message.content
+                    for message in self._session.messages
+                    if isinstance(message, Message) and message.role == "user"
+                ),
+                "",
+            )
+            assistant_message = next(
+                (
+                    message.content
+                    for message in self._session.messages
+                    if isinstance(message, Message) and message.role == "assistant"
+                ),
+                "",
+            )
+            if not user_message or not assistant_message.strip():
+                self._interaction.info("No completed exchange found to generate a session name.")
+                return
+            async_generator = getattr(generator, "generate_async", None)
+            if callable(async_generator):
+                name = await async_generator(user_message, assistant_message, self._session.model)
+            else:
+                name = await to_thread(
+                    generator.generate,
+                    user_message,
+                    assistant_message,
+                    self._session.model,
+                )
             if name:
                 self._commit(
                     lambda session: session.rename(name, source=SESSION_NAME_SOURCE_GENERATED)

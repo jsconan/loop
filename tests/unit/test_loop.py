@@ -1174,6 +1174,118 @@ def test_run_async_uses_async_input_and_agent_orchestration(tmp_path):
     interaction.conversation_ended.assert_called_once_with()
 
 
+def test_async_run_completion_uses_async_session_naming(tmp_path):
+    """Completed async runs await native title generation only when a title is eligible."""
+    interaction = output_interaction()
+    generator = SimpleNamespace(generate=lambda *_args: pytest.fail("sync generator used"))
+    generator.generate_async = AsyncMock(return_value="Async title")
+    control = Mock()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+        session_name_generator=generator,
+        run_control=control,
+    )
+    metrics = RunMetrics(
+        active_duration_seconds=0,
+        model_duration_seconds=0,
+        tool_duration_seconds=0,
+        message_count=1,
+        item_count=2,
+    )
+    result = AgentRunResult(
+        final_response=None,
+        turns=1,
+        stop_reason="completed",
+        metrics=metrics,
+    )
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+
+    async def run_agent():
+        """Persist a completed response before returning its run metrics."""
+        loop.session.add_message(Message(role="assistant", content="Answer"))
+        return result
+
+    loop.agent_runner.run_async = AsyncMock(side_effect=run_agent)
+    messages = iter(("Question", False))
+
+    async def read_input(_completer):
+        """Submit one prompt and then finish the conversation."""
+        return next(messages)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    generator.generate_async.assert_awaited_once_with("Question", "Answer", "default-model")
+    assert loop.session.name == "Async title"
+    interaction.run_metrics.assert_called_once_with(metrics)
+    control.checkpoint.assert_called_once_with()
+
+
+def test_async_run_completion_preserves_user_named_sessions(tmp_path):
+    """A user-controlled name bypasses automatic async naming after completion."""
+    interaction = output_interaction()
+    generator = SimpleNamespace(generate_async=AsyncMock())
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+        session_name_generator=generator,
+    )
+    loop.session.rename("Chosen title", source="user")
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    loop.agent_runner.run_async = AsyncMock(
+        return_value=AgentRunResult(
+            final_response=None,
+            turns=1,
+            stop_reason="completed",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+
+    messages = iter(("Question", False))
+
+    async def read_input(_completer):
+        """Submit one message before the conversation exits."""
+        return next(messages)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    generator.generate_async.assert_not_awaited()
+    assert loop.session.name == "Chosen title"
+
+
+def test_async_run_completion_rejects_missing_metrics(tmp_path):
+    """Async run completion requires the same final metrics as the synchronous path."""
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=output_interaction(),
+        working_directory=tmp_path,
+    )
+    result = AgentRunResult(final_response=None, turns=0, stop_reason="cancelled")
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    loop.agent_runner.run_async = AsyncMock(return_value=result)
+
+    async def read_input(_completer):
+        """Submit a prompt that reaches run completion."""
+        return "Question"
+
+    with pytest.raises(TypeError, match="completion metrics"):
+        asyncio.run(loop.run_async(input_source=read_input))
+
+
 def test_run_async_accepts_an_awaitable_input_source_and_preserves_steering(tmp_path):
     """Explicit steering text bypasses command dispatch on the async path."""
     interaction = output_interaction()
@@ -1353,7 +1465,7 @@ def test_run_async_handles_skill_priorities_and_attached_reference_sizes(tmp_pat
             truncated=True,
         ),
     ]
-    loop._mention_manager.resolve = Mock(return_value=references)
+    loop._mention_manager.resolve_async = AsyncMock(return_value=references)
     loop._session_manager.add_user_message = Mock()
     loop.agent_runner.recover_session_async = AsyncMock(
         return_value=SimpleNamespace(pending=False, result=None)
@@ -1402,7 +1514,7 @@ def test_run_async_warns_when_skill_metadata_does_not_fit(tmp_path):
     instructions.skill_manager.names = ("guide",)
     instructions.set_skill_catalog_priorities.return_value = False
     loop._instructions_manager = instructions
-    loop._mention_manager.resolve = Mock(return_value=[])
+    loop._mention_manager.resolve_async = AsyncMock(return_value=[])
     loop._session_manager.add_user_message = Mock()
     loop.agent_runner.recover_session_async = AsyncMock(
         return_value=SimpleNamespace(pending=False, result=None)
@@ -1456,7 +1568,7 @@ def test_run_async_reports_message_preparation_failures(tmp_path, failure, skill
     )
     loop._instructions_manager = instructions
     if failure == "mention":
-        loop._mention_manager.resolve = Mock(side_effect=OSError("mention"))
+        loop._mention_manager.resolve_async = AsyncMock(side_effect=OSError("mention"))
     loop.agent_runner.run_async = AsyncMock()
     loop.agent_runner.recover_session_async = AsyncMock(
         return_value=SimpleNamespace(pending=False, result=None)

@@ -1,5 +1,6 @@
 """Tests for deterministic and backend-assisted session naming."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -101,6 +102,78 @@ def test_backend_generator_ignores_nonterminal_events_and_empty_names():
     backend.get_response = get_response
 
     assert BackendSessionNameGenerator(backend).generate("question", "answer", None) is None
+
+
+def test_backend_generator_uses_async_response_stream():
+    """Async naming uses the native backend stream and preserves request protections."""
+    backend = SimpleNamespace()
+    request = {}
+
+    async def get_response_async(**kwargs):
+        nonlocal request
+        request = kwargs
+        yield AnswerCompleted(text="ignored")
+        yield ResponseCompleted(
+            structured_output=kwargs["output_format"].model(title="Async session title")
+        )
+
+    backend.get_response_async = get_response_async
+    generator = BackendSessionNameGenerator(backend)
+
+    name = asyncio.run(generator.generate_async("Question", "Answer", "model-b"))
+
+    assert name == "Async session title"
+    assert json.loads(request["input"]) == {
+        "user_message": "Question",
+        "assistant_message": "Answer",
+    }
+    assert request["model"] == "model-b"
+    assert request["output_format"].schema["required"] == ["title"]
+
+
+def test_async_backend_generator_closes_a_cancelled_response_stream():
+    """Cancelling title generation closes the owned backend stream."""
+    backend = SimpleNamespace()
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def get_response_async(**_kwargs):
+        try:
+            started.set()
+            yield AnswerCompleted(text="partial")
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    backend.get_response_async = get_response_async
+    generator = BackendSessionNameGenerator(backend)
+
+    async def scenario():
+        """Cancel the naming operation after its stream begins."""
+        task = asyncio.create_task(generator.generate_async("Question", "Answer", None))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert closed.is_set()
+
+
+def test_async_backend_generator_returns_none_without_structured_output():
+    """An async response without structured title data leaves naming unchanged."""
+
+    async def get_response_async(**_kwargs):
+        """Return a completed response without a generated title."""
+        yield ResponseCompleted()
+
+    backend = SimpleNamespace(get_response_async=get_response_async)
+
+    assert (
+        asyncio.run(BackendSessionNameGenerator(backend).generate_async("Question", "Answer", None))
+        is None
+    )
 
 
 def test_validate_session_source_accepts_valid_sources():
