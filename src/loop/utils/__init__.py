@@ -28,6 +28,7 @@ __all__ = [
     "ValueReference",
     "VirtualPath",
     "as_utc",
+    "await_value",
     "base64_decode",
     "base64_encode",
     "bound_tool_result",
@@ -37,6 +38,7 @@ __all__ = [
     "callable_name",
     "canonical_path",
     "choice_items",
+    "close_awaitable",
     "content_digest",
     "content_identity",
     "data_url",
@@ -48,6 +50,8 @@ __all__ = [
     "format_content_preview",
     "format_tool_call_arguments",
     "get_binary",
+    "has_running_event_loop",
+    "is_async_callable",
     "is_binary_file",
     "is_path_ignored",
     "iter_visible_paths",
@@ -79,6 +83,7 @@ __all__ = [
 ]
 
 
+from .asyncio import await_value, close_awaitable, has_running_event_loop, is_async_callable
 from .callables import callable_hints, callable_name
 from .content import (
     base64_decode,

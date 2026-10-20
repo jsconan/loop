@@ -11,7 +11,7 @@ from .configuration import ConfigurationManager
 from .errors import Problem, log_problem
 from .interaction import ConsoleInteraction
 from .telemetry import set_telemetry
-from .utils import ShutdownRequested, register_shutdown_signals
+from .utils import ShutdownRequested, has_running_event_loop, register_shutdown_signals
 from .workspace import (
     Workspace,
     WorkspaceRepository,
@@ -30,11 +30,7 @@ def run_application() -> None:  # pylint: disable=too-many-branches
     Returns:
         None: After the interactive application exits.
     """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        pass
-    else:
+    if has_running_event_loop():
         raise RuntimeError(
             "CLI run_application() cannot run inside an event loop; "
             "await run_application_async() instead."

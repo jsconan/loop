@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Any, overload
 
@@ -20,7 +21,13 @@ from ..models import (
     ToolResultPresentationSpec,
 )
 from ..permissions import Action, OperationPlan, OperationPlanner, Operations
-from ..utils import callable_name
+from ..utils import (
+    await_value,
+    callable_name,
+    close_awaitable,
+    has_running_event_loop,
+    is_async_callable,
+)
 from .context import ToolContext
 from .models import ToolPreflight
 from .utils import (
@@ -28,7 +35,6 @@ from .utils import (
     get_tool_arguments_model,
     get_tool_description,
     get_tool_schema,
-    is_async_callable,
     serialize_tool_problem,
     serialize_tool_result,
     takes_tool_context,
@@ -205,29 +211,52 @@ class Tool:
         self,
         arguments: dict[str, Any],
         context: ToolContext | None = None,
+        *,
+        async_runner: asyncio.Runner | None = None,
+        async_runner_factory: Callable[[], asyncio.Runner | None] | None = None,
     ) -> ToolExecutionResult:
         """Invoke a synchronous tool and retain its user-presentation metadata.
 
         Args:
             arguments (dict[str, Any]): Validated canonical keyword arguments.
             context (ToolContext | None): Runtime tool context.
+            async_runner (asyncio.Runner | None): Host-owned runner for awaiting a tool result
+                when synchronous dispatch is outside an active event loop.
+            async_runner_factory (Callable[[], asyncio.Runner | None] | None): Lazy host-owned
+                runner provider used only when a synchronous callable returns an awaitable.
 
         Returns:
             ToolExecutionResult: Serialized output and selected presentation.
         """
-        if is_async_callable(self.function):
-            return ToolExecutionResult(
-                serialize_tool_problem(
-                    Problem(
-                        code="tool.async_required",
-                        title="Asynchronous tool invocation required",
-                        detail=f"Tool '{self._name_for_error()}' must be called asynchronously.",
-                        operation=self._name_for_error(),
-                    )
-                )
-            )
+        runner = async_runner
+        if is_async_callable(self.function) and (runner is None or has_running_event_loop()):
+            return self._async_required_result()
         try:
             result = self._call_function(arguments, context)
+            if inspect.isawaitable(result):
+                if runner is None and async_runner_factory is not None:
+                    runner = async_runner_factory()
+                if runner is None or has_running_event_loop():
+                    close_awaitable(result)
+                    return self._async_required_result()
+                if (
+                    isinstance(result, asyncio.Future)
+                    and result.get_loop() is not runner.get_loop()
+                ):
+                    return ToolExecutionResult(
+                        serialize_tool_problem(
+                            Problem(
+                                code="tool.loop_mismatch",
+                                title="Tool event loop mismatch",
+                                detail=(
+                                    f"Tool '{self._name_for_error()}' returned a result "
+                                    "attached to a different event loop."
+                                ),
+                                operation=self._name_for_error(),
+                            )
+                        )
+                    )
+                result = runner.run(await_value(result))
             return ToolExecutionResult(
                 serialize_tool_result(result), self._presentation_for(arguments, result)
             )
@@ -243,6 +272,22 @@ class Tool:
             )
             log_problem(_LOGGER, problem, exc)
             return ToolExecutionResult(serialize_tool_problem(problem))
+
+    def _async_required_result(self) -> ToolExecutionResult:
+        """Return the standard error for async callables without a safe blocking host."""
+        return ToolExecutionResult(
+            serialize_tool_problem(
+                Problem(
+                    code="tool.async_required",
+                    title="Asynchronous tool invocation required",
+                    detail=(
+                        f"Tool '{self._name_for_error()}' must be called through the "
+                        "asynchronous tool API."
+                    ),
+                    operation=self._name_for_error(),
+                )
+            )
+        )
 
     async def call_async(
         self, arguments: dict[str, Any], context: ToolContext | None = None
@@ -262,19 +307,44 @@ class Tool:
         self,
         arguments: dict[str, Any],
         context: ToolContext | None = None,
+        *,
+        sync_dispatch: Callable[[Callable[[], Any]], Awaitable[Any]] | None = None,
     ) -> ToolExecutionResult:
         """Invoke any tool asynchronously and retain its user-presentation metadata.
 
         Args:
             arguments (dict[str, Any]): Validated canonical keyword arguments.
             context (ToolContext | None): Runtime tool context.
+            sync_dispatch (Callable[[Callable[[], Any]], Any] | None): Optional registry-owned
+                adapter that runs a synchronous invocation outside the event-loop thread.
 
         Returns:
             ToolExecutionResult: Serialized output and selected presentation.
         """
         try:
-            result = self._call_function(arguments, context)
+            invoke = lambda: self._call_function(arguments, context)
+            if not is_async_callable(self.function) and sync_dispatch is not None:
+                result = await sync_dispatch(invoke)
+            else:
+                result = invoke()
             if inspect.isawaitable(result):
+                if (
+                    isinstance(result, asyncio.Future)
+                    and result.get_loop() is not asyncio.get_running_loop()
+                ):
+                    return ToolExecutionResult(
+                        serialize_tool_problem(
+                            Problem(
+                                code="tool.loop_mismatch",
+                                title="Tool event loop mismatch",
+                                detail=(
+                                    f"Tool '{self._name_for_error()}' returned a result "
+                                    "attached to a different event loop."
+                                ),
+                                operation=self._name_for_error(),
+                            )
+                        )
+                    )
                 result = await result
             return ToolExecutionResult(
                 serialize_tool_result(result), self._presentation_for(arguments, result)

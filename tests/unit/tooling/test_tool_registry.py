@@ -1,12 +1,14 @@
 """Tests for tool registration and routing."""
 
 import asyncio
+import contextvars
 import importlib
 import io
 import json
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from threading import Event
+from threading import Event, get_ident
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -63,6 +65,7 @@ from loop.tooling import (
     ToolStatus,
 )
 from loop.tooling import tool as declare_tool
+from loop.tooling.tool_registry import ToolExecutionPortal
 from loop.utils import VirtualPath, cached_path, content_digest
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
@@ -122,9 +125,30 @@ def register(registry: ToolRegistry):
 def test_registry_closes_its_execution_service():
     """Registry teardown releases the bound command execution service once."""
     service = Mock()
-    ToolRegistry(execution_service=service).close()
+    registry = ToolRegistry(execution_service=service)
+    registry.close()
+    registry.close()
     service.close.assert_called_once()
     ToolRegistry().close()
+
+
+def test_closed_registry_rejects_new_sync_worker_calls():
+    """A closed registry reports worker capacity as unavailable without invoking tools."""
+    invoked = []
+
+    @declare_tool
+    def calculate() -> int:
+        """Record whether a closed registry invokes the handler."""
+        invoked.append(True)
+        return 1
+
+    registry = ToolRegistry([calculate])
+    registry.close()
+
+    output = asyncio.run(registry.call_async("calculate", "{}"))
+
+    assert json.loads(output)["problem"]["code"] == "tool.dispatch_busy"
+    assert invoked == []
 
 
 def test_failed_mutations_do_not_publish_committed_file_versions(tmp_path):
@@ -667,19 +691,1031 @@ def test_register_accepts_partials_with_explicit_local_metadata():
     assert result_value(registry.call("add_two", '{"second": 3}')) == 5
 
 
-def test_register_dispatches_async_callable_objects_only_through_async_calls():
-    """Coroutine-based callable instances are detected before synchronous invocation."""
+def test_sync_and_async_registry_calls_reuse_their_native_async_loops():
+    """Async callables run through one owned sync loop or the caller's async loop."""
+    loop_ids = []
 
     class AsyncMultiplier:
         """Multiply a number asynchronously."""
 
         async def __call__(self, number: int) -> int:
+            loop_ids.append(id(asyncio.get_running_loop()))
             return number * 2
 
     registry = ToolRegistry([AsyncMultiplier()])
 
-    assert "tool.async_required" in registry.call("AsyncMultiplier", '{"number": 3}')
-    assert result_value(asyncio.run(registry.call_async("AsyncMultiplier", '{"number": 3}'))) == 6
+    try:
+        assert result_value(registry.call("AsyncMultiplier", '{"number": 3}')) == 6
+        assert result_value(registry.call("AsyncMultiplier", '{"number": 4}')) == 8
+        assert loop_ids[0] == loop_ids[1]
+        assert (
+            result_value(asyncio.run(registry.call_async("AsyncMultiplier", '{"number": 5}'))) == 10
+        )
+        assert loop_ids[2] != loop_ids[0]
+    finally:
+        registry.close()
+
+
+def test_sync_dispatch_rejects_async_tools_inside_a_running_loop():
+    """A sync registry call in an active loop rejects before invoking an async tool."""
+    invoked = []
+
+    @declare_tool
+    async def calculate(number: int) -> int:
+        """Record whether synchronous dispatch reached the async callable."""
+        invoked.append(number)
+        return number * 2
+
+    registry = ToolRegistry([calculate])
+
+    async def dispatch():
+        return registry.call("calculate", '{"number": 3}')
+
+    output = asyncio.run(dispatch())
+
+    assert json.loads(output)["problem"]["code"] == "tool.async_required"
+    assert not invoked
+
+
+def test_async_dispatch_runs_sync_handlers_off_loop_and_keeps_async_handlers_on_loop():
+    """Sync handlers use workers while native async handlers remain on the owner loop."""
+    loop_thread = get_ident()
+    async_threads = []
+
+    @declare_tool
+    def calculate(number: int) -> int:
+        """Return a value from a synchronous handler."""
+        return number * 2
+
+    @declare_tool
+    async def identify() -> int:
+        """Record the thread running a native async handler."""
+        async_threads.append(get_ident())
+        return 1
+
+    registry = ToolRegistry([calculate, identify])
+
+    async def dispatch():
+        sync_result = await registry.call_async("calculate", '{"number": 3}')
+        async_result = await registry.call_async("identify", "{}")
+        return sync_result, async_result
+
+    try:
+        sync_output, async_output = asyncio.run(dispatch())
+    finally:
+        registry.close()
+
+    assert result_value(sync_output) == 6
+    assert result_value(async_output) == 1
+    assert async_threads == [loop_thread]
+
+
+def test_sync_callable_returning_awaitable_is_awaited_by_each_registry_path():
+    """A sync callable may return an awaitable for either registry execution style."""
+
+    @declare_tool
+    def calculate(number: int) -> int:
+        """Return an awaitable value from a synchronous callable."""
+
+        async def result() -> int:
+            return number * 2
+
+        return result()
+
+    registry = ToolRegistry([calculate])
+
+    try:
+        asynchronous = asyncio.run(registry.call_async("calculate", '{"number": 3}'))
+        synchronous = registry.call("calculate", '{"number": 4}')
+    finally:
+        registry.close()
+
+    assert result_value(asynchronous) == 6
+    assert result_value(synchronous) == 8
+
+
+def test_async_planners_and_continuations_use_registry_callable_dispatch():
+    """Sync planning callbacks run in workers before async handlers run on the loop."""
+    loop_thread = get_ident()
+    planner_threads = []
+
+    def continuation():
+        planner_threads.append(get_ident())
+        return OperationPlan(arguments={"number": 9})
+
+    def planner(arguments):
+        planner_threads.append(get_ident())
+        return OperationPlan(arguments=arguments, continuation=continuation)
+
+    @declare_tool(operation_planner=planner)
+    async def calculate(number: int) -> int:
+        """Return the value produced by the planning continuation."""
+        assert get_ident() == loop_thread
+        return number
+
+    registry = ToolRegistry([calculate])
+
+    try:
+        output = asyncio.run(registry.call_async("calculate", '{"number": 1}'))
+    finally:
+        registry.close()
+
+    assert result_value(output) == 9
+    assert len(planner_threads) == 2
+    assert all(thread_id != loop_thread for thread_id in planner_threads)
+
+
+def test_async_planners_and_continuations_are_awaited_on_the_owner_loop():
+    """Native async planning callbacks stay on and yield through the owner loop."""
+    owner_thread = get_ident()
+    planner_threads = []
+
+    async def continuation():
+        planner_threads.append(get_ident())
+        return OperationPlan(arguments={"number": 7})
+
+    async def planner(arguments):
+        planner_threads.append(get_ident())
+        return OperationPlan(arguments=arguments, continuation=continuation)
+
+    @declare_tool(operation_planner=planner)
+    async def calculate(number: int) -> int:
+        """Return the value produced by the asynchronous planning continuation."""
+        assert get_ident() == owner_thread
+        return number
+
+    registry = ToolRegistry([calculate])
+
+    try:
+        output = asyncio.run(registry.call_async("calculate", '{"number": 1}'))
+    finally:
+        registry.close()
+
+    assert result_value(output) == 7
+    assert planner_threads == [owner_thread, owner_thread]
+
+
+def test_blocking_sync_tool_does_not_stall_the_async_event_loop():
+    """The async loop processes owner callbacks while a synchronous tool is blocked."""
+    started = Event()
+    release = Event()
+
+    @declare_tool
+    def wait_for_release() -> str:
+        """Wait for the test owner to release the worker."""
+        started.set()
+        release.wait()
+        return "finished"
+
+    registry = ToolRegistry([wait_for_release])
+
+    async def dispatch():
+        task = asyncio.create_task(registry.call_async("wait_for_release", "{}"))
+        await asyncio.to_thread(started.wait)
+        loop_callback = asyncio.Event()
+        asyncio.get_running_loop().call_soon(loop_callback.set)
+        await loop_callback.wait()
+        release.set()
+        return await task
+
+    try:
+        output = asyncio.run(dispatch())
+    finally:
+        release.set()
+        registry.close()
+
+    assert result_value(output) == "finished"
+
+
+def test_async_tool_worker_admission_is_bounded():
+    """Synchronous tool submissions beyond worker and queue capacity return a typed error."""
+    release = Event()
+    invocation_count = []
+
+    @declare_tool
+    def wait_for_release() -> str:
+        """Hold a worker until the registry reports its capacity boundary."""
+        invocation_count.append(True)
+        release.wait()
+        return "finished"
+
+    registry = ToolRegistry([wait_for_release])
+
+    async def dispatch():
+        tasks = [
+            asyncio.create_task(registry.call_async("wait_for_release", "{}")) for _ in range(9)
+        ]
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        first = json.loads(next(iter(done)).result())
+        release.set()
+        outputs = await asyncio.gather(*tasks)
+        return first, [json.loads(output) for output in outputs]
+
+    try:
+        first, outputs = asyncio.run(dispatch())
+    finally:
+        release.set()
+        registry.close()
+
+    assert first["problem"]["code"] == "tool.dispatch_busy"
+    assert sum(result.get("ok") is True for result in outputs) == 8
+    assert (
+        sum(result.get("problem", {}).get("code") == "tool.dispatch_busy" for result in outputs)
+        == 1
+    )
+    assert len(invocation_count) == 8
+
+
+def test_cancellation_waits_for_sync_tool_settlement():
+    """Cancelling async dispatch signals its worker and waits for the actual outcome."""
+    started = Event()
+    release = Event()
+    settled = Event()
+    cancellation = Event()
+
+    @declare_tool
+    def wait_for_release(context: ToolContext) -> str:
+        """Finish only after observing the worker's cancellation signal."""
+        started.set()
+        release.wait()
+        settled.set()
+        return "finished"
+
+    registry = ToolRegistry([wait_for_release])
+
+    async def dispatch():
+        task = asyncio.create_task(
+            registry.call_async("wait_for_release", "{}", cancellation_event=cancellation)
+        )
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        await asyncio.to_thread(cancellation.wait)
+        assert not task.done()
+        task.cancel()
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(dispatch())
+    finally:
+        release.set()
+        registry.close()
+
+    assert settled.is_set()
+
+
+def test_cancellation_settles_sync_work_without_a_run_signal():
+    """Registry cancellation still waits for workers when no run event was supplied."""
+    started = Event()
+    release = Event()
+    settled = Event()
+
+    @declare_tool
+    def wait_for_release() -> str:
+        """Hold the worker until the event loop advances cancellation."""
+        started.set()
+        release.wait()
+        settled.set()
+        return "finished"
+
+    registry = ToolRegistry([wait_for_release])
+
+    async def dispatch():
+        task = asyncio.create_task(registry.call_async("wait_for_release", "{}"))
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        asyncio.get_running_loop().call_soon(release.set)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(dispatch())
+    finally:
+        release.set()
+        registry.close()
+
+    assert settled.is_set()
+
+
+def test_worker_failure_is_logged_when_cancellation_waits_for_settlement(caplog):
+    """A worker exception after cancellation is recorded once at the registry boundary."""
+    started = Event()
+    release = Event()
+    cancellation = Event()
+
+    @declare_tool
+    def fail_after_release() -> str:
+        """Raise after the cancellation owner releases the worker."""
+        started.set()
+        release.wait()
+        raise RuntimeError("private failure detail")
+
+    registry = ToolRegistry([fail_after_release])
+
+    async def dispatch():
+        task = asyncio.create_task(
+            registry.call_async("fail_after_release", "{}", cancellation_event=cancellation)
+        )
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        await asyncio.to_thread(cancellation.wait)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(dispatch())
+    finally:
+        release.set()
+        registry.close()
+
+    records = [record for record in caplog.records if record.name == "loop.tooling.tool_registry"]
+    assert len(records) == 1
+    assert records[0].__dict__["error.type"] == "tool.callback_failed"
+    assert records[0].__dict__["exception.type"] == "builtins.RuntimeError"
+    assert "private failure detail" not in records[0].getMessage()
+
+
+def test_cancelled_executor_future_settles_without_reading_its_exception():
+    """A cancelled executor future still releases worker admission during settlement."""
+
+    @declare_tool
+    def calculate() -> int:
+        """Return a value if the worker callback is submitted."""
+        return 1
+
+    registry = ToolRegistry([calculate])
+
+    async def dispatch():
+        loop = asyncio.get_running_loop()
+        original = loop.run_in_executor
+        future = loop.create_future()
+        future.cancel()
+        loop.run_in_executor = lambda *_args, **_kwargs: future
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await registry.call_async("calculate", "{}")
+        finally:
+            loop.run_in_executor = original
+
+    try:
+        asyncio.run(dispatch())
+    finally:
+        registry.close()
+
+
+def test_worker_context_relays_interaction_and_instruction_effects_and_returns_receipts(tmp_path):
+    """Worker context effects stay on the owner and file receipts return with the result."""
+    owner_thread = get_ident()
+    service_threads = []
+    path = tmp_path / "observed.txt"
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
+    )
+    observe_path = instructions.observe_path
+
+    def observe_on_owner(path_value, *, directory=False):
+        service_threads.append(get_ident())
+        return observe_path(path_value, directory=directory)
+
+    instructions.observe_path = observe_on_owner
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+
+    async def confirm_on_owner(message, *, default=False):
+        service_threads.append(get_ident())
+        return True
+
+    interaction.confirm_async = confirm_on_owner
+
+    @declare_tool
+    def inspect_context(context: ToolContext) -> dict:
+        """Record a read, update instruction scope, and request owner-thread confirmation."""
+        context.record_cached_read("cache://reference")
+        context.observe_file(path)
+        return {"allowed": context.confirm("Continue?")}
+
+    registry = ToolRegistry([inspect_context])
+
+    try:
+        output = asyncio.run(
+            registry.call_async(
+                "inspect_context",
+                "{}",
+                interaction=interaction,
+                instructions_manager=instructions,
+            )
+        )
+    finally:
+        registry.close()
+
+    result = json.loads(output)
+    assert result["ok"] is True
+    assert result["result"] == {"allowed": True}
+    assert result["read_versions"] == {"cache://reference": None}
+    assert service_threads == [owner_thread, owner_thread]
+
+
+def test_additional_authorization_rechecks_exact_dynamic_operations_on_owner():
+    """Runtime-discovered operations receive their own exact async authorization check."""
+    owner_thread = get_ident()
+    authorization_calls = []
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+
+    async def authorize_async(operations, **_kwargs):
+        authorization_calls.append((get_ident(), operations))
+        return SimpleNamespace(decision=Decision.ALLOW)
+
+    permissions.authorize_async = AsyncMock(side_effect=authorize_async)
+
+    def plan(arguments):
+        url = arguments["url"]
+        return OperationPlan(
+            arguments=arguments,
+            operations=(
+                Operation(
+                    tool_id="",
+                    action=Action.NETWORK_REQUEST,
+                    target=NetworkTarget(url=url, origin=url),
+                ),
+            ),
+        )
+
+    @declare_tool(actions={Action.NETWORK_REQUEST}, operation_planner=plan)
+    def fetch_redirect(context: ToolContext, url: str) -> str:
+        """Authorize a redirect before returning its canonical target."""
+        redirected = context.authorize_additional({"url": "https://second.local"})
+        return redirected.arguments["url"]
+
+    registry = ToolRegistry([fetch_redirect], permission_manager=permissions)
+
+    try:
+        output = asyncio.run(registry.call_async("fetch_redirect", '{"url":"https://first.local"}'))
+    finally:
+        registry.close()
+
+    assert result_value(output) == "https://second.local"
+    assert len(authorization_calls) == 2
+    assert all(thread_id == owner_thread for thread_id, _ in authorization_calls)
+    assert [operations[0].target.url for _, operations in authorization_calls] == [
+        "https://first.local",
+        "https://second.local",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("additional_decision", "expected"),
+    [(Decision.ALLOW, "https://second.local"), (Decision.DENY, "tool.denied")],
+)
+def test_sync_additional_authorization_preserves_its_denial_contract(additional_decision, expected):
+    """Sync runtime authorization checks dynamic targets and keeps denial wording."""
+    authorization_calls = []
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+
+    def authorize(operations, **_kwargs):
+        authorization_calls.append(operations)
+        decision = Decision.ALLOW if len(authorization_calls) == 1 else additional_decision
+        return SimpleNamespace(decision=decision, reason="redirect denied")
+
+    permissions.authorize = Mock(side_effect=authorize)
+
+    def plan(arguments):
+        url = arguments["url"]
+        return OperationPlan(
+            arguments=arguments,
+            operations=(
+                Operation(
+                    tool_id="",
+                    action=Action.NETWORK_REQUEST,
+                    target=NetworkTarget(url=url, origin=url),
+                ),
+            ),
+        )
+
+    @declare_tool(actions={Action.NETWORK_REQUEST}, operation_planner=plan)
+    def fetch_redirect(context: ToolContext, url: str) -> str:
+        """Authorize a redirect before returning its canonical target."""
+        redirected = context.authorize_additional({"url": "https://second.local"})
+        return redirected.arguments["url"]
+
+    registry = ToolRegistry([fetch_redirect], permission_manager=permissions)
+
+    try:
+        output = json.loads(registry.call("fetch_redirect", '{"url":"https://first.local"}'))
+    finally:
+        registry.close()
+
+    assert len(authorization_calls) == 2
+    assert [operations[0].target.url for operations in authorization_calls] == [
+        "https://first.local",
+        "https://second.local",
+    ]
+    if additional_decision is Decision.ALLOW:
+        assert output["result"] == expected
+    else:
+        assert output["problem"]["code"] == expected
+        assert output["problem"]["title"] == "Additional operation denied"
+
+
+def test_sync_additional_authorization_preserves_non_denial_planning_errors():
+    """Dynamic planning errors keep their original structured problem through authorization."""
+    authorization_calls = []
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+
+    def authorize(operations, **_kwargs):
+        authorization_calls.append(operations)
+        return SimpleNamespace(decision=Decision.ALLOW)
+
+    permissions.authorize = Mock(side_effect=authorize)
+
+    def plan(arguments):
+        if arguments["url"] == "https://second.local":
+            raise ValueError("redirect could not be planned")
+        return OperationPlan(
+            arguments=arguments,
+            operations=(
+                Operation(
+                    tool_id="",
+                    action=Action.NETWORK_REQUEST,
+                    target=NetworkTarget(url=arguments["url"], origin=arguments["url"]),
+                ),
+            ),
+        )
+
+    @declare_tool(actions={Action.NETWORK_REQUEST}, operation_planner=plan)
+    def fetch_redirect(context: ToolContext, url: str) -> str:
+        """Authorize a redirect before returning its canonical target."""
+        return context.authorize_additional({"url": "https://second.local"}).arguments["url"]
+
+    registry = ToolRegistry([fetch_redirect], permission_manager=permissions)
+
+    try:
+        output = json.loads(registry.call("fetch_redirect", '{"url":"https://first.local"}'))
+    finally:
+        registry.close()
+
+    assert output["problem"]["code"] == "tool.planning_failed"
+    assert output["problem"]["detail"] == "redirect could not be planned"
+    assert len(authorization_calls) == 1
+
+
+def test_async_additional_authorization_preserves_its_denial_contract():
+    """Async runtime authorization returns a typed denial for a redirected target."""
+    decisions = iter((Decision.ALLOW, Decision.DENY))
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+
+    async def authorize_async(*_args, **_kwargs):
+        return SimpleNamespace(decision=next(decisions), reason="redirect denied")
+
+    permissions.authorize_async = AsyncMock(side_effect=authorize_async)
+
+    def plan(arguments):
+        url = arguments["url"]
+        return OperationPlan(
+            arguments=arguments,
+            operations=(
+                Operation(
+                    tool_id="",
+                    action=Action.NETWORK_REQUEST,
+                    target=NetworkTarget(url=url, origin=url),
+                ),
+            ),
+        )
+
+    @declare_tool(actions={Action.NETWORK_REQUEST}, operation_planner=plan)
+    def fetch_redirect(context: ToolContext, url: str) -> str:
+        """Authorize a redirect before returning its canonical target."""
+        redirected = context.authorize_additional({"url": "https://second.local"})
+        return redirected.arguments["url"]
+
+    registry = ToolRegistry([fetch_redirect], permission_manager=permissions)
+
+    try:
+        output = json.loads(
+            asyncio.run(registry.call_async("fetch_redirect", '{"url":"https://first.local"}'))
+        )
+    finally:
+        registry.close()
+
+    assert output["problem"]["code"] == "tool.denied"
+    assert output["problem"]["title"] == "Additional operation denied"
+
+
+def test_sync_callable_rejects_future_bound_to_another_loop():
+    """Both registry modes reject a tool result owned by a different event loop."""
+    foreign_loop = asyncio.new_event_loop()
+    foreign_future = foreign_loop.create_future()
+    foreign_future.set_result("unowned")
+
+    @declare_tool
+    def return_foreign_future() -> str:
+        """Return a completed result attached to another event loop."""
+        return foreign_future
+
+    registry = ToolRegistry([return_foreign_future])
+
+    try:
+        synchronous = json.loads(registry.call("return_foreign_future", "{}"))
+        asynchronous = json.loads(asyncio.run(registry.call_async("return_foreign_future", "{}")))
+    finally:
+        registry.close()
+        foreign_loop.close()
+
+    assert synchronous["problem"]["code"] == "tool.loop_mismatch"
+    assert asynchronous["problem"]["code"] == "tool.loop_mismatch"
+
+
+def test_registry_reuses_a_runner_for_async_planners_in_sync_dispatch():
+    """Sync dispatch uses the registry runner for async planners and continuations."""
+    loop_ids = []
+
+    async def continuation():
+        loop_ids.append(id(asyncio.get_running_loop()))
+        return OperationPlan(arguments={"number": 7})
+
+    async def planner(arguments):
+        loop_ids.append(id(asyncio.get_running_loop()))
+        return OperationPlan(arguments=arguments, continuation=continuation)
+
+    @declare_tool(operation_planner=planner)
+    def calculate(number: int) -> int:
+        """Return the value produced by the async plan."""
+        return number
+
+    registry = ToolRegistry([calculate])
+
+    try:
+        first = result_value(registry.call("calculate", '{"number": 1}'))
+        second = result_value(registry.call("calculate", '{"number": 2}'))
+    finally:
+        registry.close()
+
+    assert first == second == 7
+    assert len(loop_ids) == 4
+    assert len(set(loop_ids)) == 1
+
+
+def test_sync_dispatch_rejects_awaitable_planners_inside_a_running_loop():
+    """Sync planning cannot create an unowned event loop from an active loop thread."""
+
+    def planner(arguments):
+        async def plan():
+            return OperationPlan(arguments=arguments)
+
+        return plan()
+
+    @declare_tool(operation_planner=planner)
+    def calculate(number: int) -> int:
+        """Return the value only if sync planning was allowed."""
+        return number
+
+    registry = ToolRegistry([calculate])
+
+    async def dispatch():
+        return registry.call("calculate", '{"number": 3}')
+
+    output = asyncio.run(dispatch())
+
+    assert json.loads(output)["problem"]["code"] == "tool.async_required"
+
+
+def test_sync_dispatch_rejects_async_planners_inside_a_running_loop():
+    """Sync planning refuses coroutine planners when their caller already owns a loop."""
+
+    async def planner(arguments):
+        return OperationPlan(arguments=arguments)
+
+    @declare_tool(operation_planner=planner)
+    def calculate(number: int) -> int:
+        """Return the value only if sync planning was allowed."""
+        return number
+
+    registry = ToolRegistry([calculate])
+
+    async def dispatch():
+        return registry.call("calculate", '{"number": 3}')
+
+    try:
+        output = asyncio.run(dispatch())
+    finally:
+        registry.close()
+
+    assert json.loads(output)["problem"]["code"] == "tool.async_required"
+
+
+def test_sync_dispatch_rejects_non_closeable_planner_results_inside_a_loop():
+    """Sync planning tolerates awaitables without a close method when it cannot await them."""
+
+    @declare_tool(operation_planner=lambda arguments: asyncio.get_running_loop().create_future())
+    def calculate(number: int) -> int:
+        """Return the value only if sync planning was allowed."""
+        return number
+
+    registry = ToolRegistry([calculate])
+
+    async def dispatch():
+        output = registry.call("calculate", '{"number": 3}')
+        assert json.loads(output)["problem"]["code"] == "tool.async_required"
+
+    try:
+        asyncio.run(dispatch())
+    finally:
+        registry.close()
+
+
+def test_sync_dispatch_rejects_a_sync_callable_returning_awaitable_inside_a_loop():
+    """A returned coroutine is closed when a sync callable cannot await it in an active loop."""
+
+    @declare_tool
+    def calculate() -> str:
+        """Return an awaitable whose body must not start in a sync call."""
+
+        async def result() -> str:
+            pytest.fail("the rejected coroutine must not execute")
+
+        return result()
+
+    registry = ToolRegistry([calculate])
+
+    async def dispatch():
+        return registry.call("calculate", "{}")
+
+    output = asyncio.run(dispatch())
+
+    assert json.loads(output)["problem"]["code"] == "tool.async_required"
+
+
+def test_async_sync_planner_rejects_a_foreign_loop_future():
+    """An async planner result attached to another loop is refused before tool execution."""
+    foreign_loop = asyncio.new_event_loop()
+    foreign_future = foreign_loop.create_future()
+    foreign_future.set_result(OperationPlan(arguments={"number": 4}))
+
+    @declare_tool(operation_planner=lambda arguments: foreign_future)
+    async def calculate(number: int) -> int:
+        """Return the planned value if its planner result is owned."""
+        return number
+
+    registry = ToolRegistry([calculate])
+
+    try:
+        output = asyncio.run(registry.call_async("calculate", '{"number": 1}'))
+    finally:
+        registry.close()
+        foreign_loop.close()
+
+    assert json.loads(output)["problem"]["code"] == "tool.loop_mismatch"
+
+
+def test_sync_async_planner_rejects_a_foreign_loop_future():
+    """Sync dispatch refuses an async planner result tied to another event loop."""
+    foreign_loop = asyncio.new_event_loop()
+    foreign_future = foreign_loop.create_future()
+    foreign_future.set_result(OperationPlan(arguments={"number": 4}))
+
+    @declare_tool(operation_planner=lambda arguments: foreign_future)
+    def calculate(number: int) -> int:
+        """Return the planned value if its planner result is owned."""
+        return number
+
+    registry = ToolRegistry([calculate])
+
+    try:
+        output = registry.call("calculate", '{"number": 1}')
+    finally:
+        registry.close()
+        foreign_loop.close()
+
+    assert json.loads(output)["problem"]["code"] == "tool.loop_mismatch"
+
+
+def test_worker_submission_failure_releases_bounded_admission(monkeypatch):
+    """A failed executor submission becomes a typed result and frees its worker slot."""
+
+    @declare_tool
+    def calculate() -> int:
+        """Return a value after executor admission recovers."""
+        return 1
+
+    registry = ToolRegistry([calculate])
+
+    async def dispatch():
+        loop = asyncio.get_running_loop()
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                loop,
+                "run_in_executor",
+                Mock(side_effect=RuntimeError("executor unavailable")),
+            )
+            failed = await registry.call_async("calculate", "{}")
+        succeeded = await registry.call_async("calculate", "{}")
+        return failed, succeeded
+
+    try:
+        failed, succeeded = asyncio.run(dispatch())
+    finally:
+        registry.close()
+
+    assert json.loads(failed)["problem"]["code"] == "tool.execution_failed"
+    assert result_value(succeeded) == 1
+
+
+def test_worker_dispatch_preserves_context_variables():
+    """Registry workers receive the caller's correlation context variables."""
+
+    trace_id = contextvars.ContextVar("trace_id", default="missing")
+
+    @declare_tool
+    def inspect_context() -> str:
+        """Return the active correlation identifier."""
+        return trace_id.get()
+
+    registry = ToolRegistry([inspect_context])
+
+    async def dispatch():
+        token = trace_id.set("trace-123")
+        try:
+            return await registry.call_async("inspect_context", "{}")
+        finally:
+            trace_id.reset(token)
+
+    try:
+        output = asyncio.run(dispatch())
+    finally:
+        registry.close()
+
+    assert result_value(output) == "trace-123"
+
+
+def test_worker_context_service_values_are_detached():
+    """Owner service values return as copies or proxies instead of live services."""
+
+    @dataclass
+    class Record:
+        """Provide a mutable owner value for relay isolation coverage."""
+
+        value: str
+
+    class OwnerService:
+        """Provide typed owner data to a worker context.
+
+        Initialize representative values for direct copies and nested service proxies.
+        """
+
+        agents_filenames: tuple[str, ...]
+        empty: None
+        text: str
+        location: Path
+        model: Problem
+        record: Record
+        sequence: tuple[int, int]
+        items: list[str]
+        mapping: dict[str, str]
+        selected: set[str]
+        nested: SimpleNamespace
+
+        def __init__(self) -> None:
+            self.agents_filenames = ()
+            self.empty = None
+            self.text = "owner-text"
+            self.location = Path("/workspace/item")
+            self.model = Problem(code="test.owner", title="Owner", detail="safe")
+            self.record = Record("record")
+            self.sequence = (1, 2)
+            self.items = ["first", "second"]
+            self.mapping = {"key": "value"}
+            self.selected = {"first", "second"}
+            self.nested = SimpleNamespace(value="proxied")
+
+    @declare_tool
+    def inspect_values(context: ToolContext) -> dict:
+        """Read all detached owner values through the invocation context."""
+        service = context.instructions_manager
+        return {
+            "empty": service.empty,
+            "text": service.text,
+            "location": str(service.location),
+            "model": service.model.code,
+            "record": service.record.value,
+            "sequence": service.sequence,
+            "items": service.items,
+            "mapping": service.mapping,
+            "selected": sorted(service.selected),
+            "nested": service.nested.value,
+        }
+
+    registry = ToolRegistry([inspect_values])
+
+    try:
+        output = asyncio.run(
+            registry.call_async("inspect_values", "{}", instructions_manager=OwnerService())
+        )
+    finally:
+        registry.close()
+
+    assert result_value(output) == {
+        "empty": None,
+        "text": "owner-text",
+        "location": "/workspace/item",
+        "model": "test.owner",
+        "record": "record",
+        "sequence": [1, 2],
+        "items": ["first", "second"],
+        "mapping": {"key": "value"},
+        "selected": ["first", "second"],
+        "nested": "proxied",
+    }
+
+
+def test_owner_portal_runs_sync_calls_and_rejects_unawaited_owner_results():
+    """Owner-thread relay calls run directly and refuse to block on returned awaitables."""
+
+    async def exercise():
+        portal = ToolExecutionPortal(asyncio.get_running_loop())
+        assert portal.call(lambda: "owner") == "owner"
+
+        async def result():
+            return "not awaited"
+
+        with pytest.raises(ProblemException, match="must be awaited"):
+            portal.call(result)
+
+        future = asyncio.get_running_loop().create_future()
+        with pytest.raises(ProblemException, match="must be awaited"):
+            portal.call(lambda: future)
+        future.cancel()
+
+    asyncio.run(exercise())
+
+
+def test_owner_portal_rejects_stopped_and_closed_loops():
+    """A worker cannot enqueue owner calls after its event loop stops."""
+    stopped_loop = asyncio.new_event_loop()
+    stopped_portal = ToolExecutionPortal(stopped_loop)
+    with pytest.raises(RuntimeError, match="relay is unavailable"):
+        stopped_portal.call(lambda: None)
+    stopped_loop.close()
+
+    closed_loop = asyncio.new_event_loop()
+    closed_portal = ToolExecutionPortal(closed_loop)
+    closed_loop.close()
+    with pytest.raises(RuntimeError, match="relay is unavailable"):
+        closed_portal.call(lambda: None)
+
+
+def test_worker_context_rejects_sync_prompt_without_native_async_input():
+    """A sync interaction cannot be called inline when a tool runs asynchronously."""
+
+    @declare_tool
+    def confirm(context: ToolContext) -> bool:
+        """Request confirmation through the injected interaction."""
+        return context.confirm("Continue?")
+
+    registry = ToolRegistry([confirm])
+
+    try:
+        output = asyncio.run(
+            registry.call_async("confirm", "{}", interaction=Mock(spec=Interaction))
+        )
+    finally:
+        registry.close()
+
+    assert json.loads(output)["problem"]["code"] == "tool.async_required"
+
+
+def test_worker_permission_proxy_prefers_native_async_methods():
+    """A sync context call uses the permission service's async owner-thread method."""
+    owner_thread = get_ident()
+    method_threads = []
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+
+    async def authorize_async(*_args, **_kwargs):
+        method_threads.append(get_ident())
+        return SimpleNamespace(decision=Decision.ALLOW)
+
+    permissions.authorize_async = AsyncMock(side_effect=authorize_async)
+
+    @declare_tool
+    def inspect_permissions(context: ToolContext) -> bool:
+        """Use the sync permission method through its async owner relay."""
+        result = context.permission_manager.authorize((), interaction=context.interaction)
+        return result.decision is Decision.ALLOW
+
+    registry = ToolRegistry([inspect_permissions], permission_manager=permissions)
+
+    try:
+        output = asyncio.run(registry.call_async("inspect_permissions", "{}"))
+    finally:
+        registry.close()
+
+    assert result_value(output) is True
+    assert method_threads == [owner_thread, owner_thread]
 
 
 def test_definitions_preserve_registration_order():

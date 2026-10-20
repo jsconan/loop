@@ -1,6 +1,5 @@
 """Run an interactive conversation with an LLM backend."""
 
-import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -36,7 +35,7 @@ from .session import (
 )
 from .telemetry import telemetry_activity
 from .tooling import ToolCommands, ToolRegistry
-from .utils import PathHolder, PathReference, find_project_root
+from .utils import PathHolder, PathReference, find_project_root, has_running_event_loop
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -576,11 +575,7 @@ class Loop:
         Returns:
             None: After the conversation has ended.
         """
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        else:
+        if has_running_event_loop():
             raise RuntimeError(
                 "Synchronous Loop.run() cannot run inside an event loop; "
                 "await Loop.run_async() instead."

@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
+import copy
+import inspect
 import json
 import logging
-from collections.abc import Callable, Iterable
-from threading import Event
+from collections.abc import Awaitable, Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import is_dataclass
+from enum import Enum
+from pathlib import Path
+from threading import BoundedSemaphore, Event, get_ident
 from time import perf_counter
-from typing import Any
+from typing import Any, cast
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
@@ -33,7 +41,14 @@ from ..permissions import (
     ProcessBoundary,
     ProcessTarget,
 )
-from ..utils import VirtualPath, callable_name
+from ..utils import (
+    VirtualPath,
+    await_value,
+    callable_name,
+    close_awaitable,
+    has_running_event_loop,
+    is_async_callable,
+)
 from .context import ToolContext
 from .file_observations import FileObservations
 from .models import (
@@ -46,10 +61,183 @@ from .tool import Tool, ToolRegistration
 from .utils import serialize_tool_problem
 
 _LOGGER = logging.getLogger(__name__)
+_TOOL_WORKER_COUNT = 4
+_TOOL_WORKER_QUEUE_SIZE = 4
+
+
+class ToolExecutionPortal:
+    """Relay synchronous extension requests to the event-loop owner.
+
+    Args:
+        loop (asyncio.AbstractEventLoop): Running loop that owns session services.
+    """
+
+    _loop: asyncio.AbstractEventLoop
+    _owner_thread: int
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._owner_thread = get_ident()
+
+    def call(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run one synchronous callback on the owner loop and return its detached result.
+
+        Args:
+            callback (Callable[..., Any]): Owner-thread operation to invoke.
+            *args (Any): Positional callback arguments.
+            **kwargs (Any): Keyword callback arguments.
+
+        Returns:
+            Any: Detached callback result.
+
+        Raises:
+            ProblemException: If an owner-thread callback returns an awaitable.
+            RuntimeError: If the owner loop has stopped.
+        """
+        if self._loop.is_closed() or not self._loop.is_running():
+            raise RuntimeError("Tool context relay is unavailable from this thread.")
+
+        if get_ident() == self._owner_thread:
+            result = callback(*args, **kwargs)
+            if inspect.isawaitable(result):
+                close_awaitable(result)
+                raise ProblemException(
+                    Problem(
+                        code="tool.async_required",
+                        title="Asynchronous context operation required",
+                        detail=(
+                            "This context operation must be awaited through the asynchronous "
+                            "tool API."
+                        ),
+                    )
+                )
+            return _detach_owner_value(result, self)
+
+        async def invoke() -> Any:
+            result = callback(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return _detach_owner_value(result, self)
+
+        return asyncio.run_coroutine_threadsafe(invoke(), self._loop).result()
+
+    def call_method(
+        self,
+        target: object,
+        name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Invoke an owner service method, preferring its native async counterpart.
+
+        Args:
+            target (object): Service owned by the event-loop thread.
+            name (str): Synchronous method requested by the extension.
+            *args (Any): Positional method arguments.
+            **kwargs (Any): Keyword method arguments.
+
+        Returns:
+            Any: Detached method result.
+
+        Raises:
+            RuntimeError: If the owner loop cannot service the request.
+            ProblemException: If no async input method exists for a prompt request.
+        """
+
+        def invoke() -> Any:
+            method = getattr(target, name)
+            async_method = getattr(target, f"{name}_async", None)
+            if name in {"confirm", "prompt"} and not callable(async_method):
+                raise ProblemException(
+                    Problem(
+                        code="tool.async_required",
+                        title="Asynchronous interaction required",
+                        detail=(
+                            "This interaction must provide asynchronous input when a tool "
+                            "runs in the async application."
+                        ),
+                    )
+                )
+
+            if callable(async_method):
+                method = async_method
+            return method(*args, **kwargs)
+
+        return self.call(invoke)
+
+    def get_attribute(self, target: object, name: str) -> tuple[bool, Any]:
+        """Read an owner service attribute without exposing its live value to a worker.
+
+        Args:
+            target (object): Service owned by the event-loop thread.
+            name (str): Attribute to inspect.
+
+        Returns:
+            tuple[bool, Any]: Whether the attribute is callable and a safe value or proxy.
+        """
+
+        def read() -> tuple[bool, Any]:
+            value = getattr(target, name)
+            return callable(value), None if callable(value) else _detach_owner_value(value, self)
+
+        return self.call(read)
+
+
+class ToolOwnerServiceProxy:
+    """Expose owner-thread services to a synchronous tool worker through a relay.
+
+    Args:
+        target (object): Service that must remain on the event-loop owner thread.
+        portal (ToolExecutionPortal): Relay used for service access.
+    """
+
+    _target: object
+    _portal: ToolExecutionPortal
+
+    def __init__(self, target: object, portal: ToolExecutionPortal) -> None:
+        self._target = target
+        self._portal = portal
+
+    def __getattr__(self, name: str) -> Any:
+        callable_attribute, value = self._portal.get_attribute(self._target, name)
+        if callable_attribute:
+            return lambda *args, **kwargs: self._portal.call_method(
+                self._target, name, *args, **kwargs
+            )
+        return value
+
+
+def _detach_owner_value(value: Any, portal: ToolExecutionPortal) -> Any:
+    """Copy plain values and proxy service objects before returning them to a worker."""
+    if isinstance(value, ToolOwnerServiceProxy):
+        return value
+    if value is None or isinstance(value, (str, int, float, bool, bytes, Enum, Path)):
+        return value
+    if isinstance(value, BaseModel):
+        return value.model_copy(deep=True)
+    if is_dataclass(value) and not isinstance(value, type):
+        return copy.deepcopy(value)
+    if isinstance(value, tuple):
+        return tuple(_detach_owner_value(item, portal) for item in value)
+    if isinstance(value, list):
+        return [_detach_owner_value(item, portal) for item in value]
+    if isinstance(value, dict):
+        return {
+            _detach_owner_value(key, portal): _detach_owner_value(item, portal)
+            for key, item in value.items()
+        }
+    if isinstance(value, (set, frozenset)):
+        return type(value)(_detach_owner_value(item, portal) for item in value)
+    return ToolOwnerServiceProxy(value, portal)
 
 
 class ToolRegistry:
-    """Collect tool declarations and route model calls to their implementations.
+    """Register tools and dispatch each callable through the host's sync or async boundary.
+
+    Synchronous handlers in async dispatch use bounded registry workers and receive relays for
+    owner-thread services. Native async handlers run on the caller's loop. Synchronous calls may
+    reuse a registry-owned runner for async handlers when called outside a running loop; ``close``
+    settles workers and releases the runner and execution service.
 
     Args:
         tools (Iterable[Callable[..., Any] | ToolRegistration] | None): Functions or configured
@@ -72,6 +260,10 @@ class ToolRegistry:
     _registration_problems: list[Problem]
     _settings: ToolRuntimeSettings
     _execution_service: CommandExecutionService | None
+    _async_runner: asyncio.Runner | None
+    _executor: ThreadPoolExecutor
+    _worker_slots: BoundedSemaphore
+    _closed: bool
 
     def __init__(
         self,
@@ -87,13 +279,156 @@ class ToolRegistry:
         self._permission_manager = permission_manager or PermissionManager(interaction=interaction)
         self._settings = settings or ToolRuntimeSettings()
         self._execution_service = execution_service
+        self._async_runner = None
+        self._executor = ThreadPoolExecutor(
+            max_workers=_TOOL_WORKER_COUNT,
+            thread_name_prefix="loop-tool",
+        )
+        self._worker_slots = BoundedSemaphore(_TOOL_WORKER_COUNT + _TOOL_WORKER_QUEUE_SIZE)
+        self._closed = False
         for tool in tools or ():
             self.register(tool)
 
     def close(self) -> None:
-        """Release the execution service owned by this registry."""
+        """Settle dispatched tools and release registry-owned execution resources."""
+        if self._closed:
+            return
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        if self._async_runner is not None:
+            self._async_runner.close()
         if self._execution_service is not None:
             self._execution_service.close()
+        self._closed = True
+
+    def _sync_runner(self) -> asyncio.Runner | None:
+        """Return the registry-owned async runner when the caller owns the thread loop."""
+        if has_running_event_loop():
+            return None
+        if self._async_runner is None:
+            self._async_runner = asyncio.Runner()
+        return self._async_runner
+
+    def _async_required(self, tool: Tool) -> ProblemException:
+        """Build the structured error for callables that cannot use a sync host."""
+        return ProblemException(
+            Problem(
+                code="tool.async_required",
+                title="Asynchronous tool invocation required",
+                detail=f"Tool '{tool.name}' must be called through the asynchronous tool API.",
+                operation=tool.name,
+            )
+        )
+
+    def _invoke_sync(self, tool: Tool, function: Callable[..., Any], *args: Any) -> Any:
+        """Invoke an extension callback directly or through the owned blocking runner."""
+        runner = self._sync_runner() if is_async_callable(function) else None
+        if is_async_callable(function) and runner is None:
+            raise self._async_required(tool)
+        result = function(*args)
+        if inspect.isawaitable(result):
+            if runner is None:
+                runner = self._sync_runner()
+            if runner is None:
+                close_awaitable(result)
+                raise self._async_required(tool)
+            if isinstance(result, asyncio.Future) and result.get_loop() is not runner.get_loop():
+                raise ProblemException(
+                    Problem(
+                        code="tool.loop_mismatch",
+                        title="Tool event loop mismatch",
+                        detail=(
+                            f"Tool '{tool.name}' returned a result attached to a different "
+                            "event loop."
+                        ),
+                        operation=tool.name,
+                    )
+                )
+            result = runner.run(await_value(result))
+        return result
+
+    async def _invoke_async(
+        self,
+        tool: Tool,
+        function: Callable[..., Any],
+        *args: Any,
+        operation: str = "tool callback",
+    ) -> Any:
+        """Invoke async callbacks on the owner loop and sync callbacks in bounded workers."""
+        if is_async_callable(function):
+            result = function(*args)
+        else:
+            result = await self._run_worker(function, *args, operation=operation)
+        if inspect.isawaitable(result):
+            if (
+                isinstance(result, asyncio.Future)
+                and result.get_loop() is not asyncio.get_running_loop()
+            ):
+                raise ProblemException(
+                    Problem(
+                        code="tool.loop_mismatch",
+                        title="Tool event loop mismatch",
+                        detail=(
+                            f"Tool '{tool.name}' returned a result attached to a different "
+                            "event loop."
+                        ),
+                    )
+                )
+            result = await result
+        return result
+
+    async def _run_worker(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        cancellation_event: Event | None = None,
+        operation: str = "tool callback",
+    ) -> Any:
+        """Run a sync callback with bounded admission and settle it after cancellation."""
+        if self._closed or not self._worker_slots.acquire(blocking=False):
+            raise ProblemException(
+                Problem(
+                    code="tool.dispatch_busy",
+                    title="Tool dispatch busy",
+                    detail="Synchronous tool capacity is full; retry after active work settles.",
+                )
+            )
+        call_context = contextvars.copy_context()
+        try:
+            future = asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                call_context.run,
+                function,
+                *args,
+            )
+        except Exception:
+            self._worker_slots.release()
+            raise
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if cancellation_event is not None:
+                cancellation_event.set()
+            settled = asyncio.create_task(asyncio.wait({future}))
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    continue
+            settled.result()
+            if not future.cancelled():
+                worker_error = future.exception()
+                if worker_error is not None and not isinstance(worker_error, ProblemException):
+                    problem = Problem.from_exception(
+                        worker_error,
+                        code="tool.callback_failed",
+                        title="Tool callback failed",
+                        detail=f"Tool callback '{operation}' failed while cancellation settled.",
+                        operation=operation,
+                    )
+                    log_problem(_LOGGER, problem, worker_error)
+            raise
+        finally:
+            self._worker_slots.release()
 
     @property
     def interaction(self) -> Interaction | None:
@@ -434,6 +769,9 @@ class ToolRegistry:
         validated, error = tool.validate_arguments(arguments)
         if error is not None:
             return error, 0
+        sync_runner = self._sync_runner() if is_async_callable(tool.function) else None
+        if is_async_callable(tool.function) and sync_runner is None:
+            return serialize_tool_problem(self._async_required(tool).problem), 0
         active_permissions = permission_manager or self._permission_manager
         plan, planning_error = self._authorized_plan(
             tool,
@@ -454,11 +792,17 @@ class ToolRegistry:
             call_id=call_id,
             permission_manager=active_permissions,
             cancellation_event=cancellation_event,
+            file_observations=file_observations,
         )
         if execution_started is not None:
             execution_started()
         started = perf_counter()
-        output = tool.call(plan.arguments, context)
+        output = tool.execute(
+            plan.arguments,
+            context,
+            async_runner=sync_runner,
+            async_runner_factory=self._sync_runner,
+        ).output
         return self._model_result(
             output,
             instructions_manager,
@@ -581,11 +925,47 @@ class ToolRegistry:
             call_id=call_id,
             permission_manager=active_permissions,
             cancellation_event=cancellation_event,
+            file_observations=file_observations,
         )
         if execution_started is not None:
             execution_started()
         started = perf_counter()
-        output = await tool.call_async(plan.arguments, context)
+        worker_context = None
+        active_context = context
+        if not is_async_callable(tool.function):
+            portal = ToolExecutionPortal(asyncio.get_running_loop())
+            worker_context = self._worker_context(
+                context,
+                portal,
+                lambda dynamic_arguments: self._authorized_plan_additional_async(
+                    tool,
+                    dynamic_arguments,
+                    interaction,
+                    active_permissions,
+                    instructions_manager,
+                    file_observations,
+                ),
+            )
+            active_context = worker_context
+        try:
+
+            async def dispatch_sync(invoke: Callable[[], Any]) -> Any:
+                return await self._run_worker(
+                    invoke,
+                    cancellation_event=active_context.cancellation_event,
+                    operation=tool.name or "tool",
+                )
+
+            result = await tool.execute_async(
+                plan.arguments,
+                active_context,
+                sync_dispatch=dispatch_sync,
+            )
+        finally:
+            if worker_context is not None:
+                context.file_versions.update(worker_context.file_versions)
+                context.read_versions.update(worker_context.read_versions)
+        output = result.output
         return self._model_result(
             output,
             instructions_manager,
@@ -654,7 +1034,12 @@ class ToolRegistry:
             prerequisite_operations=plan.prerequisite_operations,
             permission_manager=(self._permission_manager if tool.execution_authorization else None),
         )
-        result = tool.execute(plan.arguments, context)
+        result = tool.execute(
+            plan.arguments,
+            context,
+            async_runner=(self._sync_runner() if is_async_callable(tool.function) else None),
+            async_runner_factory=self._sync_runner,
+        )
         return ToolExecutionResult(
             self._model_result(result.output, instructions_manager, tool, context),
             result.presentation,
@@ -700,6 +1085,25 @@ class ToolRegistry:
             }
         return output if value == prepared else json.dumps(prepared, ensure_ascii=False)
 
+    def _plan_sync(self, tool: Tool, arguments: dict[str, object]) -> OperationPlan:
+        """Run and normalize one planner through the synchronous host policy."""
+        if tool.operation_planner is None:
+            return tool.plan(arguments)
+        planned = self._invoke_sync(tool, tool.operation_planner, copy.deepcopy(arguments))
+        return tool.normalize_plan(planned)
+
+    async def _plan_async(self, tool: Tool, arguments: dict[str, object]) -> OperationPlan:
+        """Run and normalize one planner through async or bounded-worker dispatch."""
+        if tool.operation_planner is None:
+            return tool.plan(arguments)
+        planned = await self._invoke_async(
+            tool,
+            tool.operation_planner,
+            copy.deepcopy(arguments),
+            operation=tool.name or "tool planner",
+        )
+        return tool.normalize_plan(planned)
+
     def _authorized_plan(
         self,
         tool: Tool,
@@ -713,7 +1117,7 @@ class ToolRegistry:
         try:
             if instructions_manager is not None:
                 arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
-            plan = tool.plan(arguments)
+            plan = self._plan_sync(tool, arguments)
             prerequisites = ()
             while True:
                 boundary_denial = permission_manager.check_boundaries(plan.boundary_operations)
@@ -752,7 +1156,7 @@ class ToolRegistry:
                         }
                     ), None
                 prerequisites += plan.operations
-                plan = tool.normalize_plan(plan.continuation())
+                plan = tool.normalize_plan(self._invoke_sync(tool, plan.continuation))
         except ProblemException as exc:
             return None, serialize_tool_problem(exc.problem)
         except (OSError, ValueError) as exc:
@@ -773,7 +1177,7 @@ class ToolRegistry:
         try:
             if instructions_manager is not None:
                 arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
-            plan = tool.plan(arguments)
+            plan = await self._plan_async(tool, arguments)
             prerequisites = ()
             while True:
                 boundary_denial = permission_manager.check_boundaries(plan.boundary_operations)
@@ -812,7 +1216,13 @@ class ToolRegistry:
                         }
                     ), None
                 prerequisites += plan.operations
-                plan = tool.normalize_plan(plan.continuation())
+                plan = tool.normalize_plan(
+                    await self._invoke_async(
+                        tool,
+                        plan.continuation,
+                        operation=tool.name or "tool continuation",
+                    )
+                )
         except ProblemException as exc:
             return None, serialize_tool_problem(exc.problem)
         except (OSError, ValueError) as exc:
@@ -848,11 +1258,11 @@ class ToolRegistry:
         try:
             if instructions_manager is not None:
                 arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
-            plan = tool.plan(arguments)
+            plan = self._plan_sync(tool, arguments)
             prerequisites = ()
             while plan.continuation is not None:
                 prerequisites += plan.operations
-                plan = tool.normalize_plan(plan.continuation())
+                plan = tool.normalize_plan(self._invoke_sync(tool, plan.continuation))
             return plan.model_copy(
                 update={"prerequisite_operations": prerequisites + plan.prerequisite_operations}
             ), None
@@ -862,6 +1272,110 @@ class ToolRegistry:
             return None, self._problem(
                 "tool.planning_failed", "Tool planning failed", str(exc), tool.name or "tool"
             )
+
+    def _authorized_plan_additional(
+        self,
+        tool: Tool,
+        arguments: dict[str, object],
+        interaction: Interaction | None,
+        permission_manager: PermissionManager,
+        instructions_manager: InstructionsManager | None,
+        file_observations: FileObservations | None,
+    ) -> OperationPlan:
+        """Authorize runtime-discovered effects through the regular sync policy path."""
+        plan, error = self._authorized_plan(
+            tool,
+            arguments,
+            interaction,
+            permission_manager,
+            instructions_manager,
+            file_observations,
+        )
+        if error is not None:
+            raise ProblemException(self._additional_problem_from_output(error, tool))
+        return cast(OperationPlan, plan)
+
+    async def _authorized_plan_additional_async(
+        self,
+        tool: Tool,
+        arguments: dict[str, object],
+        interaction: Interaction | None,
+        permission_manager: PermissionManager,
+        instructions_manager: InstructionsManager | None,
+        file_observations: FileObservations | None,
+    ) -> OperationPlan:
+        """Authorize runtime-discovered effects through the regular async policy path."""
+        plan, error = await self._authorized_plan_async(
+            tool,
+            arguments,
+            interaction,
+            permission_manager,
+            instructions_manager,
+            file_observations,
+        )
+        if error is not None:
+            raise ProblemException(self._additional_problem_from_output(error, tool))
+        return cast(OperationPlan, plan)
+
+    @staticmethod
+    def _problem_from_output(output: str) -> Problem:
+        """Recover a structured problem from an already-serialized planning failure."""
+        return Problem.model_validate(json.loads(output)["problem"])
+
+    @classmethod
+    def _additional_problem_from_output(cls, output: str, tool: Tool) -> Problem:
+        """Retain the additional-operation error contract after full policy revalidation."""
+        problem = cls._problem_from_output(output)
+        if problem.code != "tool.denied":
+            return problem
+        reason = problem.detail.partition(": ")[2] or problem.detail
+        return problem.model_copy(
+            update={
+                "title": "Additional operation denied",
+                "detail": f"Tool '{tool.name}' stopped: {reason}",
+            }
+        )
+
+    @staticmethod
+    def _worker_context(
+        context: ToolContext,
+        portal: ToolExecutionPortal,
+        additional_authorizer: (Callable[[dict[str, object]], Awaitable[OperationPlan]] | None),
+    ) -> ToolContext:
+        """Give a worker detached values and owner-thread proxies for session services."""
+        return ToolContext(
+            interaction=(
+                ToolOwnerServiceProxy(context.interaction, portal)
+                if context.interaction is not None
+                else None
+            ),
+            tool_name=context.tool_name,
+            instructions_manager=(
+                ToolOwnerServiceProxy(context.instructions_manager, portal)
+                if context.instructions_manager is not None
+                else None
+            ),
+            operations=copy.deepcopy(context.operations),
+            prerequisite_operations=copy.deepcopy(context.prerequisite_operations),
+            call_id=context.call_id,
+            additional_authorizer=(
+                lambda arguments: (
+                    portal.call(additional_authorizer, copy.deepcopy(arguments))
+                    if additional_authorizer is not None
+                    else None
+                )
+            ),
+            settings=copy.deepcopy(context.settings),
+            permission_manager=(
+                ToolOwnerServiceProxy(context.permission_manager, portal)
+                if context.permission_manager is not None
+                else None
+            ),
+            execution_service=context.execution_service,
+            file_versions={},
+            read_versions={},
+            cancellation_event=context.cancellation_event,
+        )
 
     def _authorize(
         self,
@@ -970,6 +1484,7 @@ class ToolRegistry:
         call_id: str | None = None,
         permission_manager: PermissionManager | None = None,
         cancellation_event: Event | None = None,
+        file_observations: FileObservations | None = None,
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""
         if interaction is None:
@@ -977,29 +1492,14 @@ class ToolRegistry:
 
         def authorize_additional(arguments: dict[str, object]) -> OperationPlan:
             """Plan and authorize one runtime-discovered operation set."""
-            if permission_manager is None:  # pragma: no cover - callback is omitted below.
-                raise RuntimeError("Additional authorization is unavailable.")
-            plan = tool.plan(arguments)
-            result = permission_manager.authorize(
-                plan.operations,
-                interaction=interaction,
-                protected_instruction_names=(
-                    instructions_manager.agents_filenames
-                    if instructions_manager is not None
-                    else ()
-                ),
+            return self._authorized_plan_additional(
+                tool,
+                arguments,
+                interaction,
+                permission_manager,
+                instructions_manager,
+                file_observations,
             )
-            if result.decision is Decision.DENY:
-                raise ProblemException(
-                    Problem(
-                        code="tool.denied",
-                        title="Additional operation denied",
-                        detail=f"Tool '{tool.name}' stopped: {result.reason}",
-                        severity="warning",
-                        operation=tool.name,
-                    )
-                )
-            return plan
 
         return ToolContext(
             interaction=interaction,

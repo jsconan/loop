@@ -72,7 +72,7 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
         self,
         function: Callable[..., Any],
         *args: Any,
-        kind=EVENT_PROMPT,
+        kind=EVENT_OUTPUT,
         **kwargs: Any,
     ) -> Any:
         """Request input through the controller's correlated async interaction channel."""
@@ -171,13 +171,13 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
         self,
         message: str | None = None,
         completer: Completer | None = None,
-        exit_commands: str | Iterable[str] | None = constants.OMIT,
+        exit_commands: str | Iterable[str] | None | constants.Omit = constants.OMIT,
         choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
         index: Iterable[str] | Mapping[object, str] | None = None,
         default: object | None = None,
         secret: bool = False,
         initial: str | None = None,
-    ) -> object | bool:
+    ) -> object | False:
         """Read input through the UI owner without blocking the conversation event loop.
 
         Args:
@@ -192,7 +192,7 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
             initial (str | None): Initial editor text. Defaults to ``None``.
 
         Returns:
-            object | bool: Selected value or text, or ``False`` when input requests exit.
+            object | False: Selected value or text, or ``False`` when input requests exit.
 
         Raises:
             ValueError: If the prompt choices or completion options are invalid.

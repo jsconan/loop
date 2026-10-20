@@ -266,6 +266,31 @@ def test_call_rejects_coroutine_functions_in_sync_dispatch(monkeypatch):
     assert failure["problem"]["code"] == "tool.async_required"
 
 
+def test_execute_rejects_awaitables_without_a_close_method_inside_a_loop():
+    """Synchronous execution safely rejects non-closeable awaitables in an active loop."""
+
+    runner = asyncio.Runner()
+
+    async def exercise():
+        future = asyncio.get_running_loop().create_future()
+        direct = make_tool(lambda number: future).execute({"number": 3})
+
+        async def calculate(number: int) -> int:
+            return number
+
+        async_tool = make_tool(calculate).execute({"number": 3}, async_runner=runner)
+        future.cancel()
+        return json.loads(direct.output), json.loads(async_tool.output)
+
+    try:
+        direct, async_tool = asyncio.run(exercise())
+    finally:
+        runner.close()
+
+    assert direct["problem"]["code"] == "tool.async_required"
+    assert async_tool["problem"]["code"] == "tool.async_required"
+
+
 def test_call_serializes_execution_failures(monkeypatch):
     """Synchronous application failures become model-readable execution errors."""
     function = Mock(side_effect=RuntimeError("boom"))

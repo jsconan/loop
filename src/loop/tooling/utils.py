@@ -13,18 +13,6 @@ from .context import ToolContext
 from .models import ToolRegistrationError
 
 
-def is_async_callable(function: Callable[..., Any]) -> bool:
-    """Return whether invoking a function or callable object produces a coroutine directly.
-
-    Args:
-        function (Callable[..., Any]): Callable whose implementation should be inspected.
-
-    Returns:
-        bool: Whether the callable is implemented as a coroutine function.
-    """
-    return inspect.iscoroutinefunction(function) or inspect.iscoroutinefunction(function.__call__)
-
-
 def get_tool_description(function: Callable[..., Any]) -> str:
     """Return the summary paragraph from a function's docstring.
 
