@@ -1,5 +1,6 @@
 """Run an interactive conversation with an LLM backend."""
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -567,14 +568,24 @@ class Loop:
                 dispatch. Defaults to synchronous interaction prompts.
 
         Raises:
+            RuntimeError: If called from an active event loop.
             TypeError: If an agent run or recovered run has no completion metrics.
             KeyboardInterrupt: If the configured stop signal interrupts agent execution.
             WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
-            CancelledError: If the caller cancels the async conversation task.
 
         Returns:
             None: After the conversation has ended.
         """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "Synchronous Loop.run() cannot run inside an event loop; "
+                "await Loop.run_async() instead."
+            )
+
         recovery_pending = self._recover_session()
         while not self._command_manager.exit_requested:
             user_input = (

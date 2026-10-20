@@ -1,5 +1,6 @@
 """Run the interactive loop application composition root."""
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -20,8 +21,29 @@ from .workspace import (
 _LOGGER = logging.getLogger(__name__)
 
 
-def main() -> None:  # pylint: disable=too-many-branches
-    """Run an interactive conversation with an LLM backend."""
+def run_application() -> None:  # pylint: disable=too-many-branches
+    """Run the asynchronous CLI application as the process entry point.
+
+    Raises:
+        RuntimeError: If called while another event loop is running in this thread.
+
+    Returns:
+        None: After the interactive application exits.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError(
+            "CLI run_application() cannot run inside an event loop; "
+            "await run_application_async() instead."
+        )
+    asyncio.run(run_application_async())
+
+
+async def run_application_async() -> None:  # pylint: disable=too-many-branches
+    """Compose, run, and release each active workspace runtime."""
     interaction = None
     runtime = None
     try:
@@ -36,7 +58,7 @@ def main() -> None:  # pylint: disable=too-many-branches
             if runtime is None:
                 runtime = _build_runtime(workspace, paths, repository, interaction)
             try:
-                runtime.run()
+                await runtime.run_async()
             except WorkspaceSwitchRequested as request:
                 previous = workspace
                 try:
@@ -109,4 +131,4 @@ def _build_runtime(
 
 
 if __name__ == "__main__":
-    main()
+    run_application()

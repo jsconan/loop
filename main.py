@@ -1,6 +1,6 @@
 """Delegate the repository entry point to the installed package."""
 
-from loop.main import main
+from loop.main import run_application
 
 if __name__ == "__main__":
-    main()
+    run_application()

@@ -38,7 +38,7 @@ classifiers = [
 "Bug Tracker" = "https://github.com/jsconan/loop/issues"
 
 [project.scripts]
-loop = "loop.main:main"
+loop = "loop.main:run_application"
 
 [project.optional-dependencies]
 tools = [

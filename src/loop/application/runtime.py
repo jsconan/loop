@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Callable, Mapping
 from types import TracebackType
@@ -266,22 +265,15 @@ class ApplicationRuntime:
         self.close()
 
     def run(self) -> None:
-        """Run the composed loop with responsive input when the UI supports it.
+        """Run the composed loop through its native synchronous path.
 
         Raises:
-            RuntimeError: If a mailbox controller is reused or an event loop is already running.
-            BaseException: If the conversation or UI fails after owned execution settles.
+            RuntimeError: If called from an active event loop.
+            TypeError: If an agent run completes without metrics.
+            KeyboardInterrupt: If the configured stop signal interrupts execution.
+            WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
         """
-        if self._session_controller is None:
-            self._loop.run()
-        else:
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-            else:
-                raise RuntimeError("Synchronous runtime.run() cannot run inside an event loop.")
-            asyncio.run(self.run_async())
+        self._loop.run()
 
     async def run_async(self) -> None:
         """Run the composed application through its async loop and session controller.

@@ -536,7 +536,7 @@ def test_context_close_releases_real_sqlite_connection_without_resource_warning(
 
 
 def test_async_runtime_binds_all_services_to_its_controller(dependencies, assembled, monkeypatch):
-    """Async UIs use one mailbox and stop control across the complete service graph."""
+    """The async runtime uses one mailbox and stop control across the complete service graph."""
     workspace, paths, workspace_paths, settings = assembled
     source = MagicMock(spec=ConsoleInteraction)
     controller = Mock()
@@ -563,7 +563,7 @@ def test_async_runtime_binds_all_services_to_its_controller(dependencies, assemb
     active = dependencies["Loop"].create_default.return_value
     active.run_async = AsyncMock()
     try:
-        runtime.run()
+        asyncio.run(runtime.run_async())
         runtime.stop()
     finally:
         runtime.close()
@@ -597,19 +597,16 @@ def test_runtime_refuses_to_close_services_while_execution_is_active():
     resource.assert_called_once_with()
 
 
-def test_runtime_rejects_nested_event_loops_before_creating_a_conversation_coroutine():
-    """An invalid synchronous entry point cannot leak an unawaited controller coroutine."""
+def test_sync_runtime_keeps_its_native_path_when_a_controller_is_bound():
+    """The synchronous runtime never routes the loop through its async controller."""
+    loop = Mock()
     controller = Mock(running=False)
-    controller.run = AsyncMock()
     runtime = ApplicationRuntime(
-        Mock(), Mock(), 1, cleanup_callbacks=[], session_controller=controller
+        loop, Mock(), 1, cleanup_callbacks=[], session_controller=controller
     )
 
-    async def scenario():
-        """Attempt the synchronous wrapper from an already running event loop."""
-        with pytest.raises(RuntimeError, match="cannot run inside an event loop"):
-            runtime.run()
+    runtime.run()
 
-    asyncio.run(scenario())
     runtime.close()
-    controller.run.assert_not_called()
+    loop.run.assert_called_once_with()
+    controller.run_async.assert_not_called()

@@ -125,6 +125,22 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.model == "requested-model"
 
 
+def test_sync_loop_run_rejects_an_active_event_loop(tmp_path):
+    """The native synchronous loop fails clearly instead of blocking an async caller."""
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=output_interaction(),
+        working_directory=tmp_path,
+    )
+
+    async def scenario():
+        """Attempt synchronous execution while this test owns an event loop."""
+        with pytest.raises(RuntimeError, match="cannot run inside an event loop"):
+            loop.run()
+
+    asyncio.run(scenario())
+
+
 def test_runtime_command_providers_keep_contextual_completion_in_the_active_loop(tmp_path):
     """Runtime and built-in command providers retain values in the active completer."""
     interaction = output_interaction()
