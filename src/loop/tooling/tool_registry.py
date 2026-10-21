@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
-from threading import BoundedSemaphore, Event, get_ident
+from threading import BoundedSemaphore, Event, Lock, get_ident
 from time import perf_counter
 from typing import Any, cast
 
@@ -236,8 +236,8 @@ class ToolRegistry:
 
     Synchronous handlers in async dispatch use bounded registry workers and receive relays for
     owner-thread services. Native async handlers run on the caller's loop. Synchronous calls may
-    reuse a registry-owned runner for async handlers when called outside a running loop; ``close``
-    settles workers and releases the runner and execution service.
+    reuse a registry-owned runner for async handlers on its first caller thread when outside a
+    running loop; ``close`` settles workers and releases the runner and execution service.
 
     Args:
         tools (Iterable[Callable[..., Any] | ToolRegistration] | None): Functions or configured
@@ -261,6 +261,8 @@ class ToolRegistry:
     _settings: ToolRuntimeSettings
     _execution_service: CommandExecutionService | None
     _async_runner: asyncio.Runner | None
+    _runner_thread: int | None
+    _runner_lock: Lock
     _executor: ThreadPoolExecutor
     _worker_slots: BoundedSemaphore
     _closed: bool
@@ -280,6 +282,8 @@ class ToolRegistry:
         self._settings = settings or ToolRuntimeSettings()
         self._execution_service = execution_service
         self._async_runner = None
+        self._runner_thread = None
+        self._runner_lock = Lock()
         self._executor = ThreadPoolExecutor(
             max_workers=_TOOL_WORKER_COUNT,
             thread_name_prefix="loop-tool",
@@ -291,22 +295,30 @@ class ToolRegistry:
 
     def close(self) -> None:
         """Settle dispatched tools and release registry-owned execution resources."""
-        if self._closed:
-            return
+        with self._runner_lock:
+            if self._closed:
+                return
+            self._closed = True
+            async_runner = self._async_runner
         self._executor.shutdown(wait=True, cancel_futures=False)
-        if self._async_runner is not None:
-            self._async_runner.close()
+        if async_runner is not None:
+            async_runner.close()
         if self._execution_service is not None:
             self._execution_service.close()
-        self._closed = True
 
     def _sync_runner(self) -> asyncio.Runner | None:
-        """Return the registry-owned async runner when the caller owns the thread loop."""
+        """Return the registry-owned runner only to its synchronous owner thread."""
         if has_running_event_loop():
             return None
-        if self._async_runner is None:
-            self._async_runner = asyncio.Runner()
-        return self._async_runner
+        with self._runner_lock:
+            if self._closed:
+                return None
+            if self._async_runner is None:
+                self._async_runner = asyncio.Runner()
+                self._runner_thread = get_ident()
+            elif self._runner_thread != get_ident():
+                return None
+            return self._async_runner
 
     def _async_required(self, tool: Tool) -> ProblemException:
         """Build the structured error for callables that cannot use a sync host."""

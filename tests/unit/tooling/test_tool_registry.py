@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from threading import Event, get_ident
+from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -714,6 +714,71 @@ def test_sync_and_async_registry_calls_reuse_their_native_async_loops():
         assert loop_ids[2] != loop_ids[0]
     finally:
         registry.close()
+
+
+def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
+    """Concurrent sync calls use one runner and reject the non-owner safely."""
+    @declare_tool
+    async def calculate() -> str:
+        """Return a result from the registry-owned async runner."""
+        return "done"
+
+    registry = ToolRegistry([calculate])
+    runner_creation_started = Event()
+    second_call_started = Event()
+    second_runner_creation_started = Event()
+    release_runner_creation = Event()
+    created_runners = []
+    created_runners_lock = Lock()
+    results = {}
+    real_runner = asyncio.Runner
+    second_thread: Thread | None = None
+
+    def create_runner():
+        """Hold the first runner creation to expose an unsynchronized check-then-act race."""
+        with created_runners_lock:
+            runner = real_runner()
+            created_runners.append(runner)
+            first_runner = len(created_runners) == 1
+        if first_runner:
+            runner_creation_started.set()
+            assert release_runner_creation.wait(timeout=3)
+        else:
+            second_runner_creation_started.set()
+        return runner
+
+    monkeypatch.setattr(tool_registry_module.asyncio, "Runner", create_runner)
+
+    def call_tool(key: str):
+        """Record the public synchronous tool result from one caller thread."""
+        if key == "second":
+            second_call_started.set()
+        results[key] = registry.call("calculate", "{}")
+
+    first_thread = Thread(target=call_tool, args=("first",))
+    try:
+        first_thread.start()
+        assert runner_creation_started.wait(timeout=3)
+        second_thread = Thread(target=call_tool, args=("second",))
+        second_thread.start()
+        assert second_call_started.wait(timeout=3)
+        assert not second_runner_creation_started.wait(timeout=1)
+    finally:
+        release_runner_creation.set()
+        first_thread.join(timeout=3)
+        if second_thread is not None:
+            second_thread.join(timeout=3)
+        registry.close()
+
+    assert not first_thread.is_alive()
+    assert second_thread is not None and not second_thread.is_alive()
+    assert len(created_runners) == 1
+    assert result_value(results["first"]) == "done"
+    assert json.loads(results["second"])["problem"]["code"] == "tool.async_required"
+    assert json.loads(registry.call("calculate", "{}"))["problem"]["code"] == (
+        "tool.async_required"
+    )
+    assert len(created_runners) == 1
 
 
 def test_sync_dispatch_rejects_async_tools_inside_a_running_loop():
