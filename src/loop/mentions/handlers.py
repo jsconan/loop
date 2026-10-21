@@ -210,6 +210,7 @@ class ProjectPathMentionHandler(MentionHandler):
 
         Raises:
             OSError: The project path listing cannot be read.
+            RuntimeError: Bounded worker admission is full or unavailable.
             asyncio.CancelledError: The awaiting task is cancelled.
         """
         values = await self._completion_adapter.values_async()
@@ -255,6 +256,7 @@ class ProjectPathMentionHandler(MentionHandler):
             OSError: Referenced content cannot be read.
             UnicodeError: Referenced content is not valid UTF-8.
             ValueError: A path is unavailable, unsafe, unsupported, or exceeds the budget.
+            RuntimeError: Bounded worker admission is full or unavailable.
             asyncio.CancelledError: The awaiting task is cancelled.
         """
         return await self._resolve_paths_async(values, ignore_invalid=False)
@@ -272,6 +274,7 @@ class ProjectPathMentionHandler(MentionHandler):
             tuple[ContextReference, ...]: Snapshots for destinations that resolve safely.
 
         Raises:
+            RuntimeError: Bounded worker admission is full or unavailable.
             asyncio.CancelledError: The awaiting task is cancelled.
         """
         return await self._resolve_paths_async(values, ignore_invalid=True)
@@ -283,7 +286,7 @@ class ProjectPathMentionHandler(MentionHandler):
         ignore_invalid: bool,
     ) -> tuple[ContextReference, ...]:
         """Resolve unique paths under one shared attachment budget."""
-        root = self._working_directory.resolve()
+        root = self._working_directory.get()
         sources = self._read_mentioned_paths(root, tuple(values), ignore_invalid)
         return self._build_references(sources, ignore_invalid=ignore_invalid)
 
@@ -294,7 +297,7 @@ class ProjectPathMentionHandler(MentionHandler):
         ignore_invalid: bool,
     ) -> tuple[ContextReference, ...]:
         """Read with a detached root and build returned references on the owner."""
-        root = self._working_directory.resolve()
+        root = self._working_directory.get()
         sources = await (
             self._async_blocking_runner(
                 self._read_mentioned_paths,
@@ -310,6 +313,8 @@ class ProjectPathMentionHandler(MentionHandler):
                 ignore_invalid,
             )
         )
+        if self._working_directory.get() != root:
+            raise ValueError("Working directory changed while resolving mentioned paths.")
         return self._build_references(sources, ignore_invalid=ignore_invalid)
 
     @staticmethod
@@ -319,6 +324,7 @@ class ProjectPathMentionHandler(MentionHandler):
         ignore_invalid: bool,
     ) -> tuple[tuple[ContextReferenceKind, str, str | bytes], ...]:
         """Read bounded path snapshots using only detached inputs."""
+        root = root.resolve()
         sources = []
         resolved_paths = set()
         for value in dict.fromkeys(values):

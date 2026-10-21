@@ -2,6 +2,7 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import get_ident
 from unittest.mock import Mock
 
@@ -60,6 +61,14 @@ def test_async_project_path_completion_reads_on_a_worker_and_updates_cache_on_ow
     source.write_text("", encoding="utf-8")
     adapter = ProjectPathCompletionAdapter("@", PathHolder(tmp_path))
     workers = []
+    root_workers = []
+    original_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        """Record where the project root is canonicalized."""
+        if path == tmp_path:
+            root_workers.append(get_ident())
+        return original_resolve(path, *args, **kwargs)
 
     def discover(root, *, recursive):
         """Record where path enumeration runs and return one visible file."""
@@ -69,12 +78,14 @@ def test_async_project_path_completion_reads_on_a_worker_and_updates_cache_on_ow
         return [source]
 
     monkeypatch.setattr("loop.completion.adapters.project_path.iter_visible_paths", discover)
+    monkeypatch.setattr(Path, "resolve", resolve)
     owner = get_ident()
 
     values = asyncio.run(adapter.values_async())
 
     assert [(item.value, item.description) for item in values] == [("source.py", "file")]
     assert workers and workers[0] != owner
+    assert root_workers and root_workers[0] != owner
     assert asyncio.run(adapter.values_async()) == values
     assert adapter.values() == values
     assert len(workers) == 1
@@ -101,6 +112,37 @@ def test_project_path_completion_uses_injected_bounded_ui_worker(tmp_path):
     assert calls[0][1] == (tmp_path,)
 
 
+@pytest.mark.parametrize("switch_on", [1, 2])
+def test_async_project_path_completion_discards_results_after_root_change(tmp_path, switch_on):
+    """A root switch during async completion cannot publish old-workspace paths."""
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    (old_root / "old.py").write_text("", encoding="utf-8")
+    (new_root / "new.py").write_text("", encoding="utf-8")
+    directory = PathHolder(old_root)
+    calls = 0
+
+    async def run_blocking(function, *args):
+        """Run one operation and switch roots before its result returns to the owner."""
+        nonlocal calls
+        result = function(*args)
+        calls += 1
+        if calls == switch_on:
+            directory.set(new_root)
+        return result
+
+    adapter = ProjectPathCompletionAdapter(
+        "@",
+        directory,
+        async_blocking_runner=run_blocking,
+    )
+
+    assert asyncio.run(adapter.values_async()) == ()
+    assert [value.value for value in asyncio.run(adapter.values_async())] == ["new.py"]
+
+
 def test_async_project_path_completion_uses_injected_bounded_worker(tmp_path):
     """Async path completion delegates traversal to the configured application worker."""
     (tmp_path / "source.py").write_text("", encoding="utf-8")
@@ -124,5 +166,6 @@ def test_async_project_path_completion_uses_injected_bounded_worker(tmp_path):
         executor.shutdown(wait=True)
 
     assert [value.value for value in values] == ["source.py"]
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0][1] == (tmp_path,)
+    assert calls[1][1] == (tmp_path,)

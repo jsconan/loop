@@ -76,7 +76,9 @@ def test_async_project_path_resolution_reads_on_a_worker_and_preserves_snapshot(
     source.write_text("review me", encoding="utf-8")
     handler = ProjectPathMentionHandler(PathHolder(tmp_path))
     original_read_bytes = Path.read_bytes
+    original_resolve = Path.resolve
     worker_threads = []
+    root_threads = []
 
     def read_bytes(path):
         """Record the thread that performs the detached filesystem read."""
@@ -84,7 +86,14 @@ def test_async_project_path_resolution_reads_on_a_worker_and_preserves_snapshot(
             worker_threads.append(get_ident())
         return original_read_bytes(path)
 
+    def resolve(path, *args, **kwargs):
+        """Record where the detached workspace root is canonicalized."""
+        if path == tmp_path:
+            root_threads.append(get_ident())
+        return original_resolve(path, *args, **kwargs)
+
     monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(Path, "resolve", resolve)
     owner = get_ident()
 
     references = asyncio.run(handler.resolve_async(("source.txt",)))
@@ -93,7 +102,32 @@ def test_async_project_path_resolution_reads_on_a_worker_and_preserves_snapshot(
     assert references[0].content == "review me"
     assert references[0].path == "source.txt"
     assert worker_threads and worker_threads[0] != owner
+    assert root_threads and root_threads[0] != owner
     assert asyncio.run(handler.resolve_optional_async(("missing.txt",))) == ()
+
+
+def test_async_project_path_resolution_rejects_results_after_root_change(tmp_path):
+    """A workspace change while reading cannot return references from the previous root."""
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    (old_root / "source.txt").write_text("old", encoding="utf-8")
+    directory = PathHolder(old_root)
+
+    async def switch_root_after_read(function, *args):
+        """Finish the detached read, then replace the active workspace root."""
+        result = function(*args)
+        directory.set(new_root)
+        return result
+
+    handler = ProjectPathMentionHandler(
+        directory,
+        async_blocking_runner=switch_root_after_read,
+    )
+
+    with pytest.raises(ValueError, match="Working directory changed"):
+        asyncio.run(handler.resolve_async(("source.txt",)))
 
 
 def test_async_project_path_resolution_uses_injected_bounded_worker(tmp_path):

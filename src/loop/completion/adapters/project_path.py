@@ -77,16 +77,24 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         return values
 
     async def values_async(self) -> tuple[CompletionValue, ...]:
-        """Return visible paths while doing uncached filesystem traversal in a worker.
+        """Resolve and list visible paths through the bounded worker.
 
         Returns:
             tuple[CompletionValue, ...]: Cached or newly discovered project-relative paths.
 
         Raises:
             OSError: The project path listing cannot be read.
+            RuntimeError: Bounded worker admission is full or unavailable.
             asyncio.CancelledError: The awaiting task is cancelled.
         """
-        root = self._working_directory.resolve()
+        root_source = self._working_directory.get()
+        root = await (
+            self._async_blocking_runner(Path.resolve, root_source)
+            if self._async_blocking_runner is not None
+            else run_in_worker(Path.resolve, root_source)
+        )
+        if self._working_directory.get() != root_source:
+            return ()
         now = time.monotonic()
         if root == self._cached_root and now < self._cached_until:
             return self._cached_values
@@ -95,6 +103,8 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
             if self._async_blocking_runner is not None
             else run_in_worker(self._discover_values, root)
         )
+        if self._working_directory.get() != root_source:
+            return ()
         self._cached_root = root
         self._cached_until = time.monotonic() + self._cache_ttl
         self._cached_values = values
