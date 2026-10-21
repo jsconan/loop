@@ -103,7 +103,8 @@ def run_command(
         str | list[str] | None,
         Field(
             description="Optional opaque grant_reference values from resolve_executable "
-            "for installations outside the automatically verified managed toolchains. "
+            "for installations outside the automatically verified managed toolchains; "
+            "omit the field when no reference was returned. "
             "Each reference binds installed-tool read access inside the sandbox."
         ),
     ] = None,

@@ -678,11 +678,10 @@ class CommandExecutionService:
                 context.instructions_manager.virtual_paths if context.instructions_manager else None
             )
             path_value = os.environ.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH)
-            explicit_references = (
-                (executable_grant,)
-                if isinstance(executable_grant, str)
-                else tuple(executable_grant or ())
-            )
+            if isinstance(executable_grant, str):
+                explicit_references = (executable_grant,) if executable_grant else ()
+            else:
+                explicit_references = tuple(executable_grant or ())
             references = tuple(
                 dict.fromkeys(
                     (

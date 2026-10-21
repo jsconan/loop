@@ -119,6 +119,35 @@ def test_public_command_budget_starts_after_sandbox_approval(tmp_path, monkeypat
     host.run_host_command.assert_not_called()
 
 
+def test_empty_executable_grant_does_not_block_sandbox_execution(tmp_path):
+    """Treat an empty optional tool reference as absent without granting host reads."""
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    service = CommandExecutionService(backend, Mock())
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", ":"),
+            cwd=str(tmp_path),
+            boundary=ProcessBoundary.SANDBOXED,
+        ),
+    )
+    context = ToolContext(
+        None,
+        "run_command",
+        operations=(operation,),
+        permission_manager=PermissionManager(tmp_path),
+    )
+
+    result = service.run_command(context, ":", executable_grant="")
+
+    assert result["boundary"] == "sandbox"
+    request = backend.run.call_args.args[0]
+    assert request.read_roots == ()
+    backend.run.assert_called_once()
+
+
 def test_execution_service_closes_optional_backend_lifecycle():
     """The facade forwards teardown only when its backend exposes close."""
     backend = Mock()
