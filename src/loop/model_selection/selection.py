@@ -340,6 +340,19 @@ class ModelSelection:
         """
         self._session_manager.assignment = self.assignment
 
+    async def synchronize_session_async(self) -> None:
+        """Synchronize the active session using native asynchronous model metadata.
+
+        Returns:
+            None: The active session assignment is synchronized.
+
+        Raises:
+            ModelSelectionError: If neither the selection nor backend defines a model.
+            BackendError: If context metadata cannot be retrieved from the backend.
+            asyncio.CancelledError: If the backend metadata request is cancelled.
+        """
+        self._session_manager.assignment = await self._get_assignment_async(self.effective)
+
     def select_fallback(self, interaction: Interaction) -> bool:
         """Let the user replace a model rejected by the backend.
 

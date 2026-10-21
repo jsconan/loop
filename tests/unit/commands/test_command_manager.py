@@ -520,6 +520,85 @@ def test_handle_user_command_async_dispatches_sync_callbacks_to_workers():
     assert observed[0][2] != owner_thread
 
 
+def test_sync_blocking_operation_runs_on_the_bounded_worker():
+    """Synchronous UI filesystem work uses the command manager's worker pool."""
+    manager = CommandManager()
+    owner_thread = get_ident()
+
+    worker_thread, value = manager.run_blocking_sync(lambda: (get_ident(), "visible"))
+
+    assert worker_thread != owner_thread
+    assert value == "visible"
+
+
+def test_sync_blocking_operation_rejects_event_loop_and_closed_manager():
+    """Synchronous UI work fails clearly on an event loop or after manager shutdown."""
+    manager = CommandManager()
+
+    async def reject_event_loop():
+        """Reject blocking completion while an event loop is active."""
+        with pytest.raises(ProblemException) as captured:
+            manager.run_blocking_sync(lambda: None)
+        assert captured.value.problem.code == "command.async_required"
+
+    asyncio.run(reject_event_loop())
+    manager.close()
+
+    with pytest.raises(ProblemException) as captured:
+        manager.run_blocking_sync(lambda: None)
+    assert captured.value.problem.code == "command.dispatch_busy"
+
+
+def test_sync_blocking_operation_reuses_existing_worker_and_releases_failed_admission(
+    monkeypatch,
+):
+    """Nested work stays in its worker and submission failures release bounded capacity."""
+    manager = CommandManager()
+    worker_thread = asyncio.run(manager.run_blocking(manager.run_blocking_sync, get_ident))
+    assert worker_thread != get_ident()
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            module.ThreadPoolExecutor, "submit", Mock(side_effect=RuntimeError("submit"))
+        )
+        with pytest.raises(RuntimeError, match="submit"):
+            manager.run_blocking_sync(lambda: None)
+
+    assert manager.run_blocking_sync(lambda: "available") == "available"
+
+
+def test_sync_blocking_operation_from_another_manager_uses_its_own_worker():
+    """A different command manager does not mistake another pool's worker for its own."""
+    first = CommandManager()
+    second = CommandManager()
+
+    def invoke_second_manager():
+        """Call the second manager while executing on the first manager's worker."""
+        first_worker = get_ident()
+        second_worker = second.run_blocking_sync(get_ident)
+        return first_worker, second_worker
+
+    try:
+        first_worker, second_worker = asyncio.run(first.run_blocking(invoke_second_manager))
+    finally:
+        first.close()
+        second.close()
+
+    assert first_worker != second_worker
+
+
+def test_sync_blocking_operation_reports_worker_failures():
+    """Synchronous bounded work propagates its original operation error."""
+    manager = CommandManager()
+
+    def fail():
+        """Raise a specific failure from the worker."""
+        raise ValueError("completion failed")
+
+    with pytest.raises(ValueError, match="completion failed"):
+        manager.run_blocking_sync(fail)
+
+
 def test_async_command_context_requires_a_manager_for_sync_leaf_work():
     """An unowned async context refuses to run synchronous work on its event loop."""
     context = CommandContext(

@@ -2,9 +2,10 @@
 
 import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from mimetypes import guess_type
 from pathlib import Path
+from typing import Any
 
 from .. import constants
 from ..completion import (
@@ -137,16 +138,34 @@ class ProjectPathMentionHandler(MentionHandler):
     Args:
         working_directory (PathReference): Current project-directory reference.
         marker (str): Marker introducing project paths. Defaults to ``@``.
+        sync_blocking_runner (Callable[..., Any] | None): Bounded worker for synchronous UI
+            completion. Defaults to direct traversal for standalone handlers.
+        async_blocking_runner (Callable[..., Awaitable[Any]] | None): Bounded worker for async
+            filesystem reads. Defaults to ``asyncio.to_thread``.
     """
 
     _working_directory: PathReference
     _marker: str
     _completion_adapter: ProjectPathCompletionAdapter
+    _async_blocking_runner: Callable[..., Awaitable[Any]] | None
 
-    def __init__(self, working_directory: PathReference, marker: str = "@") -> None:
+    def __init__(
+        self,
+        working_directory: PathReference,
+        marker: str = "@",
+        *,
+        sync_blocking_runner: Callable[..., Any] | None = None,
+        async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
+    ) -> None:
         self._working_directory = working_directory
         self._marker = marker
-        self._completion_adapter = ProjectPathCompletionAdapter(marker, working_directory)
+        self._async_blocking_runner = async_blocking_runner
+        self._completion_adapter = ProjectPathCompletionAdapter(
+            marker,
+            working_directory,
+            sync_blocking_runner=sync_blocking_runner,
+            async_blocking_runner=async_blocking_runner,
+        )
 
     @property
     def marker(self) -> str:
@@ -276,11 +295,20 @@ class ProjectPathMentionHandler(MentionHandler):
     ) -> tuple[ContextReference, ...]:
         """Read with a detached root and build returned references on the owner."""
         root = self._working_directory.resolve()
-        sources = await asyncio.to_thread(
-            self._read_mentioned_paths,
-            root,
-            tuple(values),
-            ignore_invalid,
+        sources = await (
+            self._async_blocking_runner(
+                self._read_mentioned_paths,
+                root,
+                tuple(values),
+                ignore_invalid,
+            )
+            if self._async_blocking_runner is not None
+            else asyncio.to_thread(
+                self._read_mentioned_paths,
+                root,
+                tuple(values),
+                ignore_invalid,
+            )
         )
         return self._build_references(sources, ignore_invalid=ignore_invalid)
 

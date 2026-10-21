@@ -405,7 +405,7 @@ class AgentRunner:
     async def _recover_async(self, state: SessionRecoveryState) -> AgentRunResult:
         """Continue one approved recovery plan through asynchronous operations."""
         if state.action == "finalize_run":
-            return self._record_run_result(
+            return await self._record_run_result_async(
                 final_response=None,
                 turns=0,
                 stop_reason="completed",
@@ -470,7 +470,7 @@ class AgentRunner:
                 f"Tool '{pending.call.name}' may already have run. Retry it?",
                 default=False,
             ):
-                self._persist_interrupted_tool_result(pending.call)
+                await self._persist_interrupted_tool_result_async(pending.call)
                 continue
             tools.extend(
                 await self._execute_tool_calls_async(
@@ -610,7 +610,7 @@ class AgentRunner:
                 while True:
                     response = await self._query_with_recovery_async()
                     if response is None:
-                        return self._record_run_result(
+                        return await self._record_run_result_async(
                             final_response=None,
                             turns=total_turns,
                             stop_reason="cancelled",
@@ -631,10 +631,10 @@ class AgentRunner:
                         )
                     )
                     await self._model_selection.record_response_async(response.model)
-                    self._session_manager.add_response(response)
+                    await self._session_manager.add_response_async(response)
                     if self._steering_pending():
-                        self._cancel_pending_tools()
-                        return self._record_run_result(
+                        await self._cancel_pending_tools_async()
+                        return await self._record_run_result_async(
                             final_response=response,
                             turns=total_turns,
                             stop_reason="steered",
@@ -646,8 +646,8 @@ class AgentRunner:
                     tools.extend(executions)
                     self._checkpoint()
                     if self._steering_pending():
-                        self._cancel_pending_tools()
-                        return self._record_run_result(
+                        await self._cancel_pending_tools_async()
+                        return await self._record_run_result_async(
                             final_response=response,
                             turns=total_turns,
                             stop_reason="steered",
@@ -656,7 +656,7 @@ class AgentRunner:
                             tools=tools,
                         )
                     if not executions:
-                        return self._record_run_result(
+                        return await self._record_run_result_async(
                             final_response=response,
                             turns=total_turns,
                             stop_reason="completed",
@@ -676,7 +676,7 @@ class AgentRunner:
                 self._interaction.warning(
                     f"Agent stopped after reaching the {self._max_turns}-turn safety limit."
                 )
-                return self._record_run_result(
+                return await self._record_run_result_async(
                     final_response=response,
                     turns=total_turns,
                     stop_reason="max_turns",
@@ -685,9 +685,9 @@ class AgentRunner:
                     tools=tools,
                 )
             except RunInterrupted:
-                self._cancel_pending_tools()
+                await self._cancel_pending_tools_async()
                 self._interaction.info("Run interrupted; the conversation remains open.")
-                return self._record_run_result(
+                return await self._record_run_result_async(
                     final_response=None,
                     turns=total_turns,
                     stop_reason="cancelled",
@@ -700,10 +700,10 @@ class AgentRunner:
                     self._run_control.stopped or self._run_control.interrupted
                 ):
                     raise
-                self._cancel_pending_tools()
+                await self._cancel_pending_tools_async()
                 if self._run_control.interrupted and not self._run_control.stopped:
                     self._interaction.info("Run interrupted; the conversation remains open.")
-                return self._record_run_result(
+                return await self._record_run_result_async(
                     final_response=None,
                     turns=total_turns,
                     stop_reason="cancelled",
@@ -902,13 +902,13 @@ class AgentRunner:
             },
         )
         if present:
-            self._session_manager.add_tool_call_event(tool_call.call_id)
+            await self._session_manager.add_tool_call_event_async(tool_call.call_id)
         self._interaction.tool_call(tool_call.name, tool_call.arguments)
 
-        def execution_started() -> None:
-            """Honor a stop after approval before recording the execution boundary."""
+        async def execution_started() -> None:
+            """Persist execution intent after approval and before invoking the tool."""
             self._checkpoint()
-            self._session_manager.record_tool_execution_started(tool_call.call_id)
+            await self._session_manager.record_tool_execution_started_async(tool_call.call_id)
 
         tool_result, duration = await self._agent.tools.call_with_timing_async(
             tool_call.name,
@@ -939,7 +939,7 @@ class AgentRunner:
         except json.JSONDecodeError:
             payload = None
         succeeded = isinstance(payload, dict) and payload.get("ok") is True
-        self._session_manager.add_tool_call(
+        await self._session_manager.add_tool_call_async(
             call_id=tool_call.call_id,
             output=tool_result,
             working_directory=str(instructions.working_directory or self._working_directory),
@@ -972,7 +972,48 @@ class AgentRunner:
     ) -> None:
         """Resolve one cancelled or uncertain invocation without repeating side effects."""
         instructions = self._instructions_manager
-        output = serialize_tool_problem(
+        output = self._interrupted_tool_output(call, not_started=not_started)
+        self._session_manager.add_tool_call(
+            call_id=call.call_id,
+            output=output,
+            working_directory=str(instructions.working_directory or self._working_directory),
+            active_skills=instructions.active_skill_identities,
+            succeeded=False,
+            duration_seconds=0,
+        )
+
+    async def _cancel_pending_tools_async(self) -> None:
+        """Resolve pending calls asynchronously without repeating uncertain effects."""
+        state = self._session_manager.recovery_state
+        if state is not None:
+            for pending in state.pending_calls:
+                if pending.status != "result_available":
+                    await self._persist_interrupted_tool_result_async(
+                        pending.call,
+                        not_started=pending.status == "not_started",
+                    )
+
+    async def _persist_interrupted_tool_result_async(
+        self,
+        call: ToolCall,
+        *,
+        not_started: bool = False,
+    ) -> None:
+        """Persist one cancelled or uncertain invocation through async session storage."""
+        instructions = self._instructions_manager
+        await self._session_manager.add_tool_call_async(
+            call_id=call.call_id,
+            output=self._interrupted_tool_output(call, not_started=not_started),
+            working_directory=str(instructions.working_directory or self._working_directory),
+            active_skills=instructions.active_skill_identities,
+            succeeded=False,
+            duration_seconds=0,
+        )
+
+    @staticmethod
+    def _interrupted_tool_output(call: ToolCall, *, not_started: bool) -> str:
+        """Serialize the explicit result for an interrupted or uncertain tool invocation."""
+        return serialize_tool_problem(
             Problem(
                 code="tool.execution_interrupted",
                 title="Tool execution interrupted",
@@ -987,14 +1028,6 @@ class AgentRunner:
                 severity="warning",
                 operation=call.name,
             )
-        )
-        self._session_manager.add_tool_call(
-            call_id=call.call_id,
-            output=output,
-            working_directory=str(instructions.working_directory or self._working_directory),
-            active_skills=instructions.active_skill_identities,
-            succeeded=False,
-            duration_seconds=0,
         )
 
     def query(self) -> Response:
@@ -1091,7 +1124,7 @@ class AgentRunner:
             working_directory=str(snapshot.working_directory or self._working_directory),
             active_skills=list(snapshot.active_skills),
         )
-        self._model_selection.synchronize_session()
+        await self._model_selection.synchronize_session_async()
         await self._compaction.compact_if_needed_async(snapshot)
         self._checkpoint()
         started_at = perf_counter()
@@ -1149,6 +1182,40 @@ class AgentRunner:
         tools: list[ToolExecutionMetrics],
     ) -> AgentRunResult:
         """Persist and return one completed run's aggregate operation statistics."""
+        metrics = self._build_run_metrics(calls, tools)
+        self._session_manager.record_run(stop_reason, started_at, metrics)
+        return AgentRunResult(
+            final_response=final_response,
+            turns=turns,
+            stop_reason=stop_reason,
+            metrics=metrics,
+        )
+
+    async def _record_run_result_async(
+        self,
+        final_response: Response | None,
+        turns: int,
+        stop_reason: AgentRunStopReason,
+        started_at: datetime,
+        calls: list[ModelCallMetrics],
+        tools: list[ToolExecutionMetrics],
+    ) -> AgentRunResult:
+        """Persist and return one completed run through async session storage."""
+        metrics = self._build_run_metrics(calls, tools)
+        await self._session_manager.record_run_async(stop_reason, started_at, metrics)
+        return AgentRunResult(
+            final_response=final_response,
+            turns=turns,
+            stop_reason=stop_reason,
+            metrics=metrics,
+        )
+
+    def _build_run_metrics(
+        self,
+        calls: list[ModelCallMetrics],
+        tools: list[ToolExecutionMetrics],
+    ) -> RunMetrics:
+        """Build aggregate run metrics from completed model and tool operations."""
         usage_values = {}
         for field in (
             "input_tokens",
@@ -1179,10 +1246,7 @@ class AgentRunner:
             context_tokens=self._session_manager.tokens,
             context_window=self._session_manager.context_window,
         )
-        self._session_manager.record_run(stop_reason, started_at, metrics)
-        return AgentRunResult(
-            final_response=final_response, turns=turns, stop_reason=stop_reason, metrics=metrics
-        )
+        return metrics
 
     def _query_with_recovery(self) -> Response | None:
         """Request one response while escalating exhausted failures to the user."""

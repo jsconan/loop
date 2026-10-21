@@ -248,6 +248,24 @@ def test_async_selection_restoration_and_response_recording_use_async_context_me
     active_backend.get_context_window.assert_not_called()
 
 
+def test_async_session_synchronization_uses_native_context_metadata():
+    """Async request preparation refreshes the selected model through its async backend API."""
+    active_backend = backend(
+        default_model=None,
+        get_context_window=Mock(return_value=2048),
+        get_context_window_async=AsyncMock(return_value=4096),
+    )
+    session_manager = SessionManager()
+    selection = ModelSelection(active_backend, session_manager, selected="selected")
+    active_backend.get_context_window.reset_mock()
+
+    asyncio.run(selection.synchronize_session_async())
+
+    active_backend.get_context_window_async.assert_awaited_once_with("selected")
+    active_backend.get_context_window.assert_not_called()
+    assert session_manager.context_window == 4096
+
+
 def test_async_selection_restoration_clears_an_unconfigured_assignment():
     """Async restoration clears session metadata when no selected or default model exists."""
     active_backend = backend(default_model=None)

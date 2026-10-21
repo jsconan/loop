@@ -71,12 +71,24 @@ def agent_runner(
     session_manager = Mock()
     model_selection = Mock()
     model_selection.record_response_async = AsyncMock()
+    model_selection.synchronize_session_async = AsyncMock()
+    for async_name, sync_name in (
+        ("add_response_async", "add_response"),
+        ("add_tool_call_async", "add_tool_call"),
+        ("add_tool_call_event_async", "add_tool_call_event"),
+        ("record_tool_execution_started_async", "record_tool_execution_started"),
+        ("record_run_async", "record_run"),
+    ):
+        setattr(
+            session_manager, async_name, AsyncMock(side_effect=getattr(session_manager, sync_name))
+        )
     session_manager.messages = []
     session_manager.model_context = []
     session_manager.session = Session()
     session_manager.model = None
     session_manager.tokens = 0
     session_manager.context_window = None
+    session_manager.recovery_state = None
     session_manager.execution.side_effect = nullcontext
     interaction = MagicMock(spec=Interaction)
     options = options or {
@@ -123,6 +135,7 @@ def file_runner(tmp_path, backend, *, registry=None, sessions=None, run_control=
     selection = Mock()
     selection.effective = "local-model"
     selection.record_response_async = AsyncMock()
+    selection.synchronize_session_async = AsyncMock()
     return AgentRunner(
         agent,
         backend,
@@ -1692,12 +1705,10 @@ def test_runner_run_async_records_interruption_as_cancelled():
     """A cooperative async interruption settles pending calls and records a cancelled run."""
     runner, sessions, interaction = agent_runner()
     runner.query_async = AsyncMock(side_effect=RunInterrupted())
-    runner._cancel_pending_tools = Mock()
 
     result = asyncio.run(runner.run_async())
 
     assert result.stop_reason == "cancelled"
-    runner._cancel_pending_tools.assert_called_once_with()
     interaction.info.assert_called_once_with("Run interrupted; the conversation remains open.")
     sessions.record_run.assert_called_once()
 
@@ -1879,7 +1890,7 @@ def test_async_recovery_preserves_unknown_outcome_and_pending_boundaries(
     observations = Mock(spec=FileObservations)
     monkeypatch.setattr(FileObservations, "for_recovery", Mock(return_value=observations))
     runner._confirm_async = AsyncMock(return_value=approval)
-    runner._persist_interrupted_tool_result = Mock()
+    runner._persist_interrupted_tool_result_async = AsyncMock()
     runner._execute_tool_calls_async = AsyncMock(return_value=())
     tools = []
 
@@ -1888,7 +1899,7 @@ def test_async_recovery_preserves_unknown_outcome_and_pending_boundaries(
     assert runner._execute_tool_calls_async.await_count == int(expected_execution)
     if expected_execution:
         assert runner._execute_tool_calls_async.await_args.kwargs["present"] is expected_present
-    assert runner._persist_interrupted_tool_result.call_count == int(expected_skip)
+    assert runner._persist_interrupted_tool_result_async.await_count == int(expected_skip)
     assert runner._confirm_async.await_count == int(status == "outcome_unknown")
 
 
@@ -1921,7 +1932,7 @@ def test_async_tool_execution_preserves_boundary_records_and_outcomes(
 
     kwargs = runner.agent.tools.call_with_timing_async.await_args.kwargs
     assert kwargs["cancellation_event"] is runner._run_control.cancellation_event
-    kwargs["execution_started"]()
+    asyncio.run(kwargs["execution_started"]())
     assert result.succeeded is succeeded
     assert result.duration_seconds == 0.25
     if present:

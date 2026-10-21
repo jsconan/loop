@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import ipaddress
 import json
 import logging
@@ -14,12 +16,12 @@ import sqlite3
 import stat
 import tempfile
 from atexit import register
-from collections.abc import Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextlib import contextmanager
 from fnmatch import fnmatchcase
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 from weakref import WeakSet
 
@@ -124,6 +126,8 @@ class PermissionManager:
             interactive recovery when an interaction is available and strict errors otherwise.
         command_inspection (CommandInspection | None): Trusted command inspection. Defaults to
             the built-in matchers.
+        async_blocking_runner (Callable[..., Awaitable[Any]] | None): Application-owned bounded
+            worker for synchronous audit writes. Defaults to ``asyncio.to_thread``.
 
     Raises:
         PermissionConfigurationError: If a policy is invalid in strict mode.
@@ -150,6 +154,7 @@ class PermissionManager:
     _command_inspection: CommandInspection
     _host_runtime_bindings: dict[str, str]
     _policy_lock: RLock
+    _async_blocking_runner: Callable[..., Awaitable[Any]] | None
 
     def __init__(
         self,
@@ -165,8 +170,10 @@ class PermissionManager:
         presets: Iterable[PermissionPreset] | None = None,
         load_policy: PermissionLoadPolicy | None = None,
         command_inspection: CommandInspection | None = None,
+        async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         self._policy_lock = RLock()
+        self._async_blocking_runner = async_blocking_runner
         self._command_inspection = (
             command_inspection if command_inspection is not None else CommandInspection()
         )
@@ -343,6 +350,21 @@ class PermissionManager:
         """
         self._recorder = recorder
 
+    def set_async_blocking_runner(
+        self,
+        runner: Callable[..., Awaitable[Any]],
+    ) -> None:
+        """Use an application-owned bounded worker for async audit writes.
+
+        Args:
+            runner (Callable[..., Awaitable[Any]]): Worker that invokes a synchronous operation
+                and returns its result.
+
+        Returns:
+            None: The asynchronous audit worker is configured.
+        """
+        self._async_blocking_runner = runner
+
     @property
     def persistent_rules(self) -> tuple[PermissionRule, ...]:
         """Return persisted policy rules in display order.
@@ -424,6 +446,8 @@ class PermissionManager:
             selected,
             headless=headless,
             recorder=recorder,
+            persist=True,
+            audit=True,
         )
 
     async def authorize_async(
@@ -447,7 +471,7 @@ class PermissionManager:
             AuthorizationResult: Policy, prompt, and effective result for the complete set.
 
         Raises:
-            asyncio.CancelledError: If the pending approval interaction is cancelled.
+            asyncio.CancelledError: If approval or owned audit and recording work is cancelled.
         """
         policy, fresh_file_review = self._authorization_policy(
             operations, protected_instruction_names
@@ -464,7 +488,7 @@ class PermissionManager:
                 interaction=active_interaction,
                 fresh_only=fresh_file_review,
             )
-        return self._complete_authorization(
+        result = self._complete_authorization(
             operations,
             policy,
             fresh_file_review,
@@ -472,7 +496,18 @@ class PermissionManager:
             selected,
             headless=headless,
             recorder=recorder,
+            persist=False,
+            audit=False,
         )
+        await self._audit_async(result)
+        active_recorder = recorder if recorder is not None else self._recorder
+        if active_recorder is not None:
+            async_recorder = getattr(active_recorder, "record_authorization_async", None)
+            if callable(async_recorder) and inspect.iscoroutinefunction(async_recorder):
+                await async_recorder(result)
+            else:
+                active_recorder.record_authorization(result)
+        return result
 
     def _authorization_policy(
         self,
@@ -512,6 +547,8 @@ class PermissionManager:
         *,
         headless: bool,
         recorder: PermissionRecorder | None,
+        persist: bool,
+        audit: bool,
     ) -> AuthorizationResult:
         """Apply an approval response, record its decision, and return the final result."""
         decision = policy.decision
@@ -603,9 +640,10 @@ class PermissionManager:
             "permission.decision",
             payload=result,
         )
-        self._audit(result)
+        if audit:
+            self._audit(result)
         active_recorder = recorder if recorder is not None else self._recorder
-        if active_recorder is not None:
+        if persist and active_recorder is not None:
             active_recorder.record_authorization(result)
         return result
 
@@ -2659,6 +2697,40 @@ class PermissionManager:
         """Append one independently durable, timestamped permission decision."""
         payload = result.model_dump(mode="json")
         self._append_audit("permission.decided", payload)
+
+    async def _audit_async(self, result: AuthorizationResult) -> None:
+        """Append one permission decision through bounded asynchronous worker admission."""
+        if self._audit_store is None or self._workspace_id is None:
+            return
+        pending = asyncio.ensure_future(
+            self._async_blocking_runner(self._audit, result)
+            if self._async_blocking_runner is not None
+            else asyncio.to_thread(self._audit, result)
+        )
+        cancellation = None
+        try:
+            await asyncio.wait({pending})
+        except asyncio.CancelledError as error:
+            cancellation = error
+        while not pending.done():
+            try:
+                await asyncio.wait({pending})
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+        try:
+            pending.result()
+        except Exception as error:  # noqa: BLE001  # audits must not change policy outcomes
+            if cancellation is not None:
+                cancellation.add_note(f"Permission audit also stopped with {type(error).__name__}.")
+                raise cancellation
+            telemetry_error(
+                "permission.audit_write_failed",
+                error_type="permission.audit_write_failed",
+                component="permission_manager",
+            )
+            return
+        if cancellation is not None:
+            raise cancellation
 
     def _append_audit(self, event_name: str, payload: dict[str, object]) -> None:
         """Append one bounded audit payload without affecting policy behavior."""

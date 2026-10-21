@@ -718,6 +718,7 @@ def test_sync_and_async_registry_calls_reuse_their_native_async_loops():
 
 def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
     """Concurrent sync calls use one runner and reject the non-owner safely."""
+
     @declare_tool
     async def calculate() -> str:
         """Return a result from the registry-owned async runner."""
@@ -2422,6 +2423,35 @@ def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
     assert duration == 2
     interaction.prompt_async.assert_awaited_once()
     recorder.record_authorization.assert_called_once()
+
+
+def test_async_execution_started_callback_is_awaited_before_tool_invocation():
+    """Async execution intent settles before an effectful tool callback begins."""
+    registry = ToolRegistry()
+    events = []
+
+    @declare_tool()
+    async def calculate() -> str:
+        """Record the tool invocation after execution intent."""
+        events.append("tool")
+        return "done"
+
+    registry.register(calculate)
+
+    async def execution_started():
+        """Record execution intent at the async owner boundary."""
+        events.append("started")
+
+    result = asyncio.run(
+        registry.call_async(
+            "calculate",
+            "{}",
+            execution_started=execution_started,
+        )
+    )
+
+    assert result_value(result) == "done"
+    assert events == ["started", "tool"]
 
 
 def test_async_dispatch_keeps_event_loop_responsive_during_approval():

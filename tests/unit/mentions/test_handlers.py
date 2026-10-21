@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import get_ident
 from unittest.mock import Mock
@@ -93,6 +94,38 @@ def test_async_project_path_resolution_reads_on_a_worker_and_preserves_snapshot(
     assert references[0].path == "source.txt"
     assert worker_threads and worker_threads[0] != owner
     assert asyncio.run(handler.resolve_optional_async(("missing.txt",))) == ()
+
+
+def test_async_project_path_resolution_uses_injected_bounded_worker(tmp_path):
+    """Async mention reads use the application worker while returning references on the owner."""
+    source = tmp_path / "source.txt"
+    source.write_text("review me", encoding="utf-8")
+    executor = ThreadPoolExecutor(max_workers=1)
+    worker_threads = []
+
+    async def run_blocking(function, *args):
+        """Run detached path reads in the supplied worker pool."""
+
+        def invoke():
+            """Record the worker thread and execute the detached filesystem operation."""
+            worker_threads.append(get_ident())
+            return function(*args)
+
+        return await asyncio.get_running_loop().run_in_executor(executor, invoke)
+
+    handler = ProjectPathMentionHandler(
+        PathHolder(tmp_path),
+        async_blocking_runner=run_blocking,
+    )
+    owner_thread = get_ident()
+
+    try:
+        references = asyncio.run(handler.resolve_async(("source.txt",)))
+    finally:
+        executor.shutdown(wait=True)
+
+    assert [reference.content for reference in references] == ["review me"]
+    assert worker_threads and worker_threads[0] != owner_thread
 
 
 def test_project_paths_complete_after_cache_expiry_and_resolve_unique_snapshots(

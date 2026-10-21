@@ -1,6 +1,7 @@
 """Tests for project-path completion."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from threading import get_ident
 from unittest.mock import Mock
 
@@ -77,3 +78,51 @@ def test_async_project_path_completion_reads_on_a_worker_and_updates_cache_on_ow
     assert asyncio.run(adapter.values_async()) == values
     assert adapter.values() == values
     assert len(workers) == 1
+
+
+def test_project_path_completion_uses_injected_bounded_ui_worker(tmp_path):
+    """Synchronous completion delegates filesystem traversal to its bounded worker."""
+    (tmp_path / "source.py").write_text("", encoding="utf-8")
+    calls = []
+
+    def run_blocking(function, *args):
+        """Record and invoke one completion operation through the injected boundary."""
+        calls.append((function, args))
+        return function(*args)
+
+    adapter = ProjectPathCompletionAdapter(
+        "@",
+        PathHolder(tmp_path),
+        sync_blocking_runner=run_blocking,
+    )
+
+    assert [value.value for value in adapter.values()] == ["source.py"]
+    assert len(calls) == 1
+    assert calls[0][1] == (tmp_path,)
+
+
+def test_async_project_path_completion_uses_injected_bounded_worker(tmp_path):
+    """Async path completion delegates traversal to the configured application worker."""
+    (tmp_path / "source.py").write_text("", encoding="utf-8")
+    executor = ThreadPoolExecutor(max_workers=1)
+    calls = []
+
+    async def run_blocking(function, *args):
+        """Submit detached path discovery to the controlled worker pool."""
+        calls.append((function, args))
+        return await asyncio.get_running_loop().run_in_executor(executor, function, *args)
+
+    adapter = ProjectPathCompletionAdapter(
+        "@",
+        PathHolder(tmp_path),
+        async_blocking_runner=run_blocking,
+    )
+
+    try:
+        values = asyncio.run(adapter.values_async())
+    finally:
+        executor.shutdown(wait=True)
+
+    assert [value.value for value in values] == ["source.py"]
+    assert len(calls) == 1
+    assert calls[0][1] == (tmp_path,)

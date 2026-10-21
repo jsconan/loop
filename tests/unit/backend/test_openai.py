@@ -1979,9 +1979,7 @@ def test_async_generation_hyperparameter_fallback_retries_without_rejected_contr
     sdk.responses.create = AsyncMock(
         side_effect=[rejected, AsyncEvents([sdk_completion_event(total_tokens=None)])]
     )
-    sdk.models.list.return_value = AsyncModelPage(
-        [SimpleNamespace(id="model", model_extra=None)]
-    )
+    sdk.models.list.return_value = AsyncModelPage([SimpleNamespace(id="model", model_extra=None)])
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
         assert isinstance(

@@ -831,7 +831,7 @@ class ToolRegistry:
         instructions_manager: InstructionsManager | None = None,
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
-        execution_started: Callable[[], None] | None = None,
+        execution_started: Callable[[], Any] | None = None,
         file_observations: FileObservations | None = None,
         cancellation_event: Event | None = None,
     ) -> str:
@@ -847,8 +847,8 @@ class ToolRegistry:
             permission_manager (PermissionManager | None): Invocation policy overriding the
                 registry default.
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
-            execution_started (Callable[[], None] | None): Callback invoked immediately before
-                the validated and authorized tool function runs.
+            execution_started (Callable[[], Any] | None): Callback invoked immediately before
+                the validated and authorized tool function runs; async results are awaited.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -882,7 +882,7 @@ class ToolRegistry:
         instructions_manager: InstructionsManager | None = None,
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
-        execution_started: Callable[[], None] | None = None,
+        execution_started: Callable[[], Any] | None = None,
         file_observations: FileObservations | None = None,
         cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
@@ -895,8 +895,8 @@ class ToolRegistry:
             instructions_manager (InstructionsManager | None): Active instruction manager.
             permission_manager (PermissionManager | None): Invocation permission policy.
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
-            execution_started (Callable[[], None] | None): Callback invoked immediately before
-                the validated and authorized tool function runs.
+            execution_started (Callable[[], Any] | None): Callback invoked immediately before
+                the validated and authorized tool function runs; async results are awaited.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -940,7 +940,9 @@ class ToolRegistry:
             file_observations=file_observations,
         )
         if execution_started is not None:
-            execution_started()
+            started_result = execution_started()
+            if inspect.isawaitable(started_result):
+                await started_result
         started = perf_counter()
         worker_context = None
         active_context = context

@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import replace
 from functools import partial
-from threading import BoundedSemaphore, Lock, get_ident
+from threading import BoundedSemaphore, Lock, current_thread, get_ident
 from typing import Any
 
 from pydantic import ValidationError
@@ -116,6 +116,7 @@ class CommandManager:
     _runner_thread: int | None
     _runner_lock: Lock
     _executor: ThreadPoolExecutor
+    _worker_thread_prefix: str
     _worker_slots: BoundedSemaphore
     _closed: bool
 
@@ -133,9 +134,10 @@ class CommandManager:
         self._async_runner = None
         self._runner_thread = None
         self._runner_lock = Lock()
+        self._worker_thread_prefix = f"loop-command-{id(self):x}"
         self._executor = ThreadPoolExecutor(
             max_workers=_COMMAND_WORKER_COUNT,
-            thread_name_prefix="loop-command",
+            thread_name_prefix=self._worker_thread_prefix,
         )
         self._worker_slots = BoundedSemaphore(_COMMAND_WORKER_COUNT + _COMMAND_WORKER_QUEUE_SIZE)
         self._closed = False
@@ -752,6 +754,65 @@ class CommandManager:
                 else:
                     close_awaitable(pending.result())
             raise
+        finally:
+            self._worker_slots.release()
+
+    def run_blocking_sync(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        _operation: str = "command operation",
+        **kwargs: Any,
+    ) -> Any:
+        """Run synchronous work with bounded admission for synchronous UI callbacks.
+
+        Args:
+            function (Callable[..., Any]): Synchronous operation to invoke.
+            *args (Any): Positional arguments passed to the operation.
+            _operation (str): Operation label used in worker admission errors.
+            **kwargs (Any): Keyword arguments passed to the operation.
+
+        Returns:
+            Any: Value returned by the synchronous operation.
+
+        Raises:
+            ProblemException: If called from an event loop or the worker pool is closed or full.
+            Exception: If the synchronous operation raises an exception.
+        """
+        if has_running_event_loop():
+            raise ProblemException(
+                Problem(
+                    code="command.async_required",
+                    title="Asynchronous operation required",
+                    detail=(
+                        "Synchronous file completion cannot run on an active event loop. "
+                        "Use the asynchronous completion path."
+                    ),
+                    operation=_operation,
+                )
+            )
+        if current_thread().name.startswith(f"{self._worker_thread_prefix}_"):
+            return function(*args, **kwargs)
+        if self._closed or not self._worker_slots.acquire(blocking=False):
+            raise ProblemException(
+                Problem(
+                    code="command.dispatch_busy",
+                    title="Command dispatch busy",
+                    detail=(
+                        "Synchronous command capacity is full; retry after active work settles."
+                    ),
+                    operation=_operation,
+                )
+            )
+        call_context = copy_context()
+        callback = partial(function, *args, **kwargs)
+        try:
+            pending = self._executor.submit(call_context.run, callback)
+        except Exception:
+            self._worker_slots.release()
+            raise
+        try:
+            return pending.result()
         finally:
             self._worker_slots.release()
 

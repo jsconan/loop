@@ -1,14 +1,16 @@
 """Session manager for handling user sessions."""
 
+import asyncio
 import json
 import logging
-from asyncio import current_task, to_thread
-from collections.abc import AsyncIterable, Callable, Generator, Iterable
+from asyncio import current_task
+from collections.abc import AsyncIterable, Awaitable, Callable, Generator, Iterable
 from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from dataclasses import fields
 from datetime import datetime
 from threading import Lock, get_ident
+from typing import Any
 from uuid import uuid7
 
 from ..errors import Problem, log_problem
@@ -100,6 +102,9 @@ class SessionManager:
         session_store (SessionStore | None): Store used to persist and retrieve sessions. Defaults
             to an instance-local memory store.
         workspace_id (str | None): Durable workspace identity owning every managed session.
+        async_blocking_runner (Callable[..., Awaitable[Any]] | None): Application-owned bounded
+            worker used for synchronous persistence from async workflows. Defaults to
+            ``asyncio.to_thread``.
 
     Raises:
         SessionNotFoundError: If the requested persisted session does not exist.
@@ -111,6 +116,8 @@ class SessionManager:
     _session: Session
     _session_store: SessionStore
     _workspace_id: str | None
+    _async_blocking_runner: Callable[..., Awaitable[Any]] | None
+    _persistence_lock: Lock
 
     def __init__(
         self,
@@ -118,9 +125,12 @@ class SessionManager:
         session: Session | str | None = None,
         session_store: SessionStore | None = None,
         workspace_id: str | None = None,
+        async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         self._interaction = interaction or ConsoleInteraction()
         self._session_store = session_store or MemorySessionStore()
+        self._async_blocking_runner = async_blocking_runner
+        self._persistence_lock = Lock()
         if workspace_id == "":
             raise ValueError("Workspace identifier must not be empty.")
         self._workspace_id = workspace_id
@@ -156,6 +166,21 @@ class SessionManager:
             SessionStore: The configured session store.
         """
         return self._session_store
+
+    def set_async_blocking_runner(
+        self,
+        runner: Callable[..., Awaitable[Any]],
+    ) -> None:
+        """Use an application-owned worker for synchronous async-path persistence.
+
+        Args:
+            runner (Callable[..., Awaitable[Any]]): Bounded worker that invokes a synchronous
+                function and returns its result.
+
+        Returns:
+            None: The async persistence worker is configured.
+        """
+        self._async_blocking_runner = runner
 
     @property
     def messages(self) -> list[ConversationItem]:
@@ -502,6 +527,9 @@ class SessionManager:
             active_skills (Iterable[tuple[str, str]]): Active skill identities.
             references (Iterable[CapturedInstruction]): Immutable instruction-file provenance.
 
+        Returns:
+            None: The replacement context and instruction state are durably committed.
+
         Raises:
             ValueError: If the checkpoint does not advance or has invalid context.
         """
@@ -533,6 +561,59 @@ class SessionManager:
             session.update_instruction_state(working_directory, identities)
 
         self._commit(apply)
+
+    async def add_compaction_async(
+        self,
+        result: CompactionResult,
+        *,
+        model: str,
+        instructions: str | None,
+        working_directory: str,
+        active_skills: Iterable[tuple[str, str]],
+        references: Iterable[CapturedInstruction] = (),
+    ) -> None:
+        """Persist one compaction checkpoint through the async session writer.
+
+        Args:
+            result (CompactionResult): Replacement context and reported token usage.
+            model (str): Model used to compact the active context.
+            instructions (str | None): Complete instructions supplied to the compactor.
+            working_directory (str): Effective instruction-discovery directory.
+            active_skills (Iterable[tuple[str, str]]): Active skill identities.
+            references (Iterable[CapturedInstruction]): Immutable instruction-file provenance.
+
+        Raises:
+            ValueError: If the checkpoint does not advance or has invalid context.
+            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+        """
+        identities = tuple(active_skills)
+        instruction_references = tuple(references)
+        provider = result.items[0].provider if result.items else ""
+        compaction = Compaction(
+            id=str(uuid7()),
+            boundary=len(self._session.messages),
+            created_at=utc_now(),
+            provider=provider,
+            model=model,
+            context=result.items,
+            instructions=InstructionSnapshot(
+                working_directory=working_directory,
+                content=instructions,
+                digest=sha256_digest(instructions or ""),
+                active_skills=identities,
+                references=instruction_references,
+            ),
+            input_tokens_before=self._session.tokens,
+            input_tokens_after=result.context_tokens,
+        )
+
+        def apply(session: Session) -> None:
+            session.add_compaction(compaction)
+            if result.context_tokens is not None:
+                session.tokens = result.context_tokens
+            session.update_instruction_state(working_directory, identities)
+
+        await self._commit_async(apply)
 
     def load_session(self, session: Session | str) -> None:
         """Load a session from the store.
@@ -743,8 +824,11 @@ class SessionManager:
         Args:
             generator (SessionNameGenerator): Auxiliary title generation service.
 
+        Returns:
+            None: The generated name is persisted when a usable exchange exists.
+
         Raises:
-            asyncio.CancelledError: An asynchronous generator request is cancelled.
+            asyncio.CancelledError: Naming is cancelled after any owned worker settles.
         """
         self._interaction.info("Generating a session name...")
         try:
@@ -771,14 +855,14 @@ class SessionManager:
             if callable(async_generator):
                 name = await async_generator(user_message, assistant_message, self._session.model)
             else:
-                name = await to_thread(
+                name = await self._run_blocking(
                     generator.generate,
                     user_message,
                     assistant_message,
                     self._session.model,
                 )
             if name:
-                self._commit(
+                await self._commit_async(
                     lambda session: session.rename(name, source=SESSION_NAME_SOURCE_GENERATED)
                 )
             self._interaction.info(f"Session name: {self._session.name}")
@@ -801,10 +885,25 @@ class SessionManager:
         Args:
             message (ConversationItem | Response): Conversation item to add.
 
+        Returns:
+            None: The conversation item is durably committed.
+
         Raises:
             ValueError: If the value is not a supported conversation item.
         """
         self._commit(lambda session: session.add_message(message))
+
+    async def add_message_async(self, message: ConversationItem | Response) -> None:
+        """Add conversation items through the asynchronous persistence boundary.
+
+        Args:
+            message (ConversationItem | Response): Conversation item to add.
+
+        Raises:
+            ValueError: If the value is not a supported conversation item.
+            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+        """
+        await self._commit_async(lambda session: session.add_message(message))
 
     def add_messages(self, messages: Iterable[ConversationItem]) -> None:
         """Add messages to the conversation history.
@@ -830,9 +929,58 @@ class SessionManager:
             context (Iterable[ContextReference]): Resolved context snapshots attached to the
                 message. Defaults to no explicit context.
 
+        Returns:
+            None: The user message is durably committed before model work begins.
+
         Raises:
             ValueError: If occurrence metadata is incomplete or inconsistent with its content.
         """
+        message = self._prepare_user_message(content, context)
+
+        def apply(session: Session) -> None:
+            if session.name is None:
+                session.rename(
+                    initial_session_name(content),
+                    source=SESSION_NAME_SOURCE_INITIAL,
+                )
+            session.add_message(message)
+
+        self._commit(apply)
+
+    async def add_user_message_async(
+        self,
+        content: str,
+        context: Iterable[ContextReference] = (),
+    ) -> None:
+        """Persist a user message before async model work begins.
+
+        Args:
+            content (str): Submitted user-message text.
+            context (Iterable[ContextReference]): Resolved context snapshots attached to the
+                message. Defaults to no explicit context.
+
+        Raises:
+            ValueError: If occurrence metadata is incomplete or inconsistent with its content.
+            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+        """
+        message = self._prepare_user_message(content, context)
+
+        def apply(session: Session) -> None:
+            if session.name is None:
+                session.rename(
+                    initial_session_name(content),
+                    source=SESSION_NAME_SOURCE_INITIAL,
+                )
+            session.add_message(message)
+
+        await self._commit_async(apply)
+
+    def _prepare_user_message(
+        self,
+        content: str,
+        context: Iterable[ContextReference],
+    ) -> Message:
+        """Validate context references and construct one detached user message."""
         captured = []
         for reference in context:
             if (reference.handle is None) != (reference.version is None):
@@ -900,12 +1048,7 @@ class SessionManager:
             )
         message = Message(role="user", content=content, context=captured)
 
-        def apply(session: Session) -> None:
-            if session.name is None:
-                session.rename(initial_session_name(content), source=SESSION_NAME_SOURCE_INITIAL)
-            session.add_message(message)
-
-        self._commit(apply)
+        return message
 
     def add_tool_call(
         self,
@@ -958,22 +1101,97 @@ class SessionManager:
 
         self._commit(apply)
 
+    async def add_tool_call_async(
+        self,
+        call_id: str,
+        output: str,
+        working_directory: str,
+        active_skills: Iterable[tuple[str, str]],
+        *,
+        succeeded: bool = False,
+        duration_seconds: float = 0,
+    ) -> None:
+        """Persist a tool result and its instruction state asynchronously.
+
+        Args:
+            call_id (str): Identifier used to associate the call with its result.
+            output (str): The content of the tool result.
+            working_directory (str): Effective instruction directory after the tool call.
+            active_skills (Iterable[tuple[str, str]]): Active skill names and canonical locations
+                after the tool call.
+            succeeded (bool): Whether the serialized tool result reports success.
+            duration_seconds (float): Tool-function execution duration in seconds.
+
+        Returns:
+            None: The tool result and instruction state are durably committed.
+
+        Raises:
+            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+        """
+        identities = tuple(active_skills)
+        output, handle = bound_tool_result(output, f"tool result {call_id}")
+        if handle is not None:
+            self._interaction.info(
+                f"Tool result '{call_id}' exceeded the context limit and was cached as '{handle}'."
+            )
+        result = ToolResult(
+            call_id=call_id,
+            output=output,
+            artifacts=self._content_artifacts(output),
+        )
+
+        def apply(session: Session) -> None:
+            session.update_instruction_state(working_directory, identities)
+            session.add_message(result)
+            if any(
+                isinstance(item, ToolCall) and item.call_id == call_id for item in session.messages
+            ):
+                session.events.append(
+                    ToolExecutionCompletedEvent(
+                        id=str(uuid7()),
+                        created_at=utc_now(),
+                        call_id=call_id,
+                        succeeded=succeeded,
+                        duration_seconds=duration_seconds,
+                    )
+                )
+
+        await self._commit_async(apply)
+
     def add_tool_call_event(self, call_id: str) -> None:
         """Persist one model tool call at its live presentation position.
 
         Args:
             call_id (str): Identifier of the canonical tool call to place.
 
+        Returns:
+            None: The presentation boundary is durably committed.
+
         Raises:
             ValueError: If the call is unknown or already recorded.
         """
         self._commit(lambda session: session.add_tool_call_event(call_id))
+
+    async def add_tool_call_event_async(self, call_id: str) -> None:
+        """Persist one model tool call at its live presentation position asynchronously.
+
+        Args:
+            call_id (str): Identifier of the canonical tool call to place.
+
+        Raises:
+            ValueError: If the call is unknown or already recorded.
+            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+        """
+        await self._commit_async(lambda session: session.add_tool_call_event(call_id))
 
     def record_tool_execution_started(self, call_id: str) -> None:
         """Persist that one tool invocation is about to cross the execution boundary.
 
         Args:
             call_id (str): Identifier of the model tool request being executed.
+
+        Returns:
+            None: The pre-execution intent is durably committed.
 
         Raises:
             ValueError: If the call is not present in canonical session history.
@@ -984,6 +1202,25 @@ class SessionManager:
         ):
             raise ValueError(f"Unknown tool call '{call_id}'.")
         self._persist_event(
+            ToolExecutionStartedEvent(id=str(uuid7()), created_at=utc_now(), call_id=call_id)
+        )
+
+    async def record_tool_execution_started_async(self, call_id: str) -> None:
+        """Persist tool execution intent before an async tool crosses its effect boundary.
+
+        Args:
+            call_id (str): Identifier of the model tool request being executed.
+
+        Raises:
+            ValueError: If the call is not present in canonical session history.
+            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+        """
+        if not any(
+            isinstance(item, ToolCall) and item.call_id == call_id
+            for item in self._session.messages
+        ):
+            raise ValueError(f"Unknown tool call '{call_id}'.")
+        await self._persist_event_async(
             ToolExecutionStartedEvent(id=str(uuid7()), created_at=utc_now(), call_id=call_id)
         )
 
@@ -1029,6 +1266,18 @@ class SessionManager:
         """
         self.add_message(response)
 
+    async def add_response_async(self, response: Response) -> None:
+        """Persist one complete backend response through the async session writer.
+
+        Args:
+            response (Response): The response to add.
+
+        Raises:
+            ValueError: If the response contains an unsupported conversation item.
+            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+        """
+        await self.add_message_async(response)
+
     def record_authorization(self, result: AuthorizationResult) -> None:
         """Persist one atomic authorization decision in the session timeline.
 
@@ -1041,6 +1290,25 @@ class SessionManager:
             result=result,
         )
         self._persist_event(event)
+
+    async def record_authorization_async(self, result: AuthorizationResult) -> None:
+        """Persist one authorization decision without blocking the async owner.
+
+        Args:
+            result (AuthorizationResult): Policy, approval, and effective outcome.
+
+        Returns:
+            None: The authorization decision is durably committed to the timeline.
+
+        Raises:
+            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+        """
+        event = PermissionEvent(
+            id=str(uuid7()),
+            created_at=utc_now(),
+            result=result,
+        )
+        await self._persist_event_async(event)
 
     def record_run(
         self,
@@ -1068,9 +1336,42 @@ class SessionManager:
         self._persist_event(event)
         return event
 
+    async def record_run_async(
+        self,
+        stop_reason: AgentRunStopReason,
+        started_at: datetime,
+        metrics: RunMetrics,
+    ) -> RunCompletedEvent:
+        """Persist one completed-run event through the async session writer.
+
+        Args:
+            stop_reason (AgentRunStopReason): Reason the agent run returned control.
+            started_at (datetime): UTC time at which the run began.
+            metrics (RunMetrics): Completed run statistics.
+
+        Returns:
+            RunCompletedEvent: Persisted event suitable for immediate presentation.
+
+        Raises:
+            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+        """
+        event = RunCompletedEvent(
+            id=str(uuid7()),
+            created_at=utc_now(),
+            stop_reason=stop_reason,
+            started_at=started_at,
+            metrics=metrics,
+        )
+        await self._persist_event_async(event)
+        return event
+
     def _persist_event(self, event: SessionEventModel) -> None:
         """Append and persist one standalone timeline event."""
         self._commit(lambda session: session.events.append(event))
+
+    async def _persist_event_async(self, event: SessionEventModel) -> None:
+        """Append and persist one standalone timeline event asynchronously."""
+        await self._commit_async(lambda session: session.events.append(event))
 
     def _commit(self, mutation: Callable[[Session], None]) -> None:
         """Apply and persist one session mutation atomically in memory."""
@@ -1078,7 +1379,7 @@ class SessionManager:
         try:
             mutation(self._session)
             telemetry_activity("session.persistence.started", component="session_manager")
-            self._session_store.save(self._session)
+            self._save_snapshot(self._session_store, self._persistence_lock, self._session)
             telemetry_activity(
                 "session.persistence.completed",
                 component="session_manager",
@@ -1096,3 +1397,104 @@ class SessionManager:
                     deepcopy(getattr(previous, session_field.name)),
                 )
             raise
+
+    async def _commit_async(self, mutation: Callable[[Session], None]) -> None:
+        """Persist a detached session mutation through bounded blocking admission."""
+        current = self._session
+        candidate = deepcopy(current)
+        mutation(candidate)
+        telemetry_activity("session.persistence.started", component="session_manager")
+        pending = asyncio.ensure_future(
+            self._async_blocking_runner(
+                self._save_snapshot,
+                self._session_store,
+                self._persistence_lock,
+                candidate,
+            )
+            if self._async_blocking_runner is not None
+            else asyncio.to_thread(
+                self._save_snapshot,
+                self._session_store,
+                self._persistence_lock,
+                candidate,
+            )
+        )
+        cancellation = None
+        try:
+            await asyncio.wait({pending})
+        except asyncio.CancelledError as error:
+            cancellation = error
+        while not pending.done():
+            try:
+                await asyncio.wait({pending})
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+
+        try:
+            pending.result()
+        except BaseException as error:
+            telemetry_error(
+                "session.persistence.failed",
+                error_type="session.persistence_failed",
+                component="session_manager",
+            )
+            if cancellation is not None:
+                cancellation.add_note(
+                    f"Session persistence also stopped with {type(error).__name__}."
+                )
+                raise cancellation
+            raise
+
+        if self._session is not current:
+            if cancellation is not None:
+                raise cancellation
+            raise RuntimeError("The active session changed while its snapshot was being saved.")
+        for session_field in fields(Session):
+            setattr(
+                current,
+                session_field.name,
+                deepcopy(getattr(candidate, session_field.name)),
+            )
+        telemetry_activity("session.persistence.completed", component="session_manager")
+        if cancellation is not None:
+            raise cancellation
+
+    @staticmethod
+    def _save_snapshot(
+        session_store: SessionStore,
+        persistence_lock: Lock,
+        session: Session,
+    ) -> str:
+        """Serialize store writes and persist one detached or active snapshot."""
+        with persistence_lock:
+            return session_store.save(session)
+
+    async def _run_blocking(self, function: Callable[..., Any], *args: Any) -> Any:
+        """Settle one synchronous operation before returning or propagating cancellation."""
+        pending = asyncio.ensure_future(
+            self._async_blocking_runner(function, *args)
+            if self._async_blocking_runner is not None
+            else asyncio.to_thread(function, *args)
+        )
+        cancellation = None
+        try:
+            await asyncio.wait({pending})
+        except asyncio.CancelledError as error:
+            cancellation = error
+        while not pending.done():
+            try:
+                await asyncio.wait({pending})
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+        try:
+            result = pending.result()
+        except BaseException as error:
+            if cancellation is not None:
+                cancellation.add_note(
+                    f"The blocking operation also stopped with {type(error).__name__}."
+                )
+                raise cancellation
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return result

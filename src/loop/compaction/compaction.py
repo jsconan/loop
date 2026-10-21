@@ -220,13 +220,14 @@ class ContextCompaction:
         Raises:
             BackendError: If the provider request or response fails.
             ValueError: If no effective model is configured.
+            asyncio.CancelledError: If backend compaction or session persistence is cancelled.
         """
         if not self._can_start(force):
             return False
 
         snapshot = instructions or self._instructions()
         model = self._model_selection.effective
-        self._start(model)
+        await self._start_async(model)
         try:
             result = await self._backend.compact_async(
                 self._session_manager.model_context,
@@ -235,7 +236,7 @@ class ContextCompaction:
             )
         except NotImplementedError:
             return self._unsupported()
-        return self._finish(result, snapshot, model)
+        return await self._finish_async(result, snapshot, model)
 
     def _can_start(self, force: bool) -> bool:
         """Return whether compaction should proceed, reporting an explicit empty request."""
@@ -248,6 +249,15 @@ class ContextCompaction:
     def _start(self, model: str) -> None:
         """Synchronize the selected model and report the start of compaction."""
         self._model_selection.synchronize_session()
+        self._report_start(model)
+
+    async def _start_async(self, model: str) -> None:
+        """Synchronize model metadata asynchronously and report compaction start."""
+        await self._model_selection.synchronize_session_async()
+        self._report_start(model)
+
+    def _report_start(self, model: str) -> None:
+        """Report one compaction start after model metadata is synchronized."""
         self._interaction.info("Compacting session context...")
         telemetry_activity(
             "compaction.started",
@@ -294,6 +304,35 @@ class ContextCompaction:
                 section.reference for section in snapshot.sections if section.reference is not None
             ),
         )
+        self._report_completion(previous_tokens)
+        return True
+
+    async def _finish_async(
+        self,
+        result: CompactionResult | None,
+        snapshot: PreparedInstructions,
+        model: str,
+    ) -> bool:
+        """Persist compacted context asynchronously and report its observed token change."""
+        if result is None or not result.items:
+            return self._empty_result()
+
+        previous_tokens = self._session_manager.tokens
+        await self._session_manager.add_compaction_async(
+            result,
+            model=model,
+            instructions=snapshot.content,
+            working_directory=str(snapshot.working_directory or self._working_directory),
+            active_skills=list(snapshot.active_skills),
+            references=tuple(
+                section.reference for section in snapshot.sections if section.reference is not None
+            ),
+        )
+        self._report_completion(previous_tokens)
+        return True
+
+    def _report_completion(self, previous_tokens: int) -> None:
+        """Report one persisted compaction and its token change."""
         current_tokens = self._session_manager.tokens
         telemetry_activity(
             "compaction.completed",
@@ -308,4 +347,13 @@ class ContextCompaction:
             )
         else:
             self._interaction.info("Compacted session context.")
-        return True
+
+    def _empty_result(self) -> bool:
+        """Report a compaction result that has no replacement context."""
+        telemetry_error(
+            "compaction.failed",
+            error_type="compaction.empty_result",
+            component="compaction",
+        )
+        self._interaction.warning("The selected backend did not produce compacted context.")
+        return False

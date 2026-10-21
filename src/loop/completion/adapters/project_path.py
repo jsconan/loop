@@ -2,7 +2,9 @@
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from ...utils import PathReference
 from ...utils.path import iter_visible_paths
@@ -18,6 +20,10 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         working_directory (PathReference): Current project-directory reference.
         cache_ttl (float): Seconds to reuse a discovered path snapshot. Defaults to ``5.0``;
             use ``0`` to disable caching.
+        sync_blocking_runner (Callable[..., Any] | None): Bounded worker for synchronous UI
+            completion. Defaults to direct traversal for standalone adapters.
+        async_blocking_runner (Callable[..., Awaitable[Any]] | None): Bounded worker for async
+            filesystem traversal. Defaults to ``asyncio.to_thread``.
 
     Raises:
         ValueError: If ``cache_ttl`` is negative.
@@ -28,16 +34,23 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
     _cached_root: Path | None
     _cached_until: float
     _cached_values: tuple[CompletionValue, ...]
+    _sync_blocking_runner: Callable[..., Any] | None
+    _async_blocking_runner: Callable[..., Awaitable[Any]] | None
 
     def __init__(
         self,
         marker: str,
         working_directory: PathReference,
         cache_ttl: float = 5.0,
+        *,
+        sync_blocking_runner: Callable[..., Any] | None = None,
+        async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         if cache_ttl < 0:
             raise ValueError("Path completion cache TTL cannot be negative.")
         self._working_directory = working_directory
+        self._sync_blocking_runner = sync_blocking_runner
+        self._async_blocking_runner = async_blocking_runner
         self._cache_ttl = cache_ttl
         self._cached_root = None
         self._cached_until = 0.0
@@ -54,7 +67,11 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         now = time.monotonic()
         if root == self._cached_root and now < self._cached_until:
             return self._cached_values
-        values = self._discover_values(root)
+        values = (
+            self._sync_blocking_runner(self._discover_values, root)
+            if self._sync_blocking_runner is not None
+            else self._discover_values(root)
+        )
         self._cached_root = root
         self._cached_until = time.monotonic() + self._cache_ttl
         self._cached_values = values
@@ -74,7 +91,11 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         now = time.monotonic()
         if root == self._cached_root and now < self._cached_until:
             return self._cached_values
-        values = await asyncio.to_thread(self._discover_values, root)
+        values = await (
+            self._async_blocking_runner(self._discover_values, root)
+            if self._async_blocking_runner is not None
+            else asyncio.to_thread(self._discover_values, root)
+        )
         self._cached_root = root
         self._cached_until = time.monotonic() + self._cache_ttl
         self._cached_values = values

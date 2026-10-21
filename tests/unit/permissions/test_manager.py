@@ -1246,6 +1246,120 @@ def test_authorize_async_awaits_native_approval_and_records_result(tmp_path):
     recorder.record_authorization.assert_called_once_with(result)
 
 
+def test_async_authorization_uses_bounded_audit_and_native_recorder_paths(tmp_path):
+    """Async permission audits and session observations use their owning async boundaries."""
+    audit_path = tmp_path / "audit.db"
+    worker_calls = []
+
+    async def run_blocking(function, *args):
+        """Dispatch the audit write through the supplied worker."""
+        worker_calls.append(function.__name__)
+        return await asyncio.to_thread(function, *args)
+
+    recorder = Mock()
+    recorder.record_authorization_async = AsyncMock()
+    manager = PermissionManager(
+        tmp_path,
+        audit_path=audit_path,
+        workspace_id="workspace",
+        async_blocking_runner=run_blocking,
+    )
+    operation_set = (file_operation(Action.FILESYSTEM_READ, tmp_path / "source.txt"),)
+
+    result = asyncio.run(manager.authorize_async(operation_set, recorder=recorder))
+
+    assert result.decision is Decision.ALLOW
+    assert worker_calls == ["_audit"]
+    recorder.record_authorization_async.assert_awaited_once_with(result)
+    recorder.record_authorization.assert_not_called()
+    with closing(sqlite3.connect(audit_path)) as connection:
+        row = connection.execute(
+            "SELECT workspace_id, event_name FROM permission_audit_records"
+        ).fetchone()
+    assert row == ("workspace", "permission.decided")
+
+
+def test_async_authorization_keeps_best_effort_audit_failures_out_of_policy_results(tmp_path):
+    """A bounded audit admission failure does not change an authorization outcome."""
+
+    async def reject_audit(function, *args):
+        """Reject optional audit work after policy evaluation."""
+        raise RuntimeError(f"Could not schedule {function.__name__}.")
+
+    manager = PermissionManager(
+        tmp_path,
+        audit_path=tmp_path / "audit.db",
+        workspace_id="workspace",
+        async_blocking_runner=reject_audit,
+    )
+    operation_set = (file_operation(Action.FILESYSTEM_READ, tmp_path / "source.txt"),)
+
+    result = asyncio.run(manager.authorize_async(operation_set))
+
+    assert result.decision is Decision.ALLOW
+
+
+@pytest.mark.parametrize("audit_fails", [False, True])
+def test_async_authorization_settles_audit_before_propagating_cancellation(
+    tmp_path,
+    audit_fails,
+):
+    """Permission audit work settles before cancellation returns control to the caller."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_blocking(function, *args):
+        """Keep audit work pending until the owner has been cancelled."""
+        started.set()
+        await release.wait()
+        if audit_fails:
+            raise OSError("audit storage unavailable")
+        return await asyncio.to_thread(function, *args)
+
+    manager = PermissionManager(
+        tmp_path,
+        audit_path=tmp_path / "audit.db",
+        workspace_id="workspace",
+        async_blocking_runner=run_blocking,
+    )
+    operation_set = (file_operation(Action.FILESYSTEM_READ, tmp_path / "source.txt"),)
+
+    async def cancel_authorization():
+        """Cancel authorization while its optional audit write remains owned."""
+        pending = asyncio.create_task(manager.authorize_async(operation_set))
+        await started.wait()
+        pending.cancel()
+        await asyncio.sleep(0)
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await pending
+        if audit_fails:
+            assert any("OSError" in note for note in captured.value.__notes__)
+
+    asyncio.run(cancel_authorization())
+
+
+def test_async_authorization_supports_the_standalone_audit_worker(tmp_path):
+    """Standalone permission managers still move SQLite audits off the event loop."""
+    audit_path = tmp_path / "audit.db"
+    manager = PermissionManager(
+        tmp_path,
+        audit_path=audit_path,
+        workspace_id="workspace",
+    )
+    operation_set = (file_operation(Action.FILESYSTEM_READ, tmp_path / "source.txt"),)
+
+    result = asyncio.run(manager.authorize_async(operation_set))
+
+    assert result.decision is Decision.ALLOW
+    with closing(sqlite3.connect(audit_path)) as connection:
+        row = connection.execute(
+            "SELECT workspace_id, event_name FROM permission_audit_records"
+        ).fetchone()
+    assert row == ("workspace", "permission.decided")
+
+
 def test_authorize_async_keeps_fresh_file_changes_one_time_only(tmp_path):
     """A fresh file review cannot install a reusable grant even from a stale response."""
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)

@@ -42,12 +42,14 @@ from loop import (
     Session,
     SessionExecutionConflictError,
     SessionManager,
+    SessionRevisionConflictError,
     SessionWorkspaceMismatchError,
     ToolCall,
     ToolCallCompleted,
     ToolResult,
     Usage,
 )
+from loop.constants import MAX_TOOL_RESULT_BYTES
 from loop.instructions import CapturedInstruction
 from loop.interaction import Interaction, InteractionOutput
 from loop.session import (
@@ -838,6 +840,378 @@ def test_manager_constructs_and_persists_complete_user_messages():
     store.save.assert_called_once()
 
 
+def test_async_session_commit_uses_a_bounded_worker_and_detached_session():
+    """Async persistence sends a detached snapshot to the configured worker."""
+    store = MemorySessionStore()
+    executor = ThreadPoolExecutor(max_workers=1)
+    worker_sessions = []
+
+    async def run_blocking(function, *args):
+        """Run persistence on the controlled worker and capture submitted sessions."""
+        worker_sessions.extend(argument for argument in args if isinstance(argument, Session))
+        return await asyncio.get_running_loop().run_in_executor(executor, function, *args)
+
+    manager = SessionManager(
+        session_store=store,
+        async_blocking_runner=run_blocking,
+    )
+    active = manager.session
+
+    try:
+        asyncio.run(manager.add_user_message_async("persisted input"))
+    finally:
+        executor.shutdown(wait=True)
+
+    assert manager.session is active
+    assert len(worker_sessions) == 1
+    assert worker_sessions[0] is not active
+    assert worker_sessions[0].messages == active.messages
+    assert store.load(active.id).messages == active.messages
+
+
+def test_slow_async_session_store_leaves_the_event_loop_available_for_control():
+    """A slow synchronous store write does not block other owner-loop work."""
+
+    class SlowStore(MemorySessionStore):
+        """Hold one save until the async owner confirms it can process control input."""
+
+        started: Event
+        release: Event
+
+        def __init__(self):
+            """Initialize a memory store with a deterministic save gate."""
+            super().__init__()
+            self.started = Event()
+            self.release = Event()
+
+        def save(self, session: Session) -> str:
+            """Wait for test release before persisting the detached snapshot.
+
+            Args:
+                session (Session): Snapshot being committed by the session manager.
+
+            Returns:
+                str: Identifier of the saved session.
+            """
+            self.started.set()
+            if not self.release.wait(timeout=2):
+                raise TimeoutError("The async owner did not release the slow test store.")
+            return super().save(session)
+
+    store = SlowStore()
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    async def run_blocking(function, *args):
+        """Run SQLite-like storage work on one controlled bounded worker."""
+        return await asyncio.get_running_loop().run_in_executor(executor, function, *args)
+
+    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking)
+
+    async def verify_owner_progress():
+        """Process a control callback while the session snapshot is still being saved."""
+        pending = asyncio.create_task(manager.add_user_message_async("durable input"))
+        while not store.started.is_set():
+            await asyncio.sleep(0)
+        control_processed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(control_processed.set)
+        await asyncio.wait_for(control_processed.wait(), timeout=1)
+        assert not pending.done()
+        store.release.set()
+        await pending
+
+    try:
+        asyncio.run(verify_owner_progress())
+    finally:
+        store.release.set()
+        executor.shutdown(wait=True)
+
+    assert store.load(manager.session.id).messages == manager.messages
+
+
+def test_async_session_commit_keeps_visible_state_after_store_failure():
+    """A failed async write leaves the active session unchanged."""
+    store = Mock(spec=SessionStore)
+    store.save.side_effect = OSError("store unavailable")
+    manager = SessionManager(session_store=store)
+    active = manager.session
+
+    with pytest.raises(OSError, match="store unavailable"):
+        asyncio.run(manager.add_message_async(Message(role="assistant", content="answer")))
+
+    assert manager.session is active
+    assert manager.messages == []
+    assert active.revision == 0
+
+
+def test_async_session_commit_rejects_a_stale_revision_without_publishing():
+    """A stale async snapshot cannot overwrite or publish over a newer revision."""
+    store = MemorySessionStore()
+    initial = SessionManager(session_store=store)
+    initial.add_user_message("first")
+    session_id = initial.session.id
+    stale = SessionManager(session=store.load(session_id), session_store=store)
+    current = SessionManager(session=store.load(session_id), session_store=store)
+    current.add_message(Message(role="assistant", content="newer"))
+
+    with pytest.raises(SessionRevisionConflictError):
+        asyncio.run(stale.add_message_async(Message(role="assistant", content="stale")))
+
+    assert [message.content for message in stale.messages if isinstance(message, Message)] == [
+        "first"
+    ]
+    stored_messages = store.load(session_id).messages
+    assert [message.content for message in stored_messages if isinstance(message, Message)] == [
+        "first",
+        "newer",
+    ]
+
+
+def test_async_session_transitions_persist_tool_boundaries_and_run_completion():
+    """Async responses and tool events retain their durable execution order."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    call = ToolCall(call_id="call-1", name="inspect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    started_at = datetime(2025, 1, 1, tzinfo=UTC)
+    metrics = RunMetrics(
+        active_duration_seconds=0,
+        model_duration_seconds=0,
+        tool_duration_seconds=0,
+        message_count=0,
+        item_count=1,
+    )
+
+    async def persist_run():
+        """Persist each async execution boundary before recording run completion."""
+        await manager.add_response_async(response)
+        await manager.add_tool_call_event_async(call.call_id)
+        await manager.record_tool_execution_started_async(call.call_id)
+        await manager.add_tool_call_async(
+            call.call_id,
+            '{"ok": true}',
+            "/project",
+            (),
+            succeeded=True,
+            duration_seconds=0.25,
+        )
+        await manager.record_run_async("completed", started_at, metrics)
+
+    asyncio.run(persist_run())
+
+    stored = store.load(manager.session.id)
+    assert stored.messages == manager.messages
+    assert any(isinstance(event, ToolExecutionStartedEvent) for event in stored.events)
+    assert any(isinstance(event, ToolExecutionCompletedEvent) for event in stored.events)
+    assert isinstance(stored.events[-1], RunCompletedEvent)
+
+
+def test_async_compaction_without_token_estimate_preserves_session_usage():
+    """Compaction checkpoints persist instruction state when no token estimate is returned."""
+    session = Session(messages=[Message(role="user", content="question")], tokens=48)
+    store = MemorySessionStore()
+    manager = SessionManager(session=session, session_store=store)
+    result = CompactionResult(
+        items=(CompactionContextItem(provider="loop", data={"content": "summary"}),),
+        context_tokens=None,
+    )
+
+    asyncio.run(
+        manager.add_compaction_async(
+            result,
+            model="model-a",
+            instructions=None,
+            working_directory="/project",
+            active_skills=(("guide", "/project/.agents/skills/guide"),),
+        )
+    )
+
+    stored = store.load(session.id)
+    assert stored.tokens == 48
+    assert len(stored.compactions) == 1
+    assert stored.compactions[0].context == result.items
+    assert stored.active_skills == [("guide", "/project/.agents/skills/guide")]
+
+
+def test_async_tool_result_bounds_large_output_without_a_matching_call():
+    """Large async tool results are cached and do not invent completion events."""
+    interaction = Mock(spec=Interaction)
+    manager = SessionManager(interaction=interaction)
+    output = "x" * (MAX_TOOL_RESULT_BYTES + 1)
+
+    asyncio.run(
+        manager.add_tool_call_async(
+            "unmatched",
+            output,
+            "/project",
+            (),
+            succeeded=True,
+            duration_seconds=0.1,
+        )
+    )
+
+    assert isinstance(manager.messages[-1], ToolResult)
+    assert manager.messages[-1].output != output
+    assert not any(
+        isinstance(event, ToolExecutionCompletedEvent) for event in manager.session.events
+    )
+    interaction.info.assert_called_once()
+
+
+def test_async_execution_start_rejects_an_unknown_call_without_persisting():
+    """Async effect intent cannot be recorded for a call absent from canonical history."""
+    store = Mock(spec=SessionStore)
+    manager = SessionManager(session_store=store)
+
+    with pytest.raises(ValueError, match="Unknown tool call 'missing'"):
+        asyncio.run(manager.record_tool_execution_started_async("missing"))
+
+    assert manager.session.events == []
+    store.save.assert_not_called()
+
+
+def test_async_authorization_observation_is_persisted_as_a_permission_event():
+    """Async authorization events become durable timeline entries on the session owner."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    operation = Operation(
+        tool_id="read",
+        action=Action.FILESYSTEM_READ,
+        target=FileTarget(path="/project/file.txt"),
+    )
+    result = AuthorizationResult(
+        operations=(operation,),
+        policy=PolicyDecision(
+            decision=Decision.ASK,
+            reason="approval required",
+            sources=("default:filesystem.read",),
+        ),
+        decision=Decision.ALLOW,
+        prompted=True,
+        reason="approved once",
+        source="user",
+        approval_choice=ApprovalChoice.ONCE,
+    )
+
+    asyncio.run(manager.record_authorization_async(result))
+
+    stored = manager.store.load(manager.session.id)
+    assert isinstance(stored.events[-1], PermissionEvent)
+    assert stored.events[-1].result == result
+
+
+def test_async_session_commit_finishes_persistence_before_propagating_cancellation():
+    """Cancellation waits for the owned write and publishes its committed result."""
+    store = MemorySessionStore()
+    executor = ThreadPoolExecutor(max_workers=1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_blocking(function, *args):
+        """Hold worker admission until the test cancels and releases the operation."""
+        started.set()
+        await release.wait()
+        return await asyncio.get_running_loop().run_in_executor(executor, function, *args)
+
+    manager = SessionManager(
+        session_store=store,
+        async_blocking_runner=run_blocking,
+    )
+
+    async def cancel_after_admission():
+        """Cancel an active commit and wait for its durable result to settle."""
+        pending = asyncio.create_task(
+            manager.add_message_async(Message(role="assistant", content="committed"))
+        )
+        await started.wait()
+        pending.cancel()
+        await asyncio.sleep(0)
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    try:
+        asyncio.run(cancel_after_admission())
+    finally:
+        executor.shutdown(wait=True)
+
+    assert [message.content for message in manager.messages if isinstance(message, Message)] == [
+        "committed"
+    ]
+    assert store.load(manager.session.id).messages == manager.messages
+
+
+def test_async_session_commit_preserves_cancellation_and_reports_a_save_failure():
+    """A failed detached save remains visible on cancellation without publishing its candidate."""
+    store = Mock(spec=SessionStore)
+    store.save.side_effect = OSError("disk unavailable")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_blocking(function, *args):
+        """Hold the detached persistence operation until cancellation is requested."""
+        started.set()
+        await release.wait()
+        return function(*args)
+
+    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking)
+    active = manager.session
+
+    async def cancel_failed_commit():
+        """Cancel a pending save and then let its failure settle."""
+        pending = asyncio.create_task(
+            manager.add_message_async(Message(role="assistant", content="not committed"))
+        )
+        await started.wait()
+        pending.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await pending
+        assert any("OSError" in note for note in captured.value.__notes__)
+
+    asyncio.run(cancel_failed_commit())
+
+    assert manager.session is active
+    assert manager.messages == []
+    assert active.revision == 0
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_async_session_commit_does_not_publish_over_a_replacement_session(cancelled):
+    """A late detached snapshot cannot mutate a newly selected active session."""
+    store = MemorySessionStore()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_blocking(function, *args):
+        """Delay storage until the active session changes."""
+        started.set()
+        await release.wait()
+        return function(*args)
+
+    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking)
+    replacement = Session(name="Replacement", name_source="user")
+
+    async def replace_while_saving():
+        """Replace active state before allowing the detached save to finish."""
+        pending = asyncio.create_task(
+            manager.add_message_async(Message(role="assistant", content="late"))
+        )
+        await started.wait()
+        manager.load_session(replacement)
+        if cancelled:
+            pending.cancel()
+            await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError if cancelled else RuntimeError):
+            await pending
+
+    asyncio.run(replace_while_saving())
+
+    assert manager.session is replacement
+    assert manager.messages == []
+
+
 def test_manager_does_not_commit_when_reference_cache_activation_fails():
     """A cache failure leaves both the active session and durable store unchanged."""
     store = Mock(spec=SessionStore)
@@ -1053,6 +1427,69 @@ def test_manager_generates_session_names_asynchronously_and_keeps_sync_generator
 
     assert fallback_threads and fallback_threads[0] != owner
     assert session.name == "Generated title"
+
+
+def test_async_session_name_generation_reports_legacy_worker_failure(monkeypatch):
+    """A synchronous name generator failure is reported after its worker settles."""
+    interaction = Mock(spec=Interaction)
+    logger = Mock()
+    monkeypatch.setattr(session_manager_module, "_LOGGER", logger)
+    manager = SessionManager(interaction=interaction)
+    manager.add_user_message("Question")
+    manager.add_message(Message(role="assistant", content="Answer"))
+
+    def fail_generation(*_args):
+        """Raise a representative legacy generator failure."""
+        raise RuntimeError("generator unavailable")
+
+    asyncio.run(manager.generate_session_name_async(SimpleNamespace(generate=fail_generation)))
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "session.name_generation_failed"
+    assert logger.log.call_args.kwargs["extra"]["exception.type"] == "builtins.RuntimeError"
+
+
+@pytest.mark.parametrize("worker_fails", [False, True])
+def test_async_session_name_generation_settles_legacy_worker_before_cancellation(worker_fails):
+    """Cancelling legacy naming waits for the synchronous generator without applying its result."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_blocking(function, *args):
+        """Wait for the test to cancel before completing detached name generation."""
+        started.set()
+        await release.wait()
+        return function(*args)
+
+    manager = SessionManager(async_blocking_runner=run_blocking)
+    manager.add_user_message("Question")
+    manager.add_message(Message(role="assistant", content="Answer"))
+
+    def generate(*_args):
+        """Return a title or fail after the worker is released."""
+        if worker_fails:
+            raise RuntimeError("generator unavailable")
+        return "Generated title"
+
+    generator = SimpleNamespace(generate=generate)
+
+    async def cancel_generation():
+        """Cancel naming while its synchronous generator is still owned."""
+        pending = asyncio.create_task(manager.generate_session_name_async(generator))
+        await started.wait()
+        pending.cancel()
+        await asyncio.sleep(0)
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await pending
+        if worker_fails:
+            assert any("RuntimeError" in note for note in captured.value.__notes__)
+
+    asyncio.run(cancel_generation())
+
+    assert manager.session.name == "Question"
+    assert manager.session.name_source == "initial"
 
 
 def test_manager_async_name_generation_skips_incomplete_exchange_and_reports_failure(monkeypatch):

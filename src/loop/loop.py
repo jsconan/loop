@@ -225,6 +225,8 @@ class Loop:
         )
         configured_instructions.prepare(configured_agent)
         configured_commands = CommandManager(interaction=configured_interaction)
+        configured_sessions.set_async_blocking_runner(configured_commands.run_blocking)
+        configured_permissions.set_async_blocking_runner(configured_commands.run_blocking)
         configured_selection = ModelSelection(
             backend,
             configured_sessions,
@@ -274,7 +276,13 @@ class Loop:
         configured_commands.register_providers(providers)
         skill_hints_enabled = mention_manager is None
         configured_mentions = mention_manager or MentionManager(
-            (ProjectPathMentionHandler(directory_reference),)
+            (
+                ProjectPathMentionHandler(
+                    directory_reference,
+                    sync_blocking_runner=configured_commands.run_blocking_sync,
+                    async_blocking_runner=configured_commands.run_blocking,
+                ),
+            )
         )
         completion_adapters = list(configured_mentions.completion_adapters)
         if skill_hints_enabled:
@@ -762,8 +770,8 @@ class Loop:
                             )
                         else:
                             self._interaction.info(f"Attached {reference.path}: {included} bytes.")
+                    await self._session_manager.add_user_message_async(user_input, context=context)
                     telemetry_activity("message.accepted", component="session_manager")
-                    self._session_manager.add_user_message(user_input, context=context)
                     result = await self._agent_runner.run_async()
                     await self._complete_agent_run_async(result)
             finally:

@@ -1481,14 +1481,13 @@ def test_run_async_handles_skill_priorities_and_attached_reference_sizes(tmp_pat
         ContextReference(
             kind="file",
             path="large.txt",
-            content="te",
+            content="text",
             included_bytes=2,
             size_bytes=4,
             truncated=True,
         ),
     ]
     loop._mention_manager.resolve_async = AsyncMock(return_value=references)
-    loop._session_manager.add_user_message = Mock()
     loop.agent_runner.recover_session_async = AsyncMock(
         return_value=SimpleNamespace(pending=False, result=None)
     )
