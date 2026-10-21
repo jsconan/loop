@@ -58,6 +58,37 @@ class ResponseOutcome(Enum):
     MASKED_INPUT_REQUIRED = "masked_input_required"
 
 
+class InputAdmissionKind(Enum):
+    """Identify ordinary input and owner shutdown admissions."""
+
+    MESSAGE = "message"
+    STOP = "stop"
+
+
+@dataclass(order=True, frozen=True)
+class InputAdmission:
+    """Carry one prioritized input or shutdown event into the session owner.
+
+    Args:
+        priority (int): Queue priority, with steering ahead of ordinary queued input.
+        sequence (int): Monotonic arrival order used to break priority ties.
+        kind (InputAdmissionKind): Whether this event carries a message or shutdown signal.
+        message (str | None): Submitted message for a message event, or ``None`` for shutdown.
+    """
+
+    priority: int
+    sequence: int
+    kind: InputAdmissionKind = field(compare=False)
+    message: str | None = field(default=None, compare=False)
+
+
+class ConversationRunState(Enum):
+    """Describe the owner lifecycle around an input boundary."""
+
+    IDLE = "idle"
+    WORKING = "working"
+
+
 @dataclass
 class InteractionCall:
     """Carry one UI call whose execution and result belong to the UI thread.
@@ -87,16 +118,27 @@ class InteractionCall:
 
 
 @dataclass
-class InputReady:
-    """Announce a safe conversation input boundary and its completion source.
+class RunStateChanged:
+    """Publish that the conversation owner reached an input or work boundary.
 
     Args:
         completer (Completer): Live completion source guarded by execution ownership.
-        busy (bool): Whether execution has consumed input and is starting work. Defaults to False.
+        state (ConversationRunState): Whether the owner is waiting for input or working.
         result (Future): Acknowledgement received by the execution thread. Defaults to a fresh
             future for this transition.
     """
 
     completer: Completer
-    busy: bool = False
+    state: ConversationRunState = ConversationRunState.IDLE
     result: Future = field(default_factory=Future)
+
+
+@dataclass
+class ConversationCompletion:
+    """Carry the settled outcome of the conversation owner task.
+
+    Args:
+        error (BaseException | None): Failure raised by the owner, or ``None`` after success.
+    """
+
+    error: BaseException | None = None

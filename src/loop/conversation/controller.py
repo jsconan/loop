@@ -35,10 +35,14 @@ from .models import (
     EVENT_PROMPT,
     EVENT_TERMINAL,
     EVENT_TERMINAL_EXIT,
+    ConversationCompletion,
+    ConversationRunState,
     ConversationStatus,
-    InputReady,
+    InputAdmission,
+    InputAdmissionKind,
     InteractionCall,
     ResponseOutcome,
+    RunStateChanged,
     SteeringOutcome,
 )
 
@@ -116,11 +120,11 @@ class SessionController:
     _command_manager: CommandManager | None
     _command_completer: CompletionManager
     _control: RunControl
-    _inbox: PriorityQueue
+    _inbox: PriorityQueue[InputAdmission]
     _sequence: count
     _gate: RLock
     _loop: asyncio.AbstractEventLoop | None
-    _events: asyncio.Queue | None
+    _events: asyncio.Queue[InteractionCall | RunStateChanged] | None
     _pending: InteractionCall | None
     _completer: Completer | None
     _ready: bool
@@ -655,7 +659,7 @@ class SessionController:
             if not self._control.stopped:
                 raise
 
-    def _send(self, event: InteractionCall | InputReady) -> object:
+    def _send(self, event: InteractionCall | RunStateChanged) -> object:
         """Send one acknowledged UI request from the execution owner."""
         if get_ident() == self._ui_thread:
             if not self._async_owner:
@@ -683,7 +687,7 @@ class SessionController:
         asyncio.run_coroutine_threadsafe(events.put(event), loop).result()
         return event.result.result()
 
-    async def _send_async(self, event: InteractionCall) -> object:
+    async def _send_async(self, event: InteractionCall | RunStateChanged) -> object:
         """Send and await one correlated UI request from async conversation ownership."""
         events = cast(asyncio.Queue, self._events)
         await events.put(event)
@@ -695,34 +699,38 @@ class SessionController:
             return False
         self._gate.release()
         try:
-            self._send(InputReady(completer))
-            _, _, message = self._inbox.get()
+            self._send(RunStateChanged(completer))
+            admission = self._inbox.get()
         finally:
             # Restore the owner's existing scope after lending the gate to completion readers.
             self._gate.acquire()
+        if admission.kind is InputAdmissionKind.STOP:
+            return False
         if self._control.stopped:
             return False
-        self._send(InputReady(completer, busy=True))
-        return message
+        self._send(RunStateChanged(completer, ConversationRunState.WORKING))
+        return admission.message
 
     async def _receive_async(self, completer: Completer) -> object:
         """Await the next admitted input without blocking the UI event loop."""
         if self._control.stopped:
             return False
-        await self._send_async(InputReady(completer))
+        await self._send_async(RunStateChanged(completer))
         while True:
             try:
-                _, _, message = self._inbox.get_nowait()
+                admission = self._inbox.get_nowait()
                 break
             except Empty:
                 self._input_signal.clear()
                 if not self._inbox.empty():
                     continue
                 await self._input_signal.wait()
+        if admission.kind is InputAdmissionKind.STOP:
+            return False
         if self._control.stopped:
             return False
-        await self._send_async(InputReady(completer, busy=True))
-        return message
+        await self._send_async(RunStateChanged(completer, state=ConversationRunState.WORKING))
+        return admission.message
 
     async def _drive(self, worker: asyncio.Future, *, route_idle_commands: bool) -> None:
         """Multiplex execution requests and user input without sharing domain state."""
@@ -798,7 +806,11 @@ class SessionController:
                     if not submitted.cancelled():
                         await self._accept(submitted, route_idle_commands=route_idle_commands)
                 if worker in done:
-                    worker.result()
+                    completion = ConversationCompletion(
+                        asyncio.CancelledError() if worker.cancelled() else worker.exception()
+                    )
+                    if completion.error is not None:
+                        raise completion.error
                     worker_done = True
                 if command_task is not None and command_task in done:
                     self._command_task = None
@@ -822,12 +834,12 @@ class SessionController:
             )
             self._message_input = None
 
-    async def _deliver(self, event: InteractionCall | InputReady) -> None:
+    async def _deliver(self, event: InteractionCall | RunStateChanged) -> None:
         """Apply one UI event or await its blocking request through the native input surface."""
-        if isinstance(event, InputReady):
+        if isinstance(event, RunStateChanged):
             self._ready = True
-            self._idle = not event.busy
-            if not event.busy:
+            self._idle = event.state is ConversationRunState.IDLE
+            if event.state is ConversationRunState.IDLE:
                 self._idle_command_pending = False
             self._completer = GuardedCompleter(
                 event.completer,
@@ -929,7 +941,9 @@ class SessionController:
         """Admit bounded input without losing existing work when the mailbox is full."""
         active_interaction = interaction if interaction is not None else self._source
         try:
-            self._inbox.put_nowait((priority, next(self._sequence), value))
+            self._inbox.put_nowait(
+                InputAdmission(priority, next(self._sequence), InputAdmissionKind.MESSAGE, value)
+            )
         except Full:
             telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
             active_interaction.warning(
@@ -959,7 +973,14 @@ class SessionController:
         def admit() -> bool:
             """Insert without UI work while run-control admission is locked."""
             try:
-                self._inbox.put_nowait((_STEERING_PRIORITY, sequence, message))
+                self._inbox.put_nowait(
+                    InputAdmission(
+                        _STEERING_PRIORITY,
+                        sequence,
+                        InputAdmissionKind.MESSAGE,
+                        message,
+                    )
+                )
             except Full:
                 return False
             return True
@@ -1050,7 +1071,13 @@ class SessionController:
             except Empty:
                 break
             discarded += 1
-        self._inbox.put_nowait((_INPUT_PRIORITY, next(self._sequence), False))
+        self._inbox.put_nowait(
+            InputAdmission(
+                _INPUT_PRIORITY,
+                next(self._sequence),
+                InputAdmissionKind.STOP,
+            )
+        )
         loop = self._loop
         if loop is not None:
             if get_ident() == self._ui_thread:

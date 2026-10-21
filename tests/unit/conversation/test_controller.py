@@ -31,6 +31,8 @@ from loop.conversation.models import (
     EVENT_CONFIRM,
     EVENT_PROMPT,
     EVENT_TERMINAL,
+    InputAdmission,
+    InputAdmissionKind,
     InteractionCall,
     ResponseOutcome,
     SteeringOutcome,
@@ -1122,10 +1124,11 @@ def test_queue_requires_a_run_and_preserves_command_like_text(ui):
     with controller.control.execution():
         assert controller.queue("/exit", ui) is True
 
-    priority, _sequence, message = controller._inbox.get_nowait()
-    assert priority == 1
-    assert message == SteeringMessage("/exit")
-    assert isinstance(message, SteeringMessage)
+    admission = controller._inbox.get_nowait()
+    assert admission.priority == 1
+    assert admission.kind is InputAdmissionKind.MESSAGE
+    assert admission.message == SteeringMessage("/exit")
+    assert isinstance(admission.message, SteeringMessage)
 
 
 def test_default_steering_admission_falls_back_to_ordinary_input_while_idle(ui):
@@ -1134,9 +1137,10 @@ def test_default_steering_admission_falls_back_to_ordinary_input_while_idle(ui):
 
     assert controller._enqueue_steering("message") is True
 
-    _priority, _sequence, message = controller._inbox.get_nowait()
-    assert message == "message"
-    assert not isinstance(message, SteeringMessage)
+    admission = controller._inbox.get_nowait()
+    assert admission.kind is InputAdmissionKind.MESSAGE
+    assert admission.message == "message"
+    assert not isinstance(admission.message, SteeringMessage)
 
 
 def test_steering_admission_without_a_controller_loop_still_queues(ui):
@@ -1146,8 +1150,9 @@ def test_steering_admission_without_a_controller_loop_still_queues(ui):
     with controller.control.execution():
         assert controller._enqueue_steering("message") is True
 
-    _priority, _sequence, message = controller._inbox.get_nowait()
-    assert message == SteeringMessage("message")
+    admission = controller._inbox.get_nowait()
+    assert admission.kind is InputAdmissionKind.MESSAGE
+    assert admission.message == SteeringMessage("message")
 
 
 def test_steering_admission_from_a_non_ui_thread_wakes_the_controller_loop(ui):
@@ -1227,6 +1232,41 @@ def test_controller_accepts_messages_and_status_during_serialized_work(ui):
     assert len(set(execution_threads)) == 1
     assert execution_threads[0] != get_ident()
     ui.conversation_ended.assert_called_once_with()
+
+
+def test_sync_receive_discards_admitted_input_when_stop_arrives_at_boundary(ui):
+    """A stop that races input consumption prevents the owner from starting more work."""
+    controller = SessionController(ui)
+    controller._inbox.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "late"))
+    events = []
+
+    def send(event):
+        """Request stop after publishing the idle boundary but before reading input."""
+        events.append(event)
+        controller._control.stop()
+
+    controller._send = send
+    with controller._gate:
+        assert controller._receive(DummyCompleter()) is False
+
+    assert len(events) == 1
+
+
+def test_async_receive_discards_admitted_input_when_stop_arrives_at_boundary(ui):
+    """A stop that races async input consumption prevents the owner from starting more work."""
+    controller = SessionController(ui)
+    controller._inbox.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "late"))
+    events = []
+
+    async def send(event):
+        """Request stop after publishing the idle boundary but before reading input."""
+        events.append(event)
+        controller._control.stop()
+
+    controller._send_async = send
+
+    assert asyncio.run(controller._receive_async(DummyCompleter())) is False
+    assert len(events) == 1
 
 
 def test_ordinary_input_during_active_run_is_deferred_steering(ui):
@@ -1608,7 +1648,7 @@ def test_submitted_chat_remains_queued_when_a_modal_question_arrives(ui):
         await controller._drive(worker, route_idle_commands=False)
 
     asyncio.run(scenario())
-    assert controller._inbox.get_nowait()[2] == "ordinary chat"
+    assert controller._inbox.get_nowait().message == "ordinary chat"
     assert controller._pending is None
     assert request.result.result() == "private response"
 
@@ -2106,7 +2146,7 @@ def test_async_controller_rechecks_queue_after_a_racing_admission(ui):
             """Initialize a pre-admitted message and one synthetic read race."""
             super().__init__()
             self._first_read = True
-            self.put((1, 0, "raced"))
+            self.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "raced"))
 
         def get_nowait(self):
             """Return an empty result once so the receiver checks the queue again."""
@@ -2157,7 +2197,7 @@ def test_async_controller_handles_inline_output_and_rejects_sync_input(ui):
 def test_async_controller_settles_failures_and_reports_discarded_input(ui):
     """Execution failures remain primary while queue-reporting errors are attached."""
     controller = SessionController(ui)
-    controller._inbox.put((1, 0, "queued"))
+    controller._inbox.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "queued"))
     ui.warning.side_effect = OSError("warning failed")
 
     async def conversation(_receive):
@@ -2356,7 +2396,7 @@ def test_async_controller_reports_discarded_input_failure_without_primary_error(
     async def conversation(receive):
         """Wait for UI exit while a previously queued input is discarded."""
         assert await receive(DummyCompleter()) == "hello"
-        controller._inbox.put((1, 0, "queued"))
+        controller._inbox.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "queued"))
         started.set()
         await stopping.wait()
 
