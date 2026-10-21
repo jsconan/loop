@@ -2,11 +2,13 @@
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock
+from uuid import UUID
 
 import pytest
 
 from loop import ConsoleInteraction, Interaction, Problem, RunMetrics, ToolResultPresentationSpec
 from loop.conversation.interaction import MailboxInteraction
+from loop.utils import interaction_operation, interaction_run
 
 
 def test_mailbox_async_input_uses_the_source_when_unbound():
@@ -134,6 +136,55 @@ def test_mailbox_prompts_preserve_masking_choices_and_confirmation_defaults():
     assert request.kwargs == {"default": True}
     source.prompt.assert_not_called()
     source.confirm.assert_not_called()
+
+
+def test_mailbox_requests_carry_scoped_session_run_and_operation_identity():
+    """Every marshalled request has a unique ID and inherits its active operation identity."""
+    source = Mock(spec=Interaction)
+    requests = []
+    interaction = MailboxInteraction(source)
+    interaction.bind(lambda request: requests.append(request))
+
+    with interaction_run("session-a"), interaction_operation("tool-call-a"):
+        interaction.info("working")
+        interaction.confirm("Approve?")
+
+    assert len(requests) == 2
+    assert requests[0].request_id != requests[1].request_id
+    assert UUID(requests[0].request_id).version in {4, 7}
+    assert all(request.session_id == "session-a" for request in requests)
+    assert all(request.run_id is not None for request in requests)
+    assert all(request.run_id == requests[0].run_id for request in requests)
+    assert all(request.operation_id == "tool-call-a" for request in requests)
+
+
+def test_mailbox_async_request_carries_scoped_correlation_identity():
+    """An asynchronous prompt carries the same immutable correlation as sync requests."""
+    source = MagicMock(spec=ConsoleInteraction)
+    source.prompt_async = AsyncMock(return_value="answer")
+    requests = []
+
+    async def dispatch(request):
+        """Capture the correlated request and return the deterministic answer."""
+        requests.append(request)
+        return await request.function(*request.args, **request.kwargs)
+
+    interaction = MailboxInteraction(source)
+    interaction.bind(None, dispatch)
+
+    async def scenario():
+        """Issue an async prompt inside an operation identity scope."""
+        with interaction_run("session-b"), interaction_operation("tool-call-b"):
+            assert await interaction.prompt_async("Question?") == "answer"
+
+    asyncio.run(scenario())
+
+    request = requests[0]
+    assert request.request_id
+    assert UUID(request.request_id).version in {4, 7}
+    assert request.session_id == "session-b"
+    assert request.run_id is not None
+    assert request.operation_id == "tool-call-b"
 
 
 @pytest.mark.parametrize("exit_commands", [None, "stop", ["q", "quit"]])

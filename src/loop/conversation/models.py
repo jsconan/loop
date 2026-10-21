@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from prompt_toolkit.completion import Completer
 
+from ..utils import new_uuid
+
 EVENT_OUTPUT = "output"
 EVENT_PROMPT = "prompt"
 EVENT_CONFIRM = "confirm"
@@ -67,6 +69,10 @@ class InteractionCall:
         kind (str): Output, separate input, or terminal handoff operation. Defaults to output.
         result (Future): Acknowledgement received by the execution thread. Defaults to a fresh
             future for this call.
+        request_id (str): Unique identity for this interaction request.
+        session_id (str | None): Session owning the request, when available.
+        run_id (str | None): Agent run owning the request, when available.
+        operation_id (str | None): Tool operation owning the request, when available.
     """
 
     function: Callable[..., Any]
@@ -74,6 +80,10 @@ class InteractionCall:
     kwargs: dict
     kind: Literal["output", "prompt", "confirm", "terminal", "terminal_exit"] = EVENT_OUTPUT
     result: Future = field(default_factory=Future)
+    request_id: str = field(default_factory=lambda: str(new_uuid()))
+    session_id: str | None = None
+    run_id: str | None = None
+    operation_id: str | None = None
 
 
 @dataclass

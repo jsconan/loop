@@ -40,7 +40,7 @@ from ..session import SessionManager, SessionRecoveryState
 from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
 from ..tooling.file_observations import FileObservations
 from ..tooling.utils import serialize_tool_problem
-from ..utils import PathReference, utc_now
+from ..utils import PathReference, interaction_operation, interaction_run, utc_now
 from .agent import Agent
 from .models import AgentRecoveryStatus, AgentRunResult
 
@@ -306,7 +306,11 @@ class AgentRunner:
             RuntimeError: If the configured control already owns another run.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
-        with self._session_manager.execution(), telemetry_span():
+        with (
+            interaction_run(self._session_manager.session.id),
+            self._session_manager.execution(),
+            telemetry_span(),
+        ):
             telemetry_activity("agent.run.started", component="agent_runner")
             result = self._run_from_boundary()
             telemetry_activity(
@@ -330,7 +334,11 @@ class AgentRunner:
             SessionExecutionConflictError: If another owner is executing this logical session.
             asyncio.CancelledError: If the owning async task is cancelled.
         """
-        with self._session_manager.execution(), telemetry_span():
+        with (
+            interaction_run(self._session_manager.session.id),
+            self._session_manager.execution(),
+            telemetry_span(),
+        ):
             telemetry_activity("agent.run.started", component="agent_runner")
             result = await self._run_from_boundary_async()
             telemetry_activity(
@@ -352,17 +360,18 @@ class AgentRunner:
             RuntimeError: If the configured control already owns another run.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
-        self._checkpoint()
-        state = self._session_manager.recovery_state
-        if state is None:
-            return AgentRecoveryStatus(pending=False)
-        if not self._interaction.confirm(
-            "This session stopped during an agent run. Recover and continue it?",
-            default=False,
-        ):
-            return AgentRecoveryStatus(pending=True)
-        with self._session_manager.execution():
-            return AgentRecoveryStatus(pending=False, result=self._recover(state))
+        with interaction_run(self._session_manager.session.id):
+            self._checkpoint()
+            state = self._session_manager.recovery_state
+            if state is None:
+                return AgentRecoveryStatus(pending=False)
+            if not self._interaction.confirm(
+                "This session stopped during an agent run. Recover and continue it?",
+                default=False,
+            ):
+                return AgentRecoveryStatus(pending=True)
+            with self._session_manager.execution():
+                return AgentRecoveryStatus(pending=False, result=self._recover(state))
 
     async def recover_session_async(self) -> AgentRecoveryStatus:
         """Execute an approved recovery plan using asynchronous interaction and tools.
@@ -376,17 +385,18 @@ class AgentRunner:
             SessionExecutionConflictError: If another owner is executing this logical session.
             asyncio.CancelledError: If the recovery task is cancelled.
         """
-        self._checkpoint()
-        state = self._session_manager.recovery_state
-        if state is None:
-            return AgentRecoveryStatus(pending=False)
-        if not await self._confirm_async(
-            "This session stopped during an agent run. Recover and continue it?",
-            default=False,
-        ):
-            return AgentRecoveryStatus(pending=True)
-        with self._session_manager.execution():
-            return AgentRecoveryStatus(pending=False, result=await self._recover_async(state))
+        with interaction_run(self._session_manager.session.id):
+            self._checkpoint()
+            state = self._session_manager.recovery_state
+            if state is None:
+                return AgentRecoveryStatus(pending=False)
+            if not await self._confirm_async(
+                "This session stopped during an agent run. Recover and continue it?",
+                default=False,
+            ):
+                return AgentRecoveryStatus(pending=True)
+            with self._session_manager.execution():
+                return AgentRecoveryStatus(pending=False, result=await self._recover_async(state))
 
     def _recover(self, state: SessionRecoveryState) -> AgentRunResult:
         """Continue one approved recovery plan from its durable execution boundary."""
@@ -436,10 +446,14 @@ class AgentRunner:
             self._checkpoint()
             if pending.status == "result_available":
                 continue
-            if pending.status == "outcome_unknown" and not self._interaction.confirm(
-                f"Tool '{pending.call.name}' may already have run. Retry it?",
-                default=False,
-            ):
+            retry = True
+            if pending.status == "outcome_unknown":
+                with interaction_operation(pending.call.call_id):
+                    retry = self._interaction.confirm(
+                        f"Tool '{pending.call.name}' may already have run. Retry it?",
+                        default=False,
+                    )
+            if not retry:
                 self._persist_interrupted_tool_result(pending.call)
                 continue
             tools.extend(
@@ -466,10 +480,14 @@ class AgentRunner:
             self._checkpoint()
             if pending.status == "result_available":
                 continue
-            if pending.status == "outcome_unknown" and not await self._confirm_async(
-                f"Tool '{pending.call.name}' may already have run. Retry it?",
-                default=False,
-            ):
+            retry = True
+            if pending.status == "outcome_unknown":
+                with interaction_operation(pending.call.call_id):
+                    retry = await self._confirm_async(
+                        f"Tool '{pending.call.name}' may already have run. Retry it?",
+                        default=False,
+                    )
+            if not retry:
                 await self._persist_interrupted_tool_result_async(pending.call)
                 continue
             tools.extend(
@@ -770,7 +788,11 @@ class AgentRunner:
             for tool_call in tool_calls:
                 if self._steering_pending():
                     break
-                with telemetry_span():
+                with (
+                    interaction_run(self._session_manager.session.id),
+                    interaction_operation(tool_call.call_id),
+                    telemetry_span(),
+                ):
                     executions.append(
                         self._execute_tool_call(
                             tool_call,
@@ -797,7 +819,11 @@ class AgentRunner:
             for tool_call in tool_calls:
                 if self._steering_pending():
                     break
-                with telemetry_span():
+                with (
+                    interaction_run(self._session_manager.session.id),
+                    interaction_operation(tool_call.call_id),
+                    telemetry_span(),
+                ):
                     executions.append(
                         await self._execute_tool_call_async(
                             tool_call,

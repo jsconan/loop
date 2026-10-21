@@ -47,6 +47,7 @@ from loop import (
     read_text_file,
 )
 from loop.agent import Agent, AgentRunner, AgentRunResult
+from loop.conversation.interaction import MailboxInteraction
 from loop.session.models import RunCompletedEvent
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.tooling import FileObservations
@@ -1650,6 +1651,126 @@ def test_runner_run_async_uses_async_query_and_completes():
     runner.model_selection.record_response_async.assert_awaited_once_with(response.model)
     sessions.add_response.assert_called_once_with(response)
     sessions.record_run.assert_called_once()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_agent_run_interactions_include_the_owned_session_and_run(async_mode):
+    """Both native run paths attach a session and fresh run identity to UI requests."""
+    runner, sessions, _interaction = agent_runner()
+    source = MagicMock(spec=Interaction)
+    requests = []
+
+    def dispatch(request):
+        """Capture a marshalled interaction request and invoke its source operation."""
+        requests.append(request)
+        return request.function(*request.args, **request.kwargs)
+
+    interaction = MailboxInteraction(source)
+    interaction.bind(dispatch)
+    runner._interaction = interaction
+    expected = AgentRunResult(final_response=None, turns=0, stop_reason="completed")
+
+    if async_mode:
+
+        async def boundary():
+            """Emit one interaction from the async run body."""
+            interaction.info("async run")
+            return expected
+
+        runner._run_from_boundary_async = AsyncMock(side_effect=boundary)
+        assert asyncio.run(runner.run_async()) is expected
+    else:
+
+        def boundary():
+            """Emit one interaction from the sync run body."""
+            interaction.info("sync run")
+            return expected
+
+        runner._run_from_boundary = Mock(side_effect=boundary)
+        assert runner.run() is expected
+
+    assert len(requests) == 1
+    assert requests[0].session_id == sessions.session.id
+    assert requests[0].run_id
+    assert requests[0].operation_id is None
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_tool_interactions_include_the_model_call_operation_id(async_mode):
+    """Tool UI requests preserve the model call identity alongside session and run IDs."""
+    runner, sessions, _interaction = agent_runner()
+    source = MagicMock(spec=Interaction)
+    requests = []
+
+    def dispatch(request):
+        """Capture a marshalled request and invoke the source output operation."""
+        requests.append(request)
+        return request.function(*request.args, **request.kwargs)
+
+    interaction = MailboxInteraction(source)
+    interaction.bind(dispatch)
+    runner._interaction = interaction
+    tool_call = ToolCall(call_id="call-identity", name="echo", arguments="{}")
+    runner.agent.tools.call_with_timing.return_value = ('{"ok":true}', 0.01)
+    runner.agent.tools.call_with_timing_async = AsyncMock(return_value=('{"ok":true}', 0.01))
+
+    if async_mode:
+        asyncio.run(
+            runner.handle_tool_calls_async(
+                Response(answer="", reasoning="", tool_calls=(tool_call,))
+            )
+        )
+    else:
+        runner.handle_tool_calls(Response(answer="", reasoning="", tool_calls=(tool_call,)))
+
+    tool_request = next(request for request in requests if request.function == source.tool_call)
+    assert tool_request.session_id == sessions.session.id
+    assert tool_request.run_id
+    assert tool_request.operation_id == tool_call.call_id
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_uncertain_tool_retry_prompt_carries_the_original_operation_id(async_mode):
+    """Recovery approval stays correlated to the uncertain model tool call."""
+    final = Response(answer="reconciled", reasoning="")
+    runner, sessions, _interaction = agent_runner(responses=[final])
+    source = MagicMock(spec=ConsoleInteraction if async_mode else Interaction)
+    requests = []
+
+    def dispatch(request):
+        """Capture a sync recovery prompt and invoke its source operation."""
+        requests.append(request)
+        return request.function(*request.args, **request.kwargs)
+
+    async def dispatch_async(request):
+        """Capture an async recovery prompt and await its source operation."""
+        requests.append(request)
+        return await request.function(*request.args, **request.kwargs)
+
+    if async_mode:
+        source.confirm_async = AsyncMock(side_effect=[True, False])
+        runner.query_async = AsyncMock(return_value=final)
+    else:
+        source.confirm.side_effect = [True, False]
+
+    interaction = MailboxInteraction(source)
+    interaction.bind(dispatch, dispatch_async)
+    runner._interaction = interaction
+    call = ToolCall(call_id="uncertain-call", name="mutate", arguments="{}")
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=call, status="outcome_unknown"),),
+    )
+
+    if async_mode:
+        asyncio.run(runner.recover_session_async())
+    else:
+        runner.recover_session()
+
+    retry_request = next(request for request in requests if "Retry it?" in request.args[0])
+    assert retry_request.session_id == sessions.session.id
+    assert retry_request.run_id
+    assert retry_request.operation_id == call.call_id
 
 
 @pytest.mark.parametrize(

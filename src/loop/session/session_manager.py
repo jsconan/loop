@@ -11,7 +11,6 @@ from dataclasses import fields
 from datetime import datetime
 from threading import Lock, get_ident
 from typing import Any
-from uuid import uuid7
 
 from ..errors import Problem, log_problem
 from ..instructions.models import CapturedInstruction
@@ -48,6 +47,7 @@ from ..utils import (
     content_identity,
     encode_content_cursor,
     get_binary,
+    new_uuid,
     register_cached_metadata,
     run_in_worker,
     sha256_digest,
@@ -538,7 +538,7 @@ class SessionManager:
         instruction_references = tuple(references)
         provider = result.items[0].provider if result.items else ""
         compaction = Compaction(
-            id=str(uuid7()),
+            id=str(new_uuid()),
             boundary=len(self._session.messages),
             created_at=utc_now(),
             provider=provider,
@@ -591,7 +591,7 @@ class SessionManager:
         instruction_references = tuple(references)
         provider = result.items[0].provider if result.items else ""
         compaction = Compaction(
-            id=str(uuid7()),
+            id=str(new_uuid()),
             boundary=len(self._session.messages),
             created_at=utc_now(),
             provider=provider,
@@ -1092,7 +1092,7 @@ class SessionManager:
             ):
                 session.events.append(
                     ToolExecutionCompletedEvent(
-                        id=str(uuid7()),
+                        id=str(new_uuid()),
                         created_at=utc_now(),
                         call_id=call_id,
                         succeeded=succeeded,
@@ -1149,7 +1149,7 @@ class SessionManager:
             ):
                 session.events.append(
                     ToolExecutionCompletedEvent(
-                        id=str(uuid7()),
+                        id=str(new_uuid()),
                         created_at=utc_now(),
                         call_id=call_id,
                         succeeded=succeeded,
@@ -1203,7 +1203,7 @@ class SessionManager:
         ):
             raise ValueError(f"Unknown tool call '{call_id}'.")
         self._persist_event(
-            ToolExecutionStartedEvent(id=str(uuid7()), created_at=utc_now(), call_id=call_id)
+            ToolExecutionStartedEvent(id=str(new_uuid()), created_at=utc_now(), call_id=call_id)
         )
 
     async def record_tool_execution_started_async(self, call_id: str) -> None:
@@ -1222,7 +1222,7 @@ class SessionManager:
         ):
             raise ValueError(f"Unknown tool call '{call_id}'.")
         await self._persist_event_async(
-            ToolExecutionStartedEvent(id=str(uuid7()), created_at=utc_now(), call_id=call_id)
+            ToolExecutionStartedEvent(id=str(new_uuid()), created_at=utc_now(), call_id=call_id)
         )
 
     @staticmethod
@@ -1286,7 +1286,7 @@ class SessionManager:
             result (AuthorizationResult): Policy, approval, and effective outcome.
         """
         event = PermissionEvent(
-            id=str(uuid7()),
+            id=str(new_uuid()),
             created_at=utc_now(),
             result=result,
         )
@@ -1305,7 +1305,7 @@ class SessionManager:
             asyncio.CancelledError: If the owning task is cancelled after persistence settles.
         """
         event = PermissionEvent(
-            id=str(uuid7()),
+            id=str(new_uuid()),
             created_at=utc_now(),
             result=result,
         )
@@ -1328,7 +1328,7 @@ class SessionManager:
             RunCompletedEvent: Persisted event suitable for immediate presentation.
         """
         event = RunCompletedEvent(
-            id=str(uuid7()),
+            id=str(new_uuid()),
             created_at=utc_now(),
             stop_reason=stop_reason,
             started_at=started_at,
@@ -1357,7 +1357,7 @@ class SessionManager:
             asyncio.CancelledError: If the owning task is cancelled after persistence settles.
         """
         event = RunCompletedEvent(
-            id=str(uuid7()),
+            id=str(new_uuid()),
             created_at=utc_now(),
             stop_reason=stop_reason,
             started_at=started_at,

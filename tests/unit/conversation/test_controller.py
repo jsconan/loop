@@ -875,6 +875,178 @@ def test_request_response_without_value_keeps_the_native_prompt_active(ui):
     assert controller._pending is request
 
 
+def test_request_response_rejects_a_revoked_request(ui):
+    """A completed stale request cannot receive another direct answer."""
+    controller = SessionController(ui)
+    request = InteractionCall(ui.prompt, ("Question",), {}, kind=EVENT_PROMPT)
+    request.result.set_exception(KeyboardInterrupt())
+    controller._pending = request
+
+    assert controller.request_response("late answer") is ResponseOutcome.NO_REQUEST
+    assert controller._pending is None
+
+
+def test_request_response_does_not_clear_a_replacement_request(ui):
+    """A concurrent replacement stays pending when an older request is already revoked."""
+    controller = SessionController(ui)
+    request = InteractionCall(ui.prompt, ("Old question",), {}, kind=EVENT_PROMPT)
+    replacement = InteractionCall(ui.prompt, ("New question",), {}, kind=EVENT_PROMPT)
+    controller._pending = request
+
+    def done():
+        """Simulate a new request becoming current before stale-state cleanup."""
+        controller._pending = replacement
+        return True
+
+    request.result.done = done
+
+    assert controller.request_response("late answer") is ResponseOutcome.NO_REQUEST
+    assert controller._pending is replacement
+
+
+def test_interrupt_preserves_a_response_that_won_the_race(ui):
+    """An interrupt cannot overwrite a response future completed just before revocation."""
+    controller = SessionController(ui)
+    request = InteractionCall(ui.prompt, ("Question",), {}, kind=EVENT_PROMPT)
+    request.result.set_result("answered")
+    controller._pending = request
+
+    with controller.control.execution():
+        assert controller.request_interrupt() is True
+
+    assert request.result.result() == "answered"
+    assert controller._pending is None
+
+
+def test_interrupt_does_not_clear_a_replacement_request(ui):
+    """An interrupt leaves a newer request untouched when revocation races with delivery."""
+    controller = SessionController(ui)
+    request = InteractionCall(ui.prompt, ("Old question",), {}, kind=EVENT_PROMPT)
+    replacement = InteractionCall(ui.prompt, ("New question",), {}, kind=EVENT_PROMPT)
+    controller._pending = request
+
+    def done():
+        """Simulate delivery replacing the old request during revocation."""
+        controller._pending = replacement
+        return True
+
+    request.result.done = done
+
+    with controller.control.execution():
+        assert controller.request_interrupt() is True
+
+    assert controller._pending is replacement
+
+
+def test_shutdown_preserves_a_response_that_won_the_race(ui):
+    """Shutdown leaves an already completed request intact while clearing pending state."""
+    controller = SessionController(ui)
+    request = InteractionCall(ui.prompt, ("Question",), {}, kind=EVENT_PROMPT)
+    request.result.set_result("answered")
+    controller._pending = request
+
+    controller._stop()
+
+    assert request.result.result() == "answered"
+    assert controller._pending is None
+
+
+def test_shutdown_does_not_clear_a_replacement_request(ui):
+    """Shutdown cleanup cannot erase a request installed after its stale snapshot."""
+    controller = SessionController(ui)
+    request = InteractionCall(ui.prompt, ("Old question",), {}, kind=EVENT_PROMPT)
+    replacement = InteractionCall(ui.prompt, ("New question",), {}, kind=EVENT_PROMPT)
+    controller._pending = request
+
+    def done():
+        """Simulate a replacement appearing while shutdown revokes the old future."""
+        controller._pending = replacement
+        return True
+
+    request.result.done = done
+    controller._stop()
+
+    assert controller._pending is replacement
+
+
+def test_deliver_ignores_an_interaction_revoked_before_ui_delivery(ui):
+    """A revoked request waiting in the event queue is not presented to the user."""
+    controller = SessionController(ui)
+    request = InteractionCall(ui.prompt, ("Question",), {}, kind=EVENT_PROMPT)
+    request.result.set_exception(KeyboardInterrupt())
+
+    asyncio.run(controller._deliver(request))
+
+    assert controller._pending is None
+    ui.prompt_async.assert_not_awaited()
+
+
+def test_late_prompt_value_cannot_complete_a_revoked_interaction(ui):
+    """Shutdown ignores a UI adapter that returns a value after prompt cancellation."""
+    controller = SessionController(ui)
+    started = asyncio.Event()
+
+    async def late_prompt(*_args, **_kwargs):
+        """Return a stale value after cancellation to exercise the revoked request race."""
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            return "stale approval"
+
+    ui.prompt_async.side_effect = late_prompt
+    request = InteractionCall(ui.prompt, ("Approve?",), {}, kind=EVENT_PROMPT)
+    controller._pending = request
+
+    async def scenario():
+        """Cancel the native prompt and let its adapter return a late value."""
+        answering = asyncio.create_task(controller._answer())
+        await started.wait()
+        controller._stop()
+        await answering
+
+    asyncio.run(scenario())
+
+    assert isinstance(request.result.exception(), KeyboardInterrupt)
+    assert controller._pending is None
+
+
+@pytest.mark.parametrize("late_error", [False, True])
+def test_late_prompt_completion_preserves_a_replacement_answer_task(ui, late_error):
+    """A late prompt value or error cannot clear a newer answer task."""
+    controller = SessionController(ui)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def late_prompt(*_args, **_kwargs):
+        """Wait through cancellation until the test releases a stale completion."""
+        started.set()
+        await release.wait()
+        if late_error:
+            raise ValueError("stale prompt failure")
+        return "stale answer"
+
+    ui.prompt_async.side_effect = late_prompt
+    request = InteractionCall(ui.prompt, ("Question?",), {}, kind=EVENT_PROMPT)
+    controller._pending = request
+
+    async def scenario():
+        """Revoke one request while another input task occupies the controller slot."""
+        answering = asyncio.create_task(controller._answer())
+        await started.wait()
+        replacement_input = asyncio.get_running_loop().create_future()
+        controller._answer_input = replacement_input
+        controller._stop()
+        release.set()
+        await answering
+        assert controller._answer_input is replacement_input
+
+    asyncio.run(scenario())
+
+    assert isinstance(request.result.exception(), KeyboardInterrupt)
+    assert controller._pending is None
+
+
 def test_response_completions_handle_confirm_secret_free_text_and_invalid_choices(ui):
     """Only valid, non-secret choices are completed for pending responses."""
     controller = SessionController(ui)

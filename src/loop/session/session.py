@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from mimetypes import guess_type
 from typing import Self
-from uuid import uuid7
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -25,6 +24,7 @@ from ..utils import (
     content_identity,
     encode_content_cursor,
     get_binary,
+    new_uuid,
     utc_now,
     validate_content_handle,
 )
@@ -89,7 +89,7 @@ class Session:
         revision (int): Store-managed persisted snapshot revision. New sessions start at zero.
     """
 
-    id: str = field(default_factory=lambda: str(uuid7()))
+    id: str = field(default_factory=lambda: str(new_uuid()))
     name: str | None = None
     name_source: SessionNameSource | None = None
     messages: list[ConversationItem] = field(default_factory=list)
@@ -135,7 +135,7 @@ class Session:
             if index in checkpoints:
                 self.events.append(
                     CompactionEvent(
-                        id=str(uuid7()),
+                        id=str(new_uuid()),
                         created_at=created_at,
                         compaction_index=checkpoints[index],
                     )
@@ -143,7 +143,7 @@ class Session:
             if index < len(self.messages):
                 self.events.append(
                     ConversationItemEvent(
-                        id=str(uuid7()),
+                        id=str(new_uuid()),
                         created_at=created_at,
                         item_index=index,
                     )
@@ -261,7 +261,7 @@ class Session:
         """Append one canonical conversation item to the replay timeline."""
         self.events.append(
             ConversationItemEvent(
-                id=str(uuid7()),
+                id=str(new_uuid()),
                 created_at=utc_now(),
                 item_index=item_index,
             )
@@ -285,7 +285,7 @@ class Session:
         self.compactions.append(compaction)
         self.events.append(
             CompactionEvent(
-                id=str(uuid7()),
+                id=str(new_uuid()),
                 created_at=utc_now(),
                 compaction_index=len(self.compactions) - 1,
             )
@@ -845,7 +845,7 @@ class Session:
                 if index in checkpoints:
                     events.append(
                         CompactionEvent(
-                            id=str(uuid7()),
+                            id=str(new_uuid()),
                             created_at=created_at,
                             compaction_index=checkpoints[index],
                         ).model_dump(mode="json")
@@ -853,7 +853,7 @@ class Session:
                 if index < len(messages):
                     events.append(
                         ConversationItemEvent(
-                            id=str(uuid7()), created_at=created_at, item_index=index
+                            id=str(new_uuid()), created_at=created_at, item_index=index
                         ).model_dump(mode="json")
                     )
         first_user = next(
@@ -867,7 +867,7 @@ class Session:
         )
         value.update(
             version=_SCHEMA_VERSION,
-            id=value.get("id", str(uuid7())),
+            id=value.get("id", str(new_uuid())),
             name=value.get("name", initial_session_name(first_user) if first_user else None),
             name_source=value.get(
                 "name_source", SESSION_NAME_SOURCE_INITIAL if first_user else None

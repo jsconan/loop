@@ -11,6 +11,7 @@ __all__ = [
     "IgnoreRule",
     "IgnoreRules",
     "IntValueHolder",
+    "InteractionCorrelation",
     "PathHolder",
     "PathInput",
     "PathReference",
@@ -41,6 +42,7 @@ __all__ = [
     "close_awaitable",
     "content_digest",
     "content_identity",
+    "current_interaction_correlation",
     "data_url",
     "decode_content_cursor",
     "encode_content_cursor",
@@ -51,6 +53,8 @@ __all__ = [
     "format_tool_call_arguments",
     "get_binary",
     "has_running_event_loop",
+    "interaction_operation",
+    "interaction_run",
     "is_async_callable",
     "is_binary_file",
     "is_path_ignored",
@@ -61,6 +65,7 @@ __all__ = [
     "load_unique_json",
     "local_now",
     "matches_digest",
+    "new_uuid",
     "normalized_key",
     "parse_command_line",
     "payload_digest",
@@ -114,6 +119,13 @@ from .dates import as_utc, local_now, utc_now
 from .files import is_binary_file, write_text_atomically
 from .generation import GenerationStop, GenerationWatchdog
 from .hashing import matches_digest, payload_digest, sha256_digest
+from .identifiers import new_uuid
+from .interaction_context import (
+    InteractionCorrelation,
+    current_interaction_correlation,
+    interaction_operation,
+    interaction_run,
+)
 from .json import json_encode, load_unique_json
 from .models import (
     BoundedTextContent,

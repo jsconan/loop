@@ -13,7 +13,7 @@ from ..errors import Problem
 from ..interaction import AsyncInteractionInput, Interaction
 from ..interaction.models import ListMarker
 from ..models import RAW_TOOL_RESULT_PRESENTATION, RunMetrics, ToolResultPresentationSpec
-from ..utils import ChoiceItem
+from ..utils import ChoiceItem, current_interaction_correlation
 from .models import (
     EVENT_CONFIRM,
     EVENT_OUTPUT,
@@ -75,7 +75,7 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
         """Execute locally during setup or wait for an acknowledged UI operation."""
         if self._dispatch is None:
             return function(*args, **kwargs)
-        return self._dispatch(InteractionCall(function, args, kwargs, kind))
+        return self._dispatch(self._interaction_call(function, args, kwargs, kind))
 
     async def _call_async(
         self,
@@ -87,9 +87,25 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
         """Request input through the controller's correlated async interaction channel."""
         if self._dispatch_async is None:
             if self._dispatch is not None:
-                return self._dispatch(InteractionCall(function, args, kwargs, kind))
+                return self._dispatch(self._interaction_call(function, args, kwargs, kind))
             return await function(*args, **kwargs)
-        return await self._dispatch_async(InteractionCall(function, args, kwargs, kind))
+        return await self._dispatch_async(self._interaction_call(function, args, kwargs, kind))
+
+    @staticmethod
+    def _interaction_call(
+        function: Callable[..., Any], args: tuple, kwargs: dict, kind: str
+    ) -> InteractionCall:
+        """Create a request envelope with the active execution identity."""
+        correlation = current_interaction_correlation()
+        return InteractionCall(
+            function,
+            args,
+            kwargs,
+            kind,
+            session_id=correlation.session_id,
+            run_id=correlation.run_id,
+            operation_id=correlation.operation_id,
+        )
 
     @contextmanager
     def response_context(self) -> Generator[None]:

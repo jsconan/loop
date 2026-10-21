@@ -232,8 +232,10 @@ class SessionController:
         telemetry_activity("conversation.run.interrupt_requested", component=_STATUS_COMPONENT)
         request = self._pending
         if request is not None:
-            request.result.set_exception(RunInterrupted())
-            self._pending = None
+            if not request.result.done():
+                request.result.set_exception(RunInterrupted())
+            if self._pending is request:
+                self._pending = None
         if self._answer_input is not None and self._loop is not None:
             self._loop.call_soon_threadsafe(self._answer_input.cancel)
         return True
@@ -249,6 +251,10 @@ class SessionController:
         """
         request = self._pending
         if request is None:
+            return ResponseOutcome.NO_REQUEST
+        if request.result.done():
+            if self._pending is request:
+                self._pending = None
             return ResponseOutcome.NO_REQUEST
         if answer is None:
             return ResponseOutcome.PROMPTED
@@ -830,6 +836,8 @@ class SessionController:
             )
             event.result.set_result(None)
             return
+        if event.result.done():
+            return
         if event.kind not in {EVENT_OUTPUT, EVENT_TERMINAL_EXIT}:
             if self._control.stopped:
                 event.result.set_exception(KeyboardInterrupt())
@@ -981,6 +989,7 @@ class SessionController:
     async def _answer(self) -> None:
         """Resolve only the explicit pending request through the UI's async input surface."""
         request = cast(InteractionCall, self._pending)
+        answer_input = None
         try:
             if request.kind == EVENT_TERMINAL:
                 result = request.function(*request.args, **request.kwargs)
@@ -991,22 +1000,31 @@ class SessionController:
                     if request.kind == EVENT_CONFIRM
                     else self._input.prompt_async
                 )
-                self._answer_input = asyncio.create_task(function(*request.args, **request.kwargs))
-                result = await self._answer_input
+                answer_input = asyncio.create_task(function(*request.args, **request.kwargs))
+                self._answer_input = answer_input
+                result = await answer_input
         except asyncio.CancelledError:
-            if not request.result.done():
+            if self._pending is request and not request.result.done():
                 request.result.set_exception(KeyboardInterrupt())
-            interrupted = isinstance(request.result.exception(), RunInterrupted)
-            if not self._stopping and not interrupted:
+            interrupted = (
+                not request.result.cancelled()
+                and request.result.done()
+                and isinstance(request.result.exception(), RunInterrupted)
+            )
+            if self._pending is request and not self._stopping and not interrupted:
                 raise
         except BaseException as error:
-            request.result.set_exception(error)
-            raise
+            if self._pending is request and not request.result.done():
+                request.result.set_exception(error)
+                raise
         else:
-            request.result.set_result(result)
+            if self._pending is request and not request.result.done():
+                request.result.set_result(result)
         finally:
-            self._pending = None
-            self._answer_input = None
+            if self._pending is request:
+                self._pending = None
+            if self._answer_input is answer_input:
+                self._answer_input = None
 
     def _stop(self) -> int:
         """Stop admission, revoke pending input, and wake an idle execution owner."""
@@ -1019,9 +1037,12 @@ class SessionController:
         if self._message_input is not None:
             self._message_input.cancel()
         telemetry_activity("conversation.stopping", component=_STATUS_COMPONENT)
-        if self._pending is not None:
-            self._pending.result.set_exception(KeyboardInterrupt())
-            self._pending = None
+        request = self._pending
+        if request is not None:
+            if not request.result.done():
+                request.result.set_exception(KeyboardInterrupt())
+            if self._pending is request:
+                self._pending = None
         discarded = 0
         while True:
             try:
