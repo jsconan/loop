@@ -105,13 +105,13 @@ def _decode_model_argument(field, raw_value: str) -> object:
 
 
 def get_command_arguments_model(
-    function: Callable[..., None],
+    function: Callable[..., object],
     command_name: str,
 ) -> type[BaseModel]:
     """Build a validating arguments model from a command signature.
 
     Args:
-        function (Callable[..., None]): Function whose parameters define the command schema.
+        function (Callable[..., object]): Function whose parameters define the command schema.
         command_name (str): Slash-free command name used in model and error messages.
 
     Returns:
@@ -165,11 +165,11 @@ def get_command_arguments_model(
     return model
 
 
-def takes_command_context(function: Callable[..., None]) -> bool:
+def takes_command_context(function: Callable[..., object]) -> bool:
     """Determine whether a function requests an injected command context.
 
     Args:
-        function (Callable[..., None]): Function whose first parameter may request context.
+        function (Callable[..., object]): Function whose first parameter may request context.
 
     Returns:
         bool: Whether the first parameter is annotated as ``CommandContext``.

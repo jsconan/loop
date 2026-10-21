@@ -1,6 +1,8 @@
 """Tests for session-owned user commands."""
 
+import asyncio
 import json
+from threading import Event, get_ident
 from unittest.mock import Mock
 from zipfile import ZipFile
 
@@ -13,12 +15,12 @@ from loop import (
     CommandContext,
     CommandManager,
     CompletionManager,
-    Interaction,
     MemorySessionStore,
     Message,
     Session,
     SessionManager,
 )
+from loop.interaction import ConsoleInteraction
 from loop.session import SessionCommands
 from loop.session import commands as session_commands_module
 from loop.session.store import SQLiteSessionStore
@@ -26,7 +28,7 @@ from loop.session.store import SQLiteSessionStore
 
 def test_session_commands_list_resume_rename_and_reset_sessions():
     """Session commands preserve lifecycle behavior and restoration output order."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     store = MemorySessionStore()
     first = Session(name="First topic", name_source="user", model="served-model", tokens=1234)
     first.add_message(Message(role="user", content="Prior question"))
@@ -59,7 +61,7 @@ def test_session_commands_list_resume_rename_and_reset_sessions():
 
 def test_sessions_namespace_matches_shortcuts_and_renames_stored_sessions():
     """The session namespace exposes lifecycle commands and the current-session export shortcut."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     store = MemorySessionStore()
     active = Session(name="Active", name_source="user", model="served-model")
     stored = Session(name="Stored", name_source="user", model="resumed-model")
@@ -90,7 +92,7 @@ def test_sessions_namespace_matches_shortcuts_and_renames_stored_sessions():
 
 def test_sessions_export_completes_persisted_ids_after_the_export_action():
     """Session completion defers export arguments until an export action is selected."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     store = MemorySessionStore()
     store.save(Session(id="saved-session", name="Saved", name_source="user"))
     provider = SessionCommands(SessionManager(session_store=store), Mock())
@@ -174,7 +176,7 @@ def test_sessions_export_completes_persisted_ids_after_the_export_action():
 
 def test_session_command_and_sessions_show_display_current_operational_state():
     """Current-session commands display live state without persisting or restoring history."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     active = Session(
         name="Active topic",
         name_source="user",
@@ -232,7 +234,7 @@ def test_session_command_and_sessions_show_display_current_operational_state():
 
 def test_sessions_namespace_validates_action_arguments():
     """Namespaced session operations reject incomplete and incompatible arguments."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(SessionManager(), Mock()))
 
@@ -290,7 +292,7 @@ def test_sessions_namespace_validates_action_arguments():
 
 def test_session_rename_alias_matches_explicit_and_generated_rename_commands():
     """The singular session namespace preserves explicit and generated renaming behavior."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     generator = Mock()
     generator.generate.return_value = "Generated topic"
     sessions = SessionManager(interaction=interaction)
@@ -313,7 +315,7 @@ def test_session_rename_alias_matches_explicit_and_generated_rename_commands():
 
 def test_resume_reports_unknown_session_ids():
     """Resume requires an ID and translates unknown persisted IDs into argument warnings."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(SessionManager(), Mock()))
 
@@ -326,7 +328,7 @@ def test_resume_reports_unknown_session_ids():
 
 def test_export_command_writes_a_markdown_transcript_for_the_active_session(tmp_path):
     """Export writes the active session as a readable transcript and reports its destination."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     active = Session(
         name="Current session",
         name_source="user",
@@ -350,7 +352,7 @@ def test_export_command_generates_a_markdown_filename_when_destination_is_omitte
     monkeypatch,
 ):
     """An omitted destination writes a deterministic session-named file in the current folder."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     active = Session(
         id="active_session-id",
         name="Current session",
@@ -370,7 +372,7 @@ def test_export_command_generates_a_markdown_filename_when_destination_is_omitte
 
 def test_export_alias_writes_the_current_session_transcript(tmp_path):
     """The root export command accepts a named destination for the active session."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     active = Session(
         id="active",
         name="Current session",
@@ -391,7 +393,7 @@ def test_export_alias_writes_the_current_session_transcript(tmp_path):
 
 def test_export_command_selects_a_persisted_session_without_resuming_it(tmp_path):
     """The root export accepts positional and named options for a saved session."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     store = MemorySessionStore()
     active = Session(id="active", name="Active", name_source="user")
     saved = Session(
@@ -425,7 +427,7 @@ def test_export_command_keeps_generated_filename_safe_for_unusual_session_ids(
     session_id,
 ):
     """Generated filenames remain local when a session ID is unsafe or unusually long."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(interaction=interaction)
     manager.register_provider(
         SessionCommands(SessionManager(session=Session(id=session_id)), Mock())
@@ -442,7 +444,7 @@ def test_export_command_keeps_generated_filename_safe_for_unusual_session_ids(
 
 def test_export_command_prompts_before_replacing_generated_destination(tmp_path, monkeypatch):
     """An existing generated filename stays intact when yes-or-no confirmation is declined."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.return_value = False
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(SessionManager(session=Session(id="active")), Mock()))
@@ -464,7 +466,7 @@ def test_export_command_reads_saved_session_without_resuming_and_writes_archive(
     monkeypatch,
 ):
     """Export can archive a selected saved session without replacing the active session."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     store = MemorySessionStore()
     active = Session(id="active", name="Active", name_source="user")
     saved = Session(
@@ -493,7 +495,7 @@ def test_export_command_reads_saved_session_without_resuming_and_writes_archive(
 
 def test_sessions_export_writes_a_saved_session_to_a_quoted_destination(tmp_path):
     """The plural command exports a selected session to a path containing spaces."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     store = MemorySessionStore()
     active = Session(id="active", name="Active", name_source="user")
     store.save(
@@ -517,7 +519,7 @@ def test_sessions_export_writes_a_saved_session_to_a_quoted_destination(tmp_path
 
 def test_export_command_preserves_existing_destination_when_replacement_is_declined(tmp_path):
     """A no response leaves an existing export untouched."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.return_value = False
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(SessionManager(), Mock()))
@@ -534,9 +536,42 @@ def test_export_command_preserves_existing_destination_when_replacement_is_decli
     interaction.info.assert_called_once_with("Session export stopped.")
 
 
+def test_async_export_dispatch_keeps_file_work_off_the_event_loop(tmp_path, monkeypatch):
+    """A sync export command runs in a worker while the async owner continues scheduling."""
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.worker_calls_routed = True
+    manager = CommandManager(interaction=interaction)
+    manager.register_provider(SessionCommands(SessionManager(), Mock()))
+    target = tmp_path / "async-export.md"
+    release = Event()
+    export_threads = []
+    loop_released_worker = []
+    original_export = session_commands_module.export_session
+
+    def wait_then_export(session, store, destination, *, format="markdown", overwrite=False):
+        """Pause the file operation until the async owner gets a scheduling turn."""
+        export_threads.append(get_ident())
+        loop_released_worker.append(release.wait(timeout=0.5))
+        return original_export(session, store, destination, format=format, overwrite=overwrite)
+
+    monkeypatch.setattr(session_commands_module, "export_session", wait_then_export)
+
+    async def dispatch():
+        """Let the event loop release the simulated blocking export operation."""
+        owner_thread = get_ident()
+        asyncio.get_running_loop().call_later(0.01, release.set)
+        await manager.call_async("session", f"export {target}", interaction=interaction)
+        assert export_threads[0] != owner_thread
+
+    asyncio.run(dispatch())
+
+    assert loop_released_worker == [True]
+    assert target.is_file()
+
+
 def test_export_command_replaces_existing_destination_after_confirmation(tmp_path):
     """A yes response authorizes replacing the destination and reports completion."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.return_value = True
     session = Session(name="Replace session", name_source="user")
     sessions = SessionManager(session=session)
@@ -559,7 +594,7 @@ def test_export_command_replaces_existing_destination_after_confirmation(tmp_pat
 
 def test_export_command_prompts_if_the_destination_appears_during_export(tmp_path, monkeypatch):
     """A raced export collision still requires yes-or-no replacement confirmation."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.return_value = True
     sessions = SessionManager(session=Session(name="Racing session", name_source="user"))
     manager = CommandManager(interaction=interaction)
@@ -594,7 +629,7 @@ def test_export_command_reports_write_collisions_after_replacement_confirmation(
     monkeypatch,
 ):
     """An unresolved write collision after a yes response is reported as an export failure."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.return_value = True
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(SessionManager(), Mock()))
@@ -623,7 +658,7 @@ def test_export_command_reports_write_collisions_after_replacement_confirmation(
 
 def test_export_command_rejects_directories_and_the_session_database(tmp_path):
     """Export validates file destinations and refuses to replace its session database."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     database = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(database, workspace_id="workspace")
     manager = CommandManager(interaction=interaction)
@@ -641,7 +676,7 @@ def test_export_command_rejects_directories_and_the_session_database(tmp_path):
 
 def test_export_command_reports_missing_saved_sessions_and_invalid_formats(tmp_path):
     """Export reports unavailable session IDs and unsupported direct-call formats."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     sessions = SessionManager()
     commands = SessionCommands(sessions, Mock())
     manager = CommandManager(interaction=interaction)
@@ -662,7 +697,7 @@ def test_export_command_reports_missing_saved_sessions_and_invalid_formats(tmp_p
 
 def test_rename_reports_invalid_session_names():
     """Rename translates invalid domain values into standard command argument feedback."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(SessionManager(), Mock()))
 
@@ -673,7 +708,7 @@ def test_rename_reports_invalid_session_names():
 
 def test_rename_without_a_name_generates_a_session_name():
     """Rename without arguments uses the configured automatic naming service."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     generator = Mock()
     generator.generate.return_value = "Generated topic"
     sessions = SessionManager(interaction=interaction)
@@ -697,7 +732,7 @@ def test_rename_without_a_name_generates_a_session_name():
 
 def test_rename_without_a_name_reports_a_problem_when_generation_fails():
     """Rename reports automatic naming failures without rejecting the command arguments."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     generator = Mock()
     generator.generate.side_effect = RuntimeError("Generator is unavailable")
     sessions = SessionManager(interaction=interaction)

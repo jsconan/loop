@@ -26,6 +26,11 @@ from loop.interaction import AsyncInteractionInput, ConsoleInteraction
 from loop.models import Usage
 
 
+def test_console_interaction_does_not_claim_worker_calls_are_routed():
+    """A directly used console interaction remains owner-affine by default."""
+    assert ConsoleInteraction().worker_calls_routed is False
+
+
 def test_primary_editor_text_can_be_read_and_replaced():
     """The async editor adapter exposes its live primary prompt buffer."""
     session = Mock()

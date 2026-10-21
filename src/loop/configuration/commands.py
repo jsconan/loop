@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Mapping
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -14,8 +15,12 @@ from ..completion import (
     CompletionValue,
     SchemaCompletionProviderRegistration,
 )
+from ..interaction import require_async_interaction
 from ..models import CommandCapability
 from .manager import ApplicationSettings, ConfigurationManager
+
+Result = TypeVar("Result")
+Effect = TypeVar("Effect")
 
 
 class ConfigurationGetArguments(BaseModel):
@@ -253,7 +258,7 @@ class ConfigurationCommands:
             if entry.secret
         )
 
-    def config(
+    async def config(
         self,
         context: CommandContext,
         action: Annotated[
@@ -273,7 +278,22 @@ class ConfigurationCommands:
             Field(description="Override scope, or omit it to choose interactively."),
         ] = None,
     ) -> None:
-        """Show, update, reset, or reload the application configuration."""
+        """Show, update, reset, or reload the application configuration.
+
+        Args:
+            context (CommandContext): Interaction and capability snapshot for this invocation.
+            action (Literal["get", "set", "secret", "reset", "reload"] | None): Configuration
+                operation, or ``None`` to show every setting.
+            path (str | None): Setting path such as ``loop.temperature``.
+            value (str | None): New setting value for the set operation.
+            scope (Literal["session", "user", "workspace"] | None): Override scope, or ``None``
+                to choose it interactively.
+
+        Raises:
+            CommandArgumentError: If the operation is unavailable or its arguments are invalid.
+            ProblemException: If an interactive prompt requires unavailable asynchronous input.
+            asyncio.CancelledError: If asynchronous prompt input is cancelled.
+        """
         if CommandCapability.RUN_ACTIVE in (context.capabilities or frozenset()):
             if action in {"secret", "reset", "reload"}:
                 raise CommandArgumentError(
@@ -300,35 +320,41 @@ class ConfigurationCommands:
         if action == "reload":
             if path is not None or value is not None or scope is not None:
                 raise CommandArgumentError("The reload operation does not accept arguments.")
-            self._reload(context)
+            await self._reload(context)
             return
         if action == "secret":
-            self._set_secret(context, path, value, scope)
+            await self._set_secret(context, path, value, scope)
             return
         if action == "reset" and path is None:
-            selected_scope = self._select_scope(context, scope)
-            if selected_scope is not None and self._confirm_reset(
-                context, path=None, scope=selected_scope, explicit_scope=scope is not None
+            selected_scope = await self._select_scope(context, scope)
+            if selected_scope is not None and await self._confirm_reset(
+                context,
+                path=None,
+                scope=selected_scope,
+                explicit_scope=scope is not None,
             ):
-                self._reset_all(context, selected_scope)
+                await self._reset_all(context, selected_scope)
             return
         if action == "reset":
-            selected_scope = self._select_scope(context, scope)
-            if selected_scope is not None and self._confirm_reset(
-                context, path=path, scope=selected_scope, explicit_scope=scope is not None
+            selected_scope = await self._select_scope(context, scope)
+            if selected_scope is not None and await self._confirm_reset(
+                context,
+                path=path,
+                scope=selected_scope,
+                explicit_scope=scope is not None,
             ):
-                self._reset(context, path, selected_scope)
+                await self._reset(context, path, selected_scope)
             return
         if path is None:
             raise CommandArgumentError("The set operation requires a setting path.")
         if value is None:
             raise CommandArgumentError("The set operation requires a value.")
-        selected_scope = self._select_scope(context, scope)
+        selected_scope = await self._select_scope(context, scope)
         if selected_scope is not None:
-            self._set(context, path, value, selected_scope)
+            await self._set(context, path, value, selected_scope)
 
     @staticmethod
-    def _select_scope(
+    async def _select_scope(
         context: CommandContext,
         scope: Literal["session", "user", "workspace"] | None,
     ) -> Literal["session", "user", "workspace"] | None:
@@ -337,13 +363,20 @@ class ConfigurationCommands:
         Args:
             context (CommandContext): Interaction used to select a scope.
             scope (Literal["session", "user", "workspace"] | None): Explicit scope, when supplied.
+
         Returns:
             Literal["session", "user", "workspace"] | None: Selected scope, or ``None`` when
                 cancelled.
+
+        Raises:
+            ProblemException: If the interaction does not provide asynchronous input.
+            asyncio.CancelledError: If asynchronous prompt input is cancelled.
         """
         if scope is not None:
             return scope
-        selected = context.interaction.prompt(
+        selected = await require_async_interaction(
+            context.interaction, "configuration scope selection"
+        ).prompt_async(
             "Choose configuration scope:",
             choices={
                 "user": "Save for current user",
@@ -356,7 +389,7 @@ class ConfigurationCommands:
         return selected if selected in {"session", "user", "workspace"} else None
 
     @staticmethod
-    def _confirm_reset(
+    async def _confirm_reset(
         context: CommandContext,
         path: str | None,
         scope: Literal["session", "user", "workspace"],
@@ -372,41 +405,96 @@ class ConfigurationCommands:
         if not explicit_scope:
             return True
         target = path if path is not None else "all configuration entries"
-        return context.interaction.confirm(f"Reset {target} for {scope}?", default=False)
+        return await require_async_interaction(
+            context.interaction, "configuration reset confirmation"
+        ).confirm_async(f"Reset {target} for {scope}?", default=False)
 
-    def _reset_all(
+    async def _reset_all(
         self,
         context: CommandContext,
         scope: Literal["session", "user", "workspace"],
     ) -> None:
         """Reset every setting in one selected scope to its built-in default."""
         paths = tuple(entry.path for entry in self._configuration.entries)
-        settings = self._configuration.reset_all(scope=scope)
-        statuses = {self._apply(path, settings) for path in paths}
+        if scope == "session":
+            settings = self._configuration.reset_all(scope=scope)
+            statuses = {self._apply(path, settings) for path in paths}
+        else:
+            _, applied = await self._run_blocking_with_effect(
+                context,
+                self._configuration.reset_all,
+                lambda settings: {self._apply(path, settings) for path in paths},
+                scope=scope,
+            )
+            statuses = applied
         detail = ", ".join(sorted(statuses)) if statuses else "no overrides existed"
         context.interaction.info(f"Reset all configuration entries for {scope}: {detail}.")
 
-    def _reload(self, context: CommandContext) -> None:
+    async def _reload(self, context: CommandContext) -> None:
         """Reload disk configuration and apply only effective changes."""
         previous = self._configuration.effective
         try:
-            settings = self._configuration.reload()
+            _, statuses = await self._run_blocking_with_effect(
+                context,
+                self._configuration.reload,
+                lambda settings: self._apply_changes(previous, settings),
+            )
         except (OSError, ValueError, ValidationError) as error:
             raise CommandArgumentError(str(error)) from error
-        paths = self._changed_paths(previous, settings)
+        paths = tuple(statuses)
         if not paths:
             context.interaction.info("Configuration reloaded: no effective changes.")
             return
-        statuses = (
-            self._apply_many(paths, settings)
-            if self._apply_many is not None
-            else {path: self._apply(path, settings) for path in paths}
-        )
         grouped = {}
         for path in paths:
             grouped.setdefault(statuses[path], []).append(path)
         detail = "; ".join(f"{status}: {', '.join(paths)}" for status, paths in grouped.items())
         context.interaction.info(f"Configuration reloaded: {detail}.")
+
+    def _apply_changes(
+        self,
+        previous: ApplicationSettings,
+        current: ApplicationSettings,
+    ) -> Mapping[str, str]:
+        """Apply only runtime settings whose effective values changed."""
+        paths = self._changed_paths(previous, current)
+        if not paths:
+            return {}
+        if self._apply_many is not None:
+            return self._apply_many(paths, current)
+        return {path: self._apply(path, current) for path in paths}
+
+    async def _run_blocking_with_effect(
+        self,
+        context: CommandContext,
+        function: Callable[..., Result],
+        apply: Callable[[Result], Effect],
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[Result, Effect]:
+        """Settle sync persistence before applying its result on the owner, even on cancellation."""
+        pending = asyncio.create_task(context.run_blocking(function, *args, **kwargs))
+        try:
+            result = await asyncio.shield(pending)
+        except asyncio.CancelledError as cancellation:
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:  # noqa: BLE001 - inspect the settled worker outcome below
+                    break
+            try:
+                result = pending.result()
+            except BaseException as error:
+                cancellation.add_note(
+                    f"Configuration persistence also stopped with {type(error).__name__}."
+                )
+                raise cancellation from error
+            else:
+                apply(result)
+            raise
+        return result, apply(result)
 
     @staticmethod
     def _changed_paths(
@@ -445,7 +533,7 @@ class ConfigurationCommands:
             columns=("path", "value", "source", "description"),
         )
 
-    def _set(
+    async def _set(
         self,
         context: CommandContext,
         path: str,
@@ -460,17 +548,23 @@ class ConfigurationCommands:
                 "Use the secret operation to update secret configuration fields."
             )
         try:
-            settings = (
-                self._configuration.set_session(path, value)
-                if scope == "session"
-                else self._configuration.set(path, value, scope=scope)
-            )
-            status = self._apply(path, settings)
+            if scope == "session":
+                settings = self._configuration.set_session(path, value)
+                status = self._apply(path, settings)
+            else:
+                _, status = await self._run_blocking_with_effect(
+                    context,
+                    self._configuration.set,
+                    lambda settings: self._apply(path, settings),
+                    path,
+                    value,
+                    scope=scope,
+                )
         except (ValueError, ValidationError) as error:
             raise CommandArgumentError(str(error)) from error
         context.interaction.info(f"Updated {path} for {scope}: {status}")
 
-    def _set_secret(
+    async def _set_secret(
         self,
         context: CommandContext,
         path: str | None,
@@ -484,13 +578,15 @@ class ConfigurationCommands:
             raise CommandArgumentError("The secret operation accepts its value only by prompt.")
         if not self._is_secret(path):
             raise CommandArgumentError(f"Configuration field '{path}' is not a secret.")
-        secret_value = context.interaction.prompt(f"Enter {path}:", secret=True)
+        secret_value = await require_async_interaction(
+            context.interaction, "secret configuration input"
+        ).prompt_async(f"Enter {path}:", secret=True)
         if secret_value is False:
             context.interaction.info(f"Secret {path} was not changed.")
             return
-        selected_scope = self._select_scope(context, scope)
+        selected_scope = await self._select_scope(context, scope)
         if selected_scope is not None:
-            self._set(context, path, str(secret_value), selected_scope, allow_secret=True)
+            await self._set(context, path, str(secret_value), selected_scope, allow_secret=True)
 
     def _is_secret(self, path: str) -> bool:
         """Return whether a known configuration path is secret."""
@@ -499,15 +595,20 @@ class ConfigurationCommands:
             raise CommandArgumentError(f"Unknown configuration field '{path}'.")
         return entry.secret
 
-    def _reset(self, context: CommandContext, path: str, scope: str) -> None:
+    async def _reset(self, context: CommandContext, path: str, scope: str) -> None:
         """Reset one selected-scope value and apply the resulting setting."""
         try:
-            settings = (
-                self._configuration.reset_session(path)
-                if scope == "session"
-                else self._configuration.reset(path, scope=scope)
-            )
-            status = self._apply(path, settings)
+            if scope == "session":
+                settings = self._configuration.reset_session(path)
+                status = self._apply(path, settings)
+            else:
+                _, status = await self._run_blocking_with_effect(
+                    context,
+                    self._configuration.reset,
+                    lambda settings: self._apply(path, settings),
+                    path,
+                    scope=scope,
+                )
         except (ValueError, ValidationError) as error:
             raise CommandArgumentError(str(error)) from error
         context.interaction.info(f"Reset {path} for {scope}: {status}")

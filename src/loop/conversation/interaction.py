@@ -56,6 +56,15 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
         self._dispatch = dispatch
         self._dispatch_async = dispatch_async
 
+    @property
+    def worker_calls_routed(self) -> bool:
+        """Report whether this interaction currently relays worker calls to its owner.
+
+        Returns:
+            bool: ``True`` while a controller dispatcher owns the UI interaction.
+        """
+        return self._dispatch is not None
+
     def _call(
         self,
         function: Callable[..., Any],
@@ -77,6 +86,8 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
     ) -> Any:
         """Request input through the controller's correlated async interaction channel."""
         if self._dispatch_async is None:
+            if self._dispatch is not None:
+                return self._dispatch(InteractionCall(function, args, kwargs, kind))
             return await function(*args, **kwargs)
         return await self._dispatch_async(InteractionCall(function, args, kwargs, kind))
 

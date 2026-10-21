@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .. import constants
 from ..backend import BackendError
 from ..errors import Problem, log_problem
-from ..interaction import AsyncInteractionInput, Interaction
+from ..interaction import Interaction, require_async_interaction
 from ..models import ModelAssignment, ModelInfo
 
 if TYPE_CHECKING:
@@ -33,12 +34,15 @@ class ModelSelection:
         selected (str | None): Explicit model selection, or ``None`` to use the backend default.
         on_select (Callable[[str], None] | None): Durable preference writer invoked before an
             explicit selection takes effect. Defaults to no durable writer.
+        async_blocking_runner (Callable[..., Awaitable[Any]] | None): Optional application-owned
+            worker for the synchronous preference writer. Defaults to ``asyncio.to_thread``.
     """
 
     _backend: Backend
     _session_manager: SessionManager
     _selected: str | None
     _on_select: Callable[[str], None] | None
+    _async_blocking_runner: Callable[..., Awaitable[Any]] | None
     _available_models: list[ModelInfo] | None
     _available_models_expires_at: float
 
@@ -48,11 +52,13 @@ class ModelSelection:
         session_manager: SessionManager,
         selected: str | None = None,
         on_select: Callable[[str], None] | None = None,
+        async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         self._backend = backend
         self._session_manager = session_manager
         self._selected = selected if selected is not None else session_manager.model
         self._on_select = on_select
+        self._async_blocking_runner = async_blocking_runner
         self._available_models = None
         self._available_models_expires_at = 0.0
         if self._selected is not None or backend.default_model is not None:
@@ -123,7 +129,23 @@ class ModelSelection:
 
     def _get_context_window(self, model: str | None) -> int | None:
         """Return a positive context window for a model, otherwise ``None``."""
-        context_window = self._backend.get_context_window(model)
+        return self._normalize_context_window(self._backend.get_context_window(model))
+
+    async def _get_assignment_async(self, model: str | None) -> ModelAssignment:
+        """Resolve model metadata through the backend's async API."""
+        return ModelAssignment(
+            model=model,
+            context_window=await self._get_context_window_async(model),
+        )
+
+    async def _get_context_window_async(self, model: str | None) -> int | None:
+        """Return async context metadata normalized to a positive integer."""
+        context_window = await self._backend.get_context_window_async(model)
+        return self._normalize_context_window(context_window)
+
+    @staticmethod
+    def _normalize_context_window(context_window: int | None) -> int | None:
+        """Return a positive context window, otherwise ``None``."""
         if (
             isinstance(context_window, int)
             and not isinstance(context_window, bool)
@@ -189,20 +211,44 @@ class ModelSelection:
             OSError: If the configured durable preference writer fails.
             asyncio.CancelledError: If the asynchronous context lookup is cancelled.
         """
-        if self._on_select is not None:
-            self._on_select(model)
+        cancellation = await self._persist_selection_async(model)
         self._selected = model
-        context_window = await self._backend.get_context_window_async(model)
-        self._session_manager.assignment = ModelAssignment(
-            model=model,
-            context_window=(
-                context_window
-                if isinstance(context_window, int)
-                and not isinstance(context_window, bool)
-                and context_window > 0
-                else None
-            ),
+        if cancellation is not None:
+            raise cancellation
+        self._session_manager.assignment = await self._get_assignment_async(model)
+
+    async def _persist_selection_async(self, model: str) -> asyncio.CancelledError | None:
+        """Run the synchronous durable preference writer off-loop and settle cancellation."""
+        if self._on_select is None:
+            return None
+        pending = asyncio.ensure_future(
+            self._async_blocking_runner(self._on_select, model)
+            if self._async_blocking_runner is not None
+            else asyncio.to_thread(self._on_select, model)
         )
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError as cancellation:
+            failure = None
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException as error:  # noqa: BLE001  # settle the owned worker
+                    failure = error
+                    break
+            if pending.cancelled():
+                failure = asyncio.CancelledError()
+            elif failure is None:
+                failure = pending.exception()
+            if failure is not None:
+                cancellation.add_note(
+                    f"Model preference writer also stopped with {type(failure).__name__}."
+                )
+                raise
+            return cancellation
+        return None
 
     def restore(self, model: str | None) -> None:
         """Restore a session model and synchronize its available metadata.
@@ -213,6 +259,22 @@ class ModelSelection:
         self._selected = model
         if model is not None or self._backend.default_model is not None:
             self.synchronize_session()
+        else:
+            self._session_manager.assignment = None
+
+    async def restore_async(self, model: str | None) -> None:
+        """Restore a session model and resolve its metadata through async backend calls.
+
+        Args:
+            model (str | None): Session model to restore, or ``None`` to use the backend default.
+
+        Raises:
+            BackendError: If the backend cannot retrieve model context metadata.
+            asyncio.CancelledError: If the backend metadata request is cancelled.
+        """
+        self._selected = model
+        if model is not None or self._backend.default_model is not None:
+            self._session_manager.assignment = await self._get_assignment_async(self.effective)
         else:
             self._session_manager.assignment = None
 
@@ -230,6 +292,27 @@ class ModelSelection:
         else:
             self._selected = model
             assignment = self._get_assignment(model)
+        return self.record_assignment(assignment)
+
+    async def record_response_async(self, model: str | None) -> ModelAssignment:
+        """Record a completed response using async context metadata lookup.
+
+        Args:
+            model (str | None): Provider-reported model identifier, when available.
+
+        Returns:
+            ModelAssignment: Durable assignment for the completed response.
+
+        Raises:
+            ModelSelectionError: If no model is available when ``model`` is ``None``.
+            BackendError: If the backend cannot retrieve model context metadata.
+            asyncio.CancelledError: If the backend metadata request is cancelled.
+        """
+        if model is None:
+            assignment = await self._get_assignment_async(self.effective)
+        else:
+            self._selected = model
+            assignment = await self._get_assignment_async(model)
         return self.record_assignment(assignment)
 
     def record_assignment(self, assignment: ModelAssignment | None = None) -> ModelAssignment:
@@ -318,7 +401,14 @@ class ModelSelection:
 
         Returns:
             bool: ``True`` when a replacement model was selected, otherwise ``False``.
+
+        Raises:
+            ProblemException: If the interaction does not provide asynchronous input.
+            BackendError: If the backend cannot retrieve the replacement model's context metadata.
+            OSError: If persisting the replacement model preference fails.
+            asyncio.CancelledError: If model lookup or user input is cancelled.
         """
+        async_interaction = require_async_interaction(interaction, "model selection")
         try:
             models = await self.available_async()
         except BackendError as error:
@@ -339,13 +429,9 @@ class ModelSelection:
         failing_model = self.selected
         while True:
             prompt_kwargs = {"choices": {model.id: model.id for model in models}}
-            selection = (
-                await interaction.prompt_async(
-                    "Select a replacement model:",
-                    **prompt_kwargs,
-                )
-                if isinstance(interaction, AsyncInteractionInput)
-                else interaction.prompt("Select a replacement model:", **prompt_kwargs)
+            selection = await async_interaction.prompt_async(
+                "Select a replacement model:",
+                **prompt_kwargs,
             )
             if selection is False:
                 return False
@@ -356,11 +442,7 @@ class ModelSelection:
                 "failure is likely to re-occur unless the backend is updated."
             )
             prompt = "Continue with this model, or select a different one?"
-            confirmed = (
-                await interaction.confirm_async(prompt, default=True)
-                if isinstance(interaction, AsyncInteractionInput)
-                else interaction.confirm(prompt, default=True)
-            )
+            confirmed = await async_interaction.confirm_async(prompt, default=True)
             if confirmed:
                 break
         await self.select_async(selection)

@@ -222,6 +222,7 @@ class ApplicationRuntime:
                 main_app=main_app,
                 refresh_sandbox_backend=getattr(execution_service, "refresh_backend", None),
             )
+            cls._track_close(loop.command_manager, cleanup_callbacks)
             runtime = cls(
                 loop,
                 telemetry,

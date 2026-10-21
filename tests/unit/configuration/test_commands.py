@@ -1,12 +1,17 @@
 """Tests for interactive application-configuration commands."""
 
+import asyncio
+from threading import Event, get_ident
 from unittest.mock import Mock, call
 
+import pytest
 from prompt_toolkit.document import Document
 
+from loop import Interaction
 from loop.commands import CommandManager
 from loop.completion import CommandCompletionAdapter, CompletionManager
 from loop.configuration import ConfigurationCommands, ConfigurationManager
+from loop.interaction import ConsoleInteraction
 from loop.models import CommandCapability
 
 
@@ -15,7 +20,7 @@ def test_safe_config_changes_apply_during_runs_and_hide_unsafe_values(tmp_path):
     configuration = ConfigurationManager(tmp_path / "config.toml")
     configuration.load()
     provider = ConfigurationCommands(configuration, Mock(return_value="applied now"))
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(providers=(provider,), interaction=interaction)
     manager.set_capability_provider(
         lambda: frozenset(
@@ -63,7 +68,7 @@ def test_config_run_restrictions_preserve_scope_prompt_and_reject_unsafe_operati
     """Scope selection remains interactive while runtime replacement operations stay blocked."""
     configuration = ConfigurationManager(tmp_path / "config.toml")
     configuration.load()
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),),
         interaction=interaction,
@@ -78,9 +83,9 @@ def test_config_run_restrictions_preserve_scope_prompt_and_reject_unsafe_operati
         )
     )
 
-    interaction.prompt.return_value = "session"
+    interaction.prompt_async.return_value = "session"
     assert manager.handle_user_command("/config set loop.debug true")
-    interaction.prompt.assert_called_once_with(
+    interaction.prompt_async.assert_called_once_with(
         "Choose configuration scope:",
         choices={
             "user": "Save for current user",
@@ -107,11 +112,197 @@ def test_config_run_restrictions_preserve_scope_prompt_and_reject_unsafe_operati
     assert "requires a setting path" in interaction.report.call_args.args[0].detail
 
 
+def test_sync_command_manager_keeps_sync_configuration_prompts(tmp_path):
+    """The synchronous hub invokes configuration commands with synchronous prompts."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "session"
+    interaction.confirm.return_value = True
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),),
+        interaction=interaction,
+    )
+
+    manager.call("config", "set loop.debug true")
+    manager.call("config", "reset loop.debug scope=session")
+
+    assert configuration.effective.loop.debug is False
+    interaction.prompt.assert_called_once()
+    interaction.confirm.assert_called_once_with("Reset loop.debug for session?", default=False)
+    manager.close()
+
+
+def test_async_config_command_offloads_persistence_and_applies_on_owner(tmp_path, monkeypatch):
+    """Configuration file work runs in a worker and runtime changes return to the owner."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock(spec=ConsoleInteraction)
+    release = Event()
+    set_threads = []
+    apply_threads = []
+    original_set = configuration.set
+
+    def wait_then_set(path, value, *, scope="user"):
+        """Pause persistence until the async owner gets a scheduling turn."""
+        set_threads.append(get_ident())
+        assert release.wait(timeout=0.5)
+        return original_set(path, value, scope=scope)
+
+    def apply(path, settings):
+        """Record the thread that applies the committed configuration snapshot."""
+        apply_threads.append(get_ident())
+        return "applied now"
+
+    monkeypatch.setattr(configuration, "set", wait_then_set)
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),),
+        interaction=interaction,
+    )
+
+    async def dispatch():
+        """Release synchronous persistence from a scheduled owner-loop callback."""
+        owner_thread = get_ident()
+        asyncio.get_running_loop().call_later(0.01, release.set)
+        await manager.call_async("config", "set loop.debug true scope=user")
+        assert apply_threads == [owner_thread]
+
+    asyncio.run(dispatch())
+
+    assert set_threads[0] != apply_threads[0]
+    assert configuration.effective.loop.debug is True
+
+
+def test_async_config_cancellation_settles_persistence_and_owner_effect(tmp_path, monkeypatch):
+    """Cancellation waits for an in-flight setting write and applies its committed value."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock(spec=ConsoleInteraction)
+    started = Event()
+    release = Event()
+    apply_threads = []
+    original_set = configuration.set
+
+    def wait_then_set(path, value, *, scope="user"):
+        """Hold the file transaction until the test cancels its async command."""
+        started.set()
+        assert release.wait(timeout=0.5)
+        return original_set(path, value, scope=scope)
+
+    def apply(_path, _settings):
+        """Record that committed runtime state is applied on the async owner."""
+        apply_threads.append(get_ident())
+        return "applied now"
+
+    monkeypatch.setattr(configuration, "set", wait_then_set)
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),),
+        interaction=interaction,
+    )
+
+    async def dispatch():
+        """Cancel twice while persistence runs, then release it to settle."""
+        owner_thread = get_ident()
+        pending = asyncio.create_task(
+            manager.call_async("config", "set loop.debug true scope=user")
+        )
+        assert await asyncio.to_thread(started.wait, 0.5)
+        loop = asyncio.get_running_loop()
+        loop.call_later(0, pending.cancel)
+        loop.call_later(0.01, pending.cancel)
+        loop.call_later(0.02, release.set)
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert apply_threads == [owner_thread]
+
+    asyncio.run(dispatch())
+
+    assert configuration.effective.loop.debug is True
+
+
+def test_async_config_cancellation_preserves_cancel_when_persistence_fails(tmp_path, monkeypatch):
+    """Cancellation remains primary when a settled configuration write also fails."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock(spec=ConsoleInteraction)
+    started = Event()
+    release = Event()
+
+    def fail_after_release(path, value, *, scope="user"):
+        """Fail the worker operation only after the command has been cancelled."""
+        started.set()
+        assert release.wait(timeout=1)
+        raise OSError("configuration write failed")
+
+    monkeypatch.setattr(configuration, "set", fail_after_release)
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),),
+        interaction=interaction,
+    )
+
+    async def dispatch():
+        """Cancel during persistence, then check the worker failure note."""
+        pending = asyncio.create_task(
+            manager.call_async("config", "set loop.debug true scope=user")
+        )
+        assert await asyncio.to_thread(started.wait, 0.5)
+        loop = asyncio.get_running_loop()
+        loop.call_later(0, pending.cancel)
+        loop.call_later(0.01, pending.cancel)
+        loop.call_later(0.02, release.set)
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await pending
+        assert any("OSError" in note for note in captured.value.__notes__)
+
+    asyncio.run(dispatch())
+
+
+def test_async_reset_all_offloads_persistence_and_applies_on_owner(tmp_path, monkeypatch):
+    """Persisted reset-all work runs off-loop and runtime effects return to its owner."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load()
+    configuration.set("loop.debug", True, scope="user")
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm_async.return_value = True
+    reset_threads = []
+    apply_threads = []
+    original_reset_all = configuration.reset_all
+
+    def record_reset_all(*, scope):
+        """Record where persistent reset work executes."""
+        reset_threads.append(get_ident())
+        return original_reset_all(scope=scope)
+
+    def apply(_path, _settings):
+        """Record where live settings are updated."""
+        apply_threads.append(get_ident())
+        return "applied now"
+
+    monkeypatch.setattr(configuration, "reset_all", record_reset_all)
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),),
+        interaction=interaction,
+    )
+
+    async def dispatch():
+        """Dispatch a persisted reset and capture its owner thread."""
+        owner_thread = get_ident()
+        await manager.call_async("config", "reset scope=user")
+        assert reset_threads[0] != owner_thread
+        assert apply_threads
+        assert set(apply_threads) == {owner_thread}
+
+    asyncio.run(dispatch())
+
+    assert configuration.effective.loop.debug is False
+
+
 def test_config_reads_remain_available_during_agent_runs(tmp_path):
     """Read-only configuration inspection is still dispatched during an active run."""
     configuration = ConfigurationManager(tmp_path / "config.toml")
     configuration.load()
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),),
         interaction=interaction,
@@ -137,7 +328,7 @@ def test_config_set_applies_a_session_override(tmp_path):
     )
     configuration.load()
     apply = Mock(return_value="applied now")
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
@@ -154,7 +345,7 @@ def test_config_get_rejects_secret_entries(tmp_path):
     """The read-only get form directs secret edits to the masked secret operation."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
@@ -171,7 +362,7 @@ def test_config_get_displays_non_secret_entries(tmp_path):
     """The read-only get form presents an individual non-secret configuration field."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
@@ -186,7 +377,7 @@ def test_config_without_arguments_displays_only_non_secret_entries(tmp_path):
     """The read-only config command omits secret configuration entries."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
@@ -205,7 +396,7 @@ def test_config_set_applies_a_file_override(tmp_path):
     )
     configuration.load()
     apply = Mock(return_value="applied now")
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
@@ -228,7 +419,7 @@ def test_config_reload_applies_effective_user_and_workspace_changes(tmp_path):
     workspace_path.parent.mkdir()
     workspace_path.write_text("[loop]\ndebug = true\n", encoding="utf-8")
     apply = Mock(return_value="applied now")
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
@@ -254,7 +445,7 @@ def test_config_reload_delegates_multiple_changes_to_the_batch_applicator(tmp_pa
     configuration.path.write_text("[loop]\ndebug = true\n", encoding="utf-8")
     apply = Mock()
     apply_many = Mock(return_value={"loop.debug": "applied now"})
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply, apply_many),),
         interaction=interaction,
@@ -272,7 +463,7 @@ def test_config_reload_reports_no_effective_change(tmp_path):
     configuration.initialize()
     configuration.load()
     apply = Mock()
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
@@ -288,7 +479,7 @@ def test_config_reload_rejects_arguments_and_invalid_disk_content(tmp_path):
     configuration = ConfigurationManager(tmp_path / "config.toml")
     configuration.initialize()
     configuration.load()
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
@@ -308,8 +499,8 @@ def test_config_secret_prompts_before_selecting_scope_and_applies_value(tmp_path
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
     apply = Mock(return_value="backend replaced")
-    interaction = Mock()
-    interaction.prompt.side_effect = ["new-api-key", "user"]
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async.side_effect = ["new-api-key", "user"]
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
@@ -317,7 +508,7 @@ def test_config_secret_prompts_before_selecting_scope_and_applies_value(tmp_path
     manager.call("config", "secret backend.api_key")
 
     assert configuration.effective.backend.api_key.get_secret_value() == "new-api-key"
-    assert interaction.prompt.call_args_list == [
+    assert interaction.prompt_async.call_args_list == [
         call("Enter backend.api_key:", secret=True),
         call(
             "Choose configuration scope:",
@@ -338,7 +529,7 @@ def test_config_set_rejects_secret_entries_and_secret_rejects_plain_entries(tmp_
     """Normal set and secret actions accept only their matching entry types."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
@@ -351,15 +542,15 @@ def test_config_set_rejects_secret_entries_and_secret_rejects_plain_entries(tmp_
 
     assert configuration.effective.backend.api_key.get_secret_value() == "local-api-key"
     assert interaction.report.call_count == 5
-    interaction.prompt.assert_not_called()
+    interaction.prompt_async.assert_not_called()
 
 
 def test_config_secret_cancellation_leaves_the_existing_value_unchanged(tmp_path):
     """Cancelling masked input or the later scope selection changes no configuration."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    interaction = Mock()
-    interaction.prompt.side_effect = [False, "new-api-key", "cancel"]
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async.side_effect = [False, "new-api-key", "cancel"]
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
@@ -375,15 +566,15 @@ def test_config_reset_and_invalid_direct_forms_report_argument_errors(tmp_path):
     """Repeated resets store defaults and invalid forms use normal command diagnostics."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    interaction = Mock()
-    interaction.prompt.return_value = "cancel"
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async.return_value = "cancel"
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
     )
     manager.call("config", "set loop.debug true scope=session")
 
-    interaction.confirm.side_effect = [True, True, True, True]
+    interaction.confirm_async.side_effect = [True, True, True, True]
     manager.call("config", "reset loop.debug scope=session")
     manager.call("config", "reset unknown.path scope=session")
     manager.call("config", "reset loop.debug scope=session")
@@ -402,8 +593,8 @@ def test_config_reset_with_explicit_scope_requires_confirmation(tmp_path):
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
     configuration.set_session("loop.debug", True)
-    interaction = Mock()
-    interaction.confirm.return_value = False
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm_async.return_value = False
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
@@ -412,7 +603,9 @@ def test_config_reset_with_explicit_scope_requires_confirmation(tmp_path):
     manager.call("config", "reset loop.debug scope=session")
 
     assert configuration.effective.loop.debug is True
-    interaction.confirm.assert_called_once_with("Reset loop.debug for session?", default=False)
+    interaction.confirm_async.assert_called_once_with(
+        "Reset loop.debug for session?", default=False
+    )
 
 
 def test_config_workspace_reset_reveals_user_value(tmp_path):
@@ -424,8 +617,8 @@ def test_config_workspace_reset_reveals_user_value(tmp_path):
     configuration.load()
     configuration.set("loop.debug", True, scope="user")
     configuration.set("loop.debug", False, scope="workspace")
-    interaction = Mock()
-    interaction.confirm.return_value = True
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm_async.return_value = True
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
@@ -442,7 +635,7 @@ def test_config_reset_all_and_validation_failures_leave_state_consistent(tmp_pat
     """Reset without a path clears every selected-scope override and invalid writes fail safely."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
@@ -462,7 +655,7 @@ def test_config_scope_picker_cancels_reset_all(tmp_path):
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
     configuration.set_session("loop.debug", True)
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
@@ -471,7 +664,7 @@ def test_config_scope_picker_cancels_reset_all(tmp_path):
     manager.call("config", "reset")
 
     assert configuration.effective.loop.debug is True
-    interaction.prompt.assert_called_once()
+    interaction.prompt_async.assert_called_once()
 
 
 def test_config_explicit_user_reset_can_be_declined(tmp_path):
@@ -480,15 +673,15 @@ def test_config_explicit_user_reset_can_be_declined(tmp_path):
         tmp_path / "config.toml", tmp_path / ".loop" / "config.toml"
     )
     configuration.load()
-    interaction = Mock()
-    interaction.confirm.return_value = False
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm_async.return_value = False
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
 
     manager.call("config", "reset scope=user")
 
-    interaction.confirm.assert_called_once()
+    interaction.confirm_async.assert_called_once()
 
 
 def test_config_omitted_scope_prompts_and_supports_workspace_or_cancel(tmp_path):
@@ -498,8 +691,8 @@ def test_config_omitted_scope_prompts_and_supports_workspace_or_cancel(tmp_path)
     )
     configuration.load()
     apply = Mock(return_value="applied")
-    interaction = Mock()
-    interaction.prompt.side_effect = ["workspace", "cancel", "session"]
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async.side_effect = ["workspace", "cancel", "session"]
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )

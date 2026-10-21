@@ -2213,8 +2213,8 @@ def test_call_async_routes_arguments_and_context():
 
 def test_call_async_returns_validation_and_permission_denials_before_invocation():
     """Async dispatch stops before invocation for invalid and rejected calls."""
-    interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.DENY
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async.return_value = ApprovalChoice.DENY
     registry = ToolRegistry(interaction=interaction)
 
     @declare_tool(
@@ -2333,8 +2333,8 @@ def test_all_dispatch_paths_preserve_structured_operation_planning_problems():
 
 def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
     """Async tool timing spans awaited execution but excludes permission confirmation."""
-    interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.ONCE
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async.return_value = ApprovalChoice.ONCE
     recorder = Mock()
     permissions = PermissionManager(interaction=interaction, recorder=recorder)
     registry = ToolRegistry(interaction=interaction, permission_manager=permissions)
@@ -2355,7 +2355,7 @@ def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
 
     assert result_value(output) == 3
     assert duration == 2
-    interaction.prompt.assert_called_once()
+    interaction.prompt_async.assert_awaited_once()
     recorder.record_authorization.assert_called_once()
 
 
@@ -2497,8 +2497,8 @@ def test_async_execution_authorization_keeps_sandbox_boundary(
 )
 def test_call_with_timing_async_returns_zero_before_invocation(name, arguments, error, monkeypatch):
     """Async timing remains zero when lookup, validation, or authorization stops dispatch."""
-    interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.DENY
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async.return_value = ApprovalChoice.DENY
     registry = ToolRegistry(interaction=interaction)
 
     @declare_tool(

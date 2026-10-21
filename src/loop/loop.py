@@ -20,7 +20,7 @@ from .control import RunControl
 from .errors import Problem, log_problem
 from .execution.sandbox import SandboxCommands
 from .instructions import InstructionsManager, RuntimeEnvironment, SkillCommands
-from .interaction import AsyncInteractionInput, Interaction
+from .interaction import Interaction, require_async_interaction
 from .mentions import MentionManager, ProjectPathMentionHandler
 from .mentions.parser import parse_mentions
 from .model_selection import ModelCommands, ModelSelection
@@ -224,6 +224,7 @@ class Loop:
             ),
         )
         configured_instructions.prepare(configured_agent)
+        configured_commands = CommandManager(interaction=configured_interaction)
         configured_selection = ModelSelection(
             backend,
             configured_sessions,
@@ -231,6 +232,7 @@ class Loop:
                 configured_sessions.model if configured_sessions.model is not None else model
             ),
             on_select=on_model_select,
+            async_blocking_runner=configured_commands.run_blocking,
         )
         configured_compaction = ContextCompaction(
             backend,
@@ -269,10 +271,7 @@ class Loop:
                 refresh_backend=refresh_sandbox_backend,
             ),
         )
-        configured_commands = CommandManager(
-            providers=providers,
-            interaction=configured_interaction,
-        )
+        configured_commands.register_providers(providers)
         skill_hints_enabled = mention_manager is None
         configured_mentions = mention_manager or MentionManager(
             (ProjectPathMentionHandler(directory_reference),)
@@ -678,23 +677,21 @@ class Loop:
         Args:
             input_source (Callable[[CompletionManager], Awaitable[object]] | None): Optional
                 awaitable mailbox reader for ordinary conversation input. It receives the live
-                completion manager and returns text or ``False`` to exit. Defaults to the
-                interaction's async prompt when supported, then its synchronous prompt.
+                completion manager and returns text or ``False`` to exit. Without it, the
+                interaction must provide native asynchronous input.
 
         Raises:
             KeyboardInterrupt: If the configured stop signal interrupts agent execution.
+            ProblemException: If the interaction does not provide asynchronous input.
             WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
         """
         recovery_pending = await self._recover_session_async()
         while not self._command_manager.exit_requested:
             if input_source is not None:
                 user_input = await input_source(self._completion_manager)
-            elif isinstance(self._interaction, AsyncInteractionInput):
-                user_input = await self._interaction.prompt_async(
-                    completer=self._completion_manager
-                )
             else:
-                user_input = self._interaction.prompt(completer=self._completion_manager)
+                interaction = require_async_interaction(self._interaction, "conversation input")
+                user_input = await interaction.prompt_async(completer=self._completion_manager)
             if user_input is False:
                 break
             session = self.session
@@ -703,7 +700,7 @@ class Loop:
                 handled_command = await self._command_manager.handle_user_command_async(user_input)
             if handled_command:
                 if self.session is not session:
-                    self._model_selection.restore(self.session.model)
+                    await self._model_selection.restore_async(self.session.model)
                     recovery_pending = await self._recover_session_async()
                 continue
             if recovery_pending:

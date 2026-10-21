@@ -8,6 +8,7 @@ from prompt_toolkit.document import Document
 
 from loop import CommandCompletionAdapter, CompletionManager
 from loop.commands import CommandArgumentError, CommandContext
+from loop.interaction import ConsoleInteraction
 from loop.utils import PathHolder
 from loop.workspace import (
     Workspace,
@@ -28,7 +29,7 @@ def commands(tmp_path):
 
 def test_workspace_commands_show_list_and_rename_active_workspace(commands):
     """Registry commands display locations and persist explicit user names."""
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     context = CommandContext("workspace", interaction)
 
     commands.workspace(context)
@@ -100,7 +101,7 @@ def test_workspace_commands_require_initialized_identity(tmp_path):
 
 def test_workspace_lifecycle_commands_confirm_mutations_and_report_conflicts(commands, tmp_path):
     """Attach is immediate while forget and rekey support cancellation and recovery errors."""
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.side_effect = [False, True, True, True]
     context = CommandContext("workspace", interaction)
     attached = tmp_path / "attached"
@@ -127,7 +128,7 @@ def test_workspace_attach_forwards_an_explicit_existing_identity(tmp_path):
     repository.attach.return_value = workspace
     _commands = WorkspaceCommands(workspace, repository)
 
-    interaction = Mock()
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.side_effect = [False, True]
     context = CommandContext("workspace", interaction)
 

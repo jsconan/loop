@@ -10,7 +10,7 @@ from typing import Any
 from prompt_toolkit.completion import Completer
 
 from .. import constants
-from ..errors import Problem
+from ..errors import Problem, ProblemException
 from ..models import RAW_TOOL_RESULT_PRESENTATION, RunMetrics, ToolResultPresentationSpec
 from ..utils import ChoiceItem
 from .models import ListMarker
@@ -382,6 +382,15 @@ class InteractionOutput(ABC):
 class Interaction(InteractionInput, InteractionOutput):
     """Combine synchronous input and output for existing interaction adapters."""
 
+    @property
+    def worker_calls_routed(self) -> bool:
+        """Report whether synchronous calls from workers are relayed to the UI owner.
+
+        Returns:
+            bool: ``True`` when blocking callbacks may use this interaction from a worker.
+        """
+        return False
+
     @contextmanager
     def terminal_context(self) -> Generator[None]:
         """Reserve exclusive terminal access for a directly interactive operation.
@@ -393,3 +402,33 @@ class Interaction(InteractionInput, InteractionOutput):
             None: Control while the operation owns terminal input.
         """
         yield
+
+
+def require_async_interaction(
+    interaction: Interaction | None,
+    operation: str,
+) -> AsyncInteractionInput:
+    """Require native asynchronous input for one async operation.
+
+    Args:
+        interaction (Interaction | None): Interaction expected to receive asynchronous input.
+        operation (str): Operation that requires asynchronous input.
+
+    Returns:
+        AsyncInteractionInput: Interaction providing native async prompt and confirmation methods.
+
+    Raises:
+        ProblemException: If the interaction is unavailable or provides only synchronous input.
+    """
+    if not isinstance(interaction, AsyncInteractionInput):
+        raise ProblemException(
+            Problem(
+                code="interaction.async_required",
+                title="Asynchronous interaction required",
+                detail=(
+                    f"The {operation} operation requires an interaction with asynchronous input."
+                ),
+                operation=operation,
+            )
+        )
+    return interaction

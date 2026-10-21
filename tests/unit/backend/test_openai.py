@@ -3,6 +3,7 @@
 import asyncio
 import json
 from base64 import b64decode
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -85,6 +86,27 @@ class CompactItem(BaseModel):
     type: str
     id: str
     encrypted_content: str
+
+
+class AsyncModelPage:
+    """Provide a reusable async iterable matching the SDK model paginator."""
+
+    _models: tuple[object, ...]
+    _error: Exception | None
+
+    def __init__(self, models: list[object] | None = None, error: Exception | None = None) -> None:
+        self._models = tuple(models or ())
+        self._error = error
+
+    def __aiter__(self) -> AsyncIterator[object]:
+        async def iterate() -> AsyncIterator[object]:
+            """Yield page models or raise the configured provider failure."""
+            if self._error is not None:
+                raise self._error
+            for model in self._models:
+                yield model
+
+        return iterate()
 
 
 @pytest.fixture(autouse=True)
@@ -211,7 +233,7 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
     sync_sdk = Mock()
     async_sdk = Mock()
     sync_sdk.models.list.return_value = []
-    async_sdk.models.list = AsyncMock(return_value=[])
+    async_sdk.models.list.return_value = AsyncModelPage()
 
     with (
         patch("loop.backend.openai.OpenAI", return_value=sync_sdk) as openai,
@@ -575,7 +597,7 @@ def test_configured_transport_retries_reach_both_clients():
     sync_sdk = Mock()
     sync_sdk.models.list.return_value = []
     async_sdk = Mock()
-    async_sdk.models.list = AsyncMock(return_value=[])
+    async_sdk.models.list.return_value = AsyncModelPage()
 
     with (
         patch("loop.backend.openai.OpenAI", return_value=sync_sdk) as openai,
@@ -888,7 +910,7 @@ def test_models_are_listed_asynchronously_from_the_backend():
         SimpleNamespace(id="second", model_extra=None),
     ]
     sdk = Mock()
-    sdk.models.list = AsyncMock(return_value=iter(models))
+    sdk.models.list.return_value = AsyncModelPage(models)
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
         assert asyncio.run(OpenAIBackend().get_models_async()) == [
@@ -896,7 +918,7 @@ def test_models_are_listed_asynchronously_from_the_backend():
             ModelInfo(id="second"),
         ]
 
-    sdk.models.list.assert_awaited_once_with(timeout=2.0)
+    sdk.models.list.assert_called_once_with(timeout=2.0)
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -909,7 +931,7 @@ def test_model_listing_reads_metadata_without_model_extra(asynchronous):
     )
     sdk = Mock()
     if asynchronous:
-        sdk.models.list = AsyncMock(return_value=iter([model]))
+        sdk.models.list.return_value = AsyncModelPage([model])
         factory = "loop.backend.openai.AsyncOpenAI"
     else:
         sdk.models.list.return_value = iter([model])
@@ -930,7 +952,7 @@ def test_model_listing_reads_metadata_without_model_extra(asynchronous):
         )
     ]
     if asynchronous:
-        sdk.models.list.assert_awaited_once_with(timeout=2.0)
+        sdk.models.list.assert_called_once_with(timeout=2.0)
     else:
         sdk.models.list.assert_called_once_with(timeout=2.0)
 
@@ -1015,10 +1037,8 @@ def test_hyperparameter_discovery_keeps_all_controls_when_metadata_is_unspecifie
 def test_async_declared_model_hyperparameters_avoid_an_unsupported_initial_request():
     """Asynchronous fallback requests apply explicit model metadata before generation."""
     sdk = Mock()
-    sdk.models.list = AsyncMock(
-        return_value=iter(
-            [SimpleNamespace(id="model", model_extra={"capabilities": {"temperature": True}})]
-        )
+    sdk.models.list.return_value = AsyncModelPage(
+        [SimpleNamespace(id="model", model_extra={"capabilities": {"temperature": True}})]
     )
     sdk.responses.create = AsyncMock(
         side_effect=[
@@ -1056,7 +1076,7 @@ def test_async_declared_model_hyperparameters_avoid_an_unsupported_initial_reque
     request = sdk.responses.create.await_args.kwargs
     assert request["temperature"] == 0.2
     assert "reasoning" not in request
-    sdk.models.list.assert_awaited_once_with(timeout=2.0)
+    sdk.models.list.assert_called_once_with(timeout=2.0)
 
 
 @pytest.mark.parametrize(
@@ -1193,7 +1213,7 @@ def test_retry_delay_supports_http_dates_with_optional_timezones():
 def test_async_model_listing_translates_non_status_provider_errors(provider_error, error_type):
     """Async non-status SDK failures use the provider-neutral backend hierarchy."""
     sdk = Mock()
-    sdk.models.list = AsyncMock(side_effect=provider_error)
+    sdk.models.list.return_value = AsyncModelPage(error=provider_error)
 
     with (
         patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
@@ -1319,8 +1339,8 @@ def test_prompt_tokenizers_are_unavailable_without_a_base_url():
 def test_async_model_metadata_and_tokenizer_use_the_selected_model():
     """Async metadata and tokenization mirror the model-aware synchronous helpers."""
     sdk = Mock()
-    sdk.models.list = AsyncMock(
-        return_value=[SimpleNamespace(id="active", model_extra={"max_model_len": 65536})]
+    sdk.models.list.return_value = AsyncModelPage(
+        [SimpleNamespace(id="active", model_extra={"max_model_len": 65536})]
     )
     response = Mock()
     response.json.return_value = {"count": 4}
@@ -1344,7 +1364,7 @@ def test_async_model_metadata_and_tokenizer_use_the_selected_model():
         headers={"Authorization": "Bearer key"},
         timeout=2.0,
     )
-    sdk.models.list.assert_awaited_once_with(timeout=2.0)
+    sdk.models.list.assert_called_once_with(timeout=2.0)
 
 
 def test_async_usage_helpers_gracefully_handle_configuration_and_failures():
@@ -1352,10 +1372,8 @@ def test_async_usage_helpers_gracefully_handle_configuration_and_failures():
     assert asyncio.run(OpenAIBackend(context_window=4096).get_context_window_async()) == 4096
 
     sdk = Mock()
-    sdk.models.list = AsyncMock(
-        side_effect=APIConnectionError(
-            request=httpx.Request("GET", "https://example.test/v1/models")
-        )
+    sdk.models.list.return_value = AsyncModelPage(
+        error=APIConnectionError(request=httpx.Request("GET", "https://example.test/v1/models"))
     )
     response = Mock()
     response.raise_for_status.side_effect = httpx.HTTPError("unavailable")
@@ -1961,7 +1979,9 @@ def test_async_generation_hyperparameter_fallback_retries_without_rejected_contr
     sdk.responses.create = AsyncMock(
         side_effect=[rejected, AsyncEvents([sdk_completion_event(total_tokens=None)])]
     )
-    sdk.models.list = AsyncMock(return_value=iter([SimpleNamespace(id="model", model_extra=None)]))
+    sdk.models.list.return_value = AsyncModelPage(
+        [SimpleNamespace(id="model", model_extra=None)]
+    )
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
         assert isinstance(

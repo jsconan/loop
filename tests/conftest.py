@@ -15,6 +15,7 @@ import pytest
 
 sys.dont_write_bytecode = True
 
+from loop.commands import CommandManager
 from loop.permissions import PermissionManager
 from loop.permissions import manager as permission_module
 from loop.telemetry import get_telemetry, set_telemetry
@@ -200,6 +201,23 @@ def close_permission_managers(monkeypatch, isolated_environment):
         managers.append(manager)
 
     monkeypatch.setattr(PermissionManager, "__init__", tracked_initialize)
+    yield
+    for manager in reversed(managers):
+        manager.close()
+
+
+@pytest.fixture(autouse=True)
+def close_command_managers(monkeypatch, isolated_environment):
+    """Close command runners and bounded executors owned by each test's managers."""
+    managers: list[CommandManager] = []
+    initialize: Callable[..., None] = CommandManager.__init__
+
+    def tracked_initialize(manager: CommandManager, *args: object, **kwargs: object) -> None:
+        """Track successfully initialized dispatch owners for deterministic cleanup."""
+        initialize(manager, *args, **kwargs)
+        managers.append(manager)
+
+    monkeypatch.setattr(CommandManager, "__init__", tracked_initialize)
     yield
     for manager in reversed(managers):
         manager.close()

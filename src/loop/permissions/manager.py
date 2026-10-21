@@ -27,7 +27,7 @@ import yaml
 
 from .. import constants
 from ..errors import Problem, log_problem
-from ..interaction import AsyncInteractionInput
+from ..interaction import Interaction, require_async_interaction
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import (
     ShutdownRequested,
@@ -76,7 +76,6 @@ from .protection import ProtectedWorkspacePaths, protected_workspace_paths
 
 if TYPE_CHECKING:
     from ..execution.sandbox import SandboxRequest
-    from ..interaction import Interaction
 
 _READ_ACTIONS = {Action.FILESYSTEM_LIST, Action.FILESYSTEM_READ}
 _WRITE_ACTIONS = {
@@ -1441,25 +1440,19 @@ class PermissionManager:
             ApprovalChoice: Selected denial or approval lifetime. Cancellation denies.
 
         Raises:
+            ProblemException: If the interaction does not provide asynchronous input.
             asyncio.CancelledError: If native asynchronous input is cancelled.
         """
         choices, index = self._permission_options(fresh_only)
         active_interaction = interaction if interaction is not None else self._interaction
+        async_interaction = require_async_interaction(active_interaction, "permission approval")
         active_interaction.info(prompt)
-        if isinstance(active_interaction, AsyncInteractionInput):
-            selected = await active_interaction.prompt_async(
-                "Proceed?",
-                exit_commands=None,
-                choices=choices,
-                index=index,
-            )
-        else:
-            selected = active_interaction.prompt(
-                "Proceed?",
-                exit_commands=None,
-                choices=choices,
-                index=index,
-            )
+        selected = await async_interaction.prompt_async(
+            "Proceed?",
+            exit_commands=None,
+            choices=choices,
+            index=index,
+        )
         return selected if isinstance(selected, ApprovalChoice) else ApprovalChoice.DENY
 
     def _permission_options(
@@ -1909,8 +1902,16 @@ class PermissionManager:
             self._audit_policy_change("permission.session_reset", PolicyScope.SESSION)
         return changed
 
-    def reload(self) -> PermissionLoadResult:
+    def reload(
+        self,
+        *,
+        interaction: Interaction | None = None,
+    ) -> PermissionLoadResult:
         """Reload the workspace policy according to the configured failure policy.
+
+        Args:
+            interaction (Interaction | None): Invocation interaction used for recovery prompts, or
+                ``None`` to use the manager's configured interaction.
 
         Returns:
             PermissionLoadResult: Whether new policy loaded or the active policy was retained.
@@ -1919,7 +1920,11 @@ class PermissionManager:
             PermissionConfigurationError: If loading fails in strict mode.
             ShutdownRequested: If the user exits interactive recovery.
         """
-        result = self._load_configuration(retain_on_failure=True)
+        active_interaction = interaction if interaction is not None else self._interaction
+        result = self._load_configuration(
+            retain_on_failure=True,
+            interaction=active_interaction,
+        )
         self._load_user_configuration()
         return result
 
@@ -2236,6 +2241,7 @@ class PermissionManager:
         self,
         *,
         retain_on_failure: bool = False,
+        interaction: Interaction | None = None,
     ) -> PermissionLoadResult:
         """Load configuration and completely handle the selected failure policy."""
         while True:
@@ -2250,10 +2256,13 @@ class PermissionManager:
                         return PermissionLoadResult.RETAINED
                     self._configuration = PermissionConfiguration()
                     return PermissionLoadResult.DEFAULTED
-                if self._interaction is None:
+                active_interaction = interaction if interaction is not None else self._interaction
+                if active_interaction is None:
                     raise
                 choice = self._recover_configuration_interactively(
-                    exc, retain_on_failure=retain_on_failure
+                    exc,
+                    interaction=active_interaction,
+                    retain_on_failure=retain_on_failure,
                 )
                 if choice is PermissionLoadResult.LOADED:
                     continue
@@ -2265,6 +2274,7 @@ class PermissionManager:
         self,
         error: PermissionConfigurationError,
         *,
+        interaction: Interaction,
         retain_on_failure: bool,
     ) -> PermissionLoadResult:
         """Report one failure and return the user's selected recovery outcome."""
@@ -2276,13 +2286,14 @@ class PermissionManager:
             metadata={"path": error.path},
         )
         log_problem(_LOGGER, problem, error)
-        self._interaction.report(problem)
+        interaction.report(problem)
         continue_description = (
             "Keep the current permission policy"
             if retain_on_failure
             else "Use supervised defaults for this session"
         )
-        choice = self._interaction.prompt(
+        # Construction and reload are synchronous; async callers must use a native prompt path.
+        choice = interaction.prompt(
             "Permission policy recovery:",
             exit_commands=(),
             choices={
@@ -2297,7 +2308,7 @@ class PermissionManager:
             return PermissionLoadResult.LOADED
         if choice == "reset":
             backup_path = self.reset_configuration()
-            self._interaction.info(
+            interaction.info(
                 "Reset permission policy to supervised defaults; "
                 f"archived invalid file at {backup_path}."
             )
@@ -2305,10 +2316,10 @@ class PermissionManager:
         if choice == "exit" or choice is False:
             raise ShutdownRequested()
         if retain_on_failure:
-            self._interaction.warning("Keeping the current permission policy.")
+            interaction.warning("Keeping the current permission policy.")
             return PermissionLoadResult.RETAINED
         self._configuration = PermissionConfiguration()
-        self._interaction.warning("Using supervised permission defaults for this session.")
+        interaction.warning("Using supervised permission defaults for this session.")
         return PermissionLoadResult.DEFAULTED
 
     def _report_configuration_error(self, error: PermissionConfigurationError) -> None:

@@ -69,6 +69,8 @@ def agent_runner(
     agent = Agent("Assistant", tools=Mock())
     instructions = instructions_manager or InstructionsManager()
     session_manager = Mock()
+    model_selection = Mock()
+    model_selection.record_response_async = AsyncMock()
     session_manager.messages = []
     session_manager.model_context = []
     session_manager.session = Session()
@@ -89,7 +91,7 @@ def agent_runner(
         instructions,
         Mock(),
         session_manager,
-        Mock(),
+        model_selection,
         Mock(),
         interaction,
         PathHolder(Path.cwd()),
@@ -120,6 +122,7 @@ def file_runner(tmp_path, backend, *, registry=None, sessions=None, run_control=
     agent = Agent("Assistant", tools=registry or ToolRegistry(BUILTIN_TOOLS))
     selection = Mock()
     selection.effective = "local-model"
+    selection.record_response_async = AsyncMock()
     return AgentRunner(
         agent,
         backend,
@@ -1631,6 +1634,7 @@ def test_runner_run_async_uses_async_query_and_completes():
     runner.query_async.assert_awaited_once_with()
     runner.query.assert_not_called()
     runner.handle_tool_calls_async.assert_awaited_once_with(response)
+    runner.model_selection.record_response_async.assert_awaited_once_with(response.model)
     sessions.add_response.assert_called_once_with(response)
     sessions.record_run.assert_called_once()
 

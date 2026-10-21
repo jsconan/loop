@@ -5,13 +5,14 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from typing import Protocol, overload
+from typing import Any, Protocol, overload
 
 from pydantic import BaseModel
 
 from ..completion import CommandCompletion
+from ..errors import Problem, ProblemException
 from ..models import CommandCapability
-from ..utils import callable_name
+from ..utils import callable_name, close_awaitable, is_async_callable
 from .context import CommandContext
 from .models import CommandRegistrationError
 from .utils import (
@@ -28,7 +29,7 @@ class Command:
     """Describe and, once registered, invoke a user command.
 
     Args:
-        function (Callable[..., None]): Python function invoked for the command.
+        function (Callable[..., Any]): Python function invoked for the command.
         name (str | None): Slash-free public name, or ``None`` to derive it at registration.
         description (str | None): Display description, or ``None`` to derive it from the docstring.
         arguments_model (type[BaseModel] | None): Pydantic model used to validate arguments after
@@ -39,7 +40,7 @@ class Command:
             capability remain limited to an idle session.
     """
 
-    function: Callable[..., None]
+    function: Callable[..., Any]
     name: str | None = None
     description: str | None = None
     arguments_model: type[BaseModel] | None = None
@@ -69,8 +70,8 @@ class Command:
             Command: Immutable, fully resolved command for one manager.
 
         Raises:
-            CommandRegistrationError: If the function lacks a description or its parameters
-                cannot produce an argument schema.
+            CommandRegistrationError: If the function lacks a description, its parameters cannot
+                produce an argument schema.
         """
         resolved_name = self.name if name is None else name
         if resolved_name is None:
@@ -86,12 +87,82 @@ class Command:
             arguments_model=get_command_arguments_model(self.function, resolved_name),
         )
 
-    def call(self, arguments: str, context: CommandContext | None = None) -> None:
+    def call(self, arguments: str, context: CommandContext | None = None) -> Any:
         """Parse arguments and invoke the command function.
 
         Args:
             arguments (str): Shell-like positional and ``name=value`` argument text.
             context (CommandContext | None): Runtime context supplied to a context-aware command.
+
+        Returns:
+            Any: Value returned by the command function.
+
+        Raises:
+            ValidationError: If the supplied arguments do not match the command parameters.
+            CommandArgumentError: If the argument syntax or parameter binding is invalid.
+            ProblemException: If the registered function is asynchronous or returns an awaitable.
+            ValueError: If the command is passive, or declares a context but none is provided.
+        """
+        if is_async_callable(self.function):
+            raise ProblemException(
+                Problem(
+                    code="command.async_required",
+                    title="Asynchronous command required",
+                    detail=(
+                        f"Command '{self.name}' is asynchronous; use "
+                        "CommandManager.call_async() or "
+                        "CommandManager.handle_user_command_async()."
+                    ),
+                    operation=self.name,
+                )
+            )
+        result = self.invoke(arguments, context)
+        if inspect.isawaitable(result):
+            close_awaitable(result)
+            raise ProblemException(
+                Problem(
+                    code="command.async_required",
+                    title="Asynchronous command required",
+                    detail=(
+                        f"Command '{self.name}' returned an awaitable during sync dispatch; use "
+                        "CommandManager.call_async() or "
+                        "CommandManager.handle_user_command_async()."
+                    ),
+                    operation=self.name,
+                )
+            )
+        return result
+
+    async def call_async(self, arguments: str, context: CommandContext | None = None) -> Any:
+        """Invoke the command and await an asynchronous result when it returns one.
+
+        Args:
+            arguments (str): Shell-like positional and ``name=value`` argument text.
+            context (CommandContext | None): Runtime context supplied to a context-aware command.
+
+        Returns:
+            Any: Value returned by the command function after it settles.
+
+        Raises:
+            ValidationError: If supplied arguments do not match the command parameters.
+            CommandArgumentError: If argument syntax or parameter binding is invalid.
+            ValueError: If the command is passive, or declares a context but none is provided.
+        """
+        result = self.invoke(arguments, context)
+        return await result if inspect.isawaitable(result) else result
+
+    def invoke(self, arguments: str, context: CommandContext | None = None) -> Any:
+        """Validate and invoke the registered function without adapting its result.
+
+        Use this method when a command manager needs the raw callback result to choose its own
+        execution boundary. Most callers should use :meth:`call` or :meth:`call_async`.
+
+        Args:
+            arguments (str): Shell-like positional and ``name=value`` argument text.
+            context (CommandContext | None): Runtime context supplied to a context-aware command.
+
+        Returns:
+            Any: Value returned by the registered function, possibly an awaitable.
 
         Raises:
             ValidationError: If the supplied arguments do not match the command parameters.
@@ -104,12 +175,11 @@ class Command:
         if takes_command_context(self.function):
             if context is None:
                 raise ValueError(f"Command '{self.name}' requires a CommandContext.")
-            self.function(context, **values)
-        else:
-            self.function(**values)
+            return self.function(context, **values)
+        return self.function(**values)
 
     @staticmethod
-    def _description_for(function: Callable[..., None]) -> str:
+    def _description_for(function: Callable[..., Any]) -> str:
         """Return a command description from its docstring summary."""
         docstring = inspect.getdoc(function)
         if not docstring:
@@ -119,11 +189,11 @@ class Command:
         return docstring.split("\n\n", maxsplit=1)[0].replace("\n", " ")
 
     @staticmethod
-    def get_declaration(function: Callable[..., None]) -> Command | None:
+    def get_declaration(function: Callable[..., Any]) -> Command | None:
         """Return the passive command declaration attached to a function.
 
         Args:
-            function (Callable[..., None]): Function that may carry command metadata.
+            function (Callable[..., Any]): Function that may carry command metadata.
 
         Returns:
             Command | None: Attached passive command, or ``None``.
@@ -132,11 +202,11 @@ class Command:
         return declaration if isinstance(declaration, Command) else None
 
     @staticmethod
-    def set_declaration(function: Callable[..., None], declaration: Command) -> None:
+    def set_declaration(function: Callable[..., Any], declaration: Command) -> None:
         """Attach a passive command declaration to a function.
 
         Args:
-            function (Callable[..., None]): Function to attach command metadata to.
+            function (Callable[..., Any]): Function to attach command metadata to.
             declaration (Command): Command metadata to attach.
         """
         setattr(function, _COMMAND_ATTR, declaration)
@@ -147,7 +217,7 @@ class CommandRegistration:
     """Configure one callable for registration in a command manager.
 
     Args:
-        function (Callable[..., None]): Callable to expose as a command.
+        function (Callable[..., Any]): Callable to expose as a command.
         name (str | None): Container-specific public name, or ``None`` to inherit or derive it.
         description (str | None): Container-specific description, or ``None`` to inherit or derive
             it.
@@ -157,7 +227,7 @@ class CommandRegistration:
             ``None`` to inherit those declared on the function.
     """
 
-    function: Callable[..., None]
+    function: Callable[..., Any]
     name: str | None = None
     description: str | None = None
     completion: CommandCompletion | None = None
@@ -176,13 +246,13 @@ class CommandsProvider(Protocol):
 
 
 @overload
-def command[CommandFunction: Callable[..., None]](
+def command[CommandFunction: Callable[..., Any]](
     function: CommandFunction, /
 ) -> CommandFunction: ...
 
 
 @overload
-def command[CommandFunction: Callable[..., None]](
+def command[CommandFunction: Callable[..., Any]](
     function: None = None,
     /,
     *,
@@ -193,7 +263,7 @@ def command[CommandFunction: Callable[..., None]](
 ) -> Callable[[CommandFunction], CommandFunction]: ...
 
 
-def command[CommandFunction: Callable[..., None]](
+def command[CommandFunction: Callable[..., Any]](
     function: CommandFunction | None = None,
     /,
     *,

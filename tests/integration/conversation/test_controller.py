@@ -2,7 +2,7 @@
 
 import asyncio
 from io import StringIO
-from threading import Event
+from threading import Event, get_ident
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +20,7 @@ from loop import (
     ConsoleInteraction,
     Loop,
     Message,
+    ModelInfo,
     ResponseCompleted,
     SessionController,
 )
@@ -91,6 +92,163 @@ def test_async_loop_commands_can_reserve_the_native_terminal(tmp_path):
 
     assert "terminal reserved" in output.getvalue()
     assert "terminal released" in output.getvalue()
+
+
+def test_async_loop_dispatches_model_commands_without_blocking_the_ui(tmp_path):
+    """Model catalog commands use the bounded worker and mailbox in the async application."""
+    output = StringIO()
+    backend_threads = []
+    with create_pipe_input() as pipe:
+        prompt = PromptSession(input=pipe, output=DummyOutput())
+        source = ConsoleInteraction(session=prompt, console=Console(file=output), markdown=False)
+        controller = SessionController(source)
+        table_rendered = asyncio.Event()
+        model_selected = asyncio.Event()
+        original_table = source.table
+        original_info = source.info
+
+        def get_models():
+            """Return a local model fixture for synchronous callers."""
+            backend_threads.append(get_ident())
+            return [ModelInfo(id="fixture")]
+
+        async def get_models_async():
+            """Record the owner thread and return a local asynchronous catalog fixture."""
+            backend_threads.append(get_ident())
+            return [ModelInfo(id="fixture")]
+
+        async def get_context_window_async(_model):
+            """Return local async context metadata for the selected fixture."""
+
+        def observed_table(*args, **kwargs):
+            """Render the catalog and signal that the mailbox command completed."""
+            original_table(*args, **kwargs)
+            table_rendered.set()
+
+        def observed_info(message=""):
+            """Render selection status and signal when model selection completes."""
+            original_info(message)
+            if message == "Using model: fixture":
+                model_selected.set()
+
+        source.table = observed_table
+        source.info = observed_info
+        loop = Loop.create_default(
+            SimpleNamespace(
+                default_model="fixture",
+                get_context_window=lambda _model: None,
+                get_models=get_models,
+                get_context_window_async=get_context_window_async,
+                get_models_async=get_models_async,
+            ),
+            interaction=controller.interaction,
+            run_control=controller.control,
+            working_directory=tmp_path,
+            session_name_generator=LocalSessionNameGenerator(),
+        )
+        controller.bind_command_manager(loop.command_manager)
+
+        async def scenario():
+            """Run the normal async controller and submit the model catalog command."""
+            owner_thread = get_ident()
+            task = asyncio.create_task(
+                controller.run_async(
+                    lambda receive: loop.run_async(input_source=receive),
+                    route_idle_commands=True,
+                )
+            )
+            try:
+                pipe.send_text("/models\n")
+                await asyncio.wait_for(table_rendered.wait(), timeout=5)
+                pipe.send_text("/model fixture\n")
+                await asyncio.wait_for(model_selected.wait(), timeout=5)
+                pipe.send_text("/exit\n")
+                await asyncio.wait_for(task, timeout=5)
+                return owner_thread
+            finally:
+                controller.stop()
+                await asyncio.gather(task, return_exceptions=True)
+
+        owner_thread = asyncio.run(scenario())
+
+    assert len(backend_threads) == 1
+    assert backend_threads == [owner_thread]
+    assert "fixture" in output.getvalue()
+    assert "Using model: fixture" in output.getvalue()
+
+
+def test_async_model_check_can_select_a_fallback_without_stopping_the_loop(tmp_path):
+    """A model-check fallback prompt completes through the async command mailbox."""
+    output = StringIO()
+    with create_pipe_input() as pipe:
+        prompt = PromptSession(input=pipe, output=DummyOutput())
+        source = ConsoleInteraction(session=prompt, console=Console(file=output), markdown=False)
+        controller = SessionController(source)
+        prompt_opened = asyncio.Event()
+        model_selected = asyncio.Event()
+        original_prompt_async = source.prompt_async
+        original_info = source.info
+
+        async def observed_prompt_async(*args, **kwargs):
+            """Choose a replacement after model recovery asks the async UI."""
+            if args and args[0] == "Select a replacement model:":
+                prompt_opened.set()
+                return "replacement"
+            return await original_prompt_async(*args, **kwargs)
+
+        def observed_info(message=""):
+            """Render command output and observe successful fallback selection."""
+            original_info(message)
+            if message == "Using model: replacement":
+                model_selected.set()
+
+        async def get_models_async():
+            """Return the local async catalog used by model-check recovery."""
+            return [ModelInfo(id="replacement"), ModelInfo(id="other")]
+
+        async def get_context_window_async(_model):
+            """Return local async context metadata for the selected replacement."""
+            return 4096
+
+        source.prompt_async = observed_prompt_async
+        source.info = observed_info
+        loop = Loop.create_default(
+            SimpleNamespace(
+                default_model=None,
+                get_context_window=lambda _model: 4096,
+                get_models=lambda: [ModelInfo(id="replacement"), ModelInfo(id="other")],
+                get_context_window_async=get_context_window_async,
+                get_models_async=get_models_async,
+            ),
+            interaction=controller.interaction,
+            run_control=controller.control,
+            working_directory=tmp_path,
+            session_name_generator=LocalSessionNameGenerator(),
+        )
+        controller.bind_command_manager(loop.command_manager)
+
+        async def scenario():
+            """Run model recovery through the production controller and stop cleanly."""
+            task = asyncio.create_task(
+                controller.run_async(
+                    lambda receive: loop.run_async(input_source=receive),
+                    route_idle_commands=True,
+                )
+            )
+            try:
+                pipe.send_text("/check\n")
+                await asyncio.wait_for(prompt_opened.wait(), timeout=5)
+                await asyncio.wait_for(model_selected.wait(), timeout=5)
+                pipe.send_text("/exit\n")
+                await asyncio.wait_for(task, timeout=5)
+            finally:
+                controller.stop()
+                await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(scenario())
+
+    assert "Using model: replacement" in output.getvalue()
+    assert loop.model == "replacement"
 
 
 @pytest.mark.parametrize("mode", ["queue", "interrupt", "steer", "default-steer"])

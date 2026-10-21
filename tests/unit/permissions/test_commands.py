@@ -26,12 +26,13 @@ from loop import (
     PolicyScope,
 )
 from loop.execution.sandbox import SandboxRequest
+from loop.interaction import ConsoleInteraction
 from loop.permissions import PermissionCommands
 
 
 def test_permissions_sandbox_rules_can_be_listed_and_removed(tmp_path):
     """The permission command exposes a revocation path for native approvals."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.prompt.return_value = "session"
     permissions = PermissionManager(tmp_path, interaction=interaction)
     command = command_manager(permissions, interaction)
@@ -61,7 +62,7 @@ def test_permissions_sandbox_rules_can_be_listed_and_removed(tmp_path):
 
 def test_permissions_host_rules_can_be_listed_and_revoked(tmp_path):
     """A recorded host choice has a user-visible session revocation command."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path, interaction=interaction)
     command = command_manager(permissions, interaction)
     command.call("permissions", "host list")
@@ -91,7 +92,7 @@ def test_permissions_host_rules_can_be_listed_and_revoked(tmp_path):
 
 def test_permissions_sandbox_cli_preserves_other_persisted_scope(tmp_path):
     """CLI revocation of a workspace approval leaves a user approval visible."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     user_path = tmp_path / "user.yaml"
     permissions = PermissionManager(
         tmp_path, user_configuration_path=user_path, interaction=interaction
@@ -146,7 +147,7 @@ def test_permission_policy_changes_apply_immediately_during_runs(tmp_path):
     """Safe policy edits serialize with checks and affect the next authorization decision."""
     defaults = PermissionConfiguration().defaults
     policy = PermissionConfiguration(defaults={**defaults, Action.FILESYSTEM_READ: Decision.ALLOW})
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path, configuration=policy)
     provider = PermissionCommands(permissions)
     manager = command_manager(permissions, interaction)
@@ -200,7 +201,7 @@ def test_permission_policy_changes_apply_immediately_during_runs(tmp_path):
 
 def test_permission_commands_reject_prompting_changes_during_runs(tmp_path):
     """Broad rules and policy reload or replacement cannot enter synchronous prompts mid-run."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path, interaction=interaction)
     manager = command_manager(permissions, interaction)
     manager.set_capability_provider(
@@ -248,7 +249,7 @@ def test_permission_commands_reject_prompting_changes_during_runs(tmp_path):
 )
 def test_bare_approval_listings_are_available_during_runs(tmp_path, command, heading):
     """Bare sandbox and host commands list approvals without prompting during a run."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path, interaction=interaction)
     manager = command_manager(permissions, interaction)
     manager.set_capability_provider(
@@ -273,7 +274,7 @@ def test_permission_change_during_approval_prompt_overrides_stale_approval(tmp_p
     """A policy tightened while approval waits is rechecked before the operation is authorized."""
     defaults = PermissionConfiguration().defaults
     policy = PermissionConfiguration(defaults={**defaults, Action.FILESYSTEM_READ: Decision.ASK})
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path, interaction=interaction, configuration=policy)
     manager = command_manager(permissions, interaction)
     manager.set_capability_provider(
@@ -306,7 +307,7 @@ def test_permission_change_during_approval_prompt_overrides_stale_approval(tmp_p
 
 def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes(tmp_path):
     """Commands persist every policy dimension and manage process-local rules separately."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
 
@@ -339,7 +340,7 @@ def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes
 
 def test_permissions_rule_add_defaults_omitted_matchers_to_wildcards(tmp_path):
     """Omitted trailing tool, action, and resource matchers each mean wildcard."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.return_value = True
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
@@ -370,7 +371,7 @@ def test_permissions_rule_add_defaults_omitted_matchers_to_wildcards(tmp_path):
 
 def test_permissions_rule_add_confirms_broad_matchers_before_mutation(tmp_path):
     """Broad rules require explicit approval and declined creation leaves policy unchanged."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
 
@@ -400,7 +401,7 @@ def test_permissions_rule_add_confirms_broad_matchers_before_mutation(tmp_path):
 
 def test_permissions_rule_without_mutation_lists_scoped_rules(tmp_path):
     """Bare and explicitly scoped rule inspection list rules without changing policy."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     permissions.add_rule(PermissionRule(id="workspace-rule", decision=Decision.ASK))
     permissions.add_rule(
@@ -423,7 +424,7 @@ def test_permissions_rule_without_mutation_lists_scoped_rules(tmp_path):
 
 def test_permissions_show_and_explain_report_the_complete_effective_policy(tmp_path):
     """Policy output distinguishes defaults, limits, persistent rules, and session rules."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
     manager.call("permissions", "rule add workspace allow read_text_file filesystem.read '*'")
@@ -449,7 +450,7 @@ def test_permissions_show_and_explain_report_the_complete_effective_policy(tmp_p
 
 def test_permissions_reload_and_limit_removal_report_outcomes(tmp_path):
     """Reload validates disk policy and unchanged collection operations produce warnings."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
 
@@ -467,7 +468,7 @@ def test_permissions_reload_and_limit_removal_report_outcomes(tmp_path):
 
 def test_permissions_reload_reports_invalid_policy_without_replacing_active_policy(tmp_path):
     """Reload shows recovery diagnostics while preserving the last valid workspace policy."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.prompt.return_value = "continue"
     permissions = PermissionManager(tmp_path, interaction=interaction)
     permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
@@ -486,9 +487,26 @@ def test_permissions_reload_reports_invalid_policy_without_replacing_active_poli
     assert "supervised defaults" in interaction.info.call_args.args[0]
 
 
+def test_sync_permissions_command_bridges_recovery_to_legacy_input(tmp_path):
+    """A synchronous command host keeps permission recovery on its caller interaction."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "continue"
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
+    permissions.configuration_path.write_text("version: 2\n", "utf-8")
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "reload")
+
+    assert permissions.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+    interaction.prompt.assert_called_once()
+    assert "Keeping" in interaction.warning.call_args.args[0]
+    manager.close()
+
+
 def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
     """Session boundaries affect effective output without changing workspace YAML."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
 
@@ -515,7 +533,7 @@ def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
 
 def test_permissions_limit_without_mutation_lists_scoped_values(tmp_path):
     """Bare and explicitly scoped limit inspection distinguish values from inheritance."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     manager = command_manager(permissions, interaction)
@@ -536,7 +554,7 @@ def test_permissions_limit_without_mutation_lists_scoped_values(tmp_path):
 
 def test_permissions_preset_commands_preview_and_confirm_scoped_policy_replacement(tmp_path):
     """Preset commands replace confirmed selected-scope defaults and rules only."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     permissions.add_rule(PermissionRule(id="workspace-rule", decision=Decision.DENY))
     permissions.add_rule(
@@ -575,7 +593,7 @@ def test_permissions_preset_list_reports_an_empty_catalog(monkeypatch, tmp_path)
         "load_builtin_presets",
         classmethod(lambda cls: ((), ())),
     )
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     manager = command_manager(PermissionManager(tmp_path), interaction)
 
     manager.call("permissions", "preset")
@@ -585,7 +603,7 @@ def test_permissions_preset_list_reports_an_empty_catalog(monkeypatch, tmp_path)
 
 def test_permissions_preset_diff_describes_empty_replacements_and_replace_reports_success(tmp_path):
     """Preset diff labels empty layers and confirmed replacement reports completion."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
 
@@ -602,7 +620,7 @@ def test_permissions_preset_diff_describes_empty_replacements_and_replace_report
 
 def test_permissions_unsupervised_preset_warns_and_requires_confirmation(tmp_path):
     """Unsupervised activation warns and a declined confirmation preserves the policy."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.return_value = False
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
@@ -640,7 +658,7 @@ def test_permissions_preset_diff_renders_installed_rules(tmp_path):
             "rules": [{"id": "allow-read", "decision": "allow"}],
         }
     )
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     manager = command_manager(PermissionManager(tmp_path, presets=(preset,)), interaction)
 
     manager.call("permissions", "preset diff workspace rules")
@@ -650,7 +668,7 @@ def test_permissions_preset_diff_renders_installed_rules(tmp_path):
 
 def test_permissions_command_rejects_every_malformed_branch(tmp_path):
     """Malformed subcommands fail with one consistent usage message."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=ConsoleInteraction)
     manager = command_manager(PermissionManager(tmp_path), interaction)
 
     invalid = (

@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from queue import Empty, PriorityQueue
 from threading import Event, Thread, get_ident
-from unittest.mock import MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 from prompt_toolkit.completion import CompleteEvent, DummyCompleter, WordCompleter
@@ -26,6 +26,7 @@ from loop import (
 )
 from loop.conversation import ConversationCommands
 from loop.conversation import controller as controller_module
+from loop.conversation.interaction import MailboxInteraction
 from loop.conversation.models import (
     EVENT_CONFIRM,
     EVENT_PROMPT,
@@ -55,6 +56,29 @@ def read_inputs(ui, inputs):
         return await inputs.get()
 
     ui.prompt_async.side_effect = read
+
+
+def test_mailbox_routes_async_input_through_a_bound_sync_owner(ui):
+    """Bound synchronous controllers relay async prompts through their UI owner."""
+    interaction = MailboxInteraction(ui)
+    events = []
+
+    def dispatch(event):
+        """Return the deterministic response supplied by the controller owner."""
+        events.append(event)
+        return "answer"
+
+    assert interaction.worker_calls_routed is False
+    interaction.bind(dispatch)
+
+    assert interaction.worker_calls_routed is True
+    assert asyncio.run(interaction.prompt_async("Question:")) == "answer"
+    assert len(events) == 1
+    assert events[0].kind == EVENT_PROMPT
+    assert events[0].args == ("Question:",)
+
+    interaction.bind(None)
+    assert interaction.worker_calls_routed is False
 
 
 def test_controller_requires_async_input():
@@ -529,6 +553,40 @@ def test_command_dispatch_preserves_unexpected_keyboard_interrupt(ui):
     )
     with pytest.raises(KeyboardInterrupt):
         controller._run_command(manager, "/interrupt")
+
+
+def test_async_command_dispatch_normalizes_only_expected_interruptions(ui):
+    """Async command dispatch preserves unexpected interrupts and consumes stopped work."""
+    controller = SessionController(ui)
+    interrupted = Mock()
+    interrupted.handle_user_command_async = AsyncMock(side_effect=RunInterrupted())
+    assert asyncio.run(controller._run_command_async(interrupted, "/interrupt")) is True
+
+    unexpected = Mock()
+    unexpected.handle_user_command_async = AsyncMock(side_effect=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(controller._run_command_async(unexpected, "/interrupt"))
+
+    controller.control.stop()
+    stopped = Mock()
+    stopped.handle_user_command_async = AsyncMock(side_effect=KeyboardInterrupt())
+    assert asyncio.run(controller._run_command_async(stopped, "/interrupt")) is True
+
+
+def test_sync_controller_requires_its_command_executor_when_accepting_commands(ui):
+    """Synchronous controller command admission fails clearly without its owned executor."""
+    controller = SessionController(ui)
+    commands = CommandManager()
+    controller.bind_command_manager(commands)
+
+    async def scenario():
+        """Submit a command before the synchronous controller has acquired an executor."""
+        submitted = asyncio.get_running_loop().create_future()
+        submitted.set_result("/help")
+        with pytest.raises(RuntimeError, match="command executor is unavailable"):
+            await controller._accept(submitted, route_idle_commands=False)
+
+    asyncio.run(scenario())
 
 
 def test_interrupted_active_command_does_not_stop_the_controller(ui):
@@ -2000,9 +2058,22 @@ def test_async_controller_waits_for_owned_work_after_repeated_cancellation(ui):
     assert controller.running is False
 
 
-def test_async_controller_settles_a_command_after_conversation_completion(ui, monkeypatch):
-    """Cancellation awaits a pending command even when the conversation owner already finished."""
+def test_async_controller_settles_a_sync_command_after_conversation_completion(ui, monkeypatch):
+    """Cancellation awaits a sync command after the conversation owner finishes."""
     controller = SessionController(ui)
+    commands = CommandManager()
+
+    def held() -> None:
+        """Represent one synchronous extension command held by its executor future."""
+
+    commands.register(
+        CommandRegistration(
+            held,
+            name="held",
+            capabilities=frozenset({CommandCapability.CONTEXT_READ}),
+        )
+    )
+    controller.bind_command_manager(commands)
     inputs = asyncio.Queue()
     read_inputs(ui, inputs)
 
@@ -2025,7 +2096,7 @@ def test_async_controller_settles_a_command_after_conversation_completion(ui, mo
 
         async def observe_wait(futures, **kwargs):
             """Expose command cleanup after the cancelled driver releases its completed owner."""
-            if task.cancelling() and pending in futures:
+            if task.cancelling() and controller._command_task in futures:
                 assert owner.done()
                 settling.set()
             return await original_wait(futures, **kwargs)
@@ -2045,7 +2116,7 @@ def test_async_controller_settles_a_command_after_conversation_completion(ui, mo
         try:
             await inputs.put("hello")
             await started.wait()
-            await inputs.put("/help")
+            await inputs.put("/held")
             await command_started.wait()
             finish_owner.set()
             await owner_finished.wait()
@@ -2064,6 +2135,7 @@ def test_async_controller_settles_a_command_after_conversation_completion(ui, mo
 
     asyncio.run(scenario())
     assert controller.running is False
+    commands.close()
 
 
 def test_async_controller_preserves_primary_and_secondary_failures(ui):

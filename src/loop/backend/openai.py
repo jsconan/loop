@@ -817,8 +817,8 @@ class OpenAIBackend(Backend):
             BackendError: If the provider cannot list its models.
         """
         try:
-            models = await self._get_async_client().models.list(timeout=2.0)
-            model_info = [self._model_info(model) for model in models]
+            models = self._get_async_client().models.list(timeout=2.0)
+            model_info = [self._model_info(model) async for model in models]
             self._remember_declared_hyperparameters(model_info)
             return model_info
         except OpenAIError as error:

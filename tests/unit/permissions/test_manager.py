@@ -33,6 +33,7 @@ from loop import (
     PermissionRule,
     PolicyLimits,
     PolicyScope,
+    ProblemException,
     ProcessBoundary,
     ProcessTarget,
     SessionTarget,
@@ -1265,8 +1266,8 @@ def test_authorize_async_keeps_fresh_file_changes_one_time_only(tmp_path):
     assert manager.session_rules == ()
 
 
-def test_authorize_async_retains_sync_interaction_compatibility(tmp_path):
-    """Async authorization can still use a legacy synchronous interaction adapter."""
+def test_authorize_async_requires_native_async_interaction(tmp_path):
+    """Async authorization refuses synchronous approval input on the event loop."""
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = ApprovalChoice.ONCE
     manager = PermissionManager(tmp_path, interaction=interaction)
@@ -1277,10 +1278,11 @@ def test_authorize_async_retains_sync_interaction_compatibility(tmp_path):
         ),
     )
 
-    result = asyncio.run(manager.authorize_async(operation_set))
+    with pytest.raises(ProblemException) as captured:
+        asyncio.run(manager.authorize_async(operation_set))
 
-    assert result.decision is Decision.ALLOW
-    interaction.prompt.assert_called_once()
+    assert captured.value.problem.code == "interaction.async_required"
+    interaction.prompt.assert_not_called()
 
 
 def test_authorize_async_denies_headless_and_propagates_cancellation(tmp_path):

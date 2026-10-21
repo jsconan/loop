@@ -1,6 +1,7 @@
 """Tests for user-command registration and dispatch."""
 
 import asyncio
+from threading import Barrier, Event, Lock, Thread, get_ident
 from unittest.mock import Mock
 
 import pytest
@@ -230,6 +231,28 @@ def test_command_capabilities_are_inherited_and_can_be_overridden():
     assert override.commands[-1].capabilities == frozenset({CommandCapability.CONTEXT_READ})
 
 
+def test_command_sync_call_rejects_async_and_awaitable_results():
+    """Direct sync command calls reject both coroutine callbacks and returned awaitables."""
+
+    async def asynchronous() -> None:
+        """Provide a native coroutine callback."""
+
+    async def result() -> None:
+        """Provide an awaitable returned by a sync callback."""
+
+    def returning_awaitable() -> object:
+        """Return a coroutine to exercise sync result validation."""
+        return result()
+
+    with pytest.raises(ProblemException) as captured:
+        Command(asynchronous).registered(name="asynchronous").call("")
+    assert captured.value.problem.code == "command.async_required"
+
+    with pytest.raises(ProblemException) as captured:
+        Command(returning_awaitable).registered(name="returning_awaitable").call("")
+    assert captured.value.problem.code == "command.async_required"
+
+
 def test_capabilities_filter_dispatch_and_consume_inactive_slash_commands():
     """Active commands run immediately while inactive and unknown slash input is consumed."""
     interaction = Mock(spec=Interaction)
@@ -239,6 +262,7 @@ def test_capabilities_filter_dispatch_and_consume_inactive_slash_commands():
         """Record direct dispatch and inspect the current command catalog."""
         assert context.interaction is interaction
         assert context.available_commands is not None
+        assert context.execution_mode == "sync"
         calls.append(context.name)
 
     def idle_only() -> None:
@@ -457,6 +481,7 @@ def test_handle_user_command_deserializes_arguments_and_injects_context():
     def inspect_context(context: CommandContext, count: int) -> None:
         """Inspect one invocation."""
         assert context.interaction is interaction
+        assert context.execution_mode == "sync"
         calls.append((context.name, count))
 
     manager.register(inspect_context)
@@ -470,32 +495,362 @@ def test_handle_user_command_deserializes_arguments_and_injects_context():
     assert calls == [("inspect_context", 3), ("inspect_context", 4)]
 
 
-def test_handle_user_command_async_awaits_dispatch_and_preserves_interaction(monkeypatch):
-    """Async commands use awaited worker dispatch while ordinary text needs no worker."""
+def test_handle_user_command_async_dispatches_sync_callbacks_to_workers():
+    """Async command dispatch adapts an ordinary sync callback without registration metadata."""
     interaction = Mock(spec=Interaction)
+    interaction.worker_calls_routed = True
     manager = CommandManager()
     observed = []
-    workers = []
+    owner_thread = get_ident()
 
     def probe(context: CommandContext) -> None:
-        """Record the interaction supplied to this command."""
-        observed.append(context.interaction)
+        """Record the invocation interaction and thread."""
+        observed.append((context.interaction, context.execution_mode, get_ident()))
 
     manager.register(probe)
 
-    def dispatch(loop, executor, function, *args):
-        """Execute the controlled worker boundary without creating a thread."""
-        workers.append(args)
-        future = loop.create_future()
-        future.set_result(function(*args))
+    async def scenario():
+        """Dispatch ordinary text and one synchronous command."""
+        assert await manager.handle_user_command_async("hello", interaction) is False
+        assert await manager.handle_user_command_async("/probe", interaction) is True
+
+    asyncio.run(scenario())
+    assert len(observed) == 1
+    assert observed[0][:2] == (interaction, "async")
+    assert observed[0][2] != owner_thread
+
+
+def test_async_command_context_requires_a_manager_for_sync_leaf_work():
+    """An unowned async context refuses to run synchronous work on its event loop."""
+    context = CommandContext(
+        name="probe",
+        interaction=Mock(spec=Interaction),
+        execution_mode="async",
+    )
+
+    async def scenario():
+        """Reject direct blocking work without a command-manager worker."""
+        with pytest.raises(ProblemException) as captured:
+            await context.run_blocking(lambda: None)
+        assert captured.value.problem.code == "command.blocking_dispatch_unavailable"
+
+    asyncio.run(scenario())
+
+
+def test_call_async_consumes_an_unknown_command_after_reporting_it():
+    """Async dispatch reports an unknown command without attempting callback execution."""
+    interaction = Mock(spec=Interaction)
+    manager = CommandManager(interaction=interaction)
+
+    asyncio.run(manager.call_async("missing"))
+
+    interaction.report.assert_called_once()
+    assert interaction.report.call_args.args[0].code == "command.unknown"
+
+
+def test_async_dispatch_awaits_native_commands_on_the_owner_loop():
+    """Async callbacks run and settle on the active command owner loop."""
+    manager = CommandManager()
+    observed = []
+
+    async def probe() -> None:
+        """Record the loop and thread that own this command callback."""
+        observed.append((asyncio.get_running_loop(), get_ident()))
+
+    manager.register(probe)
+
+    async def scenario():
+        """Dispatch the native async command from its active event loop."""
+        owner_loop = asyncio.get_running_loop()
+        owner_thread = get_ident()
+        await manager.handle_user_command_async("/probe")
+        assert observed == [(owner_loop, owner_thread)]
+
+    asyncio.run(scenario())
+
+
+def test_sync_dispatch_reuses_its_runner_for_async_commands():
+    """A synchronous host reuses one owned event loop for async command callbacks."""
+    manager = CommandManager()
+    observed = []
+
+    async def probe() -> None:
+        """Record the event loop that hosts this callback."""
+        observed.append(asyncio.get_running_loop())
+
+    manager.register(probe)
+    manager.call("probe")
+    manager.call("probe")
+
+    assert observed[0] is observed[1]
+    manager.close()
+
+
+def test_sync_command_result_awaitable_is_resolved_on_the_async_owner():
+    """A synchronous callback may return a coroutine that async dispatch resolves natively."""
+    manager = CommandManager()
+    observed = []
+
+    async def result() -> None:
+        """Capture the loop that receives a coroutine returned by sync command code."""
+        observed.append((asyncio.get_running_loop(), get_ident()))
+
+    def callback():
+        """Return coroutine work without changing the callback's declared sync shape."""
+        return result()
+
+    manager.register(callback)
+
+    async def scenario():
+        """Await the returned coroutine on the manager's async caller."""
+        owner = (asyncio.get_running_loop(), get_ident())
+        await manager.call_async("callback")
+        assert observed == [owner]
+
+    asyncio.run(scenario())
+
+
+def test_sync_command_rejects_a_future_from_another_loop():
+    """Async dispatch reports a sync callback future that belongs to another loop."""
+    other_loop = asyncio.new_event_loop()
+    future = other_loop.create_future()
+    manager = CommandManager()
+
+    def callback():
+        """Return a future that the current command owner cannot safely await."""
         return future
 
-    monkeypatch.setattr(asyncio.BaseEventLoop, "run_in_executor", dispatch)
-    assert asyncio.run(manager.handle_user_command_async("hello", interaction)) is False
-    assert observed == workers == []
-    assert asyncio.run(manager.handle_user_command_async("/probe", interaction)) is True
-    assert observed == [interaction]
-    assert workers == [(manager.handle_user_command, "/probe", interaction)]
+    manager.register(callback)
+    try:
+        with pytest.raises(ProblemException) as captured:
+            asyncio.run(manager.call_async("callback"))
+    finally:
+        manager.close()
+        other_loop.close()
+
+    assert captured.value.problem.code == "command.loop_mismatch"
+
+
+def test_sync_dispatch_rejects_runner_use_from_a_different_thread():
+    """A manager-owned runner remains bound to the thread that first created it."""
+    manager = CommandManager()
+
+    async def probe() -> None:
+        """Provide a native callback for runner thread ownership."""
+
+    manager.register(probe)
+    manager.call("probe")
+    failures = []
+
+    def dispatch() -> None:
+        """Capture the required-async error from the non-owning thread."""
+        try:
+            manager.call("probe")
+        except ProblemException as error:
+            failures.append(error)
+
+    thread = Thread(target=dispatch)
+    thread.start()
+    thread.join()
+
+    assert len(failures) == 1
+    assert failures[0].problem.code == "command.async_required"
+
+
+def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
+    """Concurrent sync callers cannot race manager-owned runner initialization."""
+    manager = CommandManager()
+    start = Barrier(3)
+    runner_creation_started = Event()
+    second_runner_creation_started = Event()
+    release_runner_creation = Event()
+    created_runners = []
+    created_runners_lock = Lock()
+    results = []
+
+    def create_runner():
+        """Hold the first runner creation to expose an unsynchronized check-then-act race."""
+        with created_runners_lock:
+            runner = Mock()
+            created_runners.append(runner)
+            first_runner = len(created_runners) == 1
+        if first_runner:
+            runner_creation_started.set()
+            assert release_runner_creation.wait(timeout=3)
+        else:
+            second_runner_creation_started.set()
+        return runner
+
+    monkeypatch.setattr(module.asyncio, "Runner", create_runner)
+
+    def get_runner():
+        """Request the manager runner after both callers reach the same start gate."""
+        start.wait(timeout=3)
+        results.append(manager._sync_runner())
+
+    threads = [Thread(target=get_runner) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=3)
+        assert runner_creation_started.wait(timeout=3)
+        assert not second_runner_creation_started.wait(timeout=1)
+    finally:
+        release_runner_creation.set()
+        for thread in threads:
+            thread.join(timeout=3)
+        manager.close()
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert manager._sync_runner() is None
+    assert len(created_runners) == 1
+    assert len(results) == 2
+    assert sum(result is not None for result in results) == 1
+
+
+def test_sync_dispatch_reports_async_editor_state_unavailable_to_legacy_interaction():
+    """A synchronous input adapter rejects async-only draft restoration explicitly."""
+    interaction = Mock(spec=Interaction)
+    manager = CommandManager(interaction=interaction)
+
+    async def probe(context: CommandContext) -> None:
+        """Request async editor state unavailable from a synchronous interaction."""
+        await context.interaction.prompt_async(initial="draft")
+
+    manager.register(probe)
+    manager.call("probe")
+
+    interaction.prompt.assert_not_called()
+    interaction.report.assert_called_once()
+    assert interaction.report.call_args.args[0].code == "interaction.async_required"
+    manager.close()
+
+
+def test_sync_dispatch_requires_async_api_inside_a_running_loop():
+    """A sync call cannot start the manager-owned runner inside a caller event loop."""
+    manager = CommandManager()
+
+    async def probe() -> None:
+        """Provide a native async callback for the sync boundary check."""
+
+    manager.register(probe)
+
+    async def scenario():
+        """Reject sync dispatch before invoking the asynchronous callback."""
+        with pytest.raises(ProblemException) as captured:
+            manager.call("probe")
+        assert captured.value.problem.code == "command.async_required"
+        assert "await manager.call_async(...)" in captured.value.problem.detail
+
+    asyncio.run(scenario())
+
+
+def test_sync_command_leaves_the_async_loop_responsive():
+    """An unmarked synchronous callback runs in a worker while the loop continues to run."""
+    manager = CommandManager()
+    release = Event()
+    signal_started = []
+
+    def blocked() -> None:
+        """Hold worker execution until the async owner has made progress."""
+        signal_started[0]()
+        release.wait()
+
+    manager.register(blocked)
+
+    async def scenario():
+        """Observe owner-loop progress while one blocking callback is held."""
+        loop = asyncio.get_running_loop()
+        worker_started = asyncio.Event()
+        signal_started.append(lambda: loop.call_soon_threadsafe(worker_started.set))
+
+        task = asyncio.create_task(manager.handle_user_command_async("/blocked"))
+        await worker_started.wait()
+        pulse = loop.create_future()
+        loop.call_soon(pulse.set_result, None)
+        await pulse
+        assert not task.done()
+        release.set()
+        assert await task is True
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        manager.close()
+
+
+def test_sync_command_requires_a_routed_context_interaction():
+    """A worker command cannot receive a live interaction without owner routing."""
+    interaction = Mock(spec=Interaction)
+    interaction.worker_calls_routed = False
+    called = []
+    manager = CommandManager(interaction=interaction)
+
+    def blocked(context: CommandContext) -> None:
+        """Record accidental execution without an owner-routed interaction."""
+        called.append(context.name)
+
+    manager.register(blocked)
+    asyncio.run(manager.call_async("blocked"))
+
+    interaction.report.assert_called_once()
+    assert interaction.report.call_args.args[0].code == "command.context_relay_unavailable"
+    assert called == []
+
+
+def test_sync_command_admission_is_bounded():
+    """Worker and queued command admission rejects work beyond the fixed capacity."""
+    manager = CommandManager()
+    release = Event()
+
+    def blocked() -> None:
+        """Wait until all admitted work is queued for bounded-admission coverage."""
+        release.wait()
+
+    manager.register(blocked)
+
+    async def scenario():
+        """Fill the worker and queue slots before requesting one more command."""
+        loop = asyncio.get_running_loop()
+        tasks = [asyncio.create_task(manager.call_async("blocked")) for _ in range(4)]
+        tick = loop.create_future()
+        loop.call_soon(tick.set_result, None)
+        await tick
+        with pytest.raises(ProblemException) as captured:
+            await manager.call_async("blocked")
+        assert captured.value.problem.code == "command.dispatch_busy"
+        release.set()
+        await asyncio.gather(*tasks)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        manager.close()
+
+
+def test_sync_command_releases_admission_when_executor_submission_fails(monkeypatch):
+    """A failed executor submission releases the bounded command slot and propagates its error."""
+    manager = CommandManager()
+
+    def blocked() -> None:
+        """Provide one synchronous command callback."""
+
+    manager.register(blocked)
+
+    async def scenario():
+        """Fail before worker start and prove the manager preserves that failure."""
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop,
+            "run_in_executor",
+            Mock(side_effect=RuntimeError("executor unavailable")),
+        )
+        with pytest.raises(RuntimeError, match="executor unavailable"):
+            await manager.call_async("blocked")
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -503,29 +858,39 @@ def test_handle_user_command_async_settles_after_repeated_cancellation(monkeypat
     """Cancelled dispatch retains command ownership until cleanup and preserves cancellation."""
     manager = CommandManager()
 
+    def probe() -> None:
+        """Occupy a synchronous command until its worker is released."""
+
+    manager.register(probe)
+
     async def scenario():
         """Cancel twice while a controlled worker still owns command cleanup."""
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def dispatch(*args):
+        async def dispatch(_executor, function, *args):
             """Hold the command until cleanup is released, optionally exposing its failure."""
             started.set()
             await release.wait()
             if failure:
                 raise RuntimeError("command failed")
+            function(*args)
             return True
 
         monkeypatch.setattr(
             asyncio.get_running_loop(),
             "run_in_executor",
-            lambda *args: asyncio.create_task(dispatch()),
+            lambda *args: asyncio.create_task(dispatch(*args)),
         )
         task = asyncio.create_task(manager.handle_user_command_async("/probe"))
         await started.wait()
         task.cancel()
-        await asyncio.sleep(0)
+        tick = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(tick.set_result, None)
+        await tick
         task.cancel()
-        await asyncio.sleep(0)
+        tick = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(tick.set_result, None)
+        await tick
         assert not task.done()
         release.set()
         with pytest.raises(asyncio.CancelledError) as captured:
@@ -540,19 +905,25 @@ def test_handle_user_command_async_preserves_completed_command_cancellation(monk
     """Cancellation arriving with command completion still propagates to its owner."""
     manager = CommandManager()
 
+    def probe() -> None:
+        """Provide one synchronous command for the cancellation boundary."""
+
+    manager.register(probe)
+
     async def scenario():
         """Finish the worker as its awaiting owner receives cancellation."""
         owner = asyncio.current_task()
 
-        async def dispatch(*args):
+        async def dispatch(_executor, function, *args):
             """Request caller cancellation immediately before reporting command completion."""
             owner.cancel()
+            function(*args)
             return True
 
         monkeypatch.setattr(
             asyncio.get_running_loop(),
             "run_in_executor",
-            lambda *args: asyncio.create_task(dispatch()),
+            lambda *args: asyncio.create_task(dispatch(*args)),
         )
         with pytest.raises(asyncio.CancelledError):
             await manager.handle_user_command_async("/probe")
@@ -560,9 +931,45 @@ def test_handle_user_command_async_preserves_completed_command_cancellation(monk
     asyncio.run(scenario())
 
 
+def test_handle_user_command_async_preserves_cancellation_of_worker_future(monkeypatch):
+    """A cancelled worker future does not replace its owner's cancellation."""
+    manager = CommandManager()
+
+    def probe() -> None:
+        """Provide one synchronous command for the cancellation boundary."""
+
+    manager.register(probe)
+
+    async def scenario():
+        """Cancel both the owner and its executor future while work is pending."""
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()
+        submitted = asyncio.Event()
+
+        def submit(*_args):
+            """Expose a controlled executor future to command dispatch."""
+            submitted.set()
+            return pending
+
+        monkeypatch.setattr(loop, "run_in_executor", submit)
+        task = asyncio.create_task(manager.call_async("probe"))
+        await submitted.wait()
+        task.cancel()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
 def test_handle_user_command_async_preserves_worker_keyboard_interrupt(monkeypatch):
     """A worker interruption reaches its awaiting owner without escaping an auxiliary task."""
     manager = CommandManager()
+
+    def probe() -> None:
+        """Provide one synchronous command for the worker exception boundary."""
+
+    manager.register(probe)
 
     async def scenario():
         """Expose an interrupted executor future at the native worker boundary."""

@@ -183,7 +183,19 @@ class WorkspaceCommands:
             str | None, Field(description="Existing identity to associate during attach.")
         ] = None,
     ) -> None:
-        """List registered workspaces, show the active workspace, or rename it."""
+        """List registered workspaces, show the active workspace, or rename it.
+
+        Args:
+            context (CommandContext): Interaction used to display results and confirm changes.
+            action (Literal["attach", "forget", "list", "rekey", "show", "rename", "switch"]):
+                Workspace operation. Defaults to ``"show"``.
+            name (str | None): Name, path, or workspace identifier for the operation.
+            workspace_id (str | None): Existing identity to associate during attach.
+
+        Raises:
+            CommandArgumentError: If arguments do not match the selected operation.
+            WorkspaceSwitchRequested: If the user requests a different workspace.
+        """
         if action in {"list", "show"} and (name is not None or workspace_id is not None):
             raise CommandArgumentError(f"The {action} operation does not accept a name.")
         if action != "attach" and workspace_id is not None:

@@ -35,6 +35,7 @@ from loop import (
     PermissionConfiguration,
     PermissionManager,
     PermissionPreset,
+    ProblemException,
     Response,
     ResponseCompleted,
     RunMetrics,
@@ -78,6 +79,7 @@ def loop_backend(**attributes):
     defaults = {
         "default_model": "default-model",
         "get_context_window": lambda _model: None,
+        "get_context_window_async": AsyncMock(return_value=None),
         "prepare_context": list,
     }
     return SimpleNamespace(**(defaults | attributes))
@@ -478,7 +480,9 @@ def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_p
     interaction = MagicMock(spec=Interaction)
     backend = Mock(default_model="default-model", prepare_context=Mock(side_effect=list))
     backend.get_context_window.return_value = 8192
+    backend.get_context_window_async = AsyncMock(return_value=8192)
     backend.get_models.return_value = [ModelInfo(id="selected-model")]
+    backend.get_models_async = AsyncMock(return_value=[ModelInfo(id="selected-model")])
     now = [0.0]
     monkeypatch.setattr("loop.model_selection.selection.monotonic", lambda: now[0])
     loop = Loop.create_default(backend=backend, interaction=interaction, working_directory=tmp_path)
@@ -492,7 +496,7 @@ def test_model_command_selects_models_and_reports_backend_catalog_failures(tmp_p
     assert loop.model == "selected-model"
     assert interaction.info.call_args.args[0] == "Using model: selected-model"
 
-    backend.get_models.side_effect = BackendConnectionError(
+    backend.get_models_async.side_effect = BackendConnectionError(
         "offline",
         provider="test",
         operation="list_models",
@@ -1339,8 +1343,8 @@ def test_run_async_accepts_an_awaitable_input_source_and_preserves_steering(tmp_
     loop.agent_runner.run_async.assert_awaited_once_with()
 
 
-def test_run_async_falls_back_to_synchronous_prompt_for_legacy_interactions(tmp_path):
-    """Async orchestration retains synchronous interaction adapters."""
+def test_run_async_requires_native_input_for_legacy_interactions(tmp_path):
+    """Async orchestration refuses a synchronous prompt instead of blocking the event loop."""
     interaction = output_interaction()
     interaction.prompt.return_value = False
     loop = Loop.create_default(
@@ -1352,10 +1356,12 @@ def test_run_async_falls_back_to_synchronous_prompt_for_legacy_interactions(tmp_
         return_value=SimpleNamespace(pending=False, result=None)
     )
 
-    asyncio.run(loop.run_async())
+    with pytest.raises(ProblemException) as captured:
+        asyncio.run(loop.run_async())
 
-    interaction.prompt.assert_called_once_with(completer=loop._completion_manager)
-    interaction.conversation_ended.assert_called_once_with()
+    assert captured.value.problem.code == "interaction.async_required"
+    interaction.prompt.assert_not_called()
+    interaction.conversation_ended.assert_not_called()
 
 
 def test_run_async_keeps_handled_commands_in_the_current_session(tmp_path):

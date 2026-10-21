@@ -630,7 +630,7 @@ class AgentRunner:
                             usage=response.usage,
                         )
                     )
-                    self._model_selection.record_response(response.model)
+                    await self._model_selection.record_response_async(response.model)
                     self._session_manager.add_response(response)
                     if self._steering_pending():
                         self._cancel_pending_tools()

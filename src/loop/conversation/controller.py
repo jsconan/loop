@@ -133,6 +133,7 @@ class SessionController:
     _answer_input: asyncio.Task | None
     _message_input: asyncio.Task | None
     _command_task: asyncio.Future | None
+    _command_executor: ThreadPoolExecutor | None
     _discarded: int
     _idle_command_pending: bool
     _draft: str | None
@@ -165,6 +166,7 @@ class SessionController:
         self._answer_input = None
         self._message_input = None
         self._command_task = None
+        self._command_executor = None
         self._discarded = 0
         self._idle_command_pending = False
         self._draft = None
@@ -490,7 +492,12 @@ class SessionController:
                     max_workers=1,
                     thread_name_prefix="loop-conversation",
                 ) as executor,
+                ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="loop-command",
+                ) as command_executor,
             ):
+                self._command_executor = command_executor
                 worker = self._loop.run_in_executor(
                     executor,
                     copy_context().run,
@@ -522,6 +529,7 @@ class SessionController:
             self._loop = None
             self._ui_thread = None
             self._events = None
+            self._command_executor = None
             telemetry_activity("conversation.stopped", component=_STATUS_COMPONENT)
             if self._discarded:
                 try:
@@ -860,13 +868,20 @@ class SessionController:
             self._idle_command_pending = self._enqueue(value)
             return
         if command_manager.is_user_command(value):
-            self._command_task = cast(asyncio.AbstractEventLoop, self._loop).run_in_executor(
-                None,
-                copy_context().run,
-                self._run_command,
-                command_manager,
-                value,
-            )
+            if self._async_owner:
+                self._command_task = asyncio.create_task(
+                    self._run_command_async(command_manager, value)
+                )
+            else:
+                if self._command_executor is None:
+                    raise RuntimeError("Controller command executor is unavailable.")
+                self._command_task = cast(asyncio.AbstractEventLoop, self._loop).run_in_executor(
+                    self._command_executor,
+                    copy_context().run,
+                    self._run_command,
+                    command_manager,
+                    value,
+                )
             return
         if value == "":
             self._source.warning("Please enter a message!")
@@ -879,6 +894,18 @@ class SessionController:
         """Dispatch one user command through the controller-owned interaction mailbox."""
         try:
             return command_manager.handle_user_command(value, interaction=self._interaction)
+        except (RunInterrupted, KeyboardInterrupt) as error:
+            if not isinstance(error, RunInterrupted) and not self._control.stopped:
+                raise
+            return True
+
+    async def _run_command_async(self, command_manager: CommandManager, value: str) -> bool:
+        """Dispatch one user command through the async owner and interaction mailbox."""
+        try:
+            return await command_manager.handle_user_command_async(
+                value,
+                interaction=self._interaction,
+            )
         except (RunInterrupted, KeyboardInterrupt) as error:
             if not isinstance(error, RunInterrupted) and not self._control.stopped:
                 raise

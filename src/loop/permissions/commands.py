@@ -101,7 +101,18 @@ class PermissionCommands:
         context: CommandContext,
         arguments: Annotated[tuple[str, ...], CommandRemainder()] = (),
     ) -> None:
-        """Show, explain, or change workspace and session operation policy."""
+        """Show, explain, or change workspace and session operation policy.
+
+        Args:
+            context (CommandContext): Interaction and capability snapshot for this invocation.
+            arguments (tuple[str, ...]): Permission operation and its positional arguments.
+
+        Raises:
+            CommandArgumentError: If an operation is invalid or unavailable during a run.
+            PermissionConfigurationError: If policy loading fails under the strict load policy.
+            OSError: If a permission policy cannot be archived or persisted.
+            ShutdownRequested: If the user exits interactive policy recovery.
+        """
         with self._permission_manager.policy_update():
             if CommandCapability.RUN_ACTIVE in (context.capabilities or frozenset()):
                 self._ensure_run_safe(context, arguments)
@@ -155,7 +166,7 @@ class PermissionCommands:
             context.interaction.info(manager.describe(arguments[1]))
             return
         if arguments == ("reload",):
-            result = manager.reload()
+            result = manager.reload(interaction=context.interaction)
             context.interaction.info(_DISPATCH_MESSAGES[result])
             return
         if arguments == ("help",):
@@ -241,7 +252,11 @@ class PermissionCommands:
             return
         raise ValueError("Use /permissions host list or host remove <id>.")
 
-    def _change_preset(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
+    def _change_preset(
+        self,
+        context: CommandContext,
+        arguments: tuple[str, ...],
+    ) -> None:
         """List, inspect, preview, or explicitly replace one scoped policy preset."""
         manager = self._permission_manager
         if not arguments or arguments == ("list",):
@@ -307,7 +322,11 @@ class PermissionCommands:
             return
         raise ValueError("Invalid permission default arguments.")
 
-    def _change_rule(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
+    def _change_rule(
+        self,
+        context: CommandContext,
+        arguments: tuple[str, ...],
+    ) -> None:
         manager = self._permission_manager
         if not arguments or arguments == ("list",):
             self._list_rules(context)
