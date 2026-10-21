@@ -1,6 +1,5 @@
 """Define independently injectable mention capabilities."""
 
-import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
 from mimetypes import guess_type
@@ -25,6 +24,7 @@ from ..utils import (
     get_binary,
     is_path_ignored,
     iter_visible_paths,
+    run_in_worker,
 )
 
 
@@ -141,7 +141,7 @@ class ProjectPathMentionHandler(MentionHandler):
         sync_blocking_runner (Callable[..., Any] | None): Bounded worker for synchronous UI
             completion. Defaults to direct traversal for standalone handlers.
         async_blocking_runner (Callable[..., Awaitable[Any]] | None): Bounded worker for async
-            filesystem reads. Defaults to ``asyncio.to_thread``.
+            filesystem reads. Defaults to a shared bounded process worker.
     """
 
     _working_directory: PathReference
@@ -303,7 +303,7 @@ class ProjectPathMentionHandler(MentionHandler):
                 ignore_invalid,
             )
             if self._async_blocking_runner is not None
-            else asyncio.to_thread(
+            else run_in_worker(
                 self._read_mentioned_paths,
                 root,
                 tuple(values),

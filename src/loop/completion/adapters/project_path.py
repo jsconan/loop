@@ -1,12 +1,11 @@
 """Complete visible project paths after a marker."""
 
-import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from ...utils import PathReference
+from ...utils import PathReference, run_in_worker
 from ...utils.path import iter_visible_paths
 from ..models import CompletionValue
 from .marker import MarkerCompletionAdapter
@@ -23,7 +22,7 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         sync_blocking_runner (Callable[..., Any] | None): Bounded worker for synchronous UI
             completion. Defaults to direct traversal for standalone adapters.
         async_blocking_runner (Callable[..., Awaitable[Any]] | None): Bounded worker for async
-            filesystem traversal. Defaults to ``asyncio.to_thread``.
+            filesystem traversal. Defaults to a shared bounded process worker.
 
     Raises:
         ValueError: If ``cache_ttl`` is negative.
@@ -94,7 +93,7 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         values = await (
             self._async_blocking_runner(self._discover_values, root)
             if self._async_blocking_runner is not None
-            else asyncio.to_thread(self._discover_values, root)
+            else run_in_worker(self._discover_values, root)
         )
         self._cached_root = root
         self._cached_until = time.monotonic() + self._cache_ttl

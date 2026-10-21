@@ -36,6 +36,7 @@ from ..utils import (
     VirtualPath,
     canonical_path,
     local_now,
+    run_in_worker,
     sha256_digest,
 )
 from .audit import SQLitePermissionAudit
@@ -127,7 +128,7 @@ class PermissionManager:
         command_inspection (CommandInspection | None): Trusted command inspection. Defaults to
             the built-in matchers.
         async_blocking_runner (Callable[..., Awaitable[Any]] | None): Application-owned bounded
-            worker for synchronous audit writes. Defaults to ``asyncio.to_thread``.
+            worker for synchronous audit writes. Defaults to a shared bounded process worker.
 
     Raises:
         PermissionConfigurationError: If a policy is invalid in strict mode.
@@ -2705,7 +2706,7 @@ class PermissionManager:
         pending = asyncio.ensure_future(
             self._async_blocking_runner(self._audit, result)
             if self._async_blocking_runner is not None
-            else asyncio.to_thread(self._audit, result)
+            else run_in_worker(self._audit, result)
         )
         cancellation = None
         try:

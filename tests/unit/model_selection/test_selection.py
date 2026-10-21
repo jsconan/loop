@@ -404,7 +404,7 @@ def test_async_selection_preserves_cancellation_of_the_writer_task(monkeypatch):
         """Represent cancellation before the off-loop callback starts."""
         raise asyncio.CancelledError
 
-    monkeypatch.setattr("loop.model_selection.selection.asyncio.to_thread", cancelled_writer)
+    monkeypatch.setattr("loop.model_selection.selection.run_in_worker", cancelled_writer)
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(selection.select_async("selected"))

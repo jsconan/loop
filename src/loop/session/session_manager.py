@@ -49,6 +49,7 @@ from ..utils import (
     encode_content_cursor,
     get_binary,
     register_cached_metadata,
+    run_in_worker,
     sha256_digest,
     store_content,
     utc_now,
@@ -103,8 +104,8 @@ class SessionManager:
             to an instance-local memory store.
         workspace_id (str | None): Durable workspace identity owning every managed session.
         async_blocking_runner (Callable[..., Awaitable[Any]] | None): Application-owned bounded
-            worker used for synchronous persistence from async workflows. Defaults to
-            ``asyncio.to_thread``.
+            worker used for synchronous persistence from async workflows. Defaults to a shared
+            bounded process worker.
 
     Raises:
         SessionNotFoundError: If the requested persisted session does not exist.
@@ -1412,7 +1413,7 @@ class SessionManager:
                 candidate,
             )
             if self._async_blocking_runner is not None
-            else asyncio.to_thread(
+            else run_in_worker(
                 self._save_snapshot,
                 self._session_store,
                 self._persistence_lock,
@@ -1474,7 +1475,7 @@ class SessionManager:
         pending = asyncio.ensure_future(
             self._async_blocking_runner(function, *args)
             if self._async_blocking_runner is not None
-            else asyncio.to_thread(function, *args)
+            else run_in_worker(function, *args)
         )
         cancellation = None
         try:

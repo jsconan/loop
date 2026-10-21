@@ -69,6 +69,7 @@ __all__ = [
     "register_cached_metadata",
     "register_shutdown_signals",
     "ripgrep_path",
+    "run_in_worker",
     "safe_scalar",
     "search_text_paths",
     "sha256_digest",
@@ -83,7 +84,13 @@ __all__ = [
 ]
 
 
-from .asyncio import await_value, close_awaitable, has_running_event_loop, is_async_callable
+from .asyncio import (
+    await_value,
+    close_awaitable,
+    has_running_event_loop,
+    is_async_callable,
+    run_in_worker,
+)
 from .callables import callable_hints, callable_name
 from .content import (
     base64_decode,

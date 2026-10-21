@@ -13,6 +13,7 @@ from ..backend import BackendError
 from ..errors import Problem, log_problem
 from ..interaction import Interaction, require_async_interaction
 from ..models import ModelAssignment, ModelInfo
+from ..utils import run_in_worker
 
 if TYPE_CHECKING:
     from ..backend import Backend
@@ -35,7 +36,8 @@ class ModelSelection:
         on_select (Callable[[str], None] | None): Durable preference writer invoked before an
             explicit selection takes effect. Defaults to no durable writer.
         async_blocking_runner (Callable[..., Awaitable[Any]] | None): Optional application-owned
-            worker for the synchronous preference writer. Defaults to ``asyncio.to_thread``.
+            worker for the synchronous preference writer. Defaults to a shared bounded process
+            worker.
     """
 
     _backend: Backend
@@ -224,7 +226,7 @@ class ModelSelection:
         pending = asyncio.ensure_future(
             self._async_blocking_runner(self._on_select, model)
             if self._async_blocking_runner is not None
-            else asyncio.to_thread(self._on_select, model)
+            else run_in_worker(self._on_select, model)
         )
         try:
             await asyncio.shield(pending)
