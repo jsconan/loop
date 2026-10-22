@@ -1688,6 +1688,31 @@ def test_runner_run_async_uses_async_query_and_completes():
     sessions.record_run.assert_called_once()
 
 
+def test_runner_sync_entry_points_reject_a_running_event_loop():
+    """Sync orchestration entry points reject before touching their dependencies in a loop."""
+    runner, sessions, interaction = agent_runner()
+    runner._query = Mock(side_effect=AssertionError("sync query reached its backend"))
+    methods = (
+        ("run", ()),
+        ("recover_session", ()),
+        ("handle_tool_calls", (Response(answer="", reasoning=""),)),
+        ("query", ()),
+    )
+
+    async def scenario():
+        """Use the matching native async API whenever the caller owns an event loop."""
+        for method_name, arguments in methods:
+            with pytest.raises(RuntimeError, match="await AgentRunner\\."):
+                getattr(runner, method_name)(*arguments)
+
+    asyncio.run(scenario())
+
+    sessions.execution.assert_not_called()
+    sessions.begin_run.assert_not_called()
+    interaction.confirm.assert_not_called()
+    runner._query.assert_not_called()
+
+
 @pytest.mark.parametrize("async_mode", [False, True])
 def test_agent_run_interactions_include_the_owned_session_and_run(async_mode):
     """Both native run paths attach a session and fresh run identity to UI requests."""

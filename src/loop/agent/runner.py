@@ -40,7 +40,13 @@ from ..session import SessionManager, SessionRecoveryState
 from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
 from ..tooling.file_observations import FileObservations
 from ..tooling.utils import serialize_tool_problem
-from ..utils import PathReference, interaction_operation, interaction_run, utc_now
+from ..utils import (
+    PathReference,
+    has_running_event_loop,
+    interaction_operation,
+    interaction_run,
+    utc_now,
+)
 from .agent import Agent
 from .models import AgentRecoveryStatus, AgentRunResult
 
@@ -303,9 +309,11 @@ class AgentRunner:
 
         Raises:
             KeyboardInterrupt: If the configured control requests a stop.
-            RuntimeError: If the configured control already owns another run.
+            RuntimeError: If called from an active event loop or the configured control already
+                owns another run.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
+        self._require_sync_context("run", "run_async")
         session_id = self._session_manager.session.id
         with self._session_manager.execution(), telemetry_span():
             run = self._session_manager.begin_run()
@@ -355,9 +363,11 @@ class AgentRunner:
 
         Raises:
             KeyboardInterrupt: If the configured control requests a stop.
-            RuntimeError: If the configured control already owns another run.
+            RuntimeError: If called from an active event loop or the configured control already
+                owns another run.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
+        self._require_sync_context("recover_session", "recover_session_async")
         with interaction_run(
             self._session_manager.session.id,
             self._session_manager.session.active_run_id,
@@ -751,8 +761,10 @@ class AgentRunner:
             ValueError: If a requested tool call is not present in canonical session context.
             KeyboardInterrupt: If the configured control requests a stop.
             RunInterrupted: If the active execution scope has been interrupted.
+            RuntimeError: If called from an active event loop.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
+        self._require_sync_context("handle_tool_calls", "handle_tool_calls_async")
         if not response.tool_calls:
             return ()
 
@@ -1075,9 +1087,20 @@ class AgentRunner:
             UnicodeError: An applicable instruction source is not valid UTF-8.
             KeyboardInterrupt: If the configured control requests a stop.
             RunInterrupted: If the active execution scope has been interrupted.
+            RuntimeError: If called from an active event loop.
         """
+        self._require_sync_context("query", "query_async")
         with telemetry_span():
             return self._query()
+
+    @staticmethod
+    def _require_sync_context(method: str, async_method: str) -> None:
+        """Reject synchronous orchestration when the caller already owns an event loop."""
+        if has_running_event_loop():
+            raise RuntimeError(
+                f"Synchronous AgentRunner.{method}() cannot run inside an event loop; "
+                f"await AgentRunner.{async_method}() instead."
+            )
 
     async def query_async(self) -> Response:
         """Request and collect one response through the backend's asynchronous stream.

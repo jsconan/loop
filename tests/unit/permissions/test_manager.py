@@ -8,6 +8,7 @@ import tempfile
 import time
 from contextlib import closing
 from pathlib import Path
+from threading import Event, Thread, get_ident
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
@@ -45,6 +46,7 @@ from loop.permissions import (
     CommandInspection,
     CommandReviewStatus,
     PermissionLoadFailure,
+    UserPermissionConfiguration,
 )
 from loop.permissions import manager as manager_module
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
@@ -1244,6 +1246,441 @@ def test_authorize_async_awaits_native_approval_and_records_result(tmp_path):
         ApprovalChoice.WORKSPACE: "Allow in this workspace",
     }
     recorder.record_authorization.assert_called_once_with(result)
+
+
+def test_async_remembered_approval_writes_off_loop_and_publishes_after_save(tmp_path):
+    """Async approval persistence and legacy recording settle outside the event loop."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.WORKSPACE)
+    policy_path = tmp_path / ".loop" / "permissions.yaml"
+    worker_started = Event()
+    release_worker = Event()
+    blocked_event_loop = Event()
+    recorder_threads = []
+    worker_calls = []
+    manager = PermissionManager(
+        tmp_path,
+        configuration_path=policy_path,
+        interaction=interaction,
+    )
+    original_persist = manager._persist_configuration
+
+    def slow_persist(path, configuration):
+        """Hold policy-file I/O so the test can observe event-loop progress."""
+        worker_started.set()
+        if not release_worker.wait(timeout=0.2):
+            blocked_event_loop.set()
+        original_persist(path, configuration)
+
+    manager._persist_configuration = slow_persist
+    recorder = Mock()
+    recorder.record_authorization.side_effect = lambda _result: recorder_threads.append(get_ident())
+
+    async def dispatch(function, *args):
+        """Run each synchronous authorization effect through a test worker."""
+        name = (
+            "record_authorization"
+            if function is recorder.record_authorization
+            else function.__name__
+        )
+        return await asyncio.to_thread(lambda: (worker_calls.append(name), function(*args))[1])
+
+    manager.set_async_blocking_runner(dispatch)
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    async def authorize():
+        """Inspect the owner while policy persistence is deliberately stalled."""
+        owner_thread = get_ident()
+        task = asyncio.create_task(manager.authorize_async(operation_set, recorder=recorder))
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+        unpublished_during_write = not manager.configuration.rules
+        await asyncio.sleep(0.01)
+        event_loop_responsive = not blocked_event_loop.is_set()
+        release_worker.set()
+        result = await task
+        return owner_thread, unpublished_during_write, event_loop_responsive, result
+
+    try:
+        owner_thread, unpublished, responsive, result = asyncio.run(authorize())
+    finally:
+        release_worker.set()
+
+    assert result.decision is Decision.ALLOW
+    assert unpublished
+    assert responsive
+    assert not blocked_event_loop.is_set()
+    assert worker_calls == ["_persist_configuration_candidate", "record_authorization"]
+    assert recorder_threads and recorder_threads[0] != owner_thread
+    assert manager.configuration.rules
+    assert policy_path.exists()
+
+
+def test_async_remembered_approval_retries_after_concurrent_policy_update(tmp_path):
+    """A concurrent policy change is merged instead of overwritten by a stale approval."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.WORKSPACE)
+    policy_path = tmp_path / ".loop" / "permissions.yaml"
+    worker_started = Event()
+    release_worker = Event()
+    manager = PermissionManager(
+        tmp_path,
+        configuration_path=policy_path,
+        interaction=interaction,
+        async_blocking_runner=lambda function, *args: asyncio.to_thread(function, *args),
+    )
+    original_candidate = manager._persist_configuration_candidate
+    pause_candidate = True
+
+    def delayed_candidate(path, configuration):
+        """Let one sync policy update commit before the async candidate is written."""
+        nonlocal pause_candidate
+        if pause_candidate:
+            pause_candidate = False
+            worker_started.set()
+            release_worker.wait(timeout=2)
+        original_candidate(path, configuration)
+
+    manager._persist_configuration_candidate = delayed_candidate
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    async def authorize():
+        """Interleave a serialized sync policy update with remembered approval."""
+        task = asyncio.create_task(manager.authorize_async(operation_set))
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+        await asyncio.to_thread(
+            manager.set_default,
+            Action.FILESYSTEM_READ,
+            Decision.DENY,
+            scope=PolicyScope.WORKSPACE,
+        )
+        release_worker.set()
+        return await task
+
+    try:
+        result = asyncio.run(authorize())
+    finally:
+        release_worker.set()
+
+    assert result.decision is Decision.ALLOW
+    assert manager.configuration.defaults[Action.FILESYSTEM_READ] is Decision.DENY
+    assert manager.configuration.rules
+    persisted = PermissionConfiguration.model_validate(
+        yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+    )
+    assert persisted.defaults[Action.FILESYSTEM_READ] is Decision.DENY
+    assert persisted.rules
+
+
+def test_async_remembered_approval_rechecks_a_new_deny_policy(tmp_path):
+    """A deny published during durable approval wins over the remembered allow rule."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.WORKSPACE)
+    worker_started = Event()
+    release_worker = Event()
+    manager = PermissionManager(
+        tmp_path,
+        configuration_path=tmp_path / "permissions.yaml",
+        interaction=interaction,
+        async_blocking_runner=lambda function, *args: asyncio.to_thread(function, *args),
+    )
+    original_candidate = manager._persist_configuration_candidate
+    pause_candidate = True
+
+    def delayed_candidate(path, configuration):
+        """Commit an explicit deny while an approval snapshot is being written."""
+        nonlocal pause_candidate
+        if pause_candidate:
+            pause_candidate = False
+            worker_started.set()
+            release_worker.wait(timeout=2)
+        original_candidate(path, configuration)
+
+    manager._persist_configuration_candidate = delayed_candidate
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    async def authorize():
+        """Interleave a deny update with the remembered workspace approval."""
+        task = asyncio.create_task(manager.authorize_async(operation_set))
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+        await asyncio.to_thread(
+            manager.add_rule,
+            PermissionRule(
+                decision=Decision.DENY,
+                tool="demo",
+                action=Action.NETWORK_REQUEST,
+                target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+            ),
+            scope=PolicyScope.WORKSPACE,
+        )
+        release_worker.set()
+        return await task
+
+    try:
+        result = asyncio.run(authorize())
+    finally:
+        release_worker.set()
+
+    assert result.decision is Decision.DENY
+    assert result.source == "policy"
+    assert manager.configuration.rules
+
+
+def test_async_authorization_yields_while_a_policy_update_holds_its_lock(tmp_path):
+    """Async policy evaluation waits cooperatively for a concurrent sync update."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.ONCE)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    lock_acquired = Event()
+    release_lock = Event()
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    def hold_policy_lock():
+        """Hold the policy lock on another thread until async evaluation yields."""
+        with manager.policy_update():
+            lock_acquired.set()
+            release_lock.wait(timeout=2)
+
+    async def scenario():
+        """Check that lock contention suspends authorization instead of blocking this loop."""
+        holder = asyncio.create_task(asyncio.to_thread(hold_policy_lock))
+        await asyncio.wait_for(asyncio.to_thread(lock_acquired.wait), timeout=2)
+        authorization = asyncio.create_task(manager.authorize_async(operation_set))
+        await asyncio.sleep(0.02)
+        yielded = not authorization.done()
+        release_lock.set()
+        result = await authorization
+        await holder
+        return yielded, result
+
+    try:
+        yielded, result = asyncio.run(scenario())
+    finally:
+        release_lock.set()
+
+    assert yielded
+    assert result.decision is Decision.ALLOW
+
+
+@pytest.mark.parametrize("scope", [ApprovalChoice.SESSION, ApprovalChoice.USER])
+def test_async_remembered_approval_preserves_each_scope(scope, tmp_path):
+    """Async approval writes only the selected user or session rule layer."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=scope)
+    user_path = tmp_path / "user-permissions.yaml"
+    manager = PermissionManager(
+        tmp_path,
+        user_configuration_path=user_path if scope is ApprovalChoice.USER else None,
+        interaction=interaction,
+    )
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    result = asyncio.run(manager.authorize_async(operation_set))
+
+    assert result.decision is Decision.ALLOW
+    if scope is ApprovalChoice.SESSION:
+        assert manager.session_rules
+        assert not user_path.exists()
+    else:
+        assert manager.user_rules
+        assert user_path.exists()
+        assert UserPermissionConfiguration.model_validate(
+            yaml.safe_load(user_path.read_text(encoding="utf-8"))
+        ).rules
+
+
+def test_async_remembered_approval_denies_when_policy_write_fails(tmp_path):
+    """A failed async approval write never publishes a remembered allow rule."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.WORKSPACE)
+    manager = PermissionManager(
+        tmp_path,
+        configuration_path=tmp_path / "permissions.yaml",
+        interaction=interaction,
+    )
+
+    def fail_persist(_path, _configuration):
+        """Simulate an atomic policy-file write failure."""
+        raise OSError("disk unavailable")
+
+    manager._persist_configuration_candidate = fail_persist
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    result = asyncio.run(manager.authorize_async(operation_set))
+
+    assert result.decision is Decision.DENY
+    assert result.source == "persistence"
+    assert not manager.configuration.rules
+
+
+def test_async_recorder_cancellation_is_propagated_after_recording_settles(tmp_path):
+    """Cancellation from a native async recorder stops authorization after its call settles."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.ONCE)
+    recorder = Mock()
+    recorder.record_authorization_async = AsyncMock(side_effect=asyncio.CancelledError)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(manager.authorize_async(operation_set, recorder=recorder))
+
+    recorder.record_authorization_async.assert_awaited_once()
+    recorder.record_authorization.assert_not_called()
+
+
+@pytest.mark.parametrize("worker_fails", [False, True])
+def test_async_remembered_approval_settles_worker_before_cancellation(tmp_path, worker_fails):
+    """Remembered policy writes settle after cancellation, including simultaneous write errors."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.WORKSPACE)
+    worker_started = asyncio.Event()
+    release_worker = asyncio.Event()
+
+    async def run_blocking_async(function, *args):
+        """Keep persistence owned until the test cancels its caller."""
+        worker_started.set()
+        await release_worker.wait()
+        if worker_fails:
+            raise OSError("policy storage unavailable")
+        return await asyncio.to_thread(function, *args)
+
+    manager = PermissionManager(
+        tmp_path,
+        configuration_path=tmp_path / "permissions.yaml",
+        interaction=interaction,
+        async_blocking_runner=run_blocking_async,
+    )
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    async def cancel_authorization():
+        """Cancel repeatedly while persistence remains admitted and pending."""
+        pending = asyncio.create_task(manager.authorize_async(operation_set))
+        await worker_started.wait()
+        pending.cancel()
+        await asyncio.sleep(0)
+        pending.cancel()
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await pending
+        if worker_fails:
+            assert any("OSError" in note for note in captured.value.__notes__)
+
+    asyncio.run(cancel_authorization())
+
+
+def test_async_remembered_approval_waits_for_policy_lock_after_persistence(tmp_path):
+    """Cancellation during post-save publication waits for lock ownership to settle."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.WORKSPACE)
+    lock_held = Event()
+    release_lock = Event()
+    holder_threads = []
+    manager = PermissionManager(
+        tmp_path,
+        configuration_path=tmp_path / "permissions.yaml",
+        interaction=interaction,
+        async_blocking_runner=lambda function, *args: asyncio.to_thread(function, *args),
+    )
+    original_candidate = manager._persist_configuration_candidate
+
+    def persist_then_hold_lock(path, configuration):
+        """Acquire the policy lock in a peer thread before the owner publishes its snapshot."""
+        original_candidate(path, configuration)
+
+        def hold_lock():
+            """Hold publication ownership until the async caller has been cancelled."""
+            manager._policy_lock.acquire()
+            lock_held.set()
+            release_lock.wait(timeout=3)
+            manager._policy_lock.release()
+
+        holder = Thread(target=hold_lock)
+        holder_threads.append(holder)
+        holder.start()
+        assert lock_held.wait(timeout=2)
+
+    manager._persist_configuration_candidate = persist_then_hold_lock
+    operation_set = (
+        operation(
+            Action.NETWORK_REQUEST,
+            target=NetworkTarget(url="https://example.com", origin="https://example.com"),
+        ),
+    )
+
+    async def cancel_authorization():
+        """Cancel while durable policy publication waits cooperatively for its lock."""
+        pending = asyncio.create_task(manager.authorize_async(operation_set))
+        await asyncio.wait_for(asyncio.to_thread(lock_held.wait), timeout=2)
+        await asyncio.sleep(0.02)
+        pending.cancel()
+        await asyncio.sleep(0.02)
+        pending.cancel()
+        release_lock.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    try:
+        asyncio.run(cancel_authorization())
+    finally:
+        release_lock.set()
+        for holder in holder_threads:
+            holder.join(timeout=2)
+
+    assert all(not holder.is_alive() for holder in holder_threads)
+    assert manager.configuration.rules
+
+
+def test_async_remembered_approval_rejects_unavailable_policy_scopes(tmp_path):
+    """Only configured workspace or user files can receive async remembered approval."""
+    manager = PermissionManager(tmp_path)
+    operation_set = (file_operation(Action.FILESYSTEM_READ, tmp_path / "source.txt"),)
+
+    with pytest.raises(ValueError, match="Unsupported remembered approval scope"):
+        asyncio.run(manager._remember_approval_async(operation_set, scope=ApprovalChoice.ONCE))
+    with pytest.raises(ValueError, match="policy path is unavailable"):
+        asyncio.run(manager._remember_approval_async(operation_set, scope=ApprovalChoice.USER))
+    with pytest.raises(ValueError, match="user permission policy path is not configured"):
+        manager._replace_user_configuration(UserPermissionConfiguration())
 
 
 def test_async_authorization_uses_bounded_audit_and_native_recorder_paths(tmp_path):

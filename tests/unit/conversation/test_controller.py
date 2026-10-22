@@ -817,7 +817,7 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
         try:
             inputs.put_nowait("start")
             await working.wait()
-            manager.handle_user_command("/help", interaction=ui)
+            await manager.handle_user_command_async("/help", interaction=ui)
             busy_help_names[:] = [item.name for item in ui.table.call_args.args[0]]
             inputs.put_nowait("/status")
             await captured.wait()

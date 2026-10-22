@@ -451,7 +451,7 @@ class CommandManager:
                 interaction is available to report it.
             ProblemException: If a command reports a structured operational problem and no
                 interaction is available to display it, or async dispatch is required because
-                this caller cannot safely use the owned runner.
+                this caller is in an event loop or cannot safely use the owned runner.
             ValidationError: If arguments fail schema validation and no interaction is available
                 to report it.
             ValueError: If a slash-prefixed name is supplied or an interaction required for
@@ -467,6 +467,8 @@ class CommandManager:
             return
         try:
             telemetry_activity("command.started", command=name)
+            if has_running_event_loop():
+                raise self._async_required(name)
             if is_async_callable(command.function):
                 runner = self._sync_runner()
                 if runner is None:

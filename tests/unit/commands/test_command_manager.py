@@ -849,6 +849,30 @@ def test_sync_dispatch_requires_async_api_inside_a_running_loop():
     asyncio.run(scenario())
 
 
+def test_sync_command_dispatch_rejects_callbacks_inside_a_running_loop():
+    """Sync callbacks are never invoked by the synchronous hub on an event-loop thread."""
+    invoked = []
+    manager = CommandManager()
+
+    def probe() -> None:
+        """Record whether synchronous dispatch reaches the callback."""
+        invoked.append(True)
+
+    manager.register(probe)
+
+    async def scenario():
+        """Require callers with a running loop to use the async dispatch API."""
+        assert manager._sync_runner() is None
+        with pytest.raises(ProblemException) as captured:
+            manager.call("probe")
+        assert captured.value.problem.code == "command.async_required"
+
+    asyncio.run(scenario())
+
+    assert not invoked
+    manager.close()
+
+
 def test_sync_command_leaves_the_async_loop_responsive():
     """An unmarked synchronous callback runs in a worker while the loop continues to run."""
     manager = CommandManager()

@@ -699,7 +699,7 @@ class ToolRegistry:
         file_observations: FileObservations | None = None,
         cancellation_event: Event | None = None,
     ) -> str:
-        """Dispatch a synchronous tool call by registered name.
+        """Dispatch a synchronous tool call from a synchronous caller by registered name.
 
         Args:
             name (str): Registered tool name.
@@ -750,7 +750,7 @@ class ToolRegistry:
         file_observations: FileObservations | None = None,
         cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
-        """Dispatch a tool and measure only its function execution.
+        """Dispatch from a synchronous caller and measure only function execution.
 
         Args:
             name (str): Registered tool name.
@@ -778,6 +778,8 @@ class ToolRegistry:
             return self._problem(
                 "tool.unknown", "Tool unavailable", f"Tool '{name}' is not available.", name
             ), 0
+        if has_running_event_loop():
+            return serialize_tool_problem(self._async_required(tool).problem), 0
         validated, error = tool.validate_arguments(arguments)
         if error is not None:
             return error, 0

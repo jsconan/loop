@@ -128,7 +128,8 @@ class PermissionManager:
         command_inspection (CommandInspection | None): Trusted command inspection. Defaults to
             the built-in matchers.
         async_blocking_runner (Callable[..., Awaitable[Any]] | None): Application-owned bounded
-            worker for synchronous audit writes. Defaults to a shared bounded process worker.
+            worker for synchronous policy persistence, audit writes, and compatibility recorders.
+            Defaults to a shared bounded process worker.
 
     Raises:
         PermissionConfigurationError: If a policy is invalid in strict mode.
@@ -155,6 +156,7 @@ class PermissionManager:
     _command_inspection: CommandInspection
     _host_runtime_bindings: dict[str, str]
     _policy_lock: RLock
+    _policy_revision: int
     _async_blocking_runner: Callable[..., Awaitable[Any]] | None
 
     def __init__(
@@ -174,6 +176,7 @@ class PermissionManager:
         async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         self._policy_lock = RLock()
+        self._policy_revision = 0
         self._async_blocking_runner = async_blocking_runner
         self._command_inspection = (
             command_inspection if command_inspection is not None else CommandInspection()
@@ -355,11 +358,12 @@ class PermissionManager:
         self,
         runner: Callable[..., Awaitable[Any]],
     ) -> None:
-        """Use an application-owned bounded worker for async audit writes.
+        """Use an application-owned bounded worker for synchronous async-path effects.
 
         Args:
             runner (Callable[..., Awaitable[Any]]): Worker that invokes a synchronous operation
-                and returns its result.
+                and returns its result. Used for policy and audit persistence and sync-only
+                authorization recorders.
 
         Returns:
             None: The asynchronous audit worker is configured.
@@ -447,8 +451,6 @@ class PermissionManager:
             selected,
             headless=headless,
             recorder=recorder,
-            persist=True,
-            audit=True,
         )
 
     async def authorize_async(
@@ -474,7 +476,7 @@ class PermissionManager:
         Raises:
             asyncio.CancelledError: If approval or owned audit and recording work is cancelled.
         """
-        policy, fresh_file_review = self._authorization_policy(
+        policy, fresh_file_review = await self._authorization_policy_async(
             operations, protected_instruction_names
         )
         active_interaction = interaction if interaction is not None else self._interaction
@@ -489,25 +491,34 @@ class PermissionManager:
                 interaction=active_interaction,
                 fresh_only=fresh_file_review,
             )
-        result = self._complete_authorization(
+        result, cancellation = await self._complete_authorization_async(
             operations,
             policy,
             fresh_file_review,
             prompt,
             selected,
             headless=headless,
-            recorder=recorder,
-            persist=False,
-            audit=False,
         )
-        await self._audit_async(result)
+        try:
+            await self._audit_async(result)
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
         active_recorder = recorder if recorder is not None else self._recorder
         if active_recorder is not None:
             async_recorder = getattr(active_recorder, "record_authorization_async", None)
             if callable(async_recorder) and inspect.iscoroutinefunction(async_recorder):
-                await async_recorder(result)
+                try:
+                    await async_recorder(result)
+                except asyncio.CancelledError as error:
+                    cancellation = cancellation or error
             else:
-                active_recorder.record_authorization(result)
+                _, recorder_cancellation = await self._run_blocking_settled_async(
+                    active_recorder.record_authorization,
+                    result,
+                )
+                cancellation = cancellation or recorder_cancellation
+        if cancellation is not None:
+            raise cancellation
         return result
 
     def _authorization_policy(
@@ -525,6 +536,28 @@ class PermissionManager:
                 decision=Decision.ASK,
                 reason="A user-managed replacement, deletion, "
                 "or instruction change needs fresh approval.",
+                sources=("boundary:fresh_file_review",),
+            )
+        return policy, fresh_file_review
+
+    async def _authorization_policy_async(
+        self,
+        operations: Operations,
+        protected_instruction_names: tuple[str, ...],
+    ) -> tuple[PolicyDecision, bool]:
+        """Evaluate initial async policy without blocking on concurrent policy updates."""
+        policy = await self.evaluate_async(operations)
+        fresh_file_review = self._requires_fresh_file_review(
+            operations,
+            self.protected_instruction_names(protected_instruction_names),
+        )
+        if fresh_file_review and policy.decision is not Decision.DENY:
+            policy = PolicyDecision(
+                decision=Decision.ASK,
+                reason=(
+                    "A user-managed replacement, deletion, "
+                    "or instruction change needs fresh approval."
+                ),
                 sources=("boundary:fresh_file_review",),
             )
         return policy, fresh_file_review
@@ -548,15 +581,141 @@ class PermissionManager:
         *,
         headless: bool,
         recorder: PermissionRecorder | None,
-        persist: bool,
-        audit: bool,
     ) -> AuthorizationResult:
         """Apply an approval response, record its decision, and return the final result."""
+        (
+            policy,
+            decision,
+            reason,
+            source,
+            approval_choice,
+            approval_scope,
+        ) = self._authorization_outcome(
+            operations,
+            policy,
+            fresh_file_review,
+            selected,
+            headless=headless,
+        )
+        installed_rule_ids = ()
+        if approval_scope is not None:
+            try:
+                with self.policy_update():
+                    installed_rule_ids = self._remember_approval(
+                        operations,
+                        scope=approval_scope,
+                    )
+            except OSError as exc:
+                decision = Decision.DENY
+                reason = f"Could not persist the approved permission policy: {exc}"
+                source = "persistence"
+
+        result = self._authorization_result(
+            operations,
+            policy,
+            decision,
+            reason,
+            source,
+            prompt,
+            approval_choice,
+            installed_rule_ids,
+        )
+        self._audit(result)
+        active_recorder = recorder if recorder is not None else self._recorder
+        if active_recorder is not None:
+            active_recorder.record_authorization(result)
+        return result
+
+    async def _complete_authorization_async(
+        self,
+        operations: Operations,
+        policy: PolicyDecision,
+        fresh_file_review: bool,
+        prompt: str | None,
+        selected: object | None,
+        *,
+        headless: bool,
+    ) -> tuple[AuthorizationResult, asyncio.CancelledError | None]:
+        """Apply an async approval without doing policy-file I/O on the event loop."""
+        current_policy = None
+        if (
+            policy.decision is Decision.ASK
+            and not headless
+            and self._selected_approval_choice(selected) is not ApprovalChoice.DENY
+        ):
+            current_policy = await self.evaluate_async(operations)
+        (
+            policy,
+            decision,
+            reason,
+            source,
+            approval_choice,
+            approval_scope,
+        ) = self._authorization_outcome(
+            operations,
+            policy,
+            fresh_file_review,
+            selected,
+            headless=headless,
+            current_policy=current_policy,
+        )
+        installed_rule_ids = ()
+        cancellation = None
+        if approval_scope is not None:
+            try:
+                installed_rule_ids, cancellation = await self._remember_approval_async(
+                    operations, scope=approval_scope
+                )
+            except OSError as exc:
+                decision = Decision.DENY
+                reason = f"Could not persist the approved permission policy: {exc}"
+                source = "persistence"
+            else:
+                current_policy = await self.evaluate_async(operations)
+                if current_policy.decision is Decision.DENY:
+                    policy = current_policy
+                    decision = Decision.DENY
+                    reason = (
+                        "The active permission policy changed to deny this operation while "
+                        "approval was pending."
+                    )
+                    source = "policy"
+
+        result = self._authorization_result(
+            operations,
+            policy,
+            decision,
+            reason,
+            source,
+            prompt,
+            approval_choice,
+            installed_rule_ids,
+        )
+        return result, cancellation
+
+    def _authorization_outcome(
+        self,
+        operations: Operations,
+        policy: PolicyDecision,
+        fresh_file_review: bool,
+        selected: object | None,
+        *,
+        headless: bool,
+        current_policy: PolicyDecision | None = None,
+    ) -> tuple[
+        PolicyDecision,
+        Decision,
+        str,
+        str,
+        ApprovalChoice | None,
+        ApprovalChoice | None,
+    ]:
+        """Resolve prompt choice and current policy before applying remembered approval."""
         decision = policy.decision
         reason = policy.reason
         source = "policy"
         approval_choice = None
-        installed_rule_ids = ()
+        approval_scope = None
         approval_policy_denied = False
         if policy.decision is Decision.ASK:
             if headless:
@@ -565,15 +724,9 @@ class PermissionManager:
                 source = "headless"
             else:
                 source = "user"
-                approval_choice = (
-                    selected
-                    if isinstance(selected, ApprovalChoice)
-                    else ApprovalChoice.ONCE
-                    if selected is True
-                    else ApprovalChoice.DENY
-                )
+                approval_choice = self._selected_approval_choice(selected)
                 if approval_choice is not ApprovalChoice.DENY:
-                    current_policy = self.evaluate(operations)
+                    current_policy = current_policy or self.evaluate(operations)
                     if current_policy.decision is Decision.DENY:
                         policy = current_policy
                         approval_choice = ApprovalChoice.DENY
@@ -602,20 +755,33 @@ class PermissionManager:
                         ApprovalChoice.WORKSPACE,
                         ApprovalChoice.USER,
                     }:
-                        try:
-                            with self.policy_update():
-                                installed_rule_ids = self._remember_approval(
-                                    operations, scope=approval_choice
-                                )
-                        except OSError as exc:
-                            decision = Decision.DENY
-                            reason = f"Could not persist the approved permission policy: {exc}"
-                            source = "persistence"
+                        approval_scope = approval_choice
                 elif reason == policy.reason and not approval_policy_denied:
                     decision = Decision.DENY
                     reason = "Rejected by the user."
                 if source not in {"persistence", "policy"}:
                     source = "user"
+        return policy, decision, reason, source, approval_choice, approval_scope
+
+    @staticmethod
+    def _selected_approval_choice(selected: object | None) -> ApprovalChoice:
+        """Normalize interaction values to one explicit approval choice."""
+        if isinstance(selected, ApprovalChoice):
+            return selected
+        return ApprovalChoice.ONCE if selected is True else ApprovalChoice.DENY
+
+    @staticmethod
+    def _authorization_result(
+        operations: Operations,
+        policy: PolicyDecision,
+        decision: Decision,
+        reason: str,
+        source: str,
+        prompt: str | None,
+        approval_choice: ApprovalChoice | None,
+        installed_rule_ids: tuple[str, ...],
+    ) -> AuthorizationResult:
+        """Build and trace the immutable result shared by sync and async authorization."""
         result = AuthorizationResult(
             operations=operations,
             policy=policy,
@@ -641,11 +807,6 @@ class PermissionManager:
             "permission.decision",
             payload=result,
         )
-        if audit:
-            self._audit(result)
-        active_recorder = recorder if recorder is not None else self._recorder
-        if persist and active_recorder is not None:
-            active_recorder.record_authorization(result)
         return result
 
     def _requires_fresh_file_review(
@@ -1532,9 +1693,87 @@ class PermissionManager:
             existing = self._configuration.rules
         else:
             existing = self._session_overrides.rules
+        additions = self._approval_additions(operations, existing, scope)
+        if scope is ApprovalChoice.USER:
+            updated = self._user_configuration.model_copy(deep=True)
+            updated.rules.extend(additions)
+            self._replace_user_configuration(updated)
+        elif scope is ApprovalChoice.WORKSPACE:
+            updated = self._configuration.model_copy(deep=True)
+            updated.rules.extend(additions)
+            self._replace_configuration(updated)
+        else:
+            self._session_overrides.rules.extend(additions)
+        return tuple(rule.id for rule in additions)
+
+    async def _remember_approval_async(
+        self,
+        operations: Operations,
+        *,
+        scope: ApprovalChoice,
+    ) -> tuple[tuple[str, ...], asyncio.CancelledError | None]:
+        """Persist remembered policy on a bounded worker, then publish it on the owner."""
+        if scope is ApprovalChoice.SESSION:
+            await self._acquire_policy_lock_async()
+            try:
+                return self._remember_approval(operations, scope=scope), None
+            finally:
+                self._policy_lock.release()
+
+        if scope is ApprovalChoice.USER:
+            path = self._user_configuration_path
+        elif scope is ApprovalChoice.WORKSPACE:
+            path = self._configuration_path
+        else:
+            raise ValueError(f"Unsupported remembered approval scope: {scope.value}.")
+        if path is None:
+            raise ValueError(f"Permission policy path is unavailable for {scope.value} approval.")
+
+        cancellation = None
+        while True:
+            await self._acquire_policy_lock_async()
+            try:
+                if scope is ApprovalChoice.USER:
+                    current = self._user_configuration
+                else:
+                    current = self._configuration
+                revision = self._policy_revision
+                additions = self._approval_additions(operations, current.rules, scope)
+                updated = current.model_copy(deep=True)
+                updated.rules.extend(additions)
+            finally:
+                self._policy_lock.release()
+
+            _, stopped = await self._run_blocking_settled_async(
+                self._persist_configuration_candidate,
+                path,
+                updated,
+            )
+            cancellation = cancellation or stopped
+
+            cancellation = await self._acquire_policy_lock_after_write_async(cancellation)
+            try:
+                if revision != self._policy_revision:
+                    continue
+                if scope is ApprovalChoice.USER:
+                    self._user_configuration = updated
+                else:
+                    self._configuration = updated
+                self._policy_revision += 1
+            finally:
+                self._policy_lock.release()
+            return tuple(rule.id for rule in additions), cancellation
+
+    @staticmethod
+    def _approval_additions(
+        operations: Operations,
+        existing: Iterable[PermissionRule],
+        scope: ApprovalChoice,
+    ) -> list[PermissionRule]:
+        """Build the exact allow rules not already present at the requested scope."""
         additions = []
         for operation in operations:
-            target = self._approval_target(operation.target)
+            target = PermissionManager._approval_target(operation.target)
             if any(
                 rule.decision is Decision.ALLOW
                 and rule.tool == operation.tool_id
@@ -1554,17 +1793,66 @@ class PermissionManager:
                     description=f"Approved interactively for this {scope.value}.",
                 )
             )
-        if scope is ApprovalChoice.USER:
-            updated = self._user_configuration.model_copy(deep=True)
-            updated.rules.extend(additions)
-            self._replace_user_configuration(updated)
-        elif scope is ApprovalChoice.WORKSPACE:
-            updated = self._configuration.model_copy(deep=True)
-            updated.rules.extend(additions)
-            self._replace_configuration(updated)
-        else:
-            self._session_overrides.rules.extend(additions)
-        return tuple(rule.id for rule in additions)
+        return additions
+
+    async def _acquire_policy_lock_async(self) -> None:
+        """Wait for policy ownership without blocking the current event loop."""
+        while not self._policy_lock.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+
+    async def _acquire_policy_lock_after_write_async(
+        self,
+        cancellation: asyncio.CancelledError | None,
+    ) -> asyncio.CancelledError | None:
+        """Retain ownership through publication after a durable policy write settles."""
+        while not self._policy_lock.acquire(blocking=False):
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+        return cancellation
+
+    def _persist_configuration_candidate(
+        self,
+        path: Path,
+        configuration: PermissionConfiguration | UserPermissionConfiguration,
+    ) -> None:
+        """Write a detached policy candidate while serializing all policy writers."""
+        with self.policy_update():
+            self._persist_configuration(path, configuration)
+
+    async def _run_blocking_settled_async(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+    ) -> tuple[Any, asyncio.CancelledError | None]:
+        """Wait for bounded synchronous work and retain cancellation until its outcome is known."""
+        pending = asyncio.ensure_future(
+            self._async_blocking_runner(function, *args)
+            if self._async_blocking_runner is not None
+            else run_in_worker_async(function, *args)
+        )
+        cancellation = None
+        try:
+            await asyncio.wait({pending})
+        except asyncio.CancelledError as error:
+            cancellation = error
+        while not pending.done():
+            try:
+                await asyncio.wait({pending})
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+
+        try:
+            result = pending.result()
+        except BaseException as error:
+            if cancellation is not None:
+                cancellation.add_note(
+                    f"The blocking permission operation also stopped with {type(error).__name__}."
+                )
+                raise cancellation from error
+            raise
+        return result, cancellation
 
     @staticmethod
     def _approval_target(target: OperationTarget) -> OperationTarget:
@@ -1590,27 +1878,44 @@ class PermissionManager:
             PolicyDecision: Composed allow, ask, or deny outcome and determining sources.
         """
         with self._policy_lock:
-            if not operations:
+            return self._evaluate_policy(operations)
+
+    async def evaluate_async(self, operations: Operations) -> PolicyDecision:
+        """Evaluate one operation plan without blocking on a concurrent policy update.
+
+        Args:
+            operations (Operations): Complete normalized effects to evaluate.
+
+        Returns:
+            PolicyDecision: Composed allow, ask, or deny outcome and determining sources.
+        """
+        await self._acquire_policy_lock_async()
+        try:
+            return self._evaluate_policy(operations)
+        finally:
+            self._policy_lock.release()
+
+    def _evaluate_policy(self, operations: Operations) -> PolicyDecision:
+        """Evaluate a policy snapshot while the caller owns the policy lock."""
+        if not operations:
+            return PolicyDecision(
+                decision=Decision.ALLOW,
+                reason="The tool plan requires no authority.",
+                sources=("no_authority",),
+            )
+        decisions = tuple(self._evaluate_operation(operation) for operation in operations)
+        for selected in (Decision.DENY, Decision.ASK, Decision.ALLOW):
+            determining = tuple(item for item in decisions if item.decision is selected)
+            if determining:
                 return PolicyDecision(
-                    decision=Decision.ALLOW,
-                    reason="The tool plan requires no authority.",
-                    sources=("no_authority",),
+                    decision=selected,
+                    reason=(
+                        f"{len(determining)} of {len(operations)} planned operation(s) "
+                        f"require {selected.value}."
+                    ),
+                    sources=tuple(source for item in determining for source in item.sources),
                 )
-            decisions = tuple(self._evaluate_operation(operation) for operation in operations)
-            for selected in (Decision.DENY, Decision.ASK, Decision.ALLOW):
-                determining = tuple(item for item in decisions if item.decision is selected)
-                if determining:
-                    return PolicyDecision(
-                        decision=selected,
-                        reason=(
-                            f"{len(determining)} of {len(operations)} planned operation(s) "
-                            f"require {selected.value}."
-                        ),
-                        sources=tuple(source for item in determining for source in item.sources),
-                    )
-            raise RuntimeError(
-                "Every operation must produce a policy decision."
-            )  # pragma: no cover
+        raise RuntimeError("Every operation must produce a policy decision.")  # pragma: no cover
 
     def set_default(
         self,
@@ -1979,16 +2284,18 @@ class PermissionManager:
         """
         if self._configuration_path is None:
             raise ValueError("An in-memory PermissionManager cannot reset configuration.")
-        backup_path = None
-        if self._configuration_path.exists():
-            timestamp = local_now().strftime("%Y%m%dT%H%M%S%f%z")
-            backup_path = self._configuration_path.with_name(
-                f"{self._configuration_path.name}.{timestamp}.bak"
-            )
-            self._configuration_path.replace(backup_path)
-        configuration = PermissionConfiguration()
-        self._persist(configuration)
-        self._configuration = configuration
+        with self.policy_update():
+            backup_path = None
+            if self._configuration_path.exists():
+                timestamp = local_now().strftime("%Y%m%dT%H%M%S%f%z")
+                backup_path = self._configuration_path.with_name(
+                    f"{self._configuration_path.name}.{timestamp}.bak"
+                )
+                self._configuration_path.replace(backup_path)
+            configuration = PermissionConfiguration()
+            self._persist(configuration)
+            self._configuration = configuration
+            self._policy_revision += 1
         self._audit_policy_change("permission.configuration_reset", PolicyScope.WORKSPACE)
         return backup_path
 
@@ -2041,7 +2348,8 @@ class PermissionManager:
     def _persist(self, configuration: PermissionConfiguration) -> None:
         if self._configuration_path is None:
             raise ValueError("An in-memory PermissionManager cannot persist configuration.")
-        self._persist_configuration(self._configuration_path, configuration)
+        with self.policy_update():
+            self._persist_configuration(self._configuration_path, configuration)
 
     @staticmethod
     def _persist_configuration(
@@ -2057,14 +2365,20 @@ class PermissionManager:
 
     def _replace_configuration(self, configuration: PermissionConfiguration) -> None:
         """Persist and activate one workspace policy transactionally."""
-        self._persist(configuration)
-        self._configuration = configuration
+        with self.policy_update():
+            self._persist(configuration)
+            self._configuration = configuration
+            self._policy_revision += 1
 
     def _replace_user_configuration(self, configuration: UserPermissionConfiguration) -> None:
         """Persist and activate one user-wide remembered-approval policy transactionally."""
         configuration = UserPermissionConfiguration.model_validate(configuration.model_dump())
-        self._persist_configuration(self._user_configuration_path, configuration)
-        self._user_configuration = configuration
+        if self._user_configuration_path is None:
+            raise ValueError("A user permission policy path is not configured.")
+        with self.policy_update():
+            self._persist_configuration(self._user_configuration_path, configuration)
+            self._user_configuration = configuration
+            self._policy_revision += 1
 
     def _rules_for_scope(self, scope: PolicyScope) -> tuple[PermissionRule, ...]:
         """Return deep-copied rules from one exact policy layer."""
@@ -2269,12 +2583,15 @@ class PermissionManager:
     def _load_user_configuration(self) -> None:
         """Load user-wide approvals and fail closed if their file is invalid."""
         try:
-            self._user_configuration = self._read_user_configuration()
+            configuration = self._read_user_configuration()
         except PermissionConfigurationError as exc:
             if self._load_policy is PermissionLoadPolicy.ERROR:
                 raise
-            self._user_configuration = UserPermissionConfiguration()
+            configuration = UserPermissionConfiguration()
             self._report_user_configuration_error(exc)
+        with self.policy_update():
+            self._user_configuration = configuration
+            self._policy_revision += 1
 
     def _load_configuration(
         self,
@@ -2293,7 +2610,9 @@ class PermissionManager:
                     self._report_configuration_error(exc)
                     if retain_on_failure:
                         return PermissionLoadResult.RETAINED
-                    self._configuration = PermissionConfiguration()
+                    with self.policy_update():
+                        self._configuration = PermissionConfiguration()
+                        self._policy_revision += 1
                     return PermissionLoadResult.DEFAULTED
                 active_interaction = interaction if interaction is not None else self._interaction
                 if active_interaction is None:
@@ -2306,7 +2625,9 @@ class PermissionManager:
                 if choice is PermissionLoadResult.LOADED:
                     continue
                 return choice
-            self._configuration = configuration
+            with self.policy_update():
+                self._configuration = configuration
+                self._policy_revision += 1
             return PermissionLoadResult.LOADED
 
     def _recover_configuration_interactively(
@@ -2357,7 +2678,9 @@ class PermissionManager:
         if retain_on_failure:
             interaction.warning("Keeping the current permission policy.")
             return PermissionLoadResult.RETAINED
-        self._configuration = PermissionConfiguration()
+        with self.policy_update():
+            self._configuration = PermissionConfiguration()
+            self._policy_revision += 1
         interaction.warning("Using supervised permission defaults for this session.")
         return PermissionLoadResult.DEFAULTED
 

@@ -795,12 +795,41 @@ def test_sync_dispatch_rejects_async_tools_inside_a_running_loop():
     registry = ToolRegistry([calculate])
 
     async def dispatch():
+        """Verify the owned runner and sync hub both reject the active loop."""
+        assert registry._sync_runner() is None
+        with pytest.raises(ProblemException) as captured:
+            registry._invoke(registry._tools["calculate"], calculate, {"number": 3})
+        assert captured.value.problem.code == "tool.async_required"
         return registry.call("calculate", '{"number": 3}')
 
     output = asyncio.run(dispatch())
 
     assert json.loads(output)["problem"]["code"] == "tool.async_required"
     assert not invoked
+    registry.close()
+
+
+def test_sync_dispatch_rejects_sync_tools_inside_a_running_loop():
+    """Sync tools are never invoked by the synchronous hub on an event-loop thread."""
+    invoked = []
+
+    @declare_tool
+    def calculate(number: int) -> int:
+        """Record whether synchronous dispatch reached the tool."""
+        invoked.append(number)
+        return number * 2
+
+    registry = ToolRegistry([calculate])
+
+    async def dispatch():
+        """Require the async registry API while an event loop is running."""
+        return registry.call("calculate", '{"number": 3}')
+
+    output = asyncio.run(dispatch())
+
+    assert json.loads(output)["problem"]["code"] == "tool.async_required"
+    assert not invoked
+    registry.close()
 
 
 def test_async_dispatch_runs_sync_handlers_off_loop_and_keeps_async_handlers_on_loop():
@@ -1443,11 +1472,16 @@ def test_sync_dispatch_rejects_awaitable_planners_inside_a_running_loop():
     registry = ToolRegistry([calculate])
 
     async def dispatch():
+        """Reject a returned coroutine at the internal synchronous invocation boundary."""
+        with pytest.raises(ProblemException) as captured:
+            registry._invoke(registry._tools["calculate"], planner, {"number": 3})
+        assert captured.value.problem.code == "tool.async_required"
         return registry.call("calculate", '{"number": 3}')
 
     output = asyncio.run(dispatch())
 
     assert json.loads(output)["problem"]["code"] == "tool.async_required"
+    registry.close()
 
 
 def test_sync_dispatch_rejects_async_planners_inside_a_running_loop():
@@ -1485,8 +1519,14 @@ def test_sync_dispatch_rejects_non_closeable_planner_results_inside_a_loop():
     registry = ToolRegistry([calculate])
 
     async def dispatch():
-        output = registry.call("calculate", '{"number": 3}')
-        assert json.loads(output)["problem"]["code"] == "tool.async_required"
+        """Reject a future returned by sync planning without invoking the tool."""
+        with pytest.raises(ProblemException) as captured:
+            registry._invoke(
+                registry._tools["calculate"],
+                lambda arguments: asyncio.get_running_loop().create_future(),
+                {"number": 3},
+            )
+        assert captured.value.problem.code == "tool.async_required"
 
     try:
         asyncio.run(dispatch())
