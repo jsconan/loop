@@ -126,6 +126,8 @@ class SessionManager:
     _workspace_id: str | None
     _async_blocking_runner: Callable[..., Awaitable[Any]] | None
     _persistence_lock: Lock
+    _commit_lock: Lock
+    _async_commit_lock: asyncio.Lock
 
     def __init__(
         self,
@@ -139,6 +141,8 @@ class SessionManager:
         self._session_store = session_store or MemorySessionStore()
         self._async_blocking_runner = async_blocking_runner
         self._persistence_lock = Lock()
+        self._commit_lock = Lock()
+        self._async_commit_lock = asyncio.Lock()
         if workspace_id == "":
             raise ValueError("Workspace identifier must not be empty.")
         self._workspace_id = workspace_id
@@ -1640,49 +1644,104 @@ class SessionManager:
 
     def _commit(self, mutation: Callable[[Session], None]) -> None:
         """Apply and persist one session mutation atomically in memory."""
-        previous = deepcopy(self._session)
-        try:
-            mutation(self._session)
-            telemetry_activity("session.persistence.started", component="session_manager")
-            self._save_snapshot(self._session_store, self._persistence_lock, self._session)
-            telemetry_activity(
-                "session.persistence.completed",
-                component="session_manager",
-            )
-        except Exception:
-            telemetry_error(
-                "session.persistence.failed",
-                error_type="session.persistence_failed",
-                component="session_manager",
-            )
-            for session_field in fields(Session):
-                setattr(
-                    self._session,
-                    session_field.name,
-                    deepcopy(getattr(previous, session_field.name)),
+        with self._commit_lock:
+            previous = deepcopy(self._session)
+            try:
+                mutation(self._session)
+                telemetry_activity("session.persistence.started", component="session_manager")
+                self._save_snapshot(self._session_store, self._persistence_lock, self._session)
+                telemetry_activity(
+                    "session.persistence.completed",
+                    component="session_manager",
                 )
-            raise
+            except Exception:
+                telemetry_error(
+                    "session.persistence.failed",
+                    error_type="session.persistence_failed",
+                    component="session_manager",
+                )
+                for session_field in fields(Session):
+                    setattr(
+                        self._session,
+                        session_field.name,
+                        deepcopy(getattr(previous, session_field.name)),
+                    )
+                raise
 
     async def _commit_async(self, mutation: Callable[[Session], None]) -> None:
         """Persist a detached session mutation through bounded blocking admission."""
-        current = self._session
-        candidate = deepcopy(current)
-        mutation(candidate)
-        telemetry_activity("session.persistence.started", component="session_manager")
+        async with self._async_commit_lock:
+            await self._acquire_commit_lock_async()
+            try:
+                current = self._session
+                candidate = deepcopy(current)
+                mutation(candidate)
+                telemetry_activity("session.persistence.started", component="session_manager")
+                pending = asyncio.ensure_future(
+                    self._async_blocking_runner(
+                        self._save_snapshot,
+                        self._session_store,
+                        self._persistence_lock,
+                        candidate,
+                    )
+                    if self._async_blocking_runner is not None
+                    else run_in_worker_async(
+                        self._save_snapshot,
+                        self._session_store,
+                        self._persistence_lock,
+                        candidate,
+                    )
+                )
+                cancellation = None
+                try:
+                    await asyncio.wait({pending})
+                except asyncio.CancelledError as error:
+                    cancellation = error
+                while not pending.done():
+                    try:
+                        await asyncio.wait({pending})
+                    except asyncio.CancelledError as error:
+                        cancellation = cancellation or error
+
+                try:
+                    pending.result()
+                except BaseException as error:
+                    telemetry_error(
+                        "session.persistence.failed",
+                        error_type="session.persistence_failed",
+                        component="session_manager",
+                    )
+                    if cancellation is not None:
+                        cancellation.add_note(
+                            f"Session persistence also stopped with {type(error).__name__}."
+                        )
+                        raise cancellation  # pylint: disable=raise-missing-from
+                    raise
+
+                if self._session is not current:
+                    if cancellation is not None:
+                        raise cancellation
+                    raise RuntimeError(
+                        "The active session changed while its snapshot was being saved."
+                    )
+                for session_field in fields(Session):
+                    setattr(
+                        current,
+                        session_field.name,
+                        deepcopy(getattr(candidate, session_field.name)),
+                    )
+                telemetry_activity("session.persistence.completed", component="session_manager")
+                if cancellation is not None:
+                    raise cancellation  # pylint: disable=raise-missing-from
+            finally:
+                self._commit_lock.release()
+
+    async def _acquire_commit_lock_async(self) -> None:
+        """Acquire the cross-thread commit lock without blocking the event loop."""
         pending = asyncio.ensure_future(
-            self._async_blocking_runner(
-                self._save_snapshot,
-                self._session_store,
-                self._persistence_lock,
-                candidate,
-            )
+            self._async_blocking_runner(self._commit_lock.acquire)
             if self._async_blocking_runner is not None
-            else run_in_worker_async(
-                self._save_snapshot,
-                self._session_store,
-                self._persistence_lock,
-                candidate,
-            )
+            else run_in_worker_async(self._commit_lock.acquire)
         )
         cancellation = None
         try:
@@ -1698,30 +1757,14 @@ class SessionManager:
         try:
             pending.result()
         except BaseException as error:
-            telemetry_error(
-                "session.persistence.failed",
-                error_type="session.persistence_failed",
-                component="session_manager",
-            )
             if cancellation is not None:
                 cancellation.add_note(
-                    f"Session persistence also stopped with {type(error).__name__}."
+                    f"Session commit lock acquisition also failed with {type(error).__name__}."
                 )
-                raise cancellation
+                raise cancellation  # pylint: disable=raise-missing-from
             raise
-
-        if self._session is not current:
-            if cancellation is not None:
-                raise cancellation
-            raise RuntimeError("The active session changed while its snapshot was being saved.")
-        for session_field in fields(Session):
-            setattr(
-                current,
-                session_field.name,
-                deepcopy(getattr(candidate, session_field.name)),
-            )
-        telemetry_activity("session.persistence.completed", component="session_manager")
         if cancellation is not None:
+            self._commit_lock.release()
             raise cancellation
 
     @staticmethod
@@ -1758,7 +1801,7 @@ class SessionManager:
                 cancellation.add_note(
                     f"The blocking operation also stopped with {type(error).__name__}."
                 )
-                raise cancellation
+                raise cancellation  # pylint: disable=raise-missing-from
             raise
         if cancellation is not None:
             raise cancellation

@@ -576,6 +576,7 @@ class Loop:
 
         Raises:
             RuntimeError: If called from an active event loop.
+            SessionExecutionConflictError: If another owner is executing this session.
             TypeError: If an agent run or recovered run has no completion metrics.
             KeyboardInterrupt: If the configured stop signal interrupts agent execution.
             WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
@@ -589,107 +590,114 @@ class Loop:
                 "await Loop.run_async() instead."
             )
 
-        recovery_pending = self._recover_session()
+        with self._session_manager.execution():
+            recovery_pending = self._recover_session()
         while not self._command_manager.exit_requested:
-            user_input = (
-                self._interaction.prompt(completer=self._completion_manager)
-                if input_source is None
-                else input_source(self._completion_manager)
-            )
-            if user_input is False:
-                break
-            session = self.session
-            admitted_input = (
-                user_input if isinstance(user_input, AdmittedConversationInput) else None
-            )
-            if admitted_input is not None:
-                if admitted_input.session_id != self._session_manager.session.id:
+            with self._session_manager.execution():
+                user_input = (
+                    self._interaction.prompt(completer=self._completion_manager)
+                    if input_source is None
+                    else input_source(self._completion_manager)
+                )
+                if user_input is False:
+                    break
+                session = self.session
+                admitted_input = (
+                    user_input if isinstance(user_input, AdmittedConversationInput) else None
+                )
+                if admitted_input is not None:
+                    if admitted_input.session_id != self._session_manager.session.id:
+                        self._interaction.warning(
+                            "Queued input belongs to a different session and was skipped."
+                        )
+                        continue
+                    user_input = admitted_input.message
+                handled_command = False
+                bypass_commands = isinstance(user_input, SteeringMessage) or (
+                    admitted_input is not None and admitted_input.bypass_commands
+                )
+                if not bypass_commands:
+                    handled_command = self._command_manager.handle_user_command(user_input)
+                if handled_command:
+                    if self.session is not session:
+                        with self._session_manager.execution():
+                            self._model_selection.restore(self.session.model)
+                            recovery_pending = self._recover_session()
+                    continue
+                if recovery_pending:
                     self._interaction.warning(
-                        "Queued input belongs to a different session and was skipped."
+                        "Recover the interrupted run or start a new session before sending a message."
                     )
                     continue
-                user_input = admitted_input.message
-            handled_command = False
-            bypass_commands = isinstance(user_input, SteeringMessage) or (
-                admitted_input is not None and admitted_input.bypass_commands
-            )
-            if not bypass_commands:
-                handled_command = self._command_manager.handle_user_command(user_input)
-            if handled_command:
-                if self.session is not session:
-                    self._model_selection.restore(self.session.model)
-                    recovery_pending = self._recover_session()
-                continue
-            if recovery_pending:
-                self._interaction.warning(
-                    "Recover the interrupted run or start a new session before sending a message."
-                )
-                continue
-            if self._skill_hints_enabled:
-                try:
-                    skill_mentions = tuple(
-                        dict.fromkeys(
-                            mention.value
-                            for mention in parse_mentions(
-                                user_input,
-                                {"$": self._instructions_manager.skill_manager.names},
+                if self._skill_hints_enabled:
+                    try:
+                        skill_mentions = tuple(
+                            dict.fromkeys(
+                                mention.value
+                                for mention in parse_mentions(
+                                    user_input,
+                                    {"$": self._instructions_manager.skill_manager.names},
+                                )
                             )
                         )
-                    )
-                    if not self._instructions_manager.set_skill_catalog_priorities(
-                        skill_mentions, self._agent
-                    ):
-                        self._interaction.warning(
-                            "Referenced skill metadata could not fit in the instruction budget; "
-                            "use activate_skill to load a skill."
+                        if not self._instructions_manager.set_skill_catalog_priorities(
+                            skill_mentions, self._agent
+                        ):
+                            self._interaction.warning(
+                                "Referenced skill metadata could not fit in the instruction budget; "
+                                "use activate_skill to load a skill."
+                            )
+                    except (OSError, UnicodeError, ValueError) as error:
+                        problem = Problem.from_exception(
+                            error,
+                            code="skill_hint.preparation_failed",
+                            title="Could not prepare skill hint",
+                            operation="prepare_skill_hint",
                         )
+                        log_problem(_LOGGER, problem, error)
+                        self._interaction.report(problem)
+                        continue
+                try:
+                    context = self._mention_manager.resolve(user_input)
                 except (OSError, UnicodeError, ValueError) as error:
                     problem = Problem.from_exception(
                         error,
-                        code="skill_hint.preparation_failed",
-                        title="Could not prepare skill hint",
-                        operation="prepare_skill_hint",
+                        code="mention.resolution_failed",
+                        title="Could not resolve mention",
+                        operation="resolve_mention",
                     )
                     log_problem(_LOGGER, problem, error)
                     self._interaction.report(problem)
+                    if self._skill_hints_enabled:
+                        self._clear_skill_catalog_priorities()
                     continue
-            try:
-                context = self._mention_manager.resolve(user_input)
-            except (OSError, UnicodeError, ValueError) as error:
-                problem = Problem.from_exception(
-                    error,
-                    code="mention.resolution_failed",
-                    title="Could not resolve mention",
-                    operation="resolve_mention",
-                )
-                log_problem(_LOGGER, problem, error)
-                self._interaction.report(problem)
-                if self._skill_hints_enabled:
-                    self._clear_skill_catalog_priorities()
-                continue
-            try:
-                with self._session_manager.next_message_span():
-                    for reference in context:
-                        included = reference.included_bytes
-                        size = reference.size_bytes
-                        if included < size:
-                            self._interaction.info(
-                                f"Attached {reference.path}: {included} of {size} bytes"
-                                "; additional content stays local until read."
-                            )
-                        else:
-                            self._interaction.info(f"Attached {reference.path}: {included} bytes.")
-                    telemetry_activity("message.accepted", component="session_manager")
-                    self._session_manager.add_user_message(
-                        user_input,
-                        context=context,
-                        input_id=admitted_input.input_id if admitted_input is not None else None,
-                    )
-                    result = self._agent_runner.run()
-                    self._complete_agent_run(result)
-            finally:
-                if self._skill_hints_enabled:
-                    self._clear_skill_catalog_priorities()
+                try:
+                    with self._session_manager.next_message_span():
+                        for reference in context:
+                            included = reference.included_bytes
+                            size = reference.size_bytes
+                            if included < size:
+                                self._interaction.info(
+                                    f"Attached {reference.path}: {included} of {size} bytes"
+                                    "; additional content stays local until read."
+                                )
+                            else:
+                                self._interaction.info(
+                                    f"Attached {reference.path}: {included} bytes."
+                                )
+                        self._session_manager.add_user_message(
+                            user_input,
+                            context=context,
+                            input_id=admitted_input.input_id
+                            if admitted_input is not None
+                            else None,
+                        )
+                        telemetry_activity("message.accepted", component="session_manager")
+                        result = self._agent_runner.run()
+                        self._complete_agent_run(result)
+                finally:
+                    if self._skill_hints_enabled:
+                        self._clear_skill_catalog_priorities()
 
         self._interaction.conversation_ended()
 
@@ -709,109 +717,119 @@ class Loop:
         Raises:
             KeyboardInterrupt: If the configured stop signal interrupts agent execution.
             ProblemException: If the interaction does not provide asynchronous input.
+            SessionExecutionConflictError: If another owner is executing this session.
             WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
         """
-        recovery_pending = await self._recover_session_async()
+        with self._session_manager.execution():
+            recovery_pending = await self._recover_session_async()
         while not self._command_manager.exit_requested:
-            if input_source is not None:
-                user_input = await input_source(self._completion_manager)
-            else:
-                interaction = require_async_interaction(self._interaction, "conversation input")
-                user_input = await interaction.prompt_async(completer=self._completion_manager)
-            if user_input is False:
-                break
-            session = self.session
-            admitted_input = (
-                user_input if isinstance(user_input, AdmittedConversationInput) else None
-            )
-            if admitted_input is not None:
-                if admitted_input.session_id != self._session_manager.session.id:
+            with self._session_manager.execution():
+                if input_source is not None:
+                    user_input = await input_source(self._completion_manager)
+                else:
+                    interaction = require_async_interaction(self._interaction, "conversation input")
+                    user_input = await interaction.prompt_async(completer=self._completion_manager)
+                if user_input is False:
+                    break
+                session = self.session
+                admitted_input = (
+                    user_input if isinstance(user_input, AdmittedConversationInput) else None
+                )
+                if admitted_input is not None:
+                    if admitted_input.session_id != self._session_manager.session.id:
+                        self._interaction.warning(
+                            "Queued input belongs to a different session and was skipped."
+                        )
+                        continue
+                    user_input = admitted_input.message
+                handled_command = False
+                bypass_commands = isinstance(user_input, SteeringMessage) or (
+                    admitted_input is not None and admitted_input.bypass_commands
+                )
+                if not bypass_commands:
+                    handled_command = await self._command_manager.handle_user_command_async(
+                        user_input
+                    )
+                if handled_command:
+                    if self.session is not session:
+                        with self._session_manager.execution():
+                            await self._model_selection.restore_async(self.session.model)
+                            recovery_pending = await self._recover_session_async()
+                    continue
+                if recovery_pending:
                     self._interaction.warning(
-                        "Queued input belongs to a different session and was skipped."
+                        "Recover the interrupted run or start a new session before sending a message."
                     )
                     continue
-                user_input = admitted_input.message
-            handled_command = False
-            bypass_commands = isinstance(user_input, SteeringMessage) or (
-                admitted_input is not None and admitted_input.bypass_commands
-            )
-            if not bypass_commands:
-                handled_command = await self._command_manager.handle_user_command_async(user_input)
-            if handled_command:
-                if self.session is not session:
-                    await self._model_selection.restore_async(self.session.model)
-                    recovery_pending = await self._recover_session_async()
-                continue
-            if recovery_pending:
-                self._interaction.warning(
-                    "Recover the interrupted run or start a new session before sending a message."
-                )
-                continue
-            if self._skill_hints_enabled:
-                try:
-                    skill_mentions = tuple(
-                        dict.fromkeys(
-                            mention.value
-                            for mention in parse_mentions(
-                                user_input,
-                                {"$": self._instructions_manager.skill_manager.names},
+                if self._skill_hints_enabled:
+                    try:
+                        skill_mentions = tuple(
+                            dict.fromkeys(
+                                mention.value
+                                for mention in parse_mentions(
+                                    user_input,
+                                    {"$": self._instructions_manager.skill_manager.names},
+                                )
                             )
                         )
-                    )
-                    if not self._instructions_manager.set_skill_catalog_priorities(
-                        skill_mentions, self._agent
-                    ):
-                        self._interaction.warning(
-                            "Referenced skill metadata could not fit in the instruction budget; "
-                            "use activate_skill to load a skill."
+                        if not self._instructions_manager.set_skill_catalog_priorities(
+                            skill_mentions, self._agent
+                        ):
+                            self._interaction.warning(
+                                "Referenced skill metadata could not fit in the instruction budget; "
+                                "use activate_skill to load a skill."
+                            )
+                    except (OSError, UnicodeError, ValueError) as error:
+                        problem = Problem.from_exception(
+                            error,
+                            code="skill_hint.preparation_failed",
+                            title="Could not prepare skill hint",
+                            operation="prepare_skill_hint",
                         )
+                        log_problem(_LOGGER, problem, error)
+                        self._interaction.report(problem)
+                        continue
+                try:
+                    context = await self._mention_manager.resolve_async(user_input)
                 except (OSError, UnicodeError, ValueError) as error:
                     problem = Problem.from_exception(
                         error,
-                        code="skill_hint.preparation_failed",
-                        title="Could not prepare skill hint",
-                        operation="prepare_skill_hint",
+                        code="mention.resolution_failed",
+                        title="Could not resolve mention",
+                        operation="resolve_mention",
                     )
                     log_problem(_LOGGER, problem, error)
                     self._interaction.report(problem)
+                    if self._skill_hints_enabled:
+                        self._clear_skill_catalog_priorities()
                     continue
-            try:
-                context = await self._mention_manager.resolve_async(user_input)
-            except (OSError, UnicodeError, ValueError) as error:
-                problem = Problem.from_exception(
-                    error,
-                    code="mention.resolution_failed",
-                    title="Could not resolve mention",
-                    operation="resolve_mention",
-                )
-                log_problem(_LOGGER, problem, error)
-                self._interaction.report(problem)
-                if self._skill_hints_enabled:
-                    self._clear_skill_catalog_priorities()
-                continue
-            try:
-                with self._session_manager.next_message_span():
-                    for reference in context:
-                        included = reference.included_bytes
-                        size = reference.size_bytes
-                        if included < size:
-                            self._interaction.info(
-                                f"Attached {reference.path}: {included} of {size} bytes"
-                                "; additional content stays local until read."
-                            )
-                        else:
-                            self._interaction.info(f"Attached {reference.path}: {included} bytes.")
-                    await self._session_manager.add_user_message_async(
-                        user_input,
-                        context=context,
-                        input_id=admitted_input.input_id if admitted_input is not None else None,
-                    )
-                    telemetry_activity("message.accepted", component="session_manager")
-                    result = await self._agent_runner.run_async()
-                    await self._complete_agent_run_async(result)
-            finally:
-                if self._skill_hints_enabled:
-                    self._clear_skill_catalog_priorities()
+                try:
+                    with self._session_manager.next_message_span():
+                        for reference in context:
+                            included = reference.included_bytes
+                            size = reference.size_bytes
+                            if included < size:
+                                self._interaction.info(
+                                    f"Attached {reference.path}: {included} of {size} bytes"
+                                    "; additional content stays local until read."
+                                )
+                            else:
+                                self._interaction.info(
+                                    f"Attached {reference.path}: {included} bytes."
+                                )
+                        await self._session_manager.add_user_message_async(
+                            user_input,
+                            context=context,
+                            input_id=admitted_input.input_id
+                            if admitted_input is not None
+                            else None,
+                        )
+                        telemetry_activity("message.accepted", component="session_manager")
+                        result = await self._agent_runner.run_async()
+                        await self._complete_agent_run_async(result)
+                finally:
+                    if self._skill_hints_enabled:
+                        self._clear_skill_catalog_priorities()
 
         self._interaction.conversation_ended()
 

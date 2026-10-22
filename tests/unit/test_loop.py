@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from threading import Event
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from loop import (
     InstructionsManager,
     Interaction,
     Loop,
+    MemorySessionStore,
     MentionManager,
     Message,
     ModelInfo,
@@ -42,6 +44,7 @@ from loop import (
     RuntimeEnvironment,
     Session,
     SessionController,
+    SessionExecutionConflictError,
     SessionManager,
     ShutdownRequested,
     Skill,
@@ -142,6 +145,78 @@ def test_sync_loop_run_rejects_an_active_event_loop(tmp_path):
             loop.run()
 
     asyncio.run(scenario())
+
+
+def test_sync_loop_rejects_another_session_owner_before_accepting_input(tmp_path):
+    """A competing thread cannot persist input before the session lease rejects it."""
+    session = Session(id="shared-session", workspace_id="shared-workspace")
+    owner = SessionManager(session=session)
+    sessions = SessionManager(session=Session(id=session.id, workspace_id=session.workspace_id))
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=output_interaction(),
+        mention_manager=MentionManager(),
+        session_manager=sessions,
+        working_directory=tmp_path,
+    )
+    acquired = Event()
+    release = Event()
+    input_calls = []
+
+    def read_input(_completer):
+        """Record whether the conflicting run consumed its input source."""
+        input_calls.append(True)
+        return "must not persist"
+
+    def hold_session():
+        """Retain the shared session lease until the competing call is checked."""
+        with owner.execution():
+            acquired.set()
+            release.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(hold_session)
+        assert acquired.wait(timeout=5)
+        try:
+            with pytest.raises(SessionExecutionConflictError):
+                loop.run(input_source=read_input)
+        finally:
+            release.set()
+        pending.result(timeout=5)
+
+    assert loop.messages == []
+    assert input_calls == []
+
+
+def test_async_loop_rejects_a_child_task_before_accepting_input(tmp_path):
+    """A child task cannot persist input while its parent owns the same session."""
+    sessions = SessionManager(session=Session(id="shared-session", workspace_id="shared-workspace"))
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=output_interaction(),
+        mention_manager=MentionManager(),
+        session_manager=sessions,
+        working_directory=tmp_path,
+    )
+
+    async def input_source(_completer):
+        """Record whether the conflicting child consumed its input source."""
+        input_calls.append(True)
+        return "must not persist"
+
+    input_calls = []
+
+    async def scenario():
+        """Attempt a conversation from a child task under the parent lease."""
+        with sessions.execution():
+            task = asyncio.create_task(loop.run_async(input_source=input_source))
+            with pytest.raises(SessionExecutionConflictError):
+                await task
+
+    asyncio.run(scenario())
+
+    assert loop.messages == []
+    assert input_calls == []
 
 
 def test_runtime_command_providers_keep_contextual_completion_in_the_active_loop(tmp_path):
@@ -2058,6 +2133,34 @@ def test_loop_correlates_first_message_and_run_with_its_session_identifier(tmp_p
     assert {record.session_id for record in session_records} == {loop.session.id}
     assert message.message_sequence == 0
     assert message.trace_id is not None
+
+
+def test_loop_does_not_mark_a_message_accepted_before_sync_persistence(tmp_path):
+    """A failed durable write cannot emit the message-accepted activity."""
+    interaction = output_interaction()
+    interaction.prompt.return_value = "hello"
+    store = Mock(spec=MemorySessionStore)
+    store.save.side_effect = OSError("store unavailable")
+    sessions = SessionManager(interaction=interaction, session_store=store)
+    adapter = MemoryTelemetryAdapter()
+    telemetry = Telemetry(adapter, flush_seconds=0.01)
+    set_telemetry(telemetry)
+    try:
+        loop = Loop.create_default(
+            backend=loop_backend(),
+            interaction=interaction,
+            session_manager=sessions,
+            working_directory=tmp_path,
+        )
+        with pytest.raises(OSError, match="store unavailable"):
+            loop.run()
+        assert telemetry.close(1)
+    finally:
+        set_telemetry(None)
+
+    assert loop.messages == []
+    assert store.save.call_count == 1
+    assert not any(record.event_name == "message.accepted" for record in adapter.records)
 
 
 def test_run_does_not_generate_a_name_for_an_already_named_session(tmp_path):

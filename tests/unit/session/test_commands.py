@@ -11,6 +11,7 @@ from prompt_toolkit.document import Document
 
 from loop import (
     CommandArgumentError,
+    CommandCapability,
     CommandCompletionAdapter,
     CommandContext,
     CommandManager,
@@ -88,6 +89,36 @@ def test_sessions_namespace_matches_shortcuts_and_renames_stored_sessions():
     assert "session" in commands
     assert "sessions" in commands
     assert "export" in commands
+
+
+def test_active_run_rejects_commands_that_replace_or_rename_its_session():
+    """Active runs keep session replacement and active-session rename at a safe boundary."""
+    interaction = Mock(spec=ConsoleInteraction)
+    store = MemorySessionStore()
+    active = Session(id="active-session", name="Active", name_source="user")
+    store.save(active)
+    other = Session(id="other-session", name="Other", name_source="user")
+    other_id = store.save(other)
+    sessions = SessionManager(session=active, session_store=store)
+    manager = CommandManager(interaction=interaction)
+    manager.register_provider(SessionCommands(sessions, Mock()))
+    manager.set_capability_provider(lambda: frozenset({CommandCapability.RUN_ACTIVE}))
+
+    manager.call("new")
+    manager.call("rename", '"Changed name"')
+    manager.call("resume", other_id)
+    manager.call("sessions", "new")
+    manager.call("sessions", f"resume {other_id}")
+    manager.call("session", 'rename "Changed name"')
+    manager.call("sessions", f'rename {active.id} "Changed name"')
+
+    assert sessions.session is active
+    assert sessions.session.name == "Active"
+    assert store.load(active.id).name == "Active"
+    assert store.load(other_id).name == "Other"
+    assert {"session", "sessions", "new", "rename", "resume"}.isdisjoint(
+        command.name for command in manager.active_commands
+    )
 
 
 def test_sessions_export_completes_persisted_ids_after_the_export_action():

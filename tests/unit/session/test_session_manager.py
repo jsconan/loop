@@ -870,6 +870,184 @@ def test_async_session_commit_uses_a_bounded_worker_and_detached_session():
     assert store.load(active.id).messages == active.messages
 
 
+def test_concurrent_async_session_commits_serialize_candidate_creation():
+    """Sibling async commits publish both updates in order instead of racing revisions."""
+    store = MemorySessionStore()
+    first_started = asyncio.Event()
+    second_requested = asyncio.Event()
+    release_first = asyncio.Event()
+    save_count = 0
+
+    async def run_blocking_async(function, *args):
+        """Hold the first save while a second owner requests a commit."""
+        nonlocal save_count
+        if getattr(function, "__name__", "") == "acquire":
+            return function(*args)
+        save_count += 1
+        if save_count == 1:
+            first_started.set()
+            await release_first.wait()
+        return function(*args)
+
+    manager = SessionManager(
+        session_store=store,
+        async_blocking_runner=run_blocking_async,
+    )
+
+    async def commit_second():
+        """Request the sibling update while the first snapshot is saving."""
+        second_requested.set()
+        await manager.add_message_async(Message(role="assistant", content="second"))
+
+    async def scenario():
+        """Run overlapping commits with deterministic store admission."""
+        first = asyncio.create_task(
+            manager.add_message_async(Message(role="assistant", content="first"))
+        )
+        await first_started.wait()
+        second = asyncio.create_task(commit_second())
+        await second_requested.wait()
+        assert save_count == 1
+        release_first.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(scenario())
+
+    assert [message.content for message in manager.messages] == ["first", "second"]
+    assert store.load(manager.session.id).messages == manager.messages
+    assert save_count == 2
+
+
+def test_sync_and_async_session_commits_serialize_without_blocking_the_event_loop():
+    """Cross-mode commits preserve both updates while slow storage leaves the loop responsive."""
+    store = MemorySessionStore()
+    save_started = Event()
+    release_save = Event()
+    original_save = store.save
+    executor = ThreadPoolExecutor(max_workers=1)
+    manager = SessionManager(session_store=store)
+
+    def slow_save(session):
+        """Hold the first async snapshot while the synchronous writer waits."""
+        if session.messages and session.messages[0].content == "async":
+            save_started.set()
+            if not release_save.wait(timeout=5):
+                raise TimeoutError("The test did not release the async session write.")
+        return original_save(session)
+
+    sync_started = Event()
+
+    def commit_sync():
+        """Submit a synchronous mutation while async persistence owns the transaction."""
+        sync_started.set()
+        manager.add_message(Message(role="assistant", content="sync"))
+
+    async def scenario():
+        """Run both writers and one event-loop control callback deterministically."""
+        async_commit = asyncio.create_task(
+            manager.add_message_async(Message(role="assistant", content="async"))
+        )
+        assert await asyncio.to_thread(save_started.wait, 5)
+        sync_commit = asyncio.get_running_loop().run_in_executor(executor, commit_sync)
+        assert await asyncio.to_thread(sync_started.wait, 5)
+        control_processed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(control_processed.set)
+        await asyncio.wait_for(control_processed.wait(), timeout=1)
+        assert [message.content for message in manager.messages] == []
+        assert not sync_commit.done()
+        release_save.set()
+        await async_commit
+        await sync_commit
+
+    try:
+        with patch.object(store, "save", side_effect=slow_save):
+            asyncio.run(scenario())
+    finally:
+        release_save.set()
+        executor.shutdown(wait=True)
+
+    expected = [
+        Message(role="assistant", content="async"),
+        Message(role="assistant", content="sync"),
+    ]
+    assert manager.messages == expected
+    assert store.load(manager.session.id).messages == expected
+
+
+def test_cancelled_async_commit_releases_a_lock_acquired_after_cancellation():
+    """A cancelled lock waiter settles and releases the lock before returning."""
+    acquisition_started = asyncio.Event()
+    release_acquisition = asyncio.Event()
+
+    async def delayed_worker(function, *args):
+        """Delay lock acquisition until the owning task has been cancelled."""
+        if getattr(function, "__name__", "") == "acquire" and not release_acquisition.is_set():
+            acquisition_started.set()
+            await release_acquisition.wait()
+        return function(*args)
+
+    manager = SessionManager(async_blocking_runner=delayed_worker)
+
+    async def scenario():
+        """Cancel a queued commit, then prove the next owner can persist."""
+        pending = asyncio.create_task(
+            manager.add_message_async(Message(role="assistant", content="cancelled"))
+        )
+        await acquisition_started.wait()
+        pending.cancel()
+        asyncio.get_running_loop().call_soon(pending.cancel)
+        done, _ = await asyncio.wait({pending}, timeout=0)
+        assert not done
+        release_acquisition.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await manager.add_message_async(Message(role="assistant", content="accepted"))
+
+    asyncio.run(scenario())
+
+    assert [message.content for message in manager.messages] == ["accepted"]
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_async_commit_lock_worker_failure_preserves_cancellation(cancelled):
+    """A failed lock worker propagates its error or the already-requested cancellation."""
+    acquisition_started = asyncio.Event()
+    release_acquisition = asyncio.Event()
+
+    async def failing_worker(function, *args):
+        """Fail lock admission after an optional cancellation request."""
+        if getattr(function, "__name__", "") == "acquire":
+            acquisition_started.set()
+            if cancelled:
+                await release_acquisition.wait()
+            raise RuntimeError("lock worker unavailable")
+        return function(*args)
+
+    manager = SessionManager(async_blocking_runner=failing_worker)
+
+    async def scenario():
+        """Observe lock-worker failure through the public async mutation."""
+        pending = asyncio.create_task(
+            manager.add_message_async(Message(role="assistant", content="not committed"))
+        )
+        await acquisition_started.wait()
+        if cancelled:
+            pending.cancel()
+            done, _ = await asyncio.wait({pending}, timeout=0)
+            assert not done
+            release_acquisition.set()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await pending
+            assert any("RuntimeError" in note for note in captured.value.__notes__)
+        else:
+            with pytest.raises(RuntimeError, match="lock worker unavailable"):
+                await pending
+
+    asyncio.run(scenario())
+
+    assert manager.messages == []
+
+
 def test_slow_async_session_store_leaves_the_event_loop_available_for_control():
     """A slow synchronous store write does not block other owner-loop work."""
 
@@ -1294,6 +1472,8 @@ def test_async_session_commit_finishes_persistence_before_propagating_cancellati
 
     async def run_blocking_async(function, *args):
         """Hold worker admission until the test cancels and releases the operation."""
+        if getattr(function, "__name__", "") == "acquire":
+            return function(*args)
         started.set()
         await release.wait()
         return await asyncio.get_running_loop().run_in_executor(executor, function, *args)
@@ -1336,6 +1516,8 @@ def test_async_session_commit_preserves_cancellation_and_reports_a_save_failure(
 
     async def run_blocking_async(function, *args):
         """Hold the detached persistence operation until cancellation is requested."""
+        if getattr(function, "__name__", "") == "acquire":
+            return function(*args)
         started.set()
         await release.wait()
         return function(*args)
@@ -1372,6 +1554,8 @@ def test_async_session_commit_does_not_publish_over_a_replacement_session(cancel
 
     async def run_blocking_async(function, *args):
         """Delay storage until the active session changes."""
+        if getattr(function, "__name__", "") == "acquire":
+            return function(*args)
         started.set()
         await release.wait()
         return function(*args)
