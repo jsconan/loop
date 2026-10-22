@@ -27,7 +27,9 @@ def test_default_backend_lifecycle_cleanup_is_synchronous_and_repeatable():
     backend = OpenAIBackend()
 
     assert backend.async_close_required is False
+    assert backend.async_close_loop is None
     assert Backend.async_close_required.fget(backend) is False
+    assert Backend.async_close_loop.fget(backend) is None
     Backend.close(backend)
     asyncio.run(Backend.close_async(backend))
 

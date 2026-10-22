@@ -494,6 +494,42 @@ def test_async_close_uses_async_resource_cleanup_and_is_idempotent():
     assert resource.async_closes == 1
 
 
+def test_async_close_rejects_a_different_resource_loop_before_cleanup(dependencies):
+    """Wrong-loop shutdown leaves every resource available for its owner to close."""
+
+    class Resource:
+        """Represent an async resource that reports its owning event loop."""
+
+        async_close_loop: asyncio.AbstractEventLoop
+        async_closes: int
+
+        def __init__(self, owner_loop):
+            self.async_close_loop = owner_loop
+            self.async_closes = 0
+
+        def close(self):
+            """Provide the synchronous cleanup handle registered by the runtime."""
+
+        async def close_async(self):
+            """Count an async close on the resource owner loop."""
+            self.async_closes += 1
+
+    owner_loop = asyncio.new_event_loop()
+    resource = Resource(owner_loop)
+    runtime = ApplicationRuntime(Mock(), Mock(), 1.0, cleanup_callbacks=[resource.close])
+
+    try:
+        with pytest.raises(RuntimeError, match="owning loop"):
+            asyncio.run(runtime.close_async())
+
+        assert resource.async_closes == 0
+
+        owner_loop.run_until_complete(runtime.close_async())
+        assert resource.async_closes == 1
+    finally:
+        owner_loop.close()
+
+
 def test_async_close_settles_cleanup_after_cancellation():
     """Cancellation cannot abandon a loop-affine resource close."""
 

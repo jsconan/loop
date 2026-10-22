@@ -249,8 +249,12 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
         assert client.base_url == "https://example.test/v1"
         assert client.get_models() == []
         assert client.get_models() == []
-        assert asyncio.run(client.get_models_async()) == []
-        assert asyncio.run(client.get_models_async()) == []
+
+        async def list_models_twice():
+            """List models more than once on the same owning event loop."""
+            return await client.get_models_async(), await client.get_models_async()
+
+        assert asyncio.run(list_models_twice()) == ([], [])
 
     openai.assert_called_once_with(
         base_url="https://example.test/v1", api_key="secret", max_retries=2, timeout=600.0
@@ -277,6 +281,7 @@ def test_backend_closes_both_lazy_sdk_clients_on_the_async_owner():
         with patch("loop.backend.openai.AsyncOpenAI", return_value=async_sdk):
             assert await backend.get_models_async() == []
             assert backend.async_close_required is True
+            assert backend.async_close_loop is asyncio.get_running_loop()
             with pytest.raises(RuntimeError, match="close_async"):
                 backend.close()
             await backend.close_async()
@@ -311,6 +316,31 @@ def test_backend_async_close_without_initialized_clients_is_a_noop():
     asyncio.run(backend.close_async())
 
     assert backend.async_close_required is False
+
+
+def test_backend_async_client_must_be_used_and_closed_on_its_owner_loop():
+    """An async SDK client cannot be reused or closed from another event loop."""
+    async_sdk = Mock()
+    async_sdk.close = AsyncMock()
+    async_sdk.models.list.return_value = AsyncModelPage()
+    backend = OpenAIBackend()
+    loop = asyncio.new_event_loop()
+
+    try:
+        with patch("loop.backend.openai.AsyncOpenAI", return_value=async_sdk):
+            assert loop.run_until_complete(backend.get_models_async()) == []
+            with pytest.raises(RuntimeError, match="owning event loop"):
+                asyncio.run(backend.get_models_async())
+            with pytest.raises(RuntimeError, match="owning event loop"):
+                asyncio.run(backend.close_async())
+            async_sdk.close.assert_not_awaited()
+            loop.run_until_complete(backend.close_async())
+    finally:
+        loop.close()
+
+    async_sdk.close.assert_awaited_once_with()
+    assert backend.async_close_required is False
+    assert backend.async_close_loop is None
 
 
 def test_backend_async_close_reports_sync_failure_after_async_client_succeeds():
@@ -1165,8 +1195,10 @@ def test_async_declared_model_hyperparameters_avoid_an_unsupported_initial_reque
     backend = OpenAIBackend(default_model="model")
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
-        events = asyncio.run(
-            collect_events(
+
+        async def get_responses():
+            """Request twice on one loop so the persistent client keeps its owner."""
+            first_events = await collect_events(
                 backend.get_response_async(
                     "hello",
                     stream=True,
@@ -1175,9 +1207,7 @@ def test_async_declared_model_hyperparameters_avoid_an_unsupported_initial_reque
                     ),
                 )
             )
-        )
-        asyncio.run(
-            collect_events(
+            await collect_events(
                 backend.get_response_async(
                     "again",
                     stream=True,
@@ -1186,7 +1216,9 @@ def test_async_declared_model_hyperparameters_avoid_an_unsupported_initial_reque
                     ),
                 )
             )
-        )
+            return first_events
+
+        events = asyncio.run(get_responses())
 
     assert isinstance(events[-1], ResponseCompleted)
     request = sdk.responses.create.await_args.kwargs

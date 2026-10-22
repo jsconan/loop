@@ -1,5 +1,6 @@
 """Define the backend contract consumed by conversation loops."""
 
+import asyncio
 import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable
@@ -75,6 +76,16 @@ class Backend(ABC):
             bool: Whether the active resources must be closed on their owning event loop.
         """
         return False
+
+    @property
+    def async_close_loop(self) -> asyncio.AbstractEventLoop | None:
+        """Return the event loop required to release async resources, if any.
+
+        Returns:
+            asyncio.AbstractEventLoop | None: The owning loop, or ``None`` when no loop affinity
+                applies.
+        """
+        return None
 
     def close(self) -> None:
         """Release resources owned by the synchronous backend path."""

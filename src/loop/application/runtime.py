@@ -379,7 +379,8 @@ class ApplicationRuntime:
         """Record shutdown and deterministically release every owned resource.
 
         Raises:
-            RuntimeError: If conversation execution has not yet settled.
+            RuntimeError: If conversation execution has not settled or async resources need
+                ``close_async()``.
             TimeoutError: If telemetry cannot flush and shut down within its configured timeout.
             BaseException: The first resource-specific cleanup failure after all cleanup is tried.
         """
@@ -410,7 +411,8 @@ class ApplicationRuntime:
         """Release runtime resources after async work has settled and before its loop closes.
 
         Raises:
-            RuntimeError: If conversation execution has not yet settled.
+            RuntimeError: If conversation execution has not settled or an async resource belongs
+                to another event loop.
             TimeoutError: If telemetry cannot flush within its configured timeout.
             BaseException: The first cleanup failure after every owned resource is tried.
             asyncio.CancelledError: After asynchronous resource cleanup settles.
@@ -421,6 +423,12 @@ class ApplicationRuntime:
             )
         if self._closed:
             return
+        loop = asyncio.get_running_loop()
+        for callback in self._cleanup_callbacks:
+            resource = callback.__self__ if inspect.ismethod(callback) else None
+            owner_loop = getattr(resource, "async_close_loop", None)
+            if owner_loop is not None and owner_loop is not loop:
+                raise RuntimeError("Await runtime cleanup on each async resource's owning loop.")
         self._closed = True
         callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
         try:

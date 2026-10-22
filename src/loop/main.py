@@ -39,7 +39,14 @@ def run_application() -> None:  # pylint: disable=too-many-branches
 
 
 async def run_application_async() -> None:  # pylint: disable=too-many-branches
-    """Compose, run, and release each workspace runtime before its event loop closes."""
+    """Compose, run, and release each workspace runtime before its event loop closes.
+
+    Raises:
+        RuntimeError: If conversation execution has not settled before runtime cleanup.
+        TimeoutError: If telemetry cannot flush within its configured shutdown timeout.
+        BaseException: The first owned-resource cleanup failure after every resource is tried.
+        asyncio.CancelledError: After owned resource cleanup settles following cancellation.
+    """
     interaction = None
     runtime = None
     try:

@@ -1,5 +1,6 @@
 """Adapt OpenAI-compatible APIs to conversation response events."""
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from copy import deepcopy
@@ -117,6 +118,9 @@ _ReasoningChannel = Literal["content", "summary"]
 class OpenAIBackend(Backend):
     """Adapt an OpenAI-compatible API to conversation models and events.
 
+    Keep each asynchronous client on the event loop that first initializes it, including for
+    later requests and cleanup. Synchronous operations use a separate client.
+
     Args:
         default_model (str | None): Model identifier used when a request does not specify one.
         base_url (str | None): Base URL of the OpenAI-compatible backend.
@@ -156,6 +160,7 @@ class OpenAIBackend(Backend):
 
     _client: OpenAI | None
     _async_client: AsyncOpenAI | None
+    _async_client_loop: asyncio.AbstractEventLoop | None
     _configured_context_window: int | None
     _context_windows: dict[str, int | None]
     _file_input_mode: FileInputMode
@@ -216,6 +221,7 @@ class OpenAIBackend(Backend):
         )
         self._client = None
         self._async_client = None
+        self._async_client_loop = None
         self._configured_context_window = context_window
         self._file_input_mode = file_input_mode or ("text" if base_url is not None else "native")
         self._context_windows = {}
@@ -351,6 +357,7 @@ class OpenAIBackend(Backend):
 
     def _get_async_client(self) -> AsyncOpenAI:
         """Return the lazily initialized asynchronous OpenAI client."""
+        loop = asyncio.get_running_loop()
         if self._async_client is None:
             self._async_client = AsyncOpenAI(
                 base_url=self._base_url,
@@ -358,6 +365,9 @@ class OpenAIBackend(Backend):
                 max_retries=self._max_retries,
                 timeout=self._request_timeout_seconds,
             )
+            self._async_client_loop = loop
+        elif self._async_client_loop is not loop:
+            raise RuntimeError("OpenAIBackend async client must be used on its owning event loop.")
         return self._async_client
 
     @property
@@ -368,6 +378,15 @@ class OpenAIBackend(Backend):
             bool: Whether asynchronous cleanup is required.
         """
         return self._async_client is not None
+
+    @property
+    def async_close_loop(self) -> asyncio.AbstractEventLoop | None:
+        """Return the loop that owns the async SDK client, if one has been initialized.
+
+        Returns:
+            asyncio.AbstractEventLoop | None: The client owner loop, or ``None`` before async use.
+        """
+        return self._async_client_loop
 
     def close(self) -> None:
         """Close the synchronous SDK client.
@@ -386,16 +405,22 @@ class OpenAIBackend(Backend):
         """Close both SDK clients, awaiting asynchronous cleanup on the owner loop.
 
         Raises:
+            RuntimeError: If the asynchronous client is closed from a different event loop.
             Exception: If either SDK client fails to close.
         """
         first_error = None
         if self._async_client is not None:
+            if self._async_client_loop is not asyncio.get_running_loop():
+                raise RuntimeError(
+                    "OpenAIBackend async client must be closed on its owning event loop."
+                )
             try:
                 await self._async_client.close()
             except BaseException as error:  # noqa: BLE001 - close the other client before raising
                 first_error = error
             else:
                 self._async_client = None
+                self._async_client_loop = None
         if self._client is not None:
             try:
                 self._client.close()
