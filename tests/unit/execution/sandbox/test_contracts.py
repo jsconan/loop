@@ -1,10 +1,8 @@
 """Verify exact sandbox request identities and typed outcome boundaries."""
 
-import ast
 import json
 import tempfile
 import time
-from importlib.resources import files
 from pathlib import Path
 
 import pytest
@@ -740,20 +738,6 @@ def test_sandbox_results_distinguish_exit_status_from_boundary_failure():
         CommandProcessResult(SandboxOutcome.DENIED, exit_code=1)
     with pytest.raises(ValueError):
         CommandProcessResult(SandboxOutcome.COMPLETED)
-
-
-def test_sandbox_contract_has_no_host_execution_dependency():
-    """Sandbox contract imports no host launcher or application retry authority."""
-    source = files("loop.execution.sandbox").joinpath("contracts.py")
-    tree = ast.parse(source.read_text())
-    names = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    }
-    names.update(node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom))
-    assert not any("host" in name or "application" in name for name in names)
 
 
 @pytest.mark.parametrize("outcome", list(SandboxOutcome))

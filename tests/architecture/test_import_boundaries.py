@@ -1,15 +1,13 @@
-"""Verify app imports keep native sandbox implementations platform isolated."""
+"""Check repository-wide import and dependency boundaries."""
 
+import ast
 import os
 import subprocess
 import sys
+from importlib.resources import files
 from pathlib import Path
 
-import pytest
-
 import loop
-
-pytestmark = pytest.mark.integration
 
 
 def test_app_import_avoids_other_platform_sandbox_modules(tmp_path):
@@ -38,9 +36,7 @@ assert not any(
 
 
 def test_retained_contract_import_avoids_filesystem_ignore_dependency(tmp_path):
-    """Retained contracts use VirtualPath in its owning module without application dependencies."""
-    from importlib.resources import files
-
+    """Retained contracts import from their owner without application dependencies."""
     modules = (
         "constants.py",
         "utils/virtual_path.py",
@@ -74,3 +70,17 @@ assert 'pathspec' not in sys.modules
         check=True,
         capture_output=True,
     )
+
+
+def test_sandbox_contract_has_no_host_execution_dependency():
+    """Sandbox contract imports no host launcher or application retry authority."""
+    source = files("loop.execution.sandbox").joinpath("contracts.py")
+    tree = ast.parse(source.read_text())
+    names = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    names.update(node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom))
+    assert not any("host" in name or "application" in name for name in names)

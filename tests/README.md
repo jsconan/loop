@@ -4,10 +4,9 @@ The test suites separate portable module behavior from operating-system and depe
 
 ## Organization
 
-- `architecture/` holds repository-wide static contracts that do not belong to an individual source module's unit suite. `make test` runs these checks with the unit suite.
+- `architecture/` holds repository-wide static naming and import-boundary contracts that do not belong to an individual source module's unit suite. `make test` runs these checks with the unit suite.
 - `unit/` mirrors `src/loop/` by owning module. It is the default pytest target and runs on every platform without platform skips. Platform adapters use controlled platform, process, account, clock and diagnostic doubles.
 - `integration/` exercises native boundaries in disposable workspaces. Shared process and search checks live under `execution/` and `utils/`; platform-specific checks live under `macos/` and `linux/`.
-- The fresh-process platform import check verifies that loading the app does not import the other operating system's sandbox implementation.
 - Public dispatch through permissions and execution is additionally marked `e2e`.
 - Agent runner cases simulate saves during model generation and exercise stale-edit recovery, partial reads, same-batch rereads, and isolated session observations. Tooling cases verify snapshot versions, visible byte coverage, trusted read receipts, immutable cached continuations, deletion and recreation, and interrupted batch recovery.
 - Response collection cases validate terminal metadata and malformed streams independently of a UI. Presentation cases cover channel ordering and streamed-text deduplication. Session cases apply the same checks to synchronous and asynchronous streams, including cancellation and output finalization. Console cases cover synchronous and asynchronous choice validation and input. `integration/interaction/` exercises native prompt-toolkit input with owned pipes, captured output, and cancellation followed by prompt reuse.
