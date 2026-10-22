@@ -43,7 +43,7 @@ from ..permissions import (
 )
 from ..utils import (
     VirtualPath,
-    await_value,
+    await_value_async,
     callable_name,
     close_awaitable,
     has_running_event_loop,
@@ -113,13 +113,13 @@ class ToolExecutionPortal:
                 )
             return _detach_owner_value(result, self)
 
-        async def invoke() -> Any:
+        async def invoke_async() -> Any:
             result = callback(*args, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
             return _detach_owner_value(result, self)
 
-        return asyncio.run_coroutine_threadsafe(invoke(), self._loop).result()
+        return asyncio.run_coroutine_threadsafe(invoke_async(), self._loop).result()
 
     def call_method(
         self,
@@ -331,7 +331,7 @@ class ToolRegistry:
             )
         )
 
-    def _invoke_sync(self, tool: Tool, function: Callable[..., Any], *args: Any) -> Any:
+    def _invoke(self, tool: Tool, function: Callable[..., Any], *args: Any) -> Any:
         """Invoke an extension callback directly or through the owned blocking runner."""
         runner = self._sync_runner() if is_async_callable(function) else None
         if is_async_callable(function) and runner is None:
@@ -355,7 +355,7 @@ class ToolRegistry:
                         operation=tool.name,
                     )
                 )
-            result = runner.run(await_value(result))
+            result = runner.run(await_value_async(result))
         return result
 
     async def _invoke_async(
@@ -369,7 +369,7 @@ class ToolRegistry:
         if is_async_callable(function):
             result = function(*args)
         else:
-            result = await self._run_worker(function, *args, operation=operation)
+            result = await self._run_worker_async(function, *args, operation=operation)
         if inspect.isawaitable(result):
             if (
                 isinstance(result, asyncio.Future)
@@ -388,7 +388,7 @@ class ToolRegistry:
             result = await result
         return result
 
-    async def _run_worker(
+    async def _run_worker_async(
         self,
         function: Callable[..., Any],
         *args: Any,
@@ -963,8 +963,8 @@ class ToolRegistry:
             active_context = worker_context
         try:
 
-            async def dispatch_sync(invoke: Callable[[], Any]) -> Any:
-                return await self._run_worker(
+            async def dispatch_sync_async(invoke: Callable[[], Any]) -> Any:
+                return await self._run_worker_async(
                     invoke,
                     cancellation_event=active_context.cancellation_event,
                     operation=tool.name or "tool",
@@ -973,7 +973,7 @@ class ToolRegistry:
             result = await tool.execute_async(
                 plan.arguments,
                 active_context,
-                sync_dispatch=dispatch_sync,
+                sync_dispatch=dispatch_sync_async,
             )
         finally:
             if worker_context is not None:
@@ -1099,11 +1099,11 @@ class ToolRegistry:
             }
         return output if value == prepared else json.dumps(prepared, ensure_ascii=False)
 
-    def _plan_sync(self, tool: Tool, arguments: dict[str, object]) -> OperationPlan:
+    def _plan(self, tool: Tool, arguments: dict[str, object]) -> OperationPlan:
         """Run and normalize one planner through the synchronous host policy."""
         if tool.operation_planner is None:
             return tool.plan(arguments)
-        planned = self._invoke_sync(tool, tool.operation_planner, copy.deepcopy(arguments))
+        planned = self._invoke(tool, tool.operation_planner, copy.deepcopy(arguments))
         return tool.normalize_plan(planned)
 
     async def _plan_async(self, tool: Tool, arguments: dict[str, object]) -> OperationPlan:
@@ -1131,7 +1131,7 @@ class ToolRegistry:
         try:
             if instructions_manager is not None:
                 arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
-            plan = self._plan_sync(tool, arguments)
+            plan = self._plan(tool, arguments)
             prerequisites = ()
             while True:
                 boundary_denial = permission_manager.check_boundaries(plan.boundary_operations)
@@ -1170,7 +1170,7 @@ class ToolRegistry:
                         }
                     ), None
                 prerequisites += plan.operations
-                plan = tool.normalize_plan(self._invoke_sync(tool, plan.continuation))
+                plan = tool.normalize_plan(self._invoke(tool, plan.continuation))
         except ProblemException as exc:
             return None, serialize_tool_problem(exc.problem)
         except (OSError, ValueError) as exc:
@@ -1272,11 +1272,11 @@ class ToolRegistry:
         try:
             if instructions_manager is not None:
                 arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
-            plan = self._plan_sync(tool, arguments)
+            plan = self._plan(tool, arguments)
             prerequisites = ()
             while plan.continuation is not None:
                 prerequisites += plan.operations
-                plan = tool.normalize_plan(self._invoke_sync(tool, plan.continuation))
+                plan = tool.normalize_plan(self._invoke(tool, plan.continuation))
             return plan.model_copy(
                 update={"prerequisite_operations": prerequisites + plan.prerequisite_operations}
             ), None

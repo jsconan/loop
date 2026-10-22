@@ -471,11 +471,8 @@ class CommandManager:
                 runner = self._sync_runner()
                 if runner is None:
                     raise self._async_required(name)
-                if (
-                    context is not None
-                    and active_interaction is not None
-                    and not isinstance(active_interaction, AsyncInteractionInput)
-                ):
+                if context is not None and active_interaction is not None:
+                    # Keep prompts on the sync owner when the source has loop-bound async input.
                     context = replace(
                         context,
                         interaction=SyncCommandInteraction(active_interaction),
@@ -531,7 +528,7 @@ class CommandManager:
             if is_async_callable(command.function):
                 await command.call_async(arguments, context)
             else:
-                result = await self._run_sync(command, arguments, context)
+                result = await self._run_sync_async(command, arguments, context)
                 if (
                     isinstance(result, asyncio.Future)
                     and result.get_loop() is not asyncio.get_running_loop()
@@ -598,7 +595,7 @@ class CommandManager:
                 ),
                 capabilities=capabilities,
                 execution_mode="async" if async_dispatch else "sync",
-                _blocking_runner=self.run_blocking if async_dispatch else None,
+                _blocking_runner=self.run_blocking_async if async_dispatch else None,
             )
         return command, active_interaction, context
 
@@ -665,7 +662,7 @@ class CommandManager:
             )
         )
 
-    async def _run_sync(
+    async def _run_sync_async(
         self,
         command: Command,
         arguments: str,
@@ -685,14 +682,14 @@ class CommandManager:
                     operation=command.name,
                 )
             )
-        return await self.run_blocking(
+        return await self.run_blocking_async(
             command.invoke,
             arguments,
             context,
             _operation=f"command '/{command.name}'",
         )
 
-    async def run_blocking(
+    async def run_blocking_async(
         self,
         function: Callable[..., Any],
         *args: Any,
@@ -757,7 +754,7 @@ class CommandManager:
         finally:
             self._worker_slots.release()
 
-    def run_blocking_sync(
+    def run_blocking(
         self,
         function: Callable[..., Any],
         *args: Any,

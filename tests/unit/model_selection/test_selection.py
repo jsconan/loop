@@ -344,7 +344,7 @@ def test_async_selection_uses_the_injected_bounded_worker():
         backend(get_context_window_async=AsyncMock(return_value=4096)),
         SessionManager(),
         on_select=lambda _model: writer_threads.append(get_ident()),
-        async_blocking_runner=manager.run_blocking,
+        async_blocking_runner=manager.run_blocking_async,
     )
 
     async def scenario():
@@ -404,7 +404,7 @@ def test_async_selection_preserves_cancellation_of_the_writer_task(monkeypatch):
         """Represent cancellation before the off-loop callback starts."""
         raise asyncio.CancelledError
 
-    monkeypatch.setattr("loop.model_selection.selection.run_in_worker", cancelled_writer)
+    monkeypatch.setattr("loop.model_selection.selection.run_in_worker_async", cancelled_writer)
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(selection.select_async("selected"))

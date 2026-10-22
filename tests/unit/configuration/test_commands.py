@@ -83,9 +83,9 @@ def test_config_run_restrictions_preserve_scope_prompt_and_reject_unsafe_operati
         )
     )
 
-    interaction.prompt_async.return_value = "session"
+    interaction.prompt.return_value = "session"
     assert manager.handle_user_command("/config set loop.debug true")
-    interaction.prompt_async.assert_called_once_with(
+    interaction.prompt.assert_called_once_with(
         "Choose configuration scope:",
         choices={
             "user": "Save for current user",
@@ -500,7 +500,7 @@ def test_config_secret_prompts_before_selecting_scope_and_applies_value(tmp_path
     configuration.load()
     apply = Mock(return_value="backend replaced")
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.prompt_async.side_effect = ["new-api-key", "user"]
+    interaction.prompt.side_effect = ["new-api-key", "user"]
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
@@ -508,7 +508,7 @@ def test_config_secret_prompts_before_selecting_scope_and_applies_value(tmp_path
     manager.call("config", "secret backend.api_key")
 
     assert configuration.effective.backend.api_key.get_secret_value() == "new-api-key"
-    assert interaction.prompt_async.call_args_list == [
+    assert interaction.prompt.call_args_list == [
         call("Enter backend.api_key:", secret=True),
         call(
             "Choose configuration scope:",
@@ -550,7 +550,7 @@ def test_config_secret_cancellation_leaves_the_existing_value_unchanged(tmp_path
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.prompt_async.side_effect = [False, "new-api-key", "cancel"]
+    interaction.prompt.side_effect = [False, "new-api-key", "cancel"]
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
@@ -567,14 +567,14 @@ def test_config_reset_and_invalid_direct_forms_report_argument_errors(tmp_path):
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.prompt_async.return_value = "cancel"
+    interaction.prompt.return_value = "cancel"
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
     )
     manager.call("config", "set loop.debug true scope=session")
 
-    interaction.confirm_async.side_effect = [True, True, True, True]
+    interaction.confirm.side_effect = [True, True, True, True]
     manager.call("config", "reset loop.debug scope=session")
     manager.call("config", "reset unknown.path scope=session")
     manager.call("config", "reset loop.debug scope=session")
@@ -594,7 +594,7 @@ def test_config_reset_with_explicit_scope_requires_confirmation(tmp_path):
     configuration.load()
     configuration.set_session("loop.debug", True)
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.confirm_async.return_value = False
+    interaction.confirm.return_value = False
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
@@ -603,9 +603,7 @@ def test_config_reset_with_explicit_scope_requires_confirmation(tmp_path):
     manager.call("config", "reset loop.debug scope=session")
 
     assert configuration.effective.loop.debug is True
-    interaction.confirm_async.assert_called_once_with(
-        "Reset loop.debug for session?", default=False
-    )
+    interaction.confirm.assert_called_once_with("Reset loop.debug for session?", default=False)
 
 
 def test_config_workspace_reset_reveals_user_value(tmp_path):
@@ -618,7 +616,7 @@ def test_config_workspace_reset_reveals_user_value(tmp_path):
     configuration.set("loop.debug", True, scope="user")
     configuration.set("loop.debug", False, scope="workspace")
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.confirm_async.return_value = True
+    interaction.confirm.return_value = True
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
@@ -664,7 +662,7 @@ def test_config_scope_picker_cancels_reset_all(tmp_path):
     manager.call("config", "reset")
 
     assert configuration.effective.loop.debug is True
-    interaction.prompt_async.assert_called_once()
+    interaction.prompt.assert_called_once()
 
 
 def test_config_explicit_user_reset_can_be_declined(tmp_path):
@@ -674,14 +672,14 @@ def test_config_explicit_user_reset_can_be_declined(tmp_path):
     )
     configuration.load()
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.confirm_async.return_value = False
+    interaction.confirm.return_value = False
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
 
     manager.call("config", "reset scope=user")
 
-    interaction.confirm_async.assert_called_once()
+    interaction.confirm.assert_called_once()
 
 
 def test_config_omitted_scope_prompts_and_supports_workspace_or_cancel(tmp_path):
@@ -692,7 +690,7 @@ def test_config_omitted_scope_prompts_and_supports_workspace_or_cancel(tmp_path)
     configuration.load()
     apply = Mock(return_value="applied")
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.prompt_async.side_effect = ["workspace", "cancel", "session"]
+    interaction.prompt.side_effect = ["workspace", "cancel", "session"]
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )

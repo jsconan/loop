@@ -13,7 +13,7 @@ from ..backend import BackendError
 from ..errors import Problem, log_problem
 from ..interaction import Interaction, require_async_interaction
 from ..models import ModelAssignment, ModelInfo
-from ..utils import run_in_worker
+from ..utils import run_in_worker_async
 
 if TYPE_CHECKING:
     from ..backend import Backend
@@ -226,7 +226,7 @@ class ModelSelection:
         pending = asyncio.ensure_future(
             self._async_blocking_runner(self._on_select, model)
             if self._async_blocking_runner is not None
-            else run_in_worker(self._on_select, model)
+            else run_in_worker_async(self._on_select, model)
         )
         try:
             await asyncio.shield(pending)

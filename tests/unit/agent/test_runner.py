@@ -27,6 +27,7 @@ from loop import (
     OpenAIBackend,
     PendingToolCall,
     PermissionManager,
+    ProblemException,
     Response,
     ResponseCompleted,
     ResponseMetrics,
@@ -120,6 +121,31 @@ def agent_runner(
     if responses is not None:
         runner.query = Mock(side_effect=responses)
     return runner, session_manager, interaction
+
+
+def test_runner_confirm_async_requires_native_async_interaction():
+    """Async agent confirmation never calls a synchronous prompt on the owner loop."""
+    runner, _, interaction = agent_runner()
+
+    with pytest.raises(ProblemException) as captured:
+        asyncio.run(runner._confirm_async("Continue?", default=False))
+
+    assert captured.value.problem.code == "interaction.async_required"
+    interaction.confirm.assert_not_called()
+
+
+def test_runner_confirm_async_uses_native_async_interaction():
+    """Async agent confirmation awaits the interaction's native async method."""
+    runner, _, _ = agent_runner()
+    interaction = ConsoleInteraction()
+    interaction.confirm = Mock()
+    interaction.confirm_async = AsyncMock(return_value=True)
+    runner._interaction = interaction
+
+    assert asyncio.run(runner._confirm_async("Continue?", default=True)) is True
+
+    interaction.confirm_async.assert_awaited_once_with("Continue?", default=True)
+    interaction.confirm.assert_not_called()
 
 
 def file_runner(tmp_path, backend, *, registry=None, sessions=None, run_control=None):
@@ -1488,8 +1514,8 @@ def test_runner_async_recovery_waits_with_async_confirmation_and_control(tmp_pat
 def test_runner_async_recovery_waits_without_a_run_control(tmp_path, monkeypatch):
     """Retry-after recovery yields through asyncio when no scoped control is configured."""
     runner = file_runner(tmp_path, Mock())
-    interaction = MagicMock(spec=Interaction)
-    interaction.confirm.return_value = True
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.confirm_async.return_value = True
     runner._interaction = interaction
     completed = Response(answer="complete", reasoning="")
     runner.query_async = AsyncMock(
@@ -1509,9 +1535,10 @@ def test_runner_async_recovery_waits_without_a_run_control(tmp_path, monkeypatch
     result = asyncio.run(runner._query_with_recovery_async())
 
     assert result is completed
-    interaction.confirm.assert_called_once_with(
+    interaction.confirm_async.assert_awaited_once_with(
         "Retry the complete response after at least 3 seconds?", default=False
     )
+    interaction.confirm.assert_not_called()
     sleep.assert_awaited_once_with(3)
 
 
@@ -1551,8 +1578,8 @@ def test_runner_async_recovery_skips_zero_or_missing_retry_delays(
 ):
     """A retry without a positive provider delay does not sleep or alter its prompt."""
     runner = file_runner(tmp_path, Mock())
-    interaction = MagicMock(spec=Interaction)
-    interaction.confirm.return_value = True
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.confirm_async.return_value = True
     runner._interaction = interaction
     runner._run_control = None
     completed = Response(answer="complete", reasoning="")
@@ -1570,7 +1597,10 @@ def test_runner_async_recovery_skips_zero_or_missing_retry_delays(
     )
 
     assert asyncio.run(runner._query_with_recovery_async()) is completed
-    interaction.confirm.assert_called_once_with("Retry the complete response?", default=False)
+    interaction.confirm_async.assert_awaited_once_with(
+        "Retry the complete response?", default=False
+    )
+    interaction.confirm.assert_not_called()
 
 
 def test_runner_async_recovery_retries_repetitive_output_once(tmp_path):
@@ -1595,18 +1625,20 @@ def test_runner_async_recovery_retries_repetitive_output_once(tmp_path):
 def test_runner_async_recovery_returns_none_when_repetition_retry_also_fails(tmp_path):
     """A repeated failure after repetition recovery follows normal retry policy."""
     runner = file_runner(tmp_path, Mock())
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.confirm_async.return_value = False
+    runner._interaction = interaction
     runner._query_async = AsyncMock(
         side_effect=[
             BackendRepetitionError("repetition", provider="test", operation="query"),
             BackendRepetitionError("repetition again", provider="test", operation="query"),
         ]
     )
-    runner.interaction.confirm.return_value = False
-
     assert asyncio.run(runner._query_with_recovery_async()) is None
-    runner.interaction.confirm.assert_called_once_with(
+    interaction.confirm_async.assert_awaited_once_with(
         "Retry the complete response?", default=False
     )
+    interaction.confirm.assert_not_called()
 
 
 @pytest.mark.parametrize("fallback_selected", [True, False])

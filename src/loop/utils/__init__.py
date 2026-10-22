@@ -29,7 +29,7 @@ __all__ = [
     "ValueReference",
     "VirtualPath",
     "as_utc",
-    "await_value",
+    "await_value_async",
     "base64_decode",
     "base64_encode",
     "bound_tool_result",
@@ -74,7 +74,7 @@ __all__ = [
     "register_cached_metadata",
     "register_shutdown_signals",
     "ripgrep_path",
-    "run_in_worker",
+    "run_in_worker_async",
     "safe_scalar",
     "search_text_paths",
     "sha256_digest",
@@ -90,11 +90,11 @@ __all__ = [
 
 
 from .asyncio import (
-    await_value,
+    await_value_async,
     close_awaitable,
     has_running_event_loop,
     is_async_callable,
-    run_in_worker,
+    run_in_worker_async,
 )
 from .callables import callable_hints, callable_name
 from .content import (

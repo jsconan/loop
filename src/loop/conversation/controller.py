@@ -421,7 +421,7 @@ class SessionController:
             )
             admission = self._admission_from_event(event)
             if not self._enqueue_steering(message, admission=admission, report_full=False):
-                self._reject_admission_sync(admission)
+                self._reject_admission(admission)
                 interaction.warning(
                     "Input queue is full; this input was not accepted. Try again later."
                 )
@@ -454,13 +454,13 @@ class SessionController:
         """
         if not self._control.active:
             return SteeringOutcome.RUN_INACTIVE
-        admission = await self._durable_admission(
+        admission = await self._durable_admission_async(
             message,
             priority=_STEERING_PRIORITY,
             bypass_commands=True,
         )
         if not self._enqueue_steering(message, admission=admission, report_full=False):
-            await self._reject_admission(admission)
+            await self._reject_admission_async(admission)
             interaction.warning(
                 "Input queue is full; this input was not accepted. Try again later."
             )
@@ -495,7 +495,7 @@ class SessionController:
                 report_full=False,
             ):
                 return True
-            self._reject_admission_sync(admission)
+            self._reject_admission(admission)
             interaction.warning(
                 "Input queue is full; this input was not accepted. Try again later."
             )
@@ -517,14 +517,14 @@ class SessionController:
         """
         if not self._control.active:
             return False
-        admission = await self._durable_admission(
+        admission = await self._durable_admission_async(
             message,
             priority=_INPUT_PRIORITY,
             bypass_commands=True,
         )
         if self._enqueue(message, admission=admission, interaction=interaction, report_full=False):
             return True
-        await self._reject_admission(admission)
+        await self._reject_admission_async(admission)
         interaction.warning("Input queue is full; this input was not accepted. Try again later.")
         return False
 
@@ -578,17 +578,18 @@ class SessionController:
                     raise
                 self._control.stop()
 
-    async def run(
+    def run(
         self,
         conversation: Callable[[Callable[[Completer], object]], None],
         *,
         route_idle_commands: bool = False,
     ) -> None:
-        """Run a conversation while accepting input and dispatching UI requests.
+        """Run a synchronous conversation while accepting input and dispatching UI requests.
 
         The operation must use its supplied input callback for ordinary conversation messages.
-        Nested prompts and all output use this controller's ``interaction``. Cancellation stops
-        admission and waits for the execution owner to settle before returning or raising.
+        Nested prompts and all output use this controller's ``interaction``. A shutdown request stops
+        admission and waits for the execution owner to settle before returning or raising. This
+        method owns an event loop for mailbox delivery and rejects calls from an existing loop.
 
         Args:
             conversation (Callable[[Callable[[Completer], object]], None]): Synchronous operation
@@ -599,11 +600,37 @@ class SessionController:
                 may prompt; their prompts open immediately on the async UI. Defaults to ``False``
                 for standalone controllers.
 
+        Returns:
+            None: After the synchronous callback and all owned operations settle.
+
         Raises:
-            RuntimeError: If this controller has already run.
-            asyncio.CancelledError: After owned execution settles when this task is cancelled.
+            RuntimeError: If called from an event loop or this controller has already run.
             BaseException: If the conversation or UI fails.
         """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "Synchronous SessionController.run() cannot run inside an event loop; "
+                "await SessionController.run_async() instead."
+            )
+        with asyncio.Runner() as runner:
+            runner.run(
+                self._run_sync_callback_async(
+                    conversation,
+                    route_idle_commands=route_idle_commands,
+                )
+            )
+
+    async def _run_sync_callback_async(
+        self,
+        conversation: Callable[[Callable[[Completer], object]], None],
+        *,
+        route_idle_commands: bool = False,
+    ) -> None:
+        """Host a synchronous callback on a worker while this loop owns UI delivery."""
         if self._command_manager is None:
             self.bind_command_manager(
                 CommandManager(
@@ -641,11 +668,11 @@ class SessionController:
                     conversation,
                 )
                 try:
-                    await self._drive(worker, route_idle_commands=route_idle_commands)
+                    await self._drive_async(worker, route_idle_commands=route_idle_commands)
                 except BaseException as error:
                     primary = error
                     self._stop()
-                    cleanup = asyncio.create_task(self._settle(worker))
+                    cleanup = asyncio.create_task(self._settle_async(worker))
                     while not cleanup.done():
                         try:
                             await asyncio.shield(cleanup)
@@ -729,11 +756,11 @@ class SessionController:
             with patch_stdout(raw=True):
                 worker = asyncio.create_task(self._execute_async(conversation))
                 try:
-                    await self._drive(worker, route_idle_commands=route_idle_commands)
+                    await self._drive_async(worker, route_idle_commands=route_idle_commands)
                 except BaseException as error:
                     primary = error
                     self._stop()
-                    cleanup = asyncio.create_task(self._settle(worker))
+                    cleanup = asyncio.create_task(self._settle_async(worker))
                     while not cleanup.done():
                         try:
                             await asyncio.shield(cleanup)
@@ -891,7 +918,7 @@ class SessionController:
             )
         return admission.message
 
-    async def _drive(self, worker: asyncio.Future, *, route_idle_commands: bool) -> None:
+    async def _drive_async(self, worker: asyncio.Future, *, route_idle_commands: bool) -> None:
         """Multiplex execution requests and user input without sharing domain state."""
         events = cast(asyncio.Queue, self._events)
         incoming = asyncio.create_task(events.get())
@@ -944,7 +971,7 @@ class SessionController:
                             typing = None
                             self._message_input = None
                             if not submitted.cancelled():
-                                await self._accept(
+                                await self._accept_async(
                                     submitted,
                                     route_idle_commands=route_idle_commands,
                                 )
@@ -957,13 +984,13 @@ class SessionController:
                             await asyncio.gather(typing, return_exceptions=True)
                             typing = None
                             self._message_input = None
-                    await self._deliver(event)
+                    await self._deliver_async(event)
                 if typing is not None and typing in done:
                     submitted = typing
                     typing = None
                     self._message_input = None
                     if not submitted.cancelled():
-                        await self._accept(submitted, route_idle_commands=route_idle_commands)
+                        await self._accept_async(submitted, route_idle_commands=route_idle_commands)
                 if worker in done:
                     completion = ConversationCompletion(
                         asyncio.CancelledError() if worker.cancelled() else worker.exception()
@@ -985,7 +1012,7 @@ class SessionController:
         finally:
             incoming.cancel()
             if not incoming.cancelled() and incoming.done():
-                await self._deliver(incoming.result())
+                await self._deliver_async(incoming.result())
             if typing is not None:
                 typing.cancel()
             await asyncio.gather(
@@ -993,7 +1020,7 @@ class SessionController:
             )
             self._message_input = None
 
-    async def _deliver(self, event: InteractionCall | RunStateChanged) -> None:
+    async def _deliver_async(self, event: InteractionCall | RunStateChanged) -> None:
         """Apply one UI event or await its blocking request through the native input surface."""
         if isinstance(event, RunStateChanged):
             self._ready = True
@@ -1032,7 +1059,7 @@ class SessionController:
                         raise
                     return
             self._pending = event
-            await self._answer()
+            await self._answer_async()
             return
         try:
             result = event.function(*event.args, **event.kwargs)
@@ -1046,7 +1073,7 @@ class SessionController:
             if event.kind == EVENT_TERMINAL_EXIT:
                 self._terminal_owned = False
 
-    async def _accept(self, submitted: asyncio.Task, *, route_idle_commands: bool) -> None:
+    async def _accept_async(self, submitted: asyncio.Task, *, route_idle_commands: bool) -> None:
         """Resolve input without hiding errors, then apply controls or admit ordinary text."""
         if self._stopping:
             with suppress(asyncio.CancelledError):
@@ -1086,7 +1113,7 @@ class SessionController:
             )
         elif self._session_manager is not None:
             priority = _STEERING_PRIORITY if self._control.active else _INPUT_PRIORITY
-            admission = await self._durable_admission(
+            admission = await self._durable_admission_async(
                 str(value),
                 priority=priority,
                 bypass_commands=True,
@@ -1101,7 +1128,7 @@ class SessionController:
                 )
             )
             if not admitted:
-                await self._reject_admission(admission)
+                await self._reject_admission_async(admission)
                 self._source.warning(
                     "Input queue is full; this input was not accepted. Try again later."
                 )
@@ -1178,7 +1205,7 @@ class SessionController:
             active_interaction.info(f"Queued input ({self._inbox.qsize()} pending).")
         return True
 
-    async def _durable_admission(
+    async def _durable_admission_async(
         self,
         content: str,
         *,
@@ -1216,14 +1243,14 @@ class SessionController:
         self._queued_input_ids.add(event.input_id)
         return admission
 
-    def _reject_admission_sync(self, admission: InputAdmission) -> None:
+    def _reject_admission(self, admission: InputAdmission) -> None:
         """Persist input rejection through the synchronous writer."""
         if admission.input_id is None or self._session_manager is None:
             return
         self._session_manager.reject_input(admission.input_id)
         self._queued_input_ids.discard(admission.input_id)
 
-    async def _reject_admission(self, admission: InputAdmission) -> None:
+    async def _reject_admission_async(self, admission: InputAdmission) -> None:
         """Persist rejection before returning a durable admission failure to the UI."""
         if admission.input_id is None or self._session_manager is None:
             return
@@ -1316,7 +1343,7 @@ class SessionController:
         self._source.info("Steering accepted; finishing the current operation first.")
         return True
 
-    async def _answer(self) -> None:
+    async def _answer_async(self) -> None:
         """Resolve only the explicit pending request through the UI's async input surface."""
         request = cast(InteractionCall, self._pending)
         answer_input = None
@@ -1424,7 +1451,7 @@ class SessionController:
         self._discarded += discarded
         return discarded
 
-    async def _settle(self, worker: asyncio.Future) -> BaseException | None:
+    async def _settle_async(self, worker: asyncio.Future) -> BaseException | None:
         """Drain acknowledged UI work until execution and command owners release resources."""
         events = cast(asyncio.Queue, self._events)
         command_failure = None
@@ -1439,7 +1466,7 @@ class SessionController:
                     watched.add(command_task)
                 done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
                 if incoming in done:
-                    await self._deliver(incoming.result())
+                    await self._deliver_async(incoming.result())
                 if command_task is not None and command_task in done:
                     self._command_task = None
                     try:

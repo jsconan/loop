@@ -314,7 +314,7 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
                 session_name_generator=LocalSessionNameGenerator(),
             )
             task = asyncio.create_task(
-                controller.run(lambda receive: loop.run(input_source=receive))
+                controller._run_sync_callback_async(lambda receive: loop.run(input_source=receive))
             )
             try:
                 pipe.send_text("first\n")
@@ -396,7 +396,9 @@ def test_idle_config_command_opens_its_choice_prompt_immediately(tmp_path):
 
         async def scenario():
             """Select a choice directly after the command opens its prompt."""
-            task = asyncio.create_task(controller.run(conversation, route_idle_commands=True))
+            task = asyncio.create_task(
+                controller._run_sync_callback_async(conversation, route_idle_commands=True)
+            )
             try:
                 pipe.send_text("/config set loop.max_agent_turns 100\n")
                 await choice_open.wait()
@@ -470,7 +472,7 @@ def test_active_config_command_opens_its_choice_prompt_immediately(tmp_path):
 
         async def scenario():
             """Select a scope while the active agent keeps running."""
-            task = asyncio.create_task(controller.run(conversation))
+            task = asyncio.create_task(controller._run_sync_callback_async(conversation))
             try:
                 pipe.send_text("start\n")
                 await working.wait()
@@ -553,7 +555,7 @@ def test_pending_approval_uses_native_confirmation_ui_and_preserves_the_draft():
                     else:
                         controller.interaction.info("processed")
 
-            task = asyncio.create_task(controller.run(conversation))
+            task = asyncio.create_task(controller._run_sync_callback_async(conversation))
             try:
                 pipe.send_text("start\n")
                 await asyncio.wait_for(ready.wait(), timeout=5)

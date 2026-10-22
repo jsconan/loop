@@ -22,7 +22,7 @@ from ..models import (
 )
 from ..permissions import Action, OperationPlan, OperationPlanner, Operations
 from ..utils import (
-    await_value,
+    await_value_async,
     callable_name,
     close_awaitable,
     has_running_event_loop,
@@ -256,7 +256,7 @@ class Tool:
                             )
                         )
                     )
-                result = runner.run(await_value(result))
+                result = runner.run(await_value_async(result))
             return ToolExecutionResult(
                 serialize_tool_result(result), self._presentation_for(arguments, result)
             )

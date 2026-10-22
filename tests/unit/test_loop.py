@@ -2841,7 +2841,9 @@ def test_mailbox_rejects_session_change_and_preserves_conversation_order(tmp_pat
         )
         loop.register_command_provider(ConversationCommands(controller))
         controller.bind_command_manager(loop.command_manager)
-        task = asyncio.create_task(controller.run(lambda receive: loop.run(input_source=receive)))
+        task = asyncio.create_task(
+            controller._run_sync_callback_async(lambda receive: loop.run(input_source=receive))
+        )
         try:
             inputs.put_nowait("first private request")
             await started.wait()
@@ -2965,7 +2967,9 @@ def test_mailbox_steers_or_interrupts_active_generation_without_losing_queued_me
             session_manager=sessions,
             session_name_generator=LocalSessionNameGenerator(),
         )
-        task = asyncio.create_task(controller.run(lambda receive: loop.run(input_source=receive)))
+        task = asyncio.create_task(
+            controller._run_sync_callback_async(lambda receive: loop.run(input_source=receive))
+        )
         try:
             inputs.put_nowait("first private request")
             await working.wait()

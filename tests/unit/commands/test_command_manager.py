@@ -21,6 +21,7 @@ from loop import (
     CompletionManager,
     CompletionProviderRegistration,
     CompletionValue,
+    ConsoleInteraction,
     Interaction,
     Problem,
     ProblemException,
@@ -520,12 +521,36 @@ def test_handle_user_command_async_dispatches_sync_callbacks_to_workers():
     assert observed[0][2] != owner_thread
 
 
+def test_sync_dispatch_routes_async_prompt_through_sync_interaction_owner():
+    """A dual sync/async interaction does not leak its loop-bound prompt into the runner."""
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "session"
+    answers = []
+
+    async def select_scope_async(context: CommandContext) -> None:
+        """Use the sync dispatch adapter to obtain a scope choice."""
+        answers.append(await context.interaction.prompt_async("Choose a scope:"))
+
+    manager = CommandManager(
+        commands=(CommandRegistration(select_scope_async, name="select_scope"),),
+        interaction=interaction,
+    )
+    try:
+        manager.call("select_scope")
+    finally:
+        manager.close()
+
+    assert answers == ["session"]
+    interaction.prompt.assert_called_once_with("Choose a scope:")
+    interaction.prompt_async.assert_not_called()
+
+
 def test_sync_blocking_operation_runs_on_the_bounded_worker():
     """Synchronous UI filesystem work uses the command manager's worker pool."""
     manager = CommandManager()
     owner_thread = get_ident()
 
-    worker_thread, value = manager.run_blocking_sync(lambda: (get_ident(), "visible"))
+    worker_thread, value = manager.run_blocking(lambda: (get_ident(), "visible"))
 
     assert worker_thread != owner_thread
     assert value == "visible"
@@ -538,14 +563,14 @@ def test_sync_blocking_operation_rejects_event_loop_and_closed_manager():
     async def reject_event_loop():
         """Reject blocking completion while an event loop is active."""
         with pytest.raises(ProblemException) as captured:
-            manager.run_blocking_sync(lambda: None)
+            manager.run_blocking(lambda: None)
         assert captured.value.problem.code == "command.async_required"
 
     asyncio.run(reject_event_loop())
     manager.close()
 
     with pytest.raises(ProblemException) as captured:
-        manager.run_blocking_sync(lambda: None)
+        manager.run_blocking(lambda: None)
     assert captured.value.problem.code == "command.dispatch_busy"
 
 
@@ -554,7 +579,7 @@ def test_sync_blocking_operation_reuses_existing_worker_and_releases_failed_admi
 ):
     """Nested work stays in its worker and submission failures release bounded capacity."""
     manager = CommandManager()
-    worker_thread = asyncio.run(manager.run_blocking(manager.run_blocking_sync, get_ident))
+    worker_thread = asyncio.run(manager.run_blocking_async(manager.run_blocking, get_ident))
     assert worker_thread != get_ident()
 
     with monkeypatch.context() as scoped:
@@ -562,9 +587,9 @@ def test_sync_blocking_operation_reuses_existing_worker_and_releases_failed_admi
             module.ThreadPoolExecutor, "submit", Mock(side_effect=RuntimeError("submit"))
         )
         with pytest.raises(RuntimeError, match="submit"):
-            manager.run_blocking_sync(lambda: None)
+            manager.run_blocking(lambda: None)
 
-    assert manager.run_blocking_sync(lambda: "available") == "available"
+    assert manager.run_blocking(lambda: "available") == "available"
 
 
 def test_sync_blocking_operation_from_another_manager_uses_its_own_worker():
@@ -575,11 +600,11 @@ def test_sync_blocking_operation_from_another_manager_uses_its_own_worker():
     def invoke_second_manager():
         """Call the second manager while executing on the first manager's worker."""
         first_worker = get_ident()
-        second_worker = second.run_blocking_sync(get_ident)
+        second_worker = second.run_blocking(get_ident)
         return first_worker, second_worker
 
     try:
-        first_worker, second_worker = asyncio.run(first.run_blocking(invoke_second_manager))
+        first_worker, second_worker = asyncio.run(first.run_blocking_async(invoke_second_manager))
     finally:
         first.close()
         second.close()
@@ -596,7 +621,7 @@ def test_sync_blocking_operation_reports_worker_failures():
         raise ValueError("completion failed")
 
     with pytest.raises(ValueError, match="completion failed"):
-        manager.run_blocking_sync(fail)
+        manager.run_blocking(fail)
 
 
 def test_async_command_context_requires_a_manager_for_sync_leaf_work():
@@ -610,7 +635,7 @@ def test_async_command_context_requires_a_manager_for_sync_leaf_work():
     async def scenario():
         """Reject direct blocking work without a command-manager worker."""
         with pytest.raises(ProblemException) as captured:
-            await context.run_blocking(lambda: None)
+            await context.run_blocking_async(lambda: None)
         assert captured.value.problem.code == "command.blocking_dispatch_unavailable"
 
     asyncio.run(scenario())

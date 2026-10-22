@@ -4,6 +4,7 @@ The test suites separate portable module behavior from operating-system and depe
 
 ## Organization
 
+- `architecture/` holds repository-wide static contracts that do not belong to an individual source module's unit suite. `make test` runs these checks with the unit suite.
 - `unit/` mirrors `src/loop/` by owning module. It is the default pytest target and runs on every platform without platform skips. Platform adapters use controlled platform, process, account, clock and diagnostic doubles.
 - `integration/` exercises native boundaries in disposable workspaces. Shared process and search checks live under `execution/` and `utils/`; platform-specific checks live under `macos/` and `linux/`.
 - The fresh-process platform import check verifies that loading the app does not import the other operating system's sandbox implementation.

@@ -237,8 +237,13 @@ async def chat(backend):
     controller.bind_session_manager(sessions)
     conversation.register_command_provider(ConversationCommands(controller))
     controller.bind_command_manager(conversation.command_manager)
-    await controller.run(lambda receive: conversation.run(input_source=receive))
+    async def own_conversation(receive):
+        await conversation.run_async(input_source=receive)
+
+    await controller.run_async(own_conversation)
 ```
+
+Synchronous callers can pass a synchronous conversation callback to `controller.run()`. That entry point owns its asyncio loop and cannot be called from a thread that already has a running event loop; async callers should use `run_async()`.
 
 Each controller runs once. The injected `RunControl` owns a scoped interrupt for each agent run: `interrupt()` returns whether an active run accepted the signal, and `active` and `interrupted` report its state. `execution()` brackets custom interruptible work; `checkpoint()` and `wait()` raise `RunInterrupted` inside that scope. The runner converts this signal into a persisted cancelled run after settling tool results. The UI controls also revoke outstanding questions. A scoped interrupt clears on settlement; shutdown remains sticky.
 

@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from ...utils import PathReference, run_in_worker
+from ...utils import PathReference, run_in_worker_async
 from ...utils.path import iter_visible_paths
 from ..models import CompletionValue
 from .marker import MarkerCompletionAdapter
@@ -91,7 +91,7 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         root = await (
             self._async_blocking_runner(Path.resolve, root_source)
             if self._async_blocking_runner is not None
-            else run_in_worker(Path.resolve, root_source)
+            else run_in_worker_async(Path.resolve, root_source)
         )
         if self._working_directory.get() != root_source:
             return ()
@@ -101,7 +101,7 @@ class ProjectPathCompletionAdapter(MarkerCompletionAdapter):
         values = await (
             self._async_blocking_runner(self._discover_values, root)
             if self._async_blocking_runner is not None
-            else run_in_worker(self._discover_values, root)
+            else run_in_worker_async(self._discover_values, root)
         )
         if self._working_directory.get() != root_source:
             return ()

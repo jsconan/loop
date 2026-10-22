@@ -134,7 +134,7 @@ class ConfigurationCommands:
         """
         return (
             CommandRegistration(
-                self.config,
+                self.config_async,
                 name="config",
                 capabilities=frozenset(
                     {CommandCapability.CONTEXT_READ, CommandCapability.CONTEXT_UPDATE}
@@ -258,7 +258,7 @@ class ConfigurationCommands:
             if entry.secret
         )
 
-    async def config(
+    async def config_async(
         self,
         context: CommandContext,
         action: Annotated[
@@ -288,6 +288,9 @@ class ConfigurationCommands:
             value (str | None): New setting value for the set operation.
             scope (Literal["session", "user", "workspace"] | None): Override scope, or ``None``
                 to choose it interactively.
+
+        Returns:
+            None: After displaying or applying the requested configuration operation.
 
         Raises:
             CommandArgumentError: If the operation is unavailable or its arguments are invalid.
@@ -320,41 +323,41 @@ class ConfigurationCommands:
         if action == "reload":
             if path is not None or value is not None or scope is not None:
                 raise CommandArgumentError("The reload operation does not accept arguments.")
-            await self._reload(context)
+            await self._reload_async(context)
             return
         if action == "secret":
-            await self._set_secret(context, path, value, scope)
+            await self._set_secret_async(context, path, value, scope)
             return
         if action == "reset" and path is None:
-            selected_scope = await self._select_scope(context, scope)
-            if selected_scope is not None and await self._confirm_reset(
+            selected_scope = await self._select_scope_async(context, scope)
+            if selected_scope is not None and await self._confirm_reset_async(
                 context,
                 path=None,
                 scope=selected_scope,
                 explicit_scope=scope is not None,
             ):
-                await self._reset_all(context, selected_scope)
+                await self._reset_all_async(context, selected_scope)
             return
         if action == "reset":
-            selected_scope = await self._select_scope(context, scope)
-            if selected_scope is not None and await self._confirm_reset(
+            selected_scope = await self._select_scope_async(context, scope)
+            if selected_scope is not None and await self._confirm_reset_async(
                 context,
                 path=path,
                 scope=selected_scope,
                 explicit_scope=scope is not None,
             ):
-                await self._reset(context, path, selected_scope)
+                await self._reset_async(context, path, selected_scope)
             return
         if path is None:
             raise CommandArgumentError("The set operation requires a setting path.")
         if value is None:
             raise CommandArgumentError("The set operation requires a value.")
-        selected_scope = await self._select_scope(context, scope)
+        selected_scope = await self._select_scope_async(context, scope)
         if selected_scope is not None:
-            await self._set(context, path, value, selected_scope)
+            await self._set_async(context, path, value, selected_scope)
 
     @staticmethod
-    async def _select_scope(
+    async def _select_scope_async(
         context: CommandContext,
         scope: Literal["session", "user", "workspace"] | None,
     ) -> Literal["session", "user", "workspace"] | None:
@@ -389,7 +392,7 @@ class ConfigurationCommands:
         return selected if selected in {"session", "user", "workspace"} else None
 
     @staticmethod
-    async def _confirm_reset(
+    async def _confirm_reset_async(
         context: CommandContext,
         path: str | None,
         scope: Literal["session", "user", "workspace"],
@@ -409,7 +412,7 @@ class ConfigurationCommands:
             context.interaction, "configuration reset confirmation"
         ).confirm_async(f"Reset {target} for {scope}?", default=False)
 
-    async def _reset_all(
+    async def _reset_all_async(
         self,
         context: CommandContext,
         scope: Literal["session", "user", "workspace"],
@@ -420,7 +423,7 @@ class ConfigurationCommands:
             settings = self._configuration.reset_all(scope=scope)
             statuses = {self._apply(path, settings) for path in paths}
         else:
-            _, applied = await self._run_blocking_with_effect(
+            _, applied = await self._run_blocking_with_effect_async(
                 context,
                 self._configuration.reset_all,
                 lambda settings: {self._apply(path, settings) for path in paths},
@@ -430,11 +433,11 @@ class ConfigurationCommands:
         detail = ", ".join(sorted(statuses)) if statuses else "no overrides existed"
         context.interaction.info(f"Reset all configuration entries for {scope}: {detail}.")
 
-    async def _reload(self, context: CommandContext) -> None:
+    async def _reload_async(self, context: CommandContext) -> None:
         """Reload disk configuration and apply only effective changes."""
         previous = self._configuration.effective
         try:
-            _, statuses = await self._run_blocking_with_effect(
+            _, statuses = await self._run_blocking_with_effect_async(
                 context,
                 self._configuration.reload,
                 lambda settings: self._apply_changes(previous, settings),
@@ -464,7 +467,7 @@ class ConfigurationCommands:
             return self._apply_many(paths, current)
         return {path: self._apply(path, current) for path in paths}
 
-    async def _run_blocking_with_effect(
+    async def _run_blocking_with_effect_async(
         self,
         context: CommandContext,
         function: Callable[..., Result],
@@ -473,7 +476,7 @@ class ConfigurationCommands:
         **kwargs: object,
     ) -> tuple[Result, Effect]:
         """Settle sync persistence before applying its result on the owner, even on cancellation."""
-        pending = asyncio.create_task(context.run_blocking(function, *args, **kwargs))
+        pending = asyncio.create_task(context.run_blocking_async(function, *args, **kwargs))
         try:
             result = await asyncio.shield(pending)
         except asyncio.CancelledError as cancellation:
@@ -533,7 +536,7 @@ class ConfigurationCommands:
             columns=("path", "value", "source", "description"),
         )
 
-    async def _set(
+    async def _set_async(
         self,
         context: CommandContext,
         path: str,
@@ -552,7 +555,7 @@ class ConfigurationCommands:
                 settings = self._configuration.set_session(path, value)
                 status = self._apply(path, settings)
             else:
-                _, status = await self._run_blocking_with_effect(
+                _, status = await self._run_blocking_with_effect_async(
                     context,
                     self._configuration.set,
                     lambda settings: self._apply(path, settings),
@@ -564,7 +567,7 @@ class ConfigurationCommands:
             raise CommandArgumentError(str(error)) from error
         context.interaction.info(f"Updated {path} for {scope}: {status}")
 
-    async def _set_secret(
+    async def _set_secret_async(
         self,
         context: CommandContext,
         path: str | None,
@@ -584,9 +587,11 @@ class ConfigurationCommands:
         if secret_value is False:
             context.interaction.info(f"Secret {path} was not changed.")
             return
-        selected_scope = await self._select_scope(context, scope)
+        selected_scope = await self._select_scope_async(context, scope)
         if selected_scope is not None:
-            await self._set(context, path, str(secret_value), selected_scope, allow_secret=True)
+            await self._set_async(
+                context, path, str(secret_value), selected_scope, allow_secret=True
+            )
 
     def _is_secret(self, path: str) -> bool:
         """Return whether a known configuration path is secret."""
@@ -595,14 +600,14 @@ class ConfigurationCommands:
             raise CommandArgumentError(f"Unknown configuration field '{path}'.")
         return entry.secret
 
-    async def _reset(self, context: CommandContext, path: str, scope: str) -> None:
+    async def _reset_async(self, context: CommandContext, path: str, scope: str) -> None:
         """Reset one selected-scope value and apply the resulting setting."""
         try:
             if scope == "session":
                 settings = self._configuration.reset_session(path)
                 status = self._apply(path, settings)
             else:
-                _, status = await self._run_blocking_with_effect(
+                _, status = await self._run_blocking_with_effect_async(
                     context,
                     self._configuration.reset,
                     lambda settings: self._apply(path, settings),

@@ -226,8 +226,8 @@ class Loop:
         )
         configured_instructions.prepare(configured_agent)
         configured_commands = CommandManager(interaction=configured_interaction)
-        configured_sessions.set_async_blocking_runner(configured_commands.run_blocking)
-        configured_permissions.set_async_blocking_runner(configured_commands.run_blocking)
+        configured_sessions.set_async_blocking_runner(configured_commands.run_blocking_async)
+        configured_permissions.set_async_blocking_runner(configured_commands.run_blocking_async)
         configured_selection = ModelSelection(
             backend,
             configured_sessions,
@@ -235,7 +235,7 @@ class Loop:
                 configured_sessions.model if configured_sessions.model is not None else model
             ),
             on_select=on_model_select,
-            async_blocking_runner=configured_commands.run_blocking,
+            async_blocking_runner=configured_commands.run_blocking_async,
         )
         configured_compaction = ContextCompaction(
             backend,
@@ -280,8 +280,8 @@ class Loop:
             (
                 ProjectPathMentionHandler(
                     directory_reference,
-                    sync_blocking_runner=configured_commands.run_blocking_sync,
-                    async_blocking_runner=configured_commands.run_blocking,
+                    sync_blocking_runner=configured_commands.run_blocking,
+                    async_blocking_runner=configured_commands.run_blocking_async,
                 ),
             )
         )

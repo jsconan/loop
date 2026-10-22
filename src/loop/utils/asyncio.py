@@ -15,7 +15,7 @@ _WORKER_EXECUTOR = ThreadPoolExecutor(max_workers=_WORKER_COUNT, thread_name_pre
 _WORKER_SLOTS = BoundedSemaphore(_WORKER_COUNT + _WORKER_QUEUE_SIZE)
 
 
-async def run_in_worker(function: Callable[..., Any], *args: Any) -> Any:
+async def run_in_worker_async(function: Callable[..., Any], *args: Any) -> Any:
     """Run synchronous I/O on a shared worker with bounded admission.
 
     Application services should inject their own worker when available. This process-owned
@@ -109,7 +109,7 @@ def has_running_event_loop() -> bool:
     return True
 
 
-async def await_value[T](value: Awaitable[T]) -> T:
+async def await_value_async[T](value: Awaitable[T]) -> T:
     """Await an awaitable through a coroutine wrapper.
 
     Args:

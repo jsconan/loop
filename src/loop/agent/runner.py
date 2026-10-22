@@ -21,7 +21,7 @@ from ..compaction import ContextCompaction
 from ..control import RunControl, RunInterrupted
 from ..errors import Problem, log_problem
 from ..instructions import InstructionBudgetExceededError, InstructionsManager
-from ..interaction import AsyncInteractionInput, Interaction
+from ..interaction import Interaction, require_async_interaction
 from ..model_selection import ModelSelection, ModelSelectionError
 from ..models import (
     AgentRunStopReason,
@@ -937,7 +937,7 @@ class AgentRunner:
             await self._session_manager.add_tool_call_event_async(tool_call.call_id)
         self._interaction.tool_call(tool_call.name, tool_call.arguments)
 
-        async def execution_started() -> None:
+        async def execution_started_async() -> None:
             """Persist execution intent after approval and before invoking the tool."""
             self._checkpoint()
             await self._session_manager.record_tool_execution_started_async(tool_call.call_id)
@@ -957,7 +957,7 @@ class AgentRunner:
                 if self._file_observations is not None
                 else {}
             ),
-            execution_started=execution_started,
+            execution_started=execution_started_async,
         )
         if self._file_observations is not None:
             self._file_observations.observe_result(tool_call, tool_result, include_reads=False)
@@ -1175,7 +1175,7 @@ class AgentRunner:
             tools=self._agent.tools.definitions(),
         )
 
-        async def measured_events() -> AsyncIterator[ResponseEvent]:
+        async def measured_events_async() -> AsyncIterator[ResponseEvent]:
             """Check cancellation and record first-event timing while yielding backend events."""
             nonlocal first_chunk_at
             async for event in events:
@@ -1184,7 +1184,7 @@ class AgentRunner:
                     first_chunk_at = perf_counter()
                 yield event
 
-        async with aclosing(measured_events()) as stream:
+        async with aclosing(measured_events_async()) as stream:
             try:
                 response = await self._session_manager.response_async(
                     stream,
@@ -1403,10 +1403,9 @@ class AgentRunner:
                         await self._run_control.wait_async(delay)
 
     async def _confirm_async(self, prompt: str, *, default: bool) -> bool:
-        """Use native async confirmation when available, retaining sync adapter support."""
-        if isinstance(self._interaction, AsyncInteractionInput):
-            return await self._interaction.confirm_async(prompt, default=default)
-        return self._interaction.confirm(prompt, default=default)
+        """Require native asynchronous confirmation without blocking the owner loop."""
+        interaction = require_async_interaction(self._interaction, "agent confirmation")
+        return await interaction.confirm_async(prompt, default=default)
 
     def _checkpoint(self) -> None:
         """Honor optional cooperative stop requests before a new execution boundary."""

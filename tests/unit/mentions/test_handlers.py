@@ -137,7 +137,7 @@ def test_async_project_path_resolution_uses_injected_bounded_worker(tmp_path):
     executor = ThreadPoolExecutor(max_workers=1)
     worker_threads = []
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Run detached path reads in the supplied worker pool."""
 
         def invoke():
@@ -149,7 +149,7 @@ def test_async_project_path_resolution_uses_injected_bounded_worker(tmp_path):
 
     handler = ProjectPathMentionHandler(
         PathHolder(tmp_path),
-        async_blocking_runner=run_blocking,
+        async_blocking_runner=run_blocking_async,
     )
     owner_thread = get_ident()
 

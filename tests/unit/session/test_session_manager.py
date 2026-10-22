@@ -847,14 +847,14 @@ def test_async_session_commit_uses_a_bounded_worker_and_detached_session():
     executor = ThreadPoolExecutor(max_workers=1)
     worker_sessions = []
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Run persistence on the controlled worker and capture submitted sessions."""
         worker_sessions.extend(argument for argument in args if isinstance(argument, Session))
         return await asyncio.get_running_loop().run_in_executor(executor, function, *args)
 
     manager = SessionManager(
         session_store=store,
-        async_blocking_runner=run_blocking,
+        async_blocking_runner=run_blocking_async,
     )
     active = manager.session
 
@@ -902,11 +902,11 @@ def test_slow_async_session_store_leaves_the_event_loop_available_for_control():
     store = SlowStore()
     executor = ThreadPoolExecutor(max_workers=1)
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Run SQLite-like storage work on one controlled bounded worker."""
         return await asyncio.get_running_loop().run_in_executor(executor, function, *args)
 
-    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking)
+    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking_async)
 
     async def verify_owner_progress():
         """Process a control callback while the session snapshot is still being saved."""
@@ -1292,7 +1292,7 @@ def test_async_session_commit_finishes_persistence_before_propagating_cancellati
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Hold worker admission until the test cancels and releases the operation."""
         started.set()
         await release.wait()
@@ -1300,7 +1300,7 @@ def test_async_session_commit_finishes_persistence_before_propagating_cancellati
 
     manager = SessionManager(
         session_store=store,
-        async_blocking_runner=run_blocking,
+        async_blocking_runner=run_blocking_async,
     )
 
     async def cancel_after_admission():
@@ -1334,13 +1334,13 @@ def test_async_session_commit_preserves_cancellation_and_reports_a_save_failure(
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Hold the detached persistence operation until cancellation is requested."""
         started.set()
         await release.wait()
         return function(*args)
 
-    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking)
+    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking_async)
     active = manager.session
 
     async def cancel_failed_commit():
@@ -1370,13 +1370,13 @@ def test_async_session_commit_does_not_publish_over_a_replacement_session(cancel
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Delay storage until the active session changes."""
         started.set()
         await release.wait()
         return function(*args)
 
-    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking)
+    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking_async)
     replacement = Session(name="Replacement", name_source="user")
 
     async def replace_while_saving():
@@ -1604,11 +1604,11 @@ def test_manager_generates_session_names_asynchronously_and_keeps_sync_generator
 
     fallback_threads = []
 
-    def generate_sync(*_args):
+    def generate(*_args):
         """Record the thread used for a legacy blocking generator."""
         fallback_threads.append(get_ident())
 
-    fallback = SimpleNamespace(generate=generate_sync)
+    fallback = SimpleNamespace(generate=generate)
     owner = get_ident()
     asyncio.run(manager.generate_session_name_async(fallback))
 
@@ -1642,13 +1642,13 @@ def test_async_session_name_generation_settles_legacy_worker_before_cancellation
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Wait for the test to cancel before completing detached name generation."""
         started.set()
         await release.wait()
         return function(*args)
 
-    manager = SessionManager(async_blocking_runner=run_blocking)
+    manager = SessionManager(async_blocking_runner=run_blocking_async)
     manager.add_user_message("Question")
     manager.add_message(Message(role="assistant", content="Answer"))
 

@@ -36,7 +36,7 @@ from ..utils import (
     VirtualPath,
     canonical_path,
     local_now,
-    run_in_worker,
+    run_in_worker_async,
     sha256_digest,
 )
 from .audit import SQLitePermissionAudit
@@ -2706,7 +2706,7 @@ class PermissionManager:
         pending = asyncio.ensure_future(
             self._async_blocking_runner(self._audit, result)
             if self._async_blocking_runner is not None
-            else run_in_worker(self._audit, result)
+            else run_in_worker_async(self._audit, result)
         )
         cancellation = None
         try:

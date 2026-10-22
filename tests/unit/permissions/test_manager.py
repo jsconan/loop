@@ -1251,7 +1251,7 @@ def test_async_authorization_uses_bounded_audit_and_native_recorder_paths(tmp_pa
     audit_path = tmp_path / "audit.db"
     worker_calls = []
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Dispatch the audit write through the supplied worker."""
         worker_calls.append(function.__name__)
         return await asyncio.to_thread(function, *args)
@@ -1262,7 +1262,7 @@ def test_async_authorization_uses_bounded_audit_and_native_recorder_paths(tmp_pa
         tmp_path,
         audit_path=audit_path,
         workspace_id="workspace",
-        async_blocking_runner=run_blocking,
+        async_blocking_runner=run_blocking_async,
     )
     operation_set = (file_operation(Action.FILESYSTEM_READ, tmp_path / "source.txt"),)
 
@@ -1308,7 +1308,7 @@ def test_async_authorization_settles_audit_before_propagating_cancellation(
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Keep audit work pending until the owner has been cancelled."""
         started.set()
         await release.wait()
@@ -1320,7 +1320,7 @@ def test_async_authorization_settles_audit_before_propagating_cancellation(
         tmp_path,
         audit_path=tmp_path / "audit.db",
         workspace_id="workspace",
-        async_blocking_runner=run_blocking,
+        async_blocking_runner=run_blocking_async,
     )
     operation_set = (file_operation(Action.FILESYSTEM_READ, tmp_path / "source.txt"),)
 

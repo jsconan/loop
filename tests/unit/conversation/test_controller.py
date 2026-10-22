@@ -1,6 +1,7 @@
 """Verify responsive mailbox admission and serialized conversation ownership."""
 
 import asyncio
+import inspect
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from queue import Empty, PriorityQueue
@@ -100,14 +101,50 @@ def test_controller_exposes_setup_interaction_and_a_single_execution_lifecycle(u
     controller.interaction.info("setup")
     ui.info.assert_called_once_with("setup")
 
-    asyncio.run(controller.run(lambda _receive: None))
+    controller.run(lambda _receive: None)
 
     assert controller.running is False
     controller.interaction.info("settled")
     with pytest.raises(RuntimeError, match="Bind the command manager before running"):
         controller.bind_command_manager(CommandManager())
     with pytest.raises(RuntimeError, match="only run once"):
-        asyncio.run(controller.run(lambda _receive: None))
+        controller.run(lambda _receive: None)
+
+
+def test_sync_controller_run_routes_callback_prompts_through_the_async_ui(ui):
+    """A synchronous caller keeps prompt ownership on the controller's async UI loop."""
+    controller = SessionController(ui)
+    ui.prompt_async = AsyncMock(return_value="answer")
+    answers = []
+
+    controller.run(lambda _receive: answers.append(controller.interaction.prompt("Question?")))
+
+    assert answers == ["answer"]
+    ui.prompt_async.assert_awaited_once_with(
+        "Question?",
+        completer=None,
+        choices=None,
+        index=None,
+        default=None,
+        secret=False,
+    )
+
+
+def test_sync_controller_run_rejects_an_active_event_loop_without_claiming_controller(ui):
+    """The synchronous entry point does not nest a loop or consume the lifecycle on failure."""
+    controller = SessionController(ui)
+    assert not inspect.iscoroutinefunction(controller.run)
+    assert inspect.iscoroutinefunction(controller.run_async)
+
+    async def invoke():
+        """Attempt synchronous execution from an async owner."""
+        with pytest.raises(RuntimeError, match="await SessionController.run_async"):
+            controller.run(lambda _receive: None)
+
+    asyncio.run(invoke())
+
+    assert controller.running is False
+    assert controller._used is False
 
 
 def test_controller_restores_and_records_durable_input_delivery(ui):
@@ -125,7 +162,7 @@ def test_controller_restores_and_records_durable_input_delivery(ui):
     async def run_controller() -> None:
         """Run the controller until the restored owner operation settles."""
         read_inputs(ui, asyncio.Queue())
-        await controller.run(conversation)
+        await controller._run_sync_callback_async(conversation)
 
     asyncio.run(run_controller())
 
@@ -164,7 +201,7 @@ def test_controller_holds_queued_input_until_interrupted_run_is_recovered(ui):
         inputs.put_nowait("new message")
         inputs.put_nowait(False)
         read_inputs(ui, inputs)
-        await controller.run(conversation)
+        await controller._run_sync_callback_async(conversation)
 
     asyncio.run(run_controller())
 
@@ -192,7 +229,7 @@ def test_controller_persists_interaction_lifecycle_without_answer_values(ui):
     async def run_controller() -> None:
         """Settle the correlated prompt through the controller UI loop."""
         read_inputs(ui, asyncio.Queue())
-        await controller.run(conversation)
+        await controller._run_sync_callback_async(conversation)
 
     asyncio.run(run_controller())
 
@@ -225,7 +262,7 @@ def test_controller_does_not_present_interaction_when_request_commit_fails(ui):
             patch.object(store, "save", side_effect=OSError("store unavailable")),
             pytest.raises(OSError, match="store unavailable"),
         ):
-            await controller.run(conversation)
+            await controller._run_sync_callback_async(conversation)
 
     asyncio.run(run_controller())
 
@@ -254,7 +291,7 @@ def test_controller_does_not_acknowledge_input_when_admission_commit_fails(ui):
             patch.object(store, "save", side_effect=OSError("store unavailable")),
             pytest.raises(OSError, match="store unavailable"),
         ):
-            await controller.run(conversation)
+            await controller._run_sync_callback_async(conversation)
 
     asyncio.run(run_controller())
 
@@ -351,7 +388,7 @@ def test_controller_accepts_durable_input_when_mailbox_has_capacity(ui):
         """Submit ordinary text through the controller admission path."""
         submitted = asyncio.get_running_loop().create_future()
         submitted.set_result("accepted")
-        await controller._accept(submitted, route_idle_commands=False)
+        await controller._accept_async(submitted, route_idle_commands=False)
 
     asyncio.run(scenario())
 
@@ -422,7 +459,7 @@ def test_async_durable_control_admission_and_overflow(ui):
 def test_controller_bind_session_manager_after_start_is_rejected(ui):
     """Session persistence must be attached before the controller lifecycle starts."""
     controller = SessionController(ui)
-    asyncio.run(controller.run(lambda _receive: None))
+    asyncio.run(controller._run_sync_callback_async(lambda _receive: None))
 
     with pytest.raises(RuntimeError, match="Bind session persistence before running"):
         controller.bind_session_manager(SessionManager())
@@ -499,8 +536,8 @@ def test_controller_durable_admission_reject_helpers_preserve_memory_only_inputs
     controller = SessionController(ui)
     admission = InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "ordinary")
 
-    controller._reject_admission_sync(admission)
-    asyncio.run(controller._reject_admission(admission))
+    controller._reject_admission(admission)
+    asyncio.run(controller._reject_admission_async(admission))
 
     assert controller._queued_input_ids == set()
 
@@ -547,7 +584,7 @@ def test_controller_async_durable_rejection_discards_queued_identity(ui):
     event = manager.queue_input("rejected", priority=1)
     admission = controller._admission_from_event(event)
 
-    asyncio.run(controller._reject_admission(admission))
+    asyncio.run(controller._reject_admission_async(admission))
 
     assert event.input_id not in controller._queued_input_ids
     assert manager.session.pending_inputs == ()
@@ -558,7 +595,7 @@ def test_controller_durable_admission_without_session_manager_remains_in_memory(
     controller = SessionController(ui)
 
     admission = asyncio.run(
-        controller._durable_admission("correction", priority=0, bypass_commands=True)
+        controller._durable_admission_async("correction", priority=0, bypass_commands=True)
     )
 
     assert isinstance(admission.message, SteeringMessage)
@@ -582,9 +619,9 @@ def test_controller_accept_rejects_durable_input_when_mailbox_is_full(ui, active
         submitted.set_result("overflow")
         if active:
             with controller.control.execution():
-                await controller._accept(submitted, route_idle_commands=False)
+                await controller._accept_async(submitted, route_idle_commands=False)
         else:
-            await controller._accept(submitted, route_idle_commands=False)
+            await controller._accept_async(submitted, route_idle_commands=False)
 
     asyncio.run(scenario())
 
@@ -618,7 +655,7 @@ def test_durable_interaction_request_cancellation_is_propagated(ui):
     request = InteractionCall(ui.prompt, ("Question?",), {}, kind=EVENT_PROMPT)
 
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(controller._deliver(request))
+        asyncio.run(controller._deliver_async(request))
 
     assert isinstance(request.result.exception(), asyncio.CancelledError)
     ui.prompt_async.assert_not_awaited()
@@ -658,7 +695,7 @@ def test_controller_interaction_settlement_tracks_revocation_and_failure(ui, err
     controller._pending = request
     ui.prompt_async = AsyncMock(return_value="answer")
 
-    asyncio.run(controller._answer())
+    asyncio.run(controller._answer_async())
 
     assert manager.session.pending_interactions == ()
     assert manager.session.events[-1].outcome == outcome
@@ -702,7 +739,7 @@ def test_controller_surfaces_interaction_settlement_storage_failure(ui, prompt_f
             patch.object(store, "save", side_effect=OSError("store unavailable")),
             pytest.raises((ValueError, OSError), match=expected_error) as captured,
         ):
-            await controller._answer()
+            await controller._answer_async()
         return captured.value
 
     failure = asyncio.run(scenario())
@@ -776,7 +813,7 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
             receive(DummyCompleter())
 
         ui.info.side_effect = lambda message="": working.set() if message == "working" else None
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await working.wait()
@@ -844,7 +881,7 @@ def test_controller_rejects_inactive_and_unknown_slash_input_without_queueing(ui
                 release.wait()
             received.append(receive(DummyCompleter()))
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await working.wait()
@@ -909,7 +946,9 @@ def test_controller_routes_idle_commands_through_the_conversation_owner(ui):
                 received.append(value)
                 manager.handle_user_command(value)
 
-        task = asyncio.create_task(controller.run(conversation, route_idle_commands=True))
+        task = asyncio.create_task(
+            controller._run_sync_callback_async(conversation, route_idle_commands=True)
+        )
         try:
             await task
         finally:
@@ -994,7 +1033,7 @@ def test_active_commands_use_native_async_blocking_interactions(ui, kind, expect
 
     async def scenario():
         """Submit an active command and wait for its UI question to resolve."""
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await active.wait()
@@ -1067,7 +1106,7 @@ def test_active_command_finishes_after_conversation_worker_and_keeps_prompt_open
     async def scenario():
         """Resolve the prompt after conversation execution ends, then finish the command."""
         with controller.control.execution():
-            task = asyncio.create_task(controller.run(conversation))
+            task = asyncio.create_task(controller._run_sync_callback_async(conversation))
             try:
                 inputs.put_nowait("start")
                 inputs.put_nowait("/choose")
@@ -1131,7 +1170,7 @@ def test_stopping_releases_an_active_command_confirmation(ui):
 
     async def scenario():
         """Stop after the command confirmation opens and wait for clean settlement."""
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await active.wait()
@@ -1199,7 +1238,7 @@ def test_sync_controller_requires_its_command_executor_when_accepting_commands(u
         submitted = asyncio.get_running_loop().create_future()
         submitted.set_result("/help")
         with pytest.raises(RuntimeError, match="command executor is unavailable"):
-            await controller._accept(submitted, route_idle_commands=False)
+            await controller._accept_async(submitted, route_idle_commands=False)
 
     asyncio.run(scenario())
 
@@ -1241,7 +1280,7 @@ def test_interrupted_active_command_does_not_stop_the_controller(ui):
 
     async def scenario():
         """Interrupt the pending approval and allow both owners to settle normally."""
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await active.wait()
@@ -1303,7 +1342,7 @@ def test_failed_active_command_is_reported_during_controller_settlement(ui):
 
     async def scenario():
         """Raise the UI failure after controller cleanup settles both owners."""
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await active.wait()
@@ -1590,7 +1629,7 @@ def test_deliver_ignores_an_interaction_revoked_before_ui_delivery(ui):
     request = InteractionCall(ui.prompt, ("Question",), {}, kind=EVENT_PROMPT)
     request.result.set_exception(KeyboardInterrupt())
 
-    asyncio.run(controller._deliver(request))
+    asyncio.run(controller._deliver_async(request))
 
     assert controller._pending is None
     ui.prompt_async.assert_not_awaited()
@@ -1615,7 +1654,7 @@ def test_late_prompt_value_cannot_complete_a_revoked_interaction(ui):
 
     async def scenario():
         """Cancel the native prompt and let its adapter return a late value."""
-        answering = asyncio.create_task(controller._answer())
+        answering = asyncio.create_task(controller._answer_async())
         await started.wait()
         controller._stop()
         await answering
@@ -1647,7 +1686,7 @@ def test_late_prompt_completion_preserves_a_replacement_answer_task(ui, late_err
 
     async def scenario():
         """Revoke one request while another input task occupies the controller slot."""
-        answering = asyncio.create_task(controller._answer())
+        answering = asyncio.create_task(controller._answer_async())
         await started.wait()
         replacement_input = asyncio.get_running_loop().create_future()
         controller._answer_input = replacement_input
@@ -1820,7 +1859,7 @@ def test_controller_accepts_messages_and_status_during_serialized_work(ui):
                     controller.interaction.info("processed")
             controller.interaction.conversation_ended()
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("first")
             await started.wait()
@@ -1914,7 +1953,7 @@ def test_ordinary_input_during_active_run_is_deferred_steering(ui):
             consumed.set()
             receive(DummyCompleter())
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("first")
             await working.wait()
@@ -1978,7 +2017,7 @@ def test_controller_uses_the_native_prompt_for_blocking_interactions(ui, options
             controller.interaction.info("answered")
             receive(DummyCompleter())
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await question_visible.wait()
@@ -2012,7 +2051,7 @@ def test_controller_answers_blocking_prompt_when_no_editor_task_is_active(ui):
         """Request clarification before opening the ordinary message editor."""
         responses.append(controller.interaction.prompt("Clarify this value?"))
 
-    asyncio.run(controller.run(conversation))
+    asyncio.run(controller._run_sync_callback_async(conversation))
 
     assert responses == ["answer"]
     ui.prompt_async.assert_awaited_once()
@@ -2029,7 +2068,7 @@ def test_pending_confirmation_uses_the_native_confirmation_ui(ui):
         """Ask for approval before opening the ordinary message editor."""
         decisions.append(controller.interaction.confirm("Continue?", default=False))
 
-    asyncio.run(controller.run(conversation))
+    asyncio.run(controller._run_sync_callback_async(conversation))
 
     assert decisions == [False]
     ui.confirm_async.assert_awaited_once_with("Continue?", default=False)
@@ -2073,7 +2112,7 @@ def test_pending_question_preserves_choices_for_the_native_prompt(ui):
             controller.interaction.info("answered")
             receive(DummyCompleter())
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await question_open.wait()
@@ -2127,7 +2166,7 @@ def test_declining_a_pending_question_keeps_the_conversation_available(ui):
             controller.interaction.info("done")
             receive(DummyCompleter())
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await question_open.wait()
@@ -2163,7 +2202,7 @@ def test_stop_discards_input_completed_at_the_shutdown_boundary(ui):
         """Wait for input and record the shutdown signal instead of late text."""
         messages.append(receive(DummyCompleter()))
 
-    asyncio.run(controller.run(conversation))
+    asyncio.run(controller._run_sync_callback_async(conversation))
 
     assert messages == [False]
 
@@ -2205,7 +2244,7 @@ def test_interrupt_cancels_a_modal_prompt_and_restores_the_editor_draft(ui):
             controller.interaction.info("processed")
             receive(DummyCompleter())
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await prompt_open.wait()
@@ -2258,7 +2297,7 @@ def test_submitted_chat_remains_queued_when_a_modal_question_arrives(ui):
         )
         worker = asyncio.ensure_future(asyncio.wrap_future(request.result))
 
-        await controller._drive(worker, route_idle_commands=False)
+        await controller._drive_async(worker, route_idle_commands=False)
 
     asyncio.run(scenario())
     assert controller._inbox.get_nowait().message == "ordinary chat"
@@ -2298,7 +2337,7 @@ def test_cancelled_editor_task_does_not_block_a_modal_question(ui):
         )
         worker = asyncio.ensure_future(asyncio.wrap_future(request.result))
 
-        await controller._drive(worker, route_idle_commands=False)
+        await controller._drive_async(worker, route_idle_commands=False)
 
     asyncio.run(scenario())
     assert request.result.result() == "private response"
@@ -2320,7 +2359,7 @@ def test_controller_preserves_startup_prompts_and_masked_input(ui):
         """Read a startup secret through the UI without ordinary mailbox input."""
         values.append(controller.interaction.prompt("Credential:", secret=True, exit_commands=()))
 
-    asyncio.run(controller.run(conversation))
+    asyncio.run(controller._run_sync_callback_async(conversation))
 
     assert values == ["private-value"]
     ui.prompt_async.assert_awaited_once_with(
@@ -2340,7 +2379,11 @@ def test_controller_stops_before_startup_without_opening_input(ui):
     controller = SessionController(ui)
     controller.stop()
     values = []
-    asyncio.run(controller.run(lambda receive: values.append(receive(DummyCompleter()))))
+    asyncio.run(
+        controller._run_sync_callback_async(
+            lambda receive: values.append(receive(DummyCompleter()))
+        )
+    )
 
     assert values == [False]
     assert controller.control.stopped is True
@@ -2379,7 +2422,7 @@ def test_controller_bounds_queued_inputs_and_reports_unexecuted_inputs_on_exit(u
                 release.wait()
                 messages.append(receive(DummyCompleter()))
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("first")
             await started.wait()
@@ -2426,7 +2469,7 @@ def test_controller_revokes_pending_approval_on_shutdown(ui):
             receive(DummyCompleter())
             decisions.append(controller.interaction.confirm("Approve?", default=True))
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await prompted.wait()
@@ -2474,7 +2517,7 @@ def test_controller_keeps_live_completion_reads_out_of_active_execution(ui):
             controller.interaction.info("working")
             release.wait()
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("start")
             await started.wait()
@@ -2502,7 +2545,7 @@ def test_controller_propagates_worker_errors_and_restores_direct_interaction(ui)
         raise ValueError("execution failed")
 
     with pytest.raises(ValueError, match="execution failed"):
-        asyncio.run(controller.run(conversation))
+        asyncio.run(controller._run_sync_callback_async(conversation))
 
     assert controller.running is False
     controller.interaction.info("after failure")
@@ -2531,7 +2574,7 @@ def test_controller_cancellation_waits_for_execution_cleanup(ui):
                 cleanup_threads.append(get_ident())
                 controller.interaction.info("cleaned")
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             await started.wait()
             task.cancel()
@@ -2582,7 +2625,7 @@ def test_controller_hands_off_exclusive_terminal_without_starting_another_editor
             controller.interaction.info("released")
             receive(DummyCompleter())
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("manage")
             await held.wait()
@@ -2618,7 +2661,9 @@ def test_controller_rejects_blocking_mailbox_calls_from_its_ui_thread(ui):
                 ready.set()
 
         ui.info.side_effect = show
-        await controller.run(lambda _receive: controller.interaction.info("ready"))
+        await controller._run_sync_callback_async(
+            lambda _receive: controller.interaction.info("ready")
+        )
         assert ready.is_set()
 
     asyncio.run(scenario())
@@ -2849,14 +2894,14 @@ def test_async_controller_waits_for_owned_work_after_repeated_cancellation(ui):
         asyncio.Event(),
         asyncio.Event(),
     )
-    settle = controller._settle
+    settle = controller._settle_async
 
     async def observe_settlement(worker):
         """Expose the cleanup boundary before delegating to the real settlement loop."""
         cleanup_started.set()
         return await settle(worker)
 
-    controller._settle = observe_settlement
+    controller._settle_async = observe_settlement
 
     async def conversation(receive):
         """Keep owned work active until the test releases it."""
@@ -2981,8 +3026,8 @@ def test_async_controller_preserves_primary_and_secondary_failures(ui):
         """Fail the conversation owner independently of the UI driver."""
         raise OSError("conversation failed")
 
-    controller._drive = fail_after_owner
-    controller._settle = settle_with_command_failure
+    controller._drive_async = fail_after_owner
+    controller._settle_async = settle_with_command_failure
 
     with pytest.raises(ValueError, match="driver failed") as error:
         asyncio.run(controller.run_async(conversation))
@@ -3088,7 +3133,11 @@ def test_controller_preserves_output_failures_at_the_execution_boundary(ui):
     ui.answer.side_effect = ValueError("render failed")
 
     with pytest.raises(ValueError, match="render failed"):
-        asyncio.run(controller.run(lambda _receive: controller.interaction.answer("answer")))
+        asyncio.run(
+            controller._run_sync_callback_async(
+                lambda _receive: controller.interaction.answer("answer")
+            )
+        )
 
     assert controller.running is False
 
@@ -3104,7 +3153,7 @@ def test_controller_applies_backpressure_to_concurrent_tool_output(ui):
         with ThreadPoolExecutor(max_workers=3) as executor:
             list(executor.map(controller.interaction.info, (str(index) for index in range(30))))
 
-    asyncio.run(controller.run(conversation))
+    asyncio.run(controller._run_sync_callback_async(conversation))
 
     assert sorted(int(item.args[0]) for item in ui.info.call_args_list) == list(range(30))
     assert set(threads) == {get_ident()}
@@ -3128,7 +3177,7 @@ def test_controller_reports_blank_input_and_missing_response_requests(ui):
             False,
         ):
             inputs.put_nowait(value)
-        await controller.run(lambda receive: receive(DummyCompleter()))
+        await controller._run_sync_callback_async(lambda receive: receive(DummyCompleter()))
 
     asyncio.run(scenario())
     assert [item.args[0] for item in ui.warning.call_args_list] == [
@@ -3167,7 +3216,11 @@ def test_controller_propagates_errors_and_cancellation_from_active_request_input
     ui.confirm_async.side_effect = answer
     expected = asyncio.CancelledError if cancelled else ValueError
     with pytest.raises(expected):
-        asyncio.run(controller.run(lambda _receive: controller.interaction.confirm("Approve?")))
+        asyncio.run(
+            controller._run_sync_callback_async(
+                lambda _receive: controller.interaction.confirm("Approve?")
+            )
+        )
 
     assert controller.running is False
 
@@ -3187,7 +3240,7 @@ def test_controller_external_stop_cancels_an_active_decision_prompt(ui):
 
         ui.confirm_async.side_effect = answer
         task = asyncio.create_task(
-            controller.run(
+            controller._run_sync_callback_async(
                 lambda _receive: controller.interaction.confirm("Approve?", default=True)
             )
         )
@@ -3220,7 +3273,7 @@ def test_controller_external_stop_cancels_an_active_secret_prompt(ui):
 
         ui.prompt_async.side_effect = answer
         task = asyncio.create_task(
-            controller.run(
+            controller._run_sync_callback_async(
                 lambda _receive: controller.interaction.prompt("Credential:", secret=True)
             )
         )
@@ -3246,7 +3299,7 @@ def test_controller_propagates_failures_from_a_masked_prompt(ui, failure):
 
     with pytest.raises(failure):
         asyncio.run(
-            controller.run(
+            controller._run_sync_callback_async(
                 lambda _receive: controller.interaction.prompt("Credential:", secret=True)
             )
         )
@@ -3270,7 +3323,7 @@ def test_controller_rejects_a_new_approval_requested_after_stop(ui):
             release.wait()
             controller.interaction.confirm("Too late", default=True)
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             await started.wait()
             controller.stop()
@@ -3308,7 +3361,7 @@ def test_controller_retains_cleanup_failure_evidence_during_repeated_cancellatio
                 release.wait()
             raise ValueError("cleanup failed")
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             await started.wait()
             task.cancel()
@@ -3348,7 +3401,9 @@ def test_controller_external_stop_releases_an_idle_reader_without_admitting_late
 
         ui.prompt_async.side_effect = read
         task = asyncio.create_task(
-            controller.run(lambda receive: messages.append(receive(DummyCompleter())))
+            controller._run_sync_callback_async(
+                lambda receive: messages.append(receive(DummyCompleter()))
+            )
         )
         try:
             await opened.wait()
@@ -3373,7 +3428,7 @@ def test_controller_preserves_unrequested_worker_interruption(ui):
         raise KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
-        asyncio.run(controller.run(conversation))
+        asyncio.run(controller._run_sync_callback_async(conversation))
     assert controller.running is False
 
 
@@ -3413,7 +3468,7 @@ def test_controller_stop_tolerates_the_event_loop_settling_in_another_thread(ui,
             release_worker.wait()
 
         monkeypatch.setattr(loop, "call_soon_threadsafe", call_soon)
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         thread = Thread(target=stop)
         try:
             await started.wait()
@@ -3454,7 +3509,9 @@ def test_controller_stop_preserves_real_scheduler_failures(ui, monkeypatch):
                     controller.stop()
 
         ui.info.side_effect = output
-        await controller.run(lambda _receive: controller.interaction.info("working"))
+        await controller._run_sync_callback_async(
+            lambda _receive: controller.interaction.info("working")
+        )
 
     asyncio.run(scenario())
 
@@ -3482,7 +3539,9 @@ def test_controller_cancellation_does_not_lose_dequeued_output(ui, monkeypatch):
 
         monkeypatch.setattr(controller_module.asyncio, "Queue", CancellationQueue)
         task = asyncio.create_task(
-            controller.run(lambda _receive: controller.interaction.info("buffered output"))
+            controller._run_sync_callback_async(
+                lambda _receive: controller.interaction.info("buffered output")
+            )
         )
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -3522,7 +3581,7 @@ def test_controller_reports_discarded_inputs_without_hiding_primary_failures(ui,
             if worker_failure:
                 raise LookupError("worker failed")
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("first")
             await working.wait()
@@ -3588,7 +3647,7 @@ def test_steering_precedes_queued_messages_and_keeps_corrections_in_submission_o
             controller.interaction.info("done")
             receive(DummyCompleter())
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("first")
             await working.wait()
@@ -3653,7 +3712,7 @@ def test_run_interruption_revokes_pending_approval_without_ending_the_chat(ui):
             controller.interaction.info("processed")
             receive(DummyCompleter())
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("first")
             await prompted.wait()
@@ -3709,7 +3768,7 @@ def test_rejected_steering_does_not_interrupt_or_displace_a_full_mailbox(ui):
                 received.append(receive(DummyCompleter()))
             controller.interaction.info("checked")
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("first")
             await working.wait()
@@ -3768,7 +3827,7 @@ def test_interrupted_runs_cannot_open_late_questions_or_terminal_handoffs(ui, op
             controller.interaction.info("completed")
             receive(DummyCompleter())
 
-        task = asyncio.create_task(controller.run(conversation))
+        task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
             inputs.put_nowait("first")
             await working.wait()

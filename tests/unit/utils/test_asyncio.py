@@ -9,11 +9,11 @@ import pytest
 
 import loop.utils.asyncio as asyncio_utils
 from loop.utils import (
-    await_value,
+    await_value_async,
     close_awaitable,
     has_running_event_loop,
     is_async_callable,
-    run_in_worker,
+    run_in_worker_async,
 )
 
 
@@ -91,7 +91,7 @@ def test_await_value_wraps_futures_for_runner_dispatch():
     try:
         future = runner.get_loop().create_future()
         future.set_result("resolved")
-        assert runner.run(await_value(future)) == "resolved"
+        assert runner.run(await_value_async(future)) == "resolved"
     finally:
         runner.close()
 
@@ -104,7 +104,7 @@ def test_run_in_worker_offloads_and_preserves_context():
 
     async def scenario():
         """Return worker identity and its copied correlation value."""
-        return await run_in_worker(lambda: (get_ident(), correlation.get()))
+        return await run_in_worker_async(lambda: (get_ident(), correlation.get()))
 
     worker, value = asyncio.run(scenario())
 
@@ -120,7 +120,7 @@ def test_run_in_worker_propagates_operation_failures():
         raise ValueError("operation failed")
 
     with pytest.raises(ValueError, match="operation failed"):
-        asyncio.run(run_in_worker(fail))
+        asyncio.run(run_in_worker_async(fail))
 
 
 def test_run_in_worker_rejects_full_admission(monkeypatch):
@@ -128,7 +128,7 @@ def test_run_in_worker_rejects_full_admission(monkeypatch):
     monkeypatch.setattr(asyncio_utils, "_WORKER_SLOTS", BoundedSemaphore(0))
 
     with pytest.raises(RuntimeError, match="worker queue is full"):
-        asyncio.run(run_in_worker(lambda: None))
+        asyncio.run(run_in_worker_async(lambda: None))
 
 
 def test_run_in_worker_releases_admission_when_executor_submission_fails(monkeypatch):
@@ -164,7 +164,7 @@ def test_run_in_worker_releases_admission_when_executor_submission_fails(monkeyp
     monkeypatch.setattr(asyncio_utils, "_WORKER_EXECUTOR", Executor())
 
     with pytest.raises(RuntimeError, match="executor closed"):
-        asyncio.run(run_in_worker(lambda: None))
+        asyncio.run(run_in_worker_async(lambda: None))
 
     assert slots.released == 1
 
@@ -179,7 +179,7 @@ def test_run_in_worker_reports_a_cancelled_executor_future(monkeypatch):
         pending.cancel()
         monkeypatch.setattr(loop, "run_in_executor", lambda *args: pending)
         with pytest.raises(asyncio.CancelledError) as captured:
-            await run_in_worker(lambda: None)
+            await run_in_worker_async(lambda: None)
         return captured.value
 
     error = asyncio.run(scenario())
@@ -206,7 +206,7 @@ def test_run_in_worker_settles_admitted_work_before_propagating_cancellation(fai
 
     async def scenario():
         """Cancel twice while the worker remains owned, then release it."""
-        task = asyncio.create_task(run_in_worker(work))
+        task = asyncio.create_task(run_in_worker_async(work))
         while not started.is_set():
             await asyncio.sleep(0)
         task.cancel()
@@ -227,8 +227,8 @@ def test_run_in_worker_settles_admitted_work_before_propagating_cancellation(fai
 
 def test_package_exports_asyncio_helpers():
     """The utility package exposes the asyncio helpers from their topic module."""
-    assert await_value is asyncio_utils.await_value
+    assert await_value_async is asyncio_utils.await_value_async
     assert close_awaitable is asyncio_utils.close_awaitable
     assert has_running_event_loop is asyncio_utils.has_running_event_loop
     assert is_async_callable is asyncio_utils.is_async_callable
-    assert run_in_worker is asyncio_utils.run_in_worker
+    assert run_in_worker_async is asyncio_utils.run_in_worker_async

@@ -42,7 +42,12 @@ class CommandContext:
         compare=False,
     )
 
-    async def run_blocking(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    async def run_blocking_async(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         """Run a synchronous leaf operation through the command manager's bounded worker.
 
         In a synchronous command invocation, call the operation directly. Async command

@@ -49,7 +49,7 @@ from ..utils import (
     get_binary,
     new_uuid,
     register_cached_metadata,
-    run_in_worker,
+    run_in_worker_async,
     sha256_digest,
     store_content,
     utc_now,
@@ -1104,7 +1104,7 @@ class SessionManager:
             if callable(async_generator):
                 name = await async_generator(user_message, assistant_message, self._session.model)
             else:
-                name = await self._run_blocking(
+                name = await self._run_blocking_async(
                     generator.generate,
                     user_message,
                     assistant_message,
@@ -1677,7 +1677,7 @@ class SessionManager:
                 candidate,
             )
             if self._async_blocking_runner is not None
-            else run_in_worker(
+            else run_in_worker_async(
                 self._save_snapshot,
                 self._session_store,
                 self._persistence_lock,
@@ -1734,12 +1734,12 @@ class SessionManager:
         with persistence_lock:
             return session_store.save(session)
 
-    async def _run_blocking(self, function: Callable[..., Any], *args: Any) -> Any:
+    async def _run_blocking_async(self, function: Callable[..., Any], *args: Any) -> Any:
         """Settle one synchronous operation before returning or propagating cancellation."""
         pending = asyncio.ensure_future(
             self._async_blocking_runner(function, *args)
             if self._async_blocking_runner is not None
-            else run_in_worker(function, *args)
+            else run_in_worker_async(function, *args)
         )
         cancellation = None
         try:

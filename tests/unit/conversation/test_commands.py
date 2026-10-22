@@ -1,6 +1,7 @@
 """Verify the responsive conversation command provider."""
 
 import asyncio
+from inspect import iscoroutinefunction
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -16,7 +17,7 @@ from loop import (
     CompletionValue,
     Interaction,
 )
-from loop.conversation.commands import ConversationCommands
+from loop.conversation.commands import ConversationCommands, ConversationControl
 from loop.conversation.models import ConversationStatus, ResponseOutcome, SteeringOutcome
 
 
@@ -37,9 +38,11 @@ def test_provider_declares_state_capabilities_and_response_completion():
         "interrupt",
         "respond",
         "status",
-        "steer",
-        "queue",
+        "steer_async",
+        "queue_async",
     ]
+    assert registrations[3].name == "steer"
+    assert registrations[4].name == "queue"
     assert registrations[0].capabilities == frozenset({CommandCapability.RUN_ACTIVE})
     assert registrations[1].capabilities == frozenset({CommandCapability.PENDING_RESPONSE})
     assert registrations[2].capabilities == frozenset(
@@ -48,6 +51,14 @@ def test_provider_declares_state_capabilities_and_response_completion():
     assert registrations[3].capabilities == frozenset({CommandCapability.RUN_ACTIVE})
     assert registrations[1].completion.provider == control.response_completions
     assert registrations[-1].completion == CommandCompletion()
+
+
+def test_control_protocol_declares_sync_and_async_control_methods():
+    """The control contract preserves native sync methods beside async counterparts."""
+    assert callable(ConversationControl.steer)
+    assert callable(ConversationControl.queue)
+    assert iscoroutinefunction(ConversationControl.steer_async)
+    assert iscoroutinefunction(ConversationControl.queue_async)
 
 
 def test_respond_argument_completes_the_pending_response_values():
@@ -156,7 +167,7 @@ def test_queue_reports_admission_outcomes(command_context, message, accepted, ex
     control = Mock()
     control.queue_async = AsyncMock(return_value=accepted)
 
-    asyncio.run(ConversationCommands(control).queue(context, message))
+    asyncio.run(ConversationCommands(control).queue_async(context, message))
 
     if accepted is None:
         control.queue_async.assert_not_awaited()
@@ -201,7 +212,7 @@ def test_steer_reports_validation_and_control_outcomes(
     control = Mock()
     control.steer_async = AsyncMock(return_value=outcome)
 
-    asyncio.run(ConversationCommands(control).steer(context, message))
+    asyncio.run(ConversationCommands(control).steer_async(context, message))
 
     if outcome is None:
         control.steer_async.assert_not_awaited()

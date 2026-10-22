@@ -35,10 +35,10 @@ class ModelCommands:
             tuple[CommandRegistration, ...]: Model discovery and selection commands.
         """
         return (
-            CommandRegistration(self.check, name="check"),
-            CommandRegistration(self.models, name="models"),
+            CommandRegistration(self.check_async, name="check"),
+            CommandRegistration(self.models_async, name="models"),
             CommandRegistration(
-                self.model,
+                self.model_async,
                 name="model",
                 completion=CommandCompletion(provider="models"),
             ),
@@ -64,11 +64,14 @@ class ModelCommands:
             for model in self._available()
         )
 
-    async def check(self, context: CommandContext) -> None:
+    async def check_async(self, context: CommandContext) -> None:
         """Check backend reachability and the effective model's availability.
 
         Args:
             context (CommandContext): Interaction used to report status and select a fallback.
+
+        Returns:
+            None: After reporting backend and selected-model status.
         """
         try:
             models = await self._model_selection.available_async()
@@ -80,19 +83,22 @@ class ModelCommands:
             model = self._model_selection.effective
         except ModelSelectionError:
             context.interaction.warning("Backend is available, but no model is selected.")
-            await self._select_fallback(context)
+            await self._select_fallback_async(context)
             return
         if model in {available_model.id for available_model in models}:
             context.interaction.info(f"Backend is available. Model '{model}' is available.")
             return
         context.interaction.warning(f"Backend is available, but model '{model}' is not available.")
-        await self._select_fallback(context)
+        await self._select_fallback_async(context)
 
-    async def models(self, context: CommandContext) -> None:
+    async def models_async(self, context: CommandContext) -> None:
         """List all models available from the backend.
 
         Args:
             context (CommandContext): Interaction used to display the model catalog.
+
+        Returns:
+            None: After displaying the available models or reporting an empty catalog.
         """
         try:
             models = await self._model_selection.available_async()
@@ -118,7 +124,7 @@ class ModelCommands:
             columns=("id", "context_window"),
         )
 
-    async def model(
+    async def model_async(
         self,
         context: CommandContext,
         name: Annotated[
@@ -131,6 +137,9 @@ class ModelCommands:
         Args:
             context (CommandContext): Interaction used to display model selection status.
             name (str | None): Exact backend model ID, or ``None`` to show the selection.
+
+        Returns:
+            None: After displaying or updating the selected model.
         """
         if name is None:
             selected = self._model_selection.selected
@@ -157,7 +166,7 @@ class ModelCommands:
         """Return models currently available from the backend."""
         return self._model_selection.available()
 
-    async def _select_fallback(self, context: CommandContext) -> None:
+    async def _select_fallback_async(self, context: CommandContext) -> None:
         """Select a replacement model and report expected persistence failures."""
         try:
             await self._model_selection.select_fallback_async(context.interaction)

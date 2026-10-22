@@ -24,7 +24,7 @@ from ..utils import (
     get_binary,
     is_path_ignored,
     iter_visible_paths,
-    run_in_worker,
+    run_in_worker_async,
 )
 
 
@@ -306,7 +306,7 @@ class ProjectPathMentionHandler(MentionHandler):
                 ignore_invalid,
             )
             if self._async_blocking_runner is not None
-            else run_in_worker(
+            else run_in_worker_async(
                 self._read_mentioned_paths,
                 root,
                 tuple(values),

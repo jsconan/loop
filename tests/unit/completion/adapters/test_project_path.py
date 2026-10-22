@@ -124,7 +124,7 @@ def test_async_project_path_completion_discards_results_after_root_change(tmp_pa
     directory = PathHolder(old_root)
     calls = 0
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Run one operation and switch roots before its result returns to the owner."""
         nonlocal calls
         result = function(*args)
@@ -136,7 +136,7 @@ def test_async_project_path_completion_discards_results_after_root_change(tmp_pa
     adapter = ProjectPathCompletionAdapter(
         "@",
         directory,
-        async_blocking_runner=run_blocking,
+        async_blocking_runner=run_blocking_async,
     )
 
     assert asyncio.run(adapter.values_async()) == ()
@@ -149,7 +149,7 @@ def test_async_project_path_completion_uses_injected_bounded_worker(tmp_path):
     executor = ThreadPoolExecutor(max_workers=1)
     calls = []
 
-    async def run_blocking(function, *args):
+    async def run_blocking_async(function, *args):
         """Submit detached path discovery to the controlled worker pool."""
         calls.append((function, args))
         return await asyncio.get_running_loop().run_in_executor(executor, function, *args)
@@ -157,7 +157,7 @@ def test_async_project_path_completion_uses_injected_bounded_worker(tmp_path):
     adapter = ProjectPathCompletionAdapter(
         "@",
         PathHolder(tmp_path),
-        async_blocking_runner=run_blocking,
+        async_blocking_runner=run_blocking_async,
     )
 
     try:
