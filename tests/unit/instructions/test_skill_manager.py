@@ -73,6 +73,33 @@ def test_discovery_reads_metadata_and_activation_lazily_loads_and_caches_body(
     assert reads == [location.resolve()]
 
 
+def test_prepared_skill_instructions_can_be_applied_without_a_second_file_read(
+    tmp_path, monkeypatch
+):
+    """Prepared instruction bodies can be applied once while preserving lazy loading."""
+    location = write_skill(tmp_path / "skills" / "review", "review", "Review skill.")
+    manager = SkillManager.discover(tmp_path, [tmp_path / "skills"])
+    original_read_text = Path.read_text
+    reads = []
+
+    def tracked_read_text(path, *args, **kwargs):
+        """Record skill body reads while preserving normal path behavior."""
+        if path == location:
+            reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", tracked_read_text)
+
+    instructions = manager.read_instructions("review")
+    result = manager.activate("review", content=instructions)
+
+    assert instructions == "Instructions"
+    assert result["instructions_updated"] is True
+    assert manager.activated_instructions == ((manager.skills[0], "Instructions"),)
+    assert reads == [location]
+    assert manager.read_instructions("missing").code == "skill.unknown"
+
+
 def test_activated_skills_returns_immutable_discovery_ordered_snapshot(tmp_path):
     """Activated skills are returned as an immutable snapshot in discovery order."""
     skills_directory = tmp_path / "skills"

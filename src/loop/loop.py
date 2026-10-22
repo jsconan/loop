@@ -245,6 +245,7 @@ class Loop:
             configured_interaction,
             directory_reference,
             threshold=compaction_threshold,
+            instructions_async=lambda: configured_instructions.prepare_async(configured_agent),
         )
         configured_runner = AgentRunner(
             configured_agent,
@@ -772,14 +773,14 @@ class Loop:
                                 )
                             )
                         )
-                        if not self._instructions_manager.set_skill_catalog_priorities(
+                        if not await self._instructions_manager.set_skill_catalog_priorities_async(
                             skill_mentions, self._agent
                         ):
                             self._interaction.warning(
                                 "Referenced skill metadata could not fit in the instruction budget; "
                                 "use activate_skill to load a skill."
                             )
-                    except (OSError, UnicodeError, ValueError) as error:
+                    except (OSError, UnicodeError, ValueError, RuntimeError) as error:
                         problem = Problem.from_exception(
                             error,
                             code="skill_hint.preparation_failed",
@@ -791,7 +792,7 @@ class Loop:
                         continue
                 try:
                     context = await self._mention_manager.resolve_async(user_input)
-                except (OSError, UnicodeError, ValueError) as error:
+                except (OSError, UnicodeError, ValueError, RuntimeError) as error:
                     problem = Problem.from_exception(
                         error,
                         code="mention.resolution_failed",
@@ -801,7 +802,7 @@ class Loop:
                     log_problem(_LOGGER, problem, error)
                     self._interaction.report(problem)
                     if self._skill_hints_enabled:
-                        self._clear_skill_catalog_priorities()
+                        await self._clear_skill_catalog_priorities_async()
                     continue
                 try:
                     with self._session_manager.next_message_span():
@@ -829,7 +830,7 @@ class Loop:
                         await self._complete_agent_run_async(result)
                 finally:
                     if self._skill_hints_enabled:
-                        self._clear_skill_catalog_priorities()
+                        await self._clear_skill_catalog_priorities_async()
 
         self._interaction.conversation_ended()
 
@@ -838,6 +839,20 @@ class Loop:
         try:
             self._instructions_manager.set_skill_catalog_priorities(())
         except (OSError, UnicodeError, ValueError) as error:
+            problem = Problem.from_exception(
+                error,
+                code="skill_hint.cleanup_failed",
+                title="Could not clear skill hint",
+                operation="clear_skill_hint",
+            )
+            log_problem(_LOGGER, problem, error)
+            self._interaction.report(problem)
+
+    async def _clear_skill_catalog_priorities_async(self) -> None:
+        """Clear request-scoped skill priorities without masking the preceding outcome."""
+        try:
+            await self._instructions_manager.set_skill_catalog_priorities_async(())
+        except (OSError, UnicodeError, ValueError, RuntimeError) as error:
             problem = Problem.from_exception(
                 error,
                 code="skill_hint.cleanup_failed",

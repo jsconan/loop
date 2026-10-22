@@ -1641,7 +1641,7 @@ def test_run_async_handles_skill_priorities_and_attached_reference_sizes(tmp_pat
     loop._skill_hints_enabled = True
     instructions = Mock()
     instructions.skill_manager.names = ("guide",)
-    instructions.set_skill_catalog_priorities.return_value = True
+    instructions.set_skill_catalog_priorities_async = AsyncMock(return_value=True)
     loop._instructions_manager = instructions
     references = [
         ContextReference(
@@ -1687,7 +1687,7 @@ def test_run_async_handles_skill_priorities_and_attached_reference_sizes(tmp_pat
 
     asyncio.run(loop.run_async(input_source=read_input))
 
-    instructions.set_skill_catalog_priorities.assert_has_calls(
+    instructions.set_skill_catalog_priorities_async.assert_has_awaits(
         [call(("guide",), loop.agent), call(())]
     )
     assert interaction.info.call_args_list[:2] == [
@@ -1707,7 +1707,7 @@ def test_run_async_warns_when_skill_metadata_does_not_fit(tmp_path):
     loop._skill_hints_enabled = True
     instructions = Mock()
     instructions.skill_manager.names = ("guide",)
-    instructions.set_skill_catalog_priorities.return_value = False
+    instructions.set_skill_catalog_priorities_async = AsyncMock(return_value=False)
     loop._instructions_manager = instructions
     loop._mention_manager.resolve_async = AsyncMock(return_value=[])
     loop._session_manager.add_user_message = Mock()
@@ -1743,6 +1743,56 @@ def test_run_async_warns_when_skill_metadata_does_not_fit(tmp_path):
     loop.agent_runner.run_async.assert_awaited_once_with()
 
 
+def test_run_async_reports_skill_hint_cleanup_failure_after_completion(tmp_path):
+    """Async hint cleanup failures are reported without masking a completed turn."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._skill_hints_enabled = True
+    instructions = Mock()
+    instructions.skill_manager.names = ("guide",)
+
+    async def set_priorities(names, agent=None):
+        """Accept the request hint and fail only when cleanup clears it."""
+        if names:
+            return True
+        raise UnicodeError("invalid project instructions")
+
+    instructions.set_skill_catalog_priorities_async = AsyncMock(side_effect=set_priorities)
+    loop._instructions_manager = instructions
+    loop._mention_manager.resolve_async = AsyncMock(return_value=[])
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    loop.agent_runner.run_async = AsyncMock(
+        return_value=AgentRunResult(
+            final_response=None,
+            turns=0,
+            stop_reason="cancelled",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+    values = iter(("$guide", False))
+
+    async def read_input(_completer):
+        """Return one skill hint, then finish the conversation."""
+        return next(values)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    assert interaction.report.call_args.args[0].code == "skill_hint.cleanup_failed"
+    loop.agent_runner.run_async.assert_awaited_once_with()
+
+
 @pytest.mark.parametrize(
     ("failure", "skill_hints_enabled"),
     [("priority", True), ("mention", True), ("mention", False)],
@@ -1758,8 +1808,8 @@ def test_run_async_reports_message_preparation_failures(tmp_path, failure, skill
     loop._skill_hints_enabled = skill_hints_enabled
     instructions = Mock()
     instructions.skill_manager.names = ("guide",)
-    instructions.set_skill_catalog_priorities.side_effect = (
-        ValueError("priority") if failure == "priority" else None
+    instructions.set_skill_catalog_priorities_async = AsyncMock(
+        side_effect=(ValueError("priority") if failure == "priority" else None)
     )
     loop._instructions_manager = instructions
     if failure == "mention":
@@ -1779,11 +1829,11 @@ def test_run_async_reports_message_preparation_failures(tmp_path, failure, skill
     interaction.report.assert_called_once()
     assert loop.agent_runner.run_async.await_count == 0
     if failure == "mention" and skill_hints_enabled:
-        instructions.set_skill_catalog_priorities.assert_has_calls(
+        instructions.set_skill_catalog_priorities_async.assert_has_awaits(
             [call(("guide",), loop.agent), call(())]
         )
     elif failure == "mention":
-        instructions.set_skill_catalog_priorities.assert_not_called()
+        instructions.set_skill_catalog_priorities_async.assert_not_awaited()
 
 
 def test_run_does_not_offer_to_retry_permanent_failures(tmp_path):

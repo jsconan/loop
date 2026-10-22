@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from .. import constants
@@ -13,7 +13,7 @@ from ..model_selection import ModelSelection
 from ..models import CompactionResult
 from ..session import SessionManager
 from ..telemetry import telemetry_activity, telemetry_error
-from ..utils import PathHolder, PathReference
+from ..utils import PathHolder, PathReference, run_in_worker_async
 
 
 class ContextCompaction:
@@ -25,6 +25,9 @@ class ContextCompaction:
         model_selection (ModelSelection): Active model and context-window selection.
         instructions (Callable[[], PreparedInstructions]): Provider that prepares exact
             model-ready instructions for an explicit agent.
+        instructions_async (Callable[[], Awaitable[PreparedInstructions]] | None): Native async
+            provider used by ``compact_async``. If omitted, the synchronous provider runs through
+            bounded worker admission.
         interaction (Interaction): Service used to report compaction progress and outcomes.
         working_directory (str | Path | PathReference): Current working-directory reference.
         threshold (float): Context-window utilization that triggers automatic compaction.
@@ -38,6 +41,7 @@ class ContextCompaction:
     _session_manager: SessionManager
     _model_selection: ModelSelection
     _instructions: Callable[[], PreparedInstructions]
+    _instructions_async: Callable[[], Awaitable[PreparedInstructions]] | None
     _interaction: Interaction
     _working_directory: PathReference
     _threshold: float
@@ -52,6 +56,7 @@ class ContextCompaction:
         working_directory: str | Path | PathReference,
         *,
         threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
+        instructions_async: Callable[[], Awaitable[PreparedInstructions]] | None = None,
     ) -> None:
         if not 0 < threshold < 1:
             raise ValueError("Compaction threshold must be between zero and one.")
@@ -59,6 +64,7 @@ class ContextCompaction:
         self._session_manager = session_manager
         self._model_selection = model_selection
         self._instructions = instructions
+        self._instructions_async = instructions_async
         self._interaction = interaction
         self._working_directory = PathHolder.from_value(working_directory)
         self._threshold = threshold
@@ -159,6 +165,9 @@ class ContextCompaction:
         Raises:
             BackendError: If the provider request or response fails.
             ValueError: If compaction is required but no effective model is configured.
+            RuntimeError: Bounded worker admission is full or unavailable when no async provider
+                was configured.
+            asyncio.CancelledError: The task is cancelled after instruction preparation settles.
         """
         if not self.needed():
             return False
@@ -220,12 +229,19 @@ class ContextCompaction:
         Raises:
             BackendError: If the provider request or response fails.
             ValueError: If no effective model is configured.
+            RuntimeError: Bounded worker admission is full or unavailable when no async provider
+                was configured.
             asyncio.CancelledError: If backend compaction or session persistence is cancelled.
         """
         if not self._can_start(force):
             return False
 
-        snapshot = instructions or self._instructions()
+        if instructions is not None:
+            snapshot = instructions
+        elif self._instructions_async is not None:
+            snapshot = await self._instructions_async()
+        else:
+            snapshot = await run_in_worker_async(self._instructions)
         model = self._model_selection.effective
         await self._start_async(model)
         try:

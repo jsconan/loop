@@ -27,6 +27,15 @@ from .models import (
 from .utils import get_skill_directories, read_instruction_body, read_instruction_frontmatter
 
 
+def _read_skill_instructions(location: Path) -> str:
+    """Read and validate one complete skill instruction body."""
+    return read_instruction_body(
+        location.read_text(encoding="utf-8"),
+        location.name,
+        require_frontmatter=True,
+    )
+
+
 class SkillManager:
     """Discover unique skill metadata and load complete instructions on activation.
 
@@ -263,14 +272,26 @@ class SkillManager:
             diagnostics=list(self._diagnostics),
         )
 
-    def activate(self, name: str) -> SkillActivationResponse:
+    def activate(
+        self,
+        name: str,
+        *,
+        content: str | None = None,
+    ) -> SkillActivationResponse:
         """Load one skill's complete instructions into managed state.
 
         Args:
             name (str): Exact skill name to activate.
+            content (str | None): Previously read and parsed instruction body. ``None`` reads the
+                skill file synchronously.
 
         Returns:
             SkillActivationResponse: Activation metadata or a structured missing result.
+
+        Raises:
+            OSError: The skill instruction file cannot be read.
+            UnicodeError: The skill instruction file is not valid UTF-8.
+            ValueError: The skill instruction file has malformed required frontmatter.
         """
         skill = self._skills_by_name.get(name)
         if skill is None:
@@ -282,18 +303,38 @@ class SkillManager:
             )
         instructions_updated = skill.location not in self._activated
         if instructions_updated:
-            content = skill.location.read_text(encoding="utf-8")
-            self._activated[skill.location] = read_instruction_body(
-                content,
-                skill.location.name,
-                require_frontmatter=True,
-            )
+            instructions = _read_skill_instructions(skill.location) if content is None else content
+            self._activated[skill.location] = instructions
         return SkillActivationResult(
             **self._summary(skill),
             skill_root=str(skill.location.parent),
             status="activated",
             instructions_updated=instructions_updated,
         )
+
+    def read_instructions(self, name: str) -> str | SkillOperationError:
+        """Read and validate one skill body without changing activation state.
+
+        Args:
+            name (str): Exact skill name whose instruction file should be read.
+
+        Returns:
+            str | SkillOperationError: Parsed body or a structured missing-skill result.
+
+        Raises:
+            OSError: The skill instruction file cannot be read.
+            UnicodeError: The skill instruction file is not valid UTF-8.
+            ValueError: The skill instruction file has malformed required frontmatter.
+        """
+        skill = self._skills_by_name.get(name)
+        if skill is None:
+            return SkillOperationError(
+                code="skill.unknown",
+                title="Skill unavailable",
+                detail=f"Skill '{name}' is not available.",
+                operation="activate_skill",
+            )
+        return _read_skill_instructions(skill.location)
 
     def deactivate(self, name: str) -> SkillDeactivationResponse:
         """Deactivate one skill and release its instructions.

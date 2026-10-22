@@ -1,10 +1,13 @@
 """Tests for composing dynamic backend instructions."""
 
+import asyncio
 import os
 from pathlib import Path
+from threading import get_ident
 
 import pytest
 
+import loop.instructions.instructions as instructions_module
 from loop import (
     Agent,
     AgentIdentity,
@@ -14,6 +17,7 @@ from loop import (
     Skill,
     SkillManager,
 )
+from loop.instructions.models import SkillOperationError
 
 TEST_POLICY = AgentInstructions("Test policy.", "test", "tests")
 
@@ -53,6 +57,253 @@ def test_manager_requires_an_explicit_agent_for_each_snapshot():
     assert snapshot.content == first.content
     with pytest.raises(ValueError, match="Prepared instructions exceed"):
         InstructionsManager(max_bytes=2).snapshot(configured_agent())
+
+
+def test_async_prepare_reads_changed_project_instructions_on_a_worker(tmp_path, monkeypatch):
+    """Async snapshots reload changed project instructions outside the event-loop thread."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("Initial rules.", encoding="utf-8")
+    manager = configured_discovered(tmp_path)
+    agents.write_text("Updated rules.", encoding="utf-8")
+    original_read_text = Path.read_text
+    read_threads = []
+
+    def read_text(path, *args, **kwargs):
+        """Record project instruction reads while preserving normal path behavior."""
+        if path == agents:
+            read_threads.append(get_ident())
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    owner_thread = get_ident()
+    snapshot = asyncio.run(manager.prepare_async(configured_agent()))
+
+    assert "Updated rules." in snapshot.content
+    assert read_threads and all(thread != owner_thread for thread in read_threads)
+    assert snapshot.content == manager.prepare(configured_agent()).content
+    assert asyncio.run(manager.refresh_async()) is False
+
+
+def test_async_prepare_enforces_agent_instruction_budget():
+    """Async snapshots reject composed instructions beyond the configured hard limit."""
+    manager = configured_manager(max_bytes=2)
+
+    with pytest.raises(ValueError, match="Prepared instructions exceed"):
+        asyncio.run(manager.prepare_async(configured_agent()))
+
+
+def test_async_refresh_publishes_static_instruction_updates(tmp_path):
+    """Async refresh installs project instructions without replacing an injected skill manager."""
+    manager = InstructionsManager(working_directory=tmp_path)
+    (tmp_path / "AGENTS.md").write_text("Updated static rules.", encoding="utf-8")
+
+    assert asyncio.run(manager.refresh_async()) is True
+    assert "Updated static rules." in manager.instructions
+
+
+def test_async_refresh_rejects_a_missing_discovered_skill_snapshot(tmp_path, monkeypatch):
+    """Async refresh reports an invalid detached skill discovery result."""
+    manager = configured_discovered(tmp_path)
+    manager.invalidate()
+    monkeypatch.setattr(SkillManager, "rediscover", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="refreshed skill manager is required"):
+        asyncio.run(manager.refresh_async())
+
+
+def test_async_refresh_discards_candidates_after_workspace_change(tmp_path, monkeypatch):
+    """A refresh candidate for an old directory cannot replace a newer workspace scope."""
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    (old_root / "AGENTS.md").write_text("Old rules.", encoding="utf-8")
+    (new_root / "AGENTS.md").write_text("New rules.", encoding="utf-8")
+    manager = configured_discovered(old_root)
+    manager.invalidate()
+    original_worker = instructions_module.run_in_worker_async
+    calls = 0
+
+    async def switch_after_first_candidate(function, *args):
+        """Change the scope after one detached candidate has finished loading."""
+        nonlocal calls
+        calls += 1
+        result = await original_worker(function, *args)
+        if calls == 1:
+            manager.set_working_directory(new_root)
+        return result
+
+    monkeypatch.setattr(
+        instructions_module,
+        "run_in_worker_async",
+        switch_after_first_candidate,
+    )
+
+    snapshot = asyncio.run(manager.prepare_async(configured_agent()))
+
+    assert calls == 2
+    assert "New rules." in snapshot.content
+    assert "Old rules." not in snapshot.content
+    assert manager.working_directory == new_root
+
+
+def test_async_prepare_cancellation_does_not_publish_a_completed_candidate(tmp_path, monkeypatch):
+    """Cancellation after disk reads prevents an unowned instruction snapshot publication."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("Initial rules.", encoding="utf-8")
+    manager = configured_discovered(tmp_path)
+    initial_instructions = manager.instructions
+    agents.write_text("Updated rules.", encoding="utf-8")
+    original_worker = instructions_module.run_in_worker_async
+
+    async def cancel_after_read(function, *args):
+        """Complete detached reads, then cancel before owner-side publication."""
+        await original_worker(function, *args)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(instructions_module, "run_in_worker_async", cancel_after_read)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(manager.prepare_async(configured_agent()))
+
+    assert manager.instructions == initial_instructions
+
+
+def test_async_skill_priorities_preserve_deduplication_and_instruction_budget(tmp_path):
+    """Async skill priorities retain catalog order, duplicate filtering, and hard limits."""
+    first = Skill("first", "First workflow.", tmp_path / "first" / "SKILL.md")
+    second = Skill("second", "Second workflow.", tmp_path / "second" / "SKILL.md")
+    manager = configured_manager(skill_manager=SkillManager([first, second]))
+
+    async def apply_priorities():
+        """Exercise changed, unchanged, and filtered priority sets."""
+        assert await manager.set_skill_catalog_priorities_async(("second", "second")) is True
+        assert await manager.set_skill_catalog_priorities_async(("second",)) is True
+        assert await manager.set_skill_catalog_priorities_async(("unknown",)) is True
+
+    asyncio.run(apply_priorities())
+
+    assert "<name>first</name>" in prepared(manager)
+
+    skills = [
+        Skill("ascii", "a" * 6500, tmp_path / "ascii" / "SKILL.md"),
+        Skill("unicode", "€" * 6500, tmp_path / "unicode" / "SKILL.md"),
+    ]
+    prioritized = configured_manager(skill_manager=SkillManager(skills))
+    assert (
+        asyncio.run(
+            prioritized.set_skill_catalog_priorities_async(("unicode",), configured_agent())
+        )
+        is True
+    )
+    limit = len(prepared(prioritized).encode("utf-8")) - 1
+    constrained = configured_manager(
+        skill_manager=SkillManager(skills),
+        max_bytes=limit,
+    )
+    assert (
+        asyncio.run(
+            constrained.set_skill_catalog_priorities_async(("unicode",), configured_agent())
+        )
+        is False
+    )
+    assert "<name>ascii</name>" in constrained.instructions
+
+
+def test_async_skill_activation_reads_off_loop_and_mutates_on_owner(tmp_path, monkeypatch):
+    """Async activation reads a skill on a worker and publishes its body on the owner."""
+    skill = write_skill(tmp_path / "review", "review", "Review instructions.")
+    skill_manager = SkillManager([skill])
+    manager = configured_manager(skill_manager=skill_manager)
+    original_activate = skill_manager.activate
+    original_read_text = Path.read_text
+    activation_threads = []
+    read_threads = []
+
+    def activate(name, *, content=None):
+        """Record the thread that applies activation state before delegating."""
+        activation_threads.append(get_ident())
+        return original_activate(name, content=content)
+
+    def read_text(path, *args, **kwargs):
+        """Record the thread that reads the skill body before delegating."""
+        if path == skill.location:
+            read_threads.append(get_ident())
+        return original_read_text(path, *args, **kwargs)
+
+    skill_manager.activate = activate
+    monkeypatch.setattr(Path, "read_text", read_text)
+    owner_thread = get_ident()
+
+    result = asyncio.run(manager.activate_skill_async("review"))
+
+    assert result["status"] == "activated"
+    assert activation_threads == [owner_thread]
+    assert read_threads and all(thread != owner_thread for thread in read_threads)
+    assert "Review instructions." in prepared(manager)
+    assert asyncio.run(manager.activate_skill_async("review"))["instructions_updated"] is False
+    assert len(read_threads) == 1
+    assert asyncio.run(manager.deactivate_skill_async("review"))["instructions_updated"] is True
+    assert manager.active_skill_identities == []
+
+
+def test_async_skill_activation_returns_a_structured_unknown_skill_result():
+    """Async activation preserves the structured result for unavailable skill names."""
+    manager = configured_manager()
+    result = asyncio.run(manager.activate_skill_async("missing"))
+
+    assert result.code == "skill.unknown"
+    assert asyncio.run(manager.deactivate_skill_async("missing")).code == "skill.unknown"
+
+
+def test_async_skill_activation_retries_after_live_state_changes(tmp_path, monkeypatch):
+    """A skill body loaded against an obsolete generation is discarded and loaded again."""
+    first = write_skill(tmp_path / "first", "first")
+    other = write_skill(tmp_path / "other", "other")
+    manager = configured_manager(skill_manager=SkillManager([first, other]))
+    original_worker = instructions_module.run_in_worker_async
+    calls = 0
+
+    async def activate_other_after_first_read(function, *args):
+        """Change the activation generation after the first detached body read."""
+        nonlocal calls
+        calls += 1
+        result = await original_worker(function, *args)
+        if calls == 1:
+            manager.activate_skill("other")
+        return result
+
+    monkeypatch.setattr(
+        instructions_module,
+        "run_in_worker_async",
+        activate_other_after_first_read,
+    )
+
+    result = asyncio.run(manager.activate_skill_async("first"))
+
+    assert result["name"] == "first"
+    assert calls == 2
+    assert {name for name, _ in manager.active_skill_identities} == {"first", "other"}
+
+
+@pytest.mark.parametrize("failure", ["read", "apply"])
+def test_async_skill_activation_returns_structured_service_errors(tmp_path, monkeypatch, failure):
+    """Async activation returns structured skill errors from reading or applying a body."""
+    skill = write_skill(tmp_path / "review", "review")
+    skill_manager = SkillManager([skill])
+    manager = configured_manager(skill_manager=skill_manager)
+    error = SkillOperationError(
+        code="skill.unavailable",
+        title="Skill unavailable",
+        detail="Skill changed during activation.",
+        operation="activate_skill",
+    )
+    method = "read_instructions" if failure == "read" else "activate"
+    monkeypatch.setattr(skill_manager, method, lambda *_args, **_kwargs: error)
+
+    result = asyncio.run(manager.activate_skill_async("review"))
+
+    assert result is error
 
 
 def write_skill(directory: Path, name: str, body: str = "Follow the workflow.") -> Skill:

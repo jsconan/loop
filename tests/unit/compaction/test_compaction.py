@@ -1,6 +1,7 @@
 """Tests for active conversation context compaction."""
 
 import asyncio
+from threading import get_ident
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -36,6 +37,8 @@ def compaction_feature(
     session: Session | None = None,
     compact: Mock | None = None,
     threshold: float = 0.8,
+    instruction_provider=None,
+    instructions_async=None,
 ):
     """Build context compaction with isolated collaborators."""
     manager = SessionManager(session=session)
@@ -53,10 +56,11 @@ def compaction_feature(
         backend,
         manager,
         selection,
-        lambda: instructions.prepare(agent),
+        instruction_provider or (lambda: instructions.prepare(agent)),
         interaction,
         PathHolder("/project"),
         threshold=threshold,
+        instructions_async=instructions_async,
     )
     return feature, manager, backend, interaction
 
@@ -208,6 +212,58 @@ def test_async_compaction_persists_replacement_context_after_backend_completion(
     assert backend.compact_async.call_args.kwargs["model"] == "model"
     assert len(session.compactions) == 1
     interaction.info.assert_any_call("Compacting session context...")
+
+
+def test_async_compaction_runs_legacy_instruction_provider_on_a_worker():
+    """The compatibility provider is isolated from the event-loop thread."""
+    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
+    worker_threads = []
+    snapshot = prepared_instructions()()
+
+    def provide_instructions():
+        """Return the captured instruction snapshot and record provider ownership."""
+        worker_threads.append(get_ident())
+        return snapshot
+
+    feature, _, backend, _ = compaction_feature(
+        session=session,
+        instruction_provider=provide_instructions,
+    )
+    backend.compact_async = AsyncMock(return_value=CompactionResult(items=()))
+    owner_thread = get_ident()
+
+    asyncio.run(feature.compact_async())
+
+    assert worker_threads and worker_threads[0] != owner_thread
+
+
+def test_async_compaction_awaits_a_native_instruction_provider():
+    """A configured async instruction provider is awaited directly by compaction."""
+    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
+    snapshot = prepared_instructions()()
+    instructions_async = AsyncMock(return_value=snapshot)
+    feature, _, backend, _ = compaction_feature(
+        session=session,
+        instructions_async=instructions_async,
+    )
+    backend.compact_async = AsyncMock(return_value=CompactionResult(items=()))
+
+    asyncio.run(feature.compact_async())
+
+    instructions_async.assert_awaited_once_with()
+
+
+def test_async_compaction_uses_the_explicit_prepared_snapshot():
+    """An explicit instruction snapshot bypasses both provider paths."""
+    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
+    feature, _, backend, _ = compaction_feature(session=session)
+    backend.compact_async = AsyncMock(return_value=CompactionResult(items=()))
+    snapshot = prepared_instructions()()
+
+    asyncio.run(feature.compact_async(instructions=snapshot))
+
+    backend.compact_async.assert_awaited_once()
+    assert backend.compact_async.call_args.kwargs["instructions"] == snapshot.content
 
 
 def test_async_compaction_skips_absent_or_unneeded_context():

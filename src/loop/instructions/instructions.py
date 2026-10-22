@@ -10,7 +10,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Self
 
 from .. import constants
-from ..utils import VirtualPath, sha256_digest
+from ..utils import VirtualPath, run_in_worker_async, sha256_digest
 from .models import (
     AgentInstructionsSource,
     CapturedInstruction,
@@ -82,6 +82,7 @@ class InstructionsManager:
     _workspace_id: str | None
     _workspace_root: Path | None
     _skill_catalog_priorities: tuple[str, ...]
+    _refresh_revision: int
 
     def __init__(
         self,
@@ -110,6 +111,7 @@ class InstructionsManager:
             Path(workspace_root).resolve() if workspace_root is not None else None
         )
         self._skill_catalog_priorities = ()
+        self._refresh_revision = 0
         self._dirty = False
         self._generation = 0
         self._signature = self._discovery_signature(self._working_directory)
@@ -275,6 +277,44 @@ class InstructionsManager:
             self._generation += 1
             return True
 
+    async def set_skill_catalog_priorities_async(
+        self,
+        names: Iterable[str],
+        agent: Agent | None = None,
+    ) -> bool:
+        """Prioritize referenced skills after refreshing sources off the event loop.
+
+        Args:
+            names (Iterable[str]): Candidate skill names in source order. Duplicate and unknown
+                names are ignored.
+            agent (Agent | None): Agent whose complete instruction document must remain within
+                the configured limit. Defaults to validating the contextual document alone.
+
+        Returns:
+            bool: Whether the requested priorities fit within the configured instruction limit.
+
+        Raises:
+            OSError: An applicable instruction source cannot be read.
+            UnicodeError: An applicable instruction source is not valid UTF-8.
+            RuntimeError: Bounded worker admission is full or unavailable.
+            asyncio.CancelledError: The task is cancelled after source reads settle.
+        """
+        await self._refresh_context_async()
+        with self._lock:
+            available = {skill.name for skill in self._skill_manager.skills}
+            priorities = tuple(dict.fromkeys(name for name in names if name in available))
+            if priorities == self._skill_catalog_priorities:
+                return self._encoded_size(self._build_instructions(agent)) <= self._max_bytes
+            previous = self._skill_catalog_priorities
+            self._skill_catalog_priorities = priorities
+            instructions = self._build_instructions(agent)
+            if self._encoded_size(instructions) > self._max_bytes:
+                self._skill_catalog_priorities = previous
+                return False
+            self._context_instructions = self._build_instructions()
+            self._generation += 1
+            return True
+
     @property
     def virtual_paths(self) -> VirtualPath:
         """Return current model-visible roots for metadata and declared tool path arguments.
@@ -387,6 +427,7 @@ class InstructionsManager:
             if self._working_directory != target:
                 self._working_directory = target
                 self._dirty = True
+                self._refresh_revision += 1
 
     def set_working_directory(self, path: Path | str) -> None:
         """Set the explicit runtime directory and matching instruction scope.
@@ -399,6 +440,7 @@ class InstructionsManager:
             if self._working_directory != target:
                 self._working_directory = target
                 self._dirty = True
+                self._refresh_revision += 1
             if (
                 self._runtime_environment is not None
                 and self._runtime_environment.working_directory != target
@@ -425,6 +467,7 @@ class InstructionsManager:
         with self._lock:
             if self._working_directory is not None:
                 self._dirty = True
+                self._refresh_revision += 1
 
     def prepare(self, agent: Agent, *, recovery: str | None = None) -> PreparedInstructions:
         """Prepare an immutable request snapshot for an explicit agent.
@@ -477,6 +520,38 @@ class InstructionsManager:
                 )
             return self._snapshot(agent, instructions, recovery)
 
+    async def prepare_async(
+        self,
+        agent: Agent,
+        *,
+        recovery: str | None = None,
+    ) -> PreparedInstructions:
+        """Prepare an immutable request snapshot without reading files on the event loop.
+
+        Args:
+            agent (Agent): Agent whose intrinsic identity and instructions start the document.
+            recovery (str | None): Named transient recovery section for this request.
+
+        Returns:
+            PreparedInstructions: Prepared document and exact provenance for one request.
+
+        Raises:
+            OSError: An applicable project instruction cannot be read.
+            UnicodeError: An applicable project instruction is not valid UTF-8.
+            InstructionBudgetExceededError: If the prepared document exceeds the configured
+                instruction limit.
+            RuntimeError: Bounded worker admission is full or unavailable.
+            asyncio.CancelledError: The task is cancelled after source reads settle.
+        """
+        await self._refresh_context_async()
+        with self._lock:
+            instructions = self._build_instructions(agent, recovery)
+            if self._encoded_size(instructions) > self._max_bytes:
+                raise InstructionBudgetExceededError(
+                    "Prepared instructions exceed the configured instruction limit."
+                )
+            return self._snapshot(agent, instructions, recovery)
+
     def _refresh_context(self) -> bool:
         """Refresh stale contextual sources without requiring an agent binding."""
         if self._working_directory is None:
@@ -486,6 +561,41 @@ class InstructionsManager:
         if not self._dirty and signature == self._signature:
             return False
         return self._refresh(working_directory, signature)
+
+    async def _refresh_context_async(self) -> bool:
+        """Load changed filesystem sources off-loop and publish a current snapshot on the owner."""
+        while True:
+            with self._lock:
+                working_directory = self._working_directory
+                if working_directory is None:
+                    return False
+                captured_dirty = self._dirty
+                captured_signature = self._signature
+                captured_revision = self._refresh_revision
+                captured_generation = self._generation
+                captured_active = tuple(self._skill_manager.active_identities)
+
+            signature, loaded, skill_manager = await run_in_worker_async(
+                self._load_refresh_candidate,
+                working_directory,
+                captured_dirty,
+                captured_signature,
+                captured_active,
+            )
+
+            with self._lock:
+                if (
+                    working_directory != self._working_directory
+                    or captured_dirty != self._dirty
+                    or captured_revision != self._refresh_revision
+                    or captured_generation != self._generation
+                    or captured_signature != self._signature
+                    or captured_active != tuple(self._skill_manager.active_identities)
+                ):
+                    continue
+                if loaded is None:
+                    return False
+                return self._apply_refresh(working_directory, signature, loaded, skill_manager)
 
     def refresh(self) -> bool:
         """Refresh changed contextual instruction sources.
@@ -500,6 +610,21 @@ class InstructionsManager:
         """
         with self._lock:
             return self._refresh_context()
+
+    async def refresh_async(self) -> bool:
+        """Refresh changed instruction sources without blocking the event loop.
+
+        Returns:
+            bool: Whether the effective contextual instructions or target directory changed.
+
+        Raises:
+            OSError: An applicable instruction source cannot be read.
+            UnicodeError: An applicable instruction source is not valid UTF-8.
+            ValueError: If refreshed instructions exceed the configured size limit.
+            RuntimeError: Bounded worker admission is full or unavailable.
+            asyncio.CancelledError: The task is cancelled after source reads settle.
+        """
+        return await self._refresh_context_async()
 
     def snapshot(self, agent: Agent) -> PreparedInstructions:
         """Return an immutable snapshot for an explicit agent.
@@ -560,6 +685,51 @@ class InstructionsManager:
                 return result
             return self._commit_activation(result)
 
+    async def activate_skill_async(self, name: str) -> SkillActivationResponse:
+        """Load skill instructions off-loop and apply activation on the owning task.
+
+        Args:
+            name (str): Exact available skill name.
+
+        Returns:
+            SkillActivationResponse: Compact activation acknowledgement or structured error. The
+                skill body is retained in the instruction document rather than returned here.
+
+        Raises:
+            OSError: The skill instruction file cannot be read.
+            UnicodeError: The skill instruction file is not valid UTF-8.
+            ValueError: The skill instruction file is malformed.
+            RuntimeError: Bounded worker admission is full or unavailable.
+            asyncio.CancelledError: The task is cancelled after the skill file read settles.
+        """
+        await self._refresh_context_async()
+        while True:
+            with self._lock:
+                manager = self._skill_manager
+                if manager.is_active(name):
+                    result = manager.activate(name)
+                    return self._commit_activation(result)
+                if name not in manager.names:
+                    return manager.activate(name)
+                generation = self._generation
+                revision = self._refresh_revision
+
+            instructions = await run_in_worker_async(manager.read_instructions, name)
+
+            with self._lock:
+                if (
+                    manager is not self._skill_manager
+                    or generation != self._generation
+                    or revision != self._refresh_revision
+                ):
+                    continue
+                if isinstance(instructions, SkillOperationError):
+                    return instructions
+                result = manager.activate(name, content=instructions)
+                if isinstance(result, SkillOperationError):
+                    return result
+                return self._commit_activation(result)
+
     def deactivate_skill(self, name: str) -> SkillDeactivationResponse:
         """Deactivate a skill and remove it from subsequent backend requests.
 
@@ -571,6 +741,30 @@ class InstructionsManager:
         """
         with self._lock:
             self._refresh_context()
+            result = self._skill_manager.deactivate(name)
+            if not isinstance(result, SkillOperationError) and result["instructions_updated"]:
+                self._context_instructions = self._build_instructions()
+                self._generation += 1
+            return result
+
+    async def deactivate_skill_async(self, name: str) -> SkillDeactivationResponse:
+        """Refresh skill sources off-loop, then deactivate one skill on the owner.
+
+        Args:
+            name (str): Exact available skill name.
+
+        Returns:
+            SkillDeactivationResponse: Deactivation metadata or a structured missing result.
+
+        Raises:
+            OSError: An applicable project instruction cannot be read while refreshing state.
+            UnicodeError: An applicable project instruction is not valid UTF-8.
+            ValueError: Refreshed instructions exceed the configured size limit.
+            RuntimeError: Bounded worker admission is full or unavailable.
+            asyncio.CancelledError: The task is cancelled after source reads settle.
+        """
+        await self._refresh_context_async()
+        with self._lock:
             result = self._skill_manager.deactivate(name)
             if not isinstance(result, SkillOperationError) and result["instructions_updated"]:
                 self._context_instructions = self._build_instructions()
@@ -646,16 +840,54 @@ class InstructionsManager:
 
     def _refresh(self, working_directory: Path, signature: tuple) -> bool:
         """Build and atomically install a refreshed instruction snapshot."""
-        previous_target = self._signature[0] if self._signature else None
-        previous_instructions = self._context_instructions
         active = self._skill_manager.active_identities
         loaded = load_agents_instructions(
             working_directory,
             agents_filenames=self._agents_filenames,
             max_bytes=self._max_bytes,
         )
+        skill_manager = (
+            SkillManager.rediscover(working_directory, active)
+            if self._skill_discovery_enabled
+            else None
+        )
+        return self._apply_refresh(working_directory, signature, loaded, skill_manager)
+
+    def _load_refresh_candidate(
+        self,
+        working_directory: Path,
+        dirty: bool,
+        previous_signature: tuple,
+        active: tuple[tuple[str, str], ...],
+    ) -> tuple[tuple, LoadedAgentInstructions | None, SkillManager | None]:
+        """Read one detached candidate refresh without touching live manager state."""
+        signature = self._discovery_signature(working_directory)
+        if not dirty and signature == previous_signature:
+            return signature, None, None
+        loaded = load_agents_instructions(
+            working_directory,
+            agents_filenames=self._agents_filenames,
+            max_bytes=self._max_bytes,
+        )
+        skill_manager = (
+            SkillManager.rediscover(working_directory, active)
+            if self._skill_discovery_enabled
+            else None
+        )
+        return signature, loaded, skill_manager
+
+    def _apply_refresh(
+        self,
+        working_directory: Path,
+        signature: tuple,
+        loaded: LoadedAgentInstructions,
+        refreshed_skills: SkillManager | None,
+    ) -> bool:
+        """Publish a detached refresh candidate after rechecking its owner revision."""
+        previous_target = self._signature[0] if self._signature else None
+        previous_instructions = self._context_instructions
         project_instructions = loaded.content
-        refresh_changes = self._describe_refresh(working_directory, loaded)
+        refresh_changes = self._describe_refresh(working_directory, loaded, signature)
         if not self._skill_discovery_enabled:
             return self._refresh_static(
                 working_directory,
@@ -666,7 +898,9 @@ class InstructionsManager:
                 previous_instructions,
             )
 
-        skill_manager = SkillManager.rediscover(working_directory, active)
+        if refreshed_skills is None:
+            raise RuntimeError("A refreshed skill manager is required for discovered skills.")
+        skill_manager = refreshed_skills
         diagnostics = self._load_diagnostics(loaded)
 
         for skill in skill_manager.activated_skills:
@@ -887,7 +1121,10 @@ class InstructionsManager:
         return list(loaded.diagnostics)
 
     def _describe_refresh(
-        self, working_directory: Path, loaded: LoadedAgentInstructions
+        self,
+        working_directory: Path,
+        loaded: LoadedAgentInstructions,
+        signature: tuple,
     ) -> list[str]:
         """Describe effective project-source changes for observability."""
         changes = []
@@ -905,6 +1142,6 @@ class InstructionsManager:
             after = current[path]
             if before.content != after.content or before.truncated != after.truncated:
                 changes.append(f"Changed instruction source '{path}'.")
-        if self._signature != self._discovery_signature(working_directory) and not changes:
+        if self._signature != signature and not changes:
             changes.append("Skill catalog or activated skill instructions changed.")
         return changes

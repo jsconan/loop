@@ -1071,6 +1071,8 @@ class AgentRunner:
         Raises:
             BackendError: If the backend cannot produce a complete response.
             ValueError: If neither the selection nor backend provides a model.
+            OSError: An applicable instruction source cannot be read.
+            UnicodeError: An applicable instruction source is not valid UTF-8.
             KeyboardInterrupt: If the configured control requests a stop.
             RunInterrupted: If the active execution scope has been interrupted.
         """
@@ -1086,6 +1088,9 @@ class AgentRunner:
         Raises:
             BackendError: If the backend cannot produce a complete response.
             ValueError: If neither the selection nor backend provides a model.
+            OSError: An applicable instruction source cannot be read.
+            UnicodeError: An applicable instruction source is not valid UTF-8.
+            RuntimeError: Bounded worker admission is full or unavailable.
             KeyboardInterrupt: If the configured control requests a stop.
             RunInterrupted: If the active execution scope has been interrupted.
             asyncio.CancelledError: If the query task is cancelled.
@@ -1151,7 +1156,7 @@ class AgentRunner:
         """Collect one asynchronous response inside the active model-operation span."""
         self._checkpoint()
         selected_model = self._model_selection.effective
-        snapshot = self._instructions_manager.prepare(self._agent, recovery=recovery)
+        snapshot = await self._instructions_manager.prepare_async(self._agent, recovery=recovery)
         self._session_manager.update_instruction_state(
             working_directory=str(snapshot.working_directory or self._working_directory),
             active_skills=list(snapshot.active_skills),

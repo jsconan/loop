@@ -1,5 +1,6 @@
 """Define independently injectable mention capabilities."""
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
 from mimetypes import guess_type
@@ -29,7 +30,11 @@ from ..utils import (
 
 
 class MentionHandler(ABC):
-    """Resolve one marker namespace and expose its matching completion capability."""
+    """Resolve one marker namespace and expose its matching completion capability.
+
+    The default async adapters run synchronous callbacks in a bounded worker. Handlers that mutate
+    owner-affine state must override the async callback and apply those changes on the owner task.
+    """
 
     @property
     @abstractmethod
@@ -67,12 +72,16 @@ class MentionHandler(ABC):
         """
 
     async def candidates_async(self) -> Sequence[str]:
-        """Return candidates through the synchronous handler contract by default.
+        """Run synchronous candidate discovery through bounded worker admission by default.
 
         Returns:
             Sequence[str]: Current exact mention candidates.
+
+        Raises:
+            RuntimeError: Bounded worker admission is full or unavailable.
+            asyncio.CancelledError: The task is cancelled after candidate discovery settles.
         """
-        return self.candidates()
+        return await run_in_worker_async(self.candidates)
 
     @abstractmethod
     def resolve(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
@@ -86,7 +95,7 @@ class MentionHandler(ABC):
         """
 
     async def resolve_async(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
-        """Resolve through the synchronous handler contract by default.
+        """Run synchronous resolution through bounded worker admission by default.
 
         Args:
             values (Sequence[str]): Mention values in source order.
@@ -98,8 +107,10 @@ class MentionHandler(ABC):
             OSError: A handler cannot read its referenced resource.
             UnicodeError: Referenced content is not valid UTF-8.
             ValueError: A handler rejects a mention or cannot complete its operation.
+            RuntimeError: Bounded worker admission is full or unavailable.
+            asyncio.CancelledError: The task is cancelled after resolution settles.
         """
-        return self.resolve(values)
+        return await run_in_worker_async(self.resolve, tuple(values))
 
     @abstractmethod
     def resolve_optional(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
@@ -116,7 +127,7 @@ class MentionHandler(ABC):
         self,
         values: Sequence[str],
     ) -> tuple[ContextReference, ...]:
-        """Resolve optional values through the synchronous handler contract by default.
+        """Run synchronous optional resolution through bounded worker admission by default.
 
         Args:
             values (Sequence[str]): Optional mention values in source order.
@@ -128,8 +139,10 @@ class MentionHandler(ABC):
             OSError: A handler cannot read its referenced resource.
             UnicodeError: Referenced content is not valid UTF-8.
             ValueError: A handler rejects a mention or cannot complete its operation.
+            RuntimeError: Bounded worker admission is full or unavailable.
+            asyncio.CancelledError: The task is cancelled after resolution settles.
         """
-        return self.resolve_optional(values)
+        return await run_in_worker_async(self.resolve_optional, tuple(values))
 
 
 class ProjectPathMentionHandler(MentionHandler):
@@ -508,6 +521,14 @@ class SkillMentionHandler(MentionHandler):
         """
         return tuple(skill.name for skill in self._instructions_manager.skill_manager.skills)
 
+    async def candidates_async(self) -> Sequence[str]:
+        """Return the in-memory skill catalog on the current owner task.
+
+        Returns:
+            Sequence[str]: Exact skill candidates.
+        """
+        return self.candidates()
+
     def resolve(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
         """Atomically activate every uniquely mentioned skill.
 
@@ -536,6 +557,39 @@ class SkillMentionHandler(MentionHandler):
         except (OSError, UnicodeError, ValueError):
             for name in reversed(activated):
                 self._instructions_manager.deactivate_skill(name)
+            raise
+        return ()
+
+    async def resolve_async(self, values: Sequence[str]) -> tuple[ContextReference, ...]:
+        """Activate mentioned skills while keeping manager state on the owner task.
+
+        Args:
+            values (Sequence[str]): Skill names in source order.
+
+        Returns:
+            tuple[ContextReference, ...]: Empty because skills contribute instructions.
+
+        Raises:
+            OSError: Skill instructions cannot be read.
+            UnicodeError: Skill instructions are not valid UTF-8.
+            ValueError: Skill activation fails.
+            RuntimeError: Bounded worker admission is full or unavailable.
+            asyncio.CancelledError: Cancellation occurs after any admitted read settles.
+        """
+        previously_active = {name for name, _ in self._instructions_manager.active_skill_identities}
+        activated = []
+        try:
+            for name in dict.fromkeys(values):
+                result = await self._instructions_manager.activate_skill_async(name)
+                if isinstance(result, (Problem, SkillOperationError)):
+                    raise ValueError(  # noqa: TRY004 - mention resolution exposes ValueError.
+                        result.detail
+                    )
+                if name not in previously_active:
+                    activated.append(name)
+        except (Exception, asyncio.CancelledError):
+            for name in reversed(activated):
+                await self._instructions_manager.deactivate_skill_async(name)
             raise
         return ()
 

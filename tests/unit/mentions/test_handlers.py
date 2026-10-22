@@ -5,7 +5,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import get_ident
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from prompt_toolkit.document import Document
@@ -38,6 +38,7 @@ def complete(handler, text):
 
 def test_base_handler_rejects_markdown_links_by_default():
     """Handlers inherit disabled Markdown-link resolution unless they opt in."""
+    callback_threads = []
 
     class DefaultMentionHandler(MentionHandler):
         """Provide the minimum public behavior needed to test base defaults."""
@@ -51,14 +52,17 @@ def test_base_handler_rejects_markdown_links_by_default():
             return Mock()
 
         def candidates(self):
+            callback_threads.append(get_ident())
             return ()
 
         def resolve(self, values):
             del values
+            callback_threads.append(get_ident())
             return ()
 
         def resolve_optional(self, values):
             del values
+            callback_threads.append(get_ident())
             return ()
 
     handler = DefaultMentionHandler()
@@ -66,6 +70,7 @@ def test_base_handler_rejects_markdown_links_by_default():
     assert asyncio.run(handler.candidates_async()) == ()
     assert asyncio.run(handler.resolve_async(("target",))) == ()
     assert asyncio.run(handler.resolve_optional_async(("target",))) == ()
+    assert callback_threads and all(thread != get_ident() for thread in callback_threads)
 
 
 def test_async_project_path_resolution_reads_on_a_worker_and_preserves_snapshot(
@@ -428,6 +433,7 @@ def test_skill_handler_exposes_live_candidates_and_rolls_back_failed_activation(
     assert handler.marker == "$"
     assert handler.accepts_markdown_links is False
     assert handler.candidates() == ("first", "second")
+    assert asyncio.run(handler.candidates_async()) == ("first", "second")
     assert complete(handler, "$fir") == ["$first"]
     with pytest.raises(ValueError, match="Too much skill context"):
         handler.resolve(("first", "second"))
@@ -466,7 +472,62 @@ def test_async_skill_mention_keeps_activation_on_the_session_owner(tmp_path):
         activation_threads.append(get_ident())
         return {"name": name, "status": "activated", "instructions_updated": True}
 
-    instructions.activate_skill.side_effect = activate
+    instructions.activate_skill_async = AsyncMock(side_effect=activate)
 
     assert asyncio.run(SkillMentionHandler(instructions).resolve_async(("review",))) == ()
     assert activation_threads == [owner]
+    instructions.activate_skill_async.assert_awaited_once_with("review")
+
+
+def test_async_skill_mention_rolls_back_completed_activations_on_read_failure(tmp_path):
+    """A failed later skill read removes earlier skills activated by the same mention."""
+    first = tmp_path / "first" / "SKILL.md"
+    first.parent.mkdir()
+    first.write_text(
+        "---\nname: first\ndescription: First.\n---\nFirst instructions.\n",
+        encoding="utf-8",
+    )
+    instructions = InstructionsManager(
+        skill_manager=SkillManager(
+            [
+                Skill("first", "First.", first),
+                Skill("missing", "Missing.", tmp_path / "missing" / "SKILL.md"),
+            ]
+        )
+    )
+
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(SkillMentionHandler(instructions).resolve_async(("first", "missing")))
+
+    assert instructions.active_skill_identities == []
+
+
+def test_async_skill_mention_keeps_previously_active_skills(tmp_path):
+    """Mentioning an already active skill never schedules it for rollback."""
+    location = tmp_path / "review" / "SKILL.md"
+    instructions = Mock(spec=InstructionsManager)
+    instructions.active_skill_identities = [("review", str(location))]
+    instructions.activate_skill_async = AsyncMock(
+        return_value={"name": "review", "instructions_updated": False}
+    )
+
+    result = asyncio.run(SkillMentionHandler(instructions).resolve_async(("review",)))
+
+    assert result == ()
+    instructions.deactivate_skill_async.assert_not_awaited()
+
+
+def test_async_skill_mention_reports_structured_activation_errors():
+    """Structured activation failures retain the mention handler's ValueError contract."""
+    instructions = Mock(spec=InstructionsManager)
+    instructions.active_skill_identities = []
+    instructions.activate_skill_async = AsyncMock(
+        return_value=Problem(
+            code="skill.unknown",
+            title="Skill unavailable",
+            detail="Skill 'missing' is not available.",
+        )
+    )
+
+    with pytest.raises(ValueError, match="not available"):
+        asyncio.run(SkillMentionHandler(instructions).resolve_async(("missing",)))
