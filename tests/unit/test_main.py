@@ -40,6 +40,7 @@ def test_run_application_async_closes_runtime(monkeypatch):
     interaction = Mock()
     runtime = Mock()
     runtime.run_async = AsyncMock()
+    runtime.close_async = AsyncMock()
     monkeypatch.setattr(application, "ConsoleInteraction", Mock(return_value=interaction))
     monkeypatch.setattr(application, "ApplicationRuntime", Mock(create=Mock(return_value=runtime)))
     monkeypatch.setattr(application, "register_shutdown_signals", Mock())
@@ -48,7 +49,7 @@ def test_run_application_async_closes_runtime(monkeypatch):
 
     interaction.info.assert_called_once_with("Hello from loop!")
     runtime.run_async.assert_awaited_once_with()
-    runtime.close.assert_called_once_with()
+    runtime.close_async.assert_awaited_once_with()
 
 
 @pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt, ShutdownRequested])
@@ -57,6 +58,7 @@ def test_run_application_gracefully_handles_shutdown(monkeypatch, interruption):
     interaction = Mock()
     runtime = Mock()
     runtime.run_async = AsyncMock(side_effect=interruption)
+    runtime.close_async = AsyncMock()
     monkeypatch.setattr(application, "ConsoleInteraction", Mock(return_value=interaction))
     monkeypatch.setattr(application, "ApplicationRuntime", Mock(create=Mock(return_value=runtime)))
     signals = Mock()
@@ -67,7 +69,7 @@ def test_run_application_gracefully_handles_shutdown(monkeypatch, interruption):
     signals.assert_called_once_with()
     runtime.run.assert_not_called()
     runtime.stop.assert_called_once_with()
-    runtime.close.assert_called_once_with()
+    runtime.close_async.assert_awaited_once_with()
     assert interaction.info.call_args_list == [
         call("Hello from loop!"),
         call("\nStopping loop. Goodbye!"),
@@ -79,6 +81,7 @@ def test_run_application_reports_runtime_failure_and_closes(monkeypatch):
     interaction = Mock()
     runtime = Mock()
     runtime.run_async = AsyncMock(side_effect=RuntimeError("private"))
+    runtime.close_async = AsyncMock()
     logger = Mock()
     monkeypatch.setattr(application, "ConsoleInteraction", Mock(return_value=interaction))
     monkeypatch.setattr(application, "ApplicationRuntime", Mock(create=Mock(return_value=runtime)))
@@ -90,7 +93,7 @@ def test_run_application_reports_runtime_failure_and_closes(monkeypatch):
     logger.log.assert_called_once()
     interaction.report.assert_called_once()
     assert interaction.report.call_args.args[0].severity == "fatal"
-    runtime.close.assert_called_once_with()
+    runtime.close_async.assert_awaited_once_with()
 
 
 def test_run_application_clears_telemetry_when_failure_prevents_runtime(monkeypatch):
@@ -140,6 +143,7 @@ def test_module_runs_application_entry_point(monkeypatch):
     monkeypatch.setattr("loop.interaction.ConsoleInteraction", Mock(return_value=Mock()))
     runtime = Mock()
     runtime.run_async = AsyncMock()
+    runtime.close_async = AsyncMock()
     monkeypatch.setattr("loop.application.ApplicationRuntime.create", Mock(return_value=runtime))
     monkeypatch.setattr("loop.utils.find_project_root", Mock(return_value=Path.cwd()))
     monkeypatch.setattr("loop.utils.register_shutdown_signals", Mock())
@@ -157,7 +161,9 @@ def test_run_application_closes_runtime_before_workspace_switch(monkeypatch):
     target = Workspace(Path("/target"), Path("/target"), "target", "target", "directory", 2, 2)
     first = Mock()
     first.run_async = AsyncMock(side_effect=WorkspaceSwitchRequested(target))
+    first.close_async = AsyncMock()
     second = Mock()
+    second.close_async = AsyncMock()
     runtime_factory = Mock(side_effect=[first, second])
     monkeypatch.setattr(application, "ConsoleInteraction", Mock(return_value=Mock()))
     monkeypatch.setattr(application, "ApplicationRuntime", Mock(create=runtime_factory))
@@ -165,9 +171,9 @@ def test_run_application_closes_runtime_before_workspace_switch(monkeypatch):
 
     application.run_application()
 
-    first.close.assert_called_once_with()
+    first.close_async.assert_awaited_once_with()
     assert runtime_factory.call_args_list[1].args[0] is target
-    second.close.assert_called_once_with()
+    second.close_async.assert_awaited_once_with()
 
 
 def test_run_application_restores_workspace_when_switch_rebuild_fails(monkeypatch):
@@ -175,7 +181,9 @@ def test_run_application_restores_workspace_when_switch_rebuild_fails(monkeypatc
     target = Workspace(Path("/target"), Path("/target"), "target", "target", "directory", 2, 2)
     first = Mock()
     first.run_async = AsyncMock(side_effect=WorkspaceSwitchRequested(target))
+    first.close_async = AsyncMock()
     restored = Mock()
+    restored.close_async = AsyncMock()
     runtime_factory = Mock(side_effect=[first, RuntimeError("target failed"), restored])
     interaction = Mock()
     monkeypatch.setattr(application, "ConsoleInteraction", Mock(return_value=interaction))
@@ -187,4 +195,4 @@ def test_run_application_restores_workspace_when_switch_rebuild_fails(monkeypatc
     assert runtime_factory.call_args_list[1].args[0] is target
     assert runtime_factory.call_args_list[2].args[0].id == "id"
     assert "restored workspace id" in interaction.warning.call_args.args[0]
-    restored.close.assert_called_once_with()
+    restored.close_async.assert_awaited_once_with()

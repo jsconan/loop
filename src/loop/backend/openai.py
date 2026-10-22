@@ -360,6 +360,58 @@ class OpenAIBackend(Backend):
             )
         return self._async_client
 
+    @property
+    def async_close_required(self) -> bool:
+        """Return whether the async SDK client must close on its owning event loop.
+
+        Returns:
+            bool: Whether asynchronous cleanup is required.
+        """
+        return self._async_client is not None
+
+    def close(self) -> None:
+        """Close the synchronous SDK client.
+
+        Raises:
+            RuntimeError: If the asynchronous SDK client needs cleanup on its owning loop.
+            Exception: If the synchronous SDK client fails to close.
+        """
+        if self.async_close_required:
+            raise RuntimeError("Await OpenAIBackend.close_async() to close its async client.")
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    async def close_async(self) -> None:
+        """Close both SDK clients, awaiting asynchronous cleanup on the owner loop.
+
+        Raises:
+            Exception: If either SDK client fails to close.
+        """
+        first_error = None
+        if self._async_client is not None:
+            try:
+                await self._async_client.close()
+            except BaseException as error:  # noqa: BLE001 - close the other client before raising
+                first_error = error
+            else:
+                self._async_client = None
+        if self._client is not None:
+            try:
+                self._client.close()
+            except BaseException as error:  # noqa: BLE001 - preserve both shutdown failures
+                if first_error is None:
+                    first_error = error
+                else:
+                    first_error.add_note(
+                        f"Closing the synchronous SDK client also failed with "
+                        f"{type(error).__name__}: {error}"
+                    )
+            else:
+                self._client = None
+        if first_error is not None:
+            raise first_error
+
     @classmethod
     def _translated_error(cls, error: OpenAIError, operation: str) -> BackendError:  # pylint: disable=too-many-branches
         """Translate an OpenAI SDK failure into the backend error contract."""

@@ -260,6 +260,122 @@ def test_configuration_and_lazy_clients_use_explicit_credentials(monkeypatch):
     )
 
 
+def test_backend_closes_both_lazy_sdk_clients_on_the_async_owner():
+    """Async shutdown awaits its client and also releases an initialized sync client."""
+    sync_sdk = Mock()
+    sync_sdk.models.list.return_value = []
+    async_sdk = Mock()
+    async_sdk.close = AsyncMock()
+    async_sdk.models.list.return_value = AsyncModelPage()
+    backend = OpenAIBackend()
+
+    with patch("loop.backend.openai.OpenAI", return_value=sync_sdk):
+        backend.get_models()
+
+    async def close_async_client():
+        """Initialize and close the async SDK client on one event loop."""
+        with patch("loop.backend.openai.AsyncOpenAI", return_value=async_sdk):
+            assert await backend.get_models_async() == []
+            assert backend.async_close_required is True
+            with pytest.raises(RuntimeError, match="close_async"):
+                backend.close()
+            await backend.close_async()
+
+    asyncio.run(close_async_client())
+
+    async_sdk.close.assert_awaited_once_with()
+    sync_sdk.close.assert_called_once_with()
+    assert backend.async_close_required is False
+    backend.close()
+
+
+def test_backend_sync_close_releases_only_the_sync_client():
+    """Synchronous shutdown closes its client without creating an async client."""
+    sdk = Mock()
+    sdk.models.list.return_value = []
+    backend = OpenAIBackend()
+
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        backend.get_models()
+
+    backend.close()
+
+    sdk.close.assert_called_once_with()
+    assert backend.async_close_required is False
+
+
+def test_backend_async_close_without_initialized_clients_is_a_noop():
+    """Async shutdown can safely run before either lazy SDK client is created."""
+    backend = OpenAIBackend()
+
+    asyncio.run(backend.close_async())
+
+    assert backend.async_close_required is False
+
+
+def test_backend_async_close_reports_sync_failure_after_async_client_succeeds():
+    """A sync client close error propagates after async resources have closed."""
+    sync_sdk = Mock()
+    sync_sdk.models.list.return_value = []
+    sync_sdk.close.side_effect = OSError("sync close failed")
+    async_sdk = Mock()
+    async_sdk.close = AsyncMock()
+    async_sdk.models.list.return_value = AsyncModelPage()
+    backend = OpenAIBackend()
+
+    with patch("loop.backend.openai.OpenAI", return_value=sync_sdk):
+        backend.get_models()
+
+    async def close_async_client():
+        """Close the async client, expose sync failure, and verify retry behavior."""
+        with patch("loop.backend.openai.AsyncOpenAI", return_value=async_sdk):
+            await backend.get_models_async()
+        with pytest.raises(OSError, match="sync close failed"):
+            await backend.close_async()
+        assert backend.async_close_required is False
+
+        sync_sdk.close.side_effect = None
+        await backend.close_async()
+
+    asyncio.run(close_async_client())
+
+    async_sdk.close.assert_awaited_once_with()
+    assert sync_sdk.close.call_count == 2
+
+
+def test_backend_close_attempts_both_clients_and_preserves_failures():
+    """Async shutdown tries both clients and retains failed owners for a later retry."""
+    sync_sdk = Mock()
+    sync_sdk.models.list.return_value = []
+    sync_sdk.close.side_effect = OSError("sync close failed")
+    async_sdk = Mock()
+    async_sdk.close = AsyncMock(side_effect=RuntimeError("async close failed"))
+    async_sdk.models.list.return_value = AsyncModelPage()
+    backend = OpenAIBackend()
+
+    with patch("loop.backend.openai.OpenAI", return_value=sync_sdk):
+        backend.get_models()
+
+    async def close_async_client():
+        """Exercise a failed async close, then retry after both clients recover."""
+        with patch("loop.backend.openai.AsyncOpenAI", return_value=async_sdk):
+            await backend.get_models_async()
+        with pytest.raises(RuntimeError, match="async close failed") as raised:
+            await backend.close_async()
+        assert any("sync close failed" in note for note in raised.value.__notes__)
+        assert backend.async_close_required is True
+
+        async_sdk.close.side_effect = None
+        sync_sdk.close.side_effect = None
+        await backend.close_async()
+
+    asyncio.run(close_async_client())
+
+    assert async_sdk.close.await_count == 2
+    assert sync_sdk.close.call_count == 2
+    assert backend.async_close_required is False
+
+
 def test_configuration_rejects_invalid_structured_output_policy():
     """Structured-output transport and retry defaults reject invalid overrides."""
     with pytest.raises(ValueError, match="mode"):

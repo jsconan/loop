@@ -2,8 +2,9 @@
 
 import asyncio
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import aclosing, nullcontext
+from contextlib import aclosing, closing, nullcontext
 from datetime import UTC, datetime
 from threading import Barrier, Event, get_ident
 from types import SimpleNamespace
@@ -45,6 +46,7 @@ from loop import (
     SessionManager,
     SessionRevisionConflictError,
     SessionWorkspaceMismatchError,
+    SQLiteSessionStore,
     ToolCall,
     ToolCallCompleted,
     ToolResult,
@@ -1208,6 +1210,193 @@ def test_accepted_input_survives_restart_and_consumes_with_canonical_history():
         "review this"
     ]
     assert reloaded.session.events[-1].type == "input_consumed"
+
+
+def test_sqlite_input_acknowledgement_and_consumption_survive_restarts(tmp_path):
+    """SQLite reloads accepted input until one atomic canonical message consumes it."""
+    path = tmp_path / "sessions.sqlite3"
+    workspace_id = "workspace"
+    manager = SessionManager(
+        session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+    session_id = manager.session.id
+
+    async def exercise_restart_boundaries():
+        """Reload after admission and delivery before consuming the durable input."""
+        accepted = await manager.queue_input_async(
+            "review this",
+            priority=1,
+            bypass_commands=True,
+        )
+        after_acceptance = SessionManager(
+            session=session_id,
+            session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+            workspace_id=workspace_id,
+        )
+        assert [event.input_id for event in after_acceptance.session.pending_inputs] == [
+            accepted.input_id
+        ]
+
+        await after_acceptance.mark_input_delivered_async(accepted.input_id)
+        after_delivery = SessionManager(
+            session=session_id,
+            session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+            workspace_id=workspace_id,
+        )
+        assert [event.input_id for event in after_delivery.session.pending_inputs] == [
+            accepted.input_id
+        ]
+        assert after_delivery.session.events[-1].type == "input_delivered"
+
+        await after_delivery.add_user_message_async("review this", input_id=accepted.input_id)
+        with pytest.raises(ValueError, match="not pending"):
+            await after_delivery.add_user_message_async("review this", input_id=accepted.input_id)
+
+    asyncio.run(exercise_restart_boundaries())
+
+    restored = SessionManager(
+        session=session_id,
+        session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+    user_messages = [
+        message
+        for message in restored.messages
+        if isinstance(message, Message) and message.role == "user"
+    ]
+    consumed = [event for event in restored.session.events if event.type == "input_consumed"]
+
+    assert restored.session.pending_inputs == ()
+    assert [message.content for message in user_messages] == ["review this"]
+    assert len(consumed) == 1
+    assert consumed[0].item_index == 0
+
+
+def test_sqlite_uncertain_tool_execution_requires_recovery_after_restart(tmp_path):
+    """An interrupted SQLite tool intent reloads as uncertain work requiring resolution."""
+    path = tmp_path / "sessions.sqlite3"
+    workspace_id = "workspace"
+    manager = SessionManager(
+        session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+    call = ToolCall(call_id="uncertain-call", name="write_file", arguments="{}")
+
+    async def persist_uncertain_effect():
+        """Persist the model call and execution intent before the simulated crash."""
+        run = await manager.begin_run_async()
+        await manager.add_response_async(
+            Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+        )
+        await manager.add_tool_call_event_async(call.call_id)
+        await manager.record_tool_execution_started_async(call.call_id)
+        return run.run_id
+
+    run_id = asyncio.run(persist_uncertain_effect())
+
+    restored = SessionManager(
+        session=manager.session.id,
+        session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+    recovery = restored.recovery_state
+
+    assert recovery is not None
+    assert recovery.action == "resolve_uncertain_tools"
+    assert restored.session.active_run_id == run_id
+    assert [(pending.call.call_id, pending.status) for pending in recovery.pending_calls] == [
+        (call.call_id, "outcome_unknown")
+    ]
+
+
+def test_sqlite_interaction_restart_revokes_pending_request_durably(tmp_path):
+    """A pending SQLite interaction is revoked and remains settled after restart."""
+    path = tmp_path / "sessions.sqlite3"
+    workspace_id = "workspace"
+    manager = SessionManager(
+        session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+
+    async def request_confirmation():
+        """Persist a confirmation tied to the active run and operation."""
+        run = await manager.begin_run_async()
+        await manager.record_interaction_requested_async(
+            "confirmation-request",
+            kind="confirm",
+            session_id=manager.session.id,
+            run_id=run.run_id,
+            operation_id="write-operation",
+        )
+
+    asyncio.run(request_confirmation())
+    session_id = manager.session.id
+    restored = SessionManager(
+        session=session_id,
+        session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+    settled = [
+        event
+        for event in restored.session.events
+        if event.type == "interaction_settled" and event.request_id == "confirmation-request"
+    ]
+
+    assert restored.session.pending_interactions == ()
+    assert len(settled) == 1
+    assert settled[0].outcome == "revoked"
+
+    reopened = SessionManager(
+        session=session_id,
+        session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+    assert reopened.session.pending_interactions == ()
+    assert [
+        event
+        for event in reopened.session.events
+        if event.type == "interaction_settled" and event.request_id == "confirmation-request"
+    ] == settled
+
+
+def test_sqlite_input_write_failure_is_not_acknowledged_or_published(tmp_path):
+    """A failed SQLite snapshot leaves the prior durable session and admission unchanged."""
+    path = tmp_path / "sessions.sqlite3"
+    workspace_id = "workspace"
+    store = SQLiteSessionStore(path, workspace_id=workspace_id)
+    manager = SessionManager(session_store=store, workspace_id=workspace_id)
+    manager.add_user_message("already committed")
+    session_id = manager.session.id
+
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_session_update BEFORE UPDATE ON sessions
+            BEGIN
+                SELECT RAISE(ABORT, 'injected snapshot failure');
+            END
+            """
+        )
+
+    async def fail_to_admit():
+        """Reject async admission when SQLite aborts the owning snapshot transaction."""
+        with pytest.raises(sqlite3.IntegrityError, match="injected snapshot failure"):
+            await manager.queue_input_async("not accepted", priority=1)
+
+    asyncio.run(fail_to_admit())
+
+    restored = SessionManager(
+        session=session_id,
+        session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+
+    assert manager.session.pending_inputs == ()
+    assert restored.session.pending_inputs == ()
+    assert [message.content for message in restored.messages if isinstance(message, Message)] == [
+        "already committed"
+    ]
 
 
 def test_async_input_transitions_correlate_runs_and_revoke_stale_interactions():

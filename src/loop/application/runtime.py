@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from collections.abc import Callable, Mapping
 from types import TracebackType
@@ -307,7 +309,7 @@ class ApplicationRuntime:
             str: Whether the setting was applied now or requires restart.
         """
         if path.startswith("backend."):
-            self._loop.replace_backend(self._create_backend(settings))
+            self._replace_backend(settings)
             return "applied now"
         return self._loop.apply_runtime_settings(path, settings)
 
@@ -325,7 +327,7 @@ class ApplicationRuntime:
         """
         statuses = {}
         if any(path.startswith("backend.") for path in paths):
-            self._loop.replace_backend(self._create_backend(settings))
+            self._replace_backend(settings)
             statuses.update({path: "applied now" for path in paths if path.startswith("backend.")})
         statuses.update(
             {
@@ -335,6 +337,12 @@ class ApplicationRuntime:
             }
         )
         return statuses
+
+    def _replace_backend(self, settings: ApplicationSettings) -> None:
+        """Track a replacement backend before publishing it to the active loop."""
+        backend = self._create_backend(settings)
+        self._track_close(backend, self._cleanup_callbacks)
+        self._loop.replace_backend(backend)
 
     @staticmethod
     def _create_backend(settings: ApplicationSettings) -> OpenAIBackend:
@@ -381,6 +389,12 @@ class ApplicationRuntime:
             )
         if self._closed:
             return
+        if any(
+            getattr(callback.__self__, "async_close_required", False)
+            for callback in self._cleanup_callbacks
+            if inspect.ismethod(callback)
+        ):
+            raise RuntimeError("Await ApplicationRuntime.close_async() to close async resources.")
         self._closed = True
         callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
         try:
@@ -390,6 +404,32 @@ class ApplicationRuntime:
             self._logging_handler = None
             raise
         self._cleanup(callbacks)
+        self._logging_handler = None
+
+    async def close_async(self) -> None:
+        """Release runtime resources after async work has settled and before its loop closes.
+
+        Raises:
+            RuntimeError: If conversation execution has not yet settled.
+            TimeoutError: If telemetry cannot flush within its configured timeout.
+            BaseException: The first cleanup failure after every owned resource is tried.
+            asyncio.CancelledError: After asynchronous resource cleanup settles.
+        """
+        if self._session_controller is not None and self._session_controller.running:
+            raise RuntimeError(
+                "Wait for conversation execution to settle before closing the runtime."
+            )
+        if self._closed:
+            return
+        self._closed = True
+        callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
+        try:
+            telemetry_activity("application.stopped", severity="info", component="main")
+        except BaseException as error:
+            await self._cleanup_async(callbacks, primary=error)
+            self._logging_handler = None
+            raise
+        await self._cleanup_async(callbacks)
         self._logging_handler = None
 
     @staticmethod
@@ -447,6 +487,49 @@ class ApplicationRuntime:
             for error in cleanup_errors:
                 primary.add_note(f"Runtime rollback also failed: {type(error).__name__}: {error}")
             return
+        if cleanup_errors:
+            first = cleanup_errors[0]
+            for error in cleanup_errors[1:]:
+                first.add_note(
+                    f"Additional runtime cleanup failed: {type(error).__name__}: {error}"
+                )
+            raise first
+
+    @staticmethod
+    async def _cleanup_async(
+        callbacks: list[Callable[[], object]], *, primary: BaseException | None = None
+    ) -> None:
+        """Close async resources on the current loop and settle every owned cleanup."""
+        cleanup_errors = []
+        cancellation = None
+        while callbacks:
+            callback = callbacks.pop()
+            try:
+                resource = callback.__self__ if inspect.ismethod(callback) else None
+                close_async = getattr(resource, "close_async", None)
+                result = close_async() if callable(close_async) else callback()
+                if inspect.isawaitable(result):
+                    pending = asyncio.ensure_future(result)
+                    while not pending.done():
+                        try:
+                            await asyncio.shield(pending)
+                        except asyncio.CancelledError as error:
+                            cancellation = cancellation or error
+                    pending.result()
+            except BaseException as error:  # noqa: BLE001 - shutdown must try every owner
+                cleanup_errors.append(error)
+        if primary is not None:
+            for error in cleanup_errors:
+                primary.add_note(f"Runtime rollback also failed: {type(error).__name__}: {error}")
+            if cancellation is not None:
+                primary.add_note("Runtime cleanup completed after cancellation was requested.")
+            return
+        if cancellation is not None:
+            for error in cleanup_errors:
+                cancellation.add_note(
+                    f"Runtime cleanup also failed: {type(error).__name__}: {error}"
+                )
+            raise cancellation
         if cleanup_errors:
             first = cleanup_errors[0]
             for error in cleanup_errors[1:]:

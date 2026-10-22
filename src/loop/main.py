@@ -39,7 +39,7 @@ def run_application() -> None:  # pylint: disable=too-many-branches
 
 
 async def run_application_async() -> None:  # pylint: disable=too-many-branches
-    """Compose, run, and release each active workspace runtime."""
+    """Compose, run, and release each workspace runtime before its event loop closes."""
     interaction = None
     runtime = None
     try:
@@ -58,7 +58,7 @@ async def run_application_async() -> None:  # pylint: disable=too-many-branches
             except WorkspaceSwitchRequested as request:
                 previous = workspace
                 try:
-                    runtime.close()
+                    await runtime.close_async()
                     runtime = None
                     workspace = request.workspace
                     try:
@@ -92,7 +92,7 @@ async def run_application_async() -> None:  # pylint: disable=too-many-branches
             interaction.report(problem)
     finally:
         if runtime is not None:
-            runtime.close()
+            await runtime.close_async()
         else:
             set_telemetry(None)
 

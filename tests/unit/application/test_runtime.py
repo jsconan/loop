@@ -454,6 +454,190 @@ def test_close_is_idempotent_and_context_exit_closes_resources():
     handler.close.assert_called_once_with()
 
 
+def test_async_close_uses_async_resource_cleanup_and_is_idempotent():
+    """Async shutdown closes loop-affine resources through their async lifecycle once."""
+
+    class Resource:
+        """Represent a resource whose initialized state requires async shutdown."""
+
+        def __init__(self):
+            self.sync_closes = 0
+            self.async_closes = 0
+
+        @property
+        def async_close_required(self):
+            """Report whether the resource needs its owner event loop for cleanup."""
+            return True
+
+        def close(self):
+            """Record an invalid synchronous cleanup attempt."""
+            self.sync_closes += 1
+
+        async def close_async(self):
+            """Record async cleanup on the runtime's active event loop."""
+            self.async_closes += 1
+
+    resource = Resource()
+    runtime = ApplicationRuntime(Mock(), Mock(), 1.0, cleanup_callbacks=[resource.close])
+
+    with pytest.raises(RuntimeError, match="close_async"):
+        runtime.close()
+
+    async def close_twice():
+        """Close the resource and verify a repeated request is a no-op."""
+        await runtime.close_async()
+        await runtime.close_async()
+
+    asyncio.run(close_twice())
+
+    assert resource.sync_closes == 0
+    assert resource.async_closes == 1
+
+
+def test_async_close_settles_cleanup_after_cancellation():
+    """Cancellation cannot abandon a loop-affine resource close."""
+
+    class Resource:
+        """Hold async cleanup until the test releases its owner task."""
+
+        def __init__(self, started, release, settled):
+            self._started = started
+            self._release = release
+            self._settled = settled
+
+        @property
+        def async_close_required(self):
+            """Require async cleanup for this resource."""
+            return True
+
+        def close(self):
+            """Reject synchronous cleanup for this resource."""
+            raise RuntimeError("Synchronous cleanup is unsafe.")
+
+        async def close_async(self):
+            """Signal when cleanup starts and settle after the release event."""
+            self._started.set()
+            await self._release.wait()
+            self._settled.set()
+            raise OSError("resource failed after cancellation")
+
+    async def scenario():
+        """Cancel shutdown while cleanup is active, then let the owned close finish."""
+        started, release, settled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        runtime = ApplicationRuntime(
+            Mock(),
+            Mock(),
+            1.0,
+            cleanup_callbacks=[Resource(started, release, settled).close],
+        )
+        closing = asyncio.create_task(runtime.close_async())
+        await started.wait()
+        closing.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await closing
+        assert settled.is_set()
+        assert raised.value.__notes__ == [
+            "Runtime cleanup also failed: OSError: resource failed after cancellation"
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_async_close_tries_remaining_resources_after_cleanup_failure():
+    """Async shutdown reports its first resource failure after trying every owner."""
+    synchronous = Mock(return_value=None)
+    first = Mock(side_effect=OSError("first close failed"))
+    second = Mock(side_effect=RuntimeError("second close failed"))
+    runtime = ApplicationRuntime(
+        Mock(), Mock(), 1.0, cleanup_callbacks=[synchronous, second, first]
+    )
+
+    with pytest.raises(OSError, match="first close failed") as raised:
+        asyncio.run(runtime.close_async())
+
+    assert raised.value.__notes__ == [
+        "Additional runtime cleanup failed: RuntimeError: second close failed"
+    ]
+    first.assert_called_once_with()
+    second.assert_called_once_with()
+    synchronous.assert_called_once_with()
+
+
+def test_async_close_preserves_shutdown_event_failure_during_cleanup(dependencies):
+    """A stopped-event failure stays primary while asynchronous cleanup still runs."""
+    dependencies["telemetry_activity"].side_effect = RuntimeError("event failed")
+
+    class Resource:
+        """Hold cleanup until shutdown has recorded cancellation."""
+
+        def __init__(self, started, release):
+            self.started = started
+            self.release = release
+
+        @property
+        def async_close_required(self):
+            """Require cleanup on the active event loop."""
+            return True
+
+        def close(self):
+            """Provide the runtime's synchronous cleanup handle."""
+
+        async def close_async(self):
+            """Wait for cancellation, then report the resource close failure."""
+            self.started.set()
+            await self.release.wait()
+            raise OSError("resource failed")
+
+    async def scenario():
+        """Cancel async shutdown and preserve its original telemetry failure."""
+        started, release = asyncio.Event(), asyncio.Event()
+        runtime = ApplicationRuntime(
+            Mock(), Mock(), 1.0, cleanup_callbacks=[Resource(started, release).close]
+        )
+        closing = asyncio.create_task(runtime.close_async())
+        await started.wait()
+        closing.cancel()
+        release.set()
+        with pytest.raises(RuntimeError, match="event failed") as raised:
+            await closing
+        assert raised.value.__notes__ == [
+            "Runtime rollback also failed: OSError: resource failed",
+            "Runtime cleanup completed after cancellation was requested.",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_async_close_preserves_shutdown_event_failure_without_cancellation(dependencies):
+    """A stopped-event failure remains primary after successful async cleanup."""
+    dependencies["telemetry_activity"].side_effect = RuntimeError("event failed")
+    cleanup = Mock(return_value=None)
+    runtime = ApplicationRuntime(Mock(), Mock(), 1.0, cleanup_callbacks=[cleanup])
+
+    with pytest.raises(RuntimeError, match="event failed") as raised:
+        asyncio.run(runtime.close_async())
+
+    cleanup.assert_called_once_with()
+    assert getattr(raised.value, "__notes__", []) == []
+
+
+def test_backend_replacements_remain_owned_until_runtime_shutdown(dependencies):
+    """Every live backend replacement is closed when its runtime is released."""
+    active_loop = Mock()
+    first, second = Mock(), Mock()
+    dependencies["OpenAIBackend"].side_effect = [first, second]
+    runtime = ApplicationRuntime(active_loop, Mock(), 1.0, cleanup_callbacks=[])
+
+    runtime.apply_configuration("backend.base_url", ApplicationSettings())
+    runtime.apply_configuration_changes(("backend.default_model",), ApplicationSettings())
+    runtime.close()
+
+    first.close.assert_called_once_with()
+    second.close.assert_called_once_with()
+    assert active_loop.replace_backend.call_count == 2
+
+
 def test_close_reports_telemetry_shutdown_timeout():
     """Runtime shutdown exposes telemetry flush or adapter failure to its caller."""
     telemetry = Mock()
@@ -593,6 +777,8 @@ def test_runtime_refuses_to_close_services_while_execution_is_active():
 
     with pytest.raises(RuntimeError, match="settle before closing"):
         runtime.close()
+    with pytest.raises(RuntimeError, match="settle before closing"):
+        asyncio.run(runtime.close_async())
     resource.assert_not_called()
     controller.running = False
     runtime.close()

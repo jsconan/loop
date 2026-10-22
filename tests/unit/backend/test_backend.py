@@ -22,6 +22,16 @@ def test_openai_adapter_satisfies_the_complete_backend_contract():
     assert isinstance(OpenAIBackend(), Backend)
 
 
+def test_default_backend_lifecycle_cleanup_is_synchronous_and_repeatable():
+    """Backends without owned clients support both cleanup paths without extra state."""
+    backend = OpenAIBackend()
+
+    assert backend.async_close_required is False
+    assert Backend.async_close_required.fget(backend) is False
+    Backend.close(backend)
+    asyncio.run(Backend.close_async(backend))
+
+
 def test_default_context_preparation_preserves_canonical_items():
     """Backends without source transformations preserve item identity in a fresh context list."""
     message = Message(role="user", content="source")

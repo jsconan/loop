@@ -68,6 +68,26 @@ class Backend(ABC):
         self._api_key = api_key
 
     @property
+    def async_close_required(self) -> bool:
+        """Return whether this backend owns resources that require asynchronous cleanup.
+
+        Returns:
+            bool: Whether the active resources must be closed on their owning event loop.
+        """
+        return False
+
+    def close(self) -> None:
+        """Release resources owned by the synchronous backend path."""
+
+    async def close_async(self) -> None:
+        """Release backend resources after asynchronous use.
+
+        Raises:
+            Exception: If a resource fails while closing.
+        """
+        self.close()
+
+    @property
     def base_url(self) -> str | None:
         """Return the configured service URL.
 
