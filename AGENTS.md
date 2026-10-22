@@ -20,6 +20,7 @@
 
 - Fix the root cause of unexpected warnings and errors. Do not suppress them, weaken assertions, or change warning/error filters to make checks pass. When a diagnostic is an intended test outcome, capture and assert its specific category, message, or structured result in that test.
 - Define concrete success criteria before implementation and verify them after the change. For multi-step work, use a brief plan whose steps each have an observable check.
+- Select checks by boundary: architecture tests cover repository-wide static contracts, unit tests cover portable module behavior, and integration tests cover native or dependency boundaries. Run affected architecture and unit checks for code changes, plus applicable integration checks when those boundaries are involved; use `tests/README.md` for suite commands and prerequisites.
 - A bug fix should have a check that reproduces the failure; a refactor should preserve passing checks before and after. Non-trivial new logic should leave behind the smallest runnable test or assertion that would fail if it broke. Trivial one-line changes do not require a new test.
 
 ### Documentation

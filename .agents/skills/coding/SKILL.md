@@ -59,7 +59,7 @@ Preserve observability when changing operational activity, failures, auditable d
 
 ## Verify the change
 
-Define an observable success criterion. Include docstring completeness in the check whenever a public signature or behavior changes. Run the narrowest relevant checks first, then the broader project checks warranted by the risk. Use the `testing` skill when test code must be added or changed.
+Define an observable success criterion. Include docstring completeness in the check whenever a public signature or behavior changes. Select architecture, unit and integration checks according to the affected boundaries described in `AGENTS.md` and `tests/README.md`; run the narrowest relevant checks first, then broader project checks warranted by the risk. Use the `testing` skill when test code must be added or changed.
 
 After changing code, run:
 

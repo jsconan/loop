@@ -1,6 +1,6 @@
 ---
 name: testing
-description: Write, update, reorganize, diagnose, and verify isolated pytest unit and integration tests. Activate whenever a change adds, modifies, or removes tests or test fixtures, or when the task verifies behavior, mocks, fixtures, edge and error cases, or the repository's 100% statement-and-branch coverage requirement, including running the suite or coverage to validate any other change.
+description: Write, update, reorganize, diagnose, and verify isolated pytest architecture, unit, and integration tests. Activate whenever a change adds, modifies, or removes tests or test fixtures, or when the task verifies behavior, mocks, fixtures, edge and error cases, or the repository's 100% statement-and-branch coverage requirement, including running the suite or coverage to validate any other change.
 ---
 
 # Testing
@@ -10,6 +10,8 @@ Tests, including `pytest.mark.parametrize` declarations, are exempt from the sou
 Preserve 100% statement and branch coverage for active source code. Test supported behavior, edge cases, error paths, and branches. Never lower, bypass, exclude, or weaken coverage requirements to make checks pass. Do not test passive `__init__.py` barrel files unless they contain active behavior.
 
 ## Place tests by ownership
+
+Put repository-wide static naming and import-boundary contracts in `tests/architecture/`. Keep them independent of any one source module; they do not belong in module unit suites.
 
 Mirror the package structure beneath `src/loop/` in `tests/unit/` and keep exactly one unit suite for each active source module:
 
@@ -49,7 +51,7 @@ Make every test deterministic, idempotent, standalone, and independent of execut
 
 ## Verify in increasing scope
 
-Run the affected suite independently first:
+Run the affected module suite independently first:
 
 ```shell
 uv run pytest tests/path/to/test_module.py
@@ -60,6 +62,8 @@ Then run the complete suite with strict coverage:
 ```shell
 uv run pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100
 ```
+
+For architecture and unit changes, run `make test` to execute architecture checks and the complete unit suite with strict coverage. Run `make test-architecture` for architecture checks alone. For native or dependency boundaries, run the applicable integration suite with `make test-integration`. Run every suite with strict coverage using `make test-all` when the change spans all three boundaries or warrants full-suite verification. See `tests/README.md` for suite guarantees and integration prerequisites.
 
 After changing tests, run:
 
