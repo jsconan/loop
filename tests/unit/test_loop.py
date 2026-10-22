@@ -61,6 +61,7 @@ from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
 from loop.conversation import ConversationCommands
+from loop.conversation.models import AdmittedConversationInput
 from loop.models import SteeringMessage
 from loop.permissions import PermissionLoadFailure
 from loop.session import GeneratedSessionName, LocalSessionNameGenerator
@@ -1343,6 +1344,104 @@ def test_run_async_accepts_an_awaitable_input_source_and_preserves_steering(tmp_
     loop.agent_runner.run_async.assert_awaited_once_with()
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_loop_skips_admitted_input_from_a_different_session(tmp_path, asynchronous):
+    """Stale durable input envelopes are rejected before message preparation or execution."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop.agent_runner.run = Mock()
+    loop.agent_runner.run_async = AsyncMock()
+    admitted = AdmittedConversationInput(
+        input_id="stale-input",
+        session_id="different-session",
+        message="must not execute",
+        bypass_commands=True,
+    )
+
+    if asynchronous:
+        loop.agent_runner.recover_session_async = AsyncMock(
+            return_value=SimpleNamespace(pending=False, result=None)
+        )
+        values = iter((admitted, False))
+
+        async def read_input(_completer):
+            """Return stale input and then end the async stream."""
+            return next(values)
+
+        asyncio.run(loop.run_async(input_source=read_input))
+    else:
+        loop.agent_runner.recover_session = Mock(
+            return_value=SimpleNamespace(pending=False, result=None)
+        )
+        values = iter((admitted, False))
+        loop.run(input_source=lambda _completer: next(values))
+
+    interaction.warning.assert_called_once_with(
+        "Queued input belongs to a different session and was skipped."
+    )
+    loop.agent_runner.run.assert_not_called()
+    loop.agent_runner.run_async.assert_not_awaited()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_loop_consumes_current_session_envelopes_as_user_messages(tmp_path, asynchronous):
+    """Accepted durable envelopes bypass commands and consume with canonical history."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    accepted = loop._session_manager.queue_input("/exit", priority=1, bypass_commands=True)
+    admitted = AdmittedConversationInput(
+        input_id=accepted.input_id,
+        session_id=loop.session.id,
+        message=accepted.content,
+        bypass_commands=True,
+    )
+    result = AgentRunResult(
+        final_response=None,
+        turns=0,
+        stop_reason="cancelled",
+        metrics=RunMetrics(
+            active_duration_seconds=0,
+            model_duration_seconds=0,
+            tool_duration_seconds=0,
+            message_count=1,
+            item_count=1,
+        ),
+    )
+
+    if asynchronous:
+        loop.agent_runner.recover_session_async = AsyncMock(
+            return_value=SimpleNamespace(pending=False, result=None)
+        )
+        loop.agent_runner.run_async = AsyncMock(return_value=result)
+        values = iter((admitted, False))
+
+        async def read_input(_completer):
+            """Return one accepted durable envelope and finish the stream."""
+            return next(values)
+
+        asyncio.run(loop.run_async(input_source=read_input))
+        loop.agent_runner.run_async.assert_awaited_once_with()
+    else:
+        loop.agent_runner.recover_session = Mock(
+            return_value=SimpleNamespace(pending=False, result=None)
+        )
+        loop.agent_runner.run = Mock(return_value=result)
+        values = iter((admitted, False))
+        loop.run(input_source=lambda _completer: next(values))
+        loop.agent_runner.run.assert_called_once_with()
+
+    assert loop.messages == [Message(role="user", content="/exit")]
+    assert loop._session_manager.session.pending_inputs == ()
+
+
 def test_run_async_requires_native_input_for_legacy_interactions(tmp_path):
     """Async orchestration refuses a synchronous prompt instead of blocking the event loop."""
     interaction = output_interaction()
@@ -2514,6 +2613,7 @@ def test_run_requeries_after_a_tool_call_and_records_local_items(tmp_path):
     assert len(metrics.model_calls) == 2
     assert [event.type for event in loop.session.events] == [
         "conversation_item",
+        "run_started",
         "conversation_item",
         "permission",
         "tool_execution_started",

@@ -1,6 +1,7 @@
 """Verify the responsive conversation command provider."""
 
-from unittest.mock import Mock
+import asyncio
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from prompt_toolkit.completion import CompleteEvent
@@ -153,14 +154,14 @@ def test_queue_reports_admission_outcomes(command_context, message, accepted, ex
     """Queued messages preserve their text and report empty, accepted, and rejected input."""
     context, interaction = command_context
     control = Mock()
-    control.queue.return_value = accepted
+    control.queue_async = AsyncMock(return_value=accepted)
 
-    ConversationCommands(control).queue(context, message)
+    asyncio.run(ConversationCommands(control).queue(context, message))
 
     if accepted is None:
-        control.queue.assert_not_called()
+        control.queue_async.assert_not_awaited()
     else:
-        control.queue.assert_called_once_with(" ".join(message), interaction)
+        control.queue_async.assert_awaited_once_with(" ".join(message), interaction)
     if expected_warning is None:
         interaction.warning.assert_not_called()
     else:
@@ -198,14 +199,14 @@ def test_steer_reports_validation_and_control_outcomes(
     """Steering reports usage and lifecycle outcomes without duplicating queue warnings."""
     context, interaction = command_context
     control = Mock()
-    control.steer.return_value = outcome
+    control.steer_async = AsyncMock(return_value=outcome)
 
-    ConversationCommands(control).steer(context, message)
+    asyncio.run(ConversationCommands(control).steer(context, message))
 
     if outcome is None:
-        control.steer.assert_not_called()
+        control.steer_async.assert_not_awaited()
     else:
-        control.steer.assert_called_once_with(" ".join(message), interaction)
+        control.steer_async.assert_awaited_once_with(" ".join(message), interaction)
     if method is None:
         interaction.info.assert_not_called()
         interaction.warning.assert_not_called()

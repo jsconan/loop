@@ -306,20 +306,19 @@ class AgentRunner:
             RuntimeError: If the configured control already owns another run.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
-        with (
-            interaction_run(self._session_manager.session.id),
-            self._session_manager.execution(),
-            telemetry_span(),
-        ):
-            telemetry_activity("agent.run.started", component="agent_runner")
-            result = self._run_from_boundary()
-            telemetry_activity(
-                "agent.run.completed",
-                component="agent_runner",
-                stop_reason=result.stop_reason,
-                turns=result.turns,
-            )
-            return result
+        session_id = self._session_manager.session.id
+        with self._session_manager.execution(), telemetry_span():
+            run = self._session_manager.begin_run()
+            with interaction_run(session_id, run.run_id):
+                telemetry_activity("agent.run.started", component="agent_runner")
+                result = self._run_from_boundary(started_at=run.started_at)
+                telemetry_activity(
+                    "agent.run.completed",
+                    component="agent_runner",
+                    stop_reason=result.stop_reason,
+                    turns=result.turns,
+                )
+                return result
 
     async def run_async(self) -> AgentRunResult:
         """Run model and tool turns through native asynchronous operations.
@@ -334,20 +333,19 @@ class AgentRunner:
             SessionExecutionConflictError: If another owner is executing this logical session.
             asyncio.CancelledError: If the owning async task is cancelled.
         """
-        with (
-            interaction_run(self._session_manager.session.id),
-            self._session_manager.execution(),
-            telemetry_span(),
-        ):
-            telemetry_activity("agent.run.started", component="agent_runner")
-            result = await self._run_from_boundary_async()
-            telemetry_activity(
-                "agent.run.completed",
-                component="agent_runner",
-                stop_reason=result.stop_reason,
-                turns=result.turns,
-            )
-            return result
+        session_id = self._session_manager.session.id
+        with self._session_manager.execution(), telemetry_span():
+            run = await self._session_manager.begin_run_async()
+            with interaction_run(session_id, run.run_id):
+                telemetry_activity("agent.run.started", component="agent_runner")
+                result = await self._run_from_boundary_async(started_at=run.started_at)
+                telemetry_activity(
+                    "agent.run.completed",
+                    component="agent_runner",
+                    stop_reason=result.stop_reason,
+                    turns=result.turns,
+                )
+                return result
 
     def recover_session(self) -> AgentRecoveryStatus:
         """Execute an approved recovery plan for the active session.
@@ -360,7 +358,10 @@ class AgentRunner:
             RuntimeError: If the configured control already owns another run.
             SessionExecutionConflictError: If another owner is executing this logical session.
         """
-        with interaction_run(self._session_manager.session.id):
+        with interaction_run(
+            self._session_manager.session.id,
+            self._session_manager.session.active_run_id,
+        ):
             self._checkpoint()
             state = self._session_manager.recovery_state
             if state is None:
@@ -385,7 +386,10 @@ class AgentRunner:
             SessionExecutionConflictError: If another owner is executing this logical session.
             asyncio.CancelledError: If the recovery task is cancelled.
         """
-        with interaction_run(self._session_manager.session.id):
+        with interaction_run(
+            self._session_manager.session.id,
+            self._session_manager.session.active_run_id,
+        ):
             self._checkpoint()
             state = self._session_manager.recovery_state
             if state is None:
@@ -500,6 +504,7 @@ class AgentRunner:
         self,
         *,
         recovery: SessionRecoveryState | None = None,
+        started_at: datetime | None = None,
     ) -> AgentRunResult:
         """Run model turns from a fresh or recovered durable boundary."""
         total_turns = 0
@@ -507,7 +512,7 @@ class AgentRunner:
         response = None
         calls = []
         tools = []
-        started_at = utc_now()
+        started_at = started_at or utc_now()
         with self._run_control.execution() if self._run_control is not None else nullcontext():
             self._interrupted_tools = tools
             try:
@@ -608,6 +613,7 @@ class AgentRunner:
         self,
         *,
         recovery: SessionRecoveryState | None = None,
+        started_at: datetime | None = None,
     ) -> AgentRunResult:
         """Run model turns from a fresh or recovered boundary using async operations."""
         total_turns = 0
@@ -615,7 +621,7 @@ class AgentRunner:
         response = None
         calls = []
         tools = []
-        started_at = utc_now()
+        started_at = started_at or utc_now()
         with (
             self._run_control.execution(async_owner=True)
             if self._run_control is not None

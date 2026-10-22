@@ -73,13 +73,37 @@ class InputAdmission:
         priority (int): Queue priority, with steering ahead of ordinary queued input.
         sequence (int): Monotonic arrival order used to break priority ties.
         kind (InputAdmissionKind): Whether this event carries a message or shutdown signal.
-        message (str | None): Submitted message for a message event, or ``None`` for shutdown.
+        message (object | None): Submitted message or durable input envelope, or ``None`` for
+            shutdown.
+        input_id (str | None): Durable identity, when the input was accepted by a session store.
+        session_id (str | None): Owning session for a durable input.
+        bypass_commands (bool): Whether message content was already classified as ordinary text.
     """
 
     priority: int
     sequence: int
     kind: InputAdmissionKind = field(compare=False)
-    message: str | None = field(default=None, compare=False)
+    message: object | None = field(default=None, compare=False)
+    input_id: str | None = field(default=None, compare=False)
+    session_id: str | None = field(default=None, compare=False)
+    bypass_commands: bool = field(default=False, compare=False)
+
+
+@dataclass(frozen=True)
+class AdmittedConversationInput:
+    """Carry durable input identity from mailbox delivery to canonical history.
+
+    Args:
+        input_id (str): Durable identity used to atomically consume the accepted input.
+        session_id (str): Session that accepted the input.
+        message (str): User-provided message text.
+        bypass_commands (bool): Whether the message must bypass command dispatch.
+    """
+
+    input_id: str
+    session_id: str
+    message: str
+    bypass_commands: bool
 
 
 class ConversationRunState(Enum):

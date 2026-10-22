@@ -26,7 +26,7 @@ Interruption acts at the next safe boundary. Partial model output is discarded, 
 
 When a tool, command, or recovery operation asks a question, press Enter on an empty editor or use `/respond` to open that question's input prompt. Text already queued for the conversation never becomes an approval. An unsent editor draft stays intact when a question arrives. Startup questions appear before ordinary conversation input begins.
 
-Up to 16 inputs, including corrections, may wait behind active work. A full queue explicitly rejects further inputs; rejected steering does not interrupt the current run. Queued inputs remain in memory until execution begins; attached paths are resolved and snapshotted at that point. Exit, execution failure, and workspace replacement cancel unexecuted inputs and report their count. A queued input does not survive an application crash.
+Up to 16 inputs, including corrections, may wait behind active work. A full queue explicitly rejects further inputs; rejected steering does not interrupt the current run. With a durable session store, Loop saves accepted text before confirming queue admission and restores unconsumed inputs when that session is reopened. Recovery of an interrupted run comes first; queued follow-ups stay pending until recovery is resolved. Inputs are consumed atomically with their canonical user messages, and attached paths are resolved and snapshotted at that point. Memory-only sessions cannot restore inputs after process exit.
 
 Exit stops admission and cancels pending questions. Loop closes an interrupted model stream and checks cancellation before new model requests and tool execution, then waits for owned work to settle before releasing its services. Blocking model reads and synchronous tools finish their current operation under existing deadlines before observing interruption or shutdown; unbounded custom tools can delay either indefinitely. Such tools must impose their own deadlines. Immediate cancellation of arbitrary tools requires a cancellable execution contract rather than terminating their worker thread.
 
@@ -221,17 +221,20 @@ async with aclosing(backend.get_response_async(input="Explain the result.", stre
 `SessionController` runs a synchronous conversation on one execution thread while its asyncio loop owns UI input and presentation. Build the conversation with the controller's `interaction` and `control`, and use the supplied mailbox reader for ordinary conversation input:
 
 ```python
-from loop import ConsoleInteraction, Loop, SessionController
+from loop import ConsoleInteraction, Loop, SessionController, SessionManager
 from loop.conversation import ConversationCommands
 
 
 async def chat(backend):
     controller = SessionController(ConsoleInteraction())
+    sessions = SessionManager(interaction=controller.interaction)
     conversation = Loop.create_default(
         backend,
         interaction=controller.interaction,
         run_control=controller.control,
+        session_manager=sessions,
     )
+    controller.bind_session_manager(sessions)
     conversation.register_command_provider(ConversationCommands(controller))
     controller.bind_command_manager(conversation.command_manager)
     await controller.run(lambda receive: conversation.run(input_source=receive))

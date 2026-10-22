@@ -49,7 +49,7 @@ class ConversationControl(Protocol):
             ConversationStatus: Snapshot suitable for displaying to the user.
         """
 
-    def steer(self, message: str, interaction: Interaction) -> SteeringOutcome:
+    async def steer_async(self, message: str, interaction: Interaction) -> SteeringOutcome:
         """Queue a correction and request interruption of the active run.
 
         Args:
@@ -58,9 +58,12 @@ class ConversationControl(Protocol):
 
         Returns:
             SteeringOutcome: Result distinguishing interruption, inactivity, and backpressure.
+
+        Raises:
+            asyncio.CancelledError: If durable admission is cancelled after its write settles.
         """
 
-    def queue(self, message: str, interaction: Interaction) -> bool:
+    async def queue_async(self, message: str, interaction: Interaction) -> bool:
         """Queue a message to run after the active agent run completes.
 
         Args:
@@ -69,6 +72,9 @@ class ConversationControl(Protocol):
 
         Returns:
             bool: Whether the message was admitted.
+
+        Raises:
+            asyncio.CancelledError: If durable admission is cancelled after its write settles.
         """
 
 
@@ -163,7 +169,7 @@ class ConversationCommands:
         status = self._control.status_snapshot()
         context.interaction.info(f"{status.state}; {status.queued_inputs} queued inputs.")
 
-    def steer(
+    async def steer(
         self,
         context: CommandContext,
         message: Annotated[tuple[str, ...], CommandRemainder()] = (),
@@ -174,13 +180,16 @@ class ConversationCommands:
             context (CommandContext): Interaction used to report the steering outcome.
             message (tuple[str, ...]): Correction text split into shell tokens. Defaults to an
                 empty tuple, which reports the usage requirement.
+
+        Raises:
+            asyncio.CancelledError: If durable admission is cancelled after its write settles.
         """
         text = " ".join(message)
         if not text:
             context.interaction.warning("Usage: /steer <message>")
             return
 
-        outcome = self._control.steer(text, context.interaction)
+        outcome = await self._control.steer_async(text, context.interaction)
         if outcome is SteeringOutcome.RUN_INACTIVE:
             context.interaction.warning("No agent run is active; send a normal message instead.")
         elif outcome is SteeringOutcome.INTERRUPT_REJECTED:
@@ -190,7 +199,7 @@ class ConversationCommands:
                 "Interrupt requested; waiting for the active operation to settle..."
             )
 
-    def queue(
+    async def queue(
         self,
         context: CommandContext,
         message: Annotated[tuple[str, ...], CommandRemainder()] = (),
@@ -201,9 +210,12 @@ class ConversationCommands:
             context (CommandContext): Interaction used to report the queue outcome.
             message (tuple[str, ...]): Message text split into shell tokens. Defaults to an
                 empty tuple, which reports the usage requirement.
+
+        Raises:
+            asyncio.CancelledError: If durable admission is cancelled after its write settles.
         """
         text = " ".join(message)
         if not text:
             context.interaction.warning("Usage: /queue <message>")
-        elif not self._control.queue(text, context.interaction):
+        elif not await self._control.queue_async(text, context.interaction):
             context.interaction.warning("No agent run is active; send a normal message instead.")

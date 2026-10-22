@@ -40,18 +40,22 @@ def current_interaction_correlation() -> InteractionCorrelation:
 
 
 @contextmanager
-def interaction_run(session_id: str) -> Generator[None]:
+def interaction_run(session_id: str, run_id: str | None = None) -> Generator[None]:
     """Bind interactions to a session and run, reusing a run when already nested.
 
     Args:
         session_id (str): Identifier of the session that owns the run.
+        run_id (str | None): Durable run identity to bind, or ``None`` to reuse the parent or
+            generate an identity. Defaults to ``None``.
 
     Yields:
         None: Control while the run identity is active.
     """
     parent = current_interaction_correlation()
-    run_id = parent.run_id if parent.session_id == session_id else str(new_uuid())
-    token = _CURRENT_INTERACTION.set(InteractionCorrelation(session_id, run_id))
+    active_run_id = run_id or (
+        parent.run_id if parent.session_id == session_id else str(new_uuid())
+    )
+    token = _CURRENT_INTERACTION.set(InteractionCorrelation(session_id, active_run_id))
     try:
         yield
     finally:

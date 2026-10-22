@@ -10,7 +10,7 @@ from contextvars import copy_context
 from itertools import count
 from queue import Empty, Full, PriorityQueue
 from threading import RLock, get_ident
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from prompt_toolkit.completion import (
     CompleteEvent,
@@ -25,6 +25,7 @@ from ..completion import CompletionManager, CompletionValue
 from ..control import RunControl, RunInterrupted
 from ..interaction import AsyncInteractionInput, Interaction
 from ..models import CommandCapability, SteeringMessage
+from ..session.models import InputQueuedEvent
 from ..telemetry import telemetry_activity
 from ..utils import ChoiceItem, choice_items
 from .commands import ConversationCommands
@@ -35,6 +36,7 @@ from .models import (
     EVENT_PROMPT,
     EVENT_TERMINAL,
     EVENT_TERMINAL_EXIT,
+    AdmittedConversationInput,
     ConversationCompletion,
     ConversationRunState,
     ConversationStatus,
@@ -45,6 +47,9 @@ from .models import (
     RunStateChanged,
     SteeringOutcome,
 )
+
+if TYPE_CHECKING:
+    from ..session import SessionManager
 
 _QUEUE_CAPACITY = 16
 _STEERING_PRIORITY = 0
@@ -102,7 +107,7 @@ class SessionController:
     ``ConversationCommands`` provider and binds the loop's command manager; direct compositions do
     the same. An unbound controller builds a standalone registry from that provider when it starts.
     All domain operations stay on one execution thread. The UI owns prompts, presentation, and a
-    bounded input mailbox. Pending inputs are transient until the conversation consumes them.
+    bounded input mailbox. Bound sessions retain accepted inputs until consumption or rejection.
     Ordinary input during an active run is admitted as steering and applied after the current
     model response or tool settles. Explicit ``/steer`` interrupts immediately; ``/queue`` queues
     input after the run. Each controller runs once.
@@ -143,6 +148,8 @@ class SessionController:
     _draft: str | None
     _input_signal: asyncio.Event
     _async_owner: bool
+    _session_manager: SessionManager | None
+    _queued_input_ids: set[str]
 
     def __init__(self, interaction: Interaction) -> None:
         if not isinstance(interaction, AsyncInteractionInput):
@@ -176,6 +183,8 @@ class SessionController:
         self._draft = None
         self._input_signal = asyncio.Event()
         self._async_owner = False
+        self._session_manager = None
+        self._queued_input_ids = set()
 
     def bind_command_manager(self, command_manager: CommandManager) -> None:
         """Bind the loop-owned command registry for contextual dispatch and completion.
@@ -191,6 +200,31 @@ class SessionController:
         self._command_manager = command_manager
         command_manager.set_capability_provider(self.command_capabilities)
         self._command_completer = CompletionManager((command_manager.completion_adapter,))
+
+    def bind_session_manager(self, session_manager: SessionManager) -> None:
+        """Bind durable session lifecycle records before starting the controller.
+
+        Args:
+            session_manager (SessionManager): Session persistence owner for this conversation.
+
+        Raises:
+            RuntimeError: If persistence is bound after the controller starts.
+        """
+        if self._used:
+            raise RuntimeError("Bind session persistence before running the session controller.")
+        self._session_manager = session_manager
+        sequence = (
+            max(
+                (
+                    event.sequence
+                    for event in session_manager.session.events
+                    if isinstance(event, InputQueuedEvent)
+                ),
+                default=-1,
+            )
+            + 1
+        )
+        self._sequence = count(sequence)
 
     def command_capabilities(self) -> frozenset[CommandCapability]:
         """Return commands supported by the current controller lifecycle state.
@@ -379,11 +413,57 @@ class SessionController:
         """
         if not self._control.active:
             return SteeringOutcome.RUN_INACTIVE
+        if self._session_manager is not None:
+            event = self._session_manager.queue_input(
+                message,
+                priority=_STEERING_PRIORITY,
+                bypass_commands=True,
+            )
+            admission = self._admission_from_event(event)
+            if not self._enqueue_steering(message, admission=admission, report_full=False):
+                self._reject_admission_sync(admission)
+                interaction.warning(
+                    "Input queue is full; this input was not accepted. Try again later."
+                )
+                return SteeringOutcome.QUEUE_FULL
+            if not self.request_interrupt():
+                return SteeringOutcome.INTERRUPT_REJECTED
+            return SteeringOutcome.INTERRUPTED
         if not self._enqueue(
             SteeringMessage(message),
             priority=_STEERING_PRIORITY,
             interaction=interaction,
         ):
+            return SteeringOutcome.QUEUE_FULL
+        if not self.request_interrupt():
+            return SteeringOutcome.INTERRUPT_REJECTED
+        return SteeringOutcome.INTERRUPTED
+
+    async def steer_async(self, message: str, interaction: Interaction) -> SteeringOutcome:
+        """Persist a correction before queueing it and interrupting the active run.
+
+        Args:
+            message (str): Correction text to prioritize ahead of ordinary queued input.
+            interaction (Interaction): UI used to report queue admission feedback.
+
+        Returns:
+            SteeringOutcome: Result distinguishing interruption, inactivity, and backpressure.
+
+        Raises:
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        if not self._control.active:
+            return SteeringOutcome.RUN_INACTIVE
+        admission = await self._durable_admission(
+            message,
+            priority=_STEERING_PRIORITY,
+            bypass_commands=True,
+        )
+        if not self._enqueue_steering(message, admission=admission, report_full=False):
+            await self._reject_admission(admission)
+            interaction.warning(
+                "Input queue is full; this input was not accepted. Try again later."
+            )
             return SteeringOutcome.QUEUE_FULL
         if not self.request_interrupt():
             return SteeringOutcome.INTERRUPT_REJECTED
@@ -401,7 +481,52 @@ class SessionController:
         """
         if not self._control.active:
             return False
+        if self._session_manager is not None:
+            event = self._session_manager.queue_input(
+                message,
+                priority=_INPUT_PRIORITY,
+                bypass_commands=True,
+            )
+            admission = self._admission_from_event(event)
+            if self._enqueue(
+                message,
+                admission=admission,
+                interaction=interaction,
+                report_full=False,
+            ):
+                return True
+            self._reject_admission_sync(admission)
+            interaction.warning(
+                "Input queue is full; this input was not accepted. Try again later."
+            )
+            return False
         return self._enqueue(SteeringMessage(message), interaction=interaction)
+
+    async def queue_async(self, message: str, interaction: Interaction) -> bool:
+        """Persist a follow-up before admitting it at ordinary queue priority.
+
+        Args:
+            message (str): Text to add after the active run.
+            interaction (Interaction): UI used to report queue admission feedback.
+
+        Returns:
+            bool: Whether the active run admitted the message.
+
+        Raises:
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        if not self._control.active:
+            return False
+        admission = await self._durable_admission(
+            message,
+            priority=_INPUT_PRIORITY,
+            bypass_commands=True,
+        )
+        if self._enqueue(message, admission=admission, interaction=interaction, report_full=False):
+            return True
+        await self._reject_admission(admission)
+        interaction.warning("Input queue is full; this input was not accepted. Try again later.")
+        return False
 
     @property
     def interaction(self) -> Interaction:
@@ -492,7 +617,8 @@ class SessionController:
         self._loop = asyncio.get_running_loop()
         self._ui_thread = get_ident()
         self._events = asyncio.Queue(maxsize=1)
-        self._interaction.bind(self._send)
+        self._interaction.bind(self._send, self._send_async)
+        await self._restore_pending_inputs_async()
         telemetry_activity("conversation.started", component=_STATUS_COMPONENT)
         primary = None
         try:
@@ -596,6 +722,7 @@ class SessionController:
         self._input_signal = asyncio.Event()
         self._async_owner = True
         self._interaction.bind(self._send, self._send_async)
+        await self._restore_pending_inputs_async()
         telemetry_activity("conversation.started", component=_STATUS_COMPONENT)
         primary = None
         try:
@@ -708,7 +835,23 @@ class SessionController:
             return False
         if self._control.stopped:
             return False
+        if admission.input_id is not None:
+            if (
+                self._session_manager is None
+                or admission.session_id != self._session_manager.session.id
+            ):
+                self._queued_input_ids.discard(admission.input_id)
+                self._source.warning("Queued input belongs to a different session and was skipped.")
+                return self._receive(completer)
+            self._session_manager.mark_input_delivered(admission.input_id)
         self._send(RunStateChanged(completer, ConversationRunState.WORKING))
+        if admission.input_id is not None and admission.session_id is not None:
+            return AdmittedConversationInput(
+                input_id=admission.input_id,
+                session_id=admission.session_id,
+                message=str(admission.message),
+                bypass_commands=admission.bypass_commands,
+            )
         return admission.message
 
     async def _receive_async(self, completer: Completer) -> object:
@@ -729,7 +872,23 @@ class SessionController:
             return False
         if self._control.stopped:
             return False
+        if admission.input_id is not None:
+            if (
+                self._session_manager is None
+                or admission.session_id != self._session_manager.session.id
+            ):
+                self._queued_input_ids.discard(admission.input_id)
+                self._source.warning("Queued input belongs to a different session and was skipped.")
+                return await self._receive_async(completer)
+            await self._session_manager.mark_input_delivered_async(admission.input_id)
         await self._send_async(RunStateChanged(completer, state=ConversationRunState.WORKING))
+        if admission.input_id is not None and admission.session_id is not None:
+            return AdmittedConversationInput(
+                input_id=admission.input_id,
+                session_id=admission.session_id,
+                message=str(admission.message),
+                bypass_commands=admission.bypass_commands,
+            )
         return admission.message
 
     async def _drive(self, worker: asyncio.Future, *, route_idle_commands: bool) -> None:
@@ -841,6 +1000,7 @@ class SessionController:
             self._idle = event.state is ConversationRunState.IDLE
             if event.state is ConversationRunState.IDLE:
                 self._idle_command_pending = False
+                await self._restore_pending_inputs_async()
             self._completer = GuardedCompleter(
                 event.completer,
                 self._gate,
@@ -857,6 +1017,20 @@ class SessionController:
             if self._control.interrupted:
                 event.result.set_exception(RunInterrupted())
                 return
+            if self._session_manager is not None:
+                try:
+                    await self._session_manager.record_interaction_requested_async(
+                        event.request_id,
+                        kind=event.kind,
+                        session_id=event.session_id,
+                        run_id=event.run_id,
+                        operation_id=event.operation_id,
+                    )
+                except BaseException as error:
+                    event.result.set_exception(error)
+                    if isinstance(error, asyncio.CancelledError):
+                        raise
+                    return
             self._pending = event
             await self._answer()
             return
@@ -888,7 +1062,8 @@ class SessionController:
             self._idle_command_pending = self._enqueue(value)
             return
         if command_manager.is_user_command(value):
-            if self._async_owner:
+            command_name = value.lstrip().split(maxsplit=1)[0].lstrip("/")
+            if self._async_owner or command_name in {"steer", "queue"}:
                 self._command_task = asyncio.create_task(
                     self._run_command_async(command_manager, value)
                 )
@@ -905,6 +1080,31 @@ class SessionController:
             return
         if value == "":
             self._source.warning("Please enter a message!")
+        elif self._session_manager is not None and self._session_manager.recovery_state is not None:
+            self._source.warning(
+                "Recover the interrupted run or start a new session before sending a message."
+            )
+        elif self._session_manager is not None:
+            priority = _STEERING_PRIORITY if self._control.active else _INPUT_PRIORITY
+            admission = await self._durable_admission(
+                str(value),
+                priority=priority,
+                bypass_commands=True,
+            )
+            admitted = (
+                self._enqueue_steering(str(value), admission=admission, report_full=False)
+                if self._control.active
+                else self._enqueue(
+                    admission.message,
+                    admission=admission,
+                    report_full=False,
+                )
+            )
+            if not admitted:
+                await self._reject_admission(admission)
+                self._source.warning(
+                    "Input queue is full; this input was not accepted. Try again later."
+                )
         elif self._control.active:
             self._enqueue_steering(value)
         else:
@@ -921,6 +1121,9 @@ class SessionController:
 
     async def _run_command_async(self, command_manager: CommandManager, value: str) -> bool:
         """Dispatch one user command through the async owner and interaction mailbox."""
+        owns_async_dispatch = not self._async_owner
+        if owns_async_dispatch:
+            self._async_owner = True
         try:
             return await command_manager.handle_user_command_async(
                 value,
@@ -930,25 +1133,35 @@ class SessionController:
             if not isinstance(error, RunInterrupted) and not self._control.stopped:
                 raise
             return True
+        finally:
+            if owns_async_dispatch:
+                self._async_owner = False
 
     def _enqueue(
         self,
-        value: str,
+        value: object,
         *,
         priority: int = _INPUT_PRIORITY,
         interaction: Interaction | None = None,
+        admission: InputAdmission | None = None,
+        report_full: bool = True,
     ) -> bool:
         """Admit bounded input without losing existing work when the mailbox is full."""
         active_interaction = interaction if interaction is not None else self._source
         try:
-            self._inbox.put_nowait(
-                InputAdmission(priority, next(self._sequence), InputAdmissionKind.MESSAGE, value)
+            queued = admission or InputAdmission(
+                priority,
+                next(self._sequence),
+                InputAdmissionKind.MESSAGE,
+                value,
             )
+            self._inbox.put_nowait(queued)
         except Full:
             telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
-            active_interaction.warning(
-                "Input queue is full; this input was not accepted. Try again later."
-            )
+            if report_full:
+                active_interaction.warning(
+                    "Input queue is full; this input was not accepted. Try again later."
+                )
             return False
         loop = self._loop
         if loop is not None:
@@ -965,22 +1178,113 @@ class SessionController:
             active_interaction.info(f"Queued input ({self._inbox.qsize()} pending).")
         return True
 
-    def _enqueue_steering(self, value: str) -> bool:
+    async def _durable_admission(
+        self,
+        content: str,
+        *,
+        priority: int,
+        bypass_commands: bool,
+    ) -> InputAdmission:
+        """Persist an accepted message and build its mailbox record."""
+        if self._session_manager is None:
+            message = SteeringMessage(content) if bypass_commands else content
+            return InputAdmission(
+                priority,
+                next(self._sequence),
+                InputAdmissionKind.MESSAGE,
+                message,
+                bypass_commands=bypass_commands,
+            )
+        event = await self._session_manager.queue_input_async(
+            content,
+            priority=priority,
+            bypass_commands=bypass_commands,
+        )
+        return self._admission_from_event(event)
+
+    def _admission_from_event(self, event: InputQueuedEvent) -> InputAdmission:
+        """Convert a persisted accepted input into its ordered mailbox record."""
+        admission = InputAdmission(
+            event.priority,
+            event.sequence,
+            InputAdmissionKind.MESSAGE,
+            event.content,
+            input_id=event.input_id,
+            session_id=event.session_id,
+            bypass_commands=event.bypass_commands,
+        )
+        self._queued_input_ids.add(event.input_id)
+        return admission
+
+    def _reject_admission_sync(self, admission: InputAdmission) -> None:
+        """Persist input rejection through the synchronous writer."""
+        if admission.input_id is None or self._session_manager is None:
+            return
+        self._session_manager.reject_input(admission.input_id)
+        self._queued_input_ids.discard(admission.input_id)
+
+    async def _reject_admission(self, admission: InputAdmission) -> None:
+        """Persist rejection before returning a durable admission failure to the UI."""
+        if admission.input_id is None or self._session_manager is None:
+            return
+        await self._session_manager.reject_input_async(admission.input_id)
+        self._queued_input_ids.discard(admission.input_id)
+
+    async def _restore_pending_inputs_async(self) -> None:
+        """Restore durable accepted inputs into the bounded mailbox in admission order."""
+        if (
+            self._session_manager is None
+            or self._stopping
+            or self._session_manager.recovery_state is not None
+        ):
+            return
+        pending = self._session_manager.session.pending_inputs
+        pending_ids = {event.input_id for event in pending}
+        self._queued_input_ids.intersection_update(pending_ids)
+        available = _QUEUE_CAPACITY - self._inbox.qsize()
+        for event in pending:
+            if available <= 0:
+                break
+            if event.input_id in self._queued_input_ids:
+                continue
+            admission = InputAdmission(
+                event.priority,
+                event.sequence,
+                InputAdmissionKind.MESSAGE,
+                event.content,
+                input_id=event.input_id,
+                session_id=event.session_id,
+                bypass_commands=event.bypass_commands,
+            )
+            try:
+                self._inbox.put_nowait(admission)
+            except Full:
+                break
+            self._queued_input_ids.add(event.input_id)
+            available -= 1
+        if self._inbox and self._loop is not None:
+            self._input_signal.set()
+
+    def _enqueue_steering(
+        self,
+        value: str,
+        *,
+        admission: InputAdmission | None = None,
+        report_full: bool = True,
+    ) -> bool:
         """Atomically queue active ordinary input as steering for the next safe boundary."""
         message = SteeringMessage(value)
-        sequence = next(self._sequence)
+        durable_admission = admission or InputAdmission(
+            _STEERING_PRIORITY,
+            next(self._sequence),
+            InputAdmissionKind.MESSAGE,
+            message,
+        )
 
         def admit() -> bool:
             """Insert without UI work while run-control admission is locked."""
             try:
-                self._inbox.put_nowait(
-                    InputAdmission(
-                        _STEERING_PRIORITY,
-                        sequence,
-                        InputAdmissionKind.MESSAGE,
-                        message,
-                    )
-                )
+                self._inbox.put_nowait(durable_admission)
             except Full:
                 return False
             return True
@@ -988,11 +1292,16 @@ class SessionController:
         if not self._control.request_steering(admit):
             if self._control.active:
                 telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
-                self._source.warning(
-                    "Input queue is full; this input was not accepted. Try again later."
-                )
+                if report_full:
+                    self._source.warning(
+                        "Input queue is full; this input was not accepted. Try again later."
+                    )
                 return False
-            return self._enqueue(value)
+            return self._enqueue(
+                value,
+                admission=admission,
+                report_full=report_full,
+            )
         loop = self._loop
         if loop is not None:
             if get_ident() == self._ui_thread:
@@ -1011,6 +1320,10 @@ class SessionController:
         """Resolve only the explicit pending request through the UI's async input surface."""
         request = cast(InteractionCall, self._pending)
         answer_input = None
+        outcome = "answered"
+        primary = None
+        resolved_result = None
+        answered = False
         try:
             if request.kind == EVENT_TERMINAL:
                 result = request.function(*request.args, **request.kwargs)
@@ -1024,7 +1337,9 @@ class SessionController:
                 answer_input = asyncio.create_task(function(*request.args, **request.kwargs))
                 self._answer_input = answer_input
                 result = await answer_input
-        except asyncio.CancelledError:
+            resolved_result = result
+            answered = True
+        except asyncio.CancelledError as error:
             if self._pending is request and not request.result.done():
                 request.result.set_exception(KeyboardInterrupt())
             interrupted = (
@@ -1032,20 +1347,42 @@ class SessionController:
                 and request.result.done()
                 and isinstance(request.result.exception(), RunInterrupted)
             )
+            outcome = "revoked" if self._stopping or interrupted else "failed"
             if self._pending is request and not self._stopping and not interrupted:
-                raise
-        except BaseException as error:
+                primary = error
+        except BaseException as error:  # noqa: BLE001 - return all UI failures to the owner
+            outcome = "failed"
             if self._pending is request and not request.result.done():
                 request.result.set_exception(error)
-                raise
-        else:
-            if self._pending is request and not request.result.done():
-                request.result.set_result(result)
+                primary = error
         finally:
             if self._pending is request:
                 self._pending = None
             if self._answer_input is answer_input:
                 self._answer_input = None
+            if self._session_manager is not None:
+                request_error = None
+                if request.result.done() and not request.result.cancelled():
+                    request_error = request.result.exception()
+                if isinstance(request_error, (KeyboardInterrupt, RunInterrupted)):
+                    outcome = "revoked"
+                elif request_error is not None:
+                    outcome = "failed"
+                try:
+                    await self._session_manager.record_interaction_settled_async(
+                        request.request_id,
+                        outcome,
+                    )
+                except BaseException as error:
+                    if primary is None:
+                        raise
+                    primary.add_note(
+                        f"Interaction settlement also failed with {type(error).__name__}."
+                    )
+        if primary is not None:
+            raise primary
+        if answered and not request.result.done():
+            request.result.set_result(resolved_result)
 
     def _stop(self) -> int:
         """Stop admission, revoke pending input, and wake an idle execution owner."""

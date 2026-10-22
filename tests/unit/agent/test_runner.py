@@ -51,7 +51,7 @@ from loop.conversation.interaction import MailboxInteraction
 from loop.session.models import RunCompletedEvent
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.tooling import FileObservations
-from loop.utils import PathHolder
+from loop.utils import PathHolder, utc_now
 
 
 def agent_runner(
@@ -86,6 +86,9 @@ def agent_runner(
     session_manager.messages = []
     session_manager.model_context = []
     session_manager.session = Session()
+    run = SimpleNamespace(run_id="run-id", started_at=utc_now())
+    session_manager.begin_run.return_value = run
+    session_manager.begin_run_async = AsyncMock(return_value=run)
     session_manager.model = None
     session_manager.tokens = 0
     session_manager.context_window = None
@@ -1672,7 +1675,7 @@ def test_agent_run_interactions_include_the_owned_session_and_run(async_mode):
 
     if async_mode:
 
-        async def boundary():
+        async def boundary(**_kwargs):
             """Emit one interaction from the async run body."""
             interaction.info("async run")
             return expected
@@ -1681,7 +1684,7 @@ def test_agent_run_interactions_include_the_owned_session_and_run(async_mode):
         assert asyncio.run(runner.run_async()) is expected
     else:
 
-        def boundary():
+        def boundary(**_kwargs):
             """Emit one interaction from the sync run body."""
             interaction.info("sync run")
             return expected

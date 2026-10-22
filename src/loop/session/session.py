@@ -34,9 +34,16 @@ from .models import (
     Compaction,
     CompactionEvent,
     ConversationItemEvent,
+    InputConsumedEvent,
+    InputDeliveredEvent,
+    InputQueuedEvent,
+    InputRejectedEvent,
+    InteractionRequestedEvent,
+    InteractionSettledEvent,
     PendingToolCall,
     ReferenceArtifact,
     RunCompletedEvent,
+    RunStartedEvent,
     SerializedMessage,
     SerializedSession,
     SessionEvent,
@@ -49,7 +56,7 @@ from .models import (
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 12
+_SCHEMA_VERSION = 13
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -354,6 +361,175 @@ class Session:
             action = "query_model"
         return SessionRecoveryState(action=action, pending_calls=tuple(pending))
 
+    @property
+    def active_run(self) -> RunStartedEvent | None:
+        """Return the durable run that has not settled yet.
+
+        Returns:
+            RunStartedEvent | None: Active run metadata, or ``None`` when no run is pending.
+        """
+        active_run = None
+        for event in self.events:
+            if isinstance(event, RunStartedEvent):
+                active_run = event
+            elif isinstance(event, RunCompletedEvent) and (
+                event.run_id is None
+                or (active_run is not None and event.run_id == active_run.run_id)
+            ):
+                active_run = None
+        return active_run
+
+    @property
+    def active_run_id(self) -> str | None:
+        """Return the identity of the durable run that has not settled yet.
+
+        Returns:
+            str | None: Active run identity, or ``None`` when the latest run is complete.
+        """
+        active_run = self.active_run
+        return active_run.run_id if active_run is not None else None
+
+    @property
+    def pending_inputs(self) -> tuple[InputQueuedEvent, ...]:
+        """Return accepted inputs that have not reached a durable terminal state.
+
+        Returns:
+            tuple[InputQueuedEvent, ...]: Pending input records ordered by mailbox priority and
+                admission sequence.
+        """
+        queued = {}
+        settled = set()
+        for event in self.events:
+            if isinstance(event, InputQueuedEvent):
+                queued[event.input_id] = event
+            elif isinstance(event, (InputConsumedEvent, InputRejectedEvent)):
+                settled.add(event.input_id)
+        return tuple(
+            sorted(
+                (event for input_id, event in queued.items() if input_id not in settled),
+                key=lambda event: (event.priority, event.sequence),
+            )
+        )
+
+    @property
+    def pending_interactions(self) -> tuple[InteractionRequestedEvent, ...]:
+        """Return interaction requests that have not been answered or revoked.
+
+        Returns:
+            tuple[InteractionRequestedEvent, ...]: Unsettled requests in durable event order.
+        """
+        requests = {}
+        settled = set()
+        for event in self.events:
+            if isinstance(event, InteractionRequestedEvent):
+                requests[event.request_id] = event
+            elif isinstance(event, InteractionSettledEvent):
+                settled.add(event.request_id)
+        return tuple(request for key, request in requests.items() if key not in settled)
+
+    def mark_input_delivered(self, input_id: str) -> None:
+        """Record delivery without consuming the durable input.
+
+        Args:
+            input_id (str): Identity of a previously accepted input.
+
+        Raises:
+            ValueError: If the input is unknown or already consumed or rejected.
+        """
+        if not any(item.input_id == input_id for item in self.pending_inputs):
+            raise ValueError(f"Input '{input_id}' is not pending.")
+        self.events.append(
+            InputDeliveredEvent(id=str(new_uuid()), created_at=utc_now(), input_id=input_id)
+        )
+
+    def consume_input(self, input_id: str, item_index: int) -> None:
+        """Atomically bind a pending input to its canonical user message.
+
+        Args:
+            input_id (str): Identity of a previously accepted input.
+            item_index (int): Canonical message index created by consuming the input.
+
+        Raises:
+            ValueError: If the input is unknown, settled, or does not match the message.
+        """
+        pending = next((item for item in self.pending_inputs if item.input_id == input_id), None)
+        if pending is None:
+            raise ValueError(f"Input '{input_id}' is not pending.")
+        if item_index >= len(self.messages):
+            raise ValueError(f"Input '{input_id}' has no canonical message.")
+        message = self.messages[item_index]
+        if not isinstance(message, Message) or message.role != "user":
+            raise ValueError(f"Input '{input_id}' is not bound to a user message.")
+        if message.content != pending.content:
+            raise ValueError(f"Input '{input_id}' does not match its canonical message.")
+        self.events.append(
+            InputConsumedEvent(
+                id=str(new_uuid()),
+                created_at=utc_now(),
+                input_id=input_id,
+                item_index=item_index,
+            )
+        )
+
+    def reject_input(self, input_id: str) -> None:
+        """Close a pending input that cannot be admitted or resolved.
+
+        Args:
+            input_id (str): Identity of a previously accepted input.
+
+        Raises:
+            ValueError: If the input is unknown or already settled.
+        """
+        if not any(item.input_id == input_id for item in self.pending_inputs):
+            raise ValueError(f"Input '{input_id}' is not pending.")
+        self.events.append(
+            InputRejectedEvent(id=str(new_uuid()), created_at=utc_now(), input_id=input_id)
+        )
+
+    def request_interaction(self, event: InteractionRequestedEvent) -> None:
+        """Persist a correlated interaction request without storing its arguments or answer.
+
+        Args:
+            event (InteractionRequestedEvent): Safe request identity and lifecycle metadata.
+
+        Raises:
+            ValueError: If the request belongs to another session or its ID was used before.
+        """
+        if event.session_id != self.id:
+            raise ValueError("Interaction request belongs to another session.")
+        if any(request.request_id == event.request_id for request in self.pending_interactions):
+            raise ValueError(f"Interaction request '{event.request_id}' is already pending.")
+        if any(
+            isinstance(current, InteractionRequestedEvent)
+            and current.request_id == event.request_id
+            for current in self.events
+        ):
+            raise ValueError(f"Interaction request '{event.request_id}' was already recorded.")
+        self.events.append(event)
+
+    def settle_interaction(self, request_id: str, outcome: str) -> None:
+        """Close one pending interaction without retaining its response value.
+
+        Args:
+            request_id (str): Identity of the pending request.
+            outcome (str): Answered, revoked, or failed lifecycle outcome.
+
+        Raises:
+            ValueError: If the request is unknown, already settled, or has an invalid outcome.
+        """
+        if outcome not in {"answered", "revoked", "failed"}:
+            raise ValueError("Invalid interaction outcome.")
+        if not any(request.request_id == request_id for request in self.pending_interactions):
+            raise ValueError(f"Interaction request '{request_id}' is not pending.")
+        self.events.append(
+            InteractionSettledEvent(
+                id=str(new_uuid()),
+                created_at=utc_now(),
+                request_id=request_id,
+                outcome=outcome,
+            )
+        )
+
     @staticmethod
     def _resolved_call_indices(items: list[ConversationItem]) -> set[int]:
         """Match each result to its preceding call occurrence, allowing reused provider IDs."""
@@ -494,7 +670,7 @@ class Session:
         version = payload.get("version")
         if version == _SCHEMA_VERSION:
             return False
-        if version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
+        if version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
             return True
         raise ValueError(f"Unsupported session version {version}.")
 
@@ -546,6 +722,7 @@ class Session:
         messages: list[ConversationItem],
         compactions: list[Compaction],
         events: list[SessionEvent],
+        session_id: str,
     ) -> None:
         """Validate canonical checkpoint and event references."""
         previous_boundary = -1
@@ -566,6 +743,57 @@ class Session:
                 isinstance(item, ToolCall) and item.call_id == event.call_id for item in messages
             ):
                 raise TypeError("Invalid serialized tool execution event.")
+        queued_inputs = {}
+        settled_inputs = set()
+        requested_interactions = set()
+        settled_interactions = set()
+        active_run_id = None
+        started_runs = set()
+        for event in events:
+            if isinstance(event, InputQueuedEvent):
+                if event.session_id != session_id or event.input_id in queued_inputs:
+                    raise TypeError("Invalid serialized input admission.")
+                queued_inputs[event.input_id] = event
+            elif isinstance(event, InputDeliveredEvent):
+                if event.input_id not in queued_inputs or event.input_id in settled_inputs:
+                    raise TypeError("Invalid serialized input delivery.")
+            elif isinstance(event, InputConsumedEvent):
+                if event.input_id not in queued_inputs or event.input_id in settled_inputs:
+                    raise TypeError("Invalid serialized input consumption.")
+                if event.item_index >= len(messages):
+                    raise TypeError("Invalid serialized input message reference.")
+                message = messages[event.item_index]
+                if (
+                    not isinstance(message, Message)
+                    or message.role != "user"
+                    or message.content != queued_inputs[event.input_id].content
+                ):
+                    raise TypeError("Invalid serialized input message binding.")
+                settled_inputs.add(event.input_id)
+            elif isinstance(event, InputRejectedEvent):
+                if event.input_id not in queued_inputs or event.input_id in settled_inputs:
+                    raise TypeError("Invalid serialized input rejection.")
+                settled_inputs.add(event.input_id)
+            elif isinstance(event, InteractionRequestedEvent):
+                if event.session_id != session_id or event.request_id in requested_interactions:
+                    raise TypeError("Invalid serialized interaction request.")
+                requested_interactions.add(event.request_id)
+            elif isinstance(event, InteractionSettledEvent):
+                if (
+                    event.request_id not in requested_interactions
+                    or event.request_id in settled_interactions
+                ):
+                    raise TypeError("Invalid serialized interaction settlement.")
+                settled_interactions.add(event.request_id)
+            elif isinstance(event, RunStartedEvent):
+                if active_run_id is not None or event.run_id in started_runs:
+                    raise TypeError("Invalid serialized run start.")
+                active_run_id = event.run_id
+                started_runs.add(event.run_id)
+            elif isinstance(event, RunCompletedEvent):
+                if event.run_id is not None and event.run_id != active_run_id:
+                    raise TypeError("Invalid serialized run completion.")
+                active_run_id = None
         item_event_indices = [
             event.item_index for event in events if isinstance(event, ConversationItemEvent)
         ]
@@ -615,6 +843,10 @@ class Session:
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError("Invalid serialized session.") from error
         if version == 11:
+            payload["version"] = _SCHEMA_VERSION
+            version = _SCHEMA_VERSION
+        elif version == 12:
+            payload = dict(payload)
             payload["version"] = _SCHEMA_VERSION
             version = _SCHEMA_VERSION
         elif version in {9, 10}:
@@ -671,7 +903,7 @@ class Session:
                 active_skills=active_skills,
             )
             cls._validate_reference_metadata(messages)
-            cls._validate_timeline(messages, compactions, events)
+            cls._validate_timeline(messages, compactions, events, session_id)
 
         except (KeyError, TypeError, ValidationError) as error:
             raise ValueError("Invalid serialized session.") from error

@@ -151,6 +151,8 @@ def test_async_runtime_registers_and_binds_the_session_command_provider(
     assert isinstance(
         active_loop.register_command_provider.call_args_list[0].args[0], ConversationCommands
     )
+    session_manager = dependencies["Loop"].create_default.call_args.kwargs["session_manager"]
+    controller.bind_session_manager.assert_called_once_with(session_manager)
     controller.bind_command_manager.assert_called_once_with(active_loop.command_manager)
     controller.running = False
     runtime.close()

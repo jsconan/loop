@@ -28,6 +28,7 @@ from loop import (
     Decision,
     FileTarget,
     InstructionSnapshot,
+    InteractionRequestedEvent,
     MemorySessionStore,
     Message,
     ModelAssignment,
@@ -1003,6 +1004,192 @@ def test_async_session_transitions_persist_tool_boundaries_and_run_completion():
     assert any(isinstance(event, ToolExecutionStartedEvent) for event in stored.events)
     assert any(isinstance(event, ToolExecutionCompletedEvent) for event in stored.events)
     assert isinstance(stored.events[-1], RunCompletedEvent)
+
+
+def test_accepted_input_survives_restart_and_consumes_with_canonical_history():
+    """Delivery survives restart, and message insertion settles the input atomically."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    accepted = manager.queue_input(
+        "review this",
+        priority=1,
+        bypass_commands=True,
+    )
+
+    manager.mark_input_delivered(accepted.input_id)
+    restored = SessionManager(session=manager.session.id, session_store=store)
+
+    assert [event.input_id for event in restored.session.pending_inputs] == [accepted.input_id]
+    assert restored.session.events[-1].type == "input_delivered"
+
+    restored.add_user_message("review this", input_id=accepted.input_id)
+    reloaded = SessionManager(session=manager.session.id, session_store=store)
+
+    assert reloaded.session.pending_inputs == ()
+    assert [message.content for message in reloaded.messages if isinstance(message, Message)] == [
+        "review this"
+    ]
+    assert reloaded.session.events[-1].type == "input_consumed"
+
+
+def test_async_input_transitions_correlate_runs_and_revoke_stale_interactions():
+    """Async durability preserves run identity and revokes an unanswered request on reload."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    started_at = datetime(2026, 10, 21, tzinfo=UTC)
+    metrics = RunMetrics(
+        active_duration_seconds=0,
+        model_duration_seconds=0,
+        tool_duration_seconds=0,
+        message_count=0,
+        item_count=0,
+    )
+    queued_ids = []
+
+    async def persist() -> None:
+        """Persist run, queued input, and interaction state through async APIs."""
+        run = await manager.begin_run_async()
+        queued = await manager.queue_input_async("follow up", priority=1)
+        queued_ids.append(queued.input_id)
+        await manager.mark_input_delivered_async(queued.input_id)
+        rejected = await manager.queue_input_async("declined", priority=2)
+        await manager.reject_input_async(rejected.input_id)
+        await manager.record_interaction_requested_async(
+            "request-1",
+            kind="confirm",
+            session_id=manager.session.id,
+            run_id=run.run_id,
+            operation_id="operation-1",
+        )
+
+    asyncio.run(persist())
+
+    assert manager.session.active_run_id is not None
+    assert manager.session.pending_inputs[0].content == "follow up"
+    assert manager.session.pending_interactions[0].operation_id == "operation-1"
+
+    asyncio.run(manager.record_run_async("completed", started_at, metrics))
+    completed = store.load(manager.session.id)
+    assert completed.active_run_id is None
+    assert completed.events[-1].run_id == manager.session.events[0].run_id
+
+    restored = SessionManager(session=manager.session.id, session_store=store)
+    assert restored.session.pending_interactions == ()
+    assert restored.session.events[-1].outcome == "revoked"
+    asyncio.run(restored.add_user_message_async("follow up", input_id=queued_ids[0]))
+    assert restored.session.pending_inputs == ()
+
+
+def test_input_commit_failure_never_publishes_an_accepted_input():
+    """A failed snapshot write leaves the in-memory admission state unchanged."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    with (
+        patch.object(store, "save", side_effect=OSError("store unavailable")),
+        pytest.raises(OSError, match="store unavailable"),
+    ):
+        manager.queue_input("not accepted", priority=1)
+
+    assert manager.session.pending_inputs == ()
+    assert store.list() == []
+
+
+def test_async_input_commit_failure_does_not_acknowledge_the_input():
+    """Async snapshot failure leaves no pending record that could be mistaken for acceptance."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+
+    async def fail_to_persist() -> None:
+        """Reject async admission when the session store cannot save."""
+        with (
+            patch.object(store, "save", side_effect=OSError("store unavailable")),
+            pytest.raises(OSError, match="store unavailable"),
+        ):
+            await manager.queue_input_async("not accepted", priority=1)
+
+    asyncio.run(fail_to_persist())
+
+    assert manager.session.pending_inputs == ()
+    assert store.list() == []
+
+
+def test_manager_replays_durable_runtime_lifecycle_without_rendering_it():
+    """Lifecycle records stay invisible during session history replay."""
+    interaction = MagicMock(spec=Interaction)
+    manager = SessionManager(interaction=interaction, session_store=MemorySessionStore())
+    accepted = manager.queue_input("visible user text", priority=1)
+    manager.mark_input_delivered(accepted.input_id)
+    manager.add_user_message("visible user text", input_id=accepted.input_id)
+    rejected = manager.queue_input("rejected text", priority=1)
+    manager.reject_input(rejected.input_id)
+    run = manager.begin_run()
+    asyncio.run(
+        manager.record_interaction_requested_async(
+            "request-id",
+            kind="confirm",
+            session_id=manager.session.id,
+            run_id=run.run_id,
+            operation_id="operation-id",
+        )
+    )
+    asyncio.run(manager.record_interaction_settled_async("request-id", "answered"))
+
+    manager.replay()
+
+    interaction.method_calls.clear()
+    manager.replay(interaction=interaction)
+    assert interaction.method_calls == [call.user("visible user text")]
+
+
+def test_manager_lifecycle_api_rejects_duplicate_runs_and_non_text_inputs():
+    """Run ownership and message typing are enforced by both persistence APIs."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    manager.begin_run()
+    with pytest.raises(RuntimeError, match="already active"):
+        manager.begin_run()
+    with pytest.raises(TypeError, match="must be text"):
+        manager.queue_input(None, priority=1)
+
+    async def scenario():
+        """Verify async paths enforce the same active run and input contracts."""
+        with pytest.raises(RuntimeError, match="already active"):
+            await manager.begin_run_async()
+        with pytest.raises(TypeError, match="must be text"):
+            await manager.queue_input_async(None, priority=1)
+
+    asyncio.run(scenario())
+
+
+def test_manager_sync_input_rejection_closes_pending_admission():
+    """Synchronous queue backpressure is durably recorded as an input rejection."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    accepted = manager.queue_input("cannot enqueue", priority=1)
+
+    manager.reject_input(accepted.input_id)
+
+    assert manager.session.pending_inputs == ()
+    assert manager.session.events[-1].type == "input_rejected"
+
+
+def test_load_session_revokes_in_memory_interactions_without_store_write():
+    """Loading an unpersisted session revokes stale UI grants in memory."""
+    session = Session()
+    session.request_interaction(
+        InteractionRequestedEvent(
+            id="stale-event",
+            created_at=datetime(2026, 10, 21, tzinfo=UTC),
+            request_id="stale-request",
+            session_id=session.id,
+            kind="confirm",
+        )
+    )
+    manager = SessionManager()
+
+    manager.load_session(session)
+
+    assert manager.session.pending_interactions == ()
+    assert manager.session.events[-1].type == "interaction_settled"
+    assert manager.session.events[-1].outcome == "revoked"
 
 
 def test_async_compaction_without_token_estimate_preserves_session_usage():

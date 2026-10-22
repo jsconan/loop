@@ -60,9 +60,16 @@ from .models import (
     SESSION_NAME_SOURCE_INITIAL,
     Compaction,
     CompactionEvent,
+    InputConsumedEvent,
+    InputDeliveredEvent,
+    InputQueuedEvent,
+    InputRejectedEvent,
     InstructionSnapshot,
+    InteractionRequestedEvent,
+    InteractionSettledEvent,
     PermissionEvent,
     RunCompletedEvent,
+    RunStartedEvent,
     SessionEventModel,
     SessionExecutionConflictError,
     SessionNameGenerator,
@@ -345,7 +352,20 @@ class SessionManager:
             if isinstance(event, RunCompletedEvent):
                 output.run_metrics(event.metrics)
                 continue
-            if isinstance(event, (ToolExecutionStartedEvent, ToolExecutionCompletedEvent)):
+            if isinstance(
+                event,
+                (
+                    ToolExecutionStartedEvent,
+                    ToolExecutionCompletedEvent,
+                    InputQueuedEvent,
+                    InputDeliveredEvent,
+                    InputConsumedEvent,
+                    InputRejectedEvent,
+                    InteractionRequestedEvent,
+                    InteractionSettledEvent,
+                    RunStartedEvent,
+                ),
+            ):
                 continue
             item = self._session.messages[event.item_index]
             if isinstance(item, Message):
@@ -457,6 +477,224 @@ class SessionManager:
                 ended cleanly.
         """
         return self._session.recovery_state()
+
+    def begin_run(self) -> RunStartedEvent:
+        """Persist a unique run identity before invoking model or tool work.
+
+        Returns:
+            RunStartedEvent: Durable identity and start time for the active run.
+
+        Raises:
+            RuntimeError: If another durable run is still active.
+        """
+        if self._session.active_run_id is not None:
+            raise RuntimeError("A durable session run is already active.")
+        event = RunStartedEvent(
+            id=str(new_uuid()),
+            created_at=utc_now(),
+            run_id=str(new_uuid()),
+            started_at=utc_now(),
+        )
+        self._persist_event(event)
+        return event
+
+    async def begin_run_async(self) -> RunStartedEvent:
+        """Persist a unique run identity before async model or tool work.
+
+        Returns:
+            RunStartedEvent: Durable identity and start time for the active run.
+
+        Raises:
+            RuntimeError: If another durable run is still active.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        if self._session.active_run_id is not None:
+            raise RuntimeError("A durable session run is already active.")
+        event = RunStartedEvent(
+            id=str(new_uuid()),
+            created_at=utc_now(),
+            run_id=str(new_uuid()),
+            started_at=utc_now(),
+        )
+        await self._persist_event_async(event)
+        return event
+
+    def queue_input(
+        self,
+        content: str,
+        *,
+        priority: int,
+        bypass_commands: bool = False,
+    ) -> InputQueuedEvent:
+        """Durably accept one input before the controller acknowledges it.
+
+        Args:
+            content (str): User-provided message text.
+            priority (int): Mailbox priority used to restore accepted inputs.
+            bypass_commands (bool): Whether to route the text directly as message content.
+                Defaults to ``False``.
+
+        Returns:
+            InputQueuedEvent: Persisted identity and ordering metadata for the input.
+
+        Raises:
+            TypeError: If content is not text.
+        """
+        if not isinstance(content, str):
+            raise TypeError("Input content must be text.")
+        event = self._new_input_event(content, priority, bypass_commands)
+        self._persist_event(event)
+        return event
+
+    async def queue_input_async(
+        self,
+        content: str,
+        *,
+        priority: int,
+        bypass_commands: bool = False,
+    ) -> InputQueuedEvent:
+        """Durably accept one input through the async session writer.
+
+        Args:
+            content (str): User-provided message text.
+            priority (int): Mailbox priority used to restore accepted inputs.
+            bypass_commands (bool): Whether to route the text directly as message content.
+                Defaults to ``False``.
+
+        Returns:
+            InputQueuedEvent: Persisted identity and ordering metadata for the input.
+
+        Raises:
+            TypeError: If content is not text.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        if not isinstance(content, str):
+            raise TypeError("Input content must be text.")
+        event = self._new_input_event(content, priority, bypass_commands)
+        await self._persist_event_async(event)
+        return event
+
+    def _new_input_event(
+        self,
+        content: str,
+        priority: int,
+        bypass_commands: bool,
+    ) -> InputQueuedEvent:
+        """Create the next input event using session-owned sequence and run state."""
+        sequence = (
+            max(
+                (
+                    event.sequence
+                    for event in self._session.events
+                    if isinstance(event, InputQueuedEvent)
+                ),
+                default=-1,
+            )
+            + 1
+        )
+        return InputQueuedEvent(
+            id=str(new_uuid()),
+            created_at=utc_now(),
+            input_id=str(new_uuid()),
+            session_id=self._session.id,
+            content=content,
+            priority=priority,
+            sequence=sequence,
+            bypass_commands=bypass_commands,
+            run_id=self._session.active_run_id,
+        )
+
+    def mark_input_delivered(self, input_id: str) -> None:
+        """Persist that an accepted input reached its conversation owner.
+
+        Args:
+            input_id (str): Identity of a pending accepted input.
+
+        Raises:
+            ValueError: If the input is unknown or already settled.
+        """
+        self._commit(lambda session: session.mark_input_delivered(input_id))
+
+    async def mark_input_delivered_async(self, input_id: str) -> None:
+        """Persist input delivery through the async session writer.
+
+        Args:
+            input_id (str): Identity of a pending accepted input.
+
+        Raises:
+            ValueError: If the input is unknown or already settled.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        await self._commit_async(lambda session: session.mark_input_delivered(input_id))
+
+    def reject_input(self, input_id: str) -> None:
+        """Persist that a previously accepted input could not enter the mailbox.
+
+        Args:
+            input_id (str): Identity of a pending accepted input.
+
+        Raises:
+            ValueError: If the input is unknown or already settled.
+        """
+        self._commit(lambda session: session.reject_input(input_id))
+
+    async def reject_input_async(self, input_id: str) -> None:
+        """Persist input rejection through the async session writer.
+
+        Args:
+            input_id (str): Identity of a pending accepted input.
+
+        Raises:
+            ValueError: If the input is unknown or already settled.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        await self._commit_async(lambda session: session.reject_input(input_id))
+
+    async def record_interaction_requested_async(
+        self,
+        request_id: str,
+        *,
+        kind: str,
+        session_id: str | None,
+        run_id: str | None,
+        operation_id: str | None,
+    ) -> None:
+        """Record safe identity metadata before presenting a blocking interaction.
+
+        Args:
+            request_id (str): Unique UI request identity.
+            kind (str): Prompt, confirmation, or terminal request type.
+            session_id (str | None): Request owner, or the active session when absent.
+            run_id (str | None): Correlated run identity.
+            operation_id (str | None): Correlated tool operation identity.
+
+        Raises:
+            ValueError: If the request belongs to another session or has an invalid kind.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        event = InteractionRequestedEvent(
+            id=str(new_uuid()),
+            created_at=utc_now(),
+            request_id=request_id,
+            session_id=session_id or self._session.id,
+            run_id=run_id,
+            operation_id=operation_id,
+            kind=kind,
+        )
+        await self._commit_async(lambda session: session.request_interaction(event))
+
+    async def record_interaction_settled_async(self, request_id: str, outcome: str) -> None:
+        """Close a durable UI request without retaining any answer or reusable approval.
+
+        Args:
+            request_id (str): Unique UI request identity.
+            outcome (str): Answered, revoked, or failed lifecycle outcome.
+
+        Raises:
+            ValueError: If the request is not pending or the outcome is invalid.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        await self._commit_async(lambda session: session.settle_interaction(request_id, outcome))
 
     @property
     def model(self) -> str | None:
@@ -696,6 +934,16 @@ class SessionManager:
                         artifact.source,
                         artifact.reloadable,
                     )
+        if session.pending_interactions:
+            candidate = deepcopy(session)
+            for request in candidate.pending_interactions:
+                candidate.settle_interaction(request.request_id, "revoked")
+            if load_from_store or session.revision > 0:
+                self._save_snapshot(self._session_store, self._persistence_lock, candidate)
+            for session_field in fields(Session):
+                setattr(
+                    session, session_field.name, deepcopy(getattr(candidate, session_field.name))
+                )
         self._session = session
 
     def load_persisted_session(self, session_id: str) -> Session:
@@ -922,6 +1170,8 @@ class SessionManager:
         self,
         content: str,
         context: Iterable[ContextReference] = (),
+        *,
+        input_id: str | None = None,
     ) -> None:
         """Construct and persist one complete user message.
 
@@ -929,6 +1179,8 @@ class SessionManager:
             content (str): Submitted user-message text.
             context (Iterable[ContextReference]): Resolved context snapshots attached to the
                 message. Defaults to no explicit context.
+            input_id (str | None): Durable accepted-input identity to consume with this message.
+                Defaults to ``None`` for direct or legacy input.
 
         Returns:
             None: The user message is durably committed before model work begins.
@@ -944,7 +1196,10 @@ class SessionManager:
                     initial_session_name(content),
                     source=SESSION_NAME_SOURCE_INITIAL,
                 )
+            item_index = len(session.messages)
             session.add_message(message)
+            if input_id is not None:
+                session.consume_input(input_id, item_index)
 
         self._commit(apply)
 
@@ -952,6 +1207,8 @@ class SessionManager:
         self,
         content: str,
         context: Iterable[ContextReference] = (),
+        *,
+        input_id: str | None = None,
     ) -> None:
         """Persist a user message before async model work begins.
 
@@ -959,6 +1216,8 @@ class SessionManager:
             content (str): Submitted user-message text.
             context (Iterable[ContextReference]): Resolved context snapshots attached to the
                 message. Defaults to no explicit context.
+            input_id (str | None): Durable accepted-input identity to consume with this message.
+                Defaults to ``None`` for direct or legacy input.
 
         Raises:
             ValueError: If occurrence metadata is incomplete or inconsistent with its content.
@@ -972,7 +1231,10 @@ class SessionManager:
                     initial_session_name(content),
                     source=SESSION_NAME_SOURCE_INITIAL,
                 )
+            item_index = len(session.messages)
             session.add_message(message)
+            if input_id is not None:
+                session.consume_input(input_id, item_index)
 
         await self._commit_async(apply)
 
@@ -1333,6 +1595,7 @@ class SessionManager:
             stop_reason=stop_reason,
             started_at=started_at,
             metrics=metrics,
+            run_id=self._session.active_run_id,
         )
         self._persist_event(event)
         return event
@@ -1362,6 +1625,7 @@ class SessionManager:
             stop_reason=stop_reason,
             started_at=started_at,
             metrics=metrics,
+            run_id=self._session.active_run_id,
         )
         await self._persist_event_async(event)
         return event

@@ -188,6 +188,11 @@ class ApplicationRuntime:
             if execution_tracked:
                 cleanup_callbacks.pop()
             cls._track_close(tool_registry, cleanup_callbacks)
+            session_manager = SessionManager(
+                interaction=active_interaction,
+                session_store=session_store,
+                workspace_id=workspace.id,
+            )
             loop = Loop.create_default(
                 backend,
                 interaction=active_interaction,
@@ -199,11 +204,7 @@ class ApplicationRuntime:
                     workspace_root=workspace.root,
                 ),
                 permission_manager=permission_manager,
-                session_manager=SessionManager(
-                    interaction=active_interaction,
-                    session_store=session_store,
-                    workspace_id=workspace.id,
-                ),
+                session_manager=session_manager,
                 agent_name=settings.loop.agent_name,
                 model=settings.loop.model,
                 temperature=settings.loop.temperature,
@@ -232,6 +233,7 @@ class ApplicationRuntime:
                 session_controller=session_controller,
             )
             if session_controller is not None:
+                session_controller.bind_session_manager(session_manager)
                 loop.register_command_provider(ConversationCommands(session_controller))
                 session_controller.bind_command_manager(loop.command_manager)
             loop.register_command_provider(

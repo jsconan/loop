@@ -17,6 +17,7 @@ from .completion import (
 )
 from .configuration import ApplicationSettings
 from .control import RunControl
+from .conversation.models import AdmittedConversationInput
 from .errors import Problem, log_problem
 from .execution.sandbox import SandboxCommands
 from .instructions import InstructionsManager, RuntimeEnvironment, SkillCommands
@@ -598,8 +599,21 @@ class Loop:
             if user_input is False:
                 break
             session = self.session
+            admitted_input = (
+                user_input if isinstance(user_input, AdmittedConversationInput) else None
+            )
+            if admitted_input is not None:
+                if admitted_input.session_id != self._session_manager.session.id:
+                    self._interaction.warning(
+                        "Queued input belongs to a different session and was skipped."
+                    )
+                    continue
+                user_input = admitted_input.message
             handled_command = False
-            if not isinstance(user_input, SteeringMessage):
+            bypass_commands = isinstance(user_input, SteeringMessage) or (
+                admitted_input is not None and admitted_input.bypass_commands
+            )
+            if not bypass_commands:
                 handled_command = self._command_manager.handle_user_command(user_input)
             if handled_command:
                 if self.session is not session:
@@ -666,7 +680,11 @@ class Loop:
                         else:
                             self._interaction.info(f"Attached {reference.path}: {included} bytes.")
                     telemetry_activity("message.accepted", component="session_manager")
-                    self._session_manager.add_user_message(user_input, context=context)
+                    self._session_manager.add_user_message(
+                        user_input,
+                        context=context,
+                        input_id=admitted_input.input_id if admitted_input is not None else None,
+                    )
                     result = self._agent_runner.run()
                     self._complete_agent_run(result)
             finally:
@@ -703,8 +721,21 @@ class Loop:
             if user_input is False:
                 break
             session = self.session
+            admitted_input = (
+                user_input if isinstance(user_input, AdmittedConversationInput) else None
+            )
+            if admitted_input is not None:
+                if admitted_input.session_id != self._session_manager.session.id:
+                    self._interaction.warning(
+                        "Queued input belongs to a different session and was skipped."
+                    )
+                    continue
+                user_input = admitted_input.message
             handled_command = False
-            if not isinstance(user_input, SteeringMessage):
+            bypass_commands = isinstance(user_input, SteeringMessage) or (
+                admitted_input is not None and admitted_input.bypass_commands
+            )
+            if not bypass_commands:
                 handled_command = await self._command_manager.handle_user_command_async(user_input)
             if handled_command:
                 if self.session is not session:
@@ -770,7 +801,11 @@ class Loop:
                             )
                         else:
                             self._interaction.info(f"Attached {reference.path}: {included} bytes.")
-                    await self._session_manager.add_user_message_async(user_input, context=context)
+                    await self._session_manager.add_user_message_async(
+                        user_input,
+                        context=context,
+                        input_id=admitted_input.input_id if admitted_input is not None else None,
+                    )
                     telemetry_activity("message.accepted", component="session_manager")
                     result = await self._agent_runner.run_async()
                     await self._complete_agent_run_async(result)

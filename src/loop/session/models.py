@@ -198,6 +198,118 @@ class PermissionEvent(SessionEventModel):
     result: AuthorizationResult
 
 
+class InputQueuedEvent(SessionEventModel):
+    """Persist one accepted user input before acknowledging it to the conversation owner.
+
+    Args:
+        type (Literal["input_queued"]): Event discriminator.
+        input_id (str): Stable identity used to deduplicate later delivery and consumption.
+        session_id (str): Session that accepted the input.
+        content (str): User-provided message retained until consumption or rejection.
+        priority (int): Mailbox priority used to restore accepted inputs in order.
+        sequence (int): Admission sequence used to order inputs with equal priority.
+        bypass_commands (bool): Whether this input was already classified as message content.
+        run_id (str | None): Active run when this follow-up was admitted.
+    """
+
+    type: Literal["input_queued"] = "input_queued"
+    input_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    content: str
+    priority: int
+    sequence: int = Field(ge=0)
+    bypass_commands: bool = False
+    run_id: str | None = None
+
+
+class InputDeliveredEvent(SessionEventModel):
+    """Record delivery of an accepted input to the session owner.
+
+    Args:
+        type (Literal["input_delivered"]): Event discriminator.
+        input_id (str): Identity of the accepted input.
+    """
+
+    type: Literal["input_delivered"] = "input_delivered"
+    input_id: str = Field(min_length=1)
+
+
+class InputConsumedEvent(SessionEventModel):
+    """Atomically associate an accepted input with its canonical user message.
+
+    Args:
+        type (Literal["input_consumed"]): Event discriminator.
+        input_id (str): Identity of the accepted input.
+        item_index (int): Canonical user-message index created by consumption.
+    """
+
+    type: Literal["input_consumed"] = "input_consumed"
+    input_id: str = Field(min_length=1)
+    item_index: int = Field(ge=0)
+
+
+class InputRejectedEvent(SessionEventModel):
+    """Close an accepted input that could not be admitted or resolved.
+
+    Args:
+        type (Literal["input_rejected"]): Event discriminator.
+        input_id (str): Identity of the rejected input.
+    """
+
+    type: Literal["input_rejected"] = "input_rejected"
+    input_id: str = Field(min_length=1)
+
+
+class InteractionRequestedEvent(SessionEventModel):
+    """Record a pending UI request without persisting its answer or authority.
+
+    Args:
+        type (Literal["interaction_requested"]): Event discriminator.
+        request_id (str): Stable identity of the pending interaction.
+        session_id (str): Session that owns the request.
+        run_id (str | None): Active run that owns the request.
+        operation_id (str | None): Related operation identity, when available.
+        kind (Literal["confirm", "prompt", "terminal"]): Type of user interaction.
+    """
+
+    type: Literal["interaction_requested"] = "interaction_requested"
+    request_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    run_id: str | None = None
+    operation_id: str | None = None
+    kind: Literal["confirm", "prompt", "terminal"]
+
+
+class InteractionSettledEvent(SessionEventModel):
+    """Close a pending interaction while keeping its answer out of the lifecycle ledger.
+
+    Args:
+        type (Literal["interaction_settled"]): Event discriminator.
+        request_id (str): Identity of the settled request.
+        outcome (Literal["answered", "revoked", "failed"]): How the request ended.
+    """
+
+    type: Literal["interaction_settled"] = "interaction_settled"
+    request_id: str = Field(min_length=1)
+    outcome: Literal["answered", "revoked", "failed"]
+
+
+class RunStartedEvent(SessionEventModel):
+    """Persist run identity before invoking model or tool work.
+
+    Args:
+        type (Literal["run_started"]): Event discriminator.
+        run_id (str): Stable identity for this agent run.
+        started_at (datetime): UTC time at which execution began.
+    """
+
+    type: Literal["run_started"] = "run_started"
+    run_id: str = Field(min_length=1)
+    started_at: datetime
+
+    _normalize_started_at = field_validator("started_at")(as_utc)
+
+
 class RunCompletedEvent(SessionEventModel):
     """Record aggregate and operation-level statistics for one agent run.
 
@@ -206,12 +318,14 @@ class RunCompletedEvent(SessionEventModel):
         stop_reason (AgentRunStopReason): Reason the run returned control.
         started_at (datetime): UTC time at which execution began.
         metrics (RunMetrics): Complete durable statistics and current context occupancy.
+        run_id (str | None): Identity of the run, or ``None`` for legacy completion events.
     """
 
     type: Literal["run_completed"] = "run_completed"
     stop_reason: AgentRunStopReason
     started_at: datetime
     metrics: RunMetrics
+    run_id: str | None = None
 
     _normalize_started_at = field_validator("started_at")(as_utc)
 
@@ -259,6 +373,13 @@ class CompactionEvent(SessionEventModel):
 SessionEvent = Annotated[
     ConversationItemEvent
     | PermissionEvent
+    | InputQueuedEvent
+    | InputDeliveredEvent
+    | InputConsumedEvent
+    | InputRejectedEvent
+    | InteractionRequestedEvent
+    | InteractionSettledEvent
+    | RunStartedEvent
     | RunCompletedEvent
     | ToolExecutionStartedEvent
     | ToolExecutionCompletedEvent

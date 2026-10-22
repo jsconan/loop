@@ -11,13 +11,20 @@ from loop import (
     CompactionContextItem,
     ContentArtifact,
     ContextReference,
+    InputConsumedEvent,
+    InputDeliveredEvent,
+    InputQueuedEvent,
+    InputRejectedEvent,
     InstructionSnapshot,
+    InteractionRequestedEvent,
+    InteractionSettledEvent,
     Message,
     ModelAssignment,
     Reasoning,
     Response,
     ResponseMetadata,
     RunMetrics,
+    RunStartedEvent,
     Session,
     SessionInfo,
     ToolCall,
@@ -518,7 +525,7 @@ def test_session_externalizes_shipped_v11_inline_references():
     assert reference.next_cursor is not None
     assert reference.media_type == "text/plain"
     assert restored.persistence_snapshot().reference_artifacts[0].content == b"preview"
-    assert json.loads(restored.serialize())["version"] == 12
+    assert json.loads(restored.serialize())["version"] == 13
 
 
 def test_session_persistence_snapshot_deduplicates_transient_reference_content():
@@ -638,11 +645,290 @@ def test_session_reports_whether_serialized_state_requires_migration():
     assert Session.requires_migration(json.dumps(legacy)) is True
 
 
+def test_session_migrates_v12_snapshots_without_changing_existing_history():
+    """Version 12 sessions retain canonical history while adopting the current schema."""
+    original = Session(messages=[Message(role="user", content="question")])
+    payload = json.loads(original.serialize())
+    payload["version"] = 12
+
+    restored = Session.deserialize(json.dumps(payload))
+
+    assert restored.messages == original.messages
+    assert json.loads(restored.serialize())["version"] == 13
+
+
 @pytest.mark.parametrize("value", ["not-json", "[]", '{"version":99}'])
 def test_session_rejects_invalid_versions_during_migration_inspection(value):
     """Schema inspection shares deserialization's invalid-version contract."""
     with pytest.raises(ValueError, match="Invalid serialized session|Unsupported session version"):
         Session.requires_migration(value)
+
+
+def test_session_tracks_input_interaction_and_run_lifecycles():
+    """Lifecycle records stay correlated and close without retaining interaction answers."""
+    session = Session()
+    created_at = datetime(2026, 10, 21, tzinfo=UTC)
+    queued = InputQueuedEvent(
+        id="event-queued",
+        created_at=created_at,
+        input_id="input-1",
+        session_id=session.id,
+        content="question",
+        priority=1,
+        sequence=0,
+        bypass_commands=True,
+        run_id="run-1",
+    )
+    session.events.append(queued)
+    session.mark_input_delivered(queued.input_id)
+    assert isinstance(session.events[-1], InputDeliveredEvent)
+    session.add_message(Message(role="user", content="question"))
+    session.consume_input(queued.input_id, 0)
+    assert isinstance(session.events[-1], InputConsumedEvent)
+
+    rejected = InputQueuedEvent(
+        id="event-queued-2",
+        created_at=created_at,
+        input_id="input-2",
+        session_id=session.id,
+        content="unavailable",
+        priority=2,
+        sequence=1,
+    )
+    session.events.append(rejected)
+    session.reject_input(rejected.input_id)
+    assert isinstance(session.events[-1], InputRejectedEvent)
+    assert session.pending_inputs == ()
+
+    request = InteractionRequestedEvent(
+        id="event-requested",
+        created_at=created_at,
+        request_id="request-1",
+        session_id=session.id,
+        run_id="run-1",
+        operation_id="operation-1",
+        kind="confirm",
+    )
+    session.request_interaction(request)
+    assert session.pending_interactions == (request,)
+    session.settle_interaction(request.request_id, "answered")
+    assert isinstance(session.events[-1], InteractionSettledEvent)
+    assert session.pending_interactions == ()
+
+    run = RunStartedEvent(
+        id="event-run-started",
+        created_at=created_at,
+        run_id="run-1",
+        started_at=created_at,
+    )
+    session.events.append(run)
+    assert session.active_run_id == run.run_id
+    session.events.append(
+        RunCompletedEvent(
+            id="event-run-completed",
+            created_at=created_at,
+            run_id=run.run_id,
+            stop_reason="completed",
+            started_at=created_at,
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=0,
+                item_count=1,
+            ),
+        )
+    )
+    assert session.active_run is None
+    assert "secret answer" not in session.serialize()
+    assert Session.deserialize(session.serialize()) == session
+
+
+def test_session_rejects_invalid_lifecycle_transitions():
+    """Input and interaction transitions require their original pending identities."""
+    session = Session()
+
+    with pytest.raises(ValueError, match="not pending"):
+        session.mark_input_delivered("missing")
+    with pytest.raises(ValueError, match="not pending"):
+        session.consume_input("missing", 0)
+    with pytest.raises(ValueError, match="not pending"):
+        session.reject_input("missing")
+    with pytest.raises(ValueError, match="no canonical message"):
+        pending = InputQueuedEvent(
+            id="queued-event",
+            created_at=datetime(2026, 10, 21, tzinfo=UTC),
+            input_id="pending",
+            session_id=session.id,
+            content="missing message",
+            priority=1,
+            sequence=0,
+        )
+        session.events.append(pending)
+        session.consume_input(pending.input_id, 0)
+    with pytest.raises(ValueError, match="already pending"):
+        request = InteractionRequestedEvent(
+            id="first-request-event",
+            created_at=datetime(2026, 10, 21, tzinfo=UTC),
+            request_id="request",
+            session_id=session.id,
+            kind="prompt",
+        )
+        session.request_interaction(request)
+        session.request_interaction(request.model_copy(update={"id": "second-request-event"}))
+    with pytest.raises(ValueError, match="another session"):
+        session.request_interaction(
+            InteractionRequestedEvent(
+                id="request-event",
+                created_at=datetime(2026, 10, 21, tzinfo=UTC),
+                request_id="request",
+                session_id="different-session",
+                kind="prompt",
+            )
+        )
+    with pytest.raises(ValueError, match="Invalid interaction outcome"):
+        session.settle_interaction("missing", "unknown")
+
+    with pytest.raises(ValueError, match="not bound to a user message"):
+        session = Session(messages=[Message(role="assistant", content="answer")])
+        pending = InputQueuedEvent(
+            id="assistant-queued-event",
+            created_at=datetime(2026, 10, 21, tzinfo=UTC),
+            input_id="assistant-input",
+            session_id=session.id,
+            content="answer",
+            priority=1,
+            sequence=0,
+        )
+        session.events.append(pending)
+        session.consume_input(pending.input_id, 0)
+
+    with pytest.raises(ValueError, match="does not match"):
+        session = Session(messages=[Message(role="user", content="actual")])
+        pending = InputQueuedEvent(
+            id="mismatch-queued-event",
+            created_at=datetime(2026, 10, 21, tzinfo=UTC),
+            input_id="mismatch-input",
+            session_id=session.id,
+            content="expected",
+            priority=1,
+            sequence=0,
+        )
+        session.events.append(pending)
+        session.consume_input(pending.input_id, 0)
+
+    request = InteractionRequestedEvent(
+        id="settled-request-event",
+        created_at=datetime(2026, 10, 21, tzinfo=UTC),
+        request_id="settled-request",
+        session_id=session.id,
+        kind="prompt",
+    )
+    session.request_interaction(request)
+    session.settle_interaction(request.request_id, "answered")
+    with pytest.raises(ValueError, match="was already recorded"):
+        session.request_interaction(request.model_copy(update={"id": "reused-request-event"}))
+    with pytest.raises(ValueError, match="not pending"):
+        session.settle_interaction("missing", "answered")
+
+
+def test_session_deserialization_rejects_invalid_lifecycle_event_timelines():
+    """Deserialized lifecycle events must reference unique active records and messages."""
+    created_at = datetime(2026, 10, 21, tzinfo=UTC)
+    session = Session(messages=[Message(role="user", content="actual")])
+    queued = InputQueuedEvent(
+        id="queued-event",
+        created_at=created_at,
+        input_id="input-1",
+        session_id=session.id,
+        content="actual",
+        priority=1,
+        sequence=0,
+    )
+    request = InteractionRequestedEvent(
+        id="request-event",
+        created_at=created_at,
+        request_id="request-1",
+        session_id=session.id,
+        kind="prompt",
+    )
+    settlement = InteractionSettledEvent(
+        id="settlement-event",
+        created_at=created_at,
+        request_id=request.request_id,
+        outcome="answered",
+    )
+    run = RunStartedEvent(
+        id="run-event",
+        created_at=created_at,
+        run_id="run-1",
+        started_at=created_at,
+    )
+    completed = RunCompletedEvent(
+        id="completed-event",
+        created_at=created_at,
+        run_id="run-1",
+        stop_reason="completed",
+        started_at=created_at,
+        metrics=RunMetrics(
+            active_duration_seconds=0,
+            model_duration_seconds=0,
+            tool_duration_seconds=0,
+            message_count=1,
+            item_count=1,
+        ),
+    )
+    invalid_timelines = {
+        "input_session": [queued.model_copy(update={"session_id": "different-session"})],
+        "duplicate_input": [queued, queued.model_copy(update={"id": "duplicate-event"})],
+        "delivery_unknown": [
+            InputDeliveredEvent(id="delivery-event", created_at=created_at, input_id="unknown")
+        ],
+        "delivery_after_rejection": [
+            queued,
+            InputRejectedEvent(id="reject-event", created_at=created_at, input_id="input-1"),
+            InputDeliveredEvent(id="delivery-event", created_at=created_at, input_id="input-1"),
+        ],
+        "consume_unknown": [
+            InputConsumedEvent(
+                id="consume-event", created_at=created_at, input_id="unknown", item_index=0
+            )
+        ],
+        "consume_out_of_range": [
+            queued,
+            InputConsumedEvent(
+                id="consume-event", created_at=created_at, input_id="input-1", item_index=2
+            ),
+        ],
+        "consume_mismatch": [
+            queued.model_copy(update={"content": "different"}),
+            InputConsumedEvent(
+                id="consume-event", created_at=created_at, input_id="input-1", item_index=0
+            ),
+        ],
+        "reject_unknown": [
+            InputRejectedEvent(id="reject-event", created_at=created_at, input_id="unknown")
+        ],
+        "request_session": [request.model_copy(update={"session_id": "different-session"})],
+        "duplicate_request": [request, request.model_copy(update={"id": "duplicate-request"})],
+        "settle_unknown": [settlement],
+        "duplicate_settlement": [
+            request,
+            settlement,
+            settlement.model_copy(update={"id": "duplicate-settlement"}),
+        ],
+        "duplicate_run": [run, completed, run.model_copy(update={"id": "duplicate-run"})],
+        "completion_run": [
+            run,
+            completed.model_copy(update={"run_id": "different-run"}),
+        ],
+    }
+
+    for events in invalid_timelines.values():
+        payload = json.loads(session.serialize())
+        payload["events"] = [event.model_dump(mode="json") for event in events]
+        with pytest.raises(ValueError, match="Invalid serialized session"):
+            Session.deserialize(json.dumps(payload))
 
 
 @pytest.mark.parametrize(
