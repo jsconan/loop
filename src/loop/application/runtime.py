@@ -244,6 +244,8 @@ class ApplicationRuntime:
                     configuration,
                     runtime.apply_configuration,
                     runtime.apply_configuration_changes,
+                    apply_async=runtime.apply_configuration_async,
+                    apply_many_async=runtime.apply_configuration_changes_async,
                 )
             )
             loop.register_command_provider(
@@ -314,6 +316,24 @@ class ApplicationRuntime:
             return "applied now"
         return self._loop.apply_runtime_settings(path, settings)
 
+    async def apply_configuration_async(self, path: str, settings: ApplicationSettings) -> str:
+        """Apply one configuration change through native async backend metadata APIs.
+
+        Args:
+            path (str): Changed dot-separated configuration path.
+            settings (ApplicationSettings): Newly validated effective configuration.
+
+        Returns:
+            str: Whether the setting was applied now or requires restart.
+
+        Raises:
+            asyncio.CancelledError: If asynchronous model metadata lookup is cancelled.
+        """
+        if path.startswith("backend."):
+            await self._replace_backend_async(settings)
+            return "applied now"
+        return await self._loop.apply_runtime_settings_async(path, settings)
+
     def apply_configuration_changes(
         self, paths: tuple[str, ...], settings: ApplicationSettings
     ) -> Mapping[str, str]:
@@ -339,11 +359,41 @@ class ApplicationRuntime:
         )
         return statuses
 
+    async def apply_configuration_changes_async(
+        self, paths: tuple[str, ...], settings: ApplicationSettings
+    ) -> Mapping[str, str]:
+        """Apply changed settings using async model metadata when the backend changes.
+
+        Args:
+            paths (tuple[str, ...]): Effective configuration paths changed by this reload.
+            settings (ApplicationSettings): Newly validated effective configuration.
+
+        Returns:
+            Mapping[str, str]: Per-path statuses describing whether each change was applied now.
+
+        Raises:
+            asyncio.CancelledError: If asynchronous model metadata lookup is cancelled.
+        """
+        statuses = {}
+        if any(path.startswith("backend.") for path in paths):
+            await self._replace_backend_async(settings)
+            statuses.update({path: "applied now" for path in paths if path.startswith("backend.")})
+        for path in paths:
+            if not path.startswith("backend."):
+                statuses[path] = await self._loop.apply_runtime_settings_async(path, settings)
+        return statuses
+
     def _replace_backend(self, settings: ApplicationSettings) -> None:
         """Track a replacement backend before publishing it to the active loop."""
         backend = self._create_backend(settings)
         self._track_close(backend, self._cleanup_callbacks)
         self._loop.replace_backend(backend)
+
+    async def _replace_backend_async(self, settings: ApplicationSettings) -> None:
+        """Track a replacement backend before publishing it through async restoration."""
+        backend = self._create_backend(settings)
+        self._track_close(backend, self._cleanup_callbacks)
+        await self._loop.replace_backend_async(backend)
 
     @staticmethod
     def _create_backend(settings: ApplicationSettings) -> OpenAIBackend:

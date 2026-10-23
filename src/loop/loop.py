@@ -408,12 +408,47 @@ class Loop:
             return "saved; restart required"
         return "applied now"
 
+    async def apply_runtime_settings_async(self, path: str, settings: ApplicationSettings) -> str:
+        """Apply a supported live setting through native async services when needed.
+
+        Args:
+            path (str): Changed dot-separated configuration path.
+            settings (ApplicationSettings): Newly validated effective application settings.
+
+        Returns:
+            str: Whether the setting was applied now or requires restart.
+
+        Raises:
+            asyncio.CancelledError: If asynchronous model metadata lookup is cancelled.
+        """
+        if path == "loop.model":
+            await self._model_selection.restore_async(settings.loop.model)
+            return "applied now"
+        return self.apply_runtime_settings(path, settings)
+
     def replace_backend(self, backend: Backend) -> None:
         """Replace the shared backend used by all future loop operations.
 
         Args:
             backend (Backend): Fully configured replacement backend.
         """
+        self._set_backend(backend)
+        self._model_selection.restore(self._model_selection.selected)
+
+    async def replace_backend_async(self, backend: Backend) -> None:
+        """Replace the backend and refresh model metadata through its async API.
+
+        Args:
+            backend (Backend): Fully configured replacement backend.
+
+        Raises:
+            asyncio.CancelledError: If asynchronous model metadata lookup is cancelled.
+        """
+        self._set_backend(backend)
+        await self._model_selection.restore_async(self._model_selection.selected)
+
+    def _set_backend(self, backend: Backend) -> None:
+        """Publish one backend to every runtime component that owns it."""
         self._backend = backend
         self._agent_runner.backend = backend
         self._model_selection.backend = backend
@@ -422,7 +457,6 @@ class Loop:
             self._session_name_generator, BackendSessionNameGenerator
         ):
             self._session_name_generator.backend = backend
-        self._model_selection.restore(self._model_selection.selected)
 
     @property
     def backend(self) -> Backend:

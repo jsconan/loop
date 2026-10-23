@@ -2,7 +2,7 @@
 
 import asyncio
 from threading import Event, get_ident
-from unittest.mock import Mock, call
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from prompt_toolkit.document import Document
@@ -171,6 +171,166 @@ def test_async_config_command_offloads_persistence_and_applies_on_owner(tmp_path
 
     assert set_threads[0] != apply_threads[0]
     assert configuration.effective.loop.debug is True
+
+
+def test_config_dispatch_uses_the_callback_for_its_execution_mode(tmp_path):
+    """Sync dispatch stays synchronous while async dispatch awaits its native callback."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock(spec=ConsoleInteraction)
+    apply = Mock(return_value="applied now")
+    apply_async = AsyncMock(return_value="applied now")
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply, apply_async=apply_async),),
+        interaction=interaction,
+    )
+
+    manager.call("config", "set loop.debug true scope=session")
+
+    apply.assert_called_once_with("loop.debug", configuration.effective)
+    apply_async.assert_not_awaited()
+
+    async def dispatch():
+        """Run a configuration update through the asynchronous command API."""
+        await manager.call_async("config", "set loop.debug false scope=session")
+
+    asyncio.run(dispatch())
+
+    apply_async.assert_awaited_once_with("loop.debug", configuration.effective)
+    apply.assert_called_once()
+    assert configuration.effective.loop.debug is False
+    manager.close()
+
+
+def test_async_config_reload_uses_the_async_batch_applicator(tmp_path):
+    """Async reload delegates all changed paths to its async batch callback."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load()
+    configuration.path.write_text("[loop]\ndebug = true\n", encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    apply_many = Mock()
+    apply_many_async = AsyncMock(return_value={"loop.debug": "applied now"})
+    manager = CommandManager(
+        providers=(
+            ConfigurationCommands(
+                configuration,
+                Mock(),
+                apply_many,
+                apply_many_async=apply_many_async,
+            ),
+        ),
+        interaction=interaction,
+    )
+
+    async def dispatch():
+        """Reload durable settings through asynchronous command dispatch."""
+        await manager.call_async("config", "reload")
+
+    asyncio.run(dispatch())
+
+    apply_many.assert_not_called()
+    apply_many_async.assert_awaited_once_with(("loop.debug",), configuration.effective)
+    interaction.info.assert_called_once_with("Configuration reloaded: applied now: loop.debug.")
+    manager.close()
+
+
+def test_async_config_cancellation_settles_async_runtime_effect(tmp_path):
+    """Cancellation waits for an async runtime effect after changing session settings."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock(spec=ConsoleInteraction)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    applied = []
+
+    async def apply_async(path, settings):
+        """Hold runtime application until the test cancels the configuration command."""
+        started.set()
+        await release.wait()
+        applied.append((path, settings.loop.debug))
+        return "applied now"
+
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(), apply_async=apply_async),),
+        interaction=interaction,
+    )
+
+    async def dispatch():
+        """Cancel a session update while its async runtime callback is pending."""
+        pending = asyncio.create_task(
+            manager.call_async("config", "set loop.debug true scope=session")
+        )
+        await started.wait()
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    asyncio.run(dispatch())
+
+    assert applied == [("loop.debug", True)]
+    assert configuration.effective.loop.debug is True
+    manager.close()
+
+
+def test_async_config_cancellation_preserves_failure_from_runtime_effect(tmp_path):
+    """A runtime failure is attached when cancellation arrives during async application."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock(spec=ConsoleInteraction)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail_after_release(_path, _settings):
+        """Fail runtime application only after the test cancels the command."""
+        started.set()
+        await release.wait()
+        raise ValueError("runtime update failed")
+
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(), apply_async=fail_after_release),),
+        interaction=interaction,
+    )
+
+    async def dispatch():
+        """Cancel the command before releasing its failing runtime callback."""
+        pending = asyncio.create_task(
+            manager.call_async("config", "set loop.debug true scope=session")
+        )
+        await started.wait()
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await pending
+        assert any("ValueError" in note for note in captured.value.__notes__)
+
+    asyncio.run(dispatch())
+    manager.close()
+
+
+def test_async_config_propagates_runtime_effect_failure_without_cancellation(tmp_path):
+    """An uncancelled runtime callback failure reaches the command caller."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load()
+    interaction = Mock(spec=ConsoleInteraction)
+
+    async def fail(_path, _settings):
+        """Raise the runtime error produced while applying a valid setting."""
+        raise RuntimeError("runtime update failed")
+
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(), apply_async=fail),),
+        interaction=interaction,
+    )
+
+    async def dispatch():
+        """Dispatch the setting and observe its uncancelled runtime failure."""
+        with pytest.raises(RuntimeError, match="runtime update failed"):
+            await manager.call_async("config", "set loop.debug true scope=session")
+
+    asyncio.run(dispatch())
+    manager.close()
 
 
 def test_async_config_cancellation_settles_persistence_and_owner_effect(tmp_path, monkeypatch):

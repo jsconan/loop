@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Literal, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError
@@ -109,11 +109,21 @@ class ConfigurationCommands:
         apply_many (Callable[[tuple[str, ...], ApplicationSettings], Mapping[str, str]] | None):
             Applies multiple changed settings as one reload operation. Defaults to applying each
             setting separately.
+        apply_async (Callable[[str, ApplicationSettings], Awaitable[str]] | None): Applies a
+            validated setting through native asynchronous services when provided. Defaults to
+            the synchronous callback.
+        apply_many_async (Callable[[tuple[str, ...], ApplicationSettings], Awaitable[
+            Mapping[str, str]]] | None): Applies multiple changed settings through native async
+            services when provided. Defaults to applying settings individually.
     """
 
     _configuration: ConfigurationManager
     _apply: Callable[[str, ApplicationSettings], str]
     _apply_many: Callable[[tuple[str, ...], ApplicationSettings], Mapping[str, str]] | None
+    _apply_async: Callable[[str, ApplicationSettings], Awaitable[str]] | None
+    _apply_many_async: (
+        Callable[[tuple[str, ...], ApplicationSettings], Awaitable[Mapping[str, str]]] | None
+    )
 
     def __init__(
         self,
@@ -121,10 +131,17 @@ class ConfigurationCommands:
         apply: Callable[[str, ApplicationSettings], str],
         apply_many: Callable[[tuple[str, ...], ApplicationSettings], Mapping[str, str]]
         | None = None,
+        *,
+        apply_async: Callable[[str, ApplicationSettings], Awaitable[str]] | None = None,
+        apply_many_async: (
+            Callable[[tuple[str, ...], ApplicationSettings], Awaitable[Mapping[str, str]]] | None
+        ) = None,
     ) -> None:
         self._configuration = configuration
         self._apply = apply
         self._apply_many = apply_many
+        self._apply_async = apply_async
+        self._apply_many_async = apply_many_async
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return the configuration command registration.
@@ -421,15 +438,18 @@ class ConfigurationCommands:
         paths = tuple(entry.path for entry in self._configuration.entries)
         if scope == "session":
             settings = self._configuration.reset_all(scope=scope)
-            statuses = {self._apply(path, settings) for path in paths}
+            applied = await self._apply_effect_settled_async(
+                lambda: self._apply_paths_async(context, paths, settings)
+            )
+            statuses = set(applied.values())
         else:
             _, applied = await self._run_blocking_with_effect_async(
                 context,
                 self._configuration.reset_all,
-                lambda settings: {self._apply(path, settings) for path in paths},
+                lambda settings: self._apply_paths_async(context, paths, settings),
                 scope=scope,
             )
-            statuses = applied
+            statuses = set(applied.values())
         detail = ", ".join(sorted(statuses)) if statuses else "no overrides existed"
         context.interaction.info(f"Reset all configuration entries for {scope}: {detail}.")
 
@@ -440,7 +460,7 @@ class ConfigurationCommands:
             _, statuses = await self._run_blocking_with_effect_async(
                 context,
                 self._configuration.reload,
-                lambda settings: self._apply_changes(previous, settings),
+                lambda settings: self._apply_changes_async(context, previous, settings),
             )
         except (OSError, ValueError, ValidationError) as error:
             raise CommandArgumentError(str(error)) from error
@@ -454,24 +474,49 @@ class ConfigurationCommands:
         detail = "; ".join(f"{status}: {', '.join(paths)}" for status, paths in grouped.items())
         context.interaction.info(f"Configuration reloaded: {detail}.")
 
-    def _apply_changes(
+    async def _apply_changes_async(
         self,
+        context: CommandContext,
         previous: ApplicationSettings,
         current: ApplicationSettings,
     ) -> Mapping[str, str]:
         """Apply only runtime settings whose effective values changed."""
         paths = self._changed_paths(previous, current)
+        return await self._apply_paths_async(context, paths, current)
+
+    async def _apply_paths_async(
+        self,
+        context: CommandContext,
+        paths: tuple[str, ...],
+        settings: ApplicationSettings,
+    ) -> Mapping[str, str]:
+        """Apply one set of paths using the callback matching the dispatch owner."""
         if not paths:
             return {}
-        if self._apply_many is not None:
-            return self._apply_many(paths, current)
-        return {path: self._apply(path, current) for path in paths}
+        if context.execution_mode == "async" and self._apply_many_async is not None:
+            return await self._apply_many_async(paths, settings)
+        if self._apply_many is not None and not (
+            context.execution_mode == "async" and self._apply_async is not None
+        ):
+            return self._apply_many(paths, settings)
+        return {path: await self._apply_setting_async(context, path, settings) for path in paths}
+
+    async def _apply_setting_async(
+        self,
+        context: CommandContext,
+        path: str,
+        settings: ApplicationSettings,
+    ) -> str:
+        """Apply one setting through the callback selected for its dispatch owner."""
+        if context.execution_mode == "async" and self._apply_async is not None:
+            return await self._apply_async(path, settings)
+        return self._apply(path, settings)
 
     async def _run_blocking_with_effect_async(
         self,
         context: CommandContext,
         function: Callable[..., Result],
-        apply: Callable[[Result], Effect],
+        apply: Callable[[Result], Awaitable[Effect]],
         *args: object,
         **kwargs: object,
     ) -> tuple[Result, Effect]:
@@ -494,10 +539,35 @@ class ConfigurationCommands:
                     f"Configuration persistence also stopped with {type(error).__name__}."
                 )
                 raise cancellation from error
-            else:
-                apply(result)
+            await self._apply_effect_settled_async(lambda: apply(result), cancellation=cancellation)
+        effect = await self._apply_effect_settled_async(lambda: apply(result))
+        return result, effect
+
+    async def _apply_effect_settled_async(
+        self,
+        apply: Callable[[], Awaitable[Effect]],
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> Effect:
+        """Apply owner state and settle it before propagating caller cancellation."""
+        pending = asyncio.create_task(apply())
+        while not pending.done():
+            try:
+                await asyncio.wait({pending})
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+        try:
+            effect = pending.result()
+        except BaseException as error:
+            if cancellation is not None:
+                cancellation.add_note(
+                    f"Configuration application also stopped with {type(error).__name__}."
+                )
+                raise cancellation from error
             raise
-        return result, apply(result)
+        if cancellation is not None:
+            raise cancellation
+        return effect
 
     @staticmethod
     def _changed_paths(
@@ -553,12 +623,14 @@ class ConfigurationCommands:
         try:
             if scope == "session":
                 settings = self._configuration.set_session(path, value)
-                status = self._apply(path, settings)
+                status = await self._apply_effect_settled_async(
+                    lambda: self._apply_setting_async(context, path, settings)
+                )
             else:
                 _, status = await self._run_blocking_with_effect_async(
                     context,
                     self._configuration.set,
-                    lambda settings: self._apply(path, settings),
+                    lambda settings: self._apply_setting_async(context, path, settings),
                     path,
                     value,
                     scope=scope,
@@ -605,12 +677,14 @@ class ConfigurationCommands:
         try:
             if scope == "session":
                 settings = self._configuration.reset_session(path)
-                status = self._apply(path, settings)
+                status = await self._apply_effect_settled_async(
+                    lambda: self._apply_setting_async(context, path, settings)
+                )
             else:
                 _, status = await self._run_blocking_with_effect_async(
                     context,
                     self._configuration.reset,
-                    lambda settings: self._apply(path, settings),
+                    lambda settings: self._apply_setting_async(context, path, settings),
                     path,
                     scope=scope,
                 )

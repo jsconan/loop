@@ -235,6 +235,64 @@ def test_apply_configuration_routes_aggregate_domain_and_scalar_changes(dependen
     assert active_loop.apply_runtime_settings.call_count == 4
 
 
+def test_apply_configuration_async_uses_async_loop_and_backend_paths(dependencies):
+    """Live async updates use async model metadata and replace backend only once."""
+    active_loop = Mock()
+    active_loop.apply_runtime_settings_async = AsyncMock(return_value="applied now")
+    active_loop.replace_backend_async = AsyncMock()
+    settings = ApplicationSettings.model_validate({"loop": {"model": "selected"}})
+    runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
+
+    async def dispatch():
+        """Apply one model change and one backend change through async callbacks."""
+        assert await runtime.apply_configuration_async("loop.model", settings) == "applied now"
+        assert (
+            await runtime.apply_configuration_async("backend.base_url", settings) == "applied now"
+        )
+
+    asyncio.run(dispatch())
+
+    active_loop.apply_runtime_settings_async.assert_awaited_once_with("loop.model", settings)
+    active_loop.replace_backend_async.assert_awaited_once_with(
+        dependencies["OpenAIBackend"].return_value
+    )
+    active_loop.replace_backend.assert_not_called()
+
+
+def test_apply_configuration_changes_async_batches_backend_and_model_updates(dependencies):
+    """Async reload replaces one backend before applying its remaining changed paths."""
+    active_loop = Mock()
+    active_loop.apply_runtime_settings_async = AsyncMock(return_value="applied now")
+    active_loop.replace_backend_async = AsyncMock()
+    runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
+    settings = ApplicationSettings.model_validate({"loop": {"model": "selected"}})
+
+    async def dispatch():
+        """Apply mixed, scalar-only, and empty reload change sets."""
+        mixed = await runtime.apply_configuration_changes_async(
+            ("backend.default_model", "loop.model", "telemetry.batch_size"), settings
+        )
+        scalar = await runtime.apply_configuration_changes_async(("loop.debug",), settings)
+        empty = await runtime.apply_configuration_changes_async((), settings)
+        return mixed, scalar, empty
+
+    mixed, scalar, empty = asyncio.run(dispatch())
+
+    assert mixed == {
+        "backend.default_model": "applied now",
+        "loop.model": "applied now",
+        "telemetry.batch_size": "applied now",
+    }
+    assert scalar == {"loop.debug": "applied now"}
+    assert empty == {}
+    assert active_loop.replace_backend_async.await_count == 1
+    assert active_loop.apply_runtime_settings_async.await_args_list == [
+        call("loop.model", settings),
+        call("telemetry.batch_size", settings),
+        call("loop.debug", settings),
+    ]
+
+
 def test_apply_configuration_changes_replaces_the_backend_once(dependencies):
     """Reload batches backend changes while retaining per-path runtime statuses."""
     active_loop = Mock()

@@ -417,6 +417,40 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     assert loop.tool_registry.settings.command_timeout == 0.25
 
 
+def test_loop_applies_model_changes_through_async_backend_metadata(tmp_path):
+    """Async runtime updates and backend replacement never query context metadata synchronously."""
+    original_sync_lookup = Mock(return_value=None)
+    original_backend = loop_backend(get_context_window=original_sync_lookup)
+    loop = Loop.create_default(
+        backend=original_backend,
+        model="initial",
+        working_directory=tmp_path,
+    )
+    original_sync_lookup.reset_mock()
+    original_backend.get_context_window_async.reset_mock()
+    replacement_sync_lookup = Mock(side_effect=AssertionError("sync metadata lookup"))
+    replacement = loop_backend(
+        get_context_window=replacement_sync_lookup,
+        get_context_window_async=AsyncMock(return_value=4096),
+    )
+    settings = ApplicationSettings.model_validate({"loop": {"debug": True, "model": "updated"}})
+
+    async def apply():
+        """Apply a model update, a scalar update, and an async backend replacement."""
+        assert await loop.apply_runtime_settings_async("loop.model", settings) == "applied now"
+        assert await loop.apply_runtime_settings_async("loop.debug", settings) == "applied now"
+        await loop.replace_backend_async(replacement)
+
+    asyncio.run(apply())
+
+    original_sync_lookup.assert_not_called()
+    original_backend.get_context_window_async.assert_awaited_once_with("updated")
+    replacement_sync_lookup.assert_not_called()
+    replacement.get_context_window_async.assert_awaited_once_with("updated")
+    assert loop.model == "updated"
+    assert loop.debug is True
+
+
 def test_loop_accepts_an_explicitly_assembled_runtime(tmp_path):
     """Core loop construction derives runtime services without applying fallback policy."""
     agent = Agent("Explicit")
