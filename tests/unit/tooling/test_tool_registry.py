@@ -2403,34 +2403,46 @@ def test_call_async_reports_unknown_tools():
 
 
 def test_call_async_routes_arguments_and_context():
-    """Asynchronous routing awaits the registered tool with an invocation context."""
+    """Run synchronous execution intent off-loop before invoking the context-aware tool."""
     registry = ToolRegistry()
     contexts = []
+    callback_threads = []
+    events = []
+    owner_thread = get_ident()
 
     @declare_tool
     async def calculate(context: ToolContext) -> str:
         """Return the supplied context tool name."""
         contexts.append(context)
+        events.append("tool")
         return context.tool_name
 
     registry.register(calculate)
     interaction = Mock(spec=Interaction)
-    execution_started = Mock()
 
-    result = asyncio.run(
-        registry.call_async(
-            "calculate",
-            "{}",
-            interaction=interaction,
-            call_id="async-call",
-            execution_started=execution_started,
+    def execution_started():
+        """Record the thread that persists tool execution intent."""
+        callback_threads.append(get_ident())
+        events.append("started")
+
+    try:
+        result = asyncio.run(
+            registry.call_async(
+                "calculate",
+                "{}",
+                interaction=interaction,
+                call_id="async-call",
+                execution_started=execution_started,
+            )
         )
-    )
+    finally:
+        registry.close()
 
     assert result_value(result) == "calculate"
     assert contexts[0].interaction is interaction
     assert contexts[0].call_id == "async-call"
-    execution_started.assert_called_once_with()
+    assert callback_threads and callback_threads[0] != owner_thread
+    assert events == ["started", "tool"]
 
 
 def test_call_async_returns_validation_and_permission_denials_before_invocation():

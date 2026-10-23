@@ -394,12 +394,18 @@ class ToolRegistry:
         function: Callable[..., Any],
         *args: Any,
         operation: str = "tool callback",
+        cancellation_event: Event | None = None,
     ) -> Any:
         """Invoke async callbacks on the owner loop and sync callbacks in bounded workers."""
         if is_async_callable(function):
             result = function(*args)
         else:
-            result = await self._run_worker_async(function, *args, operation=operation)
+            result = await self._run_worker_async(
+                function,
+                *args,
+                cancellation_event=cancellation_event,
+                operation=operation,
+            )
         if inspect.isawaitable(result):
             if (
                 isinstance(result, asyncio.Future)
@@ -880,7 +886,8 @@ class ToolRegistry:
                 registry default.
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
             execution_started (Callable[[], Any] | None): Callback invoked immediately before
-                the validated and authorized tool function runs; async results are awaited.
+                the validated and authorized tool function runs; async callbacks run on the owner
+                loop and sync callbacks run in a bounded worker.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -928,7 +935,8 @@ class ToolRegistry:
             permission_manager (PermissionManager | None): Invocation permission policy.
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
             execution_started (Callable[[], Any] | None): Callback invoked immediately before
-                the validated and authorized tool function runs; async results are awaited.
+                the validated and authorized tool function runs; async callbacks run on the owner
+                loop and sync callbacks run in a bounded worker.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -972,9 +980,12 @@ class ToolRegistry:
             file_observations=file_observations,
         )
         if execution_started is not None:
-            started_result = execution_started()
-            if inspect.isawaitable(started_result):
-                await started_result
+            await self._invoke_async(
+                tool,
+                execution_started,
+                operation=f"{tool.name} execution-start callback",
+                cancellation_event=cancellation_event,
+            )
         started = perf_counter()
         worker_context = None
         active_context = context
@@ -1661,7 +1672,8 @@ class ToolRegistryView:
             instructions_manager (InstructionsManager | None): Active instruction manager.
             permission_manager (PermissionManager | None): Invocation permission policy.
             call_id (str | None): Stable model request identifier.
-            execution_started (Callable[[], None] | None): Callback run before tool execution.
+            execution_started (Callable[[], Any] | None): Callback run before tool execution;
+                async callbacks run on the owner loop and sync callbacks run in a bounded worker.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -1691,7 +1703,7 @@ class ToolRegistryView:
         instructions_manager: InstructionsManager | None = None,
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
-        execution_started: Callable[[], None] | None = None,
+        execution_started: Callable[[], Any] | None = None,
         file_observations: FileObservations | None = None,
         cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
@@ -1704,7 +1716,8 @@ class ToolRegistryView:
             instructions_manager (InstructionsManager | None): Active instruction manager.
             permission_manager (PermissionManager | None): Invocation permission policy.
             call_id (str | None): Stable model request identifier.
-            execution_started (Callable[[], None] | None): Callback run before tool execution.
+            execution_started (Callable[[], Any] | None): Callback run before tool execution;
+                async callbacks run on the owner loop and sync callbacks run in a bounded worker.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
