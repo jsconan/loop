@@ -165,6 +165,29 @@ class ToolExecutionPortal:
 
         return self.call(invoke)
 
+    async def call_method_async(
+        self,
+        target: object,
+        name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Invoke an asynchronous owner method and return its detached result."""
+        if self._loop.is_closed() or not self._loop.is_running():
+            raise RuntimeError("Tool context relay is unavailable from this thread.")
+
+        async def invoke_async() -> Any:
+            """Run and await one service method on the loop owner."""
+            result = getattr(target, name)(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return _detach_owner_value(result, self)
+
+        if get_ident() == self._owner_thread:
+            return await invoke_async()
+        future = asyncio.run_coroutine_threadsafe(invoke_async(), self._loop)
+        return await asyncio.wrap_future(future)
+
     def get_attribute(self, target: object, name: str) -> tuple[bool, Any]:
         """Read an owner service attribute without exposing its live value to a worker.
 
@@ -201,6 +224,13 @@ class ToolOwnerServiceProxy:
     def __getattr__(self, name: str) -> Any:
         callable_attribute, value = self._portal.get_attribute(self._target, name)
         if callable_attribute:
+            if name.endswith("_async"):
+
+                async def invoke_async(*args: Any, **kwargs: Any) -> Any:
+                    """Call one native async service method through the owner loop."""
+                    return await self._portal.call_method_async(self._target, name, *args, **kwargs)
+
+                return invoke_async
             return lambda *args, **kwargs: self._portal.call_method(
                 self._target, name, *args, **kwargs
             )

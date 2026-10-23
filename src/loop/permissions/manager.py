@@ -19,6 +19,7 @@ from atexit import register
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextlib import contextmanager
 from fnmatch import fnmatchcase
+from functools import partial
 from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any
@@ -1134,6 +1135,85 @@ class PermissionManager:
         )
         return approved
 
+    async def authorize_sandboxed_command_async(
+        self,
+        request: SandboxRequest,
+        *,
+        tool_id: str,
+        interaction: Interaction | None = None,
+    ) -> bool:
+        """Authorize a bound sandbox request without blocking asynchronous approval input.
+
+        Args:
+            request (SandboxRequest): Exact command, authority, and path identities to approve.
+            tool_id (str): Registered execution tool identity for policy and audit.
+            interaction (Interaction | None): Interactive approval surface.
+
+        Returns:
+            bool: Whether policy or the user approved this sandbox attempt.
+
+        Raises:
+            asyncio.CancelledError: If approval or owned audit and persistence work is cancelled.
+            ProblemException: If interactive approval lacks native asynchronous input.
+        """
+        policy = await self.evaluate_async((self._sandbox_operation(request, tool_id),))
+        if policy.decision is Decision.DENY:
+            self._audit_sandbox_denial(request, source="policy")
+            return False
+        scratch_roots = self._sandbox_scratch_roots(request)
+        explicit_ask = policy.decision is Decision.ASK and any(
+            source.startswith("rule:") for source in policy.sources
+        )
+        temporary_roots = tuple(scratch_roots)
+        scratch = request.shell_environment().get("TMPDIR")
+        if scratch is not None:
+            temporary_roots += (Path(scratch),)
+        findings = self._command_inspection.inspect(
+            request.execution_source,
+            temporary_roots=temporary_roots,
+        )
+        fresh_review = any(finding.status is CommandReviewStatus.FRESH for finding in findings)
+        _, cancellation = await self._run_blocking_settled_async(
+            self._audit_sandbox_scope, request, findings
+        )
+        if cancellation is not None:
+            raise cancellation
+        if self._has_default_sandbox_access(
+            request,
+            scratch_roots,
+            explicit_ask=explicit_ask,
+            findings=findings,
+        ):
+            self._audit_sandbox_decision(request, decision="allow", source="workspace_sandbox")
+            return True
+        matched_scope = None if fresh_review else self._matching_sandbox_rule_scope(request)
+        if matched_scope is not None:
+            self._audit_sandbox_decision(
+                request,
+                decision="allow",
+                source=f"rule:{matched_scope.value}",
+            )
+            return True
+        active_interaction = interaction if interaction is not None else self._interaction
+        if active_interaction is None:
+            self._audit_sandbox_denial(request, source="headless")
+            return False
+
+        approved = await self._request_sandbox_approval_async(
+            request,
+            interaction=active_interaction,
+            scratch_roots=scratch_roots,
+            findings=findings,
+            explicit_ask=explicit_ask,
+            fresh_review=fresh_review,
+        )
+        self._audit_sandbox_decision(
+            request,
+            decision="allow" if approved else "deny",
+            source="interactive",
+        )
+        return approved
+
     @staticmethod
     def _sandbox_operation(request: SandboxRequest, tool_id: str) -> Operation:
         """Build the policy operation representing one sandboxed command."""
@@ -1248,6 +1328,46 @@ class PermissionManager:
             selected=selected,
             prefix=prefix,
         )
+
+    async def _request_sandbox_approval_async(
+        self,
+        request: SandboxRequest,
+        *,
+        interaction: Interaction,
+        scratch_roots: set[Path],
+        findings: tuple[CommandFinding, ...],
+        explicit_ask: bool,
+        fresh_review: bool,
+    ) -> bool:
+        """Prompt asynchronously and settle any remembered approval before returning."""
+        async_interaction = require_async_interaction(interaction, "sandbox command approval")
+        interaction.info(
+            self._sandbox_permission_message(
+                request,
+                scratch_roots=scratch_roots,
+                findings=findings,
+                explicit_ask=explicit_ask,
+            )
+        )
+        choices, index, prefix = self._sandbox_approval_choices(request, fresh_review=fresh_review)
+        selected = await async_interaction.prompt_async(
+            "Allow this command?", exit_commands=None, choices=choices, index=index
+        )
+        if selected not in choices or selected == "deny":
+            return False
+        if selected == "approve":
+            return True
+        approved, cancellation = await self._run_blocking_settled_async(
+            partial(
+                self._remember_sandbox_approval,
+                request,
+                selected=selected,
+                prefix=prefix,
+            )
+        )
+        if cancellation is not None:
+            raise cancellation
+        return approved
 
     def _sandbox_permission_message(
         self,

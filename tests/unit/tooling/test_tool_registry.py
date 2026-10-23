@@ -47,7 +47,7 @@ from loop import (
 from loop.constants import MAX_TOOL_RESULT_BYTES
 from loop.execution import CommandExecutionService
 from loop.execution.coordinator import LocalHostCommandExecutor
-from loop.execution.sandbox import CommandProcessResult, SandboxOutcome
+from loop.execution.sandbox import CommandProcessResult, SandboxOutcome, SandboxRequest
 from loop.execution.sandbox.macos import MacOSSeatbeltBackend
 from loop.instructions import InstructionsManager
 from loop.interaction import ConsoleInteraction, Interaction
@@ -1744,6 +1744,12 @@ def test_owner_portal_runs_sync_calls_and_rejects_unawaited_owner_results():
     async def exercise():
         portal = ToolExecutionPortal(asyncio.get_running_loop())
         assert portal.call(lambda: "owner") == "owner"
+        assert (
+            await portal.call_method_async(
+                SimpleNamespace(result_async=Mock(return_value="owner")), "result_async"
+            )
+            == "owner"
+        )
 
         async def result():
             return "not awaited"
@@ -1765,6 +1771,8 @@ def test_owner_portal_rejects_stopped_and_closed_loops():
     stopped_portal = ToolExecutionPortal(stopped_loop)
     with pytest.raises(RuntimeError, match="relay is unavailable"):
         stopped_portal.call(lambda: None)
+    with pytest.raises(RuntimeError, match="relay is unavailable"):
+        asyncio.run(stopped_portal.call_method_async(SimpleNamespace(), "method_async"))
     stopped_loop.close()
 
     closed_loop = asyncio.new_event_loop()
@@ -1772,6 +1780,8 @@ def test_owner_portal_rejects_stopped_and_closed_loops():
     closed_loop.close()
     with pytest.raises(RuntimeError, match="relay is unavailable"):
         closed_portal.call(lambda: None)
+    with pytest.raises(RuntimeError, match="relay is unavailable"):
+        asyncio.run(closed_portal.call_method_async(SimpleNamespace(), "method_async"))
 
 
 def test_worker_context_rejects_sync_prompt_without_native_async_input():
@@ -1822,6 +1832,63 @@ def test_worker_permission_proxy_prefers_native_async_methods():
 
     assert result_value(output) is True
     assert method_threads == [owner_thread, owner_thread]
+
+
+def test_worker_command_approval_uses_native_async_permission_and_interaction_methods(tmp_path):
+    """A sync command tool can request sandbox approval without blocking the owner loop."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value="approve")
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    request = SandboxRequest.create(
+        source="printf text > output",
+        cwd=tmp_path,
+        workspace=tmp_path,
+        read_roots=(),
+        write_roots=(tmp_path,),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin", "LANG": "C"},
+        policy_version="test",
+        deadline=1_000_000_000,
+        workspace_id="workspace-1",
+    )
+
+    @declare_tool
+    def authorize(context: ToolContext) -> bool:
+        """Authorize one bound command using its invocation services."""
+        return context.permission_manager.authorize_sandboxed_command(
+            request,
+            tool_id="run_command",
+            interaction=context.interaction,
+        )
+
+    registry = ToolRegistry([authorize], interaction=interaction, permission_manager=permissions)
+    try:
+        output = asyncio.run(registry.call_async("authorize", "{}", interaction=interaction))
+    finally:
+        registry.close()
+
+    assert result_value(output) is True
+    interaction.prompt_async.assert_awaited_once()
+
+
+def test_worker_proxy_can_await_native_async_method_from_its_worker_thread():
+    """An async owner method called from a worker is scheduled on the owner loop."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.confirm_async = AsyncMock(return_value=True)
+
+    @declare_tool
+    def confirm(context: ToolContext) -> bool:
+        """Request async confirmation through a worker-owned event loop."""
+        return asyncio.run(context.interaction.confirm_async("Continue?"))
+
+    registry = ToolRegistry([confirm], interaction=interaction)
+    try:
+        output = asyncio.run(registry.call_async("confirm", "{}", interaction=interaction))
+    finally:
+        registry.close()
+
+    assert result_value(output) is True
+    interaction.confirm_async.assert_awaited_once_with("Continue?")
 
 
 def test_definitions_preserve_registration_order():

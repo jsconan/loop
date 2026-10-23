@@ -135,6 +135,159 @@ def test_native_default_workspace_access_runs_without_prompt(tmp_path, write_roo
     interaction.prompt.assert_not_called()
 
 
+def test_async_sandbox_approval_uses_native_prompt_and_returns_approved_result(tmp_path):
+    """Async sandbox authorization awaits approval for a fresh destructive command."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value="approve")
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    request = native_request(tmp_path, "printf text > output", read_roots=())
+
+    assert asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+
+    interaction.prompt_async.assert_awaited_once()
+    assert interaction.prompt_async.await_args.kwargs["choices"] == {
+        "deny": "Deny",
+        "approve": "Allow once",
+    }
+
+
+def test_async_sandbox_default_workspace_command_runs_without_prompt(tmp_path):
+    """Routine workspace commands retain prompt-free sandbox access asynchronously."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock()
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    request = native_request(
+        tmp_path,
+        "printf safe",
+        read_roots=(),
+        environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(manager.temporary_directory)},
+    )
+
+    assert asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+
+    interaction.prompt_async.assert_not_awaited()
+
+
+def test_async_sandbox_approval_remembers_session_rule_for_later_requests(tmp_path):
+    """Async sandbox approval stores reusable choices and skips matching later prompts."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value="session")
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    request = native_request(tmp_path, "cat file")
+
+    assert asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+    assert manager.sandboxed_command_rules(ApprovalChoice.SESSION)
+    interaction.prompt_async.reset_mock()
+    assert asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+    interaction.prompt_async.assert_not_awaited()
+
+
+def test_async_sandbox_approval_obeys_explicit_ask_rules(tmp_path):
+    """An explicit command ask rule prompts even inside default workspace authority."""
+    console = Console(file=io.StringIO())
+    interaction = ConsoleInteraction(console=console, markdown=False)
+    interaction.prompt_async = AsyncMock(return_value="deny")
+    manager = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        configuration=PermissionConfiguration(
+            rules=[PermissionRule(decision=Decision.ASK, action=Action.PROCESS_EXECUTE)]
+        ),
+    )
+    request = native_request(tmp_path, "printf safe", read_roots=())
+
+    assert not asyncio.run(
+        manager.authorize_sandboxed_command_async(request, tool_id="run_command")
+    )
+
+    assert "run under your command approval rule" in console.file.getvalue()
+    interaction.prompt_async.assert_awaited_once()
+
+
+def test_async_sandbox_approval_denies_headless_and_policy_denied_requests(tmp_path):
+    """Async sandbox authorization denies absent interactions and explicit deny policy."""
+    request = native_request(tmp_path, "cat file")
+    headless = PermissionManager(tmp_path)
+    assert not asyncio.run(
+        headless.authorize_sandboxed_command_async(request, tool_id="run_command")
+    )
+
+    manager = PermissionManager(
+        tmp_path,
+        configuration=PermissionConfiguration(
+            rules=[PermissionRule(decision=Decision.DENY, action=Action.PROCESS_EXECUTE)]
+        ),
+    )
+    assert not asyncio.run(
+        manager.authorize_sandboxed_command_async(request, tool_id="run_command")
+    )
+
+
+@pytest.mark.parametrize("selection", [False, "deny"])
+def test_async_sandbox_approval_denies_invalid_or_rejected_choices(tmp_path, selection):
+    """Async sandbox approval denies cancelled and explicitly rejected selections."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value=selection)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    request = native_request(tmp_path, "printf text > output", read_roots=())
+
+    assert not asyncio.run(
+        manager.authorize_sandboxed_command_async(request, tool_id="run_command")
+    )
+
+
+def test_async_sandbox_approval_rejects_sync_only_interaction(tmp_path):
+    """Async sandbox authorization requires native asynchronous input for approval."""
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    request = native_request(tmp_path, "printf text > output", read_roots=())
+
+    with pytest.raises(ProblemException) as captured:
+        asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+
+    assert captured.value.problem.code == "interaction.async_required"
+    interaction.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("cancel_stage", ["audit", "remember"])
+def test_async_sandbox_approval_cancellation_settles_owned_work(tmp_path, cancel_stage):
+    """Cancellation waits for owned audit or approval work and never returns authorization."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value="session")
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    request = native_request(tmp_path, "cat file")
+
+    async def exercise():
+        """Cancel authorization while its selected owner operation is settling."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def run_blocking(function, *args):
+            """Delay the selected operation until cancellation has been requested."""
+            nonlocal calls
+            calls += 1
+            blocked = (cancel_stage == "audit" and calls == 1) or (
+                cancel_stage == "remember" and calls == 2
+            )
+            if blocked:
+                started.set()
+                await release.wait()
+            return function(*args)
+
+        manager.set_async_blocking_runner(run_blocking)
+        pending = asyncio.create_task(
+            manager.authorize_sandboxed_command_async(request, tool_id="run_command")
+        )
+        await started.wait()
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    asyncio.run(exercise())
+
+
 def test_native_network_still_requires_permission(tmp_path):
     """General network access stays outside the automatic workspace boundary."""
     manager = PermissionManager(tmp_path)

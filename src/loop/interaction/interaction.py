@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Iterable, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from typing import Any
+from typing import Any, cast
 
 from prompt_toolkit.completion import Completer
 
@@ -420,7 +420,9 @@ def require_async_interaction(
     Raises:
         ProblemException: If the interaction is unavailable or provides only synchronous input.
     """
-    if not isinstance(interaction, AsyncInteractionInput):
+    if not isinstance(interaction, AsyncInteractionInput) and not all(
+        callable(getattr(interaction, name, None)) for name in ("prompt_async", "confirm_async")
+    ):
         raise ProblemException(
             Problem(
                 code="interaction.async_required",
@@ -431,4 +433,4 @@ def require_async_interaction(
                 operation=operation,
             )
         )
-    return interaction
+    return cast(AsyncInteractionInput, interaction)
