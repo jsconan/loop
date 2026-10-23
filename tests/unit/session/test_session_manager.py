@@ -2373,6 +2373,40 @@ def test_manager_model_context_rejects_content_without_artifact_identity():
         _ = manager.model_context
 
 
+def test_model_context_async_loads_reference_content_in_a_worker(monkeypatch):
+    """Async context hydration reads immutable reference data off the owner thread."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    content = b"snapshot"
+    handle, version = content_identity(content)
+    reference = ContextReference(
+        kind="file",
+        path="source.txt",
+        content="snapshot",
+        size_bytes=len(content),
+        included_bytes=len(content),
+        truncated=False,
+        handle=handle,
+        version=version,
+    )
+    manager.add_user_message("Review @source.txt", context=(reference,))
+    owner_thread = get_ident()
+    load_threads = []
+    original_load_reference = store.load_reference
+
+    def track_load_reference(digest):
+        load_threads.append(get_ident())
+        return original_load_reference(digest)
+
+    monkeypatch.setattr(store, "load_reference", track_load_reference)
+
+    context = asyncio.run(manager.model_context_async())
+
+    assert context[0].context[0].content == "snapshot"
+    assert load_threads
+    assert owner_thread not in load_threads
+
+
 def test_manager_hydrates_a_payload_after_an_earlier_metadata_only_occurrence():
     """A lazy occurrence does not suppress a later requested payload of the same version."""
     store = MemorySessionStore()

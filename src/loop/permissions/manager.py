@@ -548,10 +548,18 @@ class PermissionManager:
     ) -> tuple[PolicyDecision, bool]:
         """Evaluate initial async policy without blocking on concurrent policy updates."""
         policy = await self.evaluate_async(operations)
-        fresh_file_review = self._requires_fresh_file_review(
-            operations,
-            self.protected_instruction_names(protected_instruction_names),
-        )
+        fresh_file_review = False
+        if any(
+            isinstance(operation.target, FileTarget) and operation.action in _WRITE_ACTIONS
+            for operation in operations
+        ):
+            fresh_file_review, cancellation = await self._run_blocking_settled_async(
+                self._requires_fresh_file_review,
+                operations,
+                self.protected_instruction_names(protected_instruction_names),
+            )
+            if cancellation is not None:
+                raise cancellation
         if fresh_file_review and policy.decision is not Decision.DENY:
             policy = PolicyDecision(
                 decision=Decision.ASK,
@@ -2008,22 +2016,56 @@ class PermissionManager:
 
         Returns:
             PolicyDecision: Composed allow, ask, or deny outcome and determining sources.
+
+        Raises:
+            asyncio.CancelledError: If boundary checks are cancelled after filesystem work settles.
         """
         await self._acquire_policy_lock_async()
         try:
-            return self._evaluate_policy(operations)
+            return await self._evaluate_policy_async(operations)
         finally:
             self._policy_lock.release()
 
+    async def _evaluate_policy_async(self, operations: Operations) -> PolicyDecision:
+        """Evaluate a stable policy snapshot with filesystem boundaries off the owner loop."""
+        if not operations:
+            return self._compose_policy_decisions(operations, ())
+        decisions = []
+        for operation in operations:
+            boundary = await self._boundary_decision_async(operation)
+            decisions.append(
+                boundary if boundary is not None else self._evaluate_operation_policy(operation)
+            )
+        return self._compose_policy_decisions(operations, tuple(decisions))
+
+    async def _boundary_decision_async(self, operation: Operation) -> PolicyDecision | None:
+        """Resolve filesystem boundaries off-loop and evaluate pure boundaries in place."""
+        if not isinstance(operation.target, FileTarget):
+            return self._boundary_decision(operation)
+        denial, cancellation = await self._run_blocking_settled_async(
+            self._boundary_decision, operation
+        )
+        if cancellation is not None:
+            raise cancellation
+        return denial
+
     def _evaluate_policy(self, operations: Operations) -> PolicyDecision:
         """Evaluate a policy snapshot while the caller owns the policy lock."""
+        decisions = tuple(self._evaluate_operation(operation) for operation in operations)
+        return self._compose_policy_decisions(operations, decisions)
+
+    @staticmethod
+    def _compose_policy_decisions(
+        operations: Operations,
+        decisions: tuple[PolicyDecision, ...],
+    ) -> PolicyDecision:
+        """Compose operation outcomes using the established batch precedence."""
         if not operations:
             return PolicyDecision(
                 decision=Decision.ALLOW,
                 reason="The tool plan requires no authority.",
                 sources=("no_authority",),
             )
-        decisions = tuple(self._evaluate_operation(operation) for operation in operations)
         for selected in (Decision.DENY, Decision.ASK, Decision.ALLOW):
             determining = tuple(item for item in decisions if item.decision is selected)
             if determining:
@@ -2859,6 +2901,10 @@ class PermissionManager:
         boundary = self._boundary_decision(operation)
         if boundary is not None:
             return boundary
+        return self._evaluate_operation_policy(operation)
+
+    def _evaluate_operation_policy(self, operation: Operation) -> PolicyDecision:
+        """Evaluate rules and defaults after the non-overridable boundary allows an operation."""
         matching = [
             (ApprovalChoice.USER.value, rule)
             for rule in self._user_configuration.rules
@@ -3036,6 +3082,31 @@ class PermissionManager:
             if denial is not None:
                 return denial
         return None
+
+    async def check_boundaries_async(self, operations: Operations) -> PolicyDecision | None:
+        """Check planned effects against filesystem boundaries without blocking the owner loop.
+
+        Args:
+            operations (Operations): Future typed effects to check.
+
+        Returns:
+            PolicyDecision | None: First boundary denial, or ``None`` when every effect is safe.
+
+        Raises:
+            asyncio.CancelledError: If a boundary check is cancelled after its filesystem work
+                settles.
+        """
+        if not operations:
+            return None
+        await self._acquire_policy_lock_async()
+        try:
+            for operation in operations:
+                denial = await self._boundary_decision_async(operation)
+                if denial is not None:
+                    return denial
+            return None
+        finally:
+            self._policy_lock.release()
 
     def _is_protected_path(self, resource: str, *, mutation: bool, recursive: bool = False) -> bool:
         if self._workspace_root is None:

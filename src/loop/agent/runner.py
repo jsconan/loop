@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import ExitStack, aclosing, nullcontext
 from datetime import datetime
+from functools import partial
 from time import perf_counter, sleep
+from typing import Any
 
 from .. import constants
 from ..backend import (
@@ -19,7 +21,7 @@ from ..backend import (
 )
 from ..compaction import ContextCompaction
 from ..control import RunControl, RunInterrupted
-from ..errors import Problem, log_problem
+from ..errors import Problem, ProblemException, log_problem
 from ..instructions import InstructionBudgetExceededError, InstructionsManager
 from ..interaction import Interaction, require_async_interaction
 from ..model_selection import ModelSelection, ModelSelectionError
@@ -45,6 +47,7 @@ from ..utils import (
     has_running_event_loop,
     interaction_operation,
     interaction_run,
+    run_in_worker_async,
     utc_now,
 )
 from .agent import Agent
@@ -74,6 +77,9 @@ class AgentRunner:
             be offered to the user for another attempt.
         run_control (RunControl | None): Optional conversation shutdown and scoped run interrupt
             signals. Active synchronous tools settle before cancellation is observed.
+        async_blocking_runner (Callable[..., Awaitable[Any]] | None): Application-owned bounded
+            worker for local synchronous preparation during async runs. Defaults to a shared
+            bounded process worker.
 
     Raises:
         ValueError: If ``max_turns`` is negative.
@@ -95,6 +101,7 @@ class AgentRunner:
     _file_observations: FileObservations | None
     _run_control: RunControl | None
     _interrupted_tools: list[ToolExecutionMetrics] | None
+    _async_blocking_runner: Callable[..., Awaitable[Any]] | None
 
     def __init__(
         self,
@@ -113,6 +120,7 @@ class AgentRunner:
         max_turns: int = constants.DEFAULT_AGENT_MAX_TURNS,
         prompt_on_recoverable_error: bool = True,
         run_control: RunControl | None = None,
+        async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         if max_turns < 0:
             raise ValueError("Agent max turns must be non-negative.")
@@ -132,6 +140,7 @@ class AgentRunner:
         self._run_control = run_control
         self._interrupted_tools = None
         self._file_observations = None
+        self._async_blocking_runner = async_blocking_runner
 
     @property
     def agent(self) -> Agent:
@@ -480,14 +489,14 @@ class AgentRunner:
         tools: list[ToolExecutionMetrics],
     ) -> None:
         """Resolve approved recovery calls without retrying unknown outcomes silently."""
-        self._file_observations = FileObservations.for_recovery(
-            self._session_manager.model_context,
+        pending_calls = tuple(
+            pending.call for pending in state.pending_calls if pending.status != "result_available"
+        )
+        self._file_observations = await self._run_blocking_async(
+            FileObservations.for_recovery,
+            await self._session_manager.model_context_async(),
             self._instructions_manager.virtual_paths,
-            (
-                pending.call
-                for pending in state.pending_calls
-                if pending.status != "result_available"
-            ),
+            pending_calls,
             prepare_context=self._backend.prepare_context,
         )
         for pending in state.pending_calls:
@@ -972,7 +981,21 @@ class AgentRunner:
             execution_started=execution_started_async,
         )
         if self._file_observations is not None:
-            self._file_observations.observe_result(tool_call, tool_result, include_reads=False)
+            try:
+                await self._run_blocking_async(
+                    self._file_observations.observe_result,
+                    tool_call,
+                    tool_result,
+                    include_reads=False,
+                )
+            except ProblemException as error:
+                if error.problem.code != "command.dispatch_busy":
+                    raise
+                # Persist the completed tool result even when this ephemeral cache is busy.
+            except RuntimeError as error:
+                if str(error) != "The bounded worker queue is full.":
+                    raise
+                # Later writes can refresh the missing observation before authorization.
         telemetry_trace_event(
             "tool.response",
             payload={"call_id": tool_call.call_id, "output": tool_result},
@@ -1189,8 +1212,11 @@ class AgentRunner:
         self._checkpoint()
         started_at = perf_counter()
         first_chunk_at = None
-        model_context = self._backend.prepare_context(self._session_manager.model_context)
-        self._file_observations = FileObservations(
+        model_context = self._backend.prepare_context(
+            await self._session_manager.model_context_async()
+        )
+        self._file_observations = await self._run_blocking_async(
+            FileObservations,
             model_context,
             self._instructions_manager.virtual_paths,
         )
@@ -1231,6 +1257,18 @@ class AgentRunner:
             ),
         )
         return response
+
+    async def _run_blocking_async(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run synchronous context preparation through the application-owned bounded worker."""
+        operation = partial(function, *args, **kwargs)
+        if self._async_blocking_runner is not None:
+            return await self._async_blocking_runner(operation)
+        return await run_in_worker_async(operation)
 
     def _record_run_result(
         self,

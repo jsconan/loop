@@ -5,6 +5,7 @@ import json
 import os
 from contextlib import nullcontext
 from pathlib import Path
+from threading import get_ident
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock
 
@@ -23,10 +24,12 @@ from loop import (
     ContextReference,
     InstructionsManager,
     Interaction,
+    Message,
     ModelSelectionError,
     OpenAIBackend,
     PendingToolCall,
     PermissionManager,
+    Problem,
     ProblemException,
     Response,
     ResponseCompleted,
@@ -52,7 +55,7 @@ from loop.conversation.interaction import MailboxInteraction
 from loop.session.models import RunCompletedEvent
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.tooling import FileObservations
-from loop.utils import PathHolder, utc_now
+from loop.utils import PathHolder, VirtualPath, content_digest, utc_now
 
 
 def agent_runner(
@@ -86,6 +89,7 @@ def agent_runner(
         )
     session_manager.messages = []
     session_manager.model_context = []
+    session_manager.model_context_async = AsyncMock(return_value=[])
     session_manager.session = Session()
     run = SimpleNamespace(run_id="run-id", started_at=utc_now())
     session_manager.begin_run.return_value = run
@@ -2082,6 +2086,129 @@ def test_async_recovery_preserves_unknown_outcome_and_pending_boundaries(
         assert runner._execute_tool_calls_async.await_args.kwargs["present"] is expected_present
     assert runner._persist_interrupted_tool_result_async.await_count == int(expected_skip)
     assert runner._confirm_async.await_count == int(status == "outcome_unknown")
+
+
+def test_async_recovery_resolves_observation_paths_in_a_worker(tmp_path, monkeypatch):
+    """Async recovery reconstructs file observations away from the event-loop thread."""
+    backend = Mock()
+    runner = file_runner(tmp_path, backend)
+    reference = ContextReference(
+        kind="file",
+        path="source.txt",
+        content="snapshot",
+        size_bytes=8,
+        included_bytes=8,
+        truncated=False,
+        version=content_digest("snapshot"),
+    )
+    runner._session_manager.model_context_async = AsyncMock(
+        return_value=[Message(role="user", content="Review", context=(reference,))]
+    )
+
+    async def run_blocking(function):
+        """Use an injected application worker for synchronous observation recovery."""
+        return await asyncio.to_thread(function)
+
+    runner._async_blocking_runner = run_blocking
+    owner_thread = get_ident()
+    resolution_threads = []
+    original_resolve = Path.resolve
+
+    def track_resolve(path, strict=False):
+        resolution_threads.append(get_ident())
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", track_resolve)
+
+    asyncio.run(
+        runner._recover_tools_async(SessionRecoveryState(action="resolve_uncertain_tools"), [])
+    )
+
+    assert resolution_threads
+    assert owner_thread not in resolution_threads
+
+
+def test_async_tool_results_update_file_observations_in_a_worker(tmp_path, monkeypatch):
+    """Async result observation canonicalizes file paths outside the owner thread."""
+    runner, _sessions, _interaction = agent_runner()
+    runner._file_observations = FileObservations((), VirtualPath(tmp_path))
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    output = json.dumps(
+        {
+            "ok": True,
+            "result": "done",
+            "file_versions": {"/workspace/source.txt": content_digest("snapshot")},
+        }
+    )
+    runner.agent.tools.call_with_timing_async = AsyncMock(return_value=(output, 0.1))
+    owner_thread = get_ident()
+    resolution_threads = []
+    original_resolve = Path.resolve
+
+    def track_resolve(path, strict=False):
+        resolution_threads.append(get_ident())
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", track_resolve)
+
+    result = asyncio.run(
+        runner._execute_tool_call_async(
+            call,
+            instructions=runner._instructions_manager,
+            present=False,
+        )
+    )
+
+    assert result.succeeded
+    assert resolution_threads
+    assert owner_thread not in resolution_threads
+
+
+@pytest.mark.parametrize(
+    ("error", "persist_result"),
+    [
+        (
+            ProblemException(Problem(code="command.dispatch_busy", title="Busy", detail="Busy")),
+            True,
+        ),
+        (RuntimeError("The bounded worker queue is full."), True),
+        (ProblemException(Problem(code="other", title="Failure", detail="Failure")), False),
+        (RuntimeError("The worker is unavailable."), False),
+    ],
+)
+def test_async_tool_result_survives_observation_worker_capacity_errors(error, persist_result):
+    """A busy ephemeral observation worker cannot discard an executed tool result."""
+    runner, sessions, _interaction = agent_runner()
+    runner._file_observations = Mock(spec=FileObservations)
+    runner.agent.tools.call_with_timing_async = AsyncMock(return_value=('{"ok":true}', 0.1))
+
+    async def run_blocking(_operation):
+        """Raise the configured worker outcome."""
+        raise error
+
+    runner._async_blocking_runner = run_blocking
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+
+    if persist_result:
+        result = asyncio.run(
+            runner._execute_tool_call_async(
+                call,
+                instructions=runner.instructions_manager,
+                present=False,
+            )
+        )
+        assert result.succeeded
+        sessions.add_tool_call_async.assert_awaited_once()
+    else:
+        with pytest.raises(type(error)):
+            asyncio.run(
+                runner._execute_tool_call_async(
+                    call,
+                    instructions=runner.instructions_manager,
+                    present=False,
+                )
+            )
+        sessions.add_tool_call_async.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

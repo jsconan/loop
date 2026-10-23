@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import is_dataclass
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from threading import BoundedSemaphore, Event, Lock, get_ident
 from time import perf_counter
@@ -957,6 +958,16 @@ class ToolRegistry:
         validated, error = tool.validate_arguments(arguments)
         if error is not None:
             return error, 0
+        virtual_paths = getattr(instructions_manager, "virtual_paths", None)
+        redaction_roots = None
+        if virtual_paths is not None:
+            try:
+                redaction_roots = await self._run_worker_async(
+                    virtual_paths.redaction_roots,
+                    operation=f"{tool.name or 'tool'} path redaction preparation",
+                )
+            except ProblemException as exc:
+                return serialize_tool_problem(exc.problem), 0
         active_permissions = permission_manager or self._permission_manager
         plan, planning_error = await self._authorized_plan_async(
             tool,
@@ -967,7 +978,13 @@ class ToolRegistry:
             file_observations,
         )
         if planning_error is not None:
-            return self._model_result(planning_error, instructions_manager, tool), 0
+            return self._model_result(
+                planning_error,
+                instructions_manager,
+                tool,
+                virtual_paths=virtual_paths,
+                redaction_roots=redaction_roots,
+            ), 0
         context = self._context_for(
             tool,
             interaction=interaction,
@@ -1028,6 +1045,8 @@ class ToolRegistry:
             instructions_manager,
             tool,
             context,
+            virtual_paths=virtual_paths,
+            redaction_roots=redaction_roots,
         ), perf_counter() - started
 
     def command(
@@ -1108,6 +1127,9 @@ class ToolRegistry:
         instructions_manager: InstructionsManager | None,
         tool: Tool,
         context: ToolContext | None = None,
+        *,
+        virtual_paths: VirtualPath | None = None,
+        redaction_roots: tuple[tuple[str, str], ...] | None = None,
     ) -> str:
         """Minimize result paths and attach trusted file read and mutation receipts."""
         if context is not None and (context.file_versions or context.read_versions):
@@ -1126,10 +1148,13 @@ class ToolRegistry:
             value = json.loads(output)
         except (json.JSONDecodeError, TypeError):
             return output
+        problem = value.get("problem") if isinstance(value, dict) else None
+        problem_detail = problem.get("detail") if isinstance(problem, dict) else None
+        if not tool.result_path_fields and not isinstance(problem_detail, str):
+            return output
+        paths = virtual_paths or instructions_manager.virtual_paths
         prepared = (
-            instructions_manager.virtual_paths.metadata(value, tool.result_path_fields)
-            if tool.result_path_fields
-            else value
+            paths.metadata(value, tool.result_path_fields) if tool.result_path_fields else value
         )
         problem = prepared.get("problem") if isinstance(prepared, dict) else None
         if isinstance(problem, dict) and isinstance(problem.get("detail"), str):
@@ -1137,7 +1162,7 @@ class ToolRegistry:
                 **prepared,
                 "problem": {
                     **problem,
-                    "detail": instructions_manager.virtual_paths.redact(problem["detail"]),
+                    "detail": paths.redact(problem["detail"], roots=redaction_roots),
                 },
             }
         return output if value == prepared else json.dumps(prepared, ensure_ascii=False)
@@ -1237,16 +1262,22 @@ class ToolRegistry:
             plan = await self._plan_async(tool, arguments)
             prerequisites = ()
             while True:
-                boundary_denial = permission_manager.check_boundaries(plan.boundary_operations)
+                boundary_denial = await permission_manager.check_boundaries_async(
+                    plan.boundary_operations
+                )
                 if boundary_denial is not None:
                     return None, self._denied_problem(tool, boundary_denial.reason)
                 if file_observations is not None:
                     absence_receipts = {}
-                    conflict = file_observations.check(
-                        plan.boundary_operations + plan.operations,
-                        plan.arguments,
-                        authorized_reads=prerequisites,
-                        absence_receipts=absence_receipts,
+                    conflict = await self._run_worker_async(
+                        partial(
+                            file_observations.check,
+                            plan.boundary_operations + plan.operations,
+                            plan.arguments,
+                            authorized_reads=prerequisites,
+                            absence_receipts=absence_receipts,
+                        ),
+                        operation=f"{tool.name or 'tool'} file observation check",
                     )
                     if conflict is not None:
                         output = serialize_tool_problem(conflict)

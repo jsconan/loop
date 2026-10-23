@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import replace
+from functools import partial
 from html import escape
 from pathlib import Path
 from threading import RLock
@@ -23,6 +24,7 @@ from .models import (
     ManagedSkillListResult,
     PreparedInstructions,
     RuntimeEnvironment,
+    Skill,
     SkillActivationResponse,
     SkillActivationResult,
     SkillDeactivationAllResult,
@@ -550,7 +552,34 @@ class InstructionsManager:
                 raise InstructionBudgetExceededError(
                     "Prepared instructions exceed the configured instruction limit."
                 )
-            return self._snapshot(agent, instructions, recovery)
+            generation = self._generation
+            working_directory = self._working_directory
+            active_skills = tuple(self._skill_manager.active_identities)
+            section_state = (
+                self._project_sources,
+                self._project_instructions,
+                self._runtime_environment,
+                self._skill_manager.catalog(preferred_names=self._skill_catalog_priorities),
+                self._skill_manager.activated_instructions,
+                self._workspace_id,
+                self._workspace_root,
+            )
+        sections = await run_in_worker_async(
+            partial(
+                self._instruction_sections_from_state,
+                agent,
+                recovery,
+                *section_state,
+            )
+        )
+        return PreparedInstructions(
+            content=instructions,
+            generation=generation,
+            working_directory=working_directory,
+            active_skills=active_skills,
+            sections=sections,
+            digest=sha256_digest(instructions),
+        )
 
     def _refresh_context(self) -> bool:
         """Refresh stale contextual sources without requiring an agent binding."""
@@ -993,6 +1022,31 @@ class InstructionsManager:
         recovery: str | None = None,
     ) -> tuple[InstructionSection, ...]:
         """Return typed provenance for every currently composed section."""
+        return self._instruction_sections_from_state(
+            agent,
+            recovery,
+            self._project_sources,
+            self._project_instructions,
+            self._runtime_environment,
+            self._skill_manager.catalog(preferred_names=self._skill_catalog_priorities),
+            self._skill_manager.activated_instructions,
+            self._workspace_id,
+            self._workspace_root,
+        )
+
+    @staticmethod
+    def _instruction_sections_from_state(
+        agent: Agent | None,
+        recovery: str | None,
+        project_sources: tuple[AgentInstructionsSource, ...],
+        project_instructions: str | None,
+        runtime_environment: RuntimeEnvironment | None,
+        skill_catalog: str,
+        activated_instructions: tuple[tuple[Skill, str], ...],
+        workspace_id: str | None,
+        workspace_root: Path | None,
+    ) -> tuple[InstructionSection, ...]:
+        """Build provenance sections from detached state and capture source paths."""
         sections = []
         if agent is not None:
             sections.extend(
@@ -1010,46 +1064,66 @@ class InstructionsManager:
                 "agents",
                 source.content,
                 str(source.path),
-                self._reference(source.path, source.content),
+                InstructionsManager._reference(
+                    source.path,
+                    source.content,
+                    workspace_id=workspace_id,
+                    workspace_root=workspace_root,
+                ),
             )
-            for source in self._project_sources
+            for source in project_sources
             if source.content
         )
         if recovery == "repetition":
             sections.append(
-                InstructionSection("recovery", self._recovery_instruction(recovery), "repetition")
+                InstructionSection(
+                    "recovery",
+                    InstructionsManager._recovery_instruction(recovery),
+                    "repetition",
+                )
             )
-        if self._project_instructions and not self._project_sources:
-            sections.append(InstructionSection("agents", self._project_instructions, "injected"))
-        if self._runtime_environment is not None:
+        if project_instructions and not project_sources:
+            sections.append(InstructionSection("agents", project_instructions, "injected"))
+        if runtime_environment is not None:
             sections.append(
                 InstructionSection(
                     "runtime_environment",
-                    self._runtime_environment.render(),
+                    runtime_environment.render(),
                     "runtime",
                 )
             )
-        catalog = self._skill_manager.catalog(preferred_names=self._skill_catalog_priorities)
-        if catalog:
-            sections.append(InstructionSection("skill_catalog", catalog, "skill_discovery"))
+        if skill_catalog:
+            sections.append(InstructionSection("skill_catalog", skill_catalog, "skill_discovery"))
         sections.extend(
             InstructionSection(
                 "active_skill",
                 instructions,
                 str(skill.location),
-                self._reference(skill.location, instructions),
+                InstructionsManager._reference(
+                    skill.location,
+                    instructions,
+                    workspace_id=workspace_id,
+                    workspace_root=workspace_root,
+                ),
             )
-            for skill, instructions in self._skill_manager.activated_instructions
+            for skill, instructions in activated_instructions
         )
         return tuple(sections)
 
-    def _reference(self, path: Path, content: str) -> CapturedInstruction:
+    @staticmethod
+    def _reference(
+        path: Path,
+        content: str,
+        *,
+        workspace_id: str | None,
+        workspace_root: Path | None,
+    ) -> CapturedInstruction:
         """Capture file provenance using the manager's durable workspace context."""
         return CapturedInstruction.capture(
             path,
             content,
-            workspace_id=self._workspace_id,
-            workspace_root=self._workspace_root,
+            workspace_id=workspace_id,
+            workspace_root=workspace_root,
         )
 
     def _compose(

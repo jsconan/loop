@@ -410,7 +410,31 @@ class SessionManager:
             ValueError: If referenced content is missing, corrupt, or inconsistent with its
                 occurrence metadata.
         """
-        context = self._session.model_context()
+        return self._hydrate_model_context(self._session.model_context(), self._session_store)
+
+    async def model_context_async(self) -> list[ModelContextItem]:
+        """Return hydrated context after loading immutable references in a bounded worker.
+
+        Returns:
+            list[ModelContextItem]: Detached, hydrated context bounded by the latest compaction
+                checkpoint.
+
+        Raises:
+            ValueError: If referenced content is missing, corrupt, or inconsistent with its
+                occurrence metadata.
+            asyncio.CancelledError: If reference loading is cancelled after it settles.
+        """
+        context = deepcopy(self._session.model_context())
+        return await self._run_blocking_async(
+            self._hydrate_model_context, context, self._session_store
+        )
+
+    @staticmethod
+    def _hydrate_model_context(
+        context: list[ModelContextItem],
+        session_store: SessionStore,
+    ) -> list[ModelContextItem]:
+        """Materialize and validate immutable reference payloads for a detached context."""
         if not any(isinstance(item, Message) and item.context for item in context):
             return context
         supplied_bytes = {}
@@ -435,7 +459,7 @@ class SessionManager:
                     raise ValueError(
                         f"Referenced snapshot '{reference.path}' has an invalid artifact handle."
                     ) from error
-                stored = self._session_store.load_reference(reference.version)
+                stored = session_store.load_reference(reference.version)
                 if stored is None:
                     raise ValueError(f"Referenced snapshot '{reference.path}' is unavailable.")
                 digest = content_digest(stored)

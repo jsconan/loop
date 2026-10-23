@@ -63,6 +63,19 @@ def file_operation(action: Action, path) -> Operation:
     return operation(action, target=FileTarget(path=str(path)))
 
 
+def path_resolution_threads(monkeypatch):
+    """Record the threads that canonicalize paths through pathlib."""
+    original_resolve = Path.resolve
+    threads = []
+
+    def track_resolve(path, strict=False):
+        threads.append(get_ident())
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", track_resolve)
+    return threads
+
+
 def native_request(root: Path, source: str = "git status", **changes) -> SandboxRequest:
     """Bind one native command to disposable policy roots."""
     values = {
@@ -1859,7 +1872,7 @@ def test_async_authorization_uses_bounded_audit_and_native_recorder_paths(tmp_pa
     result = asyncio.run(manager.authorize_async(operation_set, recorder=recorder))
 
     assert result.decision is Decision.ALLOW
-    assert worker_calls == ["_audit"]
+    assert worker_calls == ["_boundary_decision", "_audit"]
     recorder.record_authorization_async.assert_awaited_once_with(result)
     recorder.record_authorization.assert_not_called()
     with closing(sqlite3.connect(audit_path)) as connection:
@@ -1874,7 +1887,9 @@ def test_async_authorization_keeps_best_effort_audit_failures_out_of_policy_resu
 
     async def reject_audit(function, *args):
         """Reject optional audit work after policy evaluation."""
-        raise RuntimeError(f"Could not schedule {function.__name__}.")
+        if function.__name__ == "_audit":
+            raise RuntimeError(f"Could not schedule {function.__name__}.")
+        return await asyncio.to_thread(function, *args)
 
     manager = PermissionManager(
         tmp_path,
@@ -1889,6 +1904,34 @@ def test_async_authorization_keeps_best_effort_audit_failures_out_of_policy_resu
     assert result.decision is Decision.ALLOW
 
 
+def test_async_fresh_file_review_propagates_cancellation_after_path_check(tmp_path):
+    """Async authorization settles fresh path review before propagating cancellation."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_blocking_async(function, *args):
+        """Hold fresh-review path checks until the authorization task is cancelled."""
+        if function.__name__ != "_requires_fresh_file_review":
+            return await asyncio.to_thread(function, *args)
+        started.set()
+        await release.wait()
+        return function(*args)
+
+    manager = PermissionManager(tmp_path, async_blocking_runner=run_blocking_async)
+    operations = (file_operation(Action.FILESYSTEM_CREATE, tmp_path / "AGENTS.md"),)
+
+    async def cancel_authorization():
+        """Cancel during fresh-review resolution and wait for its worker to settle."""
+        pending = asyncio.create_task(manager.authorize_async(operations))
+        await started.wait()
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    asyncio.run(cancel_authorization())
+
+
 @pytest.mark.parametrize("audit_fails", [False, True])
 def test_async_authorization_settles_audit_before_propagating_cancellation(
     tmp_path,
@@ -1900,6 +1943,8 @@ def test_async_authorization_settles_audit_before_propagating_cancellation(
 
     async def run_blocking_async(function, *args):
         """Keep audit work pending until the owner has been cancelled."""
+        if function.__name__ != "_audit":
+            return await asyncio.to_thread(function, *args)
         started.set()
         await release.wait()
         if audit_fails:
@@ -2457,6 +2502,82 @@ def test_check_boundaries_allows_safe_plans_and_stops_at_first_denial(tmp_path):
 
     assert result is not None
     assert result.sources == ("limit:workspace:readable_roots",)
+
+
+def test_evaluate_async_resolves_file_boundaries_in_a_worker(tmp_path, monkeypatch):
+    """Async policy evaluation keeps filesystem canonicalization off its event-loop thread."""
+    manager = PermissionManager(tmp_path)
+    owner_thread = get_ident()
+    resolution_threads = path_resolution_threads(monkeypatch)
+
+    result = asyncio.run(
+        manager.evaluate_async((file_operation(Action.FILESYSTEM_READ, tmp_path / "file.txt"),))
+    )
+
+    assert result.decision is Decision.ALLOW
+    assert resolution_threads
+    assert owner_thread not in resolution_threads
+
+
+def test_check_boundaries_async_resolves_files_off_loop_and_stops_at_first_denial(
+    tmp_path, monkeypatch
+):
+    """Async boundary preflight keeps canonicalization off-loop and returns the first denial."""
+    manager = PermissionManager(tmp_path)
+    safe = file_operation(Action.FILESYSTEM_READ, tmp_path / "file.txt")
+    unsafe = file_operation(Action.FILESYSTEM_READ, tmp_path.parent / "outside.txt")
+    owner_thread = get_ident()
+    resolution_threads = path_resolution_threads(monkeypatch)
+
+    assert asyncio.run(manager.check_boundaries_async(())) is None
+    result = asyncio.run(manager.check_boundaries_async((safe, unsafe, safe)))
+
+    assert result is not None
+    assert result.sources == ("limit:workspace:readable_roots",)
+    assert resolution_threads
+    assert owner_thread not in resolution_threads
+
+
+def test_evaluate_async_settles_file_boundary_before_cancellation(tmp_path):
+    """Async policy evaluation settles filesystem boundary work before cancellation returns."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_blocking_async(function, *args):
+        """Hold filesystem boundary work until the owner has been cancelled."""
+        if function.__name__ == "_boundary_decision":
+            started.set()
+            await release.wait()
+        return await asyncio.to_thread(function, *args)
+
+    manager = PermissionManager(tmp_path, async_blocking_runner=run_blocking_async)
+    operations = (file_operation(Action.FILESYSTEM_READ, tmp_path / "file.txt"),)
+
+    async def cancel_evaluation():
+        """Cancel evaluation while its filesystem worker remains owned."""
+        pending = asyncio.create_task(manager.evaluate_async(operations))
+        await started.wait()
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    asyncio.run(cancel_evaluation())
+
+
+def test_authorize_async_checks_fresh_file_paths_in_a_worker(tmp_path, monkeypatch):
+    """Async fresh-review detection keeps instruction-path resolution off the owner loop."""
+    manager = PermissionManager(tmp_path)
+    owner_thread = get_ident()
+    resolution_threads = path_resolution_threads(monkeypatch)
+
+    result = asyncio.run(
+        manager.authorize_async((file_operation(Action.FILESYSTEM_CREATE, tmp_path / "AGENTS.md"),))
+    )
+
+    assert result.decision is Decision.DENY
+    assert resolution_threads
+    assert owner_thread not in resolution_threads
 
 
 def test_recursive_mutations_cannot_remove_protected_directories(tmp_path):

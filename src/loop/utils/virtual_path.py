@@ -164,23 +164,40 @@ class VirtualPath:
             prepared = rewrite(prepared, field)
         return prepared
 
-    def redact(self, value: str) -> str:
+    def redact(
+        self,
+        value: str,
+        *,
+        roots: tuple[tuple[str, str], ...] | None = None,
+    ) -> str:
         """Replace configured local roots in implementation-generated text.
 
         Args:
             value (str): Diagnostic text that may include one declared root.
+            roots (tuple[tuple[str, str], ...] | None): Precomputed local and virtual root pairs.
+                Defaults to resolving canonical root aliases on demand.
 
         Returns:
             str: Text with configured local roots represented virtually.
+        """
+        selected_roots = self.redaction_roots() if roots is None else roots
+        for local, virtual in selected_roots:
+            value = value.replace(local, virtual)
+        return value
+
+    def redaction_roots(self) -> tuple[tuple[str, str], ...]:
+        """Return lexical and canonical aliases used to hide configured host roots.
+
+        Returns:
+            tuple[tuple[str, str], ...]: Local path spellings paired with their virtual roots,
+                ordered from longest to shortest for safe replacement.
         """
         roots = (
             (str(local), virtual)
             for virtual, root in self._roots.items()
             for local in (root, root.resolve(strict=False))
         )
-        for local, virtual in sorted(roots, key=lambda pair: len(pair[0]), reverse=True):
-            value = value.replace(local, virtual)
-        return value
+        return tuple(sorted(roots, key=lambda pair: len(pair[0]), reverse=True))
 
     def _resolve_command_argument(self, argument: str) -> str:
         """Resolve an exact virtual argument or the value portion of an option."""

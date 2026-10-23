@@ -262,6 +262,7 @@ class Loop:
             max_turns=max_agent_turns,
             run_control=run_control,
             prompt_on_recoverable_error=prompt_on_recoverable_error,
+            async_blocking_runner=configured_commands.run_blocking_async,
         )
         providers = (
             SessionCommands(configured_sessions, configured_name_generator),

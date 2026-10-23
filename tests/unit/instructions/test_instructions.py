@@ -84,6 +84,36 @@ def test_async_prepare_reads_changed_project_instructions_on_a_worker(tmp_path, 
     assert asyncio.run(manager.refresh_async()) is False
 
 
+def test_async_prepare_captures_instruction_paths_off_owner_thread(tmp_path, monkeypatch):
+    """Async snapshots resolve provenance paths outside the event-loop thread."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("Project rules.", encoding="utf-8")
+    manager = configured_discovered(
+        tmp_path,
+        workspace_id="workspace",
+        workspace_root=tmp_path,
+    )
+    agent = configured_agent()
+    original_resolve = Path.resolve
+    resolution_threads = []
+
+    def track_resolve(path, strict=False):
+        """Record path canonicalization while preserving normal behavior."""
+        resolution_threads.append(get_ident())
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", track_resolve)
+    owner_thread = get_ident()
+
+    snapshot = asyncio.run(manager.prepare_async(agent))
+
+    assert any(
+        section.kind == "agents" and section.reference is not None for section in snapshot.sections
+    )
+    assert resolution_threads
+    assert owner_thread not in resolution_threads
+
+
 def test_async_prepare_enforces_agent_instruction_budget():
     """Async snapshots reject composed instructions beyond the configured hard limit."""
     manager = configured_manager(max_bytes=2)
@@ -122,14 +152,16 @@ def test_async_refresh_discards_candidates_after_workspace_change(tmp_path, monk
     manager = configured_discovered(old_root)
     manager.invalidate()
     original_worker = instructions_module.run_in_worker_async
-    calls = 0
+    candidate_calls = 0
 
     async def switch_after_first_candidate(function, *args):
         """Change the scope after one detached candidate has finished loading."""
-        nonlocal calls
-        calls += 1
+        nonlocal candidate_calls
+        is_candidate = getattr(function, "__name__", "") == "_load_refresh_candidate"
         result = await original_worker(function, *args)
-        if calls == 1:
+        if is_candidate:
+            candidate_calls += 1
+        if candidate_calls == 1:
             manager.set_working_directory(new_root)
         return result
 
@@ -141,7 +173,7 @@ def test_async_refresh_discards_candidates_after_workspace_change(tmp_path, monk
 
     snapshot = asyncio.run(manager.prepare_async(configured_agent()))
 
-    assert calls == 2
+    assert candidate_calls == 2
     assert "New rules." in snapshot.content
     assert "Old rules." not in snapshot.content
     assert manager.working_directory == new_root

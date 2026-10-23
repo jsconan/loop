@@ -87,6 +87,14 @@ def result_value(output: str):
     return payload["result"]
 
 
+def _permission_manager_mock():
+    """Provide a permission mock that allows asynchronous boundary preflight by default."""
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+    permissions.check_boundaries_async.return_value = None
+    return permissions
+
+
 @declare_tool()
 def passive_tool() -> str:
     """Return a passive result for sandbox-routing coverage."""
@@ -146,6 +154,26 @@ def test_closed_registry_rejects_new_sync_worker_calls():
     registry.close()
 
     output = asyncio.run(registry.call_async("calculate", "{}"))
+
+    assert json.loads(output)["problem"]["code"] == "tool.dispatch_busy"
+    assert invoked == []
+
+
+def test_closed_registry_rejects_async_path_redaction_before_tool_execution(tmp_path):
+    """Unavailable redaction capacity blocks async dispatch before invoking the tool."""
+    invoked = []
+
+    @declare_tool
+    def calculate() -> int:
+        """Record whether a closed registry invokes the handler."""
+        invoked.append(True)
+        return 1
+
+    registry = ToolRegistry([calculate])
+    registry.close()
+    instructions = SimpleNamespace(virtual_paths=VirtualPath(tmp_path))
+
+    output = asyncio.run(registry.call_async("calculate", "{}", instructions_manager=instructions))
 
     assert json.loads(output)["problem"]["code"] == "tool.dispatch_busy"
     assert invoked == []
@@ -231,6 +259,74 @@ def test_async_dispatch_rejects_stale_file_context_before_approval(tmp_path, del
         assert "read_versions" not in output
         assert target.read_text(encoding="utf-8") == "user edit"
     permissions.request_permission.assert_not_called()
+
+
+def test_async_dispatch_checks_file_observations_in_a_worker(tmp_path, monkeypatch):
+    """Async planning runs file observation checks outside the event-loop thread."""
+    owner_thread = get_ident()
+    check_threads = []
+    original_check = FileObservations.check
+
+    def track_check(observations, *args, **kwargs):
+        check_threads.append(get_ident())
+        return original_check(observations, *args, **kwargs)
+
+    monkeypatch.setattr(FileObservations, "check", track_check)
+
+    @declare_tool
+    def calculate() -> str:
+        """Return the calculation result."""
+        return "done"
+
+    registry = ToolRegistry([calculate])
+    try:
+        output = asyncio.run(
+            registry.call_async(
+                "calculate",
+                "{}",
+                file_observations=FileObservations((), VirtualPath(tmp_path)),
+            )
+        )
+    finally:
+        registry.close()
+
+    assert result_value(output) == "done"
+    assert len(check_threads) == 1
+    assert check_threads[0] != owner_thread
+
+
+def test_async_dispatch_redacts_canonical_paths_in_a_worker(tmp_path, monkeypatch):
+    """Async result redaction resolves virtual roots before tool execution on a worker."""
+    paths = VirtualPath(tmp_path)
+    instructions = SimpleNamespace(virtual_paths=paths, agents_filenames=())
+    owner_thread = get_ident()
+    resolution_threads = []
+    original_resolve = Path.resolve
+
+    def track_resolve(path, strict=False):
+        resolution_threads.append(get_ident())
+        return original_resolve(path, strict=strict)
+
+    @declare_tool
+    def failed() -> Problem:
+        """Return a local path in a diagnostic that requires virtual rendering."""
+        return Problem(
+            code="tool.failed",
+            title="Tool failed",
+            detail=f"Failed at {tmp_path}/source.txt",
+        )
+
+    registry = ToolRegistry([failed])
+    monkeypatch.setattr(Path, "resolve", track_resolve)
+    try:
+        output = asyncio.run(registry.call_async("failed", "{}", instructions_manager=instructions))
+    finally:
+        registry.close()
+
+    payload = json.loads(output)
+    assert payload["problem"]["detail"] == "Failed at /workspace/source.txt"
+    assert resolution_threads
+    assert owner_thread not in resolution_threads
 
 
 @pytest.mark.parametrize("denial", ["read", "boundary", "creation"])
@@ -633,8 +729,8 @@ def test_independent_registries_allow_the_same_name_and_isolate_runtime_state():
 
     first_interaction = Mock(spec=Interaction)
     second_interaction = Mock(spec=Interaction)
-    first_permissions = Mock(spec=PermissionManager)
-    second_permissions = Mock(spec=PermissionManager)
+    first_permissions = _permission_manager_mock()
+    second_permissions = _permission_manager_mock()
     first = ToolRegistry(
         [calculate], interaction=first_interaction, permission_manager=first_permissions
     )
@@ -1216,7 +1312,7 @@ def test_additional_authorization_rechecks_exact_dynamic_operations_on_owner():
     """Runtime-discovered operations receive their own exact async authorization check."""
     owner_thread = get_ident()
     authorization_calls = []
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
 
     async def authorize_async(operations, **_kwargs):
@@ -1267,7 +1363,7 @@ def test_additional_authorization_rechecks_exact_dynamic_operations_on_owner():
 def test_sync_additional_authorization_preserves_its_denial_contract(additional_decision, expected):
     """Sync runtime authorization checks dynamic targets and keeps denial wording."""
     authorization_calls = []
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
 
     def authorize(operations, **_kwargs):
@@ -1318,7 +1414,7 @@ def test_sync_additional_authorization_preserves_its_denial_contract(additional_
 def test_sync_additional_authorization_preserves_non_denial_planning_errors():
     """Dynamic planning errors keep their original structured problem through authorization."""
     authorization_calls = []
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
 
     def authorize(operations, **_kwargs):
@@ -1361,7 +1457,7 @@ def test_sync_additional_authorization_preserves_non_denial_planning_errors():
 def test_async_additional_authorization_preserves_its_denial_contract():
     """Async runtime authorization returns a typed denial for a redirected target."""
     decisions = iter((Decision.ALLOW, Decision.DENY))
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
 
     async def authorize_async(*_args, **_kwargs):
@@ -1405,7 +1501,7 @@ def test_native_async_tool_uses_async_context_authorization_on_the_owner():
     """Native async tools can authorize dynamic operations without the sync policy path."""
     owner_thread = get_ident()
     authorization_calls = []
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
 
     async def authorize_async(operations, **_kwargs):
@@ -1857,7 +1953,7 @@ def test_worker_permission_proxy_prefers_native_async_methods():
     """A sync context call uses the permission service's async owner-thread method."""
     owner_thread = get_ident()
     method_threads = []
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
 
     async def authorize_async(*_args, **_kwargs):
@@ -1988,7 +2084,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
     instructions_manager = Mock(spec=InstructionsManager)
     instructions_manager.virtual_paths.metadata.side_effect = lambda value: value
     instructions_manager.virtual_paths.redact.side_effect = lambda value: value
-    permission_manager = Mock(spec=PermissionManager)
+    permission_manager = _permission_manager_mock()
     cancellation_event = Event()
 
     assert view.definitions() is definitions
@@ -2219,7 +2315,7 @@ def test_call_uses_default_or_no_context():
 
 def test_headless_authorized_tool_receives_execution_metadata():
     """Authorized headless calls receive plans and invocation identity without a UI."""
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
     permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
     registry = ToolRegistry(permission_manager=permissions)
@@ -2246,7 +2342,7 @@ def test_headless_authorized_tool_receives_execution_metadata():
 
 def test_headless_authorization_denial_prevents_execution():
     """Removing the UI never bypasses centralized authorization."""
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
     permissions.authorize.return_value = SimpleNamespace(
         decision=Decision.DENY,
@@ -2319,7 +2415,7 @@ def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
 
 def test_call_command_parses_model_parameters_before_shared_dispatch():
     """Command routing validates parameters while bypassing the permission policy."""
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     registry = ToolRegistry(interaction=Mock(spec=Interaction), permission_manager=permissions)
 
     @declare_tool
@@ -2667,8 +2763,10 @@ def test_async_dispatch_keeps_event_loop_responsive_during_approval():
 
 def test_async_planning_stops_at_operation_boundaries():
     """Async planning rejects a boundary violation before requesting permission."""
-    permissions = Mock(spec=PermissionManager)
-    permissions.check_boundaries.return_value = SimpleNamespace(reason="Outside allowed roots.")
+    permissions = _permission_manager_mock()
+    permissions.check_boundaries_async.return_value = SimpleNamespace(
+        reason="Outside allowed roots."
+    )
 
     @declare_tool(
         actions={Action.NETWORK_REQUEST},
@@ -2790,7 +2888,7 @@ def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_meta
     """Virtual paths preserve file access while approvals receive the actual execution target."""
     path = tmp_path / "é notes.txt"
     path.write_text("useful content", encoding="utf-8")
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
     permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
     permissions.authorize_async.return_value = SimpleNamespace(decision=Decision.ALLOW)
@@ -2820,7 +2918,7 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path,
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
     instructions.observe_path(nested, directory=True)
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
     permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
     permissions.analyze_command.return_value = CommandAnalysis((), False, ())
@@ -3281,7 +3379,7 @@ def test_execution_capability_rejects_an_unbound_plan(tmp_path):
         """Route through the declared native service if authorized."""
         return context.execution_service.run_command(context, command)
 
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
     registry = ToolRegistry(
         [
@@ -3363,7 +3461,7 @@ def test_execution_capability_guards_renamed_and_second_tools(tmp_path, second_t
     name = "second_command" if second_tool else "renamed_command"
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
-    permissions = Mock(spec=PermissionManager)
+    permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
     permissions.authorize_sandboxed_command.return_value = True
     permissions.analyze_command.return_value = CommandAnalysis((), False, ())
