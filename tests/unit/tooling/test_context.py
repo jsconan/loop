@@ -1,5 +1,6 @@
 """Tests for tool invocation context."""
 
+import asyncio
 from unittest.mock import Mock
 
 import pytest
@@ -69,3 +70,67 @@ def test_additional_authorization_delegates_or_fails_closed():
     with pytest.raises(ProblemException) as denied:
         ToolContext(interaction, "fetch").authorize_additional({"url": "https://my-host.local"})
     assert denied.value.problem.code == "tool.authorization_unavailable"
+
+
+def test_async_context_uses_native_confirmation_and_authorization():
+    """Async tools have owner-loop interaction and authorization helpers."""
+    calls = []
+    plan = OperationPlan(arguments={"url": "https://second.local"})
+
+    class AsyncInteraction:
+        """Provide native async confirmation while rejecting accidental sync input."""
+
+        async def prompt_async(self, *_args, **_kwargs):
+            return "answer"
+
+        async def confirm_async(self, message, *, default=False):
+            calls.append((message, default))
+            return True
+
+        def confirm(self, *_args, **_kwargs):
+            raise AssertionError("Async tool used synchronous confirmation.")
+
+    async def authorize(arguments):
+        calls.append(arguments)
+        return plan
+
+    sync_authorizer = Mock()
+    context = ToolContext(
+        AsyncInteraction(),
+        "fetch",
+        additional_authorizer=sync_authorizer,
+        additional_authorizer_async=authorize,
+        execution_mode="async",
+    )
+
+    with pytest.raises(ProblemException) as confirmation_error:
+        context.confirm("Continue?")
+    with pytest.raises(ProblemException) as authorization_error:
+        context.authorize_additional({"url": "https://second.local"})
+
+    async def invoke():
+        assert await context.confirm_async("Continue?", default=True)
+        assert (await context.authorize_additional_async({"url": "https://second.local"})) is plan
+
+    asyncio.run(invoke())
+
+    assert confirmation_error.value.problem.code == "tool.async_required"
+    assert authorization_error.value.problem.code == "tool.async_required"
+    assert calls == [
+        ("Continue?", True),
+        {"url": "https://second.local"},
+    ]
+    sync_authorizer.assert_not_called()
+
+
+def test_async_additional_authorization_fails_closed_without_registry_support():
+    """An async tool cannot request dynamic effects without a registry authorizer."""
+    context = ToolContext(None, "fetch", execution_mode="async")
+
+    async def invoke():
+        await context.authorize_additional_async({"url": "https://second.local"})
+
+    with pytest.raises(ProblemException) as error:
+        asyncio.run(invoke())
+
+    assert error.value.problem.code == "tool.authorization_unavailable"

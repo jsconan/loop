@@ -1547,6 +1547,19 @@ class ToolRegistry:
                 file_observations,
             )
 
+        async def authorize_additional_async(
+            arguments: dict[str, object],
+        ) -> OperationPlan:
+            """Plan and authorize dynamic operations through native async policy APIs."""
+            return await self._authorized_plan_additional_async(
+                tool,
+                arguments,
+                interaction,
+                permission_manager,
+                instructions_manager,
+                file_observations,
+            )
+
         return ToolContext(
             interaction=interaction,
             tool_name=tool.name,
@@ -1563,6 +1576,10 @@ class ToolRegistry:
             if tool.execution_authorization or tool.requires_execution_service
             else None,
             cancellation_event=cancellation_event,
+            additional_authorizer_async=(
+                authorize_additional_async if permission_manager is not None else None
+            ),
+            execution_mode="async" if is_async_callable(tool.function) else "sync",
         )
 
 

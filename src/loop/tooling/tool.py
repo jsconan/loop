@@ -27,6 +27,7 @@ from ..utils import (
     close_awaitable,
     has_running_event_loop,
     is_async_callable,
+    run_in_worker_async,
 )
 from .context import ToolContext
 from .models import ToolPreflight
@@ -292,7 +293,10 @@ class Tool:
     async def call_async(
         self, arguments: dict[str, Any], context: ToolContext | None = None
     ) -> str:
-        """Invoke any registered tool asynchronously with validated arguments.
+        """Invoke a tool asynchronously with validated arguments.
+
+        Synchronous context-free callbacks use the shared bounded worker. Context-aware
+        synchronous callbacks require the registry's owner-thread relay.
 
         Args:
             arguments (dict[str, Any]): Validated keyword arguments.
@@ -310,7 +314,11 @@ class Tool:
         *,
         sync_dispatch: Callable[[Callable[[], Any]], Awaitable[Any]] | None = None,
     ) -> ToolExecutionResult:
-        """Invoke any tool asynchronously and retain its user-presentation metadata.
+        """Invoke a tool asynchronously and retain its user-presentation metadata.
+
+        The registry supplies ``sync_dispatch`` for synchronous callbacks with an owner-routed
+        context. Direct context-free calls use the shared bounded worker; a direct synchronous
+        callback with a live context is rejected because this method cannot relay its services.
 
         Args:
             arguments (dict[str, Any]): Validated canonical keyword arguments.
@@ -320,11 +328,30 @@ class Tool:
 
         Returns:
             ToolExecutionResult: Serialized output and selected presentation.
+
+        Raises:
+            asyncio.CancelledError: If cancellation is requested, after an admitted synchronous
+                callback settles.
         """
         try:
             invoke = lambda: self._call_function(arguments, context)
-            if not is_async_callable(self.function) and sync_dispatch is not None:
-                result = await sync_dispatch(invoke)
+            if not is_async_callable(self.function):
+                if sync_dispatch is not None:
+                    result = await sync_dispatch(invoke)
+                elif context is None:
+                    result = await run_in_worker_async(invoke)
+                else:
+                    raise ProblemException(
+                        Problem(
+                            code="tool.context_relay_unavailable",
+                            title="Tool context relay unavailable",
+                            detail=(
+                                f"Synchronous tool '{self._name_for_error()}' requires the "
+                                "ToolRegistry owner-thread relay when called asynchronously."
+                            ),
+                            operation=self._name_for_error(),
+                        )
+                    )
             else:
                 result = invoke()
             if inspect.isawaitable(result):

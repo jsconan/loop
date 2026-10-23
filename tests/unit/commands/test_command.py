@@ -1,5 +1,7 @@
 """Tests for individual schema-backed command declarations."""
 
+import asyncio
+from threading import Event, get_ident
 from typing import Annotated
 from unittest.mock import Mock
 
@@ -15,6 +17,7 @@ from loop import (
     CommandRegistration,
     CompletionValue,
     Interaction,
+    ProblemException,
     command,
 )
 from loop.commands.models import CommandRemainder
@@ -46,6 +49,67 @@ def test_command_binds_positional_and_named_arguments_and_decodes_each_value():
     command = make_command(select)
     assert command.call("3 enabled=true numbers='[1, 2]' label=true") is None
     assert selected == [(3, "true", True, [1, 2])]
+
+
+def test_call_async_keeps_the_owner_loop_responsive_for_context_free_sync_commands():
+    """Direct async dispatch runs context-free synchronous callbacks in a worker."""
+    started = Event()
+    release = Event()
+    worker_threads = []
+
+    def select() -> str:
+        """Wait for the test owner before returning a value."""
+        worker_threads.append(get_ident())
+        started.set()
+        release.wait(timeout=1)
+        return "selected"
+
+    async def invoke():
+        owner_thread = get_ident()
+        pending = asyncio.create_task(make_command(select).call_async(""))
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1), timeout=2)
+        await asyncio.sleep(0)
+        assert not pending.done()
+        release.set()
+        assert await pending == "selected"
+        assert worker_threads != [owner_thread]
+
+    asyncio.run(invoke())
+
+
+def test_direct_async_context_command_requires_the_manager_relay():
+    """A direct async call cannot move a live command context to a worker."""
+
+    def contextual(context: CommandContext) -> None:
+        """Return after receiving the command context."""
+        del context
+
+    command = make_command(contextual)
+    context = CommandContext("select", Mock(spec=Interaction))
+
+    with pytest.raises(ProblemException) as error:
+        asyncio.run(command.call_async("", context))
+
+    assert error.value.problem.code == "command.context_relay_unavailable"
+
+
+def test_direct_async_command_rejects_a_future_owned_by_another_loop():
+    """A synchronous callback cannot return a future from a foreign event loop."""
+    foreign_loop = asyncio.new_event_loop()
+    foreign_future = foreign_loop.create_future()
+    foreign_future.set_result("unowned")
+
+    def return_foreign_future():
+        """Return a completed future attached to another loop."""
+        return foreign_future
+
+    try:
+        with pytest.raises(ProblemException) as error:
+            asyncio.run(make_command(return_foreign_future).call_async(""))
+    finally:
+        foreign_loop.close()
+
+    assert error.value.problem.code == "command.loop_mismatch"
 
 
 def test_command_preserves_raw_strings_and_reports_annotation_errors():

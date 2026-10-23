@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 from dataclasses import FrozenInstanceError
+from threading import Event, get_ident
 from unittest.mock import Mock
 
 import pytest
@@ -312,6 +313,49 @@ def test_call_async_supports_sync_and_awaitable_results(monkeypatch):
 
     assert asyncio.run(make_tool(Mock(return_value=4)).call_async({"number": 3})) == "4"
     assert asyncio.run(make_tool(calculate).call_async({"number": 3})) == "6"
+
+
+def test_call_async_keeps_the_owner_loop_responsive_for_context_free_sync_tools():
+    """Direct async dispatch runs context-free synchronous callbacks in a worker."""
+    started = Event()
+    release = Event()
+    worker_threads = []
+
+    def calculate(number: int) -> int:
+        """Wait for the test owner before returning a value."""
+        worker_threads.append(get_ident())
+        started.set()
+        release.wait(timeout=1)
+        return number
+
+    async def invoke():
+        owner_thread = get_ident()
+        pending = asyncio.create_task(make_tool(calculate).call_async({"number": 7}))
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1), timeout=2)
+        await asyncio.sleep(0)
+        assert not pending.done()
+        release.set()
+        assert json.loads(await pending)["result"] == 7
+        assert worker_threads != [owner_thread]
+
+    asyncio.run(invoke())
+
+
+def test_direct_async_tool_rejects_a_live_context_without_a_registry_relay():
+    """A context-aware sync tool cannot receive live owner services through a direct call."""
+
+    def inspect_context(context: ToolContext, number: int) -> int:
+        """Return a value if the context was incorrectly exposed."""
+        del context
+        return number
+
+    result = asyncio.run(
+        make_tool(inspect_context).execute_async(
+            {"number": 1}, ToolContext(interaction=None, tool_name="calculate")
+        )
+    )
+
+    assert json.loads(result.output)["problem"]["code"] == "tool.context_relay_unavailable"
 
 
 def test_call_async_handles_execution_failures(monkeypatch):

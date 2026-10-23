@@ -270,6 +270,8 @@ registry = ToolRegistry([describe_tool])
 
 For model-originated calls, `context.call_id` is the stable provider call identifier and can be used as an idempotency key by tools that perform external mutations. It is `None` for direct user-command invocations.
 
+Synchronous tools can use `context.confirm()` and `context.authorize_additional()`. Native async tools should await `context.confirm_async()` and `context.authorize_additional_async()` so input and runtime-discovered permissions stay on the owner loop. Direct async calls run context-free synchronous tools through bounded worker admission; context-aware synchronous tools must be dispatched by `ToolRegistry` so their owner services can be relayed safely.
+
 Tools may declare a `preflight` check that returns a `ToolPreflightResult`. Ready tools are registered normally. Degraded tools are registered after a warning, while broken tools are logged, shown as a warning when an interaction is available, and omitted from the registry. Marking a tool `required=True` asks an interactive user whether to halt or continue without a broken tool; headless registration halts because continuing cannot be authorized.
 
 Registries can also create tools from undecorated callables and override metadata locally without changing the callable or another registry:

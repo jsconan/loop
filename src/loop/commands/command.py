@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
@@ -12,7 +13,7 @@ from pydantic import BaseModel
 from ..completion import CommandCompletion
 from ..errors import Problem, ProblemException
 from ..models import CommandCapability
-from ..utils import callable_name, close_awaitable, is_async_callable
+from ..utils import callable_name, close_awaitable, is_async_callable, run_in_worker_async
 from .context import CommandContext
 from .models import CommandRegistrationError
 from .utils import (
@@ -134,7 +135,11 @@ class Command:
         return result
 
     async def call_async(self, arguments: str, context: CommandContext | None = None) -> Any:
-        """Invoke the command and await an asynchronous result when it returns one.
+        """Invoke a command asynchronously and await an asynchronous result.
+
+        Context-free synchronous callbacks use the shared bounded worker. Context-aware
+        synchronous callbacks require ``CommandManager`` so their interaction can be relayed to
+        its owner.
 
         Args:
             arguments (str): Shell-like positional and ``name=value`` argument text.
@@ -146,9 +151,45 @@ class Command:
         Raises:
             ValidationError: If supplied arguments do not match the command parameters.
             CommandArgumentError: If argument syntax or parameter binding is invalid.
+            ProblemException: If a synchronous callback has a context that cannot be relayed, or
+                returns a future attached to a different event loop.
+            asyncio.CancelledError: If cancellation is requested while a synchronous callback is
+                running, after that callback settles.
+            RuntimeError: If bounded worker admission is full or unavailable.
             ValueError: If the command is passive, or declares a context but none is provided.
         """
-        result = self.invoke(arguments, context)
+        if is_async_callable(self.function):
+            result = self.invoke(arguments, context)
+        elif context is not None:
+            raise ProblemException(
+                Problem(
+                    code="command.context_relay_unavailable",
+                    title="Command context relay unavailable",
+                    detail=(
+                        f"Synchronous command '/{self.name}' requires CommandManager's "
+                        "owner-routed context when called asynchronously."
+                    ),
+                    operation=self.name,
+                )
+            )
+        else:
+            result = await run_in_worker_async(self.invoke, arguments, context)
+        if (
+            isinstance(result, asyncio.Future)
+            and result.get_loop() is not asyncio.get_running_loop()
+        ):
+            close_awaitable(result)
+            raise ProblemException(
+                Problem(
+                    code="command.loop_mismatch",
+                    title="Command event loop mismatch",
+                    detail=(
+                        f"Command '/{self.name}' returned a future attached to a different "
+                        "event loop."
+                    ),
+                    operation=self.name,
+                )
+            )
         return await result if inspect.isawaitable(result) else result
 
     def invoke(self, arguments: str, context: CommandContext | None = None) -> Any:

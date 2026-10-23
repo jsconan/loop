@@ -1401,6 +1401,55 @@ def test_async_additional_authorization_preserves_its_denial_contract():
     assert output["problem"]["title"] == "Additional operation denied"
 
 
+def test_native_async_tool_uses_async_context_authorization_on_the_owner():
+    """Native async tools can authorize dynamic operations without the sync policy path."""
+    owner_thread = get_ident()
+    authorization_calls = []
+    permissions = Mock(spec=PermissionManager)
+    permissions.check_boundaries.return_value = None
+
+    async def authorize_async(operations, **_kwargs):
+        authorization_calls.append((get_ident(), operations))
+        return SimpleNamespace(decision=Decision.ALLOW)
+
+    permissions.authorize_async = AsyncMock(side_effect=authorize_async)
+
+    def plan(arguments):
+        url = arguments["url"]
+        return OperationPlan(
+            arguments=arguments,
+            operations=(
+                Operation(
+                    tool_id="",
+                    action=Action.NETWORK_REQUEST,
+                    target=NetworkTarget(url=url, origin=url),
+                ),
+            ),
+        )
+
+    @declare_tool(actions={Action.NETWORK_REQUEST}, operation_planner=plan)
+    async def fetch_redirect(context: ToolContext, url: str) -> str:
+        """Authorize a redirect before returning its canonical target."""
+        redirected = await context.authorize_additional_async({"url": "https://second.local"})
+        return redirected.arguments["url"]
+
+    registry = ToolRegistry([fetch_redirect], permission_manager=permissions)
+
+    try:
+        output = asyncio.run(registry.call_async("fetch_redirect", '{"url":"https://first.local"}'))
+    finally:
+        registry.close()
+
+    assert result_value(output) == "https://second.local"
+    assert len(authorization_calls) == 2
+    assert all(thread_id == owner_thread for thread_id, _ in authorization_calls)
+    assert [operations[0].target.url for _, operations in authorization_calls] == [
+        "https://first.local",
+        "https://second.local",
+    ]
+    permissions.authorize.assert_not_called()
+
+
 def test_sync_callable_rejects_future_bound_to_another_loop():
     """Both registry modes reject a tool result owned by a different event loop."""
     foreign_loop = asyncio.new_event_loop()

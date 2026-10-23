@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from ..errors import Problem, ProblemException
-from ..interaction import Interaction
+from ..interaction import Interaction, require_async_interaction
 from ..utils import content_digest
 from .models import ToolRuntimeSettings
 
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..permissions import OperationPlan, Operations, PermissionManager
 
 AdditionalAuthorizer = Callable[[dict[str, object]], "OperationPlan"]
+AdditionalAuthorizerAsync = Callable[[dict[str, object]], Awaitable["OperationPlan"]]
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,8 @@ class ToolContext:
             ``None`` for direct user-command invocations.
         additional_authorizer (AdditionalAuthorizer | None): Registry-owned callback that plans
             and authorizes effects discovered during execution, or ``None`` when unavailable.
+        additional_authorizer_async (AdditionalAuthorizerAsync | None): Native asynchronous
+            callback for runtime-discovered effects, or ``None`` when unavailable.
         settings (ToolRuntimeSettings): Scoped settings available to tool implementations.
         permission_manager (PermissionManager | None): Authority for a native command's one-off
             approval, or None outside registry dispatch.
@@ -51,6 +54,8 @@ class ToolContext:
             ``None`` and retain their existing immutable reference identity.
         cancellation_event (Event | None): Run-scoped signal set when shutdown or interruption
             requests cancellation, or ``None`` for standalone tool dispatch.
+        execution_mode (Literal["sync", "async"]): Callback mode selected by the owning registry.
+            Defaults to ``"sync"`` for contexts assembled outside registry dispatch.
     """
 
     interaction: Interaction | None
@@ -66,6 +71,8 @@ class ToolContext:
     file_versions: dict[str, str | None] = field(default_factory=dict)
     read_versions: dict[str, str | None] = field(default_factory=dict)
     cancellation_event: Event | None = None
+    additional_authorizer_async: AdditionalAuthorizerAsync | None = None
+    execution_mode: Literal["sync", "async"] = "sync"
 
     def record_file_read(self, path: Path, version: str | None) -> None:
         """Attest to the source version actually inspected by a file reader.
@@ -151,7 +158,23 @@ class ToolContext:
 
         Returns:
             bool: Whether the user approved the action.
+
+        Raises:
+            ProblemException: If interaction is unavailable or an async tool attempts blocking
+                confirmation.
         """
+        if self.execution_mode == "async":
+            raise ProblemException(
+                Problem(
+                    code="tool.async_required",
+                    title="Asynchronous interaction required",
+                    detail=(
+                        f"Tool '{self.tool_name}' runs asynchronously; await "
+                        "context.confirm_async() instead."
+                    ),
+                    operation=self.tool_name,
+                )
+            )
         if self.interaction is None:
             raise ProblemException(
                 Problem(
@@ -163,6 +186,23 @@ class ToolContext:
                 )
             )
         return self.interaction.confirm(message, default=default)
+
+    async def confirm_async(self, message: str, *, default: bool = False) -> bool:
+        """Ask the user for confirmation through native asynchronous input.
+
+        Args:
+            message (str): Confirmation question.
+            default (bool): Answer to use when the user enters no response.
+
+        Returns:
+            bool: Whether the user approved the action.
+
+        Raises:
+            ProblemException: If interaction is unavailable or lacks native async input.
+            asyncio.CancelledError: If the interaction is cancelled.
+        """
+        interaction = require_async_interaction(self.interaction, "tool confirmation")
+        return await interaction.confirm_async(message, default=default)
 
     def authorize_additional(self, arguments: dict[str, object]) -> OperationPlan:
         """Plan and authorize effects discovered during this tool invocation.
@@ -178,6 +218,18 @@ class ToolContext:
             ProblemException: If runtime authorization is unavailable or the plan is denied.
             ValueError: If the additional arguments cannot produce a valid operation plan.
         """
+        if self.execution_mode == "async":
+            raise ProblemException(
+                Problem(
+                    code="tool.async_required",
+                    title="Asynchronous authorization required",
+                    detail=(
+                        f"Tool '{self.tool_name}' runs asynchronously; await "
+                        "context.authorize_additional_async() instead."
+                    ),
+                    operation=self.tool_name,
+                )
+            )
         if self.additional_authorizer is None:
             raise ProblemException(
                 Problem(
@@ -192,3 +244,33 @@ class ToolContext:
                 )
             )
         return self.additional_authorizer(arguments)
+
+    async def authorize_additional_async(self, arguments: dict[str, object]) -> OperationPlan:
+        """Authorize runtime-discovered effects through the async registry path.
+
+        Args:
+            arguments (dict[str, object]): Raw replacement arguments for the current registered
+                tool's operation planner.
+
+        Returns:
+            OperationPlan: Canonical plan authorized for execution.
+
+        Raises:
+            ProblemException: If runtime authorization is unavailable or the plan is denied.
+            ValueError: If the additional arguments cannot produce a valid operation plan.
+            asyncio.CancelledError: If asynchronous authorization is cancelled.
+        """
+        if self.additional_authorizer_async is None:
+            raise ProblemException(
+                Problem(
+                    code="tool.authorization_unavailable",
+                    title="Additional authorization unavailable",
+                    detail=(
+                        f"Tool '{self.tool_name}' discovered an additional operation, but this "
+                        "execution path cannot authorize it."
+                    ),
+                    severity="warning",
+                    operation=self.tool_name,
+                )
+            )
+        return await self.additional_authorizer_async(arguments)
