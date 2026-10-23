@@ -186,6 +186,7 @@ def test_controller_holds_queued_input_until_interrupted_run_is_recovered(ui):
     manager = SessionManager(session_store=MemorySessionStore())
     manager.add_user_message("interrupted request")
     manager.begin_run()
+    manager.recovery_pending = True
     accepted = manager.queue_input("follow-up", priority=1)
     controller = SessionController(ui)
     controller.bind_session_manager(manager)
@@ -394,6 +395,31 @@ def test_controller_accepts_durable_input_when_mailbox_has_capacity(ui):
 
     assert [event.content for event in manager.session.pending_inputs] == ["accepted"]
     assert controller._inbox.qsize() == 1
+
+
+def test_controller_accepts_durable_input_during_its_live_run(ui):
+    """A controller-owned durable run does not activate the abandoned-run recovery gate."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    manager.add_user_message("active request")
+    manager.begin_run()
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    controller.bind_command_manager(CommandManager())
+
+    async def scenario():
+        """Submit ordinary text while the controller owns an active run."""
+        submitted = asyncio.get_running_loop().create_future()
+        submitted.set_result("follow-up")
+        with controller.control.execution():
+            await controller._accept_async(submitted, route_idle_commands=False)
+
+    asyncio.run(scenario())
+
+    assert manager.recovery_state is not None
+    assert manager.recovery_pending is False
+    assert [event.content for event in manager.session.pending_inputs] == ["follow-up"]
+    assert controller._inbox.qsize() == 1
+    ui.warning.assert_not_called()
 
 
 @pytest.mark.parametrize("method", ["queue", "steer"])

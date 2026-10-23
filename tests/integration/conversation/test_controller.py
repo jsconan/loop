@@ -23,6 +23,7 @@ from loop import (
     ModelInfo,
     ResponseCompleted,
     SessionController,
+    SessionManager,
 )
 from loop.configuration import ConfigurationCommands, ConfigurationManager
 from loop.session import LocalSessionNameGenerator
@@ -253,7 +254,7 @@ def test_async_model_check_can_select_a_fallback_without_stopping_the_loop(tmp_p
 
 @pytest.mark.parametrize("mode", ["queue", "interrupt", "steer", "default-steer"])
 def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode):
-    """A real editor queues messages and interrupts or steers while its model is active."""
+    """A real editor queues durable input and controls execution while its model is active."""
     output = StringIO()
     release = Event()
     requests = []
@@ -306,13 +307,16 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
                 prepare_context=list,
                 get_response=get_response,
             )
+            sessions = SessionManager(interaction=controller.interaction)
             loop = Loop.create_default(
                 backend,
                 interaction=controller.interaction,
                 run_control=controller.control,
+                session_manager=sessions,
                 working_directory=tmp_path,
                 session_name_generator=LocalSessionNameGenerator(),
             )
+            controller.bind_session_manager(sessions)
             task = asyncio.create_task(
                 controller._run_sync_callback_async(lambda receive: loop.run(input_source=receive))
             )
@@ -320,7 +324,7 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
                 pipe.send_text("first\n")
                 await working.wait()
                 pipe.send_text("second\n" if mode == "default-steer" else "/queue second\n")
-                await queued.wait()
+                await asyncio.wait_for(queued.wait(), timeout=5)
                 assert len(requests) == 1
                 if mode in {"interrupt", "steer"}:
                     pipe.send_text("/steer correction\n" if mode == "steer" else "/interrupt\n")
@@ -345,6 +349,7 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
         expected = ["first", "correction", "answer 2", "second", "answer 3"]
     assert [item.content for item in loop.messages] == expected
     assert loop.session.recovery_state() is None
+    assert loop.session.pending_inputs == ()
     assert "Queued input" in output.getvalue() or "Steering accepted" in output.getvalue()
     assert "answer 2" in output.getvalue()
     assert controller.running is False

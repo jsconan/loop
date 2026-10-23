@@ -1107,7 +1107,7 @@ class SessionController:
             return
         if value == "":
             self._source.warning("Please enter a message!")
-        elif self._session_manager is not None and self._session_manager.recovery_state is not None:
+        elif self._session_manager is not None and self._session_manager.recovery_pending:
             self._source.warning(
                 "Recover the interrupted run or start a new session before sending a message."
             )
@@ -1262,7 +1262,7 @@ class SessionController:
         if (
             self._session_manager is None
             or self._stopping
-            or self._session_manager.recovery_state is not None
+            or self._session_manager.recovery_pending
         ):
             return
         pending = self._session_manager.session.pending_inputs

@@ -627,7 +627,7 @@ class Loop:
             )
 
         with self._session_manager.execution():
-            recovery_pending = self._recover_session()
+            self._recover_session()
         while not self._command_manager.exit_requested:
             with self._session_manager.execution():
                 user_input = (
@@ -658,11 +658,12 @@ class Loop:
                     if self.session is not session:
                         with self._session_manager.execution():
                             self._model_selection.restore(self.session.model)
-                            recovery_pending = self._recover_session()
+                            self._recover_session()
                     continue
-                if recovery_pending:
+                if self._session_manager.recovery_pending:
                     self._interaction.warning(
-                        "Recover the interrupted run or start a new session before sending a message."
+                        "Recover the interrupted run or start a new session "
+                        "before sending a message."
                     )
                     continue
                 if self._skill_hints_enabled:
@@ -757,7 +758,7 @@ class Loop:
             WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
         """
         with self._session_manager.execution():
-            recovery_pending = await self._recover_session_async()
+            await self._recover_session_async()
         while not self._command_manager.exit_requested:
             with self._session_manager.execution():
                 if input_source is not None:
@@ -790,11 +791,12 @@ class Loop:
                     if self.session is not session:
                         with self._session_manager.execution():
                             await self._model_selection.restore_async(self.session.model)
-                            recovery_pending = await self._recover_session_async()
+                            await self._recover_session_async()
                     continue
-                if recovery_pending:
+                if self._session_manager.recovery_pending:
                     self._interaction.warning(
-                        "Recover the interrupted run or start a new session before sending a message."
+                        "Recover the interrupted run or start a new session "
+                        "before sending a message."
                     )
                     continue
                 if self._skill_hints_enabled:
@@ -923,18 +925,16 @@ class Loop:
         if self._session_manager.session.has_initial_name():
             await self._session_manager.generate_session_name_async(self._session_name_generator)
 
-    def _recover_session(self) -> bool:
+    def _recover_session(self) -> None:
         """Recover a previously interrupted run, if any."""
         recovery = self._agent_runner.recover_session()
-        recovery_pending = recovery.pending
         if recovery.result is not None:
             self._complete_agent_run(recovery.result)
-        return recovery_pending
+        self._session_manager.recovery_pending = recovery.pending
 
-    async def _recover_session_async(self) -> bool:
+    async def _recover_session_async(self) -> None:
         """Recover an interrupted run through async permission and recovery prompts."""
         recovery = await self._agent_runner.recover_session_async()
-        recovery_pending = recovery.pending
         if recovery.result is not None:
             await self._complete_agent_run_async(recovery.result)
-        return recovery_pending
+        self._session_manager.recovery_pending = recovery.pending

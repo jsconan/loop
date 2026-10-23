@@ -820,6 +820,7 @@ def test_run_declining_recovery_blocks_new_input_without_mutating_history(tmp_pa
     loop.run()
 
     assert loop.messages == [Message(role="user", content="unfinished")]
+    assert loop._session_manager.recovery_pending is True
     backend.get_response.assert_not_called()
     interaction.warning.assert_called_once_with(
         "Recover the interrupted run or start a new session before sending a message."
@@ -1657,6 +1658,7 @@ def test_run_async_recovers_session_changes_and_blocks_messages_when_recovery_is
     asyncio.run(loop.run_async(input_source=read_input))
 
     assert loop.agent_runner.recover_session_async.await_count == 2
+    assert loop._session_manager.recovery_pending is True
     loop.agent_runner.run_async.assert_not_awaited()
     interaction.run_metrics.assert_called_once_with(recovered.metrics)
     interaction.warning.assert_called_once_with(

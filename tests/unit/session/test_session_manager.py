@@ -683,8 +683,28 @@ def test_manager_exposes_durable_recovery_classification():
     manager = SessionManager(session=session)
 
     assert manager.recovery_state.action == "query_model"
+    assert manager.recovery_pending is True
     manager.new_session()
     assert manager.recovery_state is None
+    assert manager.recovery_pending is False
+
+
+def test_manager_updates_the_shared_recovery_gate():
+    """Recovery decisions update the explicit gate independently of live history projection."""
+    manager = SessionManager()
+    manager.add_user_message("active request")
+    manager.begin_run()
+
+    assert manager.recovery_state is not None
+    assert manager.recovery_pending is False
+
+    manager.recovery_pending = True
+    assert manager.recovery_pending is True
+    manager.recovery_pending = False
+    assert manager.recovery_pending is False
+
+    with pytest.raises(TypeError, match="must be a boolean"):
+        manager.recovery_pending = 1
 
 
 def test_manager_rejects_overlapping_execution_and_releases_normal_ownership():
