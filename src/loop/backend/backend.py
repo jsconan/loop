@@ -19,6 +19,7 @@ from ..models import (
     StructuredOutputFormat,
     ToolDefinition,
 )
+from ..utils import run_in_worker_async
 from .utils import project_portable_context
 
 
@@ -91,12 +92,14 @@ class Backend(ABC):
         """Release resources owned by the synchronous backend path."""
 
     async def close_async(self) -> None:
-        """Release backend resources after asynchronous use.
+        """Release async resources and offload sync-only cleanup to a bounded worker.
 
         Raises:
+            RuntimeError: If bounded worker capacity is full or unavailable.
+            asyncio.CancelledError: If cancelled, after synchronous cleanup settles.
             Exception: If a resource fails while closing.
         """
-        self.close()
+        await run_in_worker_async(self.close)
 
     @property
     def base_url(self) -> str | None:

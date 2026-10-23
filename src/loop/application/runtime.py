@@ -28,6 +28,7 @@ from ..telemetry import (
 )
 from ..tooling import ToolRuntimeSettings
 from ..tools import create_default_tool_registry
+from ..utils import run_in_worker_async
 from ..workspace import Workspace, WorkspaceCommands, WorkspaceRepository
 from .commands import ApplicationCommands
 from .paths import ApplicationPaths, WorkspacePaths
@@ -410,9 +411,12 @@ class ApplicationRuntime:
     async def close_async(self) -> None:
         """Release runtime resources after async work has settled and before its loop closes.
 
+        Native async close methods run on their owning loop. Sync-only cleanup callbacks run on a
+        bounded worker and settle before shutdown returns.
+
         Raises:
-            RuntimeError: If conversation execution has not settled or an async resource belongs
-                to another event loop.
+            RuntimeError: If conversation execution has not settled, an async resource belongs to
+                another event loop, or bounded worker capacity is full.
             TimeoutError: If telemetry cannot flush within its configured timeout.
             BaseException: The first cleanup failure after every owned resource is tried.
             asyncio.CancelledError: After asynchronous resource cleanup settles.
@@ -507,7 +511,7 @@ class ApplicationRuntime:
     async def _cleanup_async(
         callbacks: list[Callable[[], object]], *, primary: BaseException | None = None
     ) -> None:
-        """Close async resources on the current loop and settle every owned cleanup."""
+        """Close async resources on their owner and settle sync cleanup on bounded workers."""
         cleanup_errors = []
         cancellation = None
         while callbacks:
@@ -515,7 +519,18 @@ class ApplicationRuntime:
             try:
                 resource = callback.__self__ if inspect.ismethod(callback) else None
                 close_async = getattr(resource, "close_async", None)
-                result = close_async() if callable(close_async) else callback()
+                if callable(close_async):
+                    result = close_async()
+                elif inspect.iscoroutinefunction(callback):
+                    result = callback()
+                else:
+                    pending = asyncio.ensure_future(run_in_worker_async(callback))
+                    while not pending.done():
+                        try:
+                            await asyncio.shield(pending)
+                        except asyncio.CancelledError as error:
+                            cancellation = cancellation or error
+                    result = pending.result()
                 if inspect.isawaitable(result):
                     pending = asyncio.ensure_future(result)
                     while not pending.done():

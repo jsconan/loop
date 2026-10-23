@@ -90,6 +90,7 @@ from ..utils import (
     data_url,
     get_binary,
     payload_digest,
+    run_in_worker_async,
     snippet,
     validate_term,
 )
@@ -405,7 +406,9 @@ class OpenAIBackend(Backend):
         """Close both SDK clients, awaiting asynchronous cleanup on the owner loop.
 
         Raises:
-            RuntimeError: If the asynchronous client is closed from a different event loop.
+            RuntimeError: If the async client is closed from another loop or bounded worker
+                capacity is full or unavailable.
+            asyncio.CancelledError: After synchronous client cleanup settles.
             Exception: If either SDK client fails to close.
         """
         first_error = None
@@ -423,7 +426,7 @@ class OpenAIBackend(Backend):
                 self._async_client_loop = None
         if self._client is not None:
             try:
-                self._client.close()
+                await run_in_worker_async(self._client.close)
             except BaseException as error:  # noqa: BLE001 - preserve both shutdown failures
                 if first_error is None:
                     first_error = error

@@ -4,6 +4,7 @@ import asyncio
 import gc
 import logging
 import warnings
+from threading import Event, get_ident
 from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
@@ -492,6 +493,74 @@ def test_async_close_uses_async_resource_cleanup_and_is_idempotent():
 
     assert resource.sync_closes == 0
     assert resource.async_closes == 1
+
+
+def test_async_close_runs_sync_cleanup_off_the_event_loop():
+    """Synchronous resource cleanup cannot block the runtime's owner loop."""
+    cleanup_threads = []
+    runtime = ApplicationRuntime(
+        Mock(),
+        Mock(),
+        1.0,
+        cleanup_callbacks=[lambda: cleanup_threads.append(get_ident())],
+    )
+
+    async def close_runtime():
+        """Return the event-loop thread after runtime cleanup settles."""
+        owner_thread = get_ident()
+        await runtime.close_async()
+        return owner_thread
+
+    owner_thread = asyncio.run(close_runtime())
+
+    assert len(cleanup_threads) == 1
+    assert cleanup_threads[0] != owner_thread
+
+
+def test_async_close_awaits_async_cleanup_callback_on_the_owner_loop():
+    """Standalone async cleanup callbacks run on the active event loop."""
+    cleanup_threads = []
+
+    async def cleanup():
+        """Record the thread that runs asynchronous cleanup."""
+        cleanup_threads.append(get_ident())
+
+    runtime = ApplicationRuntime(Mock(), Mock(), 1.0, cleanup_callbacks=[cleanup])
+
+    async def close_runtime():
+        """Close the runtime and return its event-loop thread."""
+        owner_thread = get_ident()
+        await runtime.close_async()
+        return owner_thread
+
+    owner_thread = asyncio.run(close_runtime())
+
+    assert cleanup_threads == [owner_thread]
+
+
+def test_async_close_settles_sync_cleanup_after_cancellation():
+    """Cancellation waits until synchronous cleanup has released its worker."""
+    started, release, settled = Event(), Event(), Event()
+
+    def cleanup():
+        """Hold cleanup until the async shutdown receives cancellation."""
+        started.set()
+        release.wait(timeout=1.0)
+        settled.set()
+
+    runtime = ApplicationRuntime(Mock(), Mock(), 1.0, cleanup_callbacks=[cleanup])
+
+    async def scenario():
+        """Cancel shutdown while cleanup is active, then verify it settles."""
+        closing = asyncio.create_task(runtime.close_async())
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1.0), timeout=2.0)
+        closing.cancel()
+        asyncio.get_running_loop().call_later(0.01, release.set)
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert settled.is_set()
+
+    asyncio.run(scenario())
 
 
 def test_async_close_rejects_a_different_resource_loop_before_cleanup(dependencies):

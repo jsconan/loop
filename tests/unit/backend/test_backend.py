@@ -1,6 +1,7 @@
 """Tests for the backend capability contract."""
 
 import asyncio
+from threading import get_ident
 from unittest.mock import Mock
 
 import pytest
@@ -32,6 +33,29 @@ def test_default_backend_lifecycle_cleanup_is_synchronous_and_repeatable():
     assert Backend.async_close_loop.fget(backend) is None
     Backend.close(backend)
     asyncio.run(Backend.close_async(backend))
+
+
+def test_default_backend_async_cleanup_runs_sync_close_on_a_worker(monkeypatch):
+    """A sync-only backend close does not block its async caller's event loop."""
+    backend = OpenAIBackend()
+    owner_threads = []
+    cleanup_threads = []
+
+    def close():
+        """Record the thread that owns synchronous cleanup."""
+        cleanup_threads.append(get_ident())
+
+    monkeypatch.setattr(backend, "close", close)
+
+    async def close_backend():
+        """Close the backend and record the async owner's thread."""
+        owner_threads.append(get_ident())
+        await Backend.close_async(backend)
+
+    asyncio.run(close_backend())
+
+    assert len(cleanup_threads) == 1
+    assert cleanup_threads[0] != owner_threads[0]
 
 
 def test_default_context_preparation_preserves_canonical_items():

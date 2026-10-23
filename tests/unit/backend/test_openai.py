@@ -4,6 +4,7 @@ import asyncio
 import json
 from base64 import b64decode
 from collections.abc import AsyncIterator
+from threading import get_ident
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -271,6 +272,9 @@ def test_backend_closes_both_lazy_sdk_clients_on_the_async_owner():
     async_sdk = Mock()
     async_sdk.close = AsyncMock()
     async_sdk.models.list.return_value = AsyncModelPage()
+    sync_close_threads = []
+    sync_sdk.close.side_effect = lambda: sync_close_threads.append(get_ident())
+    owner_threads = []
     backend = OpenAIBackend()
 
     with patch("loop.backend.openai.OpenAI", return_value=sync_sdk):
@@ -278,6 +282,7 @@ def test_backend_closes_both_lazy_sdk_clients_on_the_async_owner():
 
     async def close_async_client():
         """Initialize and close the async SDK client on one event loop."""
+        owner_threads.append(get_ident())
         with patch("loop.backend.openai.AsyncOpenAI", return_value=async_sdk):
             assert await backend.get_models_async() == []
             assert backend.async_close_required is True
@@ -290,6 +295,7 @@ def test_backend_closes_both_lazy_sdk_clients_on_the_async_owner():
 
     async_sdk.close.assert_awaited_once_with()
     sync_sdk.close.assert_called_once_with()
+    assert sync_close_threads[0] != owner_threads[0]
     assert backend.async_close_required is False
     backend.close()
 
