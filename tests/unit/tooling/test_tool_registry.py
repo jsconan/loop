@@ -1325,6 +1325,158 @@ def test_cancelled_callback_retrieves_its_completed_future_without_starting_more
         assert records == []
 
 
+@pytest.mark.parametrize("signal", [False, True])
+@pytest.mark.parametrize("repeated", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "failure", "problem", "cancelled"])
+def test_cancelled_start_callback_settles_returned_task_without_invoking_tool(
+    caplog, signal, repeated, outcome
+):
+    """Cancellation after callback worker return owns cleanup and never admits the tool body."""
+    started, awaiting, cancelling, finish = (asyncio.Event() for _ in range(4))
+    cancellation = Event() if signal else None
+    invoked, completed = [], []
+    owned = None
+
+    class CallbackTask(asyncio.Task):
+        """Expose direct and shielded waits through the task's public completion interface."""
+
+        def __await__(self):
+            awaiting.set()
+            return super().__await__()
+
+        def add_done_callback(self, callback, *, context=None):
+            """Expose when shield subscribes to this task's completion."""
+            awaiting.set()
+            return super().add_done_callback(callback, context=context)
+
+    async def before_execution():
+        """Finish owned callback cleanup even when cancellation has revoked tool execution."""
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelling.set()
+            await finish.wait()
+            completed.append(True)
+            if outcome == "failure":
+                raise RuntimeError("private callback cleanup failure")
+            if outcome == "problem":
+                raise ProblemException(
+                    Problem(
+                        code="test.callback_failed",
+                        title="Callback rejected",
+                        detail="Callback rejected before execution.",
+                    )
+                )
+            if outcome == "cancelled":
+                raise
+            return "callback settled"
+
+    def execution_started():
+        """Return owner-loop work through the synchronous callback adapter."""
+        return owned
+
+    def invoke():
+        """Record an effect that cancellation must prevent from starting."""
+        invoked.append(True)
+        return "unexpected receipt"
+
+    registry = ToolRegistry([invoke])
+
+    async def scenario():
+        """Cancel at the returned task's public await subscription without timing delays."""
+        nonlocal owned
+        owned = CallbackTask(before_execution())
+        await started.wait()
+        task = asyncio.create_task(
+            registry.call_with_timing_async(
+                "invoke",
+                "{}",
+                execution_started=execution_started,
+                cancellation_event=cancellation,
+            )
+        )
+        try:
+            await awaiting.wait()
+            task.cancel()
+            await cancelling.wait()
+            if repeated:
+                task.cancel()
+                advanced = asyncio.get_running_loop().create_future()
+                asyncio.get_running_loop().call_soon(advanced.set_result, None)
+                await advanced
+            assert not task.done()
+            assert not owned.done()
+            assert completed == []
+            assert cancellation is None or cancellation.is_set()
+            finish.set()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await task
+            assert not hasattr(captured.value, "output")
+            assert owned.done()
+            assert owned.cancelled() is (outcome == "cancelled")
+            assert completed == [True]
+            assert invoked == []
+        finally:
+            finish.set()
+            task.cancel()
+            await asyncio.gather(task, owned, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+    if outcome == "failure":
+        assert len(caplog.records) == 1
+        record = caplog.records[0]
+        assert record.name == "loop.tooling.tool_registry"
+        assert record.__dict__["error.type"] == "tool.callback_failed"
+        assert record.__dict__["exception.type"] == "builtins.RuntimeError"
+        assert record.__dict__["error.operation"] == "invoke execution-start callback"
+        assert "private callback cleanup failure" not in record.getMessage()
+    else:
+        assert caplog.records == []
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_start_callback_returned_future_preserves_normal_completion(fails):
+    """Successful callback completion admits execution while callback failure prevents it."""
+    owned = None
+    invoked = []
+    failure = RuntimeError("callback rejected")
+
+    def execution_started():
+        """Return a future on the invocation's owner loop."""
+        return owned
+
+    def invoke():
+        """Record execution admitted by a successful callback."""
+        invoked.append(True)
+        return "confirmed"
+
+    registry = ToolRegistry([invoke])
+
+    async def scenario():
+        """Resolve callback work normally without cancelling its dispatch owner."""
+        nonlocal owned
+        owned = asyncio.get_running_loop().create_future()
+        if fails:
+            owned.set_exception(failure)
+            with pytest.raises(RuntimeError) as captured:
+                await registry.call_async("invoke", "{}", execution_started=execution_started)
+            assert captured.value is failure
+        else:
+            owned.set_result(None)
+            output = await registry.call_async("invoke", "{}", execution_started=execution_started)
+            assert result_value(output) == "confirmed"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+    assert invoked == ([] if fails else [True])
+
+
 def test_sync_callable_awaits_an_owner_loop_future_normally():
     """Normal dispatch still awaits owner-loop futures and serializes their actual result."""
     returned = None

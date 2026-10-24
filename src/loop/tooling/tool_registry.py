@@ -398,7 +398,7 @@ class ToolRegistry:
         operation: str = "tool callback",
         cancellation_event: Event | None = None,
     ) -> Any:
-        """Invoke async callbacks on the owner loop and sync callbacks in bounded workers."""
+        """Invoke callbacks and retain cancellation while owned returned tasks settle."""
         if is_async_callable(function):
             result = function(*args)
         else:
@@ -423,6 +423,16 @@ class ToolRegistry:
                         ),
                     )
                 )
+            if isinstance(result, asyncio.Future):
+                try:
+                    return await asyncio.shield(result)
+                except asyncio.CancelledError:
+                    if cancellation_event is not None:
+                        cancellation_event.set()
+                    await self._cancel_returned_future_async(result)
+                    if not result.cancelled():
+                        self._log_callback_failure(result.exception(), operation)
+                    raise
             result = await result
         return result
 
@@ -485,18 +495,24 @@ class ToolRegistry:
                     elif settled_cancellation is not None:
                         settled_cancellation(cancellation)
                         return result
-                if worker_error is not None and not isinstance(worker_error, ProblemException):
-                    problem = Problem.from_exception(
-                        worker_error,
-                        code="tool.callback_failed",
-                        title="Tool callback failed",
-                        detail=f"Tool callback '{operation}' failed while cancellation settled.",
-                        operation=operation,
-                    )
-                    log_problem(_LOGGER, problem, worker_error)
+                self._log_callback_failure(worker_error, operation)
             raise
         finally:
             self._worker_slots.release()
+
+    @staticmethod
+    def _log_callback_failure(error: BaseException | None, operation: str) -> None:
+        """Report an unexpected callback failure once while cancellation settles."""
+        if error is None or isinstance(error, ProblemException):
+            return
+        problem = Problem.from_exception(
+            error,
+            code="tool.callback_failed",
+            title="Tool callback failed",
+            detail=f"Tool callback '{operation}' failed while cancellation settled.",
+            operation=operation,
+        )
+        log_problem(_LOGGER, problem, error)
 
     @staticmethod
     async def _cancel_returned_future_async(future: asyncio.Future[Any]) -> None:
@@ -918,7 +934,8 @@ class ToolRegistry:
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
             execution_started (Callable[[], Any] | None): Callback invoked immediately before
                 the validated and authorized tool function runs; async callbacks run on the owner
-                loop and sync callbacks run in a bounded worker.
+                loop and sync callbacks run in a bounded worker. Returned owner-loop tasks/futures
+                settle on cancellation without starting the tool.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -970,7 +987,8 @@ class ToolRegistry:
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
             execution_started (Callable[[], Any] | None): Callback invoked immediately before
                 the validated and authorized tool function runs; async callbacks run on the owner
-                loop and sync callbacks run in a bounded worker.
+                loop and sync callbacks run in a bounded worker. Returned owner-loop tasks/futures
+                settle on cancellation without starting the tool.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -1768,6 +1786,7 @@ class ToolRegistryView:
             call_id (str | None): Stable model request identifier.
             execution_started (Callable[[], Any] | None): Callback run before tool execution;
                 async callbacks run on the owner loop and sync callbacks run in a bounded worker.
+                Returned owner-loop tasks/futures settle on cancellation without starting the tool.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -1812,6 +1831,7 @@ class ToolRegistryView:
             call_id (str | None): Stable model request identifier.
             execution_started (Callable[[], Any] | None): Callback run before tool execution;
                 async callbacks run on the owner loop and sync callbacks run in a bounded worker.
+                Returned owner-loop tasks/futures settle on cancellation without starting the tool.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
