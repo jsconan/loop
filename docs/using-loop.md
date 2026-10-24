@@ -50,7 +50,7 @@ Library authors can inject a `MentionManager` or compose their own handlers. The
 
 ### Sessions
 
-The CLI stores conversations in the active workspace. A Git worktree is one workspace; outside Git, the launch directory is the workspace. Sessions are tied to their workspace and cannot be resumed from another one. The first user message creates the session and gives it a provisional name. After the first completed answer, Loop can ask the model for a more descriptive name. This title request does not appear in the conversation, and if it fails, the provisional name remains.
+The CLI stores conversations in the active workspace. A Git worktree is one workspace; outside Git, the launch directory is the workspace. Sessions are tied to their workspace and cannot be resumed from another one. The first user message creates the session and gives it a provisional name. In asynchronous runs, Loop starts a separate title request as soon as it has saved the first non-empty assistant response, while the agent continues handling that response. The title request does not appear in the conversation, and Loop keeps the provisional name if generation fails or the session is renamed before the generated title is saved. Synchronous `Loop.run()` calls start naming after each agent run completes.
 
 Model-assisted naming is the default. Library callers can use `LocalSessionNameGenerator` for deterministic local titles.
 

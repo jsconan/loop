@@ -1,7 +1,9 @@
 """Run an interactive conversation with an LLM backend."""
 
+import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Self
 
@@ -29,6 +31,7 @@ from .models import AgentRunStopReason, ConversationItem, ReasoningEffort, Steer
 from .permissions import PermissionCommands, PermissionManager
 from .session import (
     BackendSessionNameGenerator,
+    ResponsePersisted,
     Session,
     SessionCommands,
     SessionManager,
@@ -55,8 +58,8 @@ class Loop:
             default owned by this loop. Defaults to ``False`` for explicitly assembled loops.
         skill_hints_enabled (bool): Whether ``$skill`` references prioritize matching metadata for
             one default-configured request. Defaults to ``False`` for explicitly assembled loops.
-        run_control (RunControl | None): Optional stop signal to prevent automatic naming after
-            interruption. Defaults to no external stop signal.
+        run_control (RunControl | None): Optional stop signal for the active conversation run.
+            Defaults to no external stop signal.
 
     """
 
@@ -74,6 +77,9 @@ class Loop:
     _owns_session_name_generator: bool
     _skill_hints_enabled: bool
     _run_control: RunControl | None
+    _session_name_task_group: asyncio.TaskGroup | None
+    _session_name_tasks: dict[str, asyncio.Task[None]]
+    _session_name_attempted_this_run: bool
 
     def __init__(
         self,
@@ -100,6 +106,9 @@ class Loop:
         self._owns_session_name_generator = owns_session_name_generator
         self._skill_hints_enabled = skill_hints_enabled
         self._run_control = run_control
+        self._session_name_task_group = None
+        self._session_name_tasks = {}
+        self._session_name_attempted_this_run = False
         self._mention_manager = mention_manager
         self._instructions_manager = agent_runner.instructions_manager
         self._permission_manager = agent_runner.permission_manager
@@ -552,7 +561,8 @@ class Loop:
             await self._session_manager.begin_run_retry_async()
         elif not self._session_manager.continuable:
             return False
-        return await self._recover_session_async(explicit=True)
+        async with self._session_name_task_scope_async():
+            return await self._recover_session_async(explicit=True)
 
     @property
     def interaction(self) -> Interaction:
@@ -791,7 +801,7 @@ class Loop:
         *,
         input_source: Callable[[CompletionManager], Awaitable[object]] | None = None,
     ) -> None:
-        """Run conversation orchestration through async input and agent operations.
+        """Run conversation orchestration and own title tasks through async input and execution.
 
         Args:
             input_source (Callable[[CompletionManager], Awaitable[object]] | None): Optional
@@ -804,7 +814,17 @@ class Loop:
             ProblemException: If the interaction does not provide asynchronous input.
             SessionExecutionConflictError: If another owner is executing this session.
             WorkspaceSwitchRequested: If a command requests a workspace runtime rebuild.
+            asyncio.CancelledError: If the conversation task is cancelled.
         """
+        async with self._session_name_task_scope_async():
+            await self._run_async(input_source=input_source)
+
+    async def _run_async(
+        self,
+        *,
+        input_source: Callable[[CompletionManager], Awaitable[object]] | None = None,
+    ) -> None:
+        """Run conversation orchestration through asynchronous input and agent operations."""
         with self._session_manager.execution():
             await self._recover_session_async()
         while not self._command_manager.exit_requested:
@@ -911,6 +931,7 @@ class Loop:
                             else None,
                         )
                         telemetry_activity("message.accepted", component="session_manager")
+                        self._session_name_attempted_this_run = False
                         result = await self._agent_runner.run_async()
                         await self._complete_agent_run_async(result)
                 finally:
@@ -918,6 +939,71 @@ class Loop:
                         await self._clear_skill_catalog_priorities_async()
 
         self._interaction.conversation_ended()
+
+    @asynccontextmanager
+    async def _session_name_task_scope_async(self) -> AsyncGenerator[None, None]:
+        """Own automatically generated title tasks through conversation cleanup."""
+        if self._session_name_task_group is not None:
+            yield
+            return
+        scope_error: BaseException | None = None
+        with self._session_manager.observe_responses(self._on_response_persisted):
+            try:
+                async with asyncio.TaskGroup() as task_group:
+                    self._session_name_task_group = task_group
+                    try:
+                        yield
+                    # Let the group settle children without wrapping Loop's original exception.
+                    except BaseException as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                        scope_error = error
+                        for task in self._session_name_tasks.values():
+                            task.cancel()
+            finally:
+                self._session_name_task_group = None
+        if scope_error is not None:
+            raise scope_error
+
+    def _on_response_persisted(self, event: ResponsePersisted) -> None:
+        """Schedule title generation for a response persisted to the active session."""
+        if event.session_id == self._session_manager.session.id:
+            self._schedule_session_name_generation()
+
+    def _schedule_session_name_generation(self) -> None:
+        """Start one title request for the first usable exchange in the current run."""
+        task_group = self._session_name_task_group
+        if task_group is None or self._session_name_attempted_this_run:
+            return
+        context = self._session_manager.session_name_context()
+        if context is None:
+            return
+        pending = self._session_name_tasks.get(context.session_id)
+        if pending is not None and not pending.done():
+            self._session_name_attempted_this_run = True
+            return
+        self._session_name_attempted_this_run = True
+        task = task_group.create_task(
+            self._session_manager.generate_session_name_async(
+                self._session_name_generator,
+                context=context,
+            ),
+            name="session-name-generation",
+        )
+        self._session_name_tasks[context.session_id] = task
+        task.add_done_callback(
+            lambda completed, session_id=context.session_id: self._discard_session_name_task(
+                session_id,
+                completed,
+            )
+        )
+
+    def _discard_session_name_task(
+        self,
+        session_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        """Remove a completed title task without dropping a newer task for that session."""
+        if self._session_name_tasks.get(session_id) is task:
+            del self._session_name_tasks[session_id]
 
     def _clear_skill_catalog_priorities(self) -> None:
         """Clear request-scoped skill priorities without masking the preceding outcome."""
@@ -964,7 +1050,7 @@ class Loop:
             self._session_manager.generate_session_name(self._session_name_generator)
 
     async def _complete_agent_run_async(self, result: AgentRunResult) -> None:
-        """Present run metrics and finish session naming through async model APIs."""
+        """Present run metrics and schedule a fallback title request when needed."""
         if result.metrics is None:
             raise TypeError("Agent run did not produce completion metrics.")
         self._interaction.run_metrics(result.metrics)
@@ -976,8 +1062,7 @@ class Loop:
 
         if self._run_control is not None:
             self._run_control.checkpoint()
-        if self._session_manager.session.has_initial_name():
-            await self._session_manager.generate_session_name_async(self._session_name_generator)
+        self._schedule_session_name_generation()
 
     def _recover_session(self) -> None:
         """Recover a previously interrupted run, if any."""
@@ -987,6 +1072,7 @@ class Loop:
 
     async def _recover_session_async(self, *, explicit: bool = False) -> bool:
         """Recover an interrupted run through its existing async recovery procedure."""
+        self._session_name_attempted_this_run = False
         recovery = (
             await self._agent_runner.recover_session_async(confirmed=True)
             if explicit

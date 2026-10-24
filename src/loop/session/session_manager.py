@@ -70,12 +70,14 @@ from .models import (
     InteractionRequestedEvent,
     InteractionSettledEvent,
     PermissionEvent,
+    ResponsePersisted,
     RunCompletedEvent,
     RunFailedEvent,
     RunRetryStartedEvent,
     RunStartedEvent,
     SessionEventModel,
     SessionExecutionConflictError,
+    SessionNameContext,
     SessionNameGenerator,
     SessionRecoveryState,
     SessionWorkspaceMismatchError,
@@ -129,6 +131,8 @@ class SessionManager:
     _session_store: SessionStore
     _workspace_id: str | None
     _async_blocking_runner: Callable[..., Awaitable[Any]] | None
+    _response_persisted_observers: list[tuple[object, Callable[[ResponsePersisted], None]]]
+    _response_persisted_observers_lock: Lock
     _persistence_lock: Lock
     _commit_lock: Lock
     _async_commit_lock: asyncio.Lock
@@ -144,6 +148,8 @@ class SessionManager:
         self._interaction = interaction or ConsoleInteraction()
         self._session_store = session_store or MemorySessionStore()
         self._async_blocking_runner = async_blocking_runner
+        self._response_persisted_observers = []
+        self._response_persisted_observers_lock = Lock()
         self._persistence_lock = Lock()
         self._commit_lock = Lock()
         self._async_commit_lock = asyncio.Lock()
@@ -206,6 +212,36 @@ class SessionManager:
             list[ConversationItem]: Items accumulated during the conversation.
         """
         return self._session.messages
+
+    @contextmanager
+    def observe_responses(
+        self,
+        observer: Callable[[ResponsePersisted], None],
+    ) -> Generator[None, None, None]:
+        """Observe responses while this context is active.
+
+        Every observer receives a typed notification after a response commit succeeds. Multiple
+        observers can be active at once, and each registration is removed when its context exits.
+
+        Args:
+            observer (Callable[[ResponsePersisted], None]): Non-blocking handler invoked after a
+                response is persisted.
+
+        Yields:
+            None: The response observation remains active for the duration of the context.
+        """
+        subscription = object()
+        with self._response_persisted_observers_lock:
+            self._response_persisted_observers.append((subscription, observer))
+        try:
+            yield
+        finally:
+            with self._response_persisted_observers_lock:
+                self._response_persisted_observers[:] = [
+                    entry
+                    for entry in self._response_persisted_observers
+                    if entry[0] is not subscription
+                ]
 
     def next_message_span(self) -> AbstractContextManager[TelemetryContext | None]:
         """Return the correlation span for the next submitted user message.
@@ -1169,39 +1205,44 @@ class SessionManager:
     def generate_session_name(
         self,
         generator: SessionNameGenerator,
+        *,
+        context: SessionNameContext | None = None,
     ) -> None:
-        """Generate, persist, and report a session name from the first completed exchange.
+        """Generate, persist, and report a session name from a captured exchange.
 
         Args:
             generator (SessionNameGenerator): Auxiliary title generation service.
+            context (SessionNameContext | None): Captured automatic-name exchange to name, or
+                ``None`` to capture the active session and preserve explicit naming behavior.
         """
         self._interaction.info("Generating a session name...")
         try:
-            user_message = next(
-                (
-                    message.content
-                    for message in self._session.messages
-                    if isinstance(message, Message) and message.role == "user"
-                ),
-                "",
-            )
-            assistant_message = next(
-                (
-                    message.content
-                    for message in self._session.messages
-                    if isinstance(message, Message) and message.role == "assistant"
-                ),
-                "",
-            )
-            if not user_message or not assistant_message.strip():
+            require_initial_name = context is not None
+            context = context or self._capture_session_name_context(require_initial_name=False)
+            if context is None:
                 self._interaction.info("No completed exchange found to generate a session name.")
                 return
-            name = generator.generate(user_message, assistant_message, self._session.model)
+            if not self._is_current_name_context(
+                context,
+                require_initial_name=require_initial_name,
+            ):
+                return
+            name = generator.generate(
+                context.user_message,
+                context.assistant_message,
+                context.model,
+            )
             if name:
                 self._commit(
-                    lambda session: session.rename(name, source=SESSION_NAME_SOURCE_GENERATED)
+                    lambda session: self._rename_generated_session(
+                        session,
+                        context,
+                        name,
+                        require_initial_name=require_initial_name,
+                    )
                 )
-            self._interaction.info(f"Session name: {self._session.name}")
+            if self._session.id == context.session_id:
+                self._interaction.info(f"Session name: {self._session.name}")
         except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             problem = Problem.from_exception(
                 error,
@@ -1215,57 +1256,67 @@ class SessionManager:
             log_problem(_LOGGER, problem, error)
             self._interaction.report(problem)
 
-    async def generate_session_name_async(self, generator: SessionNameGenerator) -> None:
+    async def generate_session_name_async(
+        self,
+        generator: SessionNameGenerator,
+        *,
+        context: SessionNameContext | None = None,
+    ) -> None:
         """Generate and persist a session name without blocking asynchronous model I/O.
 
         Generators with ``generate_async`` use their native asynchronous implementation. Existing
-        synchronous generators remain supported for compatibility.
+        synchronous generators remain supported for compatibility. A supplied context preserves
+        the session identity and messages captured before this task was scheduled.
 
         Args:
             generator (SessionNameGenerator): Auxiliary title generation service.
+            context (SessionNameContext | None): Captured automatic-name exchange to name, or
+                ``None`` to capture the active session and preserve explicit naming behavior.
 
         Returns:
-            None: The generated name is persisted when a usable exchange exists.
+            None: The generated name is persisted when a usable exchange still matches its
+                captured session and name state.
 
         Raises:
             asyncio.CancelledError: Naming is cancelled after any owned worker settles.
         """
         self._interaction.info("Generating a session name...")
         try:
-            user_message = next(
-                (
-                    message.content
-                    for message in self._session.messages
-                    if isinstance(message, Message) and message.role == "user"
-                ),
-                "",
-            )
-            assistant_message = next(
-                (
-                    message.content
-                    for message in self._session.messages
-                    if isinstance(message, Message) and message.role == "assistant"
-                ),
-                "",
-            )
-            if not user_message or not assistant_message.strip():
+            require_initial_name = context is not None
+            context = context or self._capture_session_name_context(require_initial_name=False)
+            if context is None:
                 self._interaction.info("No completed exchange found to generate a session name.")
+                return
+            if not self._is_current_name_context(
+                context,
+                require_initial_name=require_initial_name,
+            ):
                 return
             async_generator = getattr(generator, "generate_async", None)
             if callable(async_generator):
-                name = await async_generator(user_message, assistant_message, self._session.model)
+                name = await async_generator(
+                    context.user_message,
+                    context.assistant_message,
+                    context.model,
+                )
             else:
                 name = await self._run_blocking_async(
                     generator.generate,
-                    user_message,
-                    assistant_message,
-                    self._session.model,
+                    context.user_message,
+                    context.assistant_message,
+                    context.model,
                 )
             if name:
                 await self._commit_async(
-                    lambda session: session.rename(name, source=SESSION_NAME_SOURCE_GENERATED)
+                    lambda session: self._rename_generated_session(
+                        session,
+                        context,
+                        name,
+                        require_initial_name=require_initial_name,
+                    )
                 )
-            self._interaction.info(f"Session name: {self._session.name}")
+            if self._session.id == context.session_id:
+                self._interaction.info(f"Session name: {self._session.name}")
         except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             problem = Problem.from_exception(
                 error,
@@ -1278,6 +1329,76 @@ class SessionManager:
             )
             log_problem(_LOGGER, problem, error)
             self._interaction.report(problem)
+
+    def session_name_context(self) -> SessionNameContext | None:
+        """Capture the first usable exchange for an automatically named session.
+
+        Returns:
+            SessionNameContext | None: Immutable title input when the active session still has a
+                provisional name and contains a user message plus non-empty assistant text.
+        """
+        return self._capture_session_name_context(require_initial_name=True)
+
+    def _capture_session_name_context(
+        self,
+        *,
+        require_initial_name: bool,
+    ) -> SessionNameContext | None:
+        """Capture the first user message and non-empty assistant response."""
+        session = self._session
+        if require_initial_name and not session.has_initial_name():
+            return None
+        user_message = next(
+            (
+                message.content
+                for message in session.messages
+                if isinstance(message, Message) and message.role == "user"
+            ),
+            "",
+        )
+        assistant_message = next(
+            (
+                message.content
+                for message in session.messages
+                if isinstance(message, Message)
+                and message.role == "assistant"
+                and message.content.strip()
+            ),
+            "",
+        )
+        if not user_message or not assistant_message:
+            return None
+        return SessionNameContext(
+            session_id=session.id,
+            user_message=user_message,
+            assistant_message=assistant_message,
+            model=session.model,
+        )
+
+    def _is_current_name_context(
+        self,
+        context: SessionNameContext,
+        *,
+        require_initial_name: bool,
+    ) -> bool:
+        """Return whether a captured request still matches the active session and name state."""
+        return self._session.id == context.session_id and (
+            not require_initial_name or self._session.has_initial_name()
+        )
+
+    @staticmethod
+    def _rename_generated_session(
+        session: Session,
+        context: SessionNameContext,
+        name: str,
+        *,
+        require_initial_name: bool,
+    ) -> None:
+        """Apply a generated name while its captured session and name state still match."""
+        if session.id == context.session_id and (
+            not require_initial_name or session.has_initial_name()
+        ):
+            session.rename(name, source=SESSION_NAME_SOURCE_GENERATED)
 
     def add_message(self, message: ConversationItem | Response) -> None:
         """Add conversation items and persist the resulting complete session.
@@ -1291,7 +1412,10 @@ class SessionManager:
         Raises:
             ValueError: If the value is not a supported conversation item.
         """
+        session_id = self._session.id
         self._commit(lambda session: session.add_message(message))
+        if isinstance(message, Response):
+            self._publish_response_persisted(message, session_id=session_id)
 
     async def add_message_async(self, message: ConversationItem | Response) -> None:
         """Add conversation items through the asynchronous persistence boundary.
@@ -1299,11 +1423,54 @@ class SessionManager:
         Args:
             message (ConversationItem | Response): Conversation item to add.
 
+        Returns:
+            None: The conversation item is durably committed before returning.
+
         Raises:
             ValueError: If the value is not a supported conversation item.
             asyncio.CancelledError: If the owning task is cancelled after persistence settles.
         """
-        await self._commit_async(lambda session: session.add_message(message))
+        await self._commit_async(
+            lambda session: session.add_message(message),
+            persisted_response=message if isinstance(message, Response) else None,
+        )
+
+    def _publish_response_persisted(self, response: Response, *, session_id: str) -> None:
+        """Notify active observers after the response is durably committed."""
+        with self._response_persisted_observers_lock:
+            observers = tuple(
+                observer for _subscription, observer in self._response_persisted_observers
+            )
+        if not observers:
+            return
+        event = ResponsePersisted(session_id=session_id, response=response)
+        for observer in observers:
+            try:
+                observer(event)
+            except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                problem = Problem.from_exception(
+                    error,
+                    code="session.response_observer_failed",
+                    title="Response observer failed",
+                    detail="A response observer failed after the response was persisted.",
+                    severity="warning",
+                    operation="notify_response_observer",
+                    metadata={"session_id": event.session_id},
+                )
+                log_problem(_LOGGER, problem, error)
+                try:
+                    self._interaction.report(problem)
+                except Exception as report_error:  # noqa: BLE001
+                    reporting_problem = Problem.from_exception(
+                        report_error,
+                        code="session.response_observer_report_failed",
+                        title="Could not report response observer failure",
+                        detail="A response observer failed and its warning could not be reported.",
+                        severity="warning",
+                        operation="report_response_observer_failure",
+                        metadata={"session_id": event.session_id},
+                    )
+                    log_problem(_LOGGER, reporting_problem, report_error)
 
     def add_messages(self, messages: Iterable[ConversationItem]) -> None:
         """Add messages to the conversation history.
@@ -1677,6 +1844,9 @@ class SessionManager:
 
         Args:
             response (Response): The response to add.
+
+        Returns:
+            None: The response is durably committed before observers are notified.
         """
         self.add_message(response)
 
@@ -1685,6 +1855,9 @@ class SessionManager:
 
         Args:
             response (Response): The response to add.
+
+        Returns:
+            None: The response is durably committed before observers are notified.
 
         Raises:
             ValueError: If the response contains an unsupported conversation item.
@@ -1815,8 +1988,15 @@ class SessionManager:
                     )
                 raise
 
-    async def _commit_async(self, mutation: Callable[[Session], None]) -> None:
-        """Persist a detached session mutation through bounded blocking admission."""
+    async def _commit_async(
+        self,
+        mutation: Callable[[Session], None],
+        *,
+        persisted_response: Response | None = None,
+    ) -> None:
+        """Persist a detached mutation and notify response observers after a successful commit."""
+        cancellation = None
+        committed_session_id = None
         async with self._async_commit_lock:
             await self._acquire_commit_lock_async()
             try:
@@ -1839,7 +2019,6 @@ class SessionManager:
                         candidate,
                     )
                 )
-                cancellation = None
                 try:
                     await asyncio.wait({pending})
                 except asyncio.CancelledError as error:
@@ -1878,10 +2057,13 @@ class SessionManager:
                         deepcopy(getattr(candidate, session_field.name)),
                     )
                 telemetry_activity("session.persistence.completed", component="session_manager")
-                if cancellation is not None:
-                    raise cancellation  # pylint: disable=raise-missing-from
+                committed_session_id = current.id
             finally:
                 self._commit_lock.release()
+        if persisted_response is not None and committed_session_id is not None:
+            self._publish_response_persisted(persisted_response, session_id=committed_session_id)
+        if cancellation is not None:
+            raise cancellation  # pylint: disable=raise-missing-from
 
     async def _acquire_commit_lock_async(self) -> None:
         """Acquire the cross-thread commit lock without blocking the event loop."""

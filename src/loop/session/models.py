@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .. import constants
 from ..instructions.models import CapturedInstruction
-from ..models import AgentRunStopReason, CompactionContextItem, RunMetrics, ToolCall
+from ..models import AgentRunStopReason, CompactionContextItem, Response, RunMetrics, ToolCall
 from ..permissions import AuthorizationResult
 from ..utils import as_utc
 
@@ -21,6 +21,36 @@ SESSION_NAME_SOURCES: set[SessionNameSource] = {
     SESSION_NAME_SOURCE_GENERATED,
     SESSION_NAME_SOURCE_USER,
 }
+
+
+@dataclass(frozen=True)
+class SessionNameContext:
+    """Capture the immutable session data used for one title request.
+
+    Args:
+        session_id (str): Identity of the session whose provisional name may be replaced.
+        user_message (str): First user message supplied to the title generator.
+        assistant_message (str): First non-empty assistant message supplied to the generator.
+        model (str | None): Selected conversation model, or ``None`` for the backend default.
+    """
+
+    session_id: str
+    user_message: str
+    assistant_message: str
+    model: str | None
+
+
+@dataclass(frozen=True)
+class ResponsePersisted:
+    """Describe a response after its session commit has succeeded.
+
+    Args:
+        session_id (str): Identity of the session that now contains the response.
+        response (Response): Complete backend response that was persisted.
+    """
+
+    session_id: str
+    response: Response
 
 
 class SessionNotFoundError(ValueError):

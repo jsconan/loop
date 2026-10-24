@@ -40,10 +40,12 @@ from loop import (
     ReasoningDelta,
     Response,
     ResponseCompleted,
+    ResponsePersisted,
     RunMetrics,
     Session,
     SessionExecutionConflictError,
     SessionManager,
+    SessionNameContext,
     SessionRevisionConflictError,
     SessionWorkspaceMismatchError,
     SQLiteSessionStore,
@@ -1209,6 +1211,127 @@ def test_async_session_commit_rejects_a_stale_revision_without_publishing():
     ]
 
 
+def test_response_observers_receive_persisted_notifications_and_unsubscribe_by_scope():
+    """Response observers fan out after persistence and are removed when their scopes exit."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    first_events: list[ResponsePersisted] = []
+    second_events: list[ResponsePersisted] = []
+    response = Response(
+        answer="answer",
+        reasoning="",
+        items=(Message(role="assistant", content="answer"),),
+    )
+    next_response = Response(
+        answer="next",
+        reasoning="",
+        items=(Message(role="assistant", content="next"),),
+    )
+
+    def observe_first(event: ResponsePersisted) -> None:
+        """Capture the event after the session and stored snapshot both contain it."""
+        first_events.append(event)
+        assert manager.messages[-1] == event.response.items[-1]
+        assert store.load(event.session_id).messages[-1] == event.response.items[-1]
+
+    def observe_second(event: ResponsePersisted) -> None:
+        """Capture notifications only while the nested subscription is active."""
+        second_events.append(event)
+
+    with manager.observe_responses(observe_first):
+        with manager.observe_responses(observe_second):
+            asyncio.run(manager.add_response_async(response))
+        manager.add_response(next_response)
+
+    assert [event.response for event in first_events] == [response, next_response]
+    assert [event.response for event in second_events] == [response]
+    assert all(event.session_id == manager.session.id for event in (*first_events, *second_events))
+
+
+def test_response_observer_failure_is_reported_without_interrupting_fan_out():
+    """A failing observer cannot block later observers or a successful response commit."""
+    interaction = response_interaction()
+    manager = SessionManager(interaction=interaction)
+    received: list[ResponsePersisted] = []
+    response = Response(
+        answer="answer",
+        reasoning="",
+        items=(Message(role="assistant", content="answer"),),
+    )
+
+    def fail(_event: ResponsePersisted) -> None:
+        """Raise to confirm observer failures are isolated."""
+        raise RuntimeError("observer details stay private")
+
+    def receive(event: ResponsePersisted) -> None:
+        """Receive the event after the earlier observer fails."""
+        received.append(event)
+
+    with manager.observe_responses(fail), manager.observe_responses(receive):
+        asyncio.run(manager.add_response_async(response))
+
+    assert received[0].response is response
+    assert manager.messages[-1] == response.items[-1]
+    interaction.report.assert_called_once()
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "session.response_observer_failed"
+    assert problem.detail == "A response observer failed after the response was persisted."
+
+
+def test_response_observer_reporting_failure_does_not_interrupt_fan_out():
+    """A broken warning reporter cannot interrupt the response persistence boundary."""
+    interaction = response_interaction()
+    interaction.report.side_effect = RuntimeError("reporter unavailable")
+    manager = SessionManager(interaction=interaction)
+    received: list[ResponsePersisted] = []
+    response = Response(
+        answer="answer",
+        reasoning="",
+        items=(Message(role="assistant", content="answer"),),
+    )
+
+    def fail(_event: ResponsePersisted) -> None:
+        """Raise to reach the warning reporter."""
+        raise RuntimeError("observer unavailable")
+
+    def receive(event: ResponsePersisted) -> None:
+        """Continue receiving events when reporting the earlier failure also fails."""
+        received.append(event)
+
+    with manager.observe_responses(fail), manager.observe_responses(receive):
+        asyncio.run(manager.add_response_async(response))
+
+    assert len(received) == 1
+    assert manager.messages == [response.items[0]]
+    interaction.report.assert_called_once()
+
+
+def test_failed_response_persistence_does_not_notify_observers():
+    """A response notification is emitted only after its durable save succeeds."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    events: list[ResponsePersisted] = []
+    response = Response(
+        answer="answer",
+        reasoning="",
+        items=(Message(role="assistant", content="answer"),),
+    )
+
+    def observe(event: ResponsePersisted) -> None:
+        """Record any notification that crosses the persistence boundary."""
+        events.append(event)
+
+    with manager.observe_responses(observe), patch.object(
+        store,
+        "save",
+        side_effect=OSError("store unavailable"),
+    ), pytest.raises(OSError, match="store unavailable"):
+        asyncio.run(manager.add_response_async(response))
+
+    assert events == []
+    assert manager.messages == []
+
+
 def test_async_session_transitions_persist_tool_boundaries_and_run_completion():
     """Async responses and tool events retain their durable execution order."""
     store = MemorySessionStore()
@@ -1862,6 +1985,11 @@ def test_async_session_commit_finishes_persistence_before_propagating_cancellati
     executor = ThreadPoolExecutor(max_workers=1)
     started = asyncio.Event()
     release = asyncio.Event()
+    response = Response(
+        answer="committed",
+        reasoning="",
+        items=(Message(role="assistant", content="committed"),),
+    )
 
     async def run_blocking_async(function, *args):
         """Hold worker admission until the test cancels and releases the operation."""
@@ -1875,11 +2003,12 @@ def test_async_session_commit_finishes_persistence_before_propagating_cancellati
         session_store=store,
         async_blocking_runner=run_blocking_async,
     )
+    events: list[ResponsePersisted] = []
 
     async def cancel_after_admission():
         """Cancel an active commit and wait for its durable result to settle."""
         pending = asyncio.create_task(
-            manager.add_message_async(Message(role="assistant", content="committed"))
+            manager.add_response_async(response)
         )
         await started.wait()
         pending.cancel()
@@ -1890,7 +2019,8 @@ def test_async_session_commit_finishes_persistence_before_propagating_cancellati
             await pending
 
     try:
-        asyncio.run(cancel_after_admission())
+        with manager.observe_responses(events.append):
+            asyncio.run(cancel_after_admission())
     finally:
         executor.shutdown(wait=True)
 
@@ -1898,6 +2028,7 @@ def test_async_session_commit_finishes_persistence_before_propagating_cancellati
         "committed"
     ]
     assert store.load(manager.session.id).messages == manager.messages
+    assert [event.response for event in events] == [response]
 
 
 def test_async_session_commit_preserves_cancellation_and_reports_a_save_failure():
@@ -2088,6 +2219,136 @@ def test_manager_generates_names_regardless_of_the_current_name_source():
         call("Generating a session name..."),
         call("Session name: Review application architecture"),
     ]
+
+
+def test_manager_captures_first_usable_exchange_only_for_provisional_names():
+    """Automatic title context skips blank assistant text and user-named sessions."""
+    manager = SessionManager(session=Session(model="model-a"))
+    manager.add_user_message("Question")
+    manager.add_message(Message(role="assistant", content="  "))
+    manager.add_message(Message(role="assistant", content="Answer"))
+
+    context = manager.session_name_context()
+
+    assert context is not None
+    assert isinstance(context, SessionNameContext)
+    assert context.session_id == manager.session.id
+    assert context.user_message == "Question"
+    assert context.assistant_message == "Answer"
+    assert context.model == "model-a"
+    manager.rename_session("Chosen title")
+    assert manager.session_name_context() is None
+
+
+def test_sync_automatic_name_ignores_stale_context_and_session_switches():
+    """A captured automatic title cannot apply after a session switch."""
+    interaction = Mock(spec=Interaction)
+    original = Session()
+    other = Session(id="other", name="Other", name_source="user")
+    manager = SessionManager(interaction=interaction, session=original)
+    manager.add_user_message("Question")
+    manager.add_message(Message(role="assistant", content="Answer"))
+    context = manager.session_name_context()
+    manager.load_session(other)
+    generator = Mock()
+
+    manager.generate_session_name(generator, context=context)
+
+    generator.generate.assert_not_called()
+    manager.load_session(original)
+
+    def switch_during_generation(*_args):
+        """Switch sessions before returning a generated title."""
+        manager.load_session(other)
+        return "Stale title"
+
+    generator.generate.side_effect = switch_during_generation
+    manager.generate_session_name(generator, context=context)
+
+    assert manager.session is other
+    assert other.name == "Other"
+    assert other.name_source == "user"
+    assert interaction.info.call_args_list == [
+        call("Generating a session name..."),
+        call("Generating a session name..."),
+    ]
+
+
+def test_async_automatic_name_does_not_overwrite_a_user_rename():
+    """A generated title cannot replace a user rename made while generation is pending."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    manager = SessionManager(session_store=MemorySessionStore())
+    manager.add_user_message("Question")
+    manager.add_message(Message(role="assistant", content="Answer"))
+    context = manager.session_name_context()
+
+    async def generate_async(*_args):
+        """Wait until the test makes the active title user-controlled."""
+        started.set()
+        await release.wait()
+        return "Generated title"
+
+    async def scenario():
+        """Rename while generation is suspended, then verify its stale result is ignored."""
+        task = asyncio.create_task(
+            manager.generate_session_name_async(
+                SimpleNamespace(generate_async=generate_async),
+                context=context,
+            )
+        )
+        await started.wait()
+        manager.rename_session("User title")
+        release.set()
+        await task
+
+    asyncio.run(scenario())
+
+    assert manager.session.name == "User title"
+    assert manager.session.name_source == "user"
+
+
+def test_async_automatic_name_does_not_cross_a_session_switch():
+    """A generated title remains attached to its captured session after a session switch."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    original = Session()
+    manager = SessionManager(session=original, session_store=MemorySessionStore())
+    manager.add_user_message("Question")
+    manager.add_message(Message(role="assistant", content="Answer"))
+    context = manager.session_name_context()
+
+    async def generate_async(*_args):
+        """Wait until another session becomes active."""
+        calls.append("started")
+        started.set()
+        await release.wait()
+        return "Generated title"
+
+    async def scenario():
+        """Switch sessions while title generation is pending."""
+        task = asyncio.create_task(
+            manager.generate_session_name_async(
+                SimpleNamespace(generate_async=generate_async),
+                context=context,
+            )
+        )
+        await started.wait()
+        manager.load_session(Session(id="other", name="Other", name_source="user"))
+        release.set()
+        await task
+        await manager.generate_session_name_async(
+            SimpleNamespace(generate_async=generate_async),
+            context=context,
+        )
+
+    asyncio.run(scenario())
+
+    assert original.name_source == "initial"
+    assert manager.session.id == "other"
+    assert manager.session.name == "Other"
+    assert calls == ["started"]
 
 
 def test_manager_renames_persisted_sessions_without_switching_the_active_session():

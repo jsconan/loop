@@ -42,6 +42,7 @@ from loop import (
     ProblemException,
     Response,
     ResponseCompleted,
+    ResponsePersisted,
     RunControl,
     RunMetrics,
     RuntimeEnvironment,
@@ -1382,7 +1383,7 @@ def test_run_async_uses_async_input_and_agent_orchestration(tmp_path):
 
 
 def test_async_run_completion_uses_async_session_naming(tmp_path):
-    """Completed async runs await native title generation only when a title is eligible."""
+    """Completed async runs finish title generation through the native async service."""
     interaction = output_interaction()
     generator = SimpleNamespace(generate=lambda *_args: pytest.fail("sync generator used"))
     generator.generate_async = AsyncMock(return_value="Async title")
@@ -1429,6 +1430,170 @@ def test_async_run_completion_uses_async_session_naming(tmp_path):
     assert loop.session.name == "Async title"
     interaction.run_metrics.assert_called_once_with(metrics)
     control.checkpoint.assert_called_once_with()
+
+
+def test_async_run_resumes_while_automatic_title_generation_is_pending(tmp_path):
+    """The next input is accepted while title generation remains in its owned task."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    interaction = output_interaction()
+    generation_count = 0
+
+    async def generate_async(*_args):
+        """Hold title generation until the conversation reaches its next input."""
+        nonlocal generation_count
+        generation_count += 1
+        started.set()
+        await release.wait()
+        return "Generated title"
+
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+        session_name_generator=SimpleNamespace(generate_async=generate_async),
+    )
+    loop._skill_hints_enabled = False
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    responses = (
+        Response(
+            answer="Answer",
+            reasoning="",
+            items=(Message(role="assistant", content="Answer"),),
+        ),
+        Response(
+            answer="Follow-up answer",
+            reasoning="",
+            items=(Message(role="assistant", content="Follow-up answer"),),
+        ),
+    )
+    loop.agent_runner._query_with_recovery_async = AsyncMock(side_effect=responses)
+
+    async def handle_tools(_response):
+        """Let title generation start while the agent handles its persisted response."""
+        assert len(loop._session_name_tasks) == 1
+        await started.wait()
+        return ()
+
+    loop.agent_runner.handle_tool_calls_async = AsyncMock(side_effect=handle_tools)
+    input_count = 0
+
+    async def read_input(_completer):
+        """Return a prompt, then release title generation after the next read begins."""
+        nonlocal input_count
+        input_count += 1
+        if input_count == 1:
+            return "Question"
+        if input_count == 2:
+            await started.wait()
+            assert not release.is_set()
+            return "Follow-up question"
+        await started.wait()
+        assert not release.is_set()
+        release.set()
+        return False
+
+    async def scenario():
+        """Run with a timeout so a blocking title request fails without hanging the suite."""
+        await asyncio.wait_for(loop.run_async(input_source=read_input), timeout=5)
+
+    asyncio.run(scenario())
+
+    assert input_count == 3
+    assert loop.session.name == "Generated title"
+    assert generation_count == 1
+    assert loop.agent_runner._query_with_recovery_async.await_count == 2
+    assert loop.agent_runner.handle_tool_calls_async.await_count == 2
+    assert interaction.run_metrics.call_count == 2
+
+
+def test_session_name_task_cleanup_preserves_a_newer_request(tmp_path):
+    """Finishing an older title task does not remove a newer task for its session."""
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=output_interaction(),
+        working_directory=tmp_path,
+    )
+    older = object()
+    newer = object()
+    loop._session_name_tasks["session-id"] = newer
+
+    loop._discard_session_name_task("session-id", older)
+    assert loop._session_name_tasks["session-id"] is newer
+
+    loop._discard_session_name_task("session-id", newer)
+    assert "session-id" not in loop._session_name_tasks
+
+
+def test_loop_ignores_response_notifications_for_a_different_session(tmp_path):
+    """Late notifications for an inactive session cannot schedule title work."""
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=output_interaction(),
+        working_directory=tmp_path,
+    )
+    schedule = Mock()
+    loop._schedule_session_name_generation = schedule
+    event = ResponsePersisted(
+        session_id="inactive-session",
+        response=Response(answer="answer", reasoning=""),
+    )
+
+    loop._on_response_persisted(event)
+
+    schedule.assert_not_called()
+
+
+def test_async_loop_cancels_title_task_and_preserves_conversation_error(tmp_path):
+    """A conversation failure cancels owned title work and keeps its original exception."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    interaction = output_interaction()
+
+    async def generate_async(*_args):
+        """Remain pending until the parent conversation fails and cancels this task."""
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+        session_name_generator=SimpleNamespace(generate_async=generate_async),
+    )
+    loop._skill_hints_enabled = False
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+
+    async def run_agent():
+        """Persist an answer, start title generation, then raise the original failure."""
+        await loop._session_manager.add_response_async(
+            Response(
+                answer="Answer",
+                reasoning="",
+                items=(Message(role="assistant", content="Answer"),),
+            )
+        )
+        await started.wait()
+        raise ValueError("agent run failed")
+
+    loop.agent_runner.run_async = AsyncMock(side_effect=run_agent)
+
+    async def read_input(_completer):
+        """Submit the request that reaches the failing agent run."""
+        return "Question"
+
+    with pytest.raises(ValueError, match="agent run failed"):
+        asyncio.run(loop.run_async(input_source=read_input))
+
+    assert cancelled.is_set()
 
 
 def test_async_cold_stop_keeps_recovery_pending_in_session_history(tmp_path):
