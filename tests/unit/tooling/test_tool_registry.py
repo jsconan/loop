@@ -1250,6 +1250,226 @@ def test_cancelled_worker_does_not_start_or_await_additional_execution(during_st
     assert all(result.cr_frame is None for result in returned)
 
 
+@pytest.mark.parametrize("during_start", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+def test_cancelled_callback_retrieves_its_completed_future_without_starting_more_work(
+    during_start, outcome, caplog
+):
+    """Completed futures preserve invocation results while cancelled start callbacks stay closed."""
+    started = asyncio.Event()
+    release = Event()
+    owner_loop = None
+    returned = None
+    invoked = []
+
+    def future_callback():
+        """Return the completed owner-loop future after cancellation reaches the worker."""
+        owner_loop.call_soon_threadsafe(started.set)
+        release.wait()
+        return returned
+
+    def invoke():
+        """Run only when cancellation did not revoke the execution-start boundary."""
+        invoked.append(True)
+        return "unexpected" if during_start else future_callback()
+
+    registry = ToolRegistry([invoke])
+
+    async def scenario():
+        """Cancel dispatch before the synchronous callback releases its result."""
+        nonlocal owner_loop, returned
+        owner_loop = asyncio.get_running_loop()
+        returned = owner_loop.create_future()
+        if outcome == "success":
+            returned.set_result("confirmed")
+        elif outcome == "failure":
+            returned.set_exception(RuntimeError("private callback failure"))
+        else:
+            returned.cancel()
+        task = asyncio.create_task(
+            registry.call_with_timing_async(
+                "invoke",
+                "{}",
+                execution_started=future_callback if during_start else None,
+            )
+        )
+        try:
+            await started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await task
+            if not during_start and outcome != "cancelled":
+                output = json.loads(captured.value.output)
+                if outcome == "success":
+                    assert output == {"ok": True, "result": "confirmed"}
+                else:
+                    assert output["problem"]["code"] == "tool.execution_failed"
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+    assert invoked == ([] if during_start else [True])
+    records = [record for record in caplog.records if record.levelname == "ERROR"]
+    if outcome == "failure":
+        assert len(records) == 1
+        expected_code = "tool.callback_failed" if during_start else "tool.execution_failed"
+        assert records[0].__dict__["error.type"] == expected_code
+        assert "private callback failure" not in records[0].getMessage()
+    else:
+        assert records == []
+
+
+def test_sync_callable_awaits_an_owner_loop_future_normally():
+    """Normal dispatch still awaits owner-loop futures and serializes their actual result."""
+    returned = None
+
+    def invoke():
+        """Return a future belonging to the dispatch loop."""
+        return returned
+
+    registry = ToolRegistry([invoke])
+
+    async def scenario():
+        """Complete the future independently of the synchronous invocation worker."""
+        nonlocal returned
+        returned = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(returned.set_result, "confirmed")
+        return await registry.call_async("invoke", "{}")
+
+    try:
+        assert json.loads(asyncio.run(scenario())) == {"ok": True, "result": "confirmed"}
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_foreign_future_ownership_is_preserved_during_dispatch_cancellation(cancelled):
+    """A future from another loop is rejected without being driven or cancelled here."""
+    foreign_loop = asyncio.new_event_loop()
+    future = foreign_loop.create_future()
+    started = asyncio.Event()
+    release = Event()
+    owner_loop = None
+
+    def invoke():
+        """Return a pending foreign future through a controlled worker boundary."""
+        owner_loop.call_soon_threadsafe(started.set)
+        release.wait()
+        return future
+
+    registry = ToolRegistry([invoke])
+
+    async def scenario():
+        """Reject foreign-loop work both normally and when the dispatch owner is cancelled."""
+        nonlocal owner_loop
+        owner_loop = asyncio.get_running_loop()
+        task = asyncio.create_task(registry.call_async("invoke", "{}"))
+        try:
+            await started.wait()
+            if cancelled:
+                task.cancel()
+                await asyncio.sleep(0)
+            release.set()
+            if cancelled:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                assert json.loads(await task)["problem"]["code"] == "tool.loop_mismatch"
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+        assert not future.done()
+    finally:
+        registry.close()
+        future.cancel()
+        foreign_loop.close()
+
+
+@pytest.mark.parametrize("signal", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_returned_task_cancellation_signals_context_and_retains_its_final_outcome(
+    monkeypatch, caplog, signal, fails
+):
+    """Drains returned-task cleanup on cancellation and publishes its result exactly once."""
+    cancelling, finish, awaiting = (asyncio.Event() for _ in range(3))
+    cancellation = Event() if signal else None
+    owned = None
+    shield = asyncio.shield
+
+    def observe_shield(value):
+        """Expose when dispatch owns the returned task's result."""
+        if value is owned:
+            awaiting.set()
+        return shield(value)
+
+    monkeypatch.setattr(asyncio, "shield", observe_shield)
+
+    async def effect():
+        """Settle cancellation with a confirmed result or a structured reported exception."""
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            assert cancellation is None or cancellation.is_set()
+            cancelling.set()
+            await finish.wait()
+            if fails:
+                raise RuntimeError("private returned-task failure")
+            return "confirmed"
+
+    def invoke():
+        """Return the actual owner-loop task from a synchronous callback."""
+        return owned
+
+    registry = ToolRegistry([invoke])
+
+    async def scenario():
+        """Cancel only after the returned task is being awaited and settle repeated cancellation."""
+        nonlocal owned
+        owned = asyncio.create_task(effect())
+        task = asyncio.create_task(
+            registry.call_async("invoke", "{}", cancellation_event=cancellation)
+        )
+        try:
+            await awaiting.wait()
+            task.cancel()
+            await cancelling.wait()
+            task.cancel()
+            finish.set()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await task
+            output = json.loads(captured.value.output)
+            if fails:
+                assert output["problem"]["code"] == "tool.execution_failed"
+            else:
+                assert output == {"ok": True, "result": "confirmed"}
+        finally:
+            finish.set()
+            if not owned.done():
+                owned.cancel()
+            await asyncio.gather(task, owned, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+    assert owned.done()
+    if fails:
+        assert len(caplog.records) == 1
+        assert caplog.records[0].__dict__["error.type"] == "tool.execution_failed"
+        assert "private returned-task failure" not in caplog.records[0].getMessage()
+    else:
+        assert caplog.records == []
+
+
 def test_worker_failure_is_logged_when_cancellation_waits_for_settlement(caplog):
     """A worker exception after cancellation is recorded once at the registry boundary."""
     started = Event()

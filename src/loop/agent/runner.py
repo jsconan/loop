@@ -52,7 +52,7 @@ from ..utils import (
     utc_now,
 )
 from .agent import Agent
-from .models import AgentRecoveryStatus, AgentRunRecoveryRequired, AgentRunResult
+from .models import AgentRecoveryStatus, AgentRunRecoveryRequired, AgentRunResult, ToolCallCancelled
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -940,7 +940,9 @@ class AgentRunner:
             if self._interrupted_tools is not None:
                 self._interrupted_tools.extend(executions)
             raise
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if isinstance(error, ToolCallCancelled):
+                executions.append(error.metrics)
             if self._interrupted_tools is not None:
                 self._interrupted_tools.extend(executions)
             raise
@@ -1074,9 +1076,7 @@ class AgentRunner:
                 cancellation = cancellation or error
         metrics = publication.result()
         if cancellation is not None:
-            if self._interrupted_tools is not None:
-                self._interrupted_tools.append(metrics)
-            raise cancellation
+            raise ToolCallCancelled(metrics) from cancellation
         return metrics
 
     async def _record_tool_result_async(

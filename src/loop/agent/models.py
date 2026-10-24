@@ -1,8 +1,10 @@
 """Define results produced by an agent run."""
 
+import asyncio
+
 from pydantic import BaseModel
 
-from ..models import AgentRunStopReason, Response, RunMetrics
+from ..models import AgentRunStopReason, Response, RunMetrics, ToolExecutionMetrics
 
 
 class AgentRunResult(BaseModel):
@@ -36,3 +38,17 @@ class AgentRecoveryStatus(BaseModel):
 
 class AgentRunRecoveryRequired(Exception):
     """Signal that a recoverable agent failure left a durable run boundary unresolved."""
+
+
+class ToolCallCancelled(asyncio.CancelledError):
+    """Carry one durably published completion to its batch's ordered metric collection.
+
+    Args:
+        metrics (ToolExecutionMetrics): Metrics for the completed invocation being interrupted.
+    """
+
+    metrics: ToolExecutionMetrics
+
+    def __init__(self, metrics: ToolExecutionMetrics) -> None:
+        super().__init__()
+        self.metrics = metrics

@@ -2632,10 +2632,22 @@ def test_controlled_async_run_cancels_stream_without_persisting_partial_response
             )
 
 
-@pytest.mark.parametrize("mode", ["interrupt", "stop", "external", "standalone"])
+@pytest.mark.parametrize(
+    ("mode", "previous_batch"),
+    [
+        ("interrupt", False),
+        ("interrupt", True),
+        ("stop", False),
+        ("stop", True),
+        ("external", False),
+        ("standalone", False),
+    ],
+)
 @pytest.mark.parametrize("successful", [False, True])
-def test_async_cancellation_persists_a_settled_sync_tool_receipt(tmp_path, mode, successful):
-    """Interrupted worker effects retain exact results and metrics before any later tool runs."""
+def test_async_cancellation_persists_a_settled_sync_tool_receipt(
+    tmp_path, mode, successful, previous_batch
+):
+    """Interrupted effects retain exact receipts and ordered metrics across completed batches."""
     control = RunControl()
     backend = Mock()
     registry = ToolRegistry()
@@ -2661,6 +2673,16 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(tmp_path, mode,
         ran.append(True)
         return {"ok": True}
 
+    def first_effect():
+        """Complete an earlier invocation in the interrupted batch."""
+        return "first receipt"
+
+    def previous_effect():
+        """Complete an invocation in a previous model-response batch."""
+        return "previous receipt"
+
+    registry.register(first_effect)
+    registry.register(previous_effect)
     registry.register(save_receipt)
     registry.register(later_effect)
     store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
@@ -2671,16 +2693,21 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(tmp_path, mode,
     runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
     sessions.add_user_message("perform effects")
     calls = (
+        ToolCall(call_id="first", name="first_effect", arguments="{}"),
         ToolCall(call_id="effect", name="save_receipt", arguments="{}"),
         ToolCall(call_id="later", name="later_effect", arguments="{}"),
     )
 
-    async def events():
+    async def events(batch):
         """Return a complete model response requesting two effects in order."""
-        for event in model_calls(*calls):
+        for event in model_calls(*batch):
             yield event
 
-    backend.get_response_async.return_value = events()
+    previous = (ToolCall(call_id="previous", name="previous_effect", arguments="{}"),)
+    if mode != "standalone":
+        backend.get_response_async.side_effect = (
+            [events(previous), events(calls)] if previous_batch else [events(calls)]
+        )
     publishing, publish = asyncio.Event(), asyncio.Event()
     record_result = sessions.add_tool_call_async
 
@@ -2739,7 +2766,12 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(tmp_path, mode,
         if successful
         else {"ok": False, "problem": receipt.model_dump(mode="json")}
     )
-    assert json.loads(outcomes[0].output) == expected_output
+    completed_ids = (["previous"] if previous_batch else []) + ["first", "effect"]
+    assert [item.call_id for item in outcomes[: len(completed_ids)]] == completed_ids
+    assert (
+        json.loads(next(item.output for item in outcomes if item.call_id == "effect"))
+        == expected_output
+    )
     assert (
         sum(
             event.type == "tool_execution_completed" and event.call_id == "effect"
@@ -2750,11 +2782,193 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(tmp_path, mode,
     assert ran == []
     if result is not None:
         assert result.stop_reason == "cancelled"
-        assert len(result.metrics.tools) == 1
-        assert result.metrics.tools[0].succeeded is successful
-        assert "cancelled before execution" in outcomes[1].output
+        expected_names = (["previous_effect"] if previous_batch else []) + [
+            "first_effect",
+            "save_receipt",
+        ]
+        assert [metric.name for metric in result.metrics.tools] == expected_names
+        assert result.metrics.tools[-1].succeeded is successful
+        assert all(metric.duration_seconds >= 0 for metric in result.metrics.tools)
+        assert "cancelled before execution" in outcomes[-1].output
     else:
         assert saved.recovery_state().action == "execute_tools"
+
+
+@pytest.mark.parametrize("mode", ["interrupt", "stop", "external"])
+@pytest.mark.parametrize(
+    ("kind", "after_return"),
+    [
+        ("completed_task", False),
+        ("completed_future", False),
+        ("pending_task", False),
+        ("pending_task", True),
+        ("recovering_task", False),
+        ("recovering_task", True),
+        ("pending_future", False),
+        ("pending_future", True),
+    ],
+)
+def test_cancellation_settles_returned_owner_loop_work_before_the_run_ends(
+    tmp_path, monkeypatch, mode, kind, after_return
+):
+    """Returned tasks and futures settle under repeated cancellation and retain known receipts."""
+    control = RunControl()
+    registry = ToolRegistry()
+    backend = Mock()
+    worker_ready, awaiting_result, effect_started, cancelling = (asyncio.Event() for _ in range(4))
+    release_worker = Event()
+    finish_cleanup = asyncio.Event()
+    owned_results, cancelled, later = [], [], []
+    owner_loop = None
+    receipt = "owned-receipt"
+    shield = asyncio.shield
+
+    def observe_shield(value):
+        """Expose when the returned future is being awaited by its public dispatch owner."""
+        if owned_results and value is owned_results[0]:
+            awaiting_result.set()
+        return shield(value)
+
+    monkeypatch.setattr(asyncio, "shield", observe_shield)
+
+    async def effect():
+        """Finish immediately or settle cancellation under an explicitly released cleanup gate."""
+        effect_started.set()
+        if kind != "completed_task":
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                cancelling.set()
+                await finish_cleanup.wait()
+                if kind != "recovering_task":
+                    raise
+        (tmp_path / "effect.txt").write_text(receipt, encoding="utf-8")
+        return receipt
+
+    async def create_result():
+        """Construct a task or future on the invocation's actual owning event loop."""
+        if kind.endswith("future"):
+            result = asyncio.get_running_loop().create_future()
+            if kind == "completed_future":
+                result.set_result(receipt)
+        else:
+            result = asyncio.create_task(effect())
+            await effect_started.wait()
+            if kind == "completed_task":
+                await result
+        owned_results.append(result)
+        return result
+
+    def returned_work():
+        """Return already-scheduled owner-loop work from a synchronous tool."""
+        result = asyncio.run_coroutine_threadsafe(create_result(), owner_loop).result()
+        owner_loop.call_soon_threadsafe(worker_ready.set)
+        release_worker.wait()
+        return result
+
+    def later_effect():
+        """Record any forbidden invocation after cancellation."""
+        later.append(True)
+        return "unexpected"
+
+    registry.register(returned_work)
+    registry.register(later_effect)
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    sessions = SessionManager(session_store=store, workspace_id="workspace")
+    runner = file_runner(
+        tmp_path, backend, registry=registry, sessions=sessions, run_control=control
+    )
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions.add_user_message("perform effects")
+    calls = (
+        ToolCall(call_id="owned", name="returned_work", arguments="{}"),
+        ToolCall(call_id="later", name="later_effect", arguments="{}"),
+    )
+
+    async def events():
+        """Request the owned invocation followed by a tool that must never run."""
+        for event in model_calls(*calls):
+            yield event
+
+    backend.get_response_async.return_value = events()
+
+    async def scenario():
+        """Cancel before or after the worker returns, then wait for its returned work to settle."""
+        nonlocal owner_loop
+        owner_loop = asyncio.get_running_loop()
+        task = asyncio.create_task(runner.run_async())
+        try:
+            await worker_ready.wait()
+            if after_return:
+                release_worker.set()
+                await awaiting_result.wait()
+            if mode == "interrupt":
+                assert control.interrupt()
+            elif mode == "stop":
+                control.stop()
+            else:
+                task.cancel()
+            await asyncio.sleep(0)
+            release_worker.set()
+            if kind in {"pending_task", "recovering_task"}:
+                await asyncio.wait_for(cancelling.wait(), timeout=1)
+                assert not task.done()
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not owned_results[0].done()
+                finish_cleanup.set()
+            if mode == "external":
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                return None
+            return await task
+        finally:
+            release_worker.set()
+            finish_cleanup.set()
+            for result in owned_results:
+                if not result.done():
+                    result.cancel()
+            await asyncio.gather(task, *owned_results, return_exceptions=True)
+
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        registry.close()
+    assert owned_results[0].done()
+    assert cancelled == ([True] if kind in {"pending_task", "recovering_task"} else [])
+    assert later == []
+    saved = store.load(sessions.session.id)
+    output = next(
+        (
+            item.output
+            for item in saved.messages
+            if isinstance(item, ToolResult) and item.call_id == "owned"
+        ),
+        None,
+    )
+    known_result = kind in {"completed_task", "completed_future", "recovering_task"}
+    if known_result:
+        assert json.loads(output) == {"ok": True, "result": receipt}
+        assert (
+            sum(
+                event.type == "tool_execution_completed" and event.call_id == "owned"
+                for event in saved.events
+            )
+            == 1
+        )
+    elif mode == "external":
+        assert output is None
+        assert saved.recovery_state().action == "resolve_uncertain_tools"
+    else:
+        assert "external outcome is unknown" in output
+    if kind.endswith("task"):
+        assert (tmp_path / "effect.txt").exists() is known_result
+    if result is not None:
+        assert [metric.name for metric in result.metrics.tools] == (
+            ["returned_work"] if known_result else []
+        )
+        assert result.stop_reason == "cancelled"
 
 
 def test_async_interruption_preserves_completed_unknown_and_unstarted_tool_outcomes(tmp_path):

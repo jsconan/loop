@@ -470,7 +470,17 @@ class ToolRegistry:
                 worker_error = future.exception()
                 if worker_error is None:
                     result = future.result()
-                    if inspect.isawaitable(result):
+                    if (
+                        isinstance(result, asyncio.Future)
+                        and result.get_loop() is asyncio.get_running_loop()
+                    ):
+                        await self._cancel_returned_future_async(result)
+                        if not result.cancelled():
+                            if settled_cancellation is not None:
+                                settled_cancellation(cancellation)
+                                return result.result()
+                            worker_error = result.exception()
+                    elif inspect.isawaitable(result):
                         close_awaitable(result)
                     elif settled_cancellation is not None:
                         settled_cancellation(cancellation)
@@ -487,6 +497,17 @@ class ToolRegistry:
             raise
         finally:
             self._worker_slots.release()
+
+    @staticmethod
+    async def _cancel_returned_future_async(future: asyncio.Future[Any]) -> None:
+        """Cancel an owned returned future once and drain it through repeated cancellation."""
+        if not future.done():
+            future.cancel()
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError:
+                continue
 
     @property
     def interaction(self) -> Interaction | None:
@@ -1046,12 +1067,27 @@ class ToolRegistry:
         try:
 
             async def dispatch_sync_async(invoke: Callable[[], Any]) -> Any:
-                return await self._run_worker_async(
+                value = await self._run_worker_async(
                     invoke,
                     cancellation_event=active_context.cancellation_event,
                     operation=tool.name or "tool",
                     settled_cancellation=retain_cancellation,
                 )
+                if (
+                    isinstance(value, asyncio.Future)
+                    and value.get_loop() is asyncio.get_running_loop()
+                ):
+                    try:
+                        return await asyncio.shield(value)
+                    except asyncio.CancelledError as error:
+                        if active_context.cancellation_event is not None:
+                            active_context.cancellation_event.set()
+                        await self._cancel_returned_future_async(value)
+                        if value.cancelled():
+                            raise
+                        retain_cancellation(error)
+                        return value.result()
+                return value
 
             result = await tool.execute_async(
                 plan.arguments,
