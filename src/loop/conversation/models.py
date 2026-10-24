@@ -32,6 +32,8 @@ class ConversationStatus:
         "Cancelled",
         "Steering",
         "Waiting for your response",
+        "Recovery pending",
+        "Paused",
         "Idle",
         "Working",
     ]

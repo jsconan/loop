@@ -14,11 +14,12 @@ class RunInterrupted(KeyboardInterrupt):
 class RunControl:
     """Coordinate shutdown and scoped interruption across execution and UI threads.
 
-    Initialize an idle control. Shutdown stays sticky; interruption applies only to the current
-    execution scope and is cleared when it settles. Cancellation-aware process supervisors receive
-    a thread-safe event; other synchronous tools still finish under their existing deadlines.
-    Steering is a separate safe-boundary signal: generation and the current tool finish, while
-    later work in the same response is skipped.
+    Initialize an idle control. Shutdown stays sticky; interruption and pause apply only to the
+    current execution scope and clear when it settles. A pause preserves the durable run boundary
+    for later recovery. Cancellation-aware process supervisors receive a thread-safe event; other
+    synchronous tools still finish under their existing deadlines. Steering is a separate
+    safe-boundary signal: generation and the current tool finish, while later work in the same
+    response is skipped.
     """
 
     _wake: Event
@@ -27,11 +28,13 @@ class RunControl:
     _stopped: bool
     _active: bool
     _interrupted: bool
+    _paused: bool
     _steering_pending: bool
     _cancelled: bool
     _async_loop: asyncio.AbstractEventLoop | None
     _async_task: asyncio.Task[Any] | None
     _async_waiters: dict[asyncio.Event, asyncio.AbstractEventLoop]
+    _active_waiters: dict[asyncio.Event, asyncio.AbstractEventLoop]
 
     def __init__(self) -> None:
         self._wake = Event()
@@ -40,11 +43,13 @@ class RunControl:
         self._stopped = False
         self._active = False
         self._interrupted = False
+        self._paused = False
         self._steering_pending = False
         self._cancelled = False
         self._async_loop = None
         self._async_task = None
         self._async_waiters = {}
+        self._active_waiters = {}
 
     @property
     def stopped(self) -> bool:
@@ -75,6 +80,16 @@ class RunControl:
         """
         with self._lock:
             return self._interrupted
+
+    @property
+    def paused(self) -> bool:
+        """Return whether the active run was asked to preserve a resumable boundary.
+
+        Returns:
+            bool: Whether the current interruption represents a pause.
+        """
+        with self._lock:
+            return self._paused
 
     @property
     def steering_pending(self) -> bool:
@@ -124,6 +139,7 @@ class RunControl:
                 self._cancelled = False
             self._wake.set()
             self._wake_async_waiters()
+            self._wake_active_waiters()
         self._cancel_async_owner()
 
     def interrupt(self) -> bool:
@@ -136,6 +152,24 @@ class RunControl:
             if not self._active or self._stopped:
                 return False
             self._interrupted = True
+            self._cancellation_event.set()
+            self._cancelled = False
+            self._wake.set()
+            self._wake_async_waiters()
+        self._cancel_async_owner()
+        return True
+
+    def pause(self) -> bool:
+        """Interrupt the current run while preserving its durable recovery boundary.
+
+        Returns:
+            bool: Whether an active run accepted the pause request.
+        """
+        with self._lock:
+            if not self._active or self._stopped:
+                return False
+            self._interrupted = True
+            self._paused = True
             self._cancellation_event.set()
             self._cancelled = False
             self._wake.set()
@@ -187,6 +221,7 @@ class RunControl:
             self._cancelled = False
             self._async_loop = loop
             self._async_task = task
+            self._wake_active_waiters()
         try:
             yield
         finally:
@@ -194,6 +229,7 @@ class RunControl:
                 self._cancelled = self._stopped or self._interrupted
                 self._active = False
                 self._interrupted = False
+                self._paused = False
                 self._steering_pending = False
                 self._async_loop = None
                 self._async_task = None
@@ -254,13 +290,47 @@ class RunControl:
             with self._lock:
                 self._async_waiters.pop(wake, None)
 
+    async def wait_until_active_async(self) -> bool:
+        """Wait until a run starts or shutdown is requested.
+
+        Returns:
+            bool: Whether a run became active before shutdown.
+
+        Raises:
+            asyncio.CancelledError: If the waiting task is cancelled.
+        """
+        loop = asyncio.get_running_loop()
+        wake = asyncio.Event()
+        with self._lock:
+            if self._stopped:
+                return False
+            if self._active:
+                return True
+            self._active_waiters[wake] = loop
+        try:
+            await wake.wait()
+        finally:
+            with self._lock:
+                self._active_waiters.pop(wake, None)
+        with self._lock:
+            return not self._stopped
+
     def _wake_async_waiters(self) -> None:
         """Schedule every registered async retry waiter on its owning event loop."""
-        for wake, loop in tuple(self._async_waiters.items()):
+        self._wake_waiters(self._async_waiters)
+
+    def _wake_active_waiters(self) -> None:
+        """Notify async observers that run activity or shutdown state may have changed."""
+        self._wake_waiters(self._active_waiters)
+
+    @staticmethod
+    def _wake_waiters(waiters: dict[asyncio.Event, asyncio.AbstractEventLoop]) -> None:
+        """Schedule registered async waiters and discard registrations for closed loops."""
+        for wake, loop in tuple(waiters.items()):
             try:
                 loop.call_soon_threadsafe(wake.set)
             except RuntimeError:
-                self._async_waiters.pop(wake, None)
+                waiters.pop(wake, None)
 
     def _cancel_async_owner(self) -> None:
         """Cancel the bound async run task without abandoning its cleanup path."""

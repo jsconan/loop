@@ -73,6 +73,34 @@ def test_interrupt_is_scoped_and_never_latches_onto_an_idle_or_later_run():
         control.checkpoint()
 
 
+def test_pause_is_scoped_and_preserves_its_reason_until_run_settlement():
+    """A pause interrupts only the current run and clears after its safe boundary."""
+    control = RunControl()
+    assert control.pause() is False
+
+    with control.execution():
+        assert control.pause() is True
+        assert control.paused is True
+        assert control.interrupted is True
+        with pytest.raises(RunInterrupted):
+            control.checkpoint()
+
+    assert control.paused is False
+    assert control.interrupted is False
+    assert control.cancelled is True
+    with control.execution():
+        assert control.paused is False
+
+
+def test_pause_cannot_override_sticky_shutdown():
+    """A conversation shutdown prevents a later pause from claiming the run."""
+    control = RunControl()
+    with control.execution():
+        control.stop()
+        assert control.pause() is False
+        assert control.paused is False
+
+
 @pytest.mark.parametrize(
     ("active", "stopped", "admitted", "expected"),
     [
@@ -180,6 +208,67 @@ def test_async_owner_scope_rejects_entry_without_an_active_task():
         return failures
 
     assert asyncio.run(scenario()) == ["Async execution ownership requires an asyncio task."]
+
+
+def test_wait_until_active_async_wakes_when_a_run_starts_or_shutdown_is_requested():
+    """Waiters observe either active execution or shutdown without polling."""
+
+    async def wait_for_state(control, started):
+        """Register one state waiter before the test changes run control."""
+        started.set()
+        return await control.wait_until_active_async()
+
+    async def scenario():
+        """Exercise activation, shutdown, and immediate lifecycle states."""
+        control = RunControl()
+        started = asyncio.Event()
+        waiter = asyncio.create_task(wait_for_state(control, started))
+        await started.wait()
+        with control.execution(async_owner=True):
+            assert await waiter is True
+
+        stopped = RunControl()
+        shutdown_started = asyncio.Event()
+        shutdown_waiter = asyncio.create_task(wait_for_state(stopped, shutdown_started))
+        await shutdown_started.wait()
+        stopped.stop()
+        assert await shutdown_waiter is False
+        stopped.stop()
+        return stopped, control
+
+    stopped, active = asyncio.run(scenario())
+
+    async def check_immediate_states():
+        """Read current activity and shutdown without registering a waiter."""
+        with active.execution(async_owner=True):
+            assert await active.wait_until_active_async() is True
+        assert await stopped.wait_until_active_async() is False
+
+    asyncio.run(check_immediate_states())
+
+
+def test_wait_until_active_async_cleans_up_when_cancelled():
+    """Cancelling an activity waiter releases its registration for later runs."""
+
+    async def scenario():
+        """Cancel a registered waiter, then verify the next run still wakes observers."""
+        control = RunControl()
+        registered = asyncio.Event()
+
+        async def wait_for_activity():
+            """Signal that waiting begins before awaiting run activity."""
+            registered.set()
+            return await control.wait_until_active_async()
+
+        waiter = asyncio.create_task(wait_for_activity())
+        await registered.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        with control.execution(async_owner=True):
+            assert await control.wait_until_active_async() is True
+
+    asyncio.run(scenario())
 
 
 def test_async_cancel_schedule_failure_keeps_scoped_interruption():

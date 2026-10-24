@@ -71,7 +71,7 @@ Start your Responses API server, then run:
 uv run loop
 ```
 
-If installed as a `uv` tool, run `loop` from any directory. Enter `/exit` to stop.
+If installed as a `uv` tool, run `loop` from any directory. Enter `/stop` to return to the session flow, or `/exit` and `/quit` to leave the application.
 
 ## Guides
 

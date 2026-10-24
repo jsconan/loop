@@ -15,7 +15,7 @@ from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.application.runtime import ApplicationRuntime
 from loop.configuration import ApplicationSettings, ConfigurationCommands
-from loop.conversation import ConversationCommands
+from loop.conversation import ConversationCommands, ConversationRecoveryCommands
 from loop.telemetry import SQLiteTelemetryAdapter, Telemetry
 from loop.workspace import Workspace, WorkspaceCommands
 
@@ -155,6 +155,10 @@ def test_async_runtime_registers_and_binds_the_session_command_provider(
     assert isinstance(
         active_loop.register_command_provider.call_args_list[0].args[0], ConversationCommands
     )
+    assert isinstance(
+        active_loop.register_command_provider.call_args_list[1].args[0],
+        ConversationRecoveryCommands,
+    )
     session_manager = dependencies["Loop"].create_default.call_args.kwargs["session_manager"]
     controller.bind_session_manager.assert_called_once_with(session_manager)
     controller.bind_command_manager.assert_called_once_with(active_loop.command_manager)
@@ -168,9 +172,37 @@ def test_runtime_async_path_without_controller_awaits_loop_directly():
     loop.run_async = AsyncMock()
     runtime = ApplicationRuntime(loop, Mock(), 1, cleanup_callbacks=[])
 
-    asyncio.run(runtime.run_async())
+    outcome = asyncio.run(runtime.run_async())
 
     loop.run_async.assert_awaited_once_with()
+    assert outcome is runtime_module.ApplicationRunOutcome.APPLICATION_EXITED
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("stopped", "expected"),
+    [
+        (True, runtime_module.ApplicationRunOutcome.CONVERSATION_STOPPED),
+        (False, runtime_module.ApplicationRunOutcome.APPLICATION_EXITED),
+    ],
+)
+def test_runtime_reports_conversation_stop_separately_from_application_exit(stopped, expected):
+    """The runtime exposes conversation stop separately from normal application exit."""
+    loop = Mock()
+    controller = Mock(running=False, conversation_stop_requested=stopped)
+    controller.run_async = AsyncMock()
+    runtime = ApplicationRuntime(
+        loop,
+        Mock(),
+        1,
+        cleanup_callbacks=[],
+        session_controller=controller,
+    )
+
+    outcome = asyncio.run(runtime.run_async())
+
+    assert outcome is expected
+    controller.run_async.assert_awaited_once()
     runtime.close()
 
 

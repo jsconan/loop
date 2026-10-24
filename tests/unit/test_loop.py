@@ -60,10 +60,11 @@ from loop import (
     manage_skills,
     tool,
 )
+from loop.agent import AgentRunRecoveryRequired
 from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
-from loop.conversation import ConversationCommands
+from loop.conversation import ConversationCommands, ConversationRecoveryCommands
 from loop.conversation.models import AdmittedConversationInput
 from loop.models import SteeringMessage
 from loop.permissions import PermissionLoadFailure
@@ -1353,6 +1354,167 @@ def test_async_run_completion_uses_async_session_naming(tmp_path):
     assert loop.session.name == "Async title"
     interaction.run_metrics.assert_called_once_with(metrics)
     control.checkpoint.assert_called_once_with()
+
+
+def test_async_pause_keeps_recovery_pending_until_a_later_recovery(tmp_path):
+    """A paused agent run keeps the loop recovery gate set after its owner settles."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._skill_hints_enabled = False
+    loop.agent_runner.recover_session_async = AsyncMock(
+        return_value=SimpleNamespace(pending=False, result=None)
+    )
+    loop.agent_runner.run_async = AsyncMock(
+        return_value=AgentRunResult(
+            final_response=None,
+            turns=0,
+            stop_reason="paused",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+    messages = iter(("question", False))
+
+    async def read_input(_completer):
+        """Submit one user turn and leave the conversation open for recovery controls."""
+        return next(messages)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    assert loop._session_manager.recovery_pending is True
+    assert loop._session_manager.recovery_state.action == "query_model"
+
+
+def test_async_continue_recovers_a_paused_run_from_its_durable_boundary(tmp_path):
+    """The continue command uses the runner's existing recovery procedure after a pause."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._skill_hints_enabled = False
+    loop.register_command_provider(ConversationRecoveryCommands(loop))
+    loop.agent_runner.recover_session_async = AsyncMock(
+        side_effect=[
+            SimpleNamespace(pending=False, result=None),
+            SimpleNamespace(pending=False, result=None),
+        ]
+    )
+    loop.agent_runner.run_async = AsyncMock(
+        return_value=AgentRunResult(
+            final_response=None,
+            turns=0,
+            stop_reason="paused",
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+    values = iter(("question", "/continue", False))
+
+    async def read_input(_completer):
+        """Submit work, continue its pause boundary, and leave the conversation."""
+        return next(values)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    assert loop.agent_runner.recover_session_async.await_args_list == [
+        call(),
+        call(confirmed=True),
+    ]
+    assert loop._session_manager.recovery_pending is False
+    assert loop._session_manager.recovery_paused is False
+    interaction.info.assert_any_call("Paused run continued.")
+
+
+def test_async_recoverable_run_failure_keeps_the_input_owner_for_retry(tmp_path):
+    """A recoverable agent failure leaves the loop open for an explicit retry command."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._skill_hints_enabled = False
+    loop.register_command_provider(ConversationRecoveryCommands(loop))
+    loop.agent_runner.recover_session_async = AsyncMock(
+        side_effect=[
+            SimpleNamespace(pending=False, result=None),
+            SimpleNamespace(pending=False, result=None),
+        ]
+    )
+    loop.agent_runner.run_async = AsyncMock(side_effect=AgentRunRecoveryRequired)
+    values = iter(("question", "/retry", False))
+
+    async def read_input(_completer):
+        """Fail one recoverable run, retry it, then end the conversation."""
+        return next(values)
+
+    asyncio.run(loop.run_async(input_source=read_input))
+
+    assert loop.agent_runner.recover_session_async.await_args_list == [
+        call(),
+        call(confirmed=True),
+    ]
+    assert loop._session_manager.recovery_pending is False
+    assert loop._session_manager.recovery_paused is False
+    interaction.warning.assert_any_call(
+        "The agent run remains recoverable. Use /retry to continue it."
+    )
+    interaction.info.assert_any_call("Recovery completed.")
+
+
+def test_recover_pending_async_does_nothing_without_a_recovery_gate(tmp_path):
+    """Explicit recovery is unavailable when the session has no pending run."""
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=output_interaction(),
+        working_directory=tmp_path,
+    )
+    loop.agent_runner.recover_session_async = AsyncMock()
+
+    assert asyncio.run(loop.recover_pending_async()) is False
+    loop.agent_runner.recover_session_async.assert_not_awaited()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_async_recovery_retains_pending_state_after_recoverable_failure(tmp_path, explicit):
+    """A recoverable failure keeps the recovery gate set until a later attempt."""
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        working_directory=tmp_path,
+    )
+    loop._session_manager.recovery_pending = True
+    loop.agent_runner.recover_session_async = AsyncMock(side_effect=AgentRunRecoveryRequired)
+
+    assert asyncio.run(loop._recover_session_async(explicit=explicit)) is True
+
+    assert loop._session_manager.recovery_pending is True
+    assert loop._session_manager.recovery_paused is False
+    if explicit:
+        interaction.warning.assert_not_called()
+        loop.agent_runner.recover_session_async.assert_awaited_once_with(confirmed=True)
+    else:
+        interaction.warning.assert_called_once_with(
+            "Recovery remains pending after a recoverable failure. Use /retry to try again."
+        )
+        loop.agent_runner.recover_session_async.assert_awaited_once_with()
 
 
 def test_async_run_completion_preserves_user_named_sessions(tmp_path):

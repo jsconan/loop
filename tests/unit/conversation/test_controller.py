@@ -27,7 +27,7 @@ from loop import (
     SessionController,
     SessionManager,
 )
-from loop.conversation import ConversationCommands
+from loop.conversation import ConversationCommands, ConversationRecoveryCommands
 from loop.conversation import controller as controller_module
 from loop.conversation.interaction import MailboxInteraction
 from loop.conversation.mailbox import InputMailbox
@@ -107,6 +107,136 @@ def test_controller_validates_and_exposes_the_active_input_mode(ui):
         controller.input_mode = "replace"
     with pytest.raises(ValueError, match="queue.*steer"):
         SessionController(ui, input_mode="replace")
+
+
+def test_controller_pause_cancels_the_active_run_without_stopping_the_conversation(ui):
+    """A pause request interrupts active work while keeping conversation control available."""
+    controller = SessionController(ui)
+    assert controller.request_pause() is False
+    started = asyncio.Event()
+    paused = asyncio.Event()
+
+    async def owner():
+        """Hold an async run until the controller requests a pause."""
+        with controller.control.execution(async_owner=True):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                paused.set()
+
+    async def scenario():
+        """Pause the run and wait for its owner to settle."""
+        task = asyncio.create_task(owner())
+        await started.wait()
+        assert controller.request_pause() is True
+        await task
+
+    asyncio.run(scenario())
+
+    assert paused.is_set()
+    assert controller.control.stopped is False
+    assert controller.conversation_stop_requested is False
+
+
+@pytest.mark.parametrize("request_completed", [False, True])
+def test_controller_pause_clears_pending_questions_and_cancels_direct_input(ui, request_completed):
+    """Pause revokes an unanswered question and cancels a competing direct-input wait."""
+    controller = SessionController(ui)
+    request = InteractionCall(ui.prompt, ("Question?",), {})
+    replacement = InteractionCall(ui.prompt, ("Replacement?",), {})
+    if request_completed:
+        request.result.set_result("already answered")
+    else:
+        request.result.add_done_callback(
+            lambda _result: setattr(controller, "_pending", replacement)
+        )
+    controller._pending = request
+    controller._loop = Mock()
+
+    async def scenario():
+        """Pause active execution while a separate answer is waiting."""
+        answer_input = asyncio.get_running_loop().create_future()
+        controller._answer_input = answer_input
+        with controller.control.execution():
+            assert controller.request_pause() is True
+        controller._loop.call_soon_threadsafe.assert_called_once_with(answer_input.cancel)
+        return answer_input
+
+    answer_input = asyncio.run(scenario())
+
+    if request_completed:
+        assert controller._pending is None
+        assert request.result.result() == "already answered"
+    else:
+        assert request.result.exception().__class__ is RunInterrupted
+        assert controller._pending is replacement
+    assert not answer_input.cancelled()
+
+
+@pytest.mark.parametrize("blocked_by", ["stopping", "ended", "control"])
+def test_stop_conversation_rejects_when_shutdown_has_already_started(ui, blocked_by):
+    """A conversation stop is rejected once any shutdown guard is active."""
+    controller = SessionController(ui)
+    if blocked_by == "stopping":
+        controller._stopping = True
+    elif blocked_by == "ended":
+        controller._ended = True
+    else:
+        controller.control.stop()
+
+    assert controller.stop_conversation() is False
+    assert controller.conversation_stop_requested is False
+
+
+def test_stop_conversation_preserves_durable_inputs_for_session_reopen(ui):
+    """Stopping clears the UI mailbox while accepted durable inputs remain pending."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    command_manager = CommandManager(
+        providers=(ConversationCommands(controller),),
+        interaction=ui,
+    )
+    controller.bind_command_manager(command_manager)
+    inputs = asyncio.Queue()
+    read_inputs(ui, inputs)
+    started = asyncio.Event()
+    queued = asyncio.Event()
+
+    async def conversation(receive):
+        """Wait at the next input boundary after the initial user message."""
+        first = await receive(DummyCompleter())
+        await manager.add_user_message_async(first.message, input_id=first.input_id)
+        started.set()
+        await receive(DummyCompleter())
+
+    def report(message=""):
+        """Signal after the durable follow-up has been admitted."""
+        if message == "Queued input for the next run.":
+            queued.set()
+
+    ui.info.side_effect = report
+
+    async def scenario():
+        """Admit a follow-up, stop the conversation, and settle its owner."""
+        task = asyncio.create_task(controller.run_async(conversation))
+        try:
+            inputs.put_nowait("start")
+            await started.wait()
+            inputs.put_nowait("/queue waiting")
+            await queued.wait()
+            inputs.put_nowait("/stop")
+            await task
+        finally:
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert controller.conversation_stop_requested is True
+    assert command_manager.exit_requested is False
+    assert [item.content for item in manager.session.pending_inputs] == ["waiting"]
 
 
 def test_async_mailbox_lock_waits_without_blocking_the_event_loop(ui):
@@ -1499,7 +1629,16 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
     manager.register(unavailable)
     manager.call("help")
     setup_names = {item.name for item in ui.table.call_args.args[0]}
-    assert {"interrupt", "respond", "status", "steer", "queue", "choose"}.isdisjoint(setup_names)
+    assert {
+        "interrupt",
+        "pause",
+        "stop",
+        "respond",
+        "status",
+        "steer",
+        "queue",
+        "choose",
+    }.isdisjoint(setup_names)
     assert "queued" in setup_names
 
     async def scenario():
@@ -1550,11 +1689,15 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
             assert "/unavailable" not in commands
             assert "/edit" in commands
             assert "/recall" in commands
+            assert "/pause" in commands
+            assert "/stop" in commands
             assert set(busy_help_names) == {
                 "help",
                 "exit",
                 "quit",
                 "interrupt",
+                "pause",
+                "stop",
                 "status",
                 "steer",
                 "queue",
@@ -2131,16 +2274,33 @@ def test_command_capabilities_track_active_run_pending_response_and_settlement(u
     def names():
         return {command.name for command in manager.active_commands}
 
-    assert {"interrupt", "respond", "status", "steer", "queue", "edit", "recall"}.isdisjoint(
-        names()
-    )
+    assert {
+        "interrupt",
+        "pause",
+        "stop",
+        "respond",
+        "status",
+        "steer",
+        "queue",
+        "edit",
+        "recall",
+    }.isdisjoint(names())
     controller._loop = Mock()
     idle_names = names()
-    assert {"status", "steer", "queue", "edit", "recall"} <= idle_names
-    assert "interrupt" not in idle_names
+    assert {"status", "stop", "steer", "queue", "edit", "recall"} <= idle_names
+    assert {"interrupt", "pause"}.isdisjoint(idle_names)
     with controller.control.execution():
         active_names = names()
-        assert {"interrupt", "status", "steer", "queue", "edit", "recall"} <= active_names
+        assert {
+            "interrupt",
+            "pause",
+            "stop",
+            "status",
+            "steer",
+            "queue",
+            "edit",
+            "recall",
+        } <= active_names
         assert "respond" not in active_names
         controller._pending = InteractionCall(
             function=ui.prompt,
@@ -2154,9 +2314,231 @@ def test_command_capabilities_track_active_run_pending_response_and_settlement(u
         assert [item.text for item in completions] == ["Yes"]
     controller._pending = None
     controller._loop = None
-    assert {"interrupt", "respond", "status", "steer", "queue", "edit", "recall"}.isdisjoint(
-        names()
+    assert {
+        "interrupt",
+        "pause",
+        "stop",
+        "respond",
+        "status",
+        "steer",
+        "queue",
+        "edit",
+        "recall",
+    }.isdisjoint(names())
+
+
+def test_recovery_command_visibility_tracks_paused_and_pending_session_state(ui):
+    """Continue and retry appear only for the recovery states they can handle."""
+    session_manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(session_manager)
+
+    class RecoveryControl:
+        """Provide recovery state for command registration tests."""
+
+        recovery_pending = False
+        recovery_paused = False
+
+        async def recover_pending_async(self):
+            """Return whether a recovery attempt would remain pending."""
+            return False
+
+    commands = CommandManager(
+        providers=(
+            ConversationCommands(controller),
+            ConversationRecoveryCommands(RecoveryControl()),
+        ),
+        interaction=ui,
     )
+    controller.bind_command_manager(commands)
+    controller._loop = Mock()
+
+    session_manager.recovery_pending = True
+    assert "retry" in {command.name for command in commands.active_commands}
+    assert "continue" not in {command.name for command in commands.active_commands}
+
+    session_manager.recovery_paused = True
+    active_names = {command.name for command in commands.active_commands}
+    assert {"continue", "retry"} <= active_names
+    completion = CompletionManager((commands.completion_adapter,))
+    suggestions = {item.text for item in completion.get_completions(Document("/"), CompleteEvent())}
+    assert {"/continue", "/retry"} <= suggestions
+
+    assert controller.status_snapshot().state == "Paused"
+    session_manager.recovery_paused = False
+    assert controller.status_snapshot().state == "Recovery pending"
+    session_manager.recovery_pending = False
+    assert {"continue", "retry"}.isdisjoint(command.name for command in commands.active_commands)
+    assert controller.status_snapshot().state == "Idle"
+
+
+@pytest.mark.parametrize("recovery_command", ["continue", "retry"])
+def test_recovery_restores_input_and_run_controls_while_active(ui, recovery_command):
+    """Pause, continue, and retry preserve input and run controls during recovery."""
+    controller = SessionController(ui)
+    session_manager = SessionManager(session_store=MemorySessionStore())
+    controller.bind_session_manager(session_manager)
+    if recovery_command == "retry":
+        session_manager.recovery_pending = True
+    run_started, paused, recovery_started, recovery_release, input_queued = (
+        asyncio.Event() for _ in range(5)
+    )
+
+    class RecoveryControl:
+        """Keep a paused run active while the controller accepts another message."""
+
+        @property
+        def recovery_pending(self):
+            """Return the recovery gate used by the registered commands."""
+            return session_manager.recovery_pending
+
+        @property
+        def recovery_paused(self):
+            """Return whether the recovery gate represents a pause."""
+            return session_manager.recovery_paused
+
+        async def recover_pending_async(self):
+            """Simulate recovered agent activity until the test admits another message."""
+            try:
+                with controller.control.execution(async_owner=True):
+                    recovery_started.set()
+                    await recovery_release.wait()
+            except asyncio.CancelledError:
+                session_manager.recovery_pending = True
+                session_manager.recovery_paused = False
+                return True
+            session_manager.recovery_pending = False
+            session_manager.recovery_paused = False
+            return False
+
+    manager = CommandManager(
+        providers=(
+            ConversationCommands(controller),
+            ConversationRecoveryCommands(RecoveryControl()),
+        ),
+        interaction=ui,
+    )
+    controller.bind_command_manager(manager)
+    inputs = asyncio.Queue()
+    prompt_started = [asyncio.Event() for _ in range(4)]
+    prompt_count = 0
+    messages = []
+
+    async def prompt(*_args, **_kwargs):
+        """Read scripted input and expose each restored editor to the test."""
+        nonlocal prompt_count
+        prompt_count += 1
+        if prompt_count <= len(prompt_started):
+            prompt_started[prompt_count - 1].set()
+        return await inputs.get()
+
+    def info(message=""):
+        """Observe durable admission while the recovered run owns execution."""
+        if message == "Queued input (1 pending).":
+            input_queued.set()
+
+    ui.prompt_async.side_effect = prompt
+    ui.info.side_effect = info
+
+    async def conversation(receive):
+        """Pause one active run, then dispatch recovery and collect its follow-up input."""
+        if recovery_command == "continue":
+            value = await receive(DummyCompleter())
+            admitted = value if isinstance(value, AdmittedConversationInput) else None
+            if admitted is not None:
+                value = value.message
+            await session_manager.add_user_message_async(
+                value,
+                input_id=admitted.input_id if admitted is not None else None,
+            )
+            messages.append(value)
+            try:
+                with controller.control.execution(async_owner=True):
+                    run_started.set()
+                    await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                session_manager.recovery_pending = True
+                session_manager.recovery_paused = True
+                paused.set()
+        while (value := await receive(DummyCompleter())) is not False:
+            if isinstance(value, AdmittedConversationInput):
+                value = value.message
+            if await manager.handle_user_command_async(value, interaction=controller.interaction):
+                continue
+            messages.append(value)
+
+    async def scenario():
+        """Recover a run, submit text during recovery, and settle the controller."""
+        task = asyncio.create_task(controller.run_async(conversation, route_idle_commands=True))
+        try:
+            await prompt_started[0].wait()
+            if recovery_command == "continue":
+                await inputs.put("start")
+                await run_started.wait()
+                await prompt_started[1].wait()
+                await inputs.put("/pause")
+                await paused.wait()
+                assert controller.status_snapshot().state == "Paused"
+                paused_names = {command.name for command in manager.active_commands}
+                assert {"continue", "retry"} <= paused_names
+                await prompt_started[2].wait()
+            await inputs.put(f"/{recovery_command}")
+            await recovery_started.wait()
+            active_prompt_index = 3 if recovery_command == "continue" else 1
+            await prompt_started[active_prompt_index].wait()
+            assert controller.status_snapshot().state == "Working"
+            active_names = {command.name for command in manager.active_commands}
+            assert {"pause", "stop"} <= active_names
+            assert {"continue", "retry"}.isdisjoint(active_names)
+            await inputs.put("during recovery")
+            await input_queued.wait()
+            await inputs.put("/stop")
+            await task
+        finally:
+            recovery_release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert controller.conversation_stop_requested is True
+    assert [item.content for item in session_manager.session.pending_inputs] == ["during recovery"]
+    expected_messages = ["start"] if recovery_command == "continue" else []
+    assert messages == expected_messages
+    assert prompt_count >= (4 if recovery_command == "continue" else 2)
+
+
+def test_idle_command_activity_waiter_is_cancelled_when_the_owner_finishes(ui):
+    """Release the recovery activity waiter when an idle command ends its owner."""
+    controller = SessionController(ui)
+    waiter_started, waiter_cancelled = asyncio.Event(), asyncio.Event()
+
+    async def wait_until_active():
+        """Hold the activity waiter until controller shutdown settles it."""
+        waiter_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            waiter_cancelled.set()
+            raise
+
+    controller.control.wait_until_active_async = wait_until_active
+    ui.prompt_async.return_value = "/finish"
+
+    def finish():
+        """Provide a registered command that the owner can consume and then finish."""
+
+    manager = CommandManager(commands=(finish,), interaction=ui)
+    controller.bind_command_manager(manager)
+
+    async def conversation(receive):
+        """Return after receiving the idle command and observing the activity waiter."""
+        assert await receive(DummyCompleter()) == "/finish"
+        await waiter_started.wait()
+
+    asyncio.run(controller.run_async(conversation, route_idle_commands=True))
+
+    assert waiter_cancelled.is_set()
 
 
 def test_command_capabilities_during_shutdown_allow_only_inspection(ui):

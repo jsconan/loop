@@ -17,7 +17,6 @@ from pydantic import ValidationError as PydanticValidationError
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 type StructuredOutputValidator = Callable[[JsonValue], Any]
-type AgentRunStopReason = Literal["completed", "cancelled", "max_turns", "steered"]
 type FileInputMode = Literal["text", "native"]
 type ConversationInputMode = Literal["queue", "steer"]
 type StructuredOutputMode = Literal["auto", "native", "prompt"]
@@ -33,6 +32,16 @@ type MessageRole = Literal["user", "assistant"]
 _JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE | re.DOTALL)
 
 
+class AgentRunStopReason(StrEnum):
+    """Describe why control returned from an agent run."""
+
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    MAX_TURNS = "max_turns"
+    STEERED = "steered"
+    PAUSED = "paused"
+
+
 class CommandCapability(StrEnum):
     """Describe the runtime operations a registered command may perform."""
 
@@ -42,6 +51,8 @@ class CommandCapability(StrEnum):
     CONVERSATION_ACTIVE = "conversation_active"
     CONVERSATION_CONTROL = "conversation_control"
     RUN_ACTIVE = "run_active"
+    RUN_PAUSED = "run_paused"
+    RECOVERY_PENDING = "recovery_pending"
     PENDING_RESPONSE = "pending_response"
 
 

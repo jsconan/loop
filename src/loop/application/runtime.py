@@ -6,12 +6,13 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Callable, Mapping
+from enum import Enum
 from types import TracebackType
 from typing import Self
 
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
-from ..conversation import ConversationCommands, SessionController
+from ..conversation import ConversationCommands, ConversationRecoveryCommands, SessionController
 from ..execution import CommandExecutionService
 from ..instructions import InstructionsManager
 from ..interaction import AsyncInteractionInput, Interaction
@@ -32,6 +33,13 @@ from ..utils import run_in_worker_async
 from ..workspace import Workspace, WorkspaceCommands, WorkspaceRepository
 from .commands import ApplicationCommands
 from .paths import ApplicationPaths, WorkspacePaths
+
+
+class ApplicationRunOutcome(Enum):
+    """Describe why the interactive runtime returned to its supervisor."""
+
+    CONVERSATION_STOPPED = "conversation_stopped"
+    APPLICATION_EXITED = "application_exited"
 
 
 class ApplicationRuntime:
@@ -238,6 +246,7 @@ class ApplicationRuntime:
             if session_controller is not None:
                 session_controller.bind_session_manager(session_manager)
                 loop.register_command_provider(ConversationCommands(session_controller))
+                loop.register_command_provider(ConversationRecoveryCommands(loop))
                 session_controller.bind_command_manager(loop.command_manager)
             loop.register_command_provider(
                 ConfigurationCommands(
@@ -283,7 +292,7 @@ class ApplicationRuntime:
         """
         self._loop.run()
 
-    async def run_async(self) -> None:
+    async def run_async(self) -> ApplicationRunOutcome:
         """Run the composed application through its async loop and session controller.
 
         Raises:
@@ -291,15 +300,20 @@ class ApplicationRuntime:
             BaseException: If the conversation or UI fails after owned execution settles.
 
         Returns:
-            None: After the conversation and its owned operations have settled.
+            ApplicationRunOutcome: Whether the user stopped this conversation or exited the app.
         """
         if self._session_controller is None:
             await self._loop.run_async()
-        else:
-            await self._session_controller.run_async(
-                lambda receive: self._loop.run_async(input_source=receive),
-                route_idle_commands=True,
-            )
+            return ApplicationRunOutcome.APPLICATION_EXITED
+        await self._session_controller.run_async(
+            lambda receive: self._loop.run_async(input_source=receive),
+            route_idle_commands=True,
+        )
+        return (
+            ApplicationRunOutcome.CONVERSATION_STOPPED
+            if self._session_controller.conversation_stop_requested is True
+            else ApplicationRunOutcome.APPLICATION_EXITED
+        )
 
     def apply_configuration(self, path: str, settings: ApplicationSettings) -> str:
         """Apply one validated configuration change to the active runtime.

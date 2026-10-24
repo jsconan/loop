@@ -5,11 +5,17 @@ __all__ = [
     "AgentIdentity",
     "AgentInstructions",
     "AgentRecoveryStatus",
+    "AgentRunRecoveryRequired",
     "AgentRunResult",
     "AgentRunStopReason",
     "AgentRunner",
 ]
 
 from .agent import Agent, AgentIdentity, AgentInstructions
-from .models import AgentRecoveryStatus, AgentRunResult, AgentRunStopReason
+from .models import (
+    AgentRecoveryStatus,
+    AgentRunRecoveryRequired,
+    AgentRunResult,
+    AgentRunStopReason,
+)
 from .runner import AgentRunner

@@ -50,7 +50,7 @@ from loop import (
     edit_text_file,
     read_text_file,
 )
-from loop.agent import Agent, AgentRunner, AgentRunResult
+from loop.agent import Agent, AgentRunner, AgentRunRecoveryRequired, AgentRunResult
 from loop.conversation.interaction import MailboxInteraction
 from loop.session.models import RunCompletedEvent
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
@@ -1626,8 +1626,8 @@ def test_runner_async_recovery_retries_repetitive_output_once(tmp_path):
     runner.interaction.confirm.assert_not_called()
 
 
-def test_runner_async_recovery_returns_none_when_repetition_retry_also_fails(tmp_path):
-    """A repeated failure after repetition recovery follows normal retry policy."""
+def test_runner_async_recovery_preserves_a_recoverable_repetition_failure(tmp_path):
+    """A declined retry after repetition recovery leaves the run available to resume."""
     runner = file_runner(tmp_path, Mock())
     interaction = MagicMock(spec=ConsoleInteraction)
     interaction.confirm_async.return_value = False
@@ -1638,7 +1638,8 @@ def test_runner_async_recovery_returns_none_when_repetition_retry_also_fails(tmp
             BackendRepetitionError("repetition again", provider="test", operation="query"),
         ]
     )
-    assert asyncio.run(runner._query_with_recovery_async()) is None
+    with pytest.raises(AgentRunRecoveryRequired):
+        asyncio.run(runner._query_with_recovery_async())
     interaction.confirm_async.assert_awaited_once_with(
         "Retry the complete response?", default=False
     )
@@ -1795,7 +1796,7 @@ def test_tool_interactions_include_the_model_call_operation_id(async_mode):
 
 @pytest.mark.parametrize("async_mode", [False, True])
 def test_uncertain_tool_retry_prompt_carries_the_original_operation_id(async_mode):
-    """Recovery approval stays correlated to the uncertain model tool call."""
+    """Explicit recovery still confirms uncertain tools against their original operation."""
     final = Response(answer="reconciled", reasoning="")
     runner, sessions, _interaction = agent_runner(responses=[final])
     source = MagicMock(spec=ConsoleInteraction if async_mode else Interaction)
@@ -1812,7 +1813,7 @@ def test_uncertain_tool_retry_prompt_carries_the_original_operation_id(async_mod
         return await request.function(*request.args, **request.kwargs)
 
     if async_mode:
-        source.confirm_async = AsyncMock(side_effect=[True, False])
+        source.confirm_async = AsyncMock(return_value=False)
         runner.query_async = AsyncMock(return_value=final)
     else:
         source.confirm.side_effect = [True, False]
@@ -1827,10 +1828,12 @@ def test_uncertain_tool_retry_prompt_carries_the_original_operation_id(async_mod
     )
 
     if async_mode:
-        asyncio.run(runner.recover_session_async())
+        asyncio.run(runner.recover_session_async(confirmed=True))
     else:
         runner.recover_session()
 
+    if async_mode:
+        source.confirm_async.assert_awaited_once()
     retry_request = next(request for request in requests if "Retry it?" in request.args[0])
     assert retry_request.session_id == sessions.session.id
     assert retry_request.run_id
@@ -2355,6 +2358,37 @@ def test_recover_session_async_preserves_approval_gate(has_recovery, approval, e
         runner._recover_async.assert_not_awaited()
 
 
+def test_recover_session_async_skips_only_the_run_level_prompt_when_explicitly_confirmed():
+    """An explicit recovery command bypasses the general prompt but keeps normal recovery."""
+    runner, sessions, _interaction = agent_runner()
+    sessions.recovery_state = SessionRecoveryState(action="query_model")
+    recovered = AgentRunResult(final_response=None, turns=0, stop_reason="completed")
+    runner._recover_async = AsyncMock(return_value=recovered)
+    runner._confirm_async = AsyncMock()
+
+    result = asyncio.run(runner.recover_session_async(confirmed=True))
+
+    assert result.pending is False
+    assert result.result is recovered
+    runner._confirm_async.assert_not_awaited()
+    runner._recover_async.assert_awaited_once_with(sessions.recovery_state)
+
+
+def test_recoverable_async_backend_failure_leaves_an_uncompleted_run():
+    """Declining a recoverable backend retry leaves the run available to ``/retry``."""
+    runner, sessions, interaction = agent_runner()
+    runner.query_async = AsyncMock(
+        side_effect=BackendConnectionError("private failure", provider="test", operation="query")
+    )
+    runner._confirm_async = AsyncMock(return_value=False)
+
+    with pytest.raises(AgentRunRecoveryRequired):
+        asyncio.run(runner.run_async())
+
+    interaction.report.assert_called_once()
+    sessions.record_run_async.assert_not_awaited()
+
+
 def test_recover_async_finalizes_or_reenters_query_boundary():
     """Async recovery either finalizes a completed run or reenters model orchestration."""
     runner, sessions, _interaction = agent_runner()
@@ -2701,6 +2735,76 @@ def test_interrupted_stream_is_closed_cancelled_and_ready_for_another_run(tmp_pa
     sessions.add_user_message("correction")
     assert runner.run().stop_reason == "completed"
     assert backend.get_response.call_count == 2
+
+
+def test_paused_stream_keeps_the_durable_run_open_for_recovery(tmp_path):
+    """A synchronous pause leaves committed messages behind an incomplete run boundary."""
+    control = RunControl()
+    closed = Mock()
+
+    def events():
+        """Request pause after partial output and close the interrupted stream."""
+        try:
+            yield AnswerDelta(text="partial")
+            assert control.pause() is True
+            yield ResponseCompleted(answer="discarded")
+        finally:
+            closed()
+
+    backend = Mock()
+    backend.get_response.side_effect = [events()]
+    runner = file_runner(tmp_path, backend, run_control=control)
+    sessions = runner.session_manager
+    sessions.add_user_message("question")
+
+    result = runner.run()
+
+    closed.assert_called_once_with()
+    assert result.stop_reason == "paused"
+    assert result.turns == 0
+    assert sessions.session.active_run_id is not None
+    assert sessions.recovery_state.action == "query_model"
+    assert not any(isinstance(event, RunCompletedEvent) for event in sessions.session.events)
+    assert control.paused is False
+
+
+def test_async_pause_cancels_the_stream_without_completing_the_run(tmp_path):
+    """An async pause closes partial output and preserves the durable recovery boundary."""
+    control = RunControl()
+    backend = Mock()
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def events():
+        """Pause after partial output and signal when the response stream closes."""
+        try:
+            yield AnswerDelta(text="partial")
+            started.set()
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    backend.get_response_async.return_value = events()
+    runner = file_runner(tmp_path, backend, run_control=control)
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions = runner.session_manager
+    sessions.add_user_message("question")
+
+    async def scenario():
+        """Request pause while the runner owns its async response stream."""
+        task = asyncio.create_task(runner.run_async())
+        await started.wait()
+        assert control.pause() is True
+        return await task
+
+    result = asyncio.run(scenario())
+
+    assert closed.is_set()
+    assert result.stop_reason == "paused"
+    assert sessions.session.active_run_id is not None
+    assert sessions.recovery_state.action == "query_model"
+    assert not any(isinstance(event, RunCompletedEvent) for event in sessions.session.events)
+    assert control.paused is False
 
 
 def test_interruption_preserves_settled_tool_results_and_cancels_remaining_calls(

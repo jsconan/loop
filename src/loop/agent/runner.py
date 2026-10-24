@@ -51,7 +51,7 @@ from ..utils import (
     utc_now,
 )
 from .agent import Agent
-from .models import AgentRecoveryStatus, AgentRunResult
+from .models import AgentRecoveryStatus, AgentRunRecoveryRequired, AgentRunResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -313,8 +313,8 @@ class AgentRunner:
         """Run model and tool turns until completion, cancellation, or the safety limit.
 
         Returns:
-            AgentRunResult: Final response, completed turn count, and termination reason. Scoped
-                interruption settles outstanding calls and returns a cancelled result.
+            AgentRunResult: Final response, completed turn count, and termination reason. A pause
+                leaves the durable run incomplete so the recovery classifier can resume it.
 
         Raises:
             KeyboardInterrupt: If the configured control requests a stop.
@@ -393,8 +393,13 @@ class AgentRunner:
             with self._session_manager.execution():
                 return AgentRecoveryStatus(pending=False, result=self._recover(state))
 
-    async def recover_session_async(self) -> AgentRecoveryStatus:
+    async def recover_session_async(self, *, confirmed: bool = False) -> AgentRecoveryStatus:
         """Execute an approved recovery plan using asynchronous interaction and tools.
+
+        Args:
+            confirmed (bool): Whether an explicit recovery command already approved the run-level
+                recovery prompt. Unknown tool outcomes still require their own confirmation.
+                Defaults to ``False``.
 
         Returns:
             AgentRecoveryStatus: Recovered run result and whether unresolved recovery remains.
@@ -413,7 +418,7 @@ class AgentRunner:
             state = self._session_manager.recovery_state
             if state is None:
                 return AgentRecoveryStatus(pending=False)
-            if not await self._confirm_async(
+            if not confirmed and not await self._confirm_async(
                 "This session stopped during an agent run. Recover and continue it?",
                 default=False,
             ):
@@ -427,7 +432,7 @@ class AgentRunner:
             return self._record_run_result(
                 final_response=None,
                 turns=0,
-                stop_reason="completed",
+                stop_reason=AgentRunStopReason.COMPLETED,
                 started_at=utc_now(),
                 calls=[],
                 tools=[],
@@ -441,7 +446,7 @@ class AgentRunner:
             return await self._record_run_result_async(
                 final_response=None,
                 turns=0,
-                stop_reason="completed",
+                stop_reason=AgentRunStopReason.COMPLETED,
                 started_at=utc_now(),
                 calls=[],
                 tools=[],
@@ -543,7 +548,7 @@ class AgentRunner:
                         return self._record_run_result(
                             final_response=None,
                             turns=total_turns,
-                            stop_reason="cancelled",
+                            stop_reason=self._interruption_stop_reason(),
                             started_at=started_at,
                             calls=calls,
                             tools=tools,
@@ -567,7 +572,7 @@ class AgentRunner:
                         return self._record_run_result(
                             final_response=response,
                             turns=total_turns,
-                            stop_reason="steered",
+                            stop_reason=AgentRunStopReason.STEERED,
                             started_at=started_at,
                             calls=calls,
                             tools=tools,
@@ -580,7 +585,7 @@ class AgentRunner:
                         return self._record_run_result(
                             final_response=response,
                             turns=total_turns,
-                            stop_reason="steered",
+                            stop_reason=AgentRunStopReason.STEERED,
                             started_at=started_at,
                             calls=calls,
                             tools=tools,
@@ -589,7 +594,7 @@ class AgentRunner:
                         return self._record_run_result(
                             final_response=response,
                             turns=total_turns,
-                            stop_reason="completed",
+                            stop_reason=AgentRunStopReason.COMPLETED,
                             started_at=started_at,
                             calls=calls,
                             tools=tools,
@@ -609,18 +614,23 @@ class AgentRunner:
                 return self._record_run_result(
                     final_response=response,
                     turns=total_turns,
-                    stop_reason="max_turns",
+                    stop_reason=AgentRunStopReason.MAX_TURNS,
                     started_at=started_at,
                     calls=calls,
                     tools=tools,
                 )
             except RunInterrupted:
                 self._cancel_pending_tools()
-                self._interaction.info("Run interrupted; the conversation remains open.")
+                stop_reason = self._interruption_stop_reason()
+                self._interaction.info(
+                    "Run paused; its durable state is ready to continue."
+                    if stop_reason == AgentRunStopReason.PAUSED
+                    else "Run interrupted; the conversation remains open."
+                )
                 return self._record_run_result(
                     final_response=None,
                     turns=total_turns,
-                    stop_reason="cancelled",
+                    stop_reason=stop_reason,
                     started_at=started_at,
                     calls=calls,
                     tools=tools,
@@ -656,7 +666,7 @@ class AgentRunner:
                         return await self._record_run_result_async(
                             final_response=None,
                             turns=total_turns,
-                            stop_reason="cancelled",
+                            stop_reason=self._interruption_stop_reason(),
                             started_at=started_at,
                             calls=calls,
                             tools=tools,
@@ -680,7 +690,7 @@ class AgentRunner:
                         return await self._record_run_result_async(
                             final_response=response,
                             turns=total_turns,
-                            stop_reason="steered",
+                            stop_reason=AgentRunStopReason.STEERED,
                             started_at=started_at,
                             calls=calls,
                             tools=tools,
@@ -693,7 +703,7 @@ class AgentRunner:
                         return await self._record_run_result_async(
                             final_response=response,
                             turns=total_turns,
-                            stop_reason="steered",
+                            stop_reason=AgentRunStopReason.STEERED,
                             started_at=started_at,
                             calls=calls,
                             tools=tools,
@@ -702,7 +712,7 @@ class AgentRunner:
                         return await self._record_run_result_async(
                             final_response=response,
                             turns=total_turns,
-                            stop_reason="completed",
+                            stop_reason=AgentRunStopReason.COMPLETED,
                             started_at=started_at,
                             calls=calls,
                             tools=tools,
@@ -722,18 +732,23 @@ class AgentRunner:
                 return await self._record_run_result_async(
                     final_response=response,
                     turns=total_turns,
-                    stop_reason="max_turns",
+                    stop_reason=AgentRunStopReason.MAX_TURNS,
                     started_at=started_at,
                     calls=calls,
                     tools=tools,
                 )
             except RunInterrupted:
                 await self._cancel_pending_tools_async()
-                self._interaction.info("Run interrupted; the conversation remains open.")
+                stop_reason = self._interruption_stop_reason()
+                self._interaction.info(
+                    "Run paused; its durable state is ready to continue."
+                    if stop_reason == AgentRunStopReason.PAUSED
+                    else "Run interrupted; the conversation remains open."
+                )
                 return await self._record_run_result_async(
                     final_response=None,
                     turns=total_turns,
-                    stop_reason="cancelled",
+                    stop_reason=stop_reason,
                     started_at=started_at,
                     calls=calls,
                     tools=tools,
@@ -744,12 +759,17 @@ class AgentRunner:
                 ):
                     raise
                 await self._cancel_pending_tools_async()
+                stop_reason = self._interruption_stop_reason()
                 if self._run_control.interrupted and not self._run_control.stopped:
-                    self._interaction.info("Run interrupted; the conversation remains open.")
+                    self._interaction.info(
+                        "Run paused; its durable state is ready to continue."
+                        if stop_reason == AgentRunStopReason.PAUSED
+                        else "Run interrupted; the conversation remains open."
+                    )
                 return await self._record_run_result_async(
                     final_response=None,
                     turns=total_turns,
-                    stop_reason="cancelled",
+                    stop_reason=stop_reason,
                     started_at=started_at,
                     calls=calls,
                     tools=tools,
@@ -1281,7 +1301,8 @@ class AgentRunner:
     ) -> AgentRunResult:
         """Persist and return one completed run's aggregate operation statistics."""
         metrics = self._build_run_metrics(calls, tools)
-        self._session_manager.record_run(stop_reason, started_at, metrics)
+        if stop_reason != AgentRunStopReason.PAUSED:
+            self._session_manager.record_run(stop_reason, started_at, metrics)
         return AgentRunResult(
             final_response=final_response,
             turns=turns,
@@ -1300,12 +1321,21 @@ class AgentRunner:
     ) -> AgentRunResult:
         """Persist and return one completed run through async session storage."""
         metrics = self._build_run_metrics(calls, tools)
-        await self._session_manager.record_run_async(stop_reason, started_at, metrics)
+        if stop_reason != AgentRunStopReason.PAUSED:
+            await self._session_manager.record_run_async(stop_reason, started_at, metrics)
         return AgentRunResult(
             final_response=final_response,
             turns=turns,
             stop_reason=stop_reason,
             metrics=metrics,
+        )
+
+    def _interruption_stop_reason(self) -> AgentRunStopReason:
+        """Preserve an incomplete run when its active control requested a pause."""
+        return (
+            AgentRunStopReason.PAUSED
+            if self._run_control is not None and self._run_control.paused
+            else AgentRunStopReason.CANCELLED
         )
 
     def _build_run_metrics(
@@ -1459,7 +1489,7 @@ class AgentRunner:
                 if error.retry_after is not None and error.retry_after > 0:
                     prompt = f"{prompt[:-1]} after at least {error.retry_after:g} seconds?"
                 if not await self._confirm_async(prompt, default=False):
-                    return None
+                    raise AgentRunRecoveryRequired from error
                 if error.retry_after is not None and error.retry_after > 0:
                     delay = min(error.retry_after, 60.0)
                     self._interaction.info(f"Retrying in {delay:g} seconds...")

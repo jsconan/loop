@@ -6,7 +6,12 @@ from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
-from .application import ApplicationMigration, ApplicationPaths, ApplicationRuntime
+from .application import (
+    ApplicationMigration,
+    ApplicationPaths,
+    ApplicationRunOutcome,
+    ApplicationRuntime,
+)
 from .configuration import ConfigurationManager
 from .errors import Problem, log_problem
 from .interaction import ConsoleInteraction
@@ -61,7 +66,11 @@ async def run_application_async() -> None:  # pylint: disable=too-many-branches
             if runtime is None:
                 runtime = _build_runtime(workspace, paths, repository, interaction)
             try:
-                await runtime.run_async()
+                outcome = await runtime.run_async()
+                if outcome is ApplicationRunOutcome.CONVERSATION_STOPPED:
+                    await runtime.close_async()
+                    runtime = None
+                    continue
             except WorkspaceSwitchRequested as request:
                 previous = workspace
                 try:

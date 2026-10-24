@@ -17,7 +17,11 @@ from loop import (
     CompletionValue,
     Interaction,
 )
-from loop.conversation.commands import ConversationCommands, ConversationControl
+from loop.conversation.commands import (
+    ConversationCommands,
+    ConversationControl,
+    ConversationRecoveryCommands,
+)
 from loop.conversation.models import (
     ConversationStatus,
     PendingInputPriorityOutcome,
@@ -42,6 +46,8 @@ def test_provider_declares_state_capabilities_and_response_completion():
 
     assert [registration.function.__name__ for registration in registrations] == [
         "interrupt",
+        "pause",
+        "stop",
         "respond",
         "status",
         "steer_async",
@@ -49,31 +55,142 @@ def test_provider_declares_state_capabilities_and_response_completion():
         "edit_async",
         "edit_async",
     ]
-    assert registrations[3].name == "steer"
-    assert registrations[4].name == "queue"
+    assert registrations[1].capabilities == frozenset({CommandCapability.RUN_ACTIVE})
+    assert registrations[2].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
+    assert registrations[5].name == "steer"
+    assert registrations[6].name == "queue"
     assert registrations[0].capabilities == frozenset({CommandCapability.RUN_ACTIVE})
-    assert registrations[1].capabilities == frozenset({CommandCapability.PENDING_RESPONSE})
-    assert registrations[2].capabilities == frozenset(
+    assert registrations[3].capabilities == frozenset({CommandCapability.PENDING_RESPONSE})
+    assert registrations[4].capabilities == frozenset(
         {CommandCapability.CONVERSATION_ACTIVE, CommandCapability.CONTEXT_READ}
     )
-    assert registrations[3].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
-    assert registrations[4].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
-    assert registrations[5].name == "edit"
-    assert registrations[6].name == "recall"
     assert registrations[5].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
     assert registrations[6].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
-    assert registrations[1].completion.provider == control.response_completions
-    assert registrations[4].completion == CommandCompletion()
+    assert registrations[7].name == "edit"
+    assert registrations[8].name == "recall"
+    assert registrations[7].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
+    assert registrations[8].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
+    assert registrations[3].completion.provider == control.response_completions
+    assert registrations[6].completion == CommandCompletion()
 
 
 def test_control_protocol_declares_sync_and_async_control_methods():
     """The control contract preserves native sync methods beside async counterparts."""
     assert callable(ConversationControl.steer)
     assert callable(ConversationControl.queue)
+    assert callable(ConversationControl.request_pause)
+    assert callable(ConversationControl.stop_conversation)
     assert iscoroutinefunction(ConversationControl.steer_async)
     assert iscoroutinefunction(ConversationControl.queue_async)
     assert iscoroutinefunction(ConversationControl.reprioritize_latest_async)
     assert iscoroutinefunction(ConversationControl.recall_latest_async)
+
+
+def test_recovery_provider_declares_state_gated_async_commands():
+    """Continue requires a paused run while retry requires any pending recovery."""
+    registrations = ConversationRecoveryCommands(Mock()).get_commands()
+
+    assert [registration.name for registration in registrations] == ["continue", "retry"]
+    assert [registration.function.__name__ for registration in registrations] == [
+        "continue_async",
+        "retry_async",
+    ]
+    assert [registration.capabilities for registration in registrations] == [
+        frozenset({CommandCapability.RUN_PAUSED}),
+        frozenset({CommandCapability.RECOVERY_PENDING}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("paused", "pending", "warning", "info"),
+    [
+        (False, False, "There is no paused run to continue.", None),
+        (True, True, "Recovery remains pending; use /retry to try again.", None),
+        (True, False, None, "Paused run continued."),
+    ],
+)
+def test_continue_reports_recovery_results(command_context, paused, pending, warning, info):
+    """Continue requires a paused run and reports whether recovery completed."""
+    context, interaction = command_context
+    control = Mock(recovery_paused=paused)
+    control.recover_pending_async = AsyncMock(return_value=pending)
+
+    asyncio.run(ConversationRecoveryCommands(control).continue_async(context))
+
+    assert control.recover_pending_async.await_count == int(paused)
+    if warning is not None:
+        interaction.warning.assert_called_once_with(warning)
+    else:
+        interaction.warning.assert_not_called()
+    if info is not None:
+        interaction.info.assert_called_once_with(info)
+    else:
+        interaction.info.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("recovery_pending", "pending", "warning", "info"),
+    [
+        (False, False, "There is nothing to retry.", None),
+        (True, True, "Recovery remains pending; use /retry to try again.", None),
+        (True, False, None, "Recovery completed."),
+    ],
+)
+def test_retry_reports_recovery_results(command_context, recovery_pending, pending, warning, info):
+    """Retry is available only for pending recovery and reports its final state."""
+    context, interaction = command_context
+    control = Mock(recovery_pending=recovery_pending)
+    control.recover_pending_async = AsyncMock(return_value=pending)
+
+    asyncio.run(ConversationRecoveryCommands(control).retry_async(context))
+
+    assert control.recover_pending_async.await_count == int(recovery_pending)
+    if warning is not None:
+        interaction.warning.assert_called_once_with(warning)
+    else:
+        interaction.warning.assert_not_called()
+    if info is not None:
+        interaction.info.assert_called_once_with(info)
+    else:
+        interaction.info.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("accepted", "method", "message"),
+    [
+        (True, "info", "Pause requested; waiting for the active operation to settle."),
+        (False, "warning", "No agent run is active."),
+    ],
+)
+def test_pause_reports_the_run_control_outcome(command_context, accepted, method, message):
+    """Pause feedback distinguishes an accepted request from an inactive run."""
+    context, interaction = command_context
+    control = Mock()
+    control.request_pause.return_value = accepted
+
+    ConversationCommands(control).pause(context)
+
+    control.request_pause.assert_called_once_with()
+    getattr(interaction, method).assert_called_once_with(message)
+
+
+@pytest.mark.parametrize(
+    ("accepted", "method", "message"),
+    [
+        (True, "info", "Stopping this conversation after owned work settles..."),
+        (False, "warning", "The conversation is already stopping."),
+    ],
+)
+def test_stop_reports_the_conversation_outcome(command_context, accepted, method, message):
+    """Stop feedback distinguishes an accepted conversation stop from an existing stop."""
+    context, interaction = command_context
+    control = Mock()
+    control.stop_conversation.return_value = accepted
+
+    ConversationCommands(control).stop(context)
+
+    control.stop_conversation.assert_called_once_with()
+    getattr(interaction, method).assert_called_once_with(message)
 
 
 def test_respond_argument_completes_the_pending_response_values():

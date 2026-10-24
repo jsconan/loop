@@ -131,6 +131,7 @@ class SessionManager:
     _commit_lock: Lock
     _async_commit_lock: asyncio.Lock
     _recovery_pending: bool
+    _recovery_paused: bool
 
     def __init__(
         self,
@@ -147,6 +148,7 @@ class SessionManager:
         self._commit_lock = Lock()
         self._async_commit_lock = asyncio.Lock()
         self._recovery_pending = False
+        self._recovery_paused = False
         if workspace_id == "":
             raise ValueError("Workspace identifier must not be empty.")
         self._workspace_id = workspace_id
@@ -534,6 +536,29 @@ class SessionManager:
         if not isinstance(pending, bool):
             raise TypeError("Recovery pending state must be a boolean.")
         self._recovery_pending = pending
+
+    @property
+    def recovery_paused(self) -> bool:
+        """Return whether the pending recovery boundary came from an explicit pause.
+
+        Returns:
+            bool: Whether the current process paused the run before it settled.
+        """
+        return self._recovery_paused
+
+    @recovery_paused.setter
+    def recovery_paused(self, paused: bool) -> None:
+        """Set the runtime-only pause state used to expose continue controls.
+
+        Args:
+            paused (bool): Whether the pending run was paused in this runtime.
+
+        Raises:
+            TypeError: If paused is not a boolean.
+        """
+        if not isinstance(paused, bool):
+            raise TypeError("Recovery paused state must be a boolean.")
+        self._recovery_paused = paused
 
     def begin_run(self) -> RunStartedEvent:
         """Persist a unique run identity before invoking model or tool work.
@@ -1057,6 +1082,7 @@ class SessionManager:
                 )
         self._session = session
         self._recovery_pending = session.recovery_state() is not None
+        self._recovery_paused = False
 
     def load_persisted_session(self, session_id: str) -> Session:
         """Read a persisted session without changing the active session.
@@ -1096,6 +1122,7 @@ class SessionManager:
             workspace_id=self._workspace_id,
         )
         self._recovery_pending = False
+        self._recovery_paused = False
 
     def rename_session(self, name: str) -> None:
         """Assign and persist a user-controlled name to the active session.

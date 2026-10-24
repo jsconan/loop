@@ -16,19 +16,21 @@ When installed as a `uv` tool, run it from any directory with:
 loop
 ```
 
-Enter a message at the `You:` prompt. To stop, enter `/exit`, `/quit`, or `q`.
+Enter a message at the `You:` prompt. Use `/stop` to end the current conversation and return to the session flow. Use `/exit`, `/quit`, or `q` to leave the application.
 
 The editor stays available while the agent works. Plain text follows `conversation.input_mode`, which defaults to queueing a follow-up; set it to `steer` to interrupt the active run with plain text. `/queue <message>` and `/steer <message>` select a priority explicitly. `/queue` and `/steer` without text change the newest message still waiting in the mailbox. `/status` reports whether Loop is idle, working, waiting for a response, or interrupting, along with the number of queued inputs.
 
 Use `/interrupt` to end the active agent run while keeping the conversation open. Existing queued follow-ups remain accepted and run afterward. Use `/steer <message>` to interrupt the active run and process a correction before those follow-ups. Multiple accepted corrections retain their submission order. `/edit` or `/recall` removes the newest waiting message and places its text in the editor; submitting it creates a new queued input. Cancelling the editor leaves the recalled input removed. Queue and steering arguments remain message text even when they begin with `/`.
 
-Interruption acts at the next safe boundary. Partial model output is discarded, completed tool results are preserved, and remaining tool calls receive explicit interruption results instead of being executed. An uncertain external outcome stays marked unknown. Pending approval requests are revoked; corrections never grant tool permission. New work retains normal authorization, recovery, and turn-limit checks. The interrupted run is recorded as cancelled.
+Use `/pause` to stop the active run at a safe boundary and keep its durable state available for `/continue`. Use `/retry` after a recoverable run failure or after declining startup recovery. Continue and retry use the same recovery procedure; a tool call with an unknown external outcome still asks before it is repeated. `/stop` returns to a fresh conversation flow where `/resume` can reopen a saved session. Accepted queued messages remain in that session until it is reopened.
+
+Interruption acts at the next safe boundary. Partial model output is discarded, completed tool results are preserved, and remaining tool calls receive explicit interruption results instead of being executed. An uncertain external outcome stays marked unknown. Pending approval requests are revoked; corrections never grant tool permission. New work retains normal authorization, recovery, and turn-limit checks. `/interrupt` records a cancelled run; `/pause` leaves it incomplete for durable recovery.
 
 When a tool, command, or recovery operation asks a question, press Enter on an empty editor or use `/respond` to open that question's input prompt. Text already queued for the conversation never becomes an approval. An unsent editor draft stays intact when a question arrives. Startup questions appear before ordinary conversation input begins.
 
 Up to 16 inputs, including corrections, may wait behind active work. A full queue explicitly rejects further inputs; rejected steering does not interrupt the current run. With a durable session store, Loop saves accepted text before confirming queue admission and restores unconsumed inputs when that session is reopened. Recovery of an interrupted run comes first; queued follow-ups stay pending until recovery is resolved. Inputs are consumed atomically with their canonical user messages, and attached paths are resolved and snapshotted at that point. Memory-only sessions cannot restore inputs after process exit.
 
-Exit stops admission and cancels pending questions. Loop closes an interrupted model stream and checks cancellation before new model requests and tool execution, then waits for owned work to settle before releasing its services. Blocking model reads and synchronous tools finish their current operation under existing deadlines before observing interruption or shutdown; unbounded custom tools can delay either indefinitely. Such tools must impose their own deadlines. Immediate cancellation of arbitrary tools requires a cancellable execution contract rather than terminating their worker thread.
+Stop and exit close input admission and cancel pending questions. `/stop` ends the current conversation and returns to the application session flow; `/exit` and `/quit` end the application. Loop closes an interrupted model stream and checks cancellation before new model requests and tool execution, then waits for owned work to settle before releasing its services. Blocking model reads and synchronous tools finish their current operation under existing deadlines before observing interruption or shutdown; unbounded custom tools can delay either indefinitely. Such tools must impose their own deadlines. Immediate cancellation of arbitrary tools requires a cancellable execution contract rather than terminating their worker thread.
 
 ### Commands and completion
 
@@ -66,7 +68,7 @@ For sandbox behavior and approval requirements, see [Built-in tools and command 
 
 Each session records an ordered history of messages, tool calls, compactions, permission decisions, and completed-run statistics. Run statistics include token use and latency by model, tool durations and results, active time, message counts, and context use. `/resume` displays this history and the permission prompts shown at the time. Past permission decisions are shown for reference and never become current grants.
 
-If Loop finds history from an incomplete run at startup or during `/resume`, it offers to recover before accepting another message. It continues from the last saved boundary, and does not silently repeat a tool call whose external outcome is unknown. If you decline an explicit retry, Loop records an interrupted result so the model can account for it.
+If Loop finds history from an incomplete run at startup or during `/resume`, it offers to recover before accepting another message. If you decline, `/retry` starts recovery later. `/continue` resumes a run paused with `/pause`. Both continue from the last saved boundary and do not silently repeat a tool call whose external outcome is unknown; those calls require per-tool confirmation.
 
 Common session commands:
 
@@ -98,7 +100,7 @@ Examples:
 /sessions export <session-id> ./saved-session.md format=archive
 ```
 
-Other useful commands: `/use` loads a skill for later requests; `/tools` lists tools or `/tools call <tool> [arguments]` invokes one; `/skills` shows active and discoverable skills; `/call <tool> [arguments]` invokes a tool directly; `/check` checks backend and model availability. Use `/help` for command help, and `/exit` or `/quit` to stop Loop.
+Other useful commands: `/use` loads a skill for later requests; `/tools` lists tools or `/tools call <tool> [arguments]` invokes one; `/skills` shows active and discoverable skills; `/call <tool> [arguments]` invokes a tool directly; `/check` checks backend and model availability. Use `/help` for command help, `/stop` to return to the session flow, and `/exit` or `/quit` to leave Loop.
 
 ### Use sessions from Python
 
@@ -245,7 +247,7 @@ async def chat(backend):
 
 Synchronous callers can pass a synchronous conversation callback to `controller.run()`. That entry point owns its asyncio loop and cannot be called from a thread that already has a running event loop; async callers should use `run_async()`.
 
-Each controller runs once. The injected `RunControl` owns a scoped interrupt for each agent run: `interrupt()` returns whether an active run accepted the signal, and `active` and `interrupted` report its state. `execution()` brackets custom interruptible work; `checkpoint()` and `wait()` raise `RunInterrupted` inside that scope. The runner converts this signal into a persisted cancelled run after settling tool results. The UI controls also revoke outstanding questions. A scoped interrupt clears on settlement; shutdown remains sticky.
+Each controller runs once. The injected `RunControl` owns a scoped interrupt or pause for each agent run: `interrupt()` and `pause()` report whether an active run accepted the signal, and `active`, `interrupted`, and `paused` report its state. `execution()` brackets custom interruptible work; `checkpoint()` and `wait()` raise `RunInterrupted` inside that scope. An interrupt records a cancelled run; a pause leaves its durable run boundary incomplete for recovery. The UI controls also revoke outstanding questions. Scoped signals clear on settlement; shutdown remains sticky.
 
 `stop()` can request shutdown from the UI or another thread; `running` stays true until owned execution has settled. Do not directly mutate conversation services while it runs. Synchronous interaction adapters continue to use the existing direct `Loop.run()` path. `ApplicationRuntime` selects mailbox execution when its UI implements `AsyncInteractionInput` and refuses to close services while execution is active. Use `close()` for a synchronous runtime and await `close_async()` for a runtime that initialized asynchronous resources, on their owning event loop before it closes.
 

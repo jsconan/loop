@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Self
 
 from . import constants
-from .agent import Agent, AgentRunner, AgentRunResult
+from .agent import Agent, AgentRunner, AgentRunRecoveryRequired, AgentRunResult
 from .backend import Backend, GenerationHyperparameters
 from .commands import CommandManager, CommandsProvider
 from .compaction import CompactionCommands, ContextCompaction
@@ -25,7 +25,7 @@ from .interaction import Interaction, require_async_interaction
 from .mentions import MentionManager, ProjectPathMentionHandler
 from .mentions.parser import parse_mentions
 from .model_selection import ModelCommands, ModelSelection
-from .models import ConversationItem, ReasoningEffort, SteeringMessage
+from .models import AgentRunStopReason, ConversationItem, ReasoningEffort, SteeringMessage
 from .permissions import PermissionCommands, PermissionManager
 from .session import (
     BackendSessionNameGenerator,
@@ -39,6 +39,7 @@ from .tooling import ToolCommands, ToolRegistry
 from .utils import PathHolder, PathReference, find_project_root, has_running_event_loop
 
 _LOGGER = logging.getLogger(__name__)
+_RECOVERY_REQUIRED_ACTIVITY = "agent.run.recovery_required"
 
 
 class Loop:
@@ -507,6 +508,37 @@ class Loop:
         return self._session_manager.session
 
     @property
+    def recovery_pending(self) -> bool:
+        """Return whether the active session blocks ordinary input until recovery.
+
+        Returns:
+            bool: Whether an unresolved run requires recovery.
+        """
+        return self._session_manager.recovery_pending
+
+    @property
+    def recovery_paused(self) -> bool:
+        """Return whether the active session has a run paused in this runtime.
+
+        Returns:
+            bool: Whether the ``/continue`` command is available.
+        """
+        return self._session_manager.recovery_paused
+
+    async def recover_pending_async(self) -> bool:
+        """Run durable recovery after an explicit continue or retry command.
+
+        Returns:
+            bool: Whether recovery remains pending after the attempt.
+
+        Raises:
+            asyncio.CancelledError: If the recovery operation is cancelled.
+        """
+        if not self._session_manager.recovery_pending:
+            return False
+        return await self._recover_session_async(explicit=True)
+
+    @property
     def interaction(self) -> Interaction:
         """Return the service used for user input and output.
 
@@ -863,8 +895,20 @@ class Loop:
                             else None,
                         )
                         telemetry_activity("message.accepted", component="session_manager")
-                        result = await self._agent_runner.run_async()
-                        await self._complete_agent_run_async(result)
+                        try:
+                            result = await self._agent_runner.run_async()
+                        except AgentRunRecoveryRequired:
+                            self._session_manager.recovery_pending = True
+                            self._session_manager.recovery_paused = False
+                            telemetry_activity(
+                                _RECOVERY_REQUIRED_ACTIVITY,
+                                component="loop",
+                            )
+                            self._interaction.warning(
+                                "The agent run remains recoverable. Use /retry to continue it."
+                            )
+                        else:
+                            await self._complete_agent_run_async(result)
                 finally:
                     if self._skill_hints_enabled:
                         await self._clear_skill_catalog_priorities_async()
@@ -904,7 +948,15 @@ class Loop:
         if result.metrics is None:
             raise TypeError("Agent run did not produce completion metrics.")
         self._interaction.run_metrics(result.metrics)
-        if result.stop_reason not in {"completed", "steered"}:
+        self._session_manager.recovery_pending = (
+            result.stop_reason == AgentRunStopReason.PAUSED
+            or self._session_manager.recovery_state is not None
+        )
+        self._session_manager.recovery_paused = result.stop_reason == AgentRunStopReason.PAUSED
+        if result.stop_reason not in {
+            AgentRunStopReason.COMPLETED,
+            AgentRunStopReason.STEERED,
+        }:
             return
 
         if self._run_control is not None:
@@ -917,7 +969,15 @@ class Loop:
         if result.metrics is None:
             raise TypeError("Agent run did not produce completion metrics.")
         self._interaction.run_metrics(result.metrics)
-        if result.stop_reason not in {"completed", "steered"}:
+        self._session_manager.recovery_pending = (
+            result.stop_reason == AgentRunStopReason.PAUSED
+            or self._session_manager.recovery_state is not None
+        )
+        self._session_manager.recovery_paused = result.stop_reason == AgentRunStopReason.PAUSED
+        if result.stop_reason not in {
+            AgentRunStopReason.COMPLETED,
+            AgentRunStopReason.STEERED,
+        }:
             return
 
         if self._run_control is not None:
@@ -930,11 +990,35 @@ class Loop:
         recovery = self._agent_runner.recover_session()
         if recovery.result is not None:
             self._complete_agent_run(recovery.result)
-        self._session_manager.recovery_pending = recovery.pending
+        paused = (
+            recovery.result is not None and recovery.result.stop_reason == AgentRunStopReason.PAUSED
+        )
+        self._session_manager.recovery_pending = recovery.pending or paused
+        self._session_manager.recovery_paused = paused
 
-    async def _recover_session_async(self) -> None:
-        """Recover an interrupted run through async permission and recovery prompts."""
-        recovery = await self._agent_runner.recover_session_async()
+    async def _recover_session_async(self, *, explicit: bool = False) -> bool:
+        """Recover an interrupted run through its existing async recovery procedure."""
+        try:
+            recovery = (
+                await self._agent_runner.recover_session_async(confirmed=True)
+                if explicit
+                else await self._agent_runner.recover_session_async()
+            )
+        except AgentRunRecoveryRequired:
+            self._session_manager.recovery_pending = True
+            self._session_manager.recovery_paused = False
+            telemetry_activity(_RECOVERY_REQUIRED_ACTIVITY, component="loop")
+            if not explicit:
+                self._interaction.warning(
+                    "Recovery remains pending after a recoverable failure. Use /retry to try again."
+                )
+            return True
         if recovery.result is not None:
             await self._complete_agent_run_async(recovery.result)
-        self._session_manager.recovery_pending = recovery.pending
+        paused = (
+            recovery.result is not None and recovery.result.stop_reason == AgentRunStopReason.PAUSED
+        )
+        pending = recovery.pending or paused
+        self._session_manager.recovery_pending = pending
+        self._session_manager.recovery_paused = paused
+        return pending

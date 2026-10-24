@@ -13,7 +13,7 @@ class AgentRunResult(BaseModel):
             response completed.
         turns (int): Number of completed model turns in the run.
         stop_reason (AgentRunStopReason): Reason control returned to the caller.
-        metrics (RunMetrics | None): Persisted run statistics after completion.
+        metrics (RunMetrics | None): Statistics collected before control returned.
     """
 
     final_response: Response | None
@@ -32,3 +32,7 @@ class AgentRecoveryStatus(BaseModel):
 
     pending: bool
     result: AgentRunResult | None = None
+
+
+class AgentRunRecoveryRequired(Exception):
+    """Signal that a recoverable agent failure left a durable run boundary unresolved."""

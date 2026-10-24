@@ -684,9 +684,11 @@ def test_manager_exposes_durable_recovery_classification():
 
     assert manager.recovery_state.action == "query_model"
     assert manager.recovery_pending is True
+    assert manager.recovery_paused is False
     manager.new_session()
     assert manager.recovery_state is None
     assert manager.recovery_pending is False
+    assert manager.recovery_paused is False
 
 
 def test_manager_updates_the_shared_recovery_gate():
@@ -703,8 +705,15 @@ def test_manager_updates_the_shared_recovery_gate():
     manager.recovery_pending = False
     assert manager.recovery_pending is False
 
+    manager.recovery_paused = True
+    assert manager.recovery_paused is True
+    manager.recovery_paused = False
+    assert manager.recovery_paused is False
+
     with pytest.raises(TypeError, match="must be a boolean"):
         manager.recovery_pending = 1
+    with pytest.raises(TypeError, match="must be a boolean"):
+        manager.recovery_paused = 1
 
 
 def test_manager_rejects_overlapping_execution_and_releases_normal_ownership():

@@ -112,8 +112,9 @@ class SessionController:
     All domain operations stay on one execution thread. The UI owns prompts, presentation, and a
     bounded input mailbox. Bound sessions retain accepted inputs until consumption or rejection.
     Plain text during an active run follows the configured queue or steering mode. Explicit
-    ``/steer`` interrupts immediately; ``/queue`` queues input after the run. Each controller runs
-    once.
+    ``/steer`` interrupts immediately; ``/queue`` queues input after the run. ``/pause`` preserves
+    an incomplete durable run for recovery, while ``/stop`` ends this conversation without setting
+    the application exit command. Each controller runs once.
 
     Args:
         interaction (Interaction): UI implementing ``AsyncInteractionInput`` as well as output.
@@ -145,6 +146,7 @@ class SessionController:
     _idle: bool
     _used: bool
     _ended: bool
+    _conversation_stop_requested: bool
     _ui_thread: int | None
     _terminal_owned: bool
     _stopping: bool
@@ -190,6 +192,7 @@ class SessionController:
         self._idle = True
         self._used = False
         self._ended = False
+        self._conversation_stop_requested = False
         self._ui_thread = None
         self._terminal_owned = False
         self._stopping = False
@@ -300,6 +303,18 @@ class SessionController:
             capabilities.add(CommandCapability.RUN_ACTIVE)
         if self._pending is not None:
             capabilities.add(CommandCapability.PENDING_RESPONSE)
+        if (
+            not self._control.active
+            and self._session_manager is not None
+            and self._session_manager.recovery_pending
+        ):
+            capabilities.add(CommandCapability.RECOVERY_PENDING)
+        if (
+            not self._control.active
+            and self._session_manager is not None
+            and self._session_manager.recovery_paused
+        ):
+            capabilities.add(CommandCapability.RUN_PAUSED)
         if not self._control.active and self._pending is None:
             capabilities.add(CommandCapability.SESSION_IDLE)
         return frozenset(capabilities)
@@ -321,6 +336,38 @@ class SessionController:
                 self._pending = None
         if self._answer_input is not None and self._loop is not None:
             self._loop.call_soon_threadsafe(self._answer_input.cancel)
+        return True
+
+    def request_pause(self) -> bool:
+        """Pause the current run and revoke its separate pending question.
+
+        Returns:
+            bool: Whether an active run accepted the pause request.
+        """
+        if not self._control.pause():
+            return False
+        telemetry_activity("conversation.run.pause_requested", component=_STATUS_COMPONENT)
+        request = self._pending
+        if request is not None:
+            if not request.result.done():
+                request.result.set_exception(RunInterrupted())
+            if self._pending is request:
+                self._pending = None
+        if self._answer_input is not None and self._loop is not None:
+            self._loop.call_soon_threadsafe(self._answer_input.cancel)
+        return True
+
+    def stop_conversation(self) -> bool:
+        """Stop this conversation without requesting application exit.
+
+        Returns:
+            bool: Whether the stop request was accepted.
+        """
+        if self._stopping or self._ended or self._control.stopped:
+            return False
+        self._conversation_stop_requested = True
+        telemetry_activity("conversation.stop_requested", component=_STATUS_COMPONENT)
+        self._stop()
         return True
 
     def request_response(self, answer: str | None = None) -> ResponseOutcome:
@@ -432,7 +479,15 @@ class SessionController:
             ConversationStatus: Current activity and pending ordinary input count.
         """
         state = (
-            "Interrupting"
+            "Paused"
+            if not self._control.active
+            and self._session_manager is not None
+            and self._session_manager.recovery_paused
+            else "Recovery pending"
+            if not self._control.active
+            and self._session_manager is not None
+            and self._session_manager.recovery_pending
+            else "Interrupting"
             if self._control.interrupted
             else "Cancelling"
             if self._control.cancelling
@@ -746,7 +801,7 @@ class SessionController:
 
     @property
     def control(self) -> RunControl:
-        """Return shutdown and scoped interruption control for the conversation's agent runner.
+        """Return shutdown, interruption, and pause control for the conversation's agent runner.
 
         Returns:
             RunControl: Cancellation signals shared with the serialized execution owner.
@@ -761,6 +816,15 @@ class SessionController:
             bool: Whether the controller has started and not yet settled.
         """
         return self._loop is not None
+
+    @property
+    def conversation_stop_requested(self) -> bool:
+        """Return whether the user ended this conversation through ``/stop``.
+
+        Returns:
+            bool: Whether control should return to the application session flow.
+        """
+        return self._conversation_stop_requested
 
     def stop(self) -> None:
         """Request safe shutdown from the UI or another thread.
@@ -1121,10 +1185,18 @@ class SessionController:
         events = cast(asyncio.Queue, self._events)
         incoming = asyncio.create_task(events.get())
         typing = None
+        active_waiter = None
         typing_bypass_commands = False
         worker_done = False
         try:
             while True:
+                if (
+                    not worker_done
+                    and not self._control.stopped
+                    and active_waiter is None
+                    and self._idle_command_pending
+                ):
+                    active_waiter = asyncio.create_task(self._control.wait_until_active_async())
                 if (
                     not worker_done
                     and self._ready
@@ -1159,10 +1231,19 @@ class SessionController:
                 command_task = self._command_task
                 if command_task is not None:
                     watched.add(command_task)
+                if active_waiter is not None:
+                    watched.add(active_waiter)
                 done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
                 if incoming in done:
                     event = incoming.result()
                     incoming = asyncio.create_task(events.get())
+                    if (
+                        isinstance(event, RunStateChanged)
+                        and event.state is ConversationRunState.IDLE
+                        and active_waiter is not None
+                    ):
+                        active_waiter.cancel()
+                        active_waiter = None
                     if (
                         isinstance(event, InteractionCall)
                         and event.kind not in {EVENT_OUTPUT, EVENT_TERMINAL_EXIT}
@@ -1206,6 +1287,10 @@ class SessionController:
                     if completion.error is not None:
                         raise completion.error
                     worker_done = True
+                if active_waiter is not None and active_waiter in done:
+                    active_waiter.result()
+                    self._idle_command_pending = False
+                    active_waiter = None
                 if command_task is not None and command_task in done:
                     self._command_task = None
                     command_task.result()
@@ -1223,8 +1308,13 @@ class SessionController:
                 await self._deliver_async(incoming.result())
             if typing is not None:
                 typing.cancel()
+            if active_waiter is not None:
+                active_waiter.cancel()
             await asyncio.gather(
-                incoming, *([typing] if typing is not None else []), return_exceptions=True
+                incoming,
+                *([typing] if typing is not None else []),
+                *([active_waiter] if active_waiter is not None else []),
+                return_exceptions=True,
             )
             self._message_input = None
 
@@ -1314,7 +1404,11 @@ class SessionController:
             return
         if value == "":
             self._source.warning("Please enter a message!")
-        elif self._session_manager is not None and self._session_manager.recovery_pending:
+        elif (
+            self._session_manager is not None
+            and self._session_manager.recovery_pending
+            and not self._control.active
+        ):
             self._source.warning(
                 "Recover the interrupted run or start a new session before sending a message."
             )

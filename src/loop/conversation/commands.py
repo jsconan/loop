@@ -29,6 +29,20 @@ class ConversationControl(Protocol):
             bool: Whether an active run accepted the interruption request.
         """
 
+    def request_pause(self) -> bool:
+        """Pause an active run while leaving the conversation available.
+
+        Returns:
+            bool: Whether an active run accepted the pause request.
+        """
+
+    def stop_conversation(self) -> bool:
+        """End the current conversation and return control to the application.
+
+        Returns:
+            bool: Whether the conversation accepted the stop request.
+        """
+
     def request_response(self, answer: str | None = None) -> ResponseOutcome:
         """Submit a direct response when the native prompt does not own input.
 
@@ -133,6 +147,36 @@ class ConversationControl(Protocol):
         """
 
 
+class ConversationRecoveryControl(Protocol):
+    """Describe recovery state and the shared recovery operation for conversation commands."""
+
+    @property
+    def recovery_pending(self) -> bool:
+        """Return whether this conversation still requires run recovery.
+
+        Returns:
+            bool: Whether the current session blocks ordinary user input.
+        """
+
+    @property
+    def recovery_paused(self) -> bool:
+        """Return whether the unresolved run was paused in the current runtime.
+
+        Returns:
+            bool: Whether ``/continue`` is available.
+        """
+
+    async def recover_pending_async(self) -> bool:
+        """Run the existing durable recovery procedure.
+
+        Returns:
+            bool: Whether recovery remains pending after the attempt.
+
+        Raises:
+            asyncio.CancelledError: If the recovery operation is cancelled.
+        """
+
+
 class ConversationCommands:
     """Register user-facing controls for an asynchronous conversation.
 
@@ -155,6 +199,14 @@ class ConversationCommands:
             CommandRegistration(
                 self.interrupt,
                 capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
+            ),
+            CommandRegistration(
+                self.pause,
+                capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
+            ),
+            CommandRegistration(
+                self.stop,
+                capabilities=frozenset({CommandCapability.CONVERSATION_ACTIVE}),
             ),
             CommandRegistration(
                 self.respond,
@@ -203,6 +255,28 @@ class ConversationCommands:
             )
         else:
             context.interaction.warning("No agent run is active.")
+
+    def pause(self, context: CommandContext) -> None:
+        """Pause the active run while preserving its durable continuation point.
+
+        Args:
+            context (CommandContext): Interaction used to report the outcome.
+        """
+        if self._control.request_pause():
+            context.interaction.info("Pause requested; waiting for the active operation to settle.")
+        else:
+            context.interaction.warning("No agent run is active.")
+
+    def stop(self, context: CommandContext) -> None:
+        """End the current conversation and return to the application session flow.
+
+        Args:
+            context (CommandContext): Interaction used to report the outcome.
+        """
+        if self._control.stop_conversation():
+            context.interaction.info("Stopping this conversation after owned work settles...")
+        else:
+            context.interaction.warning("The conversation is already stopping.")
 
     def respond(
         self,
@@ -326,3 +400,69 @@ class ConversationCommands:
             context.interaction.warning("No pending message to edit.")
         else:
             context.interaction.info("Pending message moved to the editor.")
+
+
+class ConversationRecoveryCommands:
+    """Expose continue and retry controls for pending durable run recovery.
+
+    Args:
+        control (ConversationRecoveryControl): Loop state and recovery operation.
+    """
+
+    _control: ConversationRecoveryControl
+
+    def __init__(self, control: ConversationRecoveryControl) -> None:
+        self._control = control
+
+    def get_commands(self) -> tuple[CommandRegistration, ...]:
+        """Register recovery commands for their available runtime states.
+
+        Returns:
+            tuple[CommandRegistration, ...]: Continue and retry declarations.
+        """
+        return (
+            CommandRegistration(
+                self.continue_async,
+                name="continue",
+                capabilities=frozenset({CommandCapability.RUN_PAUSED}),
+            ),
+            CommandRegistration(
+                self.retry_async,
+                name="retry",
+                capabilities=frozenset({CommandCapability.RECOVERY_PENDING}),
+            ),
+        )
+
+    async def continue_async(self, context: CommandContext) -> None:
+        """Continue a run paused in this conversation runtime.
+
+        Args:
+            context (CommandContext): Interaction used to report recovery status.
+
+        Raises:
+            asyncio.CancelledError: If the recovery operation is cancelled.
+        """
+        if not self._control.recovery_paused:
+            context.interaction.warning("There is no paused run to continue.")
+            return
+        if await self._control.recover_pending_async():
+            context.interaction.warning("Recovery remains pending; use /retry to try again.")
+        else:
+            context.interaction.info("Paused run continued.")
+
+    async def retry_async(self, context: CommandContext) -> None:
+        """Retry recovery for a failed or resumed conversation.
+
+        Args:
+            context (CommandContext): Interaction used to report recovery status.
+
+        Raises:
+            asyncio.CancelledError: If the recovery operation is cancelled.
+        """
+        if not self._control.recovery_pending:
+            context.interaction.warning("There is nothing to retry.")
+            return
+        if await self._control.recover_pending_async():
+            context.interaction.warning("Recovery remains pending; use /retry to try again.")
+        else:
+            context.interaction.info("Recovery completed.")
