@@ -77,9 +77,10 @@ class ResponseOutcome(Enum):
 
 
 class InputAdmissionKind(Enum):
-    """Identify ordinary input and owner shutdown admissions."""
+    """Identify ordinary input, owner commands, and shutdown admissions."""
 
     MESSAGE = "message"
+    COMMAND = "command"
     STOP = "stop"
 
 
@@ -90,7 +91,8 @@ class InputAdmission:
     Args:
         priority (int): Queue priority, with steering ahead of ordinary queued input.
         sequence (int): Monotonic arrival order used to break priority ties.
-        kind (InputAdmissionKind): Whether this event carries a message or shutdown signal.
+        kind (InputAdmissionKind): Whether this event carries a message, command, or shutdown
+            signal.
         message (object | None): Submitted message or durable input envelope, or ``None`` for
             shutdown.
         input_id (str | None): Durable identity, when the input was accepted by a session store.

@@ -32,6 +32,47 @@ def test_mailbox_orders_inputs_and_enforces_capacity():
         mailbox.get_nowait()
 
 
+@pytest.mark.parametrize("commands_only", [False, True])
+def test_mailbox_reserves_bounded_command_capacity_and_parks_messages(commands_only):
+    """Recovery commands remain deliverable through a full ordinary input mailbox."""
+    mailbox = InputMailbox(1)
+    message = InputAdmission(0, 0, InputAdmissionKind.MESSAGE, "urgent")
+    command = InputAdmission(1, 0, InputAdmissionKind.COMMAND, "/continue")
+    mailbox.try_put(message)
+    assert mailbox.try_put(command)
+    with pytest.raises(Full):
+        mailbox.try_put(InputAdmission(1, 1, InputAdmissionKind.COMMAND, "/retry"))
+    with pytest.raises(Full):
+        mailbox.try_put(InputAdmission(1, 2, InputAdmissionKind.MESSAGE, "overflow"))
+    assert mailbox.get_nowait(commands_only=commands_only) is (
+        command if commands_only else message
+    )
+    if commands_only:
+        with pytest.raises(Empty):
+            mailbox.get_nowait(commands_only=True)
+    assert mailbox.get_nowait() is (message if commands_only else command)
+
+
+def test_mailbox_wait_parks_existing_messages_until_a_command_arrives(monkeypatch):
+    """A waiter ignores parked messages and wakes on a newly admitted command."""
+    mailbox = InputMailbox(1)
+    message = InputAdmission(0, 0, InputAdmissionKind.MESSAGE, "parked")
+    command = InputAdmission(1, 1, InputAdmissionKind.COMMAND, "/continue")
+    mailbox.try_put(message)
+    original_wait = mailbox_module.Condition.wait
+
+    def admit_command(condition, timeout=None):
+        """Admit a command at the condition boundary without waiting for elapsed time."""
+        mailbox.try_put(command)
+        return True
+
+    monkeypatch.setattr(mailbox_module.Condition, "wait", admit_command)
+    assert mailbox.wait_until_not_empty(commands_only=True)
+    monkeypatch.setattr(mailbox_module.Condition, "wait", original_wait)
+    assert mailbox.get_nowait(commands_only=True) is command
+    assert mailbox.get_nowait() is message
+
+
 def test_mailbox_validates_positive_capacity():
     """Reject a mailbox capacity that cannot hold an input."""
     with pytest.raises(ValueError, match="capacity must be positive"):

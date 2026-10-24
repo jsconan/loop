@@ -68,7 +68,11 @@ from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
 from loop.conversation import ConversationCommands, ConversationRecoveryCommands
-from loop.conversation.models import AdmittedConversationInput
+from loop.conversation.models import (
+    AdmittedConversationInput,
+    PendingInputPriorityOutcome,
+    PendingInputRecallOutcome,
+)
 from loop.models import SteeringMessage
 from loop.permissions import PermissionLoadFailure
 from loop.session import GeneratedSessionName, LocalSessionNameGenerator
@@ -1638,6 +1642,228 @@ def test_async_cold_stop_keeps_recovery_pending_in_session_history(tmp_path):
     assert loop._session_manager.recovery_state.action == "query_model"
 
 
+@pytest.mark.parametrize("edit_pending", [False, True])
+@pytest.mark.parametrize("synchronous", [False, True])
+@pytest.mark.parametrize("boundary", ["stopped", "max_turns", "recovery_required"])
+def test_recovery_keeps_full_mailbox_inputs_until_the_owner_can_consume_them(
+    tmp_path, synchronous, boundary, edit_pending
+):
+    """Recovery commands bypass parked input without losing or duplicating accepted messages."""
+    source = MagicMock(spec=ConsoleInteraction)
+    source.response_context.side_effect = nullcontext
+    controller = SessionController(source)
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    sessions = SessionManager(
+        interaction=controller.interaction, session_store=store, workspace_id="workspace"
+    )
+    controller.bind_session_manager(sessions)
+    started, recovery_wait, complete = (asyncio.Event() for _ in range(3))
+    release = Event() if synchronous else asyncio.Event()
+    prompt_count = 0
+    capacity = 16
+    expected = [f"queued {index}" for index in range(capacity)]
+    recovery_inputs = []
+
+    def response(**kwargs):
+        """Observe canonical input at recovery and return a complete response."""
+        if not recovery_inputs:
+            recovery_inputs.extend(item.content for item in sessions.messages)
+        return [
+            ResponseCompleted(answer="answer", items=(Message(role="assistant", content="answer"),))
+        ]
+
+    async def response_async(**kwargs):
+        """Expose the same deterministic model boundary to the native async owner."""
+        for event in response(**kwargs):
+            yield event
+
+    loop = Loop.create_default(
+        backend=loop_backend(get_response=response, get_response_async=response_async),
+        interaction=controller.interaction,
+        session_manager=sessions,
+        run_control=controller.control,
+        working_directory=tmp_path,
+        session_name_generator=LocalSessionNameGenerator(),
+    )
+    loop.register_command_provider(ConversationCommands(controller))
+    loop.register_command_provider(ConversationRecoveryCommands(loop))
+    controller.bind_command_manager(loop.command_manager)
+    session_id = sessions.session.id
+    loop.agent_runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    loop.agent_runner.compaction.compact_if_needed = Mock(return_value=False)
+    owner_loop = None
+
+    def signal(event):
+        """Wake scripted input on its UI loop from either conversation ownership mode."""
+        owner_loop.call_soon_threadsafe(event.set)
+
+    def metrics(value):
+        """End scripted input only after every follow-up has a committed run."""
+        users = [
+            item.content
+            for item in sessions.messages
+            if isinstance(item, Message) and item.role == "user"
+        ]
+        if users == ["first", *expected] and not sessions.recovery_pending:
+            complete.set()
+
+    source.run_metrics.side_effect = metrics
+
+    async def prompt(*args, **kwargs):
+        """Fill ordinary capacity, then issue recovery through the reserved command slot."""
+        nonlocal prompt_count, owner_loop
+        owner_loop = asyncio.get_running_loop()
+        prompt_count += 1
+        if prompt_count == 1:
+            return "first"
+        if prompt_count == 2:
+            await started.wait()
+            for message in expected:
+                assert await controller.queue_async(message, source)
+            release.set()
+            await recovery_wait.wait()
+            if edit_pending:
+                recalled_id = sessions.session.pending_inputs[-1].input_id
+                assert await controller.recall_latest_async() is PendingInputRecallOutcome.RECALLED
+                expected.pop()
+                assert all(item.input_id != recalled_id for item in sessions.session.pending_inputs)
+                assert (
+                    await controller.reprioritize_latest_async(steer=True)
+                    is PendingInputPriorityOutcome.UPDATED
+                )
+                expected.insert(0, expected.pop())
+                expected.append("edited follow-up")
+                assert await controller.queue_async(expected[-1], source)
+                assert sessions.session.pending_inputs[-1].input_id != recalled_id
+            assert sum(event.type == "input_delivered" for event in sessions.session.events) == 1
+            return "/retry" if boundary == "recovery_required" else "/continue"
+        await complete.wait()
+        return False
+
+    source.prompt_async.side_effect = prompt
+
+    def boundary_result(run):
+        """Create one recoverable boundary without replacing subsequent runner behavior."""
+        if boundary == "max_turns":
+            sessions.record_run(
+                boundary,
+                run.started_at,
+                RunMetrics(
+                    active_duration_seconds=0,
+                    model_duration_seconds=0,
+                    tool_duration_seconds=0,
+                    message_count=1,
+                    item_count=1,
+                ),
+            )
+        elif boundary == "recovery_required":
+            sessions.record_run_failure()
+        return AgentRunResult(
+            final_response=None,
+            turns=0,
+            stop_reason=boundary,
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+
+    original_run = loop.agent_runner.run
+    original_run_async = loop.agent_runner.run_async
+
+    def stop_run():
+        """Hold one synchronous run while input is admitted, then preserve its boundary."""
+        loop.agent_runner.run = original_run
+        run = sessions.begin_run()
+        with controller.control.execution():
+            signal(started)
+            release.wait()
+        return boundary_result(run)
+
+    async def stop_run_async():
+        """Hold one async run while input is admitted, then preserve its boundary."""
+        loop.agent_runner.run_async = original_run_async
+        run = await sessions.begin_run_async()
+        with controller.control.execution(async_owner=True):
+            signal(started)
+            await release.wait()
+        return boundary_result(run)
+
+    def conversation(receive):
+        """Observe the stopped owner's next input boundary without changing its reader."""
+
+        def read(completer):
+            """Expose the recovery wait while retaining the controller's durable reader."""
+            if sessions.recovery_pending and not controller.control.active:
+                signal(recovery_wait)
+            return receive(completer)
+
+        loop.run(input_source=read)
+
+    async def conversation_async(receive):
+        """Observe async recovery input and retain the actual loop and controller handoff."""
+
+        async def read(completer):
+            """Expose the recovery wait before forwarding the durable input request."""
+            if sessions.recovery_pending and not controller.control.active:
+                signal(recovery_wait)
+            return await receive(completer)
+
+        await loop.run_async(input_source=read)
+
+    loop.agent_runner.run = stop_run
+    loop.agent_runner.run_async = stop_run_async
+    with patch("loop.conversation.controller.patch_stdout", lambda **kwargs: nullcontext()):
+        if synchronous:
+            controller.run(conversation, route_idle_commands=True)
+        else:
+            asyncio.run(controller.run_async(conversation_async, route_idle_commands=True))
+
+    assert recovery_inputs == ["first"]
+    saved = store.load(session_id)
+    assert [
+        item.content for item in saved.messages if isinstance(item, Message) and item.role == "user"
+    ] == ["first", *expected]
+    assert saved.pending_inputs == ()
+    assert sum(event.type == "input_consumed" for event in saved.events) == capacity + 1
+    assert sum(event.type == "run_retry_started" for event in saved.events) == int(
+        boundary == "recovery_required"
+    )
+    source.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_sync_recovery_commands_reenter_the_established_owner(tmp_path, retry):
+    """Explicit recovery uses native synchronous I/O and preserves exclusive session ownership."""
+    interaction = output_interaction()
+    interaction.confirm.return_value = False
+    sessions = SessionManager(interaction=interaction)
+    sessions.add_user_message("unfinished")
+    sessions.begin_run()
+    if retry:
+        sessions.record_run_failure()
+    backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted(answer="done")]))
+    loop = Loop.create_default(
+        backend,
+        interaction=interaction,
+        session_manager=sessions,
+        working_directory=tmp_path,
+        session_name_generator=LocalSessionNameGenerator(),
+    )
+    loop.agent_runner.compaction.compact_if_needed = Mock(return_value=False)
+    loop.register_command_provider(ConversationRecoveryCommands(loop))
+    inputs = iter(("/retry" if retry else "/continue", False))
+    loop.run(input_source=lambda completer: next(inputs))
+    assert sessions.recovery_pending is False
+    backend.get_response.assert_called_once()
+    assert sum(event.type == "run_retry_started" for event in sessions.session.events) == int(retry)
+    interaction.confirm.assert_called_once()
+    interaction.info.assert_any_call("Recovery completed." if retry else "Run continued.")
+
+
 def test_async_continue_recovers_a_cold_stopped_run_from_its_durable_boundary(tmp_path):
     """The continue command recovers a stopped run without rebuilding its input owner."""
     interaction = output_interaction()
@@ -1765,6 +1991,79 @@ def test_async_recoverable_run_failure_keeps_the_input_owner_for_retry(tmp_path)
     assert loop.recovery_pending is False
     interaction.run_metrics.assert_called_once()
     interaction.info.assert_any_call("Recovery completed.")
+
+
+def test_sync_recovery_rejects_event_loops_and_ignores_unavailable_boundaries(tmp_path):
+    """Native synchronous recovery rejects async callers and leaves idle state unchanged."""
+    loop = Loop.create_default(
+        loop_backend(), interaction=output_interaction(), working_directory=tmp_path
+    )
+    assert loop.recover_pending() is False
+    assert loop.recover_pending(retry=True) is False
+
+    async def scenario():
+        """Require native async recovery while an event loop owns this thread."""
+        with pytest.raises(RuntimeError, match="recover_pending_async"):
+            loop.recover_pending()
+
+    asyncio.run(scenario())
+
+
+def test_sync_recovery_releases_a_live_pause_without_replaying_history(tmp_path):
+    """Continuation unblocks the existing paused owner instead of starting durable recovery."""
+    control = RunControl()
+    loop = Loop.create_default(
+        loop_backend(),
+        interaction=output_interaction(),
+        working_directory=tmp_path,
+        run_control=control,
+    )
+    with control.execution():
+        assert control.pause()
+        assert loop.recover_pending() is False
+        assert control.paused is False
+    assert loop.session.events == []
+
+
+def test_sync_recovery_commands_report_repeated_failures_without_losing_retry(tmp_path, caplog):
+    """A failed explicit continuation remains retryable after its next authorized attempt fails."""
+    interaction = output_interaction()
+    interaction.confirm.return_value = False
+    sessions = SessionManager(interaction=interaction)
+    sessions.add_user_message("unfinished")
+    sessions.begin_run()
+    backend = loop_backend(
+        get_response=Mock(
+            side_effect=BackendConnectionError("offline", provider="fixture", operation="query")
+        )
+    )
+    loop = Loop.create_default(
+        backend,
+        interaction=interaction,
+        session_manager=sessions,
+        working_directory=tmp_path,
+        session_name_generator=LocalSessionNameGenerator(),
+    )
+    loop.agent_runner.compaction.compact_if_needed = Mock(return_value=False)
+    loop.register_command_provider(ConversationRecoveryCommands(loop))
+    inputs = iter(("/continue", "/retry", False))
+    loop.run(input_source=lambda completer: next(inputs))
+    assert sessions.retry_pending
+    assert sessions.recovery_pending
+    assert backend.get_response.call_count == 2
+    assert len(caplog.records) == 2
+    assert all(
+        record.levelname == "ERROR" and record.message.startswith("Backend request failed")
+        for record in caplog.records
+    )
+    assert (
+        interaction.warning.call_args_list.count(
+            call("Recovery remains pending; use /retry to try again.")
+        )
+        == 2
+    )
+    assert sum(event.type == "run_failed" for event in sessions.session.events) == 2
+    assert sum(event.type == "run_retry_started" for event in sessions.session.events) == 1
 
 
 def test_recover_pending_async_does_nothing_without_a_recovery_gate(tmp_path):
@@ -2321,6 +2620,58 @@ def test_run_async_warns_when_skill_metadata_does_not_fit(tmp_path):
         "use activate_skill to load a skill."
     )
     loop.agent_runner.run_async.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("failure", ["hint", "mention"])
+def test_delivered_input_preparation_failure_has_a_durable_terminal_outcome(
+    tmp_path, monkeypatch, caplog, asynchronous, failure
+):
+    """An unusable accepted input is visibly rejected and cannot reappear on restart."""
+    interaction = output_interaction()
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    sessions = SessionManager(
+        interaction=interaction, session_store=store, workspace_id="workspace"
+    )
+    event = sessions.queue_input("invalid input", priority=1, bypass_commands=True)
+    sessions.mark_input_delivered(event.input_id)
+    loop = Loop.create_default(
+        loop_backend(),
+        interaction=interaction,
+        session_manager=sessions,
+        working_directory=tmp_path,
+    )
+    error = ValueError("invalid preparation")
+    target = loop.instructions_manager if failure == "hint" else loop._mention_manager
+    name = "set_skill_catalog_priorities" if failure == "hint" else "resolve"
+    monkeypatch.setattr(
+        target,
+        name + ("_async" if asynchronous else ""),
+        AsyncMock(side_effect=error) if asynchronous else Mock(side_effect=error),
+    )
+    inputs = iter(
+        (AdmittedConversationInput(event.input_id, event.session_id, event.content, True), False)
+    )
+
+    async def receive_async(completer):
+        """Return the delivered envelope through the asynchronous input boundary."""
+        return next(inputs)
+
+    if asynchronous:
+        asyncio.run(loop.run_async(input_source=receive_async))
+    else:
+        loop.run(input_source=lambda completer: next(inputs))
+    assert sessions.messages == []
+    saved = store.load(sessions.session.id)
+    assert saved.pending_inputs == ()
+    assert saved.events[-1].type == "input_rejected"
+    interaction.report.assert_called_once()
+    expected_code = (
+        "skill_hint.preparation_failed" if failure == "hint" else "mention.resolution_failed"
+    )
+    assert interaction.report.call_args.args[0].code == expected_code
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "ERROR"
 
 
 def test_run_async_reports_skill_hint_cleanup_failure_after_completion(tmp_path):

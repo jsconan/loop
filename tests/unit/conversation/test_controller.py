@@ -202,6 +202,57 @@ def test_cold_stop_preserves_the_owner_and_durable_pending_inputs(ui):
     assert [item.content for item in manager.session.pending_inputs] == ["waiting"]
 
 
+def test_sync_admission_wakes_an_async_recall_waiter(ui, monkeypatch):
+    """A synchronous mailbox writer notifies an asynchronous mutation waiting for its lock."""
+    admitted, active = asyncio.Event(), asyncio.Event()
+    release = Event()
+    finish = asyncio.Event()
+    owner_loop = None
+
+    class HeldMailbox(InputMailbox):
+        """Hold admission while the controller owns its mailbox mutation lock."""
+
+        def try_put(self, admission):
+            """Expose the owned write before allowing the admission to finish."""
+            owner_loop.call_soon_threadsafe(admitted.set)
+            release.wait()
+            return super().try_put(admission)
+
+    monkeypatch.setattr(controller_module, "InputMailbox", HeldMailbox)
+    controller = SessionController(ui)
+
+    async def conversation(receive):
+        """Keep execution active while concurrent public queue operations settle."""
+        with controller.control.execution(async_owner=True):
+            active.set()
+            await finish.wait()
+
+    async def scenario():
+        """Recall an input while a synchronous writer still owns the mailbox lock."""
+        nonlocal owner_loop
+        owner_loop = asyncio.get_running_loop()
+        owner = asyncio.create_task(controller.run_async(conversation))
+        await active.wait()
+        writer = asyncio.create_task(asyncio.to_thread(controller.queue, "recall me", ui))
+        recall = None
+        try:
+            await admitted.wait()
+            recall = asyncio.create_task(controller.recall_latest_async())
+            await asyncio.sleep(0)
+            assert not recall.done()
+            release.set()
+            assert await writer
+            assert await asyncio.wait_for(recall, timeout=1) is PendingInputRecallOutcome.RECALLED
+        finally:
+            release.set()
+            finish.set()
+            await asyncio.gather(
+                owner, writer, *([recall] if recall else []), return_exceptions=True
+            )
+
+    asyncio.run(scenario())
+
+
 def test_async_mailbox_lock_waits_without_blocking_the_event_loop(ui):
     """Async mailbox access waits for a synchronous owner and resumes when it releases."""
     controller = SessionController(ui)
@@ -1250,14 +1301,14 @@ def test_sync_receive_rechecks_the_queue_after_an_empty_read_race(ui):
     original_get = controller._inbox.get_nowait
     inserted = False
 
-    def get_with_racing_insert():
+    def get_with_racing_insert(**kwargs):
         """Insert input after the first empty read, before the receiver waits."""
         nonlocal inserted
         if not inserted:
             inserted = True
             controller._inbox.try_put(admission)
             raise Empty
-        return original_get()
+        return original_get(**kwargs)
 
     controller._inbox.get_nowait = get_with_racing_insert
     controller._send = lambda event: event.result.set_result(None)
@@ -3928,18 +3979,13 @@ def test_async_controller_rechecks_queue_after_a_racing_admission(ui):
             self._first_read = True
             self.try_put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "raced"))
 
-        def get_nowait(self):
-            """Return an empty result once so the receiver checks the queue again."""
+        def get_nowait(self, **kwargs):
+            """Publish the raced admission's wakeup after one synthetic empty read."""
             if self._first_read:
                 self._first_read = False
+                controller._input_signal.set()
                 raise Empty
-            return super().get_nowait()
-
-        def is_empty(self):
-            """Expose the raced message immediately after the synthetic empty result."""
-            if not self._first_read:
-                return False
-            return super().is_empty()
+            return super().get_nowait(**kwargs)
 
     controller._inbox = RacingMailbox()
     received = []

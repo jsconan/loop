@@ -1,5 +1,6 @@
 """Define tooling-domain models and errors."""
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -35,6 +36,23 @@ ToolPreflight = Callable[[], ToolPreflightResult]
 
 class ToolRegistrationError(ValueError):
     """Indicate that a Python function cannot be registered as a tool."""
+
+
+class ToolExecutionCancelled(asyncio.CancelledError):
+    """Carry a confirmed tool result while propagating cancellation to its owner.
+
+    Args:
+        output (str): Normalized result of an invocation that settled after cancellation.
+        duration (float): Tool execution duration in seconds.
+    """
+
+    output: str
+    duration: float
+
+    def __init__(self, output: str, duration: float) -> None:
+        super().__init__()
+        self.output = output
+        self.duration = duration
 
 
 @dataclass

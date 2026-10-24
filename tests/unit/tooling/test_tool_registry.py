@@ -1190,6 +1190,66 @@ def test_cancellation_settles_sync_work_without_a_run_signal():
     assert settled.is_set()
 
 
+@pytest.mark.parametrize("during_start", [False, True])
+def test_cancelled_worker_does_not_start_or_await_additional_execution(during_start):
+    """Cancellation before execution or before an awaitable result never launches more work."""
+    started = asyncio.Event()
+    release = Event()
+    ran = []
+    returned = []
+    owner_loop = None
+
+    async def finish():
+        """Record work that must not be started after cancellation."""
+        ran.append("awaited")
+        return "done"
+
+    def hold():
+        """Hold a synchronous boundary until cancellation has been requested."""
+        owner_loop.call_soon_threadsafe(started.set)
+        release.wait()
+
+    def invoke():
+        """Return an unstarted coroutine only when execution was already admitted."""
+        if not during_start:
+            hold()
+        ran.append("invoked")
+        result = finish()
+        returned.append(result)
+        return result
+
+    registry = ToolRegistry([invoke])
+
+    async def scenario():
+        """Cancel the public dispatch at its controlled worker boundary."""
+        nonlocal owner_loop
+        owner_loop = asyncio.get_running_loop()
+        task = asyncio.create_task(
+            registry.call_with_timing_async(
+                "invoke",
+                "{}",
+                execution_started=hold if during_start else None,
+            )
+        )
+        try:
+            await started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+    assert ran == ([] if during_start else ["invoked"])
+    assert all(result.cr_frame is None for result in returned)
+
+
 def test_worker_failure_is_logged_when_cancellation_waits_for_settlement(caplog):
     """A worker exception after cancellation is recorded once at the registry boundary."""
     started = Event()

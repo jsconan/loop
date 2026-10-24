@@ -5,6 +5,7 @@ import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import get_ident
 from typing import Self
 
 from . import constants
@@ -27,7 +28,13 @@ from .interaction import Interaction, require_async_interaction
 from .mentions import MentionManager, ProjectPathMentionHandler
 from .mentions.parser import parse_mentions
 from .model_selection import ModelCommands, ModelSelection
-from .models import AgentRunStopReason, ConversationItem, ReasoningEffort, SteeringMessage
+from .models import (
+    AgentRunStopReason,
+    ConversationItem,
+    ReasoningEffort,
+    SteeringMessage,
+    SyncRecoveryRequested,
+)
 from .permissions import PermissionCommands, PermissionManager
 from .session import (
     BackendSessionNameGenerator,
@@ -80,6 +87,7 @@ class Loop:
     _session_name_task_group: asyncio.TaskGroup | None
     _session_name_tasks: dict[str, asyncio.Task[None]]
     _session_name_attempted_this_run: bool
+    _sync_command_thread: int | None
 
     def __init__(
         self,
@@ -109,6 +117,7 @@ class Loop:
         self._session_name_task_group = None
         self._session_name_tasks = {}
         self._session_name_attempted_this_run = False
+        self._sync_command_thread = None
         self._mention_manager = mention_manager
         self._instructions_manager = agent_runner.instructions_manager
         self._permission_manager = agent_runner.permission_manager
@@ -544,25 +553,60 @@ class Loop:
         """
         return self._session_manager.retry_pending
 
+    def recover_pending(self, *, retry: bool = False) -> bool:
+        """Recover a durable boundary on the synchronous conversation owner.
+
+        Args:
+            retry (bool): Persist authorization for a recorded failure before recovery.
+                Defaults to ``False`` for continuation.
+
+        Returns:
+            bool: Whether recovery remains pending after the attempt.
+
+        Raises:
+            RuntimeError: If invoked from an active event loop.
+            SessionExecutionConflictError: If another execution owns the session.
+        """
+        if has_running_event_loop():
+            raise RuntimeError("Await Loop.recover_pending_async() inside an event loop.")
+        if not retry and self._run_control is not None and self._run_control.continue_run():
+            return False
+        with self._session_manager.execution():
+            if retry:
+                if not self._session_manager.retry_pending:
+                    return False
+                self._session_manager.begin_run_retry()
+            elif not self._session_manager.continuable:
+                return False
+            return self._recover_session(explicit=True)
+
     async def recover_pending_async(self, *, retry: bool = False) -> bool:
         """Continue a live pause or recover a durable boundary after a command.
+
+        Args:
+            retry (bool): Persist authorization for a recorded failure before recovery.
+                Defaults to ``False`` for continuation.
 
         Returns:
             bool: Whether recovery remains pending after the attempt.
 
         Raises:
             asyncio.CancelledError: If the recovery operation is cancelled.
+            SyncRecoveryRequested: Return recovery to a synchronous command's existing owner.
         """
+        if self._sync_command_thread == get_ident():
+            raise SyncRecoveryRequested(retry)
         if not retry and self._run_control is not None and self._run_control.continue_run():
             return False
-        if retry:
-            if not self._session_manager.retry_pending:
+        with self._session_manager.execution():
+            if retry:
+                if not self._session_manager.retry_pending:
+                    return False
+                await self._session_manager.begin_run_retry_async()
+            elif not self._session_manager.continuable:
                 return False
-            await self._session_manager.begin_run_retry_async()
-        elif not self._session_manager.continuable:
-            return False
-        async with self._session_name_task_scope_async():
-            return await self._recover_session_async(explicit=True)
+            async with self._session_name_task_scope_async():
+                return await self._recover_session_async(explicit=True)
 
     @property
     def interaction(self) -> Interaction:
@@ -711,7 +755,22 @@ class Loop:
                     admitted_input is not None and admitted_input.bypass_commands
                 )
                 if not bypass_commands:
-                    handled_command = self._command_manager.handle_user_command(user_input)
+                    self._sync_command_thread = get_ident()
+                    try:
+                        handled_command = self._command_manager.handle_user_command(user_input)
+                    except SyncRecoveryRequested as request:
+                        pending = self.recover_pending(retry=request.retry)
+                        if pending:
+                            self._interaction.warning(
+                                "Recovery remains pending; use /retry to try again."
+                            )
+                        else:
+                            self._interaction.info(
+                                "Recovery completed." if request.retry else "Run continued."
+                            )
+                        handled_command = True
+                    finally:
+                        self._sync_command_thread = None
                 if handled_command:
                     if self.session is not session:
                         with self._session_manager.execution():
@@ -751,6 +810,8 @@ class Loop:
                         )
                         log_problem(_LOGGER, problem, error)
                         self._interaction.report(problem)
+                        if admitted_input is not None:
+                            self._session_manager.reject_input(admitted_input.input_id)
                         continue
                 try:
                     context = self._mention_manager.resolve(user_input)
@@ -763,6 +824,8 @@ class Loop:
                     )
                     log_problem(_LOGGER, problem, error)
                     self._interaction.report(problem)
+                    if admitted_input is not None:
+                        self._session_manager.reject_input(admitted_input.input_id)
                     if self._skill_hints_enabled:
                         self._clear_skill_catalog_priorities()
                     continue
@@ -894,6 +957,8 @@ class Loop:
                         )
                         log_problem(_LOGGER, problem, error)
                         self._interaction.report(problem)
+                        if admitted_input is not None:
+                            await self._session_manager.reject_input_async(admitted_input.input_id)
                         continue
                 try:
                     context = await self._mention_manager.resolve_async(user_input)
@@ -906,6 +971,8 @@ class Loop:
                     )
                     log_problem(_LOGGER, problem, error)
                     self._interaction.report(problem)
+                    if admitted_input is not None:
+                        await self._session_manager.reject_input_async(admitted_input.input_id)
                     if self._skill_hints_enabled:
                         await self._clear_skill_catalog_priorities_async()
                     continue
@@ -954,7 +1021,8 @@ class Loop:
                     try:
                         yield
                     # Let the group settle children without wrapping Loop's original exception.
-                    except BaseException as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                    # pylint: disable=broad-exception-caught
+                    except BaseException as error:  # noqa: BLE001
                         scope_error = error
                         for task in self._session_name_tasks.values():
                             task.cancel()
@@ -1064,11 +1132,16 @@ class Loop:
             self._run_control.checkpoint()
         self._schedule_session_name_generation()
 
-    def _recover_session(self) -> None:
+    def _recover_session(self, *, explicit: bool = False) -> bool:
         """Recover a previously interrupted run, if any."""
-        recovery = self._agent_runner.recover_session()
+        recovery = (
+            self._agent_runner.recover_session(confirmed=True)
+            if explicit
+            else self._agent_runner.recover_session()
+        )
         if recovery.result is not None:
             self._complete_agent_run(recovery.result)
+        return recovery.pending or self._session_manager.recovery_pending
 
     async def _recover_session_async(self, *, explicit: bool = False) -> bool:
         """Recover an interrupted run through its existing async recovery procedure."""

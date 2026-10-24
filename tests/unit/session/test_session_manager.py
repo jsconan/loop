@@ -1321,11 +1321,15 @@ def test_failed_response_persistence_does_not_notify_observers():
         """Record any notification that crosses the persistence boundary."""
         events.append(event)
 
-    with manager.observe_responses(observe), patch.object(
-        store,
-        "save",
-        side_effect=OSError("store unavailable"),
-    ), pytest.raises(OSError, match="store unavailable"):
+    with (
+        manager.observe_responses(observe),
+        patch.object(
+            store,
+            "save",
+            side_effect=OSError("store unavailable"),
+        ),
+        pytest.raises(OSError, match="store unavailable"),
+    ):
         asyncio.run(manager.add_response_async(response))
 
     assert events == []
@@ -2007,9 +2011,7 @@ def test_async_session_commit_finishes_persistence_before_propagating_cancellati
 
     async def cancel_after_admission():
         """Cancel an active commit and wait for its durable result to settle."""
-        pending = asyncio.create_task(
-            manager.add_response_async(response)
-        )
+        pending = asyncio.create_task(manager.add_response_async(response))
         await started.wait()
         pending.cancel()
         await asyncio.sleep(0)

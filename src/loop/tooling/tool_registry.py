@@ -53,6 +53,7 @@ from ..utils import (
 from .context import ToolContext
 from .file_observations import FileObservations
 from .models import (
+    ToolExecutionCancelled,
     ToolPreflight,
     ToolRegistrationError,
     ToolRuntimeSettings,
@@ -431,6 +432,7 @@ class ToolRegistry:
         *args: Any,
         cancellation_event: Event | None = None,
         operation: str = "tool callback",
+        settled_cancellation: Callable[[asyncio.CancelledError], None] | None = None,
     ) -> Any:
         """Run a sync callback with bounded admission and settle it after cancellation."""
         if self._closed or not self._worker_slots.acquire(blocking=False):
@@ -454,7 +456,7 @@ class ToolRegistry:
             raise
         try:
             return await asyncio.shield(future)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             if cancellation_event is not None:
                 cancellation_event.set()
             settled = asyncio.create_task(asyncio.wait({future}))
@@ -466,6 +468,13 @@ class ToolRegistry:
             settled.result()
             if not future.cancelled():
                 worker_error = future.exception()
+                if worker_error is None:
+                    result = future.result()
+                    if inspect.isawaitable(result):
+                        close_awaitable(result)
+                    elif settled_cancellation is not None:
+                        settled_cancellation(cancellation)
+                        return result
                 if worker_error is not None and not isinstance(worker_error, ProblemException):
                     problem = Problem.from_exception(
                         worker_error,
@@ -899,6 +908,9 @@ class ToolRegistry:
 
         Raises:
             ValueError: If the tool requires a context but none is provided.
+            ToolExecutionCancelled: If cancellation settles a synchronous tool with a known
+                normalized output and execution duration.
+            asyncio.CancelledError: If dispatch is cancelled without an authoritative result.
         """
         output, _ = await self.call_with_timing_async(
             name,
@@ -949,6 +961,9 @@ class ToolRegistry:
 
         Raises:
             ValueError: If the tool requires a context but none is provided.
+            ToolExecutionCancelled: If cancellation settles a synchronous tool with a known
+                normalized output and execution duration.
+            asyncio.CancelledError: If dispatch is cancelled without an authoritative result.
         """
         tool = self._tools.get(name)
         if tool is None:
@@ -1006,6 +1021,13 @@ class ToolRegistry:
         started = perf_counter()
         worker_context = None
         active_context = context
+        cancellation = None
+
+        def retain_cancellation(error: asyncio.CancelledError) -> None:
+            """Retain interruption while a completed synchronous result is normalized."""
+            nonlocal cancellation
+            cancellation = error
+
         if not is_async_callable(tool.function):
             portal = ToolExecutionPortal(asyncio.get_running_loop())
             worker_context = self._worker_context(
@@ -1028,6 +1050,7 @@ class ToolRegistry:
                     invoke,
                     cancellation_event=active_context.cancellation_event,
                     operation=tool.name or "tool",
+                    settled_cancellation=retain_cancellation,
                 )
 
             result = await tool.execute_async(
@@ -1040,14 +1063,18 @@ class ToolRegistry:
                 context.file_versions.update(worker_context.file_versions)
                 context.read_versions.update(worker_context.read_versions)
         output = result.output
-        return self._model_result(
+        output = self._model_result(
             output,
             instructions_manager,
             tool,
             context,
             virtual_paths=virtual_paths,
             redaction_roots=redaction_roots,
-        ), perf_counter() - started
+        )
+        duration = perf_counter() - started
+        if cancellation is not None:
+            raise ToolExecutionCancelled(output, duration) from cancellation
+        return output, duration
 
     def command(
         self,
@@ -1756,6 +1783,9 @@ class ToolRegistryView:
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds.
+        Raises:
+            ToolExecutionCancelled: If a cancelled synchronous invocation has a known result.
+            asyncio.CancelledError: If dispatch is cancelled without an authoritative result.
         """
         return await self._registry.call_with_timing_async(
             name,

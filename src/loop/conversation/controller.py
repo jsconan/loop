@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from contextvars import copy_context
 from itertools import count
 from queue import Empty, Full
@@ -842,7 +842,7 @@ class SessionController:
         """Run a synchronous conversation while accepting input and dispatching UI requests.
 
         The operation must use its supplied input callback for ordinary conversation messages.
-        Nested prompts and all output use this controller's ``interaction``. A shutdown request stops
+        Nested prompts and all output use this controller's ``interaction``. Shutdown stops
         admission and waits for the execution owner to settle before returning or raising. This
         method owns an event loop for mailbox delivery and rejects calls from an existing loop.
 
@@ -1103,14 +1103,17 @@ class SessionController:
         self._gate.release()
         try:
             self._send(RunStateChanged(completer))
+            commands_only = (
+                self._session_manager is not None and self._session_manager.recovery_pending
+            )
             while True:
-                with self._mailbox_lock:
+                with self._mailbox_access():
                     try:
-                        admission = self._inbox.get_nowait()
+                        admission = self._inbox.get_nowait(commands_only=commands_only)
                         break
                     except Empty:
                         pass
-                if not self._inbox.wait_until_not_empty():
+                if not self._inbox.wait_until_not_empty(commands_only=commands_only):
                     return False
         finally:
             # Restore the owner's existing scope after lending the gate to completion readers.
@@ -1379,10 +1382,18 @@ class SessionController:
         if (
             not bypass_commands
             and route_idle_commands
-            and self._idle
+            and (
+                self._idle
+                or (
+                    self._session_manager is not None
+                    and self._session_manager.recovery_pending
+                    and not self._control.active
+                    and self._pending is None
+                )
+            )
             and command_manager.is_user_command(value)
         ):
-            self._idle_command_pending = await self._enqueue_async(value)
+            self._idle_command_pending = await self._enqueue_async(value, command=True)
             return
         if not bypass_commands and command_manager.is_user_command(value):
             self._command_task = asyncio.create_task(
@@ -1455,6 +1466,15 @@ class SessionController:
             if owns_async_dispatch:
                 self._async_owner = False
 
+    @contextmanager
+    def _mailbox_access(self) -> Generator[None]:
+        """Release synchronous mailbox access with the same waiter notification as async access."""
+        self._mailbox_lock.acquire()
+        try:
+            yield
+        finally:
+            self._release_mailbox_lock()
+
     async def _acquire_mailbox_lock_async(self) -> None:
         """Wait cooperatively until the mailbox is available to the async owner."""
         available = self._mailbox_available
@@ -1484,15 +1504,18 @@ class SessionController:
         while True:
             await self._acquire_mailbox_lock_async()
             try:
+                self._input_signal.clear()
                 try:
-                    return self._inbox.get_nowait()
+                    return self._inbox.get_nowait(
+                        commands_only=(
+                            self._session_manager is not None
+                            and self._session_manager.recovery_pending
+                        )
+                    )
                 except Empty:
                     pass
             finally:
                 self._release_mailbox_lock()
-            self._input_signal.clear()
-            if not self._inbox.is_empty():
-                continue
             await self._input_signal.wait()
 
     def _put_mailbox_item_locked(self, admission: InputAdmission) -> bool:
@@ -1536,7 +1559,7 @@ class SessionController:
                 InputAdmissionKind.MESSAGE,
                 value,
             )
-            with self._mailbox_lock:
+            with self._mailbox_access():
                 if not self._put_mailbox_item_locked(queued):
                     return False
         except Full:
@@ -1557,13 +1580,14 @@ class SessionController:
         interaction: Interaction | None = None,
         admission: InputAdmission | None = None,
         report_full: bool = True,
+        command: bool = False,
     ) -> bool:
         """Admit bounded input without blocking the UI loop on cross-thread mailbox access."""
         active_interaction = interaction if interaction is not None else self._source
         queued = admission or InputAdmission(
             priority,
             next(self._sequence),
-            InputAdmissionKind.MESSAGE,
+            InputAdmissionKind.COMMAND if command else InputAdmissionKind.MESSAGE,
             value,
         )
         await self._acquire_mailbox_lock_async()
@@ -1692,7 +1716,7 @@ class SessionController:
         )
 
         try:
-            with self._mailbox_lock:
+            with self._mailbox_access():
                 accepted = self._control.request_steering(
                     lambda: self._put_mailbox_item_locked(durable_admission)
                 )

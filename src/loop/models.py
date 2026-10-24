@@ -69,6 +69,20 @@ class SteeringMessage(str):
     """
 
 
+class SyncRecoveryRequested(Exception):
+    """Return command recovery to the synchronous conversation owner.
+
+    Args:
+        retry (bool): Whether the command requests explicit retry authorization.
+    """
+
+    retry: bool
+
+    def __init__(self, retry: bool) -> None:
+        super().__init__()
+        self.retry = retry
+
+
 class StructuredOutputValidationError(ValueError):
     """Report output that does not satisfy its requested structure.
 

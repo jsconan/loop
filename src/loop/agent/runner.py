@@ -41,6 +41,7 @@ from ..permissions import PermissionManager
 from ..session import SessionManager, SessionRecoveryState
 from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
 from ..tooling.file_observations import FileObservations
+from ..tooling.models import ToolExecutionCancelled
 from ..tooling.utils import serialize_tool_problem
 from ..utils import (
     PathReference,
@@ -365,8 +366,12 @@ class AgentRunner:
                 )
                 return result
 
-    def recover_session(self) -> AgentRecoveryStatus:
+    def recover_session(self, *, confirmed: bool = False) -> AgentRecoveryStatus:
         """Execute an approved recovery plan for the active session.
+
+        Args:
+            confirmed (bool): Skip the run-level prompt after an explicit recovery command.
+                Unknown tool outcomes still require confirmation. Defaults to ``False``.
 
         Returns:
             AgentRecoveryStatus: Recovered run result and whether unresolved recovery remains.
@@ -386,7 +391,7 @@ class AgentRunner:
             state = self._session_manager.recovery_state
             if state is None:
                 return AgentRecoveryStatus(pending=False)
-            if not self._interaction.confirm(
+            if not confirmed and not self._interaction.confirm(
                 "This session stopped during an agent run. Recover and continue it?",
                 default=False,
             ):
@@ -1036,23 +1041,52 @@ class AgentRunner:
             await self._checkpoint_async()
             await self._session_manager.record_tool_execution_started_async(tool_call.call_id)
 
-        tool_result, duration = await self._agent.tools.call_with_timing_async(
-            tool_call.name,
-            tool_call.arguments,
-            interaction=self._interaction,
-            instructions_manager=instructions,
-            permission_manager=self._permission_manager,
-            call_id=tool_call.call_id,
-            cancellation_event=(
-                self._run_control.cancellation_event if self._run_control is not None else None
-            ),
-            **(
-                {"file_observations": self._file_observations}
-                if self._file_observations is not None
-                else {}
-            ),
-            execution_started=execution_started_async,
+        cancellation = None
+        try:
+            tool_result, duration = await self._agent.tools.call_with_timing_async(
+                tool_call.name,
+                tool_call.arguments,
+                interaction=self._interaction,
+                instructions_manager=instructions,
+                permission_manager=self._permission_manager,
+                call_id=tool_call.call_id,
+                cancellation_event=(
+                    self._run_control.cancellation_event if self._run_control is not None else None
+                ),
+                **(
+                    {"file_observations": self._file_observations}
+                    if self._file_observations is not None
+                    else {}
+                ),
+                execution_started=execution_started_async,
+            )
+        except ToolExecutionCancelled as error:
+            cancellation = error
+            tool_result, duration = error.output, error.duration
+
+        publication = asyncio.create_task(
+            self._record_tool_result_async(tool_call, instructions, tool_result, duration)
         )
+        while not publication.done():
+            try:
+                await asyncio.shield(publication)
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+        metrics = publication.result()
+        if cancellation is not None:
+            if self._interrupted_tools is not None:
+                self._interrupted_tools.append(metrics)
+            raise cancellation
+        return metrics
+
+    async def _record_tool_result_async(
+        self,
+        tool_call: ToolCall,
+        instructions: InstructionsManager,
+        tool_result: str,
+        duration: float,
+    ) -> ToolExecutionMetrics:
+        """Publish an authoritative result before allowing cancellation to leave its owner."""
         if self._file_observations is not None:
             try:
                 await self._run_blocking_async(

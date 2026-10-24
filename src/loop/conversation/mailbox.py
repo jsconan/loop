@@ -5,14 +5,14 @@ from heapq import heapify, heappop, heappush
 from queue import Empty, Full
 from threading import Condition
 
-from .models import InputAdmission
+from .models import InputAdmission, InputAdmissionKind
 
 
 class InputMailbox:
-    """Manage prioritized conversation inputs and atomic shutdown.
+    """Manage prioritized inputs with one reserved command slot and atomic shutdown.
 
     Args:
-        capacity (int): Maximum number of inputs accepted before shutdown.
+        capacity (int): Maximum pending ordinary inputs, plus one reserved command slot.
 
     Raises:
         ValueError: If the mailbox capacity is less than one.
@@ -33,10 +33,10 @@ class InputMailbox:
 
     @property
     def capacity(self) -> int:
-        """Return the maximum number of inputs accepted before shutdown.
+        """Return the ordinary input capacity, excluding the reserved command slot.
 
         Returns:
-            int: Maximum pending input count.
+            int: Maximum pending ordinary input count.
         """
         return self._capacity
 
@@ -77,19 +77,28 @@ class InputMailbox:
             bool: Whether the admission was accepted.
 
         Raises:
-            Full: If the mailbox reached its capacity.
+            Full: If ordinary input capacity or the single command slot is full.
         """
         with self._condition:
             if self._closed:
                 return False
-            if len(self._items) >= self._capacity:
+            commands = sum(item.kind is InputAdmissionKind.COMMAND for item in self._items)
+            if (
+                commands >= 1
+                if admission.kind is InputAdmissionKind.COMMAND
+                else len(self._items) - commands >= self._capacity
+            ):
                 raise Full
             heappush(self._items, admission)
             self._condition.notify_all()
         return True
 
-    def get_nowait(self) -> InputAdmission:
+    def get_nowait(self, *, commands_only: bool = False) -> InputAdmission:
         """Remove the highest-priority pending admission.
+
+        Args:
+            commands_only (bool): Park ordinary messages while allowing commands and shutdown.
+                Defaults to ``False``.
 
         Returns:
             InputAdmission: Admission with the lowest numeric priority, then sequence value.
@@ -98,18 +107,39 @@ class InputMailbox:
             Empty: If no admission is pending.
         """
         with self._condition:
+            if commands_only:
+                eligible = [
+                    index
+                    for index, item in enumerate(self._items)
+                    if item.kind is not InputAdmissionKind.MESSAGE
+                ]
+                if not eligible:
+                    raise Empty
+                target = self._items.pop(min(eligible, key=lambda index: self._items[index]))
+                heapify(self._items)
+                return target
             if not self._items:
                 raise Empty
             return heappop(self._items)
 
-    def wait_until_not_empty(self) -> bool:
+    def wait_until_not_empty(self, *, commands_only: bool = False) -> bool:
         """Wait until an admission arrives or shutdown closes an empty mailbox.
+
+        Args:
+            commands_only (bool): Wait for a command or shutdown while ordinary input is parked.
+                Defaults to ``False``.
 
         Returns:
             bool: Whether an admission is available after waking.
         """
         with self._condition:
-            while not self._items and not self._closed:
+            while (
+                not any(
+                    not commands_only or item.kind is not InputAdmissionKind.MESSAGE
+                    for item in self._items
+                )
+                and not self._closed
+            ):
                 self._condition.wait()
             return bool(self._items)
 

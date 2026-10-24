@@ -815,7 +815,7 @@ class SessionManager:
         await self._commit_async(lambda session: session.recall_input(input_id))
 
     def reject_input(self, input_id: str) -> None:
-        """Persist that a previously accepted input could not enter the mailbox.
+        """Persist that a previously accepted input could not be admitted or prepared.
 
         Args:
             input_id (str): Identity of a pending accepted input.

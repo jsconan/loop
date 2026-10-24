@@ -6,6 +6,7 @@ __all__ = [
     "Tool",
     "ToolCommands",
     "ToolContext",
+    "ToolExecutionCancelled",
     "ToolPreflight",
     "ToolPreflightResult",
     "ToolRegistration",
@@ -28,6 +29,7 @@ from .context import ToolContext
 from .file_observations import FileObservations
 from .models import (
     TOOL_READY,
+    ToolExecutionCancelled,
     ToolPreflight,
     ToolPreflightResult,
     ToolRegistrationError,

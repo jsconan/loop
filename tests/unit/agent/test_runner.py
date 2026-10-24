@@ -42,6 +42,7 @@ from loop import (
     SessionExecutionConflictError,
     SessionManager,
     SessionRecoveryState,
+    SQLiteSessionStore,
     ToolCall,
     ToolCallCompleted,
     ToolExecutionMetrics,
@@ -1843,7 +1844,7 @@ def test_uncertain_tool_retry_prompt_carries_the_original_operation_id(async_mod
         source.confirm_async = AsyncMock(return_value=False)
         runner.query_async = AsyncMock(return_value=final)
     else:
-        source.confirm.side_effect = [True, False]
+        source.confirm.return_value = False
 
     interaction = MailboxInteraction(source)
     interaction.bind(dispatch, dispatch_async)
@@ -1857,7 +1858,8 @@ def test_uncertain_tool_retry_prompt_carries_the_original_operation_id(async_mod
     if async_mode:
         asyncio.run(runner.recover_session_async(confirmed=True))
     else:
-        runner.recover_session()
+        runner.recover_session(confirmed=True)
+        source.confirm.assert_called_once()
 
     if async_mode:
         source.confirm_async.assert_awaited_once()
@@ -2628,6 +2630,131 @@ def test_controlled_async_run_cancels_stream_without_persisting_partial_response
             runner.interaction.info.assert_called_once_with(
                 "Run interrupted; the conversation remains open."
             )
+
+
+@pytest.mark.parametrize("mode", ["interrupt", "stop", "external", "standalone"])
+@pytest.mark.parametrize("successful", [False, True])
+def test_async_cancellation_persists_a_settled_sync_tool_receipt(tmp_path, mode, successful):
+    """Interrupted worker effects retain exact results and metrics before any later tool runs."""
+    control = RunControl()
+    backend = Mock()
+    registry = ToolRegistry()
+    started = asyncio.Event()
+    release = Event()
+    owner_loop = None
+    receipt = (
+        {"receipt": "confirmed-receipt-123"}
+        if successful
+        else Problem(code="effect.failed", title="Effect failed", detail="confirmed-receipt-123")
+    )
+    ran = []
+
+    def save_receipt():
+        """Finish a controlled effect after the run receives cancellation."""
+        owner_loop.call_soon_threadsafe(started.set)
+        release.wait()
+        (tmp_path / "receipt.txt").write_text("confirmed-receipt-123", encoding="utf-8")
+        return receipt
+
+    def later_effect():
+        """Record any forbidden work after the interrupted effect."""
+        ran.append(True)
+        return {"ok": True}
+
+    registry.register(save_receipt)
+    registry.register(later_effect)
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    sessions = SessionManager(session_store=store, workspace_id="workspace")
+    runner = file_runner(
+        tmp_path, backend, registry=registry, sessions=sessions, run_control=control
+    )
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions.add_user_message("perform effects")
+    calls = (
+        ToolCall(call_id="effect", name="save_receipt", arguments="{}"),
+        ToolCall(call_id="later", name="later_effect", arguments="{}"),
+    )
+
+    async def events():
+        """Return a complete model response requesting two effects in order."""
+        for event in model_calls(*calls):
+            yield event
+
+    backend.get_response_async.return_value = events()
+    publishing, publish = asyncio.Event(), asyncio.Event()
+    record_result = sessions.add_tool_call_async
+
+    async def hold_publication(**kwargs):
+        """Hold result persistence so repeated cancellation reaches the publication boundary."""
+        if kwargs["call_id"] == "effect":
+            publishing.set()
+            await publish.wait()
+        return await record_result(**kwargs)
+
+    sessions.add_tool_call_async = hold_publication
+
+    async def scenario():
+        """Cancel a worker, cancel again during publication, and settle the durable outcome."""
+        nonlocal owner_loop
+        owner_loop = asyncio.get_running_loop()
+        if mode == "standalone":
+            await sessions.begin_run_async()
+            response = Response(answer="", reasoning="", items=calls, tool_calls=calls)
+            await sessions.add_response_async(response)
+            task = asyncio.create_task(runner.handle_tool_calls_async(response))
+        else:
+            task = asyncio.create_task(runner.run_async())
+        try:
+            await started.wait()
+            if mode == "interrupt":
+                assert control.interrupt()
+            elif mode == "stop":
+                control.stop()
+            else:
+                task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            await publishing.wait()
+            task.cancel()
+            publish.set()
+            if mode in {"external", "standalone"}:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                return None
+            return await task
+        finally:
+            release.set()
+            publish.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        registry.close()
+    assert (tmp_path / "receipt.txt").read_text(encoding="utf-8") == "confirmed-receipt-123"
+    saved = store.load(sessions.session.id)
+    outcomes = [item for item in saved.messages if isinstance(item, ToolResult)]
+    expected_output = (
+        {"ok": True, "result": receipt}
+        if successful
+        else {"ok": False, "problem": receipt.model_dump(mode="json")}
+    )
+    assert json.loads(outcomes[0].output) == expected_output
+    assert (
+        sum(
+            event.type == "tool_execution_completed" and event.call_id == "effect"
+            for event in saved.events
+        )
+        == 1
+    )
+    assert ran == []
+    if result is not None:
+        assert result.stop_reason == "cancelled"
+        assert len(result.metrics.tools) == 1
+        assert result.metrics.tools[0].succeeded is successful
+        assert "cancelled before execution" in outcomes[1].output
+    else:
+        assert saved.recovery_state().action == "execute_tools"
 
 
 def test_async_interruption_preserves_completed_unknown_and_unstarted_tool_outcomes(tmp_path):
