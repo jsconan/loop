@@ -36,6 +36,7 @@ from .models import (
     ConversationItemEvent,
     InputConsumedEvent,
     InputDeliveredEvent,
+    InputPriorityChangedEvent,
     InputQueuedEvent,
     InputRejectedEvent,
     InteractionRequestedEvent,
@@ -56,7 +57,7 @@ from .models import (
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 13
+_SCHEMA_VERSION = 14
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -402,12 +403,48 @@ class Session:
         for event in self.events:
             if isinstance(event, InputQueuedEvent):
                 queued[event.input_id] = event
+            elif isinstance(event, InputPriorityChangedEvent):
+                queued[event.input_id] = queued[event.input_id].model_copy(
+                    update={"priority": event.priority, "sequence": event.sequence}
+                )
             elif isinstance(event, (InputConsumedEvent, InputRejectedEvent)):
                 settled.add(event.input_id)
         return tuple(
             sorted(
                 (event for input_id, event in queued.items() if input_id not in settled),
                 key=lambda event: (event.priority, event.sequence),
+            )
+        )
+
+    def change_input_priority(self, input_id: str, priority: int) -> None:
+        """Persist a changed priority for an input that is still waiting in the mailbox.
+
+        Args:
+            input_id (str): Identity of a pending accepted input.
+            priority (int): Replacement mailbox priority.
+
+        Returns:
+            None: After the priority-change event is appended, or if the priority is unchanged.
+
+        Raises:
+            ValueError: If the input is unknown, delivered, consumed, or rejected.
+        """
+        pending = next((item for item in self.pending_inputs if item.input_id == input_id), None)
+        delivered = any(
+            isinstance(event, InputDeliveredEvent) and event.input_id == input_id
+            for event in self.events
+        )
+        if pending is None or delivered:
+            raise ValueError(f"Input '{input_id}' is not waiting in the mailbox.")
+        if pending.priority == priority:
+            return
+        self.events.append(
+            InputPriorityChangedEvent(
+                id=str(new_uuid()),
+                created_at=utc_now(),
+                input_id=input_id,
+                priority=priority,
+                sequence=pending.sequence,
             )
         )
 
@@ -745,6 +782,7 @@ class Session:
                 raise TypeError("Invalid serialized tool execution event.")
         queued_inputs = {}
         settled_inputs = set()
+        delivered_inputs = set()
         requested_interactions = set()
         settled_interactions = set()
         active_run_id = None
@@ -754,9 +792,22 @@ class Session:
                 if event.session_id != session_id or event.input_id in queued_inputs:
                     raise TypeError("Invalid serialized input admission.")
                 queued_inputs[event.input_id] = event
+            elif isinstance(event, InputPriorityChangedEvent):
+                current = queued_inputs.get(event.input_id)
+                if (
+                    current is None
+                    or event.input_id in settled_inputs
+                    or event.input_id in delivered_inputs
+                    or event.sequence != current.sequence
+                ):
+                    raise TypeError("Invalid serialized input priority change.")
+                queued_inputs[event.input_id] = current.model_copy(
+                    update={"priority": event.priority, "sequence": event.sequence}
+                )
             elif isinstance(event, InputDeliveredEvent):
                 if event.input_id not in queued_inputs or event.input_id in settled_inputs:
                     raise TypeError("Invalid serialized input delivery.")
+                delivered_inputs.add(event.input_id)
             elif isinstance(event, InputConsumedEvent):
                 if event.input_id not in queued_inputs or event.input_id in settled_inputs:
                     raise TypeError("Invalid serialized input consumption.")
@@ -845,7 +896,7 @@ class Session:
         if version == 11:
             payload["version"] = _SCHEMA_VERSION
             version = _SCHEMA_VERSION
-        elif version == 12:
+        elif version in {12, 13}:
             payload = dict(payload)
             payload["version"] = _SCHEMA_VERSION
             version = _SCHEMA_VERSION

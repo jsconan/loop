@@ -148,7 +148,10 @@ def test_async_runtime_registers_and_binds_the_session_command_provider(
     )
 
     active_loop = dependencies["Loop"].create_default.return_value
-    controller_class.assert_called_once_with(interaction)
+    controller_class.assert_called_once_with(
+        interaction,
+        input_mode=settings.conversation.input_mode,
+    )
     assert isinstance(
         active_loop.register_command_provider.call_args_list[0].args[0], ConversationCommands
     )
@@ -324,6 +327,35 @@ def test_apply_configuration_changes_skips_backend_replacement_without_backend_c
 
     assert statuses == {"loop.debug": "applied now"}
     active_loop.replace_backend.assert_not_called()
+
+
+def test_conversation_input_mode_updates_the_active_controller():
+    """Configuration changes update the live controller's active-run text route."""
+    controller = Mock()
+    runtime = ApplicationRuntime(Mock(), Mock(), 2.0, session_controller=controller)
+    settings = ApplicationSettings.model_validate({"conversation": {"input_mode": "steer"}})
+
+    assert runtime.apply_configuration("conversation.input_mode", settings) == "applied now"
+    assert controller.input_mode == "steer"
+
+
+def test_conversation_input_mode_without_controller_is_saved_until_restart():
+    """Input-mode changes report restart when no conversation controller exists yet."""
+    runtime = ApplicationRuntime(Mock(), Mock(), 2.0)
+    settings = ApplicationSettings.model_validate({"conversation": {"input_mode": "steer"}})
+
+    assert runtime.apply_configuration("conversation.input_mode", settings) == (
+        "saved; restart required"
+    )
+    assert asyncio.run(runtime.apply_configuration_async("conversation.input_mode", settings)) == (
+        "saved; restart required"
+    )
+    assert runtime.apply_configuration_changes(("conversation.input_mode",), settings) == {
+        "conversation.input_mode": "saved; restart required"
+    }
+    assert asyncio.run(
+        runtime.apply_configuration_changes_async(("conversation.input_mode",), settings)
+    ) == {"conversation.input_mode": "saved; restart required"}
 
 
 @pytest.mark.parametrize("after_telemetry", [False, True])
@@ -917,7 +949,7 @@ def test_async_runtime_binds_all_services_to_its_controller(dependencies, assemb
     finally:
         runtime.close()
 
-    create.assert_called_once_with(source)
+    create.assert_called_once_with(source, input_mode=settings.conversation.input_mode)
     for dependency in ("PermissionManager", "SessionManager", "create_default_tool_registry"):
         assert dependencies[dependency].call_args.kwargs["interaction"] is controller.interaction
     assert (

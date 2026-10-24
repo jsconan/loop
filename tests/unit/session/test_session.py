@@ -13,6 +13,7 @@ from loop import (
     ContextReference,
     InputConsumedEvent,
     InputDeliveredEvent,
+    InputPriorityChangedEvent,
     InputQueuedEvent,
     InputRejectedEvent,
     InstructionSnapshot,
@@ -525,7 +526,19 @@ def test_session_externalizes_shipped_v11_inline_references():
     assert reference.next_cursor is not None
     assert reference.media_type == "text/plain"
     assert restored.persistence_snapshot().reference_artifacts[0].content == b"preview"
-    assert json.loads(restored.serialize())["version"] == 13
+    assert json.loads(restored.serialize())["version"] == 14
+
+
+def test_session_migrates_v13_snapshots_without_changing_existing_history():
+    """Version 13 sessions retain canonical history while adopting the current schema."""
+    original = Session(messages=[Message(role="user", content="question")])
+    payload = json.loads(original.serialize())
+    payload["version"] = 13
+
+    restored = Session.deserialize(json.dumps(payload))
+
+    assert restored.messages == original.messages
+    assert json.loads(restored.serialize())["version"] == 14
 
 
 def test_session_persistence_snapshot_deduplicates_transient_reference_content():
@@ -654,7 +667,7 @@ def test_session_migrates_v12_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 13
+    assert json.loads(restored.serialize())["version"] == 14
 
 
 @pytest.mark.parametrize("value", ["not-json", "[]", '{"version":99}'])
@@ -742,6 +755,93 @@ def test_session_tracks_input_interaction_and_run_lifecycles():
     assert session.active_run is None
     assert "secret answer" not in session.serialize()
     assert Session.deserialize(session.serialize()) == session
+
+
+def test_session_projects_latest_priority_and_retains_fifo_sequence():
+    """Priority transitions reorder pending inputs while equal priorities retain admission order."""
+    session = Session()
+    created_at = datetime(2026, 10, 21, tzinfo=UTC)
+    first = InputQueuedEvent(
+        id="event-queued-1",
+        created_at=created_at,
+        input_id="input-1",
+        session_id=session.id,
+        content="first",
+        priority=1,
+        sequence=0,
+    )
+    second = InputQueuedEvent(
+        id="event-queued-2",
+        created_at=created_at,
+        input_id="input-2",
+        session_id=session.id,
+        content="second",
+        priority=1,
+        sequence=1,
+    )
+    session.events.extend((first, second))
+
+    session.change_input_priority(second.input_id, 0)
+
+    assert [(item.content, item.priority, item.sequence) for item in session.pending_inputs] == [
+        ("second", 0, 1),
+        ("first", 1, 0),
+    ]
+    assert isinstance(session.events[-1], InputPriorityChangedEvent)
+    session.change_input_priority(second.input_id, 1)
+
+    assert [(item.content, item.priority, item.sequence) for item in session.pending_inputs] == [
+        ("first", 1, 0),
+        ("second", 1, 1),
+    ]
+    restored = Session.deserialize(session.serialize())
+    assert restored.pending_inputs == session.pending_inputs
+
+    event_count = len(session.events)
+    session.change_input_priority(second.input_id, 1)
+    assert len(session.events) == event_count
+
+
+def test_session_rejects_priority_changes_for_inputs_not_waiting():
+    """Delivered and unknown inputs cannot be changed after leaving the mailbox."""
+    session = Session()
+    queued = InputQueuedEvent(
+        id="event-queued",
+        created_at=datetime(2026, 10, 21, tzinfo=UTC),
+        input_id="input-1",
+        session_id=session.id,
+        content="message",
+        priority=1,
+        sequence=0,
+    )
+    session.events.append(queued)
+
+    with pytest.raises(ValueError, match="not waiting"):
+        session.change_input_priority("unknown", 0)
+
+    session.mark_input_delivered(queued.input_id)
+    with pytest.raises(ValueError, match="not waiting"):
+        session.change_input_priority(queued.input_id, 0)
+
+
+def test_session_deserialization_rejects_priority_changes_with_new_sequences():
+    """Priority transitions cannot alter a message's original admission sequence."""
+    session = Session()
+    queued = InputQueuedEvent(
+        id="event-queued",
+        created_at=datetime(2026, 10, 21, tzinfo=UTC),
+        input_id="input-1",
+        session_id=session.id,
+        content="message",
+        priority=1,
+        sequence=0,
+    )
+    session.events.append(queued)
+    session.change_input_priority(queued.input_id, 0)
+    session.events[-1] = session.events[-1].model_copy(update={"sequence": 1})
+
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        Session.deserialize(session.serialize())
 
 
 def test_session_rejects_invalid_lifecycle_transitions():

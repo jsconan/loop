@@ -1232,6 +1232,76 @@ def test_accepted_input_survives_restart_and_consumes_with_canonical_history():
     assert reloaded.session.events[-1].type == "input_consumed"
 
 
+def test_manager_persists_priority_changes_synchronously():
+    """Synchronous transitions update the durable pending-input projection."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    first = manager.queue_input("first", priority=1)
+    second = manager.queue_input("second", priority=1)
+
+    manager.change_input_priority(second.input_id, 0)
+    restored = SessionManager(session=manager.session.id, session_store=store)
+
+    assert [
+        (event.content, event.priority, event.sequence) for event in restored.session.pending_inputs
+    ] == [
+        ("second", 0, second.sequence),
+        ("first", 1, first.sequence),
+    ]
+
+
+def test_manager_persists_priority_changes_asynchronously_to_sqlite(tmp_path):
+    """Async transitions survive SQLite reload with the original admission sequence."""
+    workspace_id = "workspace"
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite3", workspace_id=workspace_id)
+    manager = SessionManager(session_store=store, workspace_id=workspace_id)
+
+    async def change_priority():
+        """Admit two messages and reprioritize the latest through the async writer."""
+        first = await manager.queue_input_async("first", priority=1)
+        second = await manager.queue_input_async("second", priority=1)
+        await manager.change_input_priority_async(second.input_id, 0)
+        return first, second
+
+    first, second = asyncio.run(change_priority())
+    restored = SessionManager(
+        session=manager.session.id,
+        session_store=SQLiteSessionStore(store.path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+
+    assert [
+        (event.content, event.priority, event.sequence) for event in restored.session.pending_inputs
+    ] == [
+        ("second", 0, second.sequence),
+        ("first", 1, first.sequence),
+    ]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_manager_priority_write_failure_preserves_previous_projection(monkeypatch, asynchronous):
+    """A failed priority write leaves the in-memory event history untouched."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    accepted = manager.queue_input("waiting", priority=1)
+    original = manager.session.serialize()
+
+    def fail_save(_session):
+        """Simulate a durable store refusing the transition."""
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "save", fail_save)
+
+    if asynchronous:
+        with pytest.raises(OSError, match="disk full"):
+            asyncio.run(manager.change_input_priority_async(accepted.input_id, 0))
+    else:
+        with pytest.raises(OSError, match="disk full"):
+            manager.change_input_priority(accepted.input_id, 0)
+
+    assert manager.session.serialize() == original
+
+
 def test_sqlite_input_acknowledgement_and_consumption_survive_restarts(tmp_path):
     """SQLite reloads accepted input until one atomic canonical message consumes it."""
     path = tmp_path / "sessions.sqlite3"

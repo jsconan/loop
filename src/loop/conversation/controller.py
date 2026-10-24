@@ -8,8 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from contextvars import copy_context
 from itertools import count
-from queue import Empty, Full, PriorityQueue
-from threading import RLock, get_ident
+from queue import Empty, Full
+from threading import Lock, RLock, get_ident
 from typing import TYPE_CHECKING, cast
 
 from prompt_toolkit.completion import (
@@ -24,12 +24,13 @@ from ..commands import CommandManager
 from ..completion import CompletionManager, CompletionValue
 from ..control import RunControl, RunInterrupted
 from ..interaction import AsyncInteractionInput, Interaction
-from ..models import CommandCapability, SteeringMessage
-from ..session.models import InputQueuedEvent
+from ..models import CommandCapability, ConversationInputMode, SteeringMessage
+from ..session.models import InputDeliveredEvent, InputQueuedEvent
 from ..telemetry import telemetry_activity
 from ..utils import ChoiceItem, choice_items
 from .commands import ConversationCommands
 from .interaction import MailboxInteraction
+from .mailbox import InputMailbox
 from .models import (
     EVENT_CONFIRM,
     EVENT_OUTPUT,
@@ -43,6 +44,7 @@ from .models import (
     InputAdmission,
     InputAdmissionKind,
     InteractionCall,
+    PendingInputPriorityOutcome,
     ResponseOutcome,
     RunStateChanged,
     SteeringOutcome,
@@ -108,15 +110,18 @@ class SessionController:
     the same. An unbound controller builds a standalone registry from that provider when it starts.
     All domain operations stay on one execution thread. The UI owns prompts, presentation, and a
     bounded input mailbox. Bound sessions retain accepted inputs until consumption or rejection.
-    Ordinary input during an active run is admitted as steering and applied after the current
-    model response or tool settles. Explicit ``/steer`` interrupts immediately; ``/queue`` queues
-    input after the run. Each controller runs once.
+    Plain text during an active run follows the configured queue or steering mode. Explicit
+    ``/steer`` interrupts immediately; ``/queue`` queues input after the run. Each controller runs
+    once.
 
     Args:
         interaction (Interaction): UI implementing ``AsyncInteractionInput`` as well as output.
+        input_mode (ConversationInputMode): Active-run routing for plain text.
+            Defaults to ``queue``.
 
     Raises:
         TypeError: If the UI does not implement asynchronous input.
+        ValueError: If the input mode is neither ``queue`` nor ``steer``.
     """
 
     _source: Interaction
@@ -125,9 +130,12 @@ class SessionController:
     _command_manager: CommandManager | None
     _command_completer: CompletionManager
     _control: RunControl
-    _inbox: PriorityQueue[InputAdmission]
+    _inbox: InputMailbox
     _sequence: count
     _gate: RLock
+    _mailbox_lock: Lock
+    _mailbox_available: asyncio.Event | None
+    _input_mode: ConversationInputMode
     _loop: asyncio.AbstractEventLoop | None
     _events: asyncio.Queue[InteractionCall | RunStateChanged] | None
     _pending: InteractionCall | None
@@ -142,7 +150,6 @@ class SessionController:
     _answer_input: asyncio.Task | None
     _message_input: asyncio.Task | None
     _command_task: asyncio.Future | None
-    _command_executor: ThreadPoolExecutor | None
     _discarded: int
     _idle_command_pending: bool
     _draft: str | None
@@ -151,18 +158,28 @@ class SessionController:
     _session_manager: SessionManager | None
     _queued_input_ids: set[str]
 
-    def __init__(self, interaction: Interaction) -> None:
+    def __init__(
+        self,
+        interaction: Interaction,
+        *,
+        input_mode: ConversationInputMode = "queue",
+    ) -> None:
         if not isinstance(interaction, AsyncInteractionInput):
             raise TypeError("Session controller requires asynchronous input.")
+        if input_mode not in ("queue", "steer"):
+            raise ValueError("Conversation input mode must be 'queue' or 'steer'.")
         self._source = interaction
         self._input = cast(AsyncInteractionInput, interaction)
         self._interaction = MailboxInteraction(interaction)
         self._command_manager = None
         self._command_completer = CompletionManager()
         self._control = RunControl()
-        self._inbox = PriorityQueue(maxsize=_QUEUE_CAPACITY)
+        self._inbox = InputMailbox(_QUEUE_CAPACITY)
         self._sequence = count()
         self._gate = RLock()
+        self._mailbox_lock = Lock()
+        self._mailbox_available = None
+        self._input_mode = input_mode
         self._loop = None
         self._events = None
         self._pending = None
@@ -177,7 +194,6 @@ class SessionController:
         self._answer_input = None
         self._message_input = None
         self._command_task = None
-        self._command_executor = None
         self._discarded = 0
         self._idle_command_pending = False
         self._draft = None
@@ -185,6 +201,32 @@ class SessionController:
         self._async_owner = False
         self._session_manager = None
         self._queued_input_ids = set()
+
+    @property
+    def input_mode(self) -> ConversationInputMode:
+        """Return the active-run route for plain text.
+
+        Returns:
+            ConversationInputMode: Queue or steering priority for active-run text.
+        """
+        return self._input_mode
+
+    @input_mode.setter
+    def input_mode(self, mode: ConversationInputMode) -> None:
+        """Set the active-run route for plain text.
+
+        Args:
+            mode (ConversationInputMode): Queue or steering priority for active-run text.
+
+        Returns:
+            None: After the active-run input mode is set.
+
+        Raises:
+            ValueError: If the mode is neither ``queue`` nor ``steer``.
+        """
+        if mode not in ("queue", "steer"):
+            raise ValueError("Conversation input mode must be 'queue' or 'steer'.")
+        self._input_mode = mode
 
     def bind_command_manager(self, command_manager: CommandManager) -> None:
         """Bind the loop-owned command registry for contextual dispatch and completion.
@@ -399,7 +441,7 @@ class SessionController:
             if self._pending is not None
             else ("Idle" if self._idle else "Working")
         )
-        return ConversationStatus(state=state, queued_inputs=self._inbox.qsize())
+        return ConversationStatus(state=state, queued_inputs=self._inbox.size())
 
     def steer(self, message: str, interaction: Interaction) -> SteeringOutcome:
         """Queue a correction and interrupt the active run.
@@ -440,34 +482,51 @@ class SessionController:
         return SteeringOutcome.INTERRUPTED
 
     async def steer_async(self, message: str, interaction: Interaction) -> SteeringOutcome:
-        """Persist a correction before queueing it and interrupting the active run.
+        """Persist a steering input and interrupt the active run when one is running.
 
         Args:
             message (str): Correction text to prioritize ahead of ordinary queued input.
             interaction (Interaction): UI used to report queue admission feedback.
 
         Returns:
-            SteeringOutcome: Result distinguishing interruption, inactivity, and backpressure.
+            SteeringOutcome: Result distinguishing interruption, queued input, inactivity, and
+                backpressure.
 
         Raises:
             asyncio.CancelledError: If persistence settles after cancellation.
         """
-        if not self._control.active:
+        if not self._control.active and not self.running:
             return SteeringOutcome.RUN_INACTIVE
         admission = await self._durable_admission_async(
             message,
             priority=_STEERING_PRIORITY,
             bypass_commands=True,
         )
-        if not self._enqueue_steering(message, admission=admission, report_full=False):
+        if self._control.active:
+            if not await self._enqueue_steering_async(
+                message,
+                admission=admission,
+                report_full=False,
+            ):
+                await self._reject_admission_async(admission)
+                interaction.warning(
+                    "Input queue is full; this input was not accepted. Try again later."
+                )
+                return SteeringOutcome.QUEUE_FULL
+            if self.request_interrupt():
+                return SteeringOutcome.INTERRUPTED
+            return (
+                SteeringOutcome.INTERRUPT_REJECTED
+                if self._control.active
+                else SteeringOutcome.QUEUED
+            )
+        if not await self._enqueue_async(message, admission=admission, report_full=False):
             await self._reject_admission_async(admission)
             interaction.warning(
                 "Input queue is full; this input was not accepted. Try again later."
             )
             return SteeringOutcome.QUEUE_FULL
-        if not self.request_interrupt():
-            return SteeringOutcome.INTERRUPT_REJECTED
-        return SteeringOutcome.INTERRUPTED
+        return SteeringOutcome.QUEUED
 
     def queue(self, message: str, interaction: Interaction) -> bool:
         """Admit an explicit message for execution after the active run completes.
@@ -510,23 +569,93 @@ class SessionController:
             interaction (Interaction): UI used to report queue admission feedback.
 
         Returns:
-            bool: Whether the active run admitted the message.
+            bool: Whether the active conversation admitted the message.
 
         Raises:
             asyncio.CancelledError: If persistence settles after cancellation.
         """
-        if not self._control.active:
+        if not self._control.active and not self.running:
             return False
         admission = await self._durable_admission_async(
             message,
             priority=_INPUT_PRIORITY,
             bypass_commands=True,
         )
-        if self._enqueue(message, admission=admission, interaction=interaction, report_full=False):
+        if await self._enqueue_async(
+            message,
+            admission=admission,
+            interaction=interaction,
+            report_full=False,
+        ):
             return True
         await self._reject_admission_async(admission)
         interaction.warning("Input queue is full; this input was not accepted. Try again later.")
         return False
+
+    async def reprioritize_latest_async(
+        self,
+        *,
+        steer: bool,
+    ) -> PendingInputPriorityOutcome:
+        """Change the newest waiting mailbox input and request interruption when steering.
+
+        Args:
+            steer (bool): Whether to move the input to steering priority.
+
+        Returns:
+            PendingInputPriorityOutcome: Whether an input was updated and a run interrupted.
+
+        Raises:
+            asyncio.CancelledError: If durable persistence settles after cancellation.
+        """
+        await self._acquire_mailbox_lock_async()
+        try:
+            session_manager = self._session_manager
+            session_id = session_manager.session.id if session_manager is not None else None
+            delivered_ids = (
+                {
+                    event.input_id
+                    for event in session_manager.session.events
+                    if isinstance(event, InputDeliveredEvent)
+                }
+                if session_manager is not None
+                else set()
+            )
+            eligible = [
+                item
+                for item in self._inbox.snapshot()
+                if item.kind is InputAdmissionKind.MESSAGE
+                and (item.input_id is None or item.session_id == session_id)
+                and item.input_id not in delivered_ids
+            ]
+            if not eligible:
+                return PendingInputPriorityOutcome.NO_PENDING_INPUT
+            target = max(eligible, key=lambda item: item.sequence)
+            priority = _STEERING_PRIORITY if steer else _INPUT_PRIORITY
+            if target.priority != priority and target.input_id is not None:
+                if session_manager is None:
+                    return PendingInputPriorityOutcome.NO_PENDING_INPUT
+                try:
+                    await session_manager.change_input_priority_async(target.input_id, priority)
+                except asyncio.CancelledError:
+                    persisted = next(
+                        (
+                            item
+                            for item in session_manager.session.pending_inputs
+                            if item.input_id == target.input_id
+                        ),
+                        None,
+                    )
+                    if persisted is not None and persisted.priority == priority:
+                        self._inbox.reprioritize(target, priority)
+                    raise
+            if target.priority != priority and not self._inbox.reprioritize(target, priority):
+                return PendingInputPriorityOutcome.NO_PENDING_INPUT
+        finally:
+            self._release_mailbox_lock()
+        if steer and self._control.active and self.request_interrupt():
+            return PendingInputPriorityOutcome.INTERRUPTED
+        return PendingInputPriorityOutcome.UPDATED
 
     @property
     def interaction(self) -> Interaction:
@@ -655,12 +784,7 @@ class SessionController:
                     max_workers=1,
                     thread_name_prefix="loop-conversation",
                 ) as executor,
-                ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="loop-command",
-                ) as command_executor,
             ):
-                self._command_executor = command_executor
                 worker = self._loop.run_in_executor(
                     executor,
                     copy_context().run,
@@ -692,7 +816,6 @@ class SessionController:
             self._loop = None
             self._ui_thread = None
             self._events = None
-            self._command_executor = None
             telemetry_activity("conversation.stopped", component=_STATUS_COMPONENT)
             if self._discarded:
                 try:
@@ -854,7 +977,15 @@ class SessionController:
         self._gate.release()
         try:
             self._send(RunStateChanged(completer))
-            admission = self._inbox.get()
+            while True:
+                with self._mailbox_lock:
+                    try:
+                        admission = self._inbox.get_nowait()
+                        break
+                    except Empty:
+                        pass
+                if not self._inbox.wait_until_not_empty():
+                    return False
         finally:
             # Restore the owner's existing scope after lending the gate to completion readers.
             self._gate.acquire()
@@ -886,15 +1017,7 @@ class SessionController:
         if self._control.stopped:
             return False
         await self._send_async(RunStateChanged(completer))
-        while True:
-            try:
-                admission = self._inbox.get_nowait()
-                break
-            except Empty:
-                self._input_signal.clear()
-                if not self._inbox.empty():
-                    continue
-                await self._input_signal.wait()
+        admission = await self._get_input_async()
         if admission.kind is InputAdmissionKind.STOP:
             return False
         if self._control.stopped:
@@ -1086,24 +1209,12 @@ class SessionController:
             return
         command_manager = cast(CommandManager, self._command_manager)
         if route_idle_commands and self._idle and command_manager.is_user_command(value):
-            self._idle_command_pending = self._enqueue(value)
+            self._idle_command_pending = await self._enqueue_async(value)
             return
         if command_manager.is_user_command(value):
-            command_name = value.lstrip().split(maxsplit=1)[0].lstrip("/")
-            if self._async_owner or command_name in {"steer", "queue"}:
-                self._command_task = asyncio.create_task(
-                    self._run_command_async(command_manager, value)
-                )
-            else:
-                if self._command_executor is None:
-                    raise RuntimeError("Controller command executor is unavailable.")
-                self._command_task = cast(asyncio.AbstractEventLoop, self._loop).run_in_executor(
-                    self._command_executor,
-                    copy_context().run,
-                    self._run_command,
-                    command_manager,
-                    value,
-                )
+            self._command_task = asyncio.create_task(
+                self._run_command_async(command_manager, value)
+            )
             return
         if value == "":
             self._source.warning("Please enter a message!")
@@ -1112,16 +1223,19 @@ class SessionController:
                 "Recover the interrupted run or start a new session before sending a message."
             )
         elif self._session_manager is not None:
-            priority = _STEERING_PRIORITY if self._control.active else _INPUT_PRIORITY
+            steer = self._control.active and self._input_mode == "steer"
+            priority = _STEERING_PRIORITY if steer else _INPUT_PRIORITY
             admission = await self._durable_admission_async(
                 str(value),
                 priority=priority,
                 bypass_commands=True,
             )
             admitted = (
-                self._enqueue_steering(str(value), admission=admission, report_full=False)
-                if self._control.active
-                else self._enqueue(
+                await self._enqueue_steering_async(
+                    str(value), admission=admission, report_full=False
+                )
+                if steer
+                else await self._enqueue_async(
                     admission.message,
                     admission=admission,
                     report_full=False,
@@ -1132,10 +1246,10 @@ class SessionController:
                 self._source.warning(
                     "Input queue is full; this input was not accepted. Try again later."
                 )
-        elif self._control.active:
-            self._enqueue_steering(value)
+        elif self._control.active and self._input_mode == "steer":
+            await self._enqueue_steering_async(value)
         else:
-            self._enqueue(value)
+            await self._enqueue_async(value)
 
     def _run_command(self, command_manager: CommandManager, value: str) -> bool:
         """Dispatch one user command through the controller-owned interaction mailbox."""
@@ -1164,6 +1278,69 @@ class SessionController:
             if owns_async_dispatch:
                 self._async_owner = False
 
+    async def _acquire_mailbox_lock_async(self) -> None:
+        """Wait cooperatively until the mailbox is available to the async owner."""
+        available = self._mailbox_available
+        if available is None:
+            available = asyncio.Event()
+            self._mailbox_available = available
+        while not self._mailbox_lock.acquire(blocking=False):
+            available.clear()
+            if self._mailbox_lock.acquire(blocking=False):
+                return
+            await available.wait()
+
+    def _release_mailbox_lock(self) -> None:
+        """Release the mailbox lock and wake any async owner waiting for it."""
+        self._mailbox_lock.release()
+        available = self._mailbox_available
+        if available is None:
+            return
+        loop = self._loop
+        if loop is None or get_ident() == self._ui_thread:
+            available.set()
+        else:
+            loop.call_soon_threadsafe(available.set)
+
+    async def _get_input_async(self) -> InputAdmission:
+        """Dequeue one mailbox item without racing a durable priority transition."""
+        while True:
+            await self._acquire_mailbox_lock_async()
+            try:
+                try:
+                    return self._inbox.get_nowait()
+                except Empty:
+                    pass
+            finally:
+                self._release_mailbox_lock()
+            self._input_signal.clear()
+            if not self._inbox.is_empty():
+                continue
+            await self._input_signal.wait()
+
+    def _put_mailbox_item_locked(self, admission: InputAdmission) -> bool:
+        """Add one input while the mailbox lock is held, unless shutdown has started."""
+        if self._stopping:
+            return False
+        return self._inbox.try_put(admission)
+
+    def _report_enqueued(self, interaction: Interaction) -> None:
+        """Wake the input owner and report one accepted mailbox admission."""
+        loop = self._loop
+        if loop is not None:
+            if get_ident() == self._ui_thread:
+                self._input_signal.set()
+            else:
+                loop.call_soon_threadsafe(self._input_signal.set)
+        pending = self._inbox.size()
+        telemetry_activity(
+            "conversation.input.queued",
+            component=_STATUS_COMPONENT,
+            pending=pending,
+        )
+        if not self._idle:
+            interaction.info(f"Queued input ({pending} pending).")
+
     def _enqueue(
         self,
         value: object,
@@ -1182,7 +1359,9 @@ class SessionController:
                 InputAdmissionKind.MESSAGE,
                 value,
             )
-            self._inbox.put_nowait(queued)
+            with self._mailbox_lock:
+                if not self._put_mailbox_item_locked(queued):
+                    return False
         except Full:
             telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
             if report_full:
@@ -1190,19 +1369,41 @@ class SessionController:
                     "Input queue is full; this input was not accepted. Try again later."
                 )
             return False
-        loop = self._loop
-        if loop is not None:
-            if get_ident() == self._ui_thread:
-                self._input_signal.set()
-            else:
-                loop.call_soon_threadsafe(self._input_signal.set)
-        telemetry_activity(
-            "conversation.input.queued",
-            component=_STATUS_COMPONENT,
-            pending=self._inbox.qsize(),
+        self._report_enqueued(active_interaction)
+        return True
+
+    async def _enqueue_async(
+        self,
+        value: object,
+        *,
+        priority: int = _INPUT_PRIORITY,
+        interaction: Interaction | None = None,
+        admission: InputAdmission | None = None,
+        report_full: bool = True,
+    ) -> bool:
+        """Admit bounded input without blocking the UI loop on cross-thread mailbox access."""
+        active_interaction = interaction if interaction is not None else self._source
+        queued = admission or InputAdmission(
+            priority,
+            next(self._sequence),
+            InputAdmissionKind.MESSAGE,
+            value,
         )
-        if not self._idle:
-            active_interaction.info(f"Queued input ({self._inbox.qsize()} pending).")
+        await self._acquire_mailbox_lock_async()
+        try:
+            try:
+                if not self._put_mailbox_item_locked(queued):
+                    return False
+            except Full:
+                telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
+                if report_full:
+                    active_interaction.warning(
+                        "Input queue is full; this input was not accepted. Try again later."
+                    )
+                return False
+        finally:
+            self._release_mailbox_lock()
+        self._report_enqueued(active_interaction)
         return True
 
     async def _durable_admission_async(
@@ -1265,30 +1466,35 @@ class SessionController:
             or self._session_manager.recovery_pending
         ):
             return
-        pending = self._session_manager.session.pending_inputs
-        pending_ids = {event.input_id for event in pending}
-        self._queued_input_ids.intersection_update(pending_ids)
-        available = _QUEUE_CAPACITY - self._inbox.qsize()
-        for event in pending:
-            if available <= 0:
-                break
-            if event.input_id in self._queued_input_ids:
-                continue
-            admission = InputAdmission(
-                event.priority,
-                event.sequence,
-                InputAdmissionKind.MESSAGE,
-                event.content,
-                input_id=event.input_id,
-                session_id=event.session_id,
-                bypass_commands=event.bypass_commands,
-            )
-            try:
-                self._inbox.put_nowait(admission)
-            except Full:
-                break
-            self._queued_input_ids.add(event.input_id)
-            available -= 1
+        await self._acquire_mailbox_lock_async()
+        try:
+            pending = self._session_manager.session.pending_inputs
+            pending_ids = {event.input_id for event in pending}
+            self._queued_input_ids.intersection_update(pending_ids)
+            available = self._inbox.capacity - self._inbox.size()
+            for event in pending:
+                if available <= 0:
+                    break
+                if event.input_id in self._queued_input_ids:
+                    continue
+                admission = InputAdmission(
+                    event.priority,
+                    event.sequence,
+                    InputAdmissionKind.MESSAGE,
+                    event.content,
+                    input_id=event.input_id,
+                    session_id=event.session_id,
+                    bypass_commands=event.bypass_commands,
+                )
+                try:
+                    if not self._put_mailbox_item_locked(admission):
+                        break
+                except Full:
+                    break
+                self._queued_input_ids.add(event.input_id)
+                available -= 1
+        finally:
+            self._release_mailbox_lock()
         if self._inbox and self._loop is not None:
             self._input_signal.set()
 
@@ -1308,15 +1514,16 @@ class SessionController:
             message,
         )
 
-        def admit() -> bool:
-            """Insert without UI work while run-control admission is locked."""
-            try:
-                self._inbox.put_nowait(durable_admission)
-            except Full:
+        try:
+            with self._mailbox_lock:
+                accepted = self._control.request_steering(
+                    lambda: self._put_mailbox_item_locked(durable_admission)
+                )
+        except Full:
+            accepted = False
+        if not accepted:
+            if self._stopping:
                 return False
-            return True
-
-        if not self._control.request_steering(admit):
             if self._control.active:
                 telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
                 if report_full:
@@ -1338,10 +1545,53 @@ class SessionController:
         telemetry_activity(
             "conversation.input.queued",
             component=_STATUS_COMPONENT,
-            pending=self._inbox.qsize(),
+            pending=self._inbox.size(),
         )
         self._source.info("Steering accepted; finishing the current operation first.")
         return True
+
+    async def _enqueue_steering_async(
+        self,
+        value: str,
+        *,
+        admission: InputAdmission | None = None,
+        report_full: bool = True,
+    ) -> bool:
+        """Admit steering without blocking the UI loop on cross-thread mailbox access."""
+        durable_admission = admission or InputAdmission(
+            _STEERING_PRIORITY,
+            next(self._sequence),
+            InputAdmissionKind.MESSAGE,
+            SteeringMessage(value),
+        )
+        await self._acquire_mailbox_lock_async()
+        try:
+            try:
+                accepted = self._control.request_steering(
+                    lambda: self._put_mailbox_item_locked(durable_admission)
+                )
+            except Full:
+                accepted = False
+        finally:
+            self._release_mailbox_lock()
+        if accepted:
+            self._report_enqueued(self._source)
+            self._source.info("Steering accepted; finishing the current operation first.")
+            return True
+        if self._stopping:
+            return False
+        if self._control.active:
+            telemetry_activity("conversation.queue.full", component=_STATUS_COMPONENT)
+            if report_full:
+                self._source.warning(
+                    "Input queue is full; this input was not accepted. Try again later."
+                )
+            return False
+        return await self._enqueue_async(
+            value,
+            admission=admission,
+            report_full=report_full,
+        )
 
     async def _answer_async(self) -> None:
         """Resolve only the explicit pending request through the UI's async input surface."""
@@ -1428,19 +1678,8 @@ class SessionController:
                 request.result.set_exception(KeyboardInterrupt())
             if self._pending is request:
                 self._pending = None
-        discarded = 0
-        while True:
-            try:
-                self._inbox.get_nowait()
-            except Empty:
-                break
-            discarded += 1
-        self._inbox.put_nowait(
-            InputAdmission(
-                _INPUT_PRIORITY,
-                next(self._sequence),
-                InputAdmissionKind.STOP,
-            )
+        discarded = self._inbox.stop_and_replace(
+            InputAdmission(_INPUT_PRIORITY, next(self._sequence), InputAdmissionKind.STOP)
         )
         loop = self._loop
         if loop is not None:

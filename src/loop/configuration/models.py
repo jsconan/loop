@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings
 from .. import constants
 from ..models import (
     CommandCapability,
+    ConversationInputMode,
     FileInputMode,
     HyperparameterPolicy,
     ReasoningEffort,
@@ -106,6 +107,23 @@ class LoopSettings(BaseModel):
     )
 
 
+class ConversationSettings(BaseModel):
+    """Configure how plain text is admitted while an agent run is active.
+
+    Args:
+        input_mode (ConversationInputMode): Whether active-run text is queued or steers the run.
+            Defaults to ``queue``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    input_mode: ConversationInputMode = Field(
+        default=constants.DEFAULT_CONVERSATION_INPUT_MODE,
+        description="Route plain text during an active run to the queue or steering priority.",
+        json_schema_extra={"required_capabilities": [CommandCapability.SESSION_IDLE.value]},
+    )
+
+
 class WebSettings(BaseModel):
     """Configure web-content retrieval."""
 
@@ -162,6 +180,7 @@ class ApplicationSettings(BaseSettings):
 
     config_version: int = CONFIGURATION_VERSION
     backend: BackendSettings = BackendSettings()
+    conversation: ConversationSettings = ConversationSettings()
     loop: LoopSettings = LoopSettings()
     web: WebSettings = WebSettings()
     tools: ToolSettings = ToolSettings()

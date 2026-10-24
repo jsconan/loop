@@ -62,6 +62,7 @@ from .models import (
     CompactionEvent,
     InputConsumedEvent,
     InputDeliveredEvent,
+    InputPriorityChangedEvent,
     InputQueuedEvent,
     InputRejectedEvent,
     InstructionSnapshot,
@@ -364,6 +365,7 @@ class SessionManager:
                     ToolExecutionStartedEvent,
                     ToolExecutionCompletedEvent,
                     InputQueuedEvent,
+                    InputPriorityChangedEvent,
                     InputDeliveredEvent,
                     InputConsumedEvent,
                     InputRejectedEvent,
@@ -679,6 +681,37 @@ class SessionManager:
             asyncio.CancelledError: If persistence settles after cancellation.
         """
         await self._commit_async(lambda session: session.mark_input_delivered(input_id))
+
+    def change_input_priority(self, input_id: str, priority: int) -> None:
+        """Persist a priority change for an input that has not reached its owner.
+
+        Args:
+            input_id (str): Identity of the accepted input.
+            priority (int): Replacement mailbox priority.
+
+        Returns:
+            None: After the priority change is durably committed.
+
+        Raises:
+            ValueError: If the input is no longer waiting in the mailbox.
+        """
+        self._commit(lambda session: session.change_input_priority(input_id, priority))
+
+    async def change_input_priority_async(self, input_id: str, priority: int) -> None:
+        """Persist a priority change through the asynchronous session writer.
+
+        Args:
+            input_id (str): Identity of the accepted input.
+            priority (int): Replacement mailbox priority.
+
+        Returns:
+            None: After the priority change is durably committed.
+
+        Raises:
+            ValueError: If the input is no longer waiting in the mailbox.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        await self._commit_async(lambda session: session.change_input_priority(input_id, priority))
 
     def reject_input(self, input_id: str) -> None:
         """Persist that a previously accepted input could not enter the mailbox.

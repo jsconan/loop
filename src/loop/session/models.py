@@ -222,6 +222,22 @@ class InputQueuedEvent(SessionEventModel):
     run_id: str | None = None
 
 
+class InputPriorityChangedEvent(SessionEventModel):
+    """Persist a mailbox priority change without assigning a new admission order.
+
+    Args:
+        type (Literal["input_priority_changed"]): Event discriminator.
+        input_id (str): Stable identity of the waiting input.
+        priority (int): New mailbox priority.
+        sequence (int): Original admission sequence retained for FIFO ordering.
+    """
+
+    type: Literal["input_priority_changed"] = "input_priority_changed"
+    input_id: str = Field(min_length=1)
+    priority: int
+    sequence: int = Field(ge=0)
+
+
 class InputDeliveredEvent(SessionEventModel):
     """Record delivery of an accepted input to the session owner.
 
@@ -374,6 +390,7 @@ SessionEvent = Annotated[
     ConversationItemEvent
     | PermissionEvent
     | InputQueuedEvent
+    | InputPriorityChangedEvent
     | InputDeliveredEvent
     | InputConsumedEvent
     | InputRejectedEvent

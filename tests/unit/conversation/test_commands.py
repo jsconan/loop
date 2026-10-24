@@ -18,7 +18,12 @@ from loop import (
     Interaction,
 )
 from loop.conversation.commands import ConversationCommands, ConversationControl
-from loop.conversation.models import ConversationStatus, ResponseOutcome, SteeringOutcome
+from loop.conversation.models import (
+    ConversationStatus,
+    PendingInputPriorityOutcome,
+    ResponseOutcome,
+    SteeringOutcome,
+)
 
 
 @pytest.fixture
@@ -48,7 +53,8 @@ def test_provider_declares_state_capabilities_and_response_completion():
     assert registrations[2].capabilities == frozenset(
         {CommandCapability.CONVERSATION_ACTIVE, CommandCapability.CONTEXT_READ}
     )
-    assert registrations[3].capabilities == frozenset({CommandCapability.RUN_ACTIVE})
+    assert registrations[3].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
+    assert registrations[4].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
     assert registrations[1].completion.provider == control.response_completions
     assert registrations[-1].completion == CommandCompletion()
 
@@ -59,6 +65,7 @@ def test_control_protocol_declares_sync_and_async_control_methods():
     assert callable(ConversationControl.queue)
     assert iscoroutinefunction(ConversationControl.steer_async)
     assert iscoroutinefunction(ConversationControl.queue_async)
+    assert iscoroutinefunction(ConversationControl.reprioritize_latest_async)
 
 
 def test_respond_argument_completes_the_pending_response_values():
@@ -154,23 +161,27 @@ def test_status_formats_the_controller_snapshot(command_context):
 
 
 @pytest.mark.parametrize(
-    ("message", "accepted", "expected_warning"),
+    ("message", "accepted", "priority_outcome", "expected_warning"),
     [
-        ((), None, "Usage: /queue <message>"),
-        (("after", "this"), True, None),
-        (("after",), False, "No agent run is active; send a normal message instead."),
+        ((), None, PendingInputPriorityOutcome.NO_PENDING_INPUT, "No pending message to queue"),
+        (("after", "this"), True, None, None),
+        (("after",), False, None, "No agent run is active; send a normal message instead."),
     ],
 )
-def test_queue_reports_admission_outcomes(command_context, message, accepted, expected_warning):
+def test_queue_reports_admission_outcomes(
+    command_context, message, accepted, priority_outcome, expected_warning
+):
     """Queued messages preserve their text and report empty, accepted, and rejected input."""
     context, interaction = command_context
     control = Mock()
     control.queue_async = AsyncMock(return_value=accepted)
+    control.reprioritize_latest_async = AsyncMock(return_value=priority_outcome)
 
     asyncio.run(ConversationCommands(control).queue_async(context, message))
 
     if accepted is None:
         control.queue_async.assert_not_awaited()
+        control.reprioritize_latest_async.assert_awaited_once_with(steer=False)
     else:
         control.queue_async.assert_awaited_once_with(" ".join(message), interaction)
     if expected_warning is None:
@@ -179,43 +190,88 @@ def test_queue_reports_admission_outcomes(command_context, message, accepted, ex
         interaction.warning.assert_called_once_with(expected_warning)
 
 
+def test_queue_without_arguments_reprioritizes_the_latest_waiting_message(command_context):
+    """Queue without text demotes the latest mailbox message to ordinary priority."""
+    context, interaction = command_context
+    control = Mock()
+    control.reprioritize_latest_async = AsyncMock(return_value=PendingInputPriorityOutcome.UPDATED)
+
+    asyncio.run(ConversationCommands(control).queue_async(context))
+
+    control.reprioritize_latest_async.assert_awaited_once_with(steer=False)
+    interaction.info.assert_called_once_with("Newest pending message set to queue priority.")
+    interaction.warning.assert_not_called()
+
+
+def test_queue_reports_idle_admission_for_the_next_run(command_context):
+    """Explicit queue input accepted between runs is described as a next-run message."""
+    context, interaction = command_context
+    control = Mock()
+    control.queue_async = AsyncMock(return_value=True)
+    control.status_snapshot.return_value = ConversationStatus("Idle", 1)
+
+    asyncio.run(ConversationCommands(control).queue_async(context, ("after", "this")))
+
+    control.queue_async.assert_awaited_once_with("after this", interaction)
+    interaction.info.assert_called_once_with("Queued input for the next run.")
+    interaction.warning.assert_not_called()
+
+
 @pytest.mark.parametrize(
-    ("message", "outcome", "method", "feedback"),
+    ("message", "outcome", "priority_outcome", "method", "feedback"),
     [
-        ((), None, "warning", "Usage: /steer <message>"),
+        (
+            (),
+            None,
+            PendingInputPriorityOutcome.NO_PENDING_INPUT,
+            "warning",
+            "No pending message to steer",
+        ),
         (
             ("fix",),
             SteeringOutcome.RUN_INACTIVE,
+            None,
             "warning",
             "No agent run is active; send a normal message instead.",
         ),
         (
             ("fix",),
             SteeringOutcome.INTERRUPT_REJECTED,
+            None,
             "warning",
             "No agent run is active.",
         ),
         (
             ("fix",),
             SteeringOutcome.INTERRUPTED,
+            None,
             "info",
             "Interrupt requested; waiting for the active operation to settle...",
         ),
-        (("fix",), SteeringOutcome.QUEUE_FULL, None, None),
+        (
+            ("fix",),
+            SteeringOutcome.QUEUED,
+            None,
+            "info",
+            "Steering input accepted for the next run.",
+        ),
+        (("fix",), SteeringOutcome.QUEUE_FULL, None, None, None),
     ],
 )
 def test_steer_reports_validation_and_control_outcomes(
-    command_context, message, outcome, method, feedback
+    command_context, message, outcome, priority_outcome, method, feedback
 ):
     """Steering reports usage and lifecycle outcomes without duplicating queue warnings."""
     context, interaction = command_context
     control = Mock()
     control.steer_async = AsyncMock(return_value=outcome)
+    control.reprioritize_latest_async = AsyncMock(return_value=priority_outcome)
 
     asyncio.run(ConversationCommands(control).steer_async(context, message))
 
     if outcome is None:
         control.steer_async.assert_not_awaited()
+        control.reprioritize_latest_async.assert_awaited_once_with(steer=True)
     else:
         control.steer_async.assert_awaited_once_with(" ".join(message), interaction)
     if method is None:
@@ -223,3 +279,31 @@ def test_steer_reports_validation_and_control_outcomes(
         interaction.warning.assert_not_called()
     else:
         getattr(interaction, method).assert_called_once_with(feedback)
+
+
+@pytest.mark.parametrize(
+    ("priority_outcome", "feedback"),
+    [
+        (
+            PendingInputPriorityOutcome.UPDATED,
+            "Newest pending message set to steering priority.",
+        ),
+        (
+            PendingInputPriorityOutcome.INTERRUPTED,
+            "Interrupt requested; waiting for the active operation to settle...",
+        ),
+    ],
+)
+def test_steer_without_arguments_reprioritizes_and_interrupts(
+    command_context, priority_outcome, feedback
+):
+    """Steer without text prioritizes the latest mailbox message and reports interruption."""
+    context, interaction = command_context
+    control = Mock()
+    control.reprioritize_latest_async = AsyncMock(return_value=priority_outcome)
+
+    asyncio.run(ConversationCommands(control).steer_async(context))
+
+    control.reprioritize_latest_async.assert_awaited_once_with(steer=True)
+    interaction.info.assert_called_once_with(feedback)
+    interaction.warning.assert_not_called()

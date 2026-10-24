@@ -38,6 +38,7 @@ _ENVIRONMENT_FIELDS = {
     "USER_AGENT": ("web", "user_agent"),
     "LOOP_COMMAND_TIMEOUT": ("tools", "command_timeout"),
     "LOOP_AGENT_NAME": ("loop", "agent_name"),
+    "LOOP_CONVERSATION_INPUT_MODE": ("conversation", "input_mode"),
     "LOOP_MODEL": ("loop", "model"),
     "LOOP_TEMPERATURE": ("loop", "temperature"),
     "LOOP_REASONING_EFFORT": ("loop", "reasoning_effort"),

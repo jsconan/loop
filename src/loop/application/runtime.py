@@ -116,7 +116,7 @@ class ApplicationRuntime:
         if workspace.id is None:
             raise ValueError("Application runtime requires an initialized workspace.")
         session_controller = (
-            SessionController(interaction)
+            SessionController(interaction, input_mode=settings.conversation.input_mode)
             if isinstance(interaction, AsyncInteractionInput)
             else None
         )
@@ -314,6 +314,8 @@ class ApplicationRuntime:
         if path.startswith("backend."):
             self._replace_backend(settings)
             return "applied now"
+        if path == "conversation.input_mode":
+            return self._apply_conversation_input_mode(settings)
         return self._loop.apply_runtime_settings(path, settings)
 
     async def apply_configuration_async(self, path: str, settings: ApplicationSettings) -> str:
@@ -332,6 +334,8 @@ class ApplicationRuntime:
         if path.startswith("backend."):
             await self._replace_backend_async(settings)
             return "applied now"
+        if path == "conversation.input_mode":
+            return self._apply_conversation_input_mode(settings)
         return await self._loop.apply_runtime_settings_async(path, settings)
 
     def apply_configuration_changes(
@@ -354,9 +358,11 @@ class ApplicationRuntime:
             {
                 path: self._loop.apply_runtime_settings(path, settings)
                 for path in paths
-                if not path.startswith("backend.")
+                if not path.startswith("backend.") and path != "conversation.input_mode"
             }
         )
+        if "conversation.input_mode" in paths:
+            statuses["conversation.input_mode"] = self._apply_conversation_input_mode(settings)
         return statuses
 
     async def apply_configuration_changes_async(
@@ -380,8 +386,18 @@ class ApplicationRuntime:
             statuses.update({path: "applied now" for path in paths if path.startswith("backend.")})
         for path in paths:
             if not path.startswith("backend."):
-                statuses[path] = await self._loop.apply_runtime_settings_async(path, settings)
+                if path == "conversation.input_mode":
+                    statuses[path] = self._apply_conversation_input_mode(settings)
+                else:
+                    statuses[path] = await self._loop.apply_runtime_settings_async(path, settings)
         return statuses
+
+    def _apply_conversation_input_mode(self, settings: ApplicationSettings) -> str:
+        """Apply the configured plain-text route to the active session controller."""
+        if self._session_controller is None:
+            return "saved; restart required"
+        self._session_controller.input_mode = settings.conversation.input_mode
+        return "applied now"
 
     def _replace_backend(self, settings: ApplicationSettings) -> None:
         """Track a replacement backend before publishing it to the active loop."""

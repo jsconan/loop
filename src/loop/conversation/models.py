@@ -45,6 +45,15 @@ class SteeringOutcome(Enum):
     RUN_INACTIVE = "run_inactive"
     INTERRUPT_REJECTED = "interrupt_rejected"
     QUEUE_FULL = "queue_full"
+    QUEUED = "queued"
+
+
+class PendingInputPriorityOutcome(Enum):
+    """Describe the result of changing the newest waiting input's priority."""
+
+    NO_PENDING_INPUT = "no_pending_input"
+    UPDATED = "updated"
+    INTERRUPTED = "interrupted"
 
 
 class ResponseOutcome(Enum):

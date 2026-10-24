@@ -4,7 +4,7 @@ import asyncio
 import inspect
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from queue import Empty, PriorityQueue
+from queue import Empty
 from threading import Event, Thread, get_ident
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -30,6 +30,7 @@ from loop import (
 from loop.conversation import ConversationCommands
 from loop.conversation import controller as controller_module
 from loop.conversation.interaction import MailboxInteraction
+from loop.conversation.mailbox import InputMailbox
 from loop.conversation.models import (
     EVENT_CONFIRM,
     EVENT_PROMPT,
@@ -38,6 +39,7 @@ from loop.conversation.models import (
     InputAdmission,
     InputAdmissionKind,
     InteractionCall,
+    PendingInputPriorityOutcome,
     ResponseOutcome,
     SteeringOutcome,
 )
@@ -91,6 +93,59 @@ def test_controller_requires_async_input():
     """Legacy synchronous adapters remain outside the responsive controller."""
     with pytest.raises(TypeError, match="asynchronous input"):
         SessionController(MagicMock(spec=Interaction))
+
+
+def test_controller_validates_and_exposes_the_active_input_mode(ui):
+    """Controller mode values are restricted to the two documented active-run routes."""
+    controller = SessionController(ui)
+
+    assert controller.input_mode == "queue"
+    controller.input_mode = "steer"
+    assert controller.input_mode == "steer"
+    with pytest.raises(ValueError, match="queue.*steer"):
+        controller.input_mode = "replace"
+    with pytest.raises(ValueError, match="queue.*steer"):
+        SessionController(ui, input_mode="replace")
+
+
+def test_async_mailbox_lock_waits_without_blocking_the_event_loop(ui):
+    """Async mailbox access waits for a synchronous owner and resumes when it releases."""
+    controller = SessionController(ui)
+    controller._mailbox_lock.acquire()
+
+    async def scenario():
+        """Hold an async acquisition until the existing lock owner releases it."""
+        waiting = asyncio.create_task(controller._acquire_mailbox_lock_async())
+        await asyncio.sleep(0)
+        assert waiting.done() is False
+        controller._release_mailbox_lock()
+        await waiting
+        controller._release_mailbox_lock()
+
+    asyncio.run(scenario())
+
+
+def test_async_mailbox_lock_retries_after_a_release_race(ui):
+    """A lock released just before the wait is registered is acquired on the retry."""
+    controller = SessionController(ui)
+    lock = Mock()
+    lock.acquire.side_effect = [False, True]
+    controller._mailbox_lock = lock
+
+    asyncio.run(controller._acquire_mailbox_lock_async())
+    controller._release_mailbox_lock()
+
+    lock.release.assert_called_once_with()
+
+
+def test_mailbox_lock_release_is_safe_before_async_waiters_exist(ui):
+    """Synchronous mailbox use does not require an async availability event."""
+    controller = SessionController(ui)
+    controller._mailbox_lock.acquire()
+
+    controller._release_mailbox_lock()
+
+    assert controller._mailbox_available is None
 
 
 def test_controller_exposes_setup_interaction_and_a_single_execution_lifecycle(ui):
@@ -316,7 +371,7 @@ def test_durable_sync_queue_and_steer_persist_before_admission(ui):
         "follow up",
         "correction",
     }
-    assert {item.input_id for item in controller._inbox.queue} == {
+    assert {item.input_id for item in controller._inbox.snapshot()} == {
         event.input_id for event in manager.session.pending_inputs
     }
     assert all(event.bypass_commands for event in manager.session.pending_inputs)
@@ -333,7 +388,7 @@ def test_sync_steer_interrupt_rejection_preserves_the_durable_input(ui):
         assert controller.steer("correction", ui) is SteeringOutcome.INTERRUPT_REJECTED
 
     assert [event.content for event in manager.session.pending_inputs] == ["correction"]
-    assert controller._inbox.qsize() == 1
+    assert controller._inbox.size() == 1
 
 
 def test_sync_steer_without_durable_storage_preserves_legacy_outcomes(ui):
@@ -345,8 +400,8 @@ def test_sync_steer_without_durable_storage_preserves_legacy_outcomes(ui):
         assert controller.steer("correction", ui) is SteeringOutcome.INTERRUPTED
 
     controller = SessionController(ui)
-    for sequence in range(controller._inbox.maxsize):
-        controller._inbox.put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued"))
+    for sequence in range(controller._inbox.capacity):
+        controller._inbox.try_put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued"))
     with controller.control.execution():
         assert controller.steer("overflow", ui) is SteeringOutcome.QUEUE_FULL
 
@@ -375,7 +430,7 @@ def test_async_steer_reports_interrupt_rejection_after_admission(ui):
             return await controller.steer_async("correction", ui)
 
     assert asyncio.run(scenario()) is SteeringOutcome.INTERRUPT_REJECTED
-    assert controller._inbox.qsize() == 1
+    assert controller._inbox.size() == 1
 
 
 def test_controller_accepts_durable_input_when_mailbox_has_capacity(ui):
@@ -394,7 +449,7 @@ def test_controller_accepts_durable_input_when_mailbox_has_capacity(ui):
     asyncio.run(scenario())
 
     assert [event.content for event in manager.session.pending_inputs] == ["accepted"]
-    assert controller._inbox.qsize() == 1
+    assert controller._inbox.size() == 1
 
 
 def test_controller_accepts_durable_input_during_its_live_run(ui):
@@ -418,8 +473,406 @@ def test_controller_accepts_durable_input_during_its_live_run(ui):
     assert manager.recovery_state is not None
     assert manager.recovery_pending is False
     assert [event.content for event in manager.session.pending_inputs] == ["follow-up"]
-    assert controller._inbox.qsize() == 1
+    assert controller._inbox.size() == 1
     ui.warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_priority", "steering_pending", "interrupted"),
+    [
+        ("queue", 1, False, False),
+        ("steer", 0, True, False),
+    ],
+)
+def test_controller_routes_active_plain_text_through_the_configured_mode(
+    ui, mode, expected_priority, steering_pending, interrupted
+):
+    """Active plain text follows configured priority and interruption semantics."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    manager.add_user_message("active request")
+    manager.begin_run()
+    controller = SessionController(ui, input_mode=mode)
+    controller.bind_session_manager(manager)
+    controller.bind_command_manager(CommandManager())
+
+    async def scenario():
+        """Submit ordinary text inside the active run's admission scope."""
+        submitted = asyncio.get_running_loop().create_future()
+        submitted.set_result("follow-up")
+        with controller.control.execution():
+            await controller._accept_async(submitted, route_idle_commands=False)
+            assert controller.control.steering_pending is steering_pending
+            assert controller.control.interrupted is interrupted
+
+    asyncio.run(scenario())
+
+    assert manager.session.pending_inputs[0].priority == expected_priority
+    assert controller._inbox.size() == 1
+    assert ui.warning.call_count == 0
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+def test_controller_marks_in_memory_plain_text_steering_only_after_admission(ui, admitted):
+    """In-memory steer mode marks steering only after its message enters the mailbox."""
+    controller = SessionController(ui, input_mode="steer")
+    controller.bind_command_manager(CommandManager())
+    if not admitted:
+        for sequence in range(controller._inbox.capacity):
+            controller._inbox.try_put(
+                InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued")
+            )
+
+    async def scenario():
+        """Submit plain text to an active non-durable controller."""
+        submitted = asyncio.get_running_loop().create_future()
+        submitted.set_result("follow-up")
+        with controller.control.execution():
+            await controller._accept_async(submitted, route_idle_commands=False)
+            assert controller.control.steering_pending is admitted
+            assert controller.control.interrupted is False
+
+    asyncio.run(scenario())
+    assert controller._inbox.size() == (1 if admitted else controller._inbox.capacity)
+    assert ui.warning.call_count == (0 if admitted else 1)
+
+
+def test_async_steer_input_waiting_between_runs_is_queued_for_the_next_run(ui):
+    """An explicit correction remains accepted when its controller has no active run."""
+    controller = SessionController(ui)
+
+    async def scenario():
+        """Keep the controller lifecycle open without activating a model run."""
+        controller._loop = asyncio.get_running_loop()
+        controller._ui_thread = get_ident()
+        result = await controller.steer_async("correction", ui)
+        fallback = await controller._enqueue_steering_async("ordinary fallback")
+        controller._loop = None
+        controller._ui_thread = None
+        return result, fallback
+
+    result, fallback = asyncio.run(scenario())
+
+    assert result is SteeringOutcome.QUEUED
+    assert fallback is True
+    assert [
+        (item.priority, str(item.message)) for item in sorted(controller._inbox.snapshot())
+    ] == [
+        (0, "correction"),
+        (1, "ordinary fallback"),
+    ]
+
+
+def test_async_steer_input_between_runs_reports_a_full_mailbox(ui):
+    """An explicit correction between runs is rejected visibly when capacity is exhausted."""
+    controller = SessionController(ui)
+    for sequence in range(controller._inbox.capacity):
+        controller._inbox.try_put(
+            InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "waiting")
+        )
+
+    async def scenario():
+        """Keep the controller alive between runs while the mailbox remains full."""
+        controller._loop = asyncio.get_running_loop()
+        controller._ui_thread = get_ident()
+        result = await controller.steer_async("correction", ui)
+        controller._loop = None
+        controller._ui_thread = None
+        return result
+
+    assert asyncio.run(scenario()) is SteeringOutcome.QUEUE_FULL
+    ui.warning.assert_called_once_with(
+        "Input queue is full; this input was not accepted. Try again later."
+    )
+
+
+def test_enqueue_methods_reject_new_input_after_shutdown_starts(ui):
+    """Shutdown closes both synchronous and async mailbox admission without a false warning."""
+    controller = SessionController(ui)
+    controller._stopping = True
+
+    async def scenario():
+        """Try each asynchronous admission path after its shutdown guard is set."""
+        assert await controller._enqueue_async("ordinary") is False
+        with controller.control.execution():
+            assert await controller._enqueue_steering_async("steering") is False
+
+    assert controller._enqueue("ordinary") is False
+    with controller.control.execution():
+        assert controller._enqueue_steering("steering") is False
+    asyncio.run(scenario())
+    ui.warning.assert_not_called()
+
+
+def test_steering_admission_reports_full_capacity_and_wakes_the_ui_owner(ui):
+    """Full steering queues report rejection while accepted steering wakes the UI loop."""
+    controller = SessionController(ui)
+    for sequence in range(controller._inbox.capacity):
+        controller._inbox.try_put(
+            InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "waiting")
+        )
+    with controller.control.execution():
+        assert controller._enqueue_steering("overflow") is False
+    ui.warning.assert_called_once_with(
+        "Input queue is full; this input was not accepted. Try again later."
+    )
+
+    controller = SessionController(ui)
+
+    async def admit_from_ui_thread():
+        """Use the synchronous library path while the current event loop owns the UI."""
+        controller._loop = asyncio.get_running_loop()
+        controller._ui_thread = get_ident()
+        with controller.control.execution():
+            assert controller._enqueue_steering("accepted") is True
+        assert controller._input_signal.is_set()
+        controller._loop = None
+        controller._ui_thread = None
+
+    asyncio.run(admit_from_ui_thread())
+
+
+def test_async_admission_reports_full_capacity_when_requested(ui):
+    """Async ordinary and steering admission report their own bounded-queue rejection."""
+    controller = SessionController(ui)
+    for sequence in range(controller._inbox.capacity):
+        controller._inbox.try_put(
+            InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "waiting")
+        )
+
+    async def scenario():
+        """Exercise the reporting async paths against a full mailbox."""
+        assert await controller._enqueue_async("overflow") is False
+        with controller.control.execution():
+            assert await controller._enqueue_steering_async("overflow") is False
+
+    asyncio.run(scenario())
+    assert ui.warning.call_count == 2
+    assert all(
+        item.args[0] == "Input queue is full; this input was not accepted. Try again later."
+        for item in ui.warning.call_args_list
+    )
+
+
+def test_controller_priority_commands_update_the_latest_waiting_message(ui):
+    """Explicit priority commands durably reorder only messages still waiting in the mailbox."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    received = []
+
+    async def scenario():
+        """Run commands while a durable conversation input owner is active."""
+        inputs = asyncio.Queue()
+        release = asyncio.Event()
+        working = asyncio.Event()
+        queued_twice = asyncio.Event()
+        steered = asyncio.Event()
+        read_inputs(ui, inputs)
+        queued_count = 0
+
+        async def conversation(receive):
+            """Hold a run while queuing, steering, then receive the priority order."""
+            await receive(DummyCompleter())
+            with controller.control.execution():
+                controller.interaction.info("working")
+                await release.wait()
+            received.append((await receive(DummyCompleter())).message)
+            received.append((await receive(DummyCompleter())).message)
+
+        def report(message=""):
+            """Expose command feedback as deterministic synchronization points."""
+            nonlocal queued_count
+            if message == "working":
+                working.set()
+            elif message.startswith("Queued input"):
+                queued_count += 1
+                if queued_count == 2:
+                    queued_twice.set()
+            elif message.startswith("Interrupt requested"):
+                steered.set()
+
+        ui.info.side_effect = report
+        task = asyncio.create_task(controller.run_async(conversation))
+        try:
+            inputs.put_nowait("start")
+            await working.wait()
+            inputs.put_nowait("/queue first")
+            inputs.put_nowait("/queue second")
+            await queued_twice.wait()
+            inputs.put_nowait("/steer")
+            await steered.wait()
+            release.set()
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert received == ["second", "first"]
+    assert [
+        (item.content, item.priority, item.sequence) for item in manager.session.pending_inputs
+    ] == [
+        ("second", 0, 2),
+        ("start", 1, 0),
+        ("first", 1, 1),
+    ]
+    assert [
+        event.type for event in manager.session.events if event.type == "input_priority_changed"
+    ] == ["input_priority_changed"]
+
+
+def test_controller_priority_write_failure_keeps_the_mailbox_item_unchanged(ui):
+    """A failed durable priority transition leaves its queued input at its previous priority."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    manager.change_input_priority_async = AsyncMock(side_effect=OSError("disk full"))
+
+    async def scenario():
+        """Queue input and fail its durable priority update before the mailbox mutation."""
+        with controller.control.execution():
+            assert await controller.queue_async("waiting", ui) is True
+            with pytest.raises(OSError, match="disk full"):
+                await controller.reprioritize_latest_async(steer=True)
+            admission = await controller._get_input_async()
+        return admission
+
+    admission = asyncio.run(scenario())
+
+    assert admission.priority == 1
+    assert manager.session.pending_inputs[0].priority == 1
+    assert [event.type for event in manager.session.events] == ["input_queued"]
+
+
+def test_controller_reprioritization_skips_inputs_already_delivered(ui):
+    """The physical queue cannot reprioritize an input after durable delivery begins."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+
+    async def scenario():
+        """Mark the accepted message delivered while leaving its stale envelope in the queue."""
+        admission = await controller._durable_admission_async(
+            "delivered",
+            priority=1,
+            bypass_commands=True,
+        )
+        assert controller._enqueue(admission.message, admission=admission) is True
+        await manager.mark_input_delivered_async(admission.input_id)
+        result = await controller.reprioritize_latest_async(steer=True)
+        return admission, result
+
+    admission, result = asyncio.run(scenario())
+
+    assert result is PendingInputPriorityOutcome.NO_PENDING_INPUT
+    assert controller._inbox.get_nowait() == admission
+    assert manager.session.pending_inputs[0].priority == 1
+
+
+def test_controller_reprioritization_reports_when_target_was_removed_during_write(ui):
+    """A shutdown during durable priority persistence leaves the queue safely stopped."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+
+    async def remove_during_write(input_id, priority):
+        """Stop the mailbox, then finish the durable priority transition."""
+        controller._stop()
+        manager.change_input_priority(input_id, priority)
+
+    manager.change_input_priority_async = remove_during_write
+
+    async def scenario():
+        """Select one queued message and remove it while the persistence await is pending."""
+        admission = await controller._durable_admission_async(
+            "waiting",
+            priority=1,
+            bypass_commands=True,
+        )
+        assert controller._enqueue(admission.message, admission=admission) is True
+        return await controller.reprioritize_latest_async(steer=True)
+
+    assert asyncio.run(scenario()) is PendingInputPriorityOutcome.NO_PENDING_INPUT
+    assert manager.session.pending_inputs[0].priority == 0
+    assert controller._inbox.get_nowait().kind is InputAdmissionKind.STOP
+
+
+@pytest.mark.parametrize(
+    ("steer", "initial_priority", "expected_priority"),
+    [(False, 0, 1), (True, 1, 0)],
+)
+def test_controller_reprioritizes_memory_only_input_when_storage_is_unbound(
+    ui, steer, initial_priority, expected_priority
+):
+    """Memory-only messages can move either way without a durable identity."""
+    controller = SessionController(ui)
+    controller._inbox.try_put(
+        InputAdmission(initial_priority, 0, InputAdmissionKind.MESSAGE, "waiting")
+    )
+    controller.request_interrupt = Mock(return_value=False)
+
+    async def scenario():
+        """Change a memory-only priority and decline any optional interruption."""
+        if steer:
+            with controller.control.execution():
+                return await controller.reprioritize_latest_async(steer=steer)
+        return await controller.reprioritize_latest_async(steer=False)
+
+    result = asyncio.run(scenario())
+
+    assert result is PendingInputPriorityOutcome.UPDATED
+    assert controller._inbox.get_nowait().priority == expected_priority
+
+
+def test_controller_refuses_to_reprioritize_durable_identity_without_its_manager(ui):
+    """A durable identity without its owning session cannot be priority updated."""
+    controller = SessionController(ui)
+    controller._inbox.try_put(
+        InputAdmission(
+            0,
+            0,
+            InputAdmissionKind.MESSAGE,
+            "waiting",
+            input_id="input-1",
+        )
+    )
+
+    assert asyncio.run(controller.reprioritize_latest_async(steer=False)) is (
+        PendingInputPriorityOutcome.NO_PENDING_INPUT
+    )
+    assert controller._inbox.get_nowait().priority == 0
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_controller_priority_cancellation_keeps_durable_and_mailbox_state_aligned(ui, committed):
+    """Cancellation leaves the mailbox unchanged or synchronizes a completed durable write."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+
+    async def scenario():
+        """Cancel reprioritization before or just after its durable transition commits."""
+        with controller.control.execution():
+            assert await controller.queue_async("waiting", ui) is True
+
+            async def cancel_priority(input_id, priority):
+                """Optionally commit the update before propagating task cancellation."""
+                if committed:
+                    manager.change_input_priority(input_id, priority)
+                raise asyncio.CancelledError
+
+            manager.change_input_priority_async = cancel_priority
+            with pytest.raises(asyncio.CancelledError):
+                await controller.reprioritize_latest_async(steer=True)
+            return await controller._get_input_async()
+
+    admission = asyncio.run(scenario())
+    expected_priority = 0 if committed else 1
+
+    assert admission.priority == expected_priority
+    assert manager.session.pending_inputs[0].priority == expected_priority
 
 
 @pytest.mark.parametrize("method", ["queue", "steer"])
@@ -429,8 +882,8 @@ def test_durable_sync_control_rejects_mailbox_overflow(ui, method):
     controller = SessionController(ui)
     controller.bind_session_manager(manager)
     controller.bind_command_manager(CommandManager())
-    for sequence in range(controller._inbox.maxsize):
-        controller._inbox.put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued"))
+    for sequence in range(controller._inbox.capacity):
+        controller._inbox.try_put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued"))
 
     with controller.control.execution():
         if method == "queue":
@@ -458,8 +911,8 @@ def test_async_durable_control_admission_and_overflow(ui):
         with controller.control.execution():
             assert await controller.queue_async("follow up", ui) is True
             assert await controller.steer_async("correction", ui) is SteeringOutcome.INTERRUPTED
-            for sequence in range(controller._inbox.maxsize - controller._inbox.qsize()):
-                controller._inbox.put_nowait(
+            for sequence in range(controller._inbox.capacity - controller._inbox.size()):
+                controller._inbox.try_put(
                     InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued")
                 )
             assert await controller.queue_async("queue overflow", ui) is False
@@ -497,7 +950,7 @@ def test_controller_receives_durable_inputs_as_async_envelopes(ui):
     event = manager.queue_input("async message", priority=1, bypass_commands=True)
     controller = SessionController(ui)
     controller.bind_session_manager(manager)
-    controller._inbox.put_nowait(controller._admission_from_event(event))
+    controller._inbox.try_put(controller._admission_from_event(event))
 
     async def send(event):
         """Acknowledge the direct unit-test owner boundary."""
@@ -516,13 +969,52 @@ def test_controller_receives_durable_inputs_as_async_envelopes(ui):
     assert manager.session.events[-1].type == "input_delivered"
 
 
+def test_sync_receive_rechecks_the_queue_after_an_empty_read_race(ui):
+    """A message inserted between an empty read and condition wait is not lost."""
+    controller = SessionController(ui)
+    admission = InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "arrived")
+    original_get = controller._inbox.get_nowait
+    inserted = False
+
+    def get_with_racing_insert():
+        """Insert input after the first empty read, before the receiver waits."""
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            controller._inbox.try_put(admission)
+            raise Empty
+        return original_get()
+
+    controller._inbox.get_nowait = get_with_racing_insert
+    controller._send = lambda event: event.result.set_result(None)
+
+    with controller._gate:
+        result = controller._receive(DummyCompleter())
+
+    assert result == "arrived"
+
+
+def test_sync_receive_returns_when_a_closed_mailbox_has_no_items(ui):
+    """Finish input reception if shutdown was already consumed by another owner."""
+    controller = SessionController(ui)
+    stop = InputAdmission(1, 0, InputAdmissionKind.STOP)
+    controller._inbox.stop_and_replace(stop)
+    controller._inbox.get_nowait()
+    controller._send = lambda event: event.result.set_result(None)
+
+    with controller._gate:
+        result = controller._receive(DummyCompleter())
+
+    assert result is False
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_controller_skips_mailbox_items_from_another_session(ui, asynchronous):
     """A stale durable envelope is dropped before it reaches the conversation owner."""
     manager = SessionManager(session_store=MemorySessionStore())
     controller = SessionController(ui)
     controller.bind_session_manager(manager)
-    controller._inbox.put(
+    controller._inbox.try_put(
         InputAdmission(
             0,
             0,
@@ -532,7 +1024,7 @@ def test_controller_skips_mailbox_items_from_another_session(ui, asynchronous):
             session_id="different-session",
         )
     )
-    controller._inbox.put(InputAdmission(1, 1, InputAdmissionKind.MESSAGE, "current"))
+    controller._inbox.try_put(InputAdmission(1, 1, InputAdmissionKind.MESSAGE, "current"))
 
     def send(event):
         """Acknowledge the direct unit-test owner boundary."""
@@ -577,11 +1069,11 @@ def test_controller_restores_pending_inputs_up_to_mailbox_capacity(ui):
 
     asyncio.run(controller._restore_pending_inputs_async())
 
-    restored = [controller._inbox.get_nowait() for _ in range(controller._inbox.maxsize)]
+    restored = [controller._inbox.get_nowait() for _ in range(controller._inbox.capacity)]
     assert [admission.input_id for admission in restored] == [
-        event.input_id for event in accepted[: controller._inbox.maxsize]
+        event.input_id for event in accepted[: controller._inbox.capacity]
     ]
-    assert len(controller._queued_input_ids) == controller._inbox.maxsize
+    assert len(controller._queued_input_ids) == controller._inbox.capacity
 
 
 def test_controller_pending_input_restore_handles_queue_race_and_skip_states(ui, monkeypatch):
@@ -590,9 +1082,9 @@ def test_controller_pending_input_restore_handles_queue_race_and_skip_states(ui,
     manager.queue_input("pending", priority=1)
     controller = SessionController(ui)
     controller.bind_session_manager(manager)
-    for sequence in range(controller._inbox.maxsize):
-        controller._inbox.put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "full"))
-    monkeypatch.setattr(controller._inbox, "qsize", lambda: 0)
+    for sequence in range(controller._inbox.capacity):
+        controller._inbox.try_put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "full"))
+    monkeypatch.setattr(controller._inbox, "size", lambda: 0)
     asyncio.run(controller._restore_pending_inputs_async())
 
     controller._session_manager = None
@@ -600,6 +1092,28 @@ def test_controller_pending_input_restore_handles_queue_race_and_skip_states(ui,
     controller._session_manager = manager
     controller._stopping = True
     asyncio.run(controller._restore_pending_inputs_async())
+
+
+def test_controller_stops_restoring_when_shutdown_races_with_mailbox_recovery(ui, monkeypatch):
+    """A shutdown during pending-input restoration leaves only the stop marker in memory."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    manager.queue_input("pending", priority=1)
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    put = controller._put_mailbox_item_locked
+
+    def stop_before_restore(admission):
+        """Start shutdown just before the restore attempts to add its record."""
+        controller._stop()
+        return put(admission)
+
+    monkeypatch.setattr(controller, "_put_mailbox_item_locked", stop_before_restore)
+
+    asyncio.run(controller._restore_pending_inputs_async())
+
+    assert controller._inbox.size() == 1
+    assert controller._inbox.get_nowait().kind is InputAdmissionKind.STOP
+    assert controller._queued_input_ids == set()
 
 
 def test_controller_async_durable_rejection_discards_queued_identity(ui):
@@ -636,8 +1150,8 @@ def test_controller_accept_rejects_durable_input_when_mailbox_is_full(ui, active
     controller = SessionController(ui)
     controller.bind_session_manager(manager)
     controller.bind_command_manager(CommandManager())
-    for sequence in range(controller._inbox.maxsize):
-        controller._inbox.put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued"))
+    for sequence in range(controller._inbox.capacity):
+        controller._inbox.try_put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued"))
 
     async def scenario():
         """Submit an ordinary message under the requested controller activity state."""
@@ -661,8 +1175,8 @@ def test_controller_accept_rejects_durable_input_when_mailbox_is_full(ui, active
 def test_controller_reports_generic_mailbox_overflow(ui):
     """Direct bounded admission reports overflow only when requested by its caller."""
     controller = SessionController(ui)
-    for sequence in range(controller._inbox.maxsize):
-        controller._inbox.put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued"))
+    for sequence in range(controller._inbox.capacity):
+        controller._inbox.try_put(InputAdmission(1, sequence, InputAdmissionKind.MESSAGE, "queued"))
 
     assert controller._enqueue("overflow", report_full=False) is False
     ui.warning.assert_not_called()
@@ -1235,6 +1749,16 @@ def test_command_dispatch_preserves_unexpected_keyboard_interrupt(ui):
         controller._run_command(manager, "/interrupt")
 
 
+def test_sync_command_dispatch_suppresses_interrupt_after_shutdown(ui):
+    """A synchronous command interruption is normal once controller shutdown is requested."""
+    controller = SessionController(ui)
+    controller.control.stop()
+    manager = Mock()
+    manager.handle_user_command.side_effect = KeyboardInterrupt
+
+    assert controller._run_command(manager, "/interrupt") is True
+
+
 def test_async_command_dispatch_normalizes_only_expected_interruptions(ui):
     """Async command dispatch preserves unexpected interrupts and consumes stopped work."""
     controller = SessionController(ui)
@@ -1253,20 +1777,29 @@ def test_async_command_dispatch_normalizes_only_expected_interruptions(ui):
     assert asyncio.run(controller._run_command_async(stopped, "/interrupt")) is True
 
 
-def test_sync_controller_requires_its_command_executor_when_accepting_commands(ui):
-    """Synchronous controller command admission fails clearly without its owned executor."""
+@pytest.mark.parametrize("async_owner", [False, True])
+def test_controller_dispatches_registered_async_commands_on_the_async_path(ui, async_owner):
+    """Registered asynchronous commands run through async dispatch in either controller mode."""
     controller = SessionController(ui)
-    commands = CommandManager()
+    called = asyncio.Event()
+
+    async def asynchronous_command():
+        """Record execution on the event loop that accepted the command."""
+        called.set()
+
+    commands = CommandManager(commands=(asynchronous_command,))
     controller.bind_command_manager(commands)
+    controller._async_owner = async_owner
 
     async def scenario():
-        """Submit a command before the synchronous controller has acquired an executor."""
+        """Submit one registered asynchronous callback through controller input handling."""
         submitted = asyncio.get_running_loop().create_future()
-        submitted.set_result("/help")
-        with pytest.raises(RuntimeError, match="command executor is unavailable"):
-            await controller._accept_async(submitted, route_idle_commands=False)
+        submitted.set_result("/asynchronous_command")
+        await controller._accept_async(submitted, route_idle_commands=False)
+        await controller._command_task
 
     asyncio.run(scenario())
+    assert called.is_set()
 
 
 def test_interrupted_active_command_does_not_stop_the_controller(ui):
@@ -1415,6 +1948,9 @@ def test_command_capabilities_track_active_run_pending_response_and_settlement(u
 
     assert {"interrupt", "respond", "status", "steer", "queue"}.isdisjoint(names())
     controller._loop = Mock()
+    idle_names = names()
+    assert {"status", "steer", "queue"} <= idle_names
+    assert "interrupt" not in idle_names
     with controller.control.execution():
         active_names = names()
         assert {"interrupt", "status", "steer", "queue"} <= active_names
@@ -1915,7 +2451,7 @@ def test_controller_accepts_messages_and_status_during_serialized_work(ui):
 def test_sync_receive_discards_admitted_input_when_stop_arrives_at_boundary(ui):
     """A stop that races input consumption prevents the owner from starting more work."""
     controller = SessionController(ui)
-    controller._inbox.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "late"))
+    controller._inbox.try_put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "late"))
     events = []
 
     def send(event):
@@ -1933,7 +2469,7 @@ def test_sync_receive_discards_admitted_input_when_stop_arrives_at_boundary(ui):
 def test_async_receive_discards_admitted_input_when_stop_arrives_at_boundary(ui):
     """A stop that races async input consumption prevents the owner from starting more work."""
     controller = SessionController(ui)
-    controller._inbox.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "late"))
+    controller._inbox.try_put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "late"))
     events = []
 
     async def send(event):
@@ -1949,7 +2485,7 @@ def test_async_receive_discards_admitted_input_when_stop_arrives_at_boundary(ui)
 
 def test_ordinary_input_during_active_run_is_deferred_steering(ui):
     """Active ordinary input finishes the current operation, then returns as a correction."""
-    controller = SessionController(ui)
+    controller = SessionController(ui, input_mode="steer")
     release = Event()
     received = []
 
@@ -1967,7 +2503,7 @@ def test_ordinary_input_during_active_run_is_deferred_steering(ui):
         )
 
         def conversation(receive):
-            """Complete the current boundary without converting steering into interruption."""
+            """Complete the current boundary and receive the correction next."""
             received.append(receive(DummyCompleter()))
             with controller.control.execution():
                 controller.interaction.info("working")
@@ -2821,16 +3357,16 @@ def test_async_controller_rechecks_queue_after_a_racing_admission(ui):
     inputs = asyncio.Queue()
     read_inputs(ui, inputs)
 
-    class RacingQueue(PriorityQueue):
+    class RacingMailbox(InputMailbox):
         """Force one empty read followed by a visible queued input."""
 
         _first_read: bool
 
         def __init__(self):
             """Initialize a pre-admitted message and one synthetic read race."""
-            super().__init__()
+            super().__init__(controller._inbox.capacity)
             self._first_read = True
-            self.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "raced"))
+            self.try_put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "raced"))
 
         def get_nowait(self):
             """Return an empty result once so the receiver checks the queue again."""
@@ -2839,13 +3375,13 @@ def test_async_controller_rechecks_queue_after_a_racing_admission(ui):
                 raise Empty
             return super().get_nowait()
 
-        def empty(self):
+        def is_empty(self):
             """Expose the raced message immediately after the synthetic empty result."""
             if not self._first_read:
                 return False
-            return super().empty()
+            return super().is_empty()
 
-    controller._inbox = RacingQueue()
+    controller._inbox = RacingMailbox()
     received = []
 
     async def conversation(receive):
@@ -2881,7 +3417,7 @@ def test_async_controller_handles_inline_output_and_rejects_sync_input(ui):
 def test_async_controller_settles_failures_and_reports_discarded_input(ui):
     """Execution failures remain primary while queue-reporting errors are attached."""
     controller = SessionController(ui)
-    controller._inbox.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "queued"))
+    controller._inbox.try_put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "queued"))
     ui.warning.side_effect = OSError("warning failed")
 
     async def conversation(_receive):
@@ -3080,7 +3616,7 @@ def test_async_controller_reports_discarded_input_failure_without_primary_error(
     async def conversation(receive):
         """Wait for UI exit while a previously queued input is discarded."""
         assert await receive(DummyCompleter()) == "hello"
-        controller._inbox.put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "queued"))
+        controller._inbox.try_put(InputAdmission(1, 0, InputAdmissionKind.MESSAGE, "queued"))
         started.set()
         await stopping.wait()
 
@@ -3198,7 +3734,6 @@ def test_controller_reports_blank_input_and_missing_response_requests(ui):
             "/respond",
             "/interrupt",
             "/steer",
-            "/steer correction",
             "/status",
             False,
         ):
@@ -3216,14 +3751,7 @@ def test_controller_reports_blank_input_and_missing_response_requests(ui):
             "Command '/interrupt' is unavailable in the current conversation state. "
             "Type /help to see commands that can run now."
         ),
-        (
-            "Command '/steer' is unavailable in the current conversation state. "
-            "Type /help to see commands that can run now."
-        ),
-        (
-            "Command '/steer' is unavailable in the current conversation state. "
-            "Type /help to see commands that can run now."
-        ),
+        "No pending message to steer",
     ]
     ui.info.assert_any_call("Idle; 0 queued inputs.")
 

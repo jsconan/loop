@@ -45,6 +45,9 @@ structured_output_mode = "auto"
 structured_output_max_retries = 1
 hyperparameter_policy = "fallback"
 
+[conversation]
+input_mode = "queue" # "queue" | "steer"
+
 [loop]
 agent_name = "Loop"
 # temperature = <unset>
@@ -93,6 +96,8 @@ Use `/config` to browse, inspect, change, or reset effective settings. Completio
 Reset behavior depends on the scope. At workspace scope, reset removes the override so the user setting applies. At user or session scope, reset restores the built-in default.
 
 Session settings apply only to the current Loop process and take precedence over environment and file values. A file value remains saved when an environment variable overrides it, so the saved value applies again when the variable is absent. Backend and supported interactive-loop settings apply immediately. Logging, telemetry, and agent identity changes require a restart. API-key input and configuration output are masked.
+
+While an agent run is active, `conversation.input_mode = "queue"` admits plain text as a follow-up that runs after the current operation settles. Set it to `"steer"` to admit plain text at steering priority and request the existing controlled interruption. Explicit `/queue` and `/steer` commands override this setting.
 
 ## Configure the backend from Python
 
@@ -145,6 +150,7 @@ The `loop` command accepts environment overrides for automation:
 | Web user agent              | `USER_AGENT`                            | browser-like user agent        |
 | Command timeout             | `LOOP_COMMAND_TIMEOUT`                  | `60.0`                         |
 | Loop agent name             | `LOOP_AGENT_NAME`                       | `Loop`                         |
+| Active input mode           | `LOOP_CONVERSATION_INPUT_MODE`          | `queue`                        |
 | Loop model                  | `LOOP_MODEL`                            | unset                          |
 | Stream responses            | `LOOP_STREAM`                           | `true`                         |
 | Debug responses             | `LOOP_DEBUG`                            | `false`                        |

@@ -21,6 +21,7 @@ DEFAULT_API_KEY = "local-api-key"
 
 # Default agent configuration constants
 DEFAULT_AGENT_NAME = "Loop"
+DEFAULT_CONVERSATION_INPUT_MODE = "queue"
 TEMPORARY_DIRECTORY_PREFIX = "loop-"
 TEMPORARY_CONTENT_DIRECTORY_PREFIX = "loop-content-"
 

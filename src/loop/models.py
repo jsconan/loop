@@ -19,6 +19,7 @@ type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, J
 type StructuredOutputValidator = Callable[[JsonValue], Any]
 type AgentRunStopReason = Literal["completed", "cancelled", "max_turns", "steered"]
 type FileInputMode = Literal["text", "native"]
+type ConversationInputMode = Literal["queue", "steer"]
 type StructuredOutputMode = Literal["auto", "native", "prompt"]
 type StructuredOutputTransport = Literal["native", "prompt"]
 type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]

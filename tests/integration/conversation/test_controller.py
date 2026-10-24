@@ -252,7 +252,10 @@ def test_async_model_check_can_select_a_fallback_without_stopping_the_loop(tmp_p
     assert loop.model == "replacement"
 
 
-@pytest.mark.parametrize("mode", ["queue", "interrupt", "steer", "default-steer"])
+@pytest.mark.parametrize(
+    "mode",
+    ["queue", "interrupt", "steer", "default-queue", "default-steer"],
+)
 def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode):
     """A real editor queues durable input and controls execution while its model is active."""
     output = StringIO()
@@ -261,7 +264,9 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
     with create_pipe_input() as pipe:
         prompt = PromptSession(input=pipe, output=DummyOutput())
         source = ConsoleInteraction(session=prompt, console=Console(file=output), markdown=False)
-        controller = SessionController(source)
+        controller = SessionController(
+            source, input_mode="steer" if mode == "default-steer" else "queue"
+        )
 
         async def scenario():
             """Submit queued input before releasing the first model operation."""
@@ -323,7 +328,9 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
             try:
                 pipe.send_text("first\n")
                 await working.wait()
-                pipe.send_text("second\n" if mode == "default-steer" else "/queue second\n")
+                pipe.send_text(
+                    "second\n" if mode in {"default-queue", "default-steer"} else "/queue second\n"
+                )
                 await asyncio.wait_for(queued.wait(), timeout=5)
                 assert len(requests) == 1
                 if mode in {"interrupt", "steer"}:
@@ -341,7 +348,7 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
 
         loop = asyncio.run(scenario())
 
-    if mode in {"queue", "default-steer"}:
+    if mode in {"queue", "default-queue", "default-steer"}:
         expected = ["first", "answer 1", "second", "answer 2"]
     elif mode == "interrupt":
         expected = ["first", "second", "answer 2"]

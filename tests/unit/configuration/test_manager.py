@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from loop.configuration import ConfigurationManager
+from loop.configuration import ApplicationSettings, ConfigurationManager
 from loop.configuration.models import BackendSettings
 from loop.models import CommandCapability
 
@@ -38,6 +38,25 @@ def test_manager_snapshots_its_configuration_path(tmp_path):
 
     assert manager.path == path
     assert path.is_file()
+
+
+def test_conversation_input_mode_defaults_validates_and_loads_from_environment(tmp_path):
+    """The active input route defaults to queue and accepts only the documented modes."""
+    assert ApplicationSettings().conversation.input_mode == "queue"
+    with pytest.raises(ValidationError):
+        ApplicationSettings.model_validate({"conversation": {"input_mode": "interrupt"}})
+
+    path = tmp_path / "config.toml"
+    manager = ConfigurationManager(path)
+    manager.initialize()
+    settings = manager.load({"LOOP_CONVERSATION_INPUT_MODE": "steer"})
+
+    assert settings.conversation.input_mode == "steer"
+    assert manager.source_for("conversation.input_mode") == "environment"
+    assert '[conversation]\ninput_mode = "queue"' in path.read_text(encoding="utf-8")
+    entry = next(item for item in manager.entries if item.path == "conversation.input_mode")
+    assert entry.default == "queue"
+    assert entry.choices == ("queue", "steer")
 
 
 def test_user_defaults_merge_with_sparse_workspace_overrides(tmp_path):

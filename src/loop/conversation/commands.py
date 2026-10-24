@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Annotated, Protocol
 from ..commands import CommandContext, CommandRegistration, CommandRemainder
 from ..completion import CommandCompletion, CompletionValue
 from ..models import CommandCapability
-from .models import ConversationStatus, ResponseOutcome, SteeringOutcome
+from .models import (
+    ConversationStatus,
+    PendingInputPriorityOutcome,
+    ResponseOutcome,
+    SteeringOutcome,
+)
 
 if TYPE_CHECKING:
     from ..interaction import Interaction
@@ -99,6 +104,23 @@ class ConversationControl(Protocol):
             asyncio.CancelledError: If durable admission is cancelled after its write settles.
         """
 
+    async def reprioritize_latest_async(
+        self,
+        *,
+        steer: bool,
+    ) -> PendingInputPriorityOutcome:
+        """Change the newest input still waiting in the conversation mailbox.
+
+        Args:
+            steer (bool): Whether to move the input to steering priority.
+
+        Returns:
+            PendingInputPriorityOutcome: Whether an input changed and the run was interrupted.
+
+        Raises:
+            asyncio.CancelledError: If durable persistence settles after cancellation.
+        """
+
 
 class ConversationCommands:
     """Register user-facing controls for an asynchronous conversation.
@@ -138,13 +160,13 @@ class ConversationCommands:
                 self.steer_async,
                 name="steer",
                 completion=CommandCompletion(),
-                capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
+                capabilities=frozenset({CommandCapability.CONVERSATION_ACTIVE}),
             ),
             CommandRegistration(
                 self.queue_async,
                 name="queue",
                 completion=CommandCompletion(),
-                capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
+                capabilities=frozenset({CommandCapability.CONVERSATION_ACTIVE}),
             ),
         )
 
@@ -202,8 +224,8 @@ class ConversationCommands:
 
         Args:
             context (CommandContext): Interaction used to report the steering outcome.
-            message (tuple[str, ...]): Correction text split into shell tokens. Defaults to an
-                empty tuple, which reports the usage requirement.
+            message (tuple[str, ...]): Optional correction text split into shell tokens. An empty
+                tuple reprioritizes the newest pending message. Defaults to an empty tuple.
 
         Returns:
             None: After reporting the control outcome.
@@ -213,7 +235,15 @@ class ConversationCommands:
         """
         text = " ".join(message)
         if not text:
-            context.interaction.warning("Usage: /steer <message>")
+            outcome = await self._control.reprioritize_latest_async(steer=True)
+            if outcome is PendingInputPriorityOutcome.NO_PENDING_INPUT:
+                context.interaction.warning("No pending message to steer")
+            elif outcome is PendingInputPriorityOutcome.INTERRUPTED:
+                context.interaction.info(
+                    "Interrupt requested; waiting for the active operation to settle..."
+                )
+            else:
+                context.interaction.info("Newest pending message set to steering priority.")
             return
 
         outcome = await self._control.steer_async(text, context.interaction)
@@ -225,6 +255,8 @@ class ConversationCommands:
             context.interaction.info(
                 "Interrupt requested; waiting for the active operation to settle..."
             )
+        elif outcome is SteeringOutcome.QUEUED:
+            context.interaction.info("Steering input accepted for the next run.")
 
     async def queue_async(
         self,
@@ -235,8 +267,8 @@ class ConversationCommands:
 
         Args:
             context (CommandContext): Interaction used to report the queue outcome.
-            message (tuple[str, ...]): Message text split into shell tokens. Defaults to an
-                empty tuple, which reports the usage requirement.
+            message (tuple[str, ...]): Optional message text split into shell tokens. An empty
+                tuple reprioritizes the newest pending message. Defaults to an empty tuple.
 
         Returns:
             None: After reporting the queue outcome.
@@ -246,6 +278,12 @@ class ConversationCommands:
         """
         text = " ".join(message)
         if not text:
-            context.interaction.warning("Usage: /queue <message>")
+            outcome = await self._control.reprioritize_latest_async(steer=False)
+            if outcome is PendingInputPriorityOutcome.NO_PENDING_INPUT:
+                context.interaction.warning("No pending message to queue")
+            else:
+                context.interaction.info("Newest pending message set to queue priority.")
         elif not await self._control.queue_async(text, context.interaction):
             context.interaction.warning("No agent run is active; send a normal message instead.")
+        elif self._control.status_snapshot().state == "Idle":
+            context.interaction.info("Queued input for the next run.")
