@@ -172,24 +172,17 @@ def test_runtime_async_path_without_controller_awaits_loop_directly():
     loop.run_async = AsyncMock()
     runtime = ApplicationRuntime(loop, Mock(), 1, cleanup_callbacks=[])
 
-    outcome = asyncio.run(runtime.run_async())
+    result = asyncio.run(runtime.run_async())
 
     loop.run_async.assert_awaited_once_with()
-    assert outcome is runtime_module.ApplicationRunOutcome.APPLICATION_EXITED
+    assert result is None
     runtime.close()
 
 
-@pytest.mark.parametrize(
-    ("stopped", "expected"),
-    [
-        (True, runtime_module.ApplicationRunOutcome.CONVERSATION_STOPPED),
-        (False, runtime_module.ApplicationRunOutcome.APPLICATION_EXITED),
-    ],
-)
-def test_runtime_reports_conversation_stop_separately_from_application_exit(stopped, expected):
-    """The runtime exposes conversation stop separately from normal application exit."""
+def test_runtime_returns_only_after_the_conversation_owner_exits():
+    """The runtime reports exit only after its persistent conversation owner returns."""
     loop = Mock()
-    controller = Mock(running=False, conversation_stop_requested=stopped)
+    controller = Mock(running=False)
     controller.run_async = AsyncMock()
     runtime = ApplicationRuntime(
         loop,
@@ -199,9 +192,9 @@ def test_runtime_reports_conversation_stop_separately_from_application_exit(stop
         session_controller=controller,
     )
 
-    outcome = asyncio.run(runtime.run_async())
+    result = asyncio.run(runtime.run_async())
 
-    assert outcome is expected
+    assert result is None
     controller.run_async.assert_awaited_once()
     runtime.close()
 

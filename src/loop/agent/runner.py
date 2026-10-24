@@ -20,7 +20,7 @@ from ..backend import (
     BackendRepetitionError,
 )
 from ..compaction import ContextCompaction
-from ..control import RunControl, RunInterrupted
+from ..control import RunControl, RunInterrupted, RunStopRequested
 from ..errors import Problem, ProblemException, log_problem
 from ..instructions import InstructionBudgetExceededError, InstructionsManager
 from ..interaction import Interaction, require_async_interaction
@@ -313,8 +313,8 @@ class AgentRunner:
         """Run model and tool turns until completion, cancellation, or the safety limit.
 
         Returns:
-            AgentRunResult: Final response, completed turn count, and termination reason. A pause
-                leaves the durable run incomplete so the recovery classifier can resume it.
+            AgentRunResult: Final response, turn count, metrics, and termination reason. Pause,
+                cold stop, or a declined recoverable failure leaves the run open for recovery.
 
         Raises:
             KeyboardInterrupt: If the configured control requests a stop.
@@ -341,8 +341,9 @@ class AgentRunner:
         """Run model and tool turns through native asynchronous operations.
 
         Returns:
-            AgentRunResult: Final response, completed turn count, and termination reason. Scoped
-                interruption settles outstanding calls and returns a cancelled result.
+            AgentRunResult: Final response, turn count, metrics, and termination reason. A pause
+                parks this owner; cold stop or a declined recoverable failure leaves the run open
+                for later recovery.
 
         Raises:
             KeyboardInterrupt: If the configured control requests a stop.
@@ -391,6 +392,10 @@ class AgentRunner:
             ):
                 return AgentRecoveryStatus(pending=True)
             with self._session_manager.execution():
+                if self._session_manager.retry_pending:
+                    self._session_manager.begin_run_retry()
+                if self._session_manager.session.active_run_id is None:
+                    self._session_manager.begin_run()
                 return AgentRecoveryStatus(pending=False, result=self._recover(state))
 
     async def recover_session_async(self, *, confirmed: bool = False) -> AgentRecoveryStatus:
@@ -414,7 +419,7 @@ class AgentRunner:
             self._session_manager.session.id,
             self._session_manager.session.active_run_id,
         ):
-            self._checkpoint()
+            await self._checkpoint_async()
             state = self._session_manager.recovery_state
             if state is None:
                 return AgentRecoveryStatus(pending=False)
@@ -424,6 +429,10 @@ class AgentRunner:
             ):
                 return AgentRecoveryStatus(pending=True)
             with self._session_manager.execution():
+                if self._session_manager.retry_pending:
+                    await self._session_manager.begin_run_retry_async()
+                if self._session_manager.session.active_run_id is None:
+                    await self._session_manager.begin_run_async()
                 return AgentRecoveryStatus(pending=False, result=await self._recover_async(state))
 
     def _recover(self, state: SessionRecoveryState) -> AgentRunResult:
@@ -505,7 +514,7 @@ class AgentRunner:
             prepare_context=self._backend.prepare_context,
         )
         for pending in state.pending_calls:
-            self._checkpoint()
+            await self._checkpoint_async()
             if pending.status == "result_available":
                 continue
             retry = True
@@ -619,6 +628,28 @@ class AgentRunner:
                     calls=calls,
                     tools=tools,
                 )
+            except AgentRunRecoveryRequired:
+                self._interaction.warning(
+                    "The agent run remains recoverable. Use /retry to continue it."
+                )
+                return self._record_run_result(
+                    final_response=None,
+                    turns=total_turns,
+                    stop_reason=AgentRunStopReason.RECOVERY_REQUIRED,
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
+                )
+            except RunStopRequested:
+                self._interaction.info("Run stopped; its durable state is ready to continue.")
+                return self._record_run_result(
+                    final_response=None,
+                    turns=total_turns,
+                    stop_reason=AgentRunStopReason.STOPPED,
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
+                )
             except RunInterrupted:
                 self._cancel_pending_tools()
                 stop_reason = self._interruption_stop_reason()
@@ -697,7 +728,7 @@ class AgentRunner:
                         )
                     executions = await self.handle_tool_calls_async(response)
                     tools.extend(executions)
-                    self._checkpoint()
+                    await self._checkpoint_async()
                     if self._steering_pending():
                         await self._cancel_pending_tools_async()
                         return await self._record_run_result_async(
@@ -749,6 +780,28 @@ class AgentRunner:
                     final_response=None,
                     turns=total_turns,
                     stop_reason=stop_reason,
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
+                )
+            except AgentRunRecoveryRequired:
+                self._interaction.warning(
+                    "The agent run remains recoverable. Use /retry to continue it."
+                )
+                return await self._record_run_result_async(
+                    final_response=None,
+                    turns=total_turns,
+                    stop_reason=AgentRunStopReason.RECOVERY_REQUIRED,
+                    started_at=started_at,
+                    calls=calls,
+                    tools=tools,
+                )
+            except RunStopRequested:
+                self._interaction.info("Run stopped; its durable state is ready to continue.")
+                return await self._record_run_result_async(
+                    final_response=None,
+                    turns=total_turns,
+                    stop_reason=AgentRunStopReason.STOPPED,
                     started_at=started_at,
                     calls=calls,
                     tools=tools,
@@ -847,7 +900,7 @@ class AgentRunner:
                             present=present,
                         )
                     )
-        except RunInterrupted:
+        except (RunInterrupted, RunStopRequested):
             if self._interrupted_tools is not None:
                 self._interrupted_tools.extend(executions)
             raise
@@ -878,7 +931,7 @@ class AgentRunner:
                             present=present,
                         )
                     )
-        except RunInterrupted:
+        except (RunInterrupted, RunStopRequested):
             if self._interrupted_tools is not None:
                 self._interrupted_tools.extend(executions)
             raise
@@ -965,7 +1018,7 @@ class AgentRunner:
         present: bool,
     ) -> ToolExecutionMetrics:
         """Execute, trace, and persist one tool request through async dispatch."""
-        self._checkpoint()
+        await self._checkpoint_async()
         telemetry_trace_event(
             "tool.request",
             payload={
@@ -980,7 +1033,7 @@ class AgentRunner:
 
         async def execution_started_async() -> None:
             """Persist execution intent after approval and before invoking the tool."""
-            self._checkpoint()
+            await self._checkpoint_async()
             await self._session_manager.record_tool_execution_started_async(tool_call.call_id)
 
         tool_result, duration = await self._agent.tools.call_with_timing_async(
@@ -1220,7 +1273,7 @@ class AgentRunner:
 
     async def _query_async(self, recovery: str | None = None) -> Response:
         """Collect one asynchronous response inside the active model-operation span."""
-        self._checkpoint()
+        await self._checkpoint_async()
         selected_model = self._model_selection.effective
         snapshot = await self._instructions_manager.prepare_async(self._agent, recovery=recovery)
         self._session_manager.update_instruction_state(
@@ -1229,7 +1282,7 @@ class AgentRunner:
         )
         await self._model_selection.synchronize_session_async()
         await self._compaction.compact_if_needed_async(snapshot)
-        self._checkpoint()
+        await self._checkpoint_async()
         started_at = perf_counter()
         first_chunk_at = None
         model_context = self._backend.prepare_context(
@@ -1253,7 +1306,7 @@ class AgentRunner:
             """Check cancellation and record first-event timing while yielding backend events."""
             nonlocal first_chunk_at
             async for event in events:
-                self._checkpoint()
+                await self._checkpoint_async()
                 if first_chunk_at is None:
                     first_chunk_at = perf_counter()
                 yield event
@@ -1301,7 +1354,11 @@ class AgentRunner:
     ) -> AgentRunResult:
         """Persist and return one completed run's aggregate operation statistics."""
         metrics = self._build_run_metrics(calls, tools)
-        if stop_reason != AgentRunStopReason.PAUSED:
+        if stop_reason not in {
+            AgentRunStopReason.PAUSED,
+            AgentRunStopReason.STOPPED,
+            AgentRunStopReason.RECOVERY_REQUIRED,
+        }:
             self._session_manager.record_run(stop_reason, started_at, metrics)
         return AgentRunResult(
             final_response=final_response,
@@ -1321,7 +1378,11 @@ class AgentRunner:
     ) -> AgentRunResult:
         """Persist and return one completed run through async session storage."""
         metrics = self._build_run_metrics(calls, tools)
-        if stop_reason != AgentRunStopReason.PAUSED:
+        if stop_reason not in {
+            AgentRunStopReason.PAUSED,
+            AgentRunStopReason.STOPPED,
+            AgentRunStopReason.RECOVERY_REQUIRED,
+        }:
             await self._session_manager.record_run_async(stop_reason, started_at, metrics)
         return AgentRunResult(
             final_response=final_response,
@@ -1422,7 +1483,8 @@ class AgentRunner:
                 if error.retry_after is not None and error.retry_after > 0:
                     prompt = f"{prompt[:-1]} after at least {error.retry_after:g} seconds?"
                 if not self._interaction.confirm(prompt, default=False):
-                    return None
+                    self._session_manager.record_run_failure()
+                    raise AgentRunRecoveryRequired from error
                 if error.retry_after is not None and error.retry_after > 0:
                     delay = min(error.retry_after, 60.0)
                     self._interaction.info(f"Retrying in {delay:g} seconds...")
@@ -1447,7 +1509,7 @@ class AgentRunner:
         """
         recovery = None
         while True:
-            self._checkpoint()
+            await self._checkpoint_async()
             try:
                 if recovery is None:
                     return await self.query_async()
@@ -1489,6 +1551,7 @@ class AgentRunner:
                 if error.retry_after is not None and error.retry_after > 0:
                     prompt = f"{prompt[:-1]} after at least {error.retry_after:g} seconds?"
                 if not await self._confirm_async(prompt, default=False):
+                    await self._session_manager.record_run_failure_async()
                     raise AgentRunRecoveryRequired from error
                 if error.retry_after is not None and error.retry_after > 0:
                     delay = min(error.retry_after, 60.0)
@@ -1507,6 +1570,11 @@ class AgentRunner:
         """Honor optional cooperative stop requests before a new execution boundary."""
         if self._run_control is not None:
             self._run_control.checkpoint()
+
+    async def _checkpoint_async(self) -> None:
+        """Honor run-control state at an asynchronous execution boundary."""
+        if self._run_control is not None:
+            await self._run_control.checkpoint_async()
 
     def _steering_pending(self) -> bool:
         """Return whether an admitted steering message should stop new work in this run."""

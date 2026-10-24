@@ -146,9 +146,12 @@ __all__ = [
     "RetentionPolicy",
     "RunCompletedEvent",
     "RunControl",
+    "RunFailedEvent",
     "RunInterrupted",
     "RunMetrics",
+    "RunRetryStartedEvent",
     "RunStartedEvent",
+    "RunStopRequested",
     "RuntimeEnvironment",
     "SQLiteSessionStore",
     "SchemaCompletionProviderRegistration",
@@ -294,7 +297,7 @@ from .completion import (
 )
 from .configuration import ConfigurationManager
 from .constants import OMIT, Omit
-from .control import RunControl, RunInterrupted
+from .control import RunControl, RunInterrupted, RunStopRequested
 from .conversation import SessionController
 from .errors import Problem, ProblemException, log_problem
 from .instructions import (
@@ -423,6 +426,8 @@ from .session import (
     PendingToolCall,
     PermissionEvent,
     RunCompletedEvent,
+    RunFailedEvent,
+    RunRetryStartedEvent,
     RunStartedEvent,
     SerializedMessage,
     SerializedSession,

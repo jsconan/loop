@@ -8,6 +8,7 @@ import pytest
 
 from loop import RunControl, RunInterrupted
 from loop import control as control_module
+from loop.control import RunStopRequested
 
 
 def test_control_stays_stopped_after_a_stop_request():
@@ -73,23 +74,71 @@ def test_interrupt_is_scoped_and_never_latches_onto_an_idle_or_later_run():
         control.checkpoint()
 
 
-def test_pause_is_scoped_and_preserves_its_reason_until_run_settlement():
-    """A pause interrupts only the current run and clears after its safe boundary."""
+def test_pause_parks_the_same_async_run_until_continue():
+    """A pause keeps its owner alive at a cooperative checkpoint until continued."""
     control = RunControl()
     assert control.pause() is False
 
-    with control.execution():
-        assert control.pause() is True
-        assert control.paused is True
-        assert control.interrupted is True
-        with pytest.raises(RunInterrupted):
-            control.checkpoint()
+    async def scenario():
+        """Park the owner and release it through an explicit state transition."""
+        started = asyncio.Event()
+        checkpoint = asyncio.Event()
+        resumed = asyncio.Event()
 
+        async def owner():
+            """Wait at a checkpoint while its control state is paused."""
+            with control.execution(async_owner=True):
+                started.set()
+                await checkpoint.wait()
+                await control.checkpoint_async()
+                resumed.set()
+
+        task = asyncio.create_task(owner())
+        await started.wait()
+        assert control.pause() is True
+        assert control.pause() is True
+        checkpoint.set()
+        await asyncio.sleep(0)
+        assert task.done() is False
+        assert control.paused is True
+        assert control.interrupted is False
+        assert control.cancellation_event.is_set() is False
+        assert control.continue_run() is True
+        await task
+        assert resumed.is_set()
+
+    asyncio.run(scenario())
     assert control.paused is False
-    assert control.interrupted is False
-    assert control.cancelled is True
-    with control.execution():
-        assert control.paused is False
+    assert control.cancelled is False
+
+
+def test_cold_stop_unwinds_at_a_checkpoint_without_cancelling_the_owner():
+    """A cold stop returns the run to its caller while preserving the conversation owner."""
+
+    async def scenario():
+        """Request a cold stop while the owner waits in a cancellable delay."""
+        control = RunControl()
+        started = asyncio.Event()
+
+        async def owner():
+            """Translate the cooperative stop exception into an observable result."""
+            with control.execution(async_owner=True):
+                started.set()
+                with pytest.raises(RunStopRequested):
+                    await control.wait_async(60)
+
+        task = asyncio.create_task(owner())
+        await started.wait()
+        assert control.request_stop_run() is True
+        assert control.request_stop_run() is True
+        await task
+        return control
+
+    control = asyncio.run(scenario())
+
+    assert control.stopped is False
+    assert control.cancelled is False
+    assert control.cancellation_event.is_set() is False
 
 
 def test_pause_cannot_override_sticky_shutdown():
@@ -99,6 +148,20 @@ def test_pause_cannot_override_sticky_shutdown():
         control.stop()
         assert control.pause() is False
         assert control.paused is False
+
+
+def test_cold_stop_supersedes_pause_and_cannot_be_reversed():
+    """A cold stop releases a parked run and remains final until the scope settles."""
+    control = RunControl()
+    with control.execution():
+        assert control.pause() is True
+        assert control.request_stop_run() is True
+        assert control.stop_requested is True
+        assert control.continue_run() is False
+        assert control.pause() is False
+        assert control.interrupt() is False
+        with pytest.raises(RunStopRequested):
+            control.checkpoint()
 
 
 @pytest.mark.parametrize(
@@ -150,9 +213,8 @@ def test_shutdown_supersedes_interruption_and_survives_execution_cleanup():
     assert control.interrupt() is False
 
 
-@pytest.mark.parametrize("mode", ["interrupt", "stop"])
-def test_async_execution_cancels_its_owner_and_tracks_settlement(mode):
-    """Run cancellation interrupts its bound task and is recorded only after cleanup."""
+def test_async_execution_cancels_its_owner_and_tracks_settlement():
+    """Explicit run interruption cancels its bound task only after cleanup is delivered."""
 
     async def scenario():
         """Hold an async execution until its control requests cancellation."""
@@ -168,10 +230,7 @@ def test_async_execution_cancels_its_owner_and_tracks_settlement(mode):
         task = asyncio.create_task(owner())
         await started.wait()
         assert control.cancelling is False
-        if mode == "interrupt":
-            assert control.interrupt() is True
-        else:
-            control.stop()
+        assert control.interrupt() is True
         assert control.cancelling is True
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -289,11 +348,11 @@ def test_async_cancel_schedule_failure_keeps_scoped_interruption():
 
 def test_interruption_wakes_retry_waits_and_failure_releases_the_scope(monkeypatch):
     """Retry waits observe run interruption without real delays or poisoning the next run."""
-    wake_event, cancellation_event = Mock(), Mock()
+    wake_event, resume_event, cancellation_event = Mock(), Mock(), Mock()
     monkeypatch.setattr(
         control_module,
         "Event",
-        Mock(side_effect=[wake_event, cancellation_event]),
+        Mock(side_effect=[wake_event, resume_event, cancellation_event]),
     )
     control = RunControl()
     with pytest.raises(RunInterrupted), control.execution():
@@ -304,6 +363,7 @@ def test_interruption_wakes_retry_waits_and_failure_releases_the_scope(monkeypat
     cancellation_event.set.assert_called_once_with()
     wake_event.wait.assert_called_once_with(5)
     wake_event.clear.assert_called_once_with()
+    resume_event.set.assert_called()
     cancellation_event.clear.assert_called_once_with()
     assert control.active is False
     control.checkpoint()

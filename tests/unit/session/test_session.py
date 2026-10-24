@@ -25,7 +25,9 @@ from loop import (
     Reasoning,
     Response,
     ResponseMetadata,
+    RunFailedEvent,
     RunMetrics,
+    RunRetryStartedEvent,
     RunStartedEvent,
     Session,
     SessionInfo,
@@ -303,6 +305,73 @@ def test_session_treats_presented_legacy_calls_as_uncertain_and_completed_runs_a
     assert session.recovery_state() is None
 
 
+def test_max_turn_completion_remains_continuable_from_its_last_checkpoint():
+    """A max-turn boundary remains available even though the run has a completion event."""
+    session = Session(messages=[Message(role="user", content="question")])
+    created_at = datetime(2026, 10, 21, tzinfo=UTC)
+    session.events.append(
+        RunStartedEvent(
+            id="max-turn-started",
+            created_at=created_at,
+            run_id="max-turn-run",
+            started_at=created_at,
+        )
+    )
+    session.events.append(
+        RunCompletedEvent(
+            id="max-turn-completed",
+            created_at=created_at,
+            run_id="max-turn-run",
+            stop_reason="max_turns",
+            started_at=created_at,
+            metrics=RunMetrics(
+                active_duration_seconds=0,
+                model_duration_seconds=0,
+                tool_duration_seconds=0,
+                message_count=1,
+                item_count=1,
+            ),
+        )
+    )
+
+    assert session.active_run_id is None
+    assert session.recovery_state() is not None
+    assert session.recovery_state().action == "query_model"
+
+
+def test_session_retry_state_follows_failure_and_retry_events():
+    """Only a recorded failure allows retry, and authorization clears that state."""
+    session = Session(messages=[Message(role="user", content="question")])
+    created_at = datetime(2026, 10, 21, tzinfo=UTC)
+    session.events.append(
+        RunStartedEvent(
+            id="run-started",
+            created_at=created_at,
+            run_id="run-1",
+            started_at=created_at,
+        )
+    )
+
+    session.record_run_failure()
+
+    assert session.retry_pending is True
+    restored = Session.deserialize(session.serialize())
+    assert restored.retry_pending is True
+    session.begin_run_retry()
+    assert session.retry_pending is False
+    assert Session.deserialize(session.serialize()).retry_pending is False
+    session.record_run_failure()
+    assert session.retry_pending is True
+    assert isinstance(session.events[-1], RunFailedEvent)
+    assert isinstance(session.events[-2], RunRetryStartedEvent)
+
+    with pytest.raises(RuntimeError, match="active run awaiting a failure"):
+        session.record_run_failure()
+
+    with pytest.raises(RuntimeError, match="no failed run"):
+        Session().begin_run_retry()
+
+
 def test_session_finalizes_a_response_that_followed_durable_tool_results():
     """A final assistant item after consumed tool results needs only run bookkeeping."""
     call = ToolCall(call_id="call", name="demo", arguments="{}")
@@ -527,7 +596,7 @@ def test_session_externalizes_shipped_v11_inline_references():
     assert reference.next_cursor is not None
     assert reference.media_type == "text/plain"
     assert restored.persistence_snapshot().reference_artifacts[0].content == b"preview"
-    assert json.loads(restored.serialize())["version"] == 15
+    assert json.loads(restored.serialize())["version"] == 16
 
 
 def test_session_migrates_v13_snapshots_without_changing_existing_history():
@@ -539,7 +608,7 @@ def test_session_migrates_v13_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 15
+    assert json.loads(restored.serialize())["version"] == 16
 
 
 def test_session_persistence_snapshot_deduplicates_transient_reference_content():
@@ -671,7 +740,7 @@ def test_session_migrates_v12_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 15
+    assert json.loads(restored.serialize())["version"] == 16
 
 
 def test_session_migrates_v14_snapshots_without_changing_existing_history():
@@ -683,7 +752,7 @@ def test_session_migrates_v14_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 15
+    assert json.loads(restored.serialize())["version"] == 16
 
 
 @pytest.mark.parametrize("value", ["not-json", "[]", '{"version":99}'])
@@ -1033,6 +1102,16 @@ def test_session_deserialization_rejects_invalid_lifecycle_event_timelines():
             item_count=1,
         ),
     )
+    failed = RunFailedEvent(
+        id="failed-event",
+        created_at=created_at,
+        run_id=run.run_id,
+    )
+    retry_started = RunRetryStartedEvent(
+        id="retry-started-event",
+        created_at=created_at,
+        run_id=run.run_id,
+    )
     invalid_timelines = {
         "input_session": [queued.model_copy(update={"session_id": "different-session"})],
         "duplicate_input": [queued, queued.model_copy(update={"id": "duplicate-event"})],
@@ -1086,6 +1165,15 @@ def test_session_deserialization_rejects_invalid_lifecycle_event_timelines():
             run,
             completed.model_copy(update={"run_id": "different-run"}),
         ],
+        "failure_without_run": [failed],
+        "duplicate_failure": [run, failed, failed.model_copy(update={"id": "failed-again"})],
+        "retry_without_failure": [run, retry_started],
+        "retry_for_other_run": [
+            run,
+            failed,
+            retry_started.model_copy(update={"run_id": "different-run"}),
+        ],
+        "completion_before_retry": [run, failed, completed],
     }
 
     for events in invalid_timelines.values():

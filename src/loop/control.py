@@ -3,12 +3,27 @@
 import asyncio
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from enum import StrEnum
 from threading import Event, Lock
 from typing import Any
 
 
 class RunInterrupted(KeyboardInterrupt):
     """Return control from the active run without shutting down its conversation."""
+
+
+class RunStopRequested(Exception):
+    """Return control from an active run while preserving its durable recovery boundary."""
+
+
+class RunControlState(StrEnum):
+    """Describe the current scoped run state."""
+
+    IDLE = "idle"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    INTERRUPTED = "interrupted"
+    STOP_REQUESTED = "stop_requested"
 
 
 class RunControl:
@@ -23,33 +38,34 @@ class RunControl:
     """
 
     _wake: Event
+    _resume: Event
     _cancellation_event: Event
     _lock: Lock
     _stopped: bool
-    _active: bool
-    _interrupted: bool
-    _paused: bool
+    _state: RunControlState
     _steering_pending: bool
     _cancelled: bool
     _async_loop: asyncio.AbstractEventLoop | None
     _async_task: asyncio.Task[Any] | None
     _async_waiters: dict[asyncio.Event, asyncio.AbstractEventLoop]
     _active_waiters: dict[asyncio.Event, asyncio.AbstractEventLoop]
+    _checkpoint_waiters: dict[asyncio.Event, asyncio.AbstractEventLoop]
 
     def __init__(self) -> None:
         self._wake = Event()
+        self._resume = Event()
+        self._resume.set()
         self._cancellation_event = Event()
         self._lock = Lock()
         self._stopped = False
-        self._active = False
-        self._interrupted = False
-        self._paused = False
+        self._state = RunControlState.IDLE
         self._steering_pending = False
         self._cancelled = False
         self._async_loop = None
         self._async_task = None
         self._async_waiters = {}
         self._active_waiters = {}
+        self._checkpoint_waiters = {}
 
     @property
     def stopped(self) -> bool:
@@ -66,10 +82,10 @@ class RunControl:
         """Return whether an agent execution scope is active.
 
         Returns:
-            bool: Whether interruption can target the current run.
+            bool: Whether the current run has not settled its execution scope.
         """
         with self._lock:
-            return self._active
+            return self._state != RunControlState.IDLE
 
     @property
     def interrupted(self) -> bool:
@@ -79,7 +95,7 @@ class RunControl:
             bool: Whether a run interruption awaits settlement.
         """
         with self._lock:
-            return self._interrupted
+            return self._state == RunControlState.INTERRUPTED
 
     @property
     def paused(self) -> bool:
@@ -89,7 +105,17 @@ class RunControl:
             bool: Whether the current interruption represents a pause.
         """
         with self._lock:
-            return self._paused
+            return self._state == RunControlState.PAUSED
+
+    @property
+    def stop_requested(self) -> bool:
+        """Return whether the active run should settle at its next safe boundary.
+
+        Returns:
+            bool: Whether a cold stop request is pending for the current run.
+        """
+        with self._lock:
+            return self._state == RunControlState.STOP_REQUESTED
 
     @property
     def steering_pending(self) -> bool:
@@ -109,7 +135,9 @@ class RunControl:
             bool: Whether shutdown or interruption has been requested for the active run.
         """
         with self._lock:
-            return self._active and (self._stopped or self._interrupted)
+            return self._state != RunControlState.IDLE and (
+                self._state == RunControlState.INTERRUPTED or self._stopped
+            )
 
     @property
     def cancelled(self) -> bool:
@@ -133,13 +161,16 @@ class RunControl:
     def stop(self) -> None:
         """Request conversation shutdown at the next safe boundary."""
         with self._lock:
+            was_active = self._state != RunControlState.IDLE
             self._stopped = True
             self._cancellation_event.set()
-            if self._active:
+            if was_active:
                 self._cancelled = False
+            self._resume.set()
             self._wake.set()
             self._wake_async_waiters()
             self._wake_active_waiters()
+            self._wake_checkpoint_waiters()
         self._cancel_async_owner()
 
     def interrupt(self) -> bool:
@@ -149,32 +180,71 @@ class RunControl:
             bool: Whether an active run accepted the request. Idle or stopped controls reject it.
         """
         with self._lock:
-            if not self._active or self._stopped:
+            if self._stopped:
                 return False
-            self._interrupted = True
+            if self._state == RunControlState.INTERRUPTED:
+                return True
+            if self._state not in {RunControlState.ACTIVE, RunControlState.PAUSED}:
+                return False
+            self._state = RunControlState.INTERRUPTED
             self._cancellation_event.set()
             self._cancelled = False
+            self._resume.set()
             self._wake.set()
             self._wake_async_waiters()
+            self._wake_checkpoint_waiters()
         self._cancel_async_owner()
         return True
 
     def pause(self) -> bool:
-        """Interrupt the current run while preserving its durable recovery boundary.
+        """Park the current run at its next cooperative checkpoint.
 
         Returns:
             bool: Whether an active run accepted the pause request.
         """
         with self._lock:
-            if not self._active or self._stopped:
+            if self._state == RunControlState.PAUSED:
+                return True
+            if self._state != RunControlState.ACTIVE or self._stopped:
                 return False
-            self._interrupted = True
-            self._paused = True
-            self._cancellation_event.set()
-            self._cancelled = False
+            self._state = RunControlState.PAUSED
+            self._resume.clear()
             self._wake.set()
             self._wake_async_waiters()
-        self._cancel_async_owner()
+            self._wake_checkpoint_waiters()
+        return True
+
+    def continue_run(self) -> bool:
+        """Resume a run parked at a cooperative checkpoint.
+
+        Returns:
+            bool: Whether a live paused run was resumed.
+        """
+        with self._lock:
+            if self._state != RunControlState.PAUSED:
+                return False
+            self._state = RunControlState.ACTIVE
+            self._resume.set()
+            self._wake.set()
+            self._wake_checkpoint_waiters()
+        return True
+
+    def request_stop_run(self) -> bool:
+        """Settle the active run at its next checkpoint without shutting down its owner.
+
+        Returns:
+            bool: Whether a live run accepted the cold-stop request.
+        """
+        with self._lock:
+            if self._state == RunControlState.STOP_REQUESTED:
+                return True
+            if self._state not in {RunControlState.ACTIVE, RunControlState.PAUSED} or self._stopped:
+                return False
+            self._state = RunControlState.STOP_REQUESTED
+            self._resume.set()
+            self._wake.set()
+            self._wake_async_waiters()
+            self._wake_checkpoint_waiters()
         return True
 
     def request_steering(self, admit: Callable[[], bool]) -> bool:
@@ -188,7 +258,7 @@ class RunControl:
             bool: Whether the active run admitted the message and recorded the signal.
         """
         with self._lock:
-            if not self._active or self._stopped or not admit():
+            if self._state == RunControlState.IDLE or self._stopped or not admit():
                 return False
             self._steering_pending = True
             return True
@@ -215,10 +285,11 @@ class RunControl:
             if task is None:
                 raise RuntimeError("Async execution ownership requires an asyncio task.")
         with self._lock:
-            if self._active:
+            if self._state != RunControlState.IDLE:
                 raise RuntimeError("Run control already owns an active execution.")
-            self._active = True
+            self._state = RunControlState.ACTIVE
             self._cancelled = False
+            self._resume.set()
             self._async_loop = loop
             self._async_task = task
             self._wake_active_waiters()
@@ -226,10 +297,8 @@ class RunControl:
             yield
         finally:
             with self._lock:
-                self._cancelled = self._stopped or self._interrupted
-                self._active = False
-                self._interrupted = False
-                self._paused = False
+                self._cancelled = self._stopped or self._state == RunControlState.INTERRUPTED
+                self._state = RunControlState.IDLE
                 self._steering_pending = False
                 self._async_loop = None
                 self._async_task = None
@@ -238,17 +307,52 @@ class RunControl:
                     self._cancellation_event.clear()
 
     def checkpoint(self) -> None:
-        """Observe shutdown before a scoped interrupt at a safe execution boundary.
+        """Observe shutdown, interruption, pause, and stop at a safe execution boundary.
 
         Raises:
             KeyboardInterrupt: If conversation shutdown was requested.
             RunInterrupted: If the active run was interrupted without shutdown.
+            RunStopRequested: If the run received a cold-stop request.
         """
-        with self._lock:
-            if self._stopped:
-                raise KeyboardInterrupt
-            if self._interrupted:
-                raise RunInterrupted
+        while True:
+            with self._lock:
+                if self._stopped:
+                    raise KeyboardInterrupt
+                if self._state == RunControlState.INTERRUPTED:
+                    raise RunInterrupted
+                if self._state == RunControlState.STOP_REQUESTED:
+                    raise RunStopRequested
+                if self._state != RunControlState.PAUSED:
+                    return
+            self._resume.wait()
+
+    async def checkpoint_async(self) -> None:
+        """Wait asynchronously through a pause and observe other run control states.
+
+        Raises:
+            KeyboardInterrupt: If conversation shutdown was requested.
+            RunInterrupted: If the active run was interrupted.
+            RunStopRequested: If the run received a cold-stop request.
+            asyncio.CancelledError: If the waiting task is cancelled.
+        """
+        while True:
+            loop = asyncio.get_running_loop()
+            wake = asyncio.Event()
+            with self._lock:
+                if self._stopped:
+                    raise KeyboardInterrupt
+                if self._state == RunControlState.INTERRUPTED:
+                    raise RunInterrupted
+                if self._state == RunControlState.STOP_REQUESTED:
+                    raise RunStopRequested
+                if self._state != RunControlState.PAUSED:
+                    return
+                self._checkpoint_waiters[wake] = loop
+            try:
+                await wake.wait()
+            finally:
+                with self._lock:
+                    self._checkpoint_waiters.pop(wake, None)
 
     def wait(self, seconds: float) -> None:
         """Wait for a retry delay or return promptly on either cancellation signal.
@@ -259,6 +363,7 @@ class RunControl:
         Raises:
             KeyboardInterrupt: If conversation shutdown was requested.
             RunInterrupted: If the active run was interrupted.
+            RunStopRequested: If the active run received a cold-stop request.
         """
         self._wake.wait(seconds)
         self.checkpoint()
@@ -272,20 +377,21 @@ class RunControl:
         Raises:
             KeyboardInterrupt: If conversation shutdown was requested.
             RunInterrupted: If the active run was interrupted.
+            RunStopRequested: If the active run received a cold-stop request.
             asyncio.CancelledError: If the waiting task is cancelled.
         """
         loop = asyncio.get_running_loop()
         wake = asyncio.Event()
         with self._lock:
             self._async_waiters[wake] = loop
-            if self._stopped or self._interrupted:
+            if self._stopped or self._state == RunControlState.INTERRUPTED:
                 loop.call_soon(wake.set)
         try:
             try:
                 await asyncio.wait_for(wake.wait(), timeout=seconds)
             except TimeoutError:
                 pass
-            self.checkpoint()
+            await self.checkpoint_async()
         finally:
             with self._lock:
                 self._async_waiters.pop(wake, None)
@@ -304,7 +410,7 @@ class RunControl:
         with self._lock:
             if self._stopped:
                 return False
-            if self._active:
+            if self._state != RunControlState.IDLE:
                 return True
             self._active_waiters[wake] = loop
         try:
@@ -322,6 +428,10 @@ class RunControl:
     def _wake_active_waiters(self) -> None:
         """Notify async observers that run activity or shutdown state may have changed."""
         self._wake_waiters(self._active_waiters)
+
+    def _wake_checkpoint_waiters(self) -> None:
+        """Notify async checkpoints that the scoped run state may have changed."""
+        self._wake_waiters(self._checkpoint_waiters)
 
     @staticmethod
     def _wake_waiters(waiters: dict[asyncio.Event, asyncio.AbstractEventLoop]) -> None:

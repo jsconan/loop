@@ -36,11 +36,11 @@ class ConversationControl(Protocol):
             bool: Whether an active run accepted the pause request.
         """
 
-    def stop_conversation(self) -> bool:
-        """End the current conversation and return control to the application.
+    def request_stop_run(self) -> bool:
+        """Settle the active run while keeping its conversation owner available.
 
         Returns:
-            bool: Whether the conversation accepted the stop request.
+            bool: Whether the active run accepted the cold-stop request.
         """
 
     def request_response(self, answer: str | None = None) -> ResponseOutcome:
@@ -148,26 +148,30 @@ class ConversationControl(Protocol):
 
 
 class ConversationRecoveryControl(Protocol):
-    """Describe recovery state and the shared recovery operation for conversation commands."""
+    """Describe continuation and retry state for conversation commands."""
 
     @property
-    def recovery_pending(self) -> bool:
-        """Return whether this conversation still requires run recovery.
-
-        Returns:
-            bool: Whether the current session blocks ordinary user input.
-        """
-
-    @property
-    def recovery_paused(self) -> bool:
-        """Return whether the unresolved run was paused in the current runtime.
+    def continuable(self) -> bool:
+        """Return whether a paused or stopped run can be resumed.
 
         Returns:
             bool: Whether ``/continue`` is available.
         """
 
-    async def recover_pending_async(self) -> bool:
-        """Run the existing durable recovery procedure.
+    @property
+    def retry_pending(self) -> bool:
+        """Return whether a durable failure event authorizes retry.
+
+        Returns:
+            bool: Whether ``/retry`` is available.
+        """
+
+    async def recover_pending_async(self, *, retry: bool = False) -> bool:
+        """Resume a live pause or run durable recovery.
+
+        Args:
+            retry (bool): Whether to persist explicit retry authorization first. Defaults to
+                ``False``.
 
         Returns:
             bool: Whether recovery remains pending after the attempt.
@@ -206,7 +210,7 @@ class ConversationCommands:
             ),
             CommandRegistration(
                 self.stop,
-                capabilities=frozenset({CommandCapability.CONVERSATION_ACTIVE}),
+                capabilities=frozenset({CommandCapability.RUN_ACTIVE}),
             ),
             CommandRegistration(
                 self.respond,
@@ -263,20 +267,20 @@ class ConversationCommands:
             context (CommandContext): Interaction used to report the outcome.
         """
         if self._control.request_pause():
-            context.interaction.info("Pause requested; waiting for the active operation to settle.")
+            context.interaction.info("Run paused at its next safe checkpoint.")
         else:
             context.interaction.warning("No agent run is active.")
 
     def stop(self, context: CommandContext) -> None:
-        """End the current conversation and return to the application session flow.
+        """Stop the active run while preserving its durable continuation point.
 
         Args:
             context (CommandContext): Interaction used to report the outcome.
         """
-        if self._control.stop_conversation():
-            context.interaction.info("Stopping this conversation after owned work settles...")
+        if self._control.request_stop_run():
+            context.interaction.info("Run stop requested; use /continue to resume it later.")
         else:
-            context.interaction.warning("The conversation is already stopping.")
+            context.interaction.warning("No agent run is active.")
 
     def respond(
         self,
@@ -424,17 +428,17 @@ class ConversationRecoveryCommands:
             CommandRegistration(
                 self.continue_async,
                 name="continue",
-                capabilities=frozenset({CommandCapability.RUN_PAUSED}),
+                capabilities=frozenset({CommandCapability.RUN_CONTINUABLE}),
             ),
             CommandRegistration(
                 self.retry_async,
                 name="retry",
-                capabilities=frozenset({CommandCapability.RECOVERY_PENDING}),
+                capabilities=frozenset({CommandCapability.RUN_RETRYABLE}),
             ),
         )
 
     async def continue_async(self, context: CommandContext) -> None:
-        """Continue a run paused in this conversation runtime.
+        """Continue a paused, stopped, or otherwise recoverable run.
 
         Args:
             context (CommandContext): Interaction used to report recovery status.
@@ -442,16 +446,16 @@ class ConversationRecoveryCommands:
         Raises:
             asyncio.CancelledError: If the recovery operation is cancelled.
         """
-        if not self._control.recovery_paused:
-            context.interaction.warning("There is no paused run to continue.")
+        if not self._control.continuable:
+            context.interaction.warning("There is no run to continue.")
             return
         if await self._control.recover_pending_async():
             context.interaction.warning("Recovery remains pending; use /retry to try again.")
         else:
-            context.interaction.info("Paused run continued.")
+            context.interaction.info("Run continued.")
 
     async def retry_async(self, context: CommandContext) -> None:
-        """Retry recovery for a failed or resumed conversation.
+        """Retry recovery for a durable run with a recorded failure.
 
         Args:
             context (CommandContext): Interaction used to report recovery status.
@@ -459,10 +463,10 @@ class ConversationRecoveryCommands:
         Raises:
             asyncio.CancelledError: If the recovery operation is cancelled.
         """
-        if not self._control.recovery_pending:
+        if not self._control.retry_pending:
             context.interaction.warning("There is nothing to retry.")
             return
-        if await self._control.recover_pending_async():
+        if await self._control.recover_pending_async(retry=True):
             context.interaction.warning("Recovery remains pending; use /retry to try again.")
         else:
             context.interaction.info("Recovery completed.")

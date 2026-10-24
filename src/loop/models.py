@@ -40,6 +40,8 @@ class AgentRunStopReason(StrEnum):
     MAX_TURNS = "max_turns"
     STEERED = "steered"
     PAUSED = "paused"
+    STOPPED = "stopped"
+    RECOVERY_REQUIRED = "recovery_required"
 
 
 class CommandCapability(StrEnum):
@@ -51,8 +53,8 @@ class CommandCapability(StrEnum):
     CONVERSATION_ACTIVE = "conversation_active"
     CONVERSATION_CONTROL = "conversation_control"
     RUN_ACTIVE = "run_active"
-    RUN_PAUSED = "run_paused"
-    RECOVERY_PENDING = "recovery_pending"
+    RUN_CONTINUABLE = "run_continuable"
+    RUN_RETRYABLE = "run_retryable"
     PENDING_RESPONSE = "pending_response"
 
 

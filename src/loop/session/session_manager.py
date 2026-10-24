@@ -71,6 +71,8 @@ from .models import (
     InteractionSettledEvent,
     PermissionEvent,
     RunCompletedEvent,
+    RunFailedEvent,
+    RunRetryStartedEvent,
     RunStartedEvent,
     SessionEventModel,
     SessionExecutionConflictError,
@@ -130,8 +132,6 @@ class SessionManager:
     _persistence_lock: Lock
     _commit_lock: Lock
     _async_commit_lock: asyncio.Lock
-    _recovery_pending: bool
-    _recovery_paused: bool
 
     def __init__(
         self,
@@ -147,8 +147,6 @@ class SessionManager:
         self._persistence_lock = Lock()
         self._commit_lock = Lock()
         self._async_commit_lock = asyncio.Lock()
-        self._recovery_pending = False
-        self._recovery_paused = False
         if workspace_id == "":
             raise ValueError("Workspace identifier must not be empty.")
         self._workspace_id = workspace_id
@@ -375,6 +373,8 @@ class SessionManager:
                     InputRecalledEvent,
                     InteractionRequestedEvent,
                     InteractionSettledEvent,
+                    RunFailedEvent,
+                    RunRetryStartedEvent,
                     RunStartedEvent,
                 ),
             ):
@@ -521,44 +521,59 @@ class SessionManager:
         Returns:
             bool: Whether ordinary conversation input must wait for recovery.
         """
-        return self._recovery_pending
-
-    @recovery_pending.setter
-    def recovery_pending(self, pending: bool) -> None:
-        """Set the recovery gate shared by the loop and its conversation controller.
-
-        Args:
-            pending (bool): Whether ordinary conversation input must wait for recovery.
-
-        Raises:
-            TypeError: If pending is not a boolean.
-        """
-        if not isinstance(pending, bool):
-            raise TypeError("Recovery pending state must be a boolean.")
-        self._recovery_pending = pending
+        return self.recovery_state is not None
 
     @property
-    def recovery_paused(self) -> bool:
-        """Return whether the pending recovery boundary came from an explicit pause.
+    def retry_pending(self) -> bool:
+        """Return whether the active durable run has a failed event awaiting retry.
 
         Returns:
-            bool: Whether the current process paused the run before it settled.
+            bool: Whether the latest run-state event permits ``/retry``.
         """
-        return self._recovery_paused
+        return self._session.retry_pending
 
-    @recovery_paused.setter
-    def recovery_paused(self, paused: bool) -> None:
-        """Set the runtime-only pause state used to expose continue controls.
+    @property
+    def continuable(self) -> bool:
+        """Return whether a durable run boundary can be resumed with ``/continue``.
 
-        Args:
-            paused (bool): Whether the pending run was paused in this runtime.
+        Returns:
+            bool: Whether recovery is pending without a failed event requiring retry.
+        """
+        return self.recovery_pending and not self.retry_pending
+
+    def record_run_failure(self) -> None:
+        """Persist a recoverable failure marker for the current run.
 
         Raises:
-            TypeError: If paused is not a boolean.
+            RuntimeError: If there is no active run or it already has a pending failure.
         """
-        if not isinstance(paused, bool):
-            raise TypeError("Recovery paused state must be a boolean.")
-        self._recovery_paused = paused
+        self._commit(lambda session: session.record_run_failure())
+
+    async def record_run_failure_async(self) -> None:
+        """Persist a recoverable run failure through the async session writer.
+
+        Raises:
+            RuntimeError: If there is no active run or it already has a pending failure.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        await self._commit_async(lambda session: session.record_run_failure())
+
+    def begin_run_retry(self) -> None:
+        """Persist explicit authorization to retry the current failed run.
+
+        Raises:
+            RuntimeError: If the active run has no recorded failure to retry.
+        """
+        self._commit(lambda session: session.begin_run_retry())
+
+    async def begin_run_retry_async(self) -> None:
+        """Persist explicit retry authorization through the async session writer.
+
+        Raises:
+            RuntimeError: If the active run has no recorded failure to retry.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        await self._commit_async(lambda session: session.begin_run_retry())
 
     def begin_run(self) -> RunStartedEvent:
         """Persist a unique run identity before invoking model or tool work.
@@ -1081,8 +1096,6 @@ class SessionManager:
                     session, session_field.name, deepcopy(getattr(candidate, session_field.name))
                 )
         self._session = session
-        self._recovery_pending = session.recovery_state() is not None
-        self._recovery_paused = False
 
     def load_persisted_session(self, session_id: str) -> Session:
         """Read a persisted session without changing the active session.
@@ -1121,8 +1134,6 @@ class SessionManager:
             model=self._session.model,
             workspace_id=self._workspace_id,
         )
-        self._recovery_pending = False
-        self._recovery_paused = False
 
     def rename_session(self, name: str) -> None:
         """Assign and persist a user-controlled name to the active session.

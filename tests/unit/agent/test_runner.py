@@ -5,7 +5,7 @@ import json
 import os
 from contextlib import nullcontext
 from pathlib import Path
-from threading import get_ident
+from threading import Event, Thread, get_ident
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock
 
@@ -36,6 +36,7 @@ from loop import (
     ResponseMetrics,
     RunControl,
     RunInterrupted,
+    RunStopRequested,
     RuntimeEnvironment,
     Session,
     SessionExecutionConflictError,
@@ -52,7 +53,7 @@ from loop import (
 )
 from loop.agent import Agent, AgentRunner, AgentRunRecoveryRequired, AgentRunResult
 from loop.conversation.interaction import MailboxInteraction
-from loop.session.models import RunCompletedEvent
+from loop.session.models import RunCompletedEvent, RunStartedEvent
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.tooling import FileObservations
 from loop.utils import PathHolder, VirtualPath, content_digest, utc_now
@@ -92,8 +93,33 @@ def agent_runner(
     session_manager.model_context_async = AsyncMock(return_value=[])
     session_manager.session = Session()
     run = SimpleNamespace(run_id="run-id", started_at=utc_now())
-    session_manager.begin_run.return_value = run
-    session_manager.begin_run_async = AsyncMock(return_value=run)
+
+    def begin_run():
+        """Add the durable run identity expected by failure and recovery tests."""
+        if session_manager.session.active_run_id is None:
+            session_manager.session.events.append(
+                RunStartedEvent(
+                    id="run-event",
+                    created_at=run.started_at,
+                    run_id=run.run_id,
+                    started_at=run.started_at,
+                )
+            )
+        return run
+
+    session_manager.begin_run.side_effect = begin_run
+    session_manager.begin_run_async = AsyncMock(side_effect=begin_run)
+    session_manager.retry_pending = False
+    session_manager.record_run_failure = Mock(
+        side_effect=session_manager.session.record_run_failure
+    )
+    session_manager.record_run_failure_async = AsyncMock(
+        side_effect=session_manager.session.record_run_failure
+    )
+    session_manager.begin_run_retry = Mock(side_effect=session_manager.session.begin_run_retry)
+    session_manager.begin_run_retry_async = AsyncMock(
+        side_effect=session_manager.session.begin_run_retry
+    )
     session_manager.model = None
     session_manager.tokens = 0
     session_manager.context_window = None
@@ -1632,6 +1658,7 @@ def test_runner_async_recovery_preserves_a_recoverable_repetition_failure(tmp_pa
     interaction = MagicMock(spec=ConsoleInteraction)
     interaction.confirm_async.return_value = False
     runner._interaction = interaction
+    asyncio.run(runner.session_manager.begin_run_async())
     runner._query_async = AsyncMock(
         side_effect=[
             BackendRepetitionError("repetition", provider="test", operation="query"),
@@ -2374,6 +2401,71 @@ def test_recover_session_async_skips_only_the_run_level_prompt_when_explicitly_c
     runner._recover_async.assert_awaited_once_with(sessions.recovery_state)
 
 
+@pytest.mark.parametrize(("active_run", "retry_pending"), [(False, False), (True, True)])
+def test_recover_session_starts_only_the_required_durable_run_transition(
+    active_run,
+    retry_pending,
+):
+    """Sync recovery starts a run after cold stops and records authorized retries."""
+    runner, sessions, interaction = agent_runner()
+    state = SessionRecoveryState(action="query_model")
+    sessions.recovery_state = state
+    sessions.retry_pending = retry_pending
+    recovered = AgentRunResult(final_response=None, turns=0, stop_reason="completed")
+    runner._recover = Mock(return_value=recovered)
+    interaction.confirm.return_value = True
+    if active_run:
+        sessions.begin_run()
+        sessions.session.record_run_failure()
+    sessions.begin_run.reset_mock()
+
+    result = runner.recover_session()
+
+    assert result.pending is False
+    assert result.result is recovered
+    if active_run:
+        sessions.begin_run.assert_not_called()
+    else:
+        sessions.begin_run.assert_called_once_with()
+    if retry_pending:
+        sessions.begin_run_retry.assert_called_once_with()
+    else:
+        sessions.begin_run_retry.assert_not_called()
+    runner._recover.assert_called_once_with(state)
+
+
+@pytest.mark.parametrize(("active_run", "retry_pending"), [(False, False), (True, True)])
+def test_recover_session_async_starts_only_the_required_durable_run_transition(
+    active_run,
+    retry_pending,
+):
+    """Async recovery starts cold runs and persists retry authorization before resuming."""
+    runner, sessions, _interaction = agent_runner()
+    state = SessionRecoveryState(action="query_model")
+    sessions.recovery_state = state
+    sessions.retry_pending = retry_pending
+    recovered = AgentRunResult(final_response=None, turns=0, stop_reason="completed")
+    runner._recover_async = AsyncMock(return_value=recovered)
+    if active_run:
+        sessions.begin_run()
+        sessions.session.record_run_failure()
+    sessions.begin_run.reset_mock()
+
+    result = asyncio.run(runner.recover_session_async(confirmed=True))
+
+    assert result.pending is False
+    assert result.result is recovered
+    if active_run:
+        sessions.begin_run.assert_not_called()
+    else:
+        sessions.begin_run_async.assert_awaited_once_with()
+    if retry_pending:
+        sessions.begin_run_retry_async.assert_awaited_once_with()
+    else:
+        sessions.begin_run_retry_async.assert_not_awaited()
+    runner._recover_async.assert_awaited_once_with(state)
+
+
 def test_recoverable_async_backend_failure_leaves_an_uncompleted_run():
     """Declining a recoverable backend retry leaves the run available to ``/retry``."""
     runner, sessions, interaction = agent_runner()
@@ -2382,11 +2474,36 @@ def test_recoverable_async_backend_failure_leaves_an_uncompleted_run():
     )
     runner._confirm_async = AsyncMock(return_value=False)
 
-    with pytest.raises(AgentRunRecoveryRequired):
-        asyncio.run(runner.run_async())
+    result = asyncio.run(runner.run_async())
 
+    assert result.stop_reason == "recovery_required"
+    assert result.metrics is not None
     interaction.report.assert_called_once()
     sessions.record_run_async.assert_not_awaited()
+    sessions.record_run_failure_async.assert_awaited_once()
+
+
+def test_runner_cold_stop_returns_metrics_without_completing_the_run():
+    """A synchronous cold stop preserves the run boundary without cancellation."""
+    runner, sessions, interaction = agent_runner(run_control=RunControl())
+    runner._query_with_recovery = Mock(side_effect=RunStopRequested)
+
+    result = runner.run()
+
+    assert result.stop_reason == "stopped"
+    assert result.metrics is not None
+    sessions.record_run.assert_not_called()
+    interaction.info.assert_any_call("Run stopped; its durable state is ready to continue.")
+
+
+def test_runner_does_not_cancel_tools_without_a_recovery_state():
+    """Cancellation before durable run state exists has no tool calls to settle."""
+    runner, _sessions, _interaction = agent_runner()
+    runner.session_manager.recovery_state = None
+
+    runner._cancel_pending_tools()
+
+    runner.session_manager.add_tool_call.assert_not_called()
 
 
 def test_recover_async_finalizes_or_reenters_query_boundary():
@@ -2737,17 +2854,19 @@ def test_interrupted_stream_is_closed_cancelled_and_ready_for_another_run(tmp_pa
     assert backend.get_response.call_count == 2
 
 
-def test_paused_stream_keeps_the_durable_run_open_for_recovery(tmp_path):
-    """A synchronous pause leaves committed messages behind an incomplete run boundary."""
+def test_synchronous_pause_resumes_the_same_stream_at_a_safe_checkpoint(tmp_path):
+    """A synchronous pause parks the existing stream and resumes it without cancellation."""
     control = RunControl()
     closed = Mock()
+    pause_requested = Event()
 
     def events():
-        """Request pause after partial output and close the interrupted stream."""
+        """Pause after partial output, then complete after the control resumes."""
         try:
             yield AnswerDelta(text="partial")
             assert control.pause() is True
-            yield ResponseCompleted(answer="discarded")
+            pause_requested.set()
+            yield ResponseCompleted(answer="continued")
         finally:
             closed()
 
@@ -2756,31 +2875,36 @@ def test_paused_stream_keeps_the_durable_run_open_for_recovery(tmp_path):
     runner = file_runner(tmp_path, backend, run_control=control)
     sessions = runner.session_manager
     sessions.add_user_message("question")
+    resume = Thread(target=lambda: (pause_requested.wait(), control.continue_run()))
+    resume.start()
 
     result = runner.run()
+    resume.join()
 
     closed.assert_called_once_with()
-    assert result.stop_reason == "paused"
-    assert result.turns == 0
-    assert sessions.session.active_run_id is not None
-    assert sessions.recovery_state.action == "query_model"
-    assert not any(isinstance(event, RunCompletedEvent) for event in sessions.session.events)
+    assert result.stop_reason == "completed"
+    assert result.turns == 1
+    assert sessions.session.active_run_id is None
+    assert sessions.recovery_state is None
+    assert any(isinstance(event, RunCompletedEvent) for event in sessions.session.events)
     assert control.paused is False
 
 
-def test_async_pause_cancels_the_stream_without_completing_the_run(tmp_path):
-    """An async pause closes partial output and preserves the durable recovery boundary."""
+def test_async_pause_preserves_the_stream_and_run_owner_until_continue(tmp_path):
+    """An async pause leaves an active stream open until the same owner can continue."""
     control = RunControl()
     backend = Mock()
     started = asyncio.Event()
+    release = asyncio.Event()
     closed = asyncio.Event()
 
     async def events():
-        """Pause after partial output and signal when the response stream closes."""
+        """Yield a final event only after the test has observed a live paused stream."""
         try:
             yield AnswerDelta(text="partial")
             started.set()
-            await asyncio.Event().wait()
+            await release.wait()
+            yield ResponseCompleted(answer="continued")
         finally:
             closed.set()
 
@@ -2791,20 +2915,67 @@ def test_async_pause_cancels_the_stream_without_completing_the_run(tmp_path):
     sessions.add_user_message("question")
 
     async def scenario():
-        """Request pause while the runner owns its async response stream."""
+        """Pause without cancelling the owner, then continue the same stream."""
         task = asyncio.create_task(runner.run_async())
         await started.wait()
         assert control.pause() is True
+        assert not task.done()
+        assert not closed.is_set()
+        release.set()
+        assert control.continue_run() is True
         return await task
 
     result = asyncio.run(scenario())
 
     assert closed.is_set()
-    assert result.stop_reason == "paused"
+    assert result.stop_reason == "completed"
+    assert sessions.session.active_run_id is None
+    assert sessions.recovery_state is None
+    assert any(isinstance(event, RunCompletedEvent) for event in sessions.session.events)
+    assert control.paused is False
+
+
+def test_async_cold_stop_preserves_the_durable_run_and_does_not_cancel_stream(tmp_path):
+    """A cold stop settles after the active stream without cancelling its process boundary."""
+    control = RunControl()
+    backend = Mock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def events():
+        """Pause the stream until the cold stop has been requested."""
+        try:
+            yield AnswerDelta(text="partial")
+            started.set()
+            await release.wait()
+            yield ResponseCompleted(answer="discarded")
+        finally:
+            closed.set()
+
+    backend.get_response_async.return_value = events()
+    runner = file_runner(tmp_path, backend, run_control=control)
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions = runner.session_manager
+    sessions.add_user_message("question")
+
+    async def scenario():
+        """Request a cold stop and allow the active response operation to settle."""
+        task = asyncio.create_task(runner.run_async())
+        await started.wait()
+        assert control.request_stop_run() is True
+        assert control.cancellation_event.is_set() is False
+        release.set()
+        return await task
+
+    result = asyncio.run(scenario())
+
+    assert closed.is_set()
+    assert result.stop_reason == "stopped"
     assert sessions.session.active_run_id is not None
     assert sessions.recovery_state.action == "query_model"
     assert not any(isinstance(event, RunCompletedEvent) for event in sessions.session.events)
-    assert control.paused is False
+    assert control.cancellation_event.is_set() is False
 
 
 def test_interruption_preserves_settled_tool_results_and_cancels_remaining_calls(

@@ -112,9 +112,9 @@ class SessionController:
     All domain operations stay on one execution thread. The UI owns prompts, presentation, and a
     bounded input mailbox. Bound sessions retain accepted inputs until consumption or rejection.
     Plain text during an active run follows the configured queue or steering mode. Explicit
-    ``/steer`` interrupts immediately; ``/queue`` queues input after the run. ``/pause`` preserves
-    an incomplete durable run for recovery, while ``/stop`` ends this conversation without setting
-    the application exit command. Each controller runs once.
+    ``/steer`` interrupts immediately; ``/queue`` queues input after the run. ``/pause`` parks at a
+    safe checkpoint, while ``/stop`` settles the run and leaves this conversation owner available
+    for ``/continue``. Only application exit shuts down the runtime. Each controller runs once.
 
     Args:
         interaction (Interaction): UI implementing ``AsyncInteractionInput`` as well as output.
@@ -146,7 +146,6 @@ class SessionController:
     _idle: bool
     _used: bool
     _ended: bool
-    _conversation_stop_requested: bool
     _ui_thread: int | None
     _terminal_owned: bool
     _stopping: bool
@@ -192,7 +191,6 @@ class SessionController:
         self._idle = True
         self._used = False
         self._ended = False
-        self._conversation_stop_requested = False
         self._ui_thread = None
         self._terminal_owned = False
         self._stopping = False
@@ -303,18 +301,18 @@ class SessionController:
             capabilities.add(CommandCapability.RUN_ACTIVE)
         if self._pending is not None:
             capabilities.add(CommandCapability.PENDING_RESPONSE)
+        if self._control.paused or (
+            not self._control.active
+            and self._session_manager is not None
+            and self._session_manager.continuable
+        ):
+            capabilities.add(CommandCapability.RUN_CONTINUABLE)
         if (
             not self._control.active
             and self._session_manager is not None
-            and self._session_manager.recovery_pending
+            and self._session_manager.retry_pending
         ):
-            capabilities.add(CommandCapability.RECOVERY_PENDING)
-        if (
-            not self._control.active
-            and self._session_manager is not None
-            and self._session_manager.recovery_paused
-        ):
-            capabilities.add(CommandCapability.RUN_PAUSED)
+            capabilities.add(CommandCapability.RUN_RETRYABLE)
         if not self._control.active and self._pending is None:
             capabilities.add(CommandCapability.SESSION_IDLE)
         return frozenset(capabilities)
@@ -339,7 +337,7 @@ class SessionController:
         return True
 
     def request_pause(self) -> bool:
-        """Pause the current run and revoke its separate pending question.
+        """Park the current run without cancelling its owner or active operation.
 
         Returns:
             bool: Whether an active run accepted the pause request.
@@ -347,27 +345,17 @@ class SessionController:
         if not self._control.pause():
             return False
         telemetry_activity("conversation.run.pause_requested", component=_STATUS_COMPONENT)
-        request = self._pending
-        if request is not None:
-            if not request.result.done():
-                request.result.set_exception(RunInterrupted())
-            if self._pending is request:
-                self._pending = None
-        if self._answer_input is not None and self._loop is not None:
-            self._loop.call_soon_threadsafe(self._answer_input.cancel)
         return True
 
-    def stop_conversation(self) -> bool:
-        """Stop this conversation without requesting application exit.
+    def request_stop_run(self) -> bool:
+        """Settle the active run without stopping the conversation owner.
 
         Returns:
             bool: Whether the stop request was accepted.
         """
-        if self._stopping or self._ended or self._control.stopped:
+        if not self._control.request_stop_run():
             return False
-        self._conversation_stop_requested = True
         telemetry_activity("conversation.stop_requested", component=_STATUS_COMPONENT)
-        self._stop()
         return True
 
     def request_response(self, answer: str | None = None) -> ResponseOutcome:
@@ -480,9 +468,17 @@ class SessionController:
         """
         state = (
             "Paused"
+            if self._control.paused
+            else "Stopping"
+            if self._control.stop_requested
+            else "Retry pending"
             if not self._control.active
             and self._session_manager is not None
-            and self._session_manager.recovery_paused
+            and self._session_manager.retry_pending
+            else "Continue pending"
+            if not self._control.active
+            and self._session_manager is not None
+            and self._session_manager.continuable
             else "Recovery pending"
             if not self._control.active
             and self._session_manager is not None
@@ -816,15 +812,6 @@ class SessionController:
             bool: Whether the controller has started and not yet settled.
         """
         return self._loop is not None
-
-    @property
-    def conversation_stop_requested(self) -> bool:
-        """Return whether the user ended this conversation through ``/stop``.
-
-        Returns:
-            bool: Whether control should return to the application session flow.
-        """
-        return self._conversation_stop_requested
 
     def stop(self) -> None:
         """Request safe shutdown from the UI or another thread.

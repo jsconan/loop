@@ -358,6 +358,30 @@ class RunCompletedEvent(SessionEventModel):
     _normalize_started_at = field_validator("started_at")(as_utc)
 
 
+class RunFailedEvent(SessionEventModel):
+    """Record that an active run stopped at a recoverable failure boundary.
+
+    Args:
+        type (Literal["run_failed"]): Event discriminator.
+        run_id (str): Identity of the failed durable run.
+    """
+
+    type: Literal["run_failed"] = "run_failed"
+    run_id: str = Field(min_length=1)
+
+
+class RunRetryStartedEvent(SessionEventModel):
+    """Record explicit authorization to retry a failed run boundary.
+
+    Args:
+        type (Literal["run_retry_started"]): Event discriminator.
+        run_id (str): Identity of the run authorized for retry.
+    """
+
+    type: Literal["run_retry_started"] = "run_retry_started"
+    run_id: str = Field(min_length=1)
+
+
 class ToolExecutionStartedEvent(SessionEventModel):
     """Record that one local tool invocation crossed its execution boundary.
 
@@ -411,6 +435,8 @@ SessionEvent = Annotated[
     | InteractionSettledEvent
     | RunStartedEvent
     | RunCompletedEvent
+    | RunFailedEvent
+    | RunRetryStartedEvent
     | ToolExecutionStartedEvent
     | ToolExecutionCompletedEvent
     | CompactionEvent,

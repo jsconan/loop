@@ -3,11 +3,10 @@
 __all__ = [
     "ApplicationMigration",
     "ApplicationPaths",
-    "ApplicationRunOutcome",
     "ApplicationRuntime",
     "WorkspacePaths",
 ]
 
 from .migration import ApplicationMigration
 from .paths import ApplicationPaths, WorkspacePaths
-from .runtime import ApplicationRunOutcome, ApplicationRuntime
+from .runtime import ApplicationRuntime

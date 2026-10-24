@@ -562,6 +562,19 @@ def test_manager_replays_permissions_and_run_statistics():
     interaction.run_metrics.assert_called_once_with(metrics)
 
 
+def test_manager_replay_skips_durable_failure_and_retry_events():
+    """Run failure transitions are control history, not conversation items."""
+    interaction = MagicMock(spec=Interaction)
+    manager = SessionManager(interaction=interaction)
+    manager.begin_run()
+    manager.record_run_failure()
+    manager.begin_run_retry()
+
+    manager.replay()
+
+    assert interaction.method_calls == []
+
+
 def test_manager_loads_a_session_identifier_during_initialization():
     """A session identifier is resolved through the configured store at construction."""
     store = Mock(spec=SessionStore)
@@ -684,36 +697,56 @@ def test_manager_exposes_durable_recovery_classification():
 
     assert manager.recovery_state.action == "query_model"
     assert manager.recovery_pending is True
-    assert manager.recovery_paused is False
+    assert manager.continuable is True
+    assert manager.retry_pending is False
     manager.new_session()
     assert manager.recovery_state is None
     assert manager.recovery_pending is False
-    assert manager.recovery_paused is False
+    assert manager.continuable is False
+    assert manager.retry_pending is False
 
 
-def test_manager_updates_the_shared_recovery_gate():
-    """Recovery decisions update the explicit gate independently of live history projection."""
+def test_manager_projects_retry_and_continue_from_durable_run_events():
+    """Recovery visibility follows persisted events rather than mutable runtime flags."""
     manager = SessionManager()
     manager.add_user_message("active request")
-    manager.begin_run()
+    run = manager.begin_run()
 
     assert manager.recovery_state is not None
-    assert manager.recovery_pending is False
-
-    manager.recovery_pending = True
     assert manager.recovery_pending is True
-    manager.recovery_pending = False
-    assert manager.recovery_pending is False
+    assert manager.continuable is True
+    assert manager.retry_pending is False
 
-    manager.recovery_paused = True
-    assert manager.recovery_paused is True
-    manager.recovery_paused = False
-    assert manager.recovery_paused is False
+    manager.record_run_failure()
 
-    with pytest.raises(TypeError, match="must be a boolean"):
-        manager.recovery_pending = 1
-    with pytest.raises(TypeError, match="must be a boolean"):
-        manager.recovery_paused = 1
+    assert manager.retry_pending is True
+    assert manager.continuable is False
+
+    manager.begin_run_retry()
+
+    assert manager.retry_pending is False
+    assert manager.continuable is True
+    assert manager.session.active_run_id == run.run_id
+
+
+def test_manager_persists_retry_transitions_asynchronously():
+    """Async failure and retry transitions update the persisted event projection."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    manager.add_user_message("active request")
+    asyncio.run(manager.begin_run_async())
+
+    async def record_transitions():
+        """Persist failure, authorization, and another denied retry."""
+        await manager.record_run_failure_async()
+        assert manager.retry_pending is True
+        await manager.begin_run_retry_async()
+        assert manager.retry_pending is False
+        await manager.record_run_failure_async()
+
+    asyncio.run(record_transitions())
+
+    assert manager.retry_pending is True
+    assert manager.session.events[-1].type == "run_failed"
 
 
 def test_manager_rejects_overlapping_execution_and_releases_normal_ownership():

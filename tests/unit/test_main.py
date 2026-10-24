@@ -9,7 +9,6 @@ import pytest
 
 from loop import ShutdownRequested
 from loop import main as application
-from loop.application import ApplicationRunOutcome
 from loop.configuration import ApplicationSettings
 from loop.workspace import Workspace, WorkspaceSwitchRequested
 
@@ -51,27 +50,6 @@ def test_run_application_async_closes_runtime(monkeypatch):
     interaction.info.assert_called_once_with("Hello from loop!")
     runtime.run_async.assert_awaited_once_with()
     runtime.close_async.assert_awaited_once_with()
-
-
-def test_run_application_rebuilds_runtime_after_conversation_stop(monkeypatch):
-    """Stopping one conversation rebuilds its runtime and keeps the application flow open."""
-    interaction = Mock()
-    first = Mock()
-    first.run_async = AsyncMock(return_value=ApplicationRunOutcome.CONVERSATION_STOPPED)
-    first.close_async = AsyncMock()
-    second = Mock()
-    second.run_async = AsyncMock(return_value=ApplicationRunOutcome.APPLICATION_EXITED)
-    second.close_async = AsyncMock()
-    create_runtime = Mock(side_effect=[first, second])
-    monkeypatch.setattr(application, "ConsoleInteraction", Mock(return_value=interaction))
-    monkeypatch.setattr(application, "ApplicationRuntime", Mock(create=create_runtime))
-    monkeypatch.setattr(application, "register_shutdown_signals", Mock())
-
-    asyncio.run(application.run_application_async())
-
-    assert create_runtime.call_count == 2
-    first.close_async.assert_awaited_once_with()
-    second.close_async.assert_awaited_once_with()
 
 
 @pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt, ShutdownRequested])

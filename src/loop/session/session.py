@@ -10,6 +10,7 @@ from typing import Self
 from pydantic import TypeAdapter, ValidationError
 
 from ..models import (
+    AgentRunStopReason,
     ConversationItem,
     Message,
     ModelAssignment,
@@ -45,6 +46,8 @@ from .models import (
     PendingToolCall,
     ReferenceArtifact,
     RunCompletedEvent,
+    RunFailedEvent,
+    RunRetryStartedEvent,
     RunStartedEvent,
     SerializedMessage,
     SerializedSession,
@@ -58,7 +61,7 @@ from .models import (
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 15
+_SCHEMA_VERSION = 16
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -320,10 +323,17 @@ class Session:
                 ``None`` when the latest run ended cleanly.
         """
         completed_items = 0
+        last_completion = None
         for event in self.events:
             if isinstance(event, RunCompletedEvent):
                 completed_items = event.metrics.item_count
+                last_completion = event
         if completed_items >= len(self.messages):
+            if self.active_run is not None or (
+                last_completion is not None
+                and last_completion.stop_reason == AgentRunStopReason.MAX_TURNS
+            ):
+                return SessionRecoveryState(action="query_model")
             return None
 
         suffix = self.messages[completed_items:]
@@ -362,6 +372,56 @@ class Session:
         else:
             action = "query_model"
         return SessionRecoveryState(action=action, pending_calls=tuple(pending))
+
+    @property
+    def retry_pending(self) -> bool:
+        """Return whether the active run's latest recovery event is a recorded failure.
+
+        Returns:
+            bool: Whether ``/retry`` is allowed for the active durable run.
+        """
+        run_id = self.active_run_id
+        if run_id is None:
+            return False
+        failed = False
+        for event in self.events:
+            if isinstance(event, (RunFailedEvent, RunRetryStartedEvent)) and event.run_id == run_id:
+                failed = isinstance(event, RunFailedEvent)
+        return failed
+
+    def record_run_failure(self) -> None:
+        """Record a recoverable failure for the current durable run.
+
+        Raises:
+            RuntimeError: If there is no active run or it already has a pending failure.
+        """
+        run_id = self.active_run_id
+        if run_id is None or self.retry_pending:
+            raise RuntimeError("There is no active run awaiting a failure record.")
+        self.events.append(
+            RunFailedEvent(
+                id=str(new_uuid()),
+                created_at=utc_now(),
+                run_id=run_id,
+            )
+        )
+
+    def begin_run_retry(self) -> None:
+        """Record explicit retry authorization for the failed active run.
+
+        Raises:
+            RuntimeError: If the active run has no recorded failure to retry.
+        """
+        run_id = self.active_run_id
+        if run_id is None or not self.retry_pending:
+            raise RuntimeError("There is no failed run to retry.")
+        self.events.append(
+            RunRetryStartedEvent(
+                id=str(new_uuid()),
+                created_at=utc_now(),
+                run_id=run_id,
+            )
+        )
 
     @property
     def active_run(self) -> RunStartedEvent | None:
@@ -808,6 +868,7 @@ class Session:
         settled_interactions = set()
         active_run_id = None
         started_runs = set()
+        failed_run_id = None
         for event in events:
             if isinstance(event, InputQueuedEvent):
                 if event.session_id != session_id or event.input_id in queued_inputs:
@@ -870,10 +931,22 @@ class Session:
                     raise TypeError("Invalid serialized run start.")
                 active_run_id = event.run_id
                 started_runs.add(event.run_id)
+                failed_run_id = None
+            elif isinstance(event, RunFailedEvent):
+                if event.run_id != active_run_id or failed_run_id is not None:
+                    raise TypeError("Invalid serialized run failure.")
+                failed_run_id = event.run_id
+            elif isinstance(event, RunRetryStartedEvent):
+                if event.run_id != active_run_id or failed_run_id != event.run_id:
+                    raise TypeError("Invalid serialized run retry.")
+                failed_run_id = None
             elif isinstance(event, RunCompletedEvent):
-                if event.run_id is not None and event.run_id != active_run_id:
+                if (
+                    event.run_id is not None and event.run_id != active_run_id
+                ) or failed_run_id is not None:
                     raise TypeError("Invalid serialized run completion.")
                 active_run_id = None
+                failed_run_id = None
         item_event_indices = [
             event.item_index for event in events if isinstance(event, ConversationItemEvent)
         ]
