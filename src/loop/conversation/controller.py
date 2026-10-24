@@ -25,7 +25,7 @@ from ..completion import CompletionManager, CompletionValue
 from ..control import RunControl, RunInterrupted
 from ..interaction import AsyncInteractionInput, Interaction
 from ..models import CommandCapability, ConversationInputMode, SteeringMessage
-from ..session.models import InputDeliveredEvent, InputQueuedEvent
+from ..session.models import InputDeliveredEvent, InputQueuedEvent, InputRecalledEvent
 from ..telemetry import telemetry_activity
 from ..utils import ChoiceItem, choice_items
 from .commands import ConversationCommands
@@ -45,6 +45,7 @@ from .models import (
     InputAdmissionKind,
     InteractionCall,
     PendingInputPriorityOutcome,
+    PendingInputRecallOutcome,
     ResponseOutcome,
     RunStateChanged,
     SteeringOutcome,
@@ -153,6 +154,7 @@ class SessionController:
     _discarded: int
     _idle_command_pending: bool
     _draft: str | None
+    _draft_bypass_commands: bool
     _input_signal: asyncio.Event
     _async_owner: bool
     _session_manager: SessionManager | None
@@ -197,6 +199,7 @@ class SessionController:
         self._discarded = 0
         self._idle_command_pending = False
         self._draft = None
+        self._draft_bypass_commands = False
         self._input_signal = asyncio.Event()
         self._async_owner = False
         self._session_manager = None
@@ -657,6 +660,78 @@ class SessionController:
             return PendingInputPriorityOutcome.INTERRUPTED
         return PendingInputPriorityOutcome.UPDATED
 
+    async def recall_latest_async(self) -> PendingInputRecallOutcome:
+        """Return the newest waiting mailbox message to the active editor.
+
+        Returns:
+            PendingInputRecallOutcome: Whether a waiting message was recalled.
+
+        Raises:
+            asyncio.CancelledError: If durable persistence settles after cancellation.
+        """
+        await self._acquire_mailbox_lock_async()
+        try:
+            session_manager = self._session_manager
+            session_id = session_manager.session.id if session_manager is not None else None
+            delivered_ids = (
+                {
+                    event.input_id
+                    for event in session_manager.session.events
+                    if isinstance(event, InputDeliveredEvent)
+                }
+                if session_manager is not None
+                else set()
+            )
+            pending_ids = (
+                {event.input_id for event in session_manager.session.pending_inputs}
+                if session_manager is not None
+                else set()
+            )
+            eligible = [
+                item
+                for item in self._inbox.snapshot()
+                if item.kind is InputAdmissionKind.MESSAGE
+                and isinstance(item.message, str)
+                and (
+                    item.input_id is None
+                    or (
+                        session_manager is not None
+                        and item.session_id == session_id
+                        and item.input_id in pending_ids
+                        and item.input_id not in delivered_ids
+                    )
+                )
+            ]
+            if not eligible:
+                return PendingInputRecallOutcome.NO_PENDING_INPUT
+            target = max(eligible, key=lambda item: item.sequence)
+            message = cast(str, target.message)
+            if target.input_id is not None and session_manager is not None:
+                try:
+                    await session_manager.recall_input_async(target.input_id)
+                except asyncio.CancelledError:
+                    recalled = any(
+                        isinstance(event, InputRecalledEvent) and event.input_id == target.input_id
+                        for event in session_manager.session.events
+                    )
+                    if recalled:
+                        self._remove_recalled_input(target)
+                        self._draft = message
+                        self._draft_bypass_commands = target.bypass_commands
+                    raise
+            self._remove_recalled_input(target)
+            self._draft = message
+            self._draft_bypass_commands = target.bypass_commands
+        finally:
+            self._release_mailbox_lock()
+        return PendingInputRecallOutcome.RECALLED
+
+    def _remove_recalled_input(self, admission: InputAdmission) -> None:
+        """Remove a recalled admission and release its durable mailbox identity."""
+        self._inbox.remove(admission)
+        if admission.input_id is not None:
+            self._queued_input_ids.discard(admission.input_id)
+
     @property
     def interaction(self) -> Interaction:
         """Return the interaction to inject into conversation-owned services.
@@ -1046,6 +1121,7 @@ class SessionController:
         events = cast(asyncio.Queue, self._events)
         incoming = asyncio.create_task(events.get())
         typing = None
+        typing_bypass_commands = False
         worker_done = False
         try:
             while True:
@@ -1059,6 +1135,7 @@ class SessionController:
                     and self._command_task is None
                 ):
                     if self._draft is not None:
+                        typing_bypass_commands = self._draft_bypass_commands
                         typing = asyncio.create_task(
                             self._input.prompt_async(
                                 completer=self._completer,
@@ -1067,7 +1144,9 @@ class SessionController:
                             )
                         )
                         self._draft = None
+                        self._draft_bypass_commands = False
                     else:
+                        typing_bypass_commands = False
                         typing = asyncio.create_task(
                             self._input.prompt_async(completer=self._completer, default="")
                         )
@@ -1097,11 +1176,13 @@ class SessionController:
                                 await self._accept_async(
                                     submitted,
                                     route_idle_commands=route_idle_commands,
+                                    bypass_commands=typing_bypass_commands,
                                 )
                         else:
                             draft = self._input.current_input()
                             if isinstance(draft, str):
                                 self._draft = draft
+                                self._draft_bypass_commands = typing_bypass_commands
                             self._input.set_current_input("")
                             typing.cancel()
                             await asyncio.gather(typing, return_exceptions=True)
@@ -1113,7 +1194,11 @@ class SessionController:
                     typing = None
                     self._message_input = None
                     if not submitted.cancelled():
-                        await self._accept_async(submitted, route_idle_commands=route_idle_commands)
+                        await self._accept_async(
+                            submitted,
+                            route_idle_commands=route_idle_commands,
+                            bypass_commands=typing_bypass_commands,
+                        )
                 if worker in done:
                     completion = ConversationCompletion(
                         asyncio.CancelledError() if worker.cancelled() else worker.exception()
@@ -1196,7 +1281,13 @@ class SessionController:
             if event.kind == EVENT_TERMINAL_EXIT:
                 self._terminal_owned = False
 
-    async def _accept_async(self, submitted: asyncio.Task, *, route_idle_commands: bool) -> None:
+    async def _accept_async(
+        self,
+        submitted: asyncio.Task,
+        *,
+        route_idle_commands: bool,
+        bypass_commands: bool = False,
+    ) -> None:
         """Resolve input without hiding errors, then apply controls or admit ordinary text."""
         if self._stopping:
             with suppress(asyncio.CancelledError):
@@ -1208,10 +1299,15 @@ class SessionController:
             self._source.info("Stopping after the active operation settles...")
             return
         command_manager = cast(CommandManager, self._command_manager)
-        if route_idle_commands and self._idle and command_manager.is_user_command(value):
+        if (
+            not bypass_commands
+            and route_idle_commands
+            and self._idle
+            and command_manager.is_user_command(value)
+        ):
             self._idle_command_pending = await self._enqueue_async(value)
             return
-        if command_manager.is_user_command(value):
+        if not bypass_commands and command_manager.is_user_command(value):
             self._command_task = asyncio.create_task(
                 self._run_command_async(command_manager, value)
             )

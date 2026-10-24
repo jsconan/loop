@@ -51,6 +51,20 @@ def test_mailbox_reprioritizes_only_the_target_object():
     assert mailbox.get_nowait().priority == 0
 
 
+def test_mailbox_removes_only_the_target_object():
+    """Recall removes the exact selected admission and preserves equal messages."""
+    mailbox = InputMailbox(2)
+    target = InputAdmission(1, 1, InputAdmissionKind.MESSAGE, "target")
+    equal_admission = InputAdmission(1, 1, InputAdmissionKind.STOP)
+    mailbox.try_put(target)
+    mailbox.try_put(InputAdmission(1, 2, InputAdmissionKind.MESSAGE, "remaining"))
+
+    assert target == equal_admission
+    assert mailbox.remove(equal_admission) is False
+    assert mailbox.remove(target) is True
+    assert mailbox.snapshot() == (InputAdmission(1, 2, InputAdmissionKind.MESSAGE, "remaining"),)
+
+
 @pytest.mark.parametrize("shutdown", [False, True])
 def test_mailbox_wait_wakes_for_admission_or_shutdown(monkeypatch, shutdown):
     """Wake a blocked waiter when input arrives or shutdown replaces pending input."""

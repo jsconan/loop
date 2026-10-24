@@ -38,6 +38,7 @@ from .models import (
     InputDeliveredEvent,
     InputPriorityChangedEvent,
     InputQueuedEvent,
+    InputRecalledEvent,
     InputRejectedEvent,
     InteractionRequestedEvent,
     InteractionSettledEvent,
@@ -57,7 +58,7 @@ from .models import (
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 
-_SCHEMA_VERSION = 14
+_SCHEMA_VERSION = 15
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -407,7 +408,7 @@ class Session:
                 queued[event.input_id] = queued[event.input_id].model_copy(
                     update={"priority": event.priority, "sequence": event.sequence}
                 )
-            elif isinstance(event, (InputConsumedEvent, InputRejectedEvent)):
+            elif isinstance(event, (InputConsumedEvent, InputRejectedEvent, InputRecalledEvent)):
                 settled.add(event.input_id)
         return tuple(
             sorted(
@@ -446,6 +447,26 @@ class Session:
                 priority=priority,
                 sequence=pending.sequence,
             )
+        )
+
+    def recall_input(self, input_id: str) -> None:
+        """Close an input that is still waiting in the mailbox.
+
+        Args:
+            input_id (str): Identity of the accepted input to return to the editor.
+
+        Raises:
+            ValueError: If the input is unknown, delivered, or already settled.
+        """
+        pending = next((item for item in self.pending_inputs if item.input_id == input_id), None)
+        delivered = any(
+            isinstance(event, InputDeliveredEvent) and event.input_id == input_id
+            for event in self.events
+        )
+        if pending is None or delivered:
+            raise ValueError(f"Input '{input_id}' is not waiting in the mailbox.")
+        self.events.append(
+            InputRecalledEvent(id=str(new_uuid()), created_at=utc_now(), input_id=input_id)
         )
 
     @property
@@ -707,7 +728,7 @@ class Session:
         version = payload.get("version")
         if version == _SCHEMA_VERSION:
             return False
-        if version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+        if version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
             return True
         raise ValueError(f"Unsupported session version {version}.")
 
@@ -825,6 +846,14 @@ class Session:
                 if event.input_id not in queued_inputs or event.input_id in settled_inputs:
                     raise TypeError("Invalid serialized input rejection.")
                 settled_inputs.add(event.input_id)
+            elif isinstance(event, InputRecalledEvent):
+                if (
+                    event.input_id not in queued_inputs
+                    or event.input_id in settled_inputs
+                    or event.input_id in delivered_inputs
+                ):
+                    raise TypeError("Invalid serialized input recall.")
+                settled_inputs.add(event.input_id)
             elif isinstance(event, InteractionRequestedEvent):
                 if event.session_id != session_id or event.request_id in requested_interactions:
                     raise TypeError("Invalid serialized interaction request.")
@@ -896,7 +925,7 @@ class Session:
         if version == 11:
             payload["version"] = _SCHEMA_VERSION
             version = _SCHEMA_VERSION
-        elif version in {12, 13}:
+        elif version in {12, 13, 14}:
             payload = dict(payload)
             payload["version"] = _SCHEMA_VERSION
             version = _SCHEMA_VERSION

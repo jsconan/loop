@@ -276,6 +276,18 @@ class InputRejectedEvent(SessionEventModel):
     input_id: str = Field(min_length=1)
 
 
+class InputRecalledEvent(SessionEventModel):
+    """Close a waiting input after moving its text back to the editor.
+
+    Args:
+        type (Literal["input_recalled"]): Event discriminator.
+        input_id (str): Identity of the accepted input removed from the mailbox.
+    """
+
+    type: Literal["input_recalled"] = "input_recalled"
+    input_id: str = Field(min_length=1)
+
+
 class InteractionRequestedEvent(SessionEventModel):
     """Record a pending UI request without persisting its answer or authority.
 
@@ -394,6 +406,7 @@ SessionEvent = Annotated[
     | InputDeliveredEvent
     | InputConsumedEvent
     | InputRejectedEvent
+    | InputRecalledEvent
     | InteractionRequestedEvent
     | InteractionSettledEvent
     | RunStartedEvent

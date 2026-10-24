@@ -500,7 +500,7 @@ def test_store_upgrades_path_owned_snapshots_once_on_load(tmp_path):
         stored = json.loads(
             connection.execute("SELECT session FROM sessions WHERE id = 'legacy'").fetchone()[0]
         )
-    assert stored["version"] == 14
+    assert stored["version"] == 15
     assert stored["workspace_id"] == "workspace"
     assert "workspace_root" not in stored
     assert restored.revision == 2
@@ -589,7 +589,7 @@ def test_store_migrates_legacy_references_atomically_on_load(tmp_path, legacy_ve
         link_count = connection.execute(
             "SELECT COUNT(*) FROM session_reference_artifacts"
         ).fetchone()[0]
-    assert stored["version"] == 14
+    assert stored["version"] == 15
     assert "content" not in stored["messages"][0]["data"]["context"][0]
     assert artifact_count == link_count == 2
 

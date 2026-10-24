@@ -134,6 +134,26 @@ class InputMailbox:
             heapify(self._items)
         return True
 
+    def remove(self, target: InputAdmission) -> bool:
+        """Remove a queued admission by object identity.
+
+        Args:
+            target (InputAdmission): Exact queued admission to remove.
+
+        Returns:
+            bool: Whether the target was present and removed.
+        """
+        with self._condition:
+            index = next(
+                (position for position, item in enumerate(self._items) if item is target),
+                None,
+            )
+            if index is None:
+                return False
+            self._items.pop(index)
+            heapify(self._items)
+        return True
+
     def stop_and_replace(self, stop_admission: InputAdmission) -> int:
         """Close admission, discard pending inputs, and enqueue the stop signal.
 

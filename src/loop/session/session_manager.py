@@ -64,6 +64,7 @@ from .models import (
     InputDeliveredEvent,
     InputPriorityChangedEvent,
     InputQueuedEvent,
+    InputRecalledEvent,
     InputRejectedEvent,
     InstructionSnapshot,
     InteractionRequestedEvent,
@@ -369,6 +370,7 @@ class SessionManager:
                     InputDeliveredEvent,
                     InputConsumedEvent,
                     InputRejectedEvent,
+                    InputRecalledEvent,
                     InteractionRequestedEvent,
                     InteractionSettledEvent,
                     RunStartedEvent,
@@ -712,6 +714,29 @@ class SessionManager:
             asyncio.CancelledError: If persistence settles after cancellation.
         """
         await self._commit_async(lambda session: session.change_input_priority(input_id, priority))
+
+    def recall_input(self, input_id: str) -> None:
+        """Persist the recall of an input that is still waiting in the mailbox.
+
+        Args:
+            input_id (str): Identity of the accepted input to return to the editor.
+
+        Raises:
+            ValueError: If the input is no longer waiting in the mailbox.
+        """
+        self._commit(lambda session: session.recall_input(input_id))
+
+    async def recall_input_async(self, input_id: str) -> None:
+        """Persist a mailbox input recall through the asynchronous session writer.
+
+        Args:
+            input_id (str): Identity of the accepted input to return to the editor.
+
+        Raises:
+            ValueError: If the input is no longer waiting in the mailbox.
+            asyncio.CancelledError: If persistence settles after cancellation.
+        """
+        await self._commit_async(lambda session: session.recall_input(input_id))
 
     def reject_input(self, input_id: str) -> None:
         """Persist that a previously accepted input could not enter the mailbox.

@@ -21,6 +21,7 @@ from loop.conversation.commands import ConversationCommands, ConversationControl
 from loop.conversation.models import (
     ConversationStatus,
     PendingInputPriorityOutcome,
+    PendingInputRecallOutcome,
     ResponseOutcome,
     SteeringOutcome,
 )
@@ -45,6 +46,8 @@ def test_provider_declares_state_capabilities_and_response_completion():
         "status",
         "steer_async",
         "queue_async",
+        "edit_async",
+        "edit_async",
     ]
     assert registrations[3].name == "steer"
     assert registrations[4].name == "queue"
@@ -55,8 +58,12 @@ def test_provider_declares_state_capabilities_and_response_completion():
     )
     assert registrations[3].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
     assert registrations[4].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
+    assert registrations[5].name == "edit"
+    assert registrations[6].name == "recall"
+    assert registrations[5].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
+    assert registrations[6].capabilities == frozenset({CommandCapability.CONVERSATION_ACTIVE})
     assert registrations[1].completion.provider == control.response_completions
-    assert registrations[-1].completion == CommandCompletion()
+    assert registrations[4].completion == CommandCompletion()
 
 
 def test_control_protocol_declares_sync_and_async_control_methods():
@@ -66,6 +73,7 @@ def test_control_protocol_declares_sync_and_async_control_methods():
     assert iscoroutinefunction(ConversationControl.steer_async)
     assert iscoroutinefunction(ConversationControl.queue_async)
     assert iscoroutinefunction(ConversationControl.reprioritize_latest_async)
+    assert iscoroutinefunction(ConversationControl.recall_latest_async)
 
 
 def test_respond_argument_completes_the_pending_response_values():
@@ -307,3 +315,30 @@ def test_steer_without_arguments_reprioritizes_and_interrupts(
     control.reprioritize_latest_async.assert_awaited_once_with(steer=True)
     interaction.info.assert_called_once_with(feedback)
     interaction.warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "method", "feedback"),
+    [
+        (
+            PendingInputRecallOutcome.NO_PENDING_INPUT,
+            "warning",
+            "No pending message to edit.",
+        ),
+        (
+            PendingInputRecallOutcome.RECALLED,
+            "info",
+            "Pending message moved to the editor.",
+        ),
+    ],
+)
+def test_edit_reports_recall_outcomes(command_context, outcome, method, feedback):
+    """The edit and recall aliases report empty and successful mailbox recalls."""
+    context, interaction = command_context
+    control = Mock()
+    control.recall_latest_async = AsyncMock(return_value=outcome)
+
+    asyncio.run(ConversationCommands(control).edit_async(context))
+
+    control.recall_latest_async.assert_awaited_once_with()
+    getattr(interaction, method).assert_called_once_with(feedback)

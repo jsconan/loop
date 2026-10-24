@@ -56,6 +56,13 @@ class PendingInputPriorityOutcome(Enum):
     INTERRUPTED = "interrupted"
 
 
+class PendingInputRecallOutcome(Enum):
+    """Describe whether a waiting input was returned to the editor."""
+
+    NO_PENDING_INPUT = "no_pending_input"
+    RECALLED = "recalled"
+
+
 class ResponseOutcome(Enum):
     """Describe how a pending interaction response was handled."""
 

@@ -15,6 +15,7 @@ from loop import (
     InputDeliveredEvent,
     InputPriorityChangedEvent,
     InputQueuedEvent,
+    InputRecalledEvent,
     InputRejectedEvent,
     InstructionSnapshot,
     InteractionRequestedEvent,
@@ -526,7 +527,7 @@ def test_session_externalizes_shipped_v11_inline_references():
     assert reference.next_cursor is not None
     assert reference.media_type == "text/plain"
     assert restored.persistence_snapshot().reference_artifacts[0].content == b"preview"
-    assert json.loads(restored.serialize())["version"] == 14
+    assert json.loads(restored.serialize())["version"] == 15
 
 
 def test_session_migrates_v13_snapshots_without_changing_existing_history():
@@ -538,7 +539,7 @@ def test_session_migrates_v13_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 14
+    assert json.loads(restored.serialize())["version"] == 15
 
 
 def test_session_persistence_snapshot_deduplicates_transient_reference_content():
@@ -653,9 +654,12 @@ def test_session_reports_whether_serialized_state_requires_migration():
     current = Session().serialize()
     legacy = json.loads(current)
     legacy["version"] = 11
+    previous = json.loads(current)
+    previous["version"] = 14
 
     assert Session.requires_migration(current) is False
     assert Session.requires_migration(json.dumps(legacy)) is True
+    assert Session.requires_migration(json.dumps(previous)) is True
 
 
 def test_session_migrates_v12_snapshots_without_changing_existing_history():
@@ -667,7 +671,19 @@ def test_session_migrates_v12_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 14
+    assert json.loads(restored.serialize())["version"] == 15
+
+
+def test_session_migrates_v14_snapshots_without_changing_existing_history():
+    """Version 14 sessions retain canonical history while adopting the current schema."""
+    original = Session(messages=[Message(role="user", content="question")])
+    payload = json.loads(original.serialize())
+    payload["version"] = 14
+
+    restored = Session.deserialize(json.dumps(payload))
+
+    assert restored.messages == original.messages
+    assert json.loads(restored.serialize())["version"] == 15
 
 
 @pytest.mark.parametrize("value", ["not-json", "[]", '{"version":99}'])
@@ -800,6 +816,40 @@ def test_session_projects_latest_priority_and_retains_fifo_sequence():
     event_count = len(session.events)
     session.change_input_priority(second.input_id, 1)
     assert len(session.events) == event_count
+
+
+def test_session_recall_closes_only_an_undelivered_pending_input():
+    """Recall records a durable terminal outcome and removes its input from restoration."""
+    session = Session()
+    queued = InputQueuedEvent(
+        id="event-queued",
+        created_at=datetime(2026, 10, 21, tzinfo=UTC),
+        input_id="input-1",
+        session_id=session.id,
+        content="message",
+        priority=1,
+        sequence=0,
+        bypass_commands=True,
+    )
+    session.events.append(queued)
+
+    session.recall_input(queued.input_id)
+
+    assert isinstance(session.events[-1], InputRecalledEvent)
+    assert session.pending_inputs == ()
+    assert Session.deserialize(session.serialize()).events == session.events
+    with pytest.raises(ValueError, match="not waiting"):
+        session.recall_input(queued.input_id)
+
+    with pytest.raises(ValueError, match="not waiting"):
+        session.recall_input("unknown")
+
+    delivered_session = Session()
+    delivered = queued.model_copy(update={"session_id": delivered_session.id})
+    delivered_session.events.append(delivered)
+    delivered_session.mark_input_delivered(delivered.input_id)
+    with pytest.raises(ValueError, match="not waiting"):
+        delivered_session.recall_input(delivered.input_id)
 
 
 def test_session_rejects_priority_changes_for_inputs_not_waiting():
@@ -945,6 +995,11 @@ def test_session_deserialization_rejects_invalid_lifecycle_event_timelines():
         priority=1,
         sequence=0,
     )
+    recalled = InputRecalledEvent(
+        id="recall-event",
+        created_at=created_at,
+        input_id="input-1",
+    )
     request = InteractionRequestedEvent(
         id="request-event",
         created_at=created_at,
@@ -1009,6 +1064,15 @@ def test_session_deserialization_rejects_invalid_lifecycle_event_timelines():
         "reject_unknown": [
             InputRejectedEvent(id="reject-event", created_at=created_at, input_id="unknown")
         ],
+        "recall_unknown": [
+            InputRecalledEvent(id="recall-event", created_at=created_at, input_id="unknown")
+        ],
+        "recall_after_delivery": [
+            queued,
+            InputDeliveredEvent(id="delivery-event", created_at=created_at, input_id="input-1"),
+            recalled,
+        ],
+        "duplicate_recall": [queued, recalled, recalled.model_copy(update={"id": "recall-2"})],
         "request_session": [request.model_copy(update={"session_id": "different-session"})],
         "duplicate_request": [request, request.model_copy(update={"id": "duplicate-request"})],
         "settle_unknown": [settlement],

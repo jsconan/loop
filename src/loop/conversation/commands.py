@@ -10,6 +10,7 @@ from ..models import CommandCapability
 from .models import (
     ConversationStatus,
     PendingInputPriorityOutcome,
+    PendingInputRecallOutcome,
     ResponseOutcome,
     SteeringOutcome,
 )
@@ -121,6 +122,16 @@ class ConversationControl(Protocol):
             asyncio.CancelledError: If durable persistence settles after cancellation.
         """
 
+    async def recall_latest_async(self) -> PendingInputRecallOutcome:
+        """Return the newest waiting message to the editor.
+
+        Returns:
+            PendingInputRecallOutcome: Whether a message was recalled.
+
+        Raises:
+            asyncio.CancelledError: If durable persistence settles after cancellation.
+        """
+
 
 class ConversationCommands:
     """Register user-facing controls for an asynchronous conversation.
@@ -166,6 +177,16 @@ class ConversationCommands:
                 self.queue_async,
                 name="queue",
                 completion=CommandCompletion(),
+                capabilities=frozenset({CommandCapability.CONVERSATION_ACTIVE}),
+            ),
+            CommandRegistration(
+                self.edit_async,
+                name="edit",
+                capabilities=frozenset({CommandCapability.CONVERSATION_ACTIVE}),
+            ),
+            CommandRegistration(
+                self.edit_async,
+                name="recall",
                 capabilities=frozenset({CommandCapability.CONVERSATION_ACTIVE}),
             ),
         )
@@ -287,3 +308,21 @@ class ConversationCommands:
             context.interaction.warning("No agent run is active; send a normal message instead.")
         elif self._control.status_snapshot().state == "Idle":
             context.interaction.info("Queued input for the next run.")
+
+    async def edit_async(self, context: CommandContext) -> None:
+        """Move the newest waiting message into the input editor.
+
+        Args:
+            context (CommandContext): Interaction used to report the recall outcome.
+
+        Returns:
+            None: After reporting the recall outcome.
+
+        Raises:
+            asyncio.CancelledError: If durable persistence is cancelled after its write settles.
+        """
+        outcome = await self._control.recall_latest_async()
+        if outcome is PendingInputRecallOutcome.NO_PENDING_INPUT:
+            context.interaction.warning("No pending message to edit.")
+        else:
+            context.interaction.info("Pending message moved to the editor.")

@@ -40,6 +40,7 @@ from loop.conversation.models import (
     InputAdmissionKind,
     InteractionCall,
     PendingInputPriorityOutcome,
+    PendingInputRecallOutcome,
     ResponseOutcome,
     SteeringOutcome,
 )
@@ -875,6 +876,186 @@ def test_controller_priority_cancellation_keeps_durable_and_mailbox_state_aligne
     assert manager.session.pending_inputs[0].priority == expected_priority
 
 
+def test_controller_recall_does_not_remove_input_when_durable_write_fails(ui):
+    """A failed recall write leaves the accepted message in the mailbox and session."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    manager.recall_input_async = AsyncMock(side_effect=OSError("disk full"))
+
+    async def scenario():
+        """Queue one durable input and attempt to recall it during active ownership."""
+        with controller.control.execution():
+            assert await controller.queue_async("waiting", ui) is True
+            with pytest.raises(OSError, match="disk full"):
+                await controller.recall_latest_async()
+
+    asyncio.run(scenario())
+
+    assert controller.status_snapshot().queued_inputs == 1
+    assert [item.content for item in manager.session.pending_inputs] == ["waiting"]
+
+
+def test_controller_recall_reports_empty_and_supports_memory_only_inputs(ui):
+    """Recall reports an empty mailbox and removes in-memory messages without storage."""
+    controller = SessionController(ui)
+
+    async def scenario():
+        """Exercise the public recall boundary with no input and then one queued input."""
+        assert await controller.recall_latest_async() is PendingInputRecallOutcome.NO_PENDING_INPUT
+        with controller.control.execution():
+            assert await controller.queue_async("waiting", ui) is True
+            result = await controller.recall_latest_async()
+        return result
+
+    assert asyncio.run(scenario()) is PendingInputRecallOutcome.RECALLED
+    assert controller.status_snapshot().queued_inputs == 0
+
+
+@pytest.mark.parametrize("settlement", ["delivered", "consumed"])
+def test_controller_recall_skips_delivered_or_consumed_inputs(ui, settlement):
+    """Mailbox text already delivered or recorded in history cannot be recalled."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+
+    async def scenario():
+        """Close an accepted input at the requested durable boundary before recall."""
+        with controller.control.execution():
+            assert await controller.queue_async("waiting", ui) is True
+            accepted = manager.session.pending_inputs[0]
+            if settlement == "delivered":
+                await manager.mark_input_delivered_async(accepted.input_id)
+            else:
+                await manager.add_user_message_async("waiting", input_id=accepted.input_id)
+            return await controller.recall_latest_async()
+
+    assert asyncio.run(scenario()) is PendingInputRecallOutcome.NO_PENDING_INPUT
+    assert controller.status_snapshot().queued_inputs == 1
+    assert not any(event.type == "input_recalled" for event in manager.session.events)
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_controller_recall_cancellation_keeps_mailbox_aligned_with_durable_state(ui, committed):
+    """Cancellation preserves an uncommitted input or removes a durably recalled one."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+
+    async def scenario():
+        """Cancel before or after the session has persisted the recalled outcome."""
+        with controller.control.execution():
+            assert await controller.queue_async("waiting", ui) is True
+            accepted = manager.session.pending_inputs[0]
+
+            async def cancel_recall(input_id):
+                """Optionally commit the terminal event before propagating cancellation."""
+                if committed:
+                    manager.recall_input(input_id)
+                raise asyncio.CancelledError
+
+            manager.recall_input_async = cancel_recall
+            with pytest.raises(asyncio.CancelledError):
+                await controller.recall_latest_async()
+            return accepted.input_id
+
+    asyncio.run(scenario())
+
+    if committed:
+        assert controller.status_snapshot().queued_inputs == 0
+        assert manager.session.pending_inputs == ()
+    else:
+        assert controller.status_snapshot().queued_inputs == 1
+        assert [item.content for item in manager.session.pending_inputs] == ["waiting"]
+
+
+@pytest.mark.parametrize(
+    ("edit_command", "cancel_edit"),
+    [("/edit", False), ("/edit", True), ("/recall", False), ("/recall", True)],
+)
+def test_edit_recalls_latest_message_and_submits_it_as_a_new_input(ui, edit_command, cancel_edit):
+    """Edit restores the newest queued text, while cancellation keeps it recalled."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    commands = CommandManager(providers=(ConversationCommands(controller),), interaction=ui)
+    controller.bind_command_manager(commands)
+    received = []
+
+    async def scenario():
+        """Run the editor through queue admission, recall, and optional resubmission."""
+        inputs = asyncio.Queue()
+        working = asyncio.Event()
+        queued_twice = asyncio.Event()
+        draft_ready = asyncio.Event()
+        release = asyncio.Event()
+        queued_count = 0
+
+        async def prompt(*_args, **kwargs):
+            """Return submitted commands and expose recalled text as an editor default."""
+            if "initial" in kwargs:
+                assert kwargs["initial"] == "/exit"
+                draft_ready.set()
+                return False if cancel_edit else "/exit edited"
+            return await inputs.get()
+
+        def report(message=""):
+            """Signal after both follow-ups are durably admitted."""
+            nonlocal queued_count
+            if message.startswith("Queued input"):
+                queued_count += 1
+                if queued_count == 2:
+                    queued_twice.set()
+
+        ui.prompt_async.side_effect = prompt
+        ui.info.side_effect = report
+
+        async def conversation(receive):
+            """Receive the initial prompt and both remaining mailbox messages."""
+            received.append(await receive(DummyCompleter()))
+            with controller.control.execution():
+                working.set()
+                await release.wait()
+            received.append(await receive(DummyCompleter()))
+            if not cancel_edit:
+                received.append(await receive(DummyCompleter()))
+
+        task = asyncio.create_task(controller.run_async(conversation))
+        try:
+            inputs.put_nowait("start")
+            await working.wait()
+            inputs.put_nowait("/steer first")
+            inputs.put_nowait("/queue /exit")
+            await queued_twice.wait()
+            inputs.put_nowait(edit_command)
+            await draft_ready.wait()
+            release.set()
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    queued = [event for event in manager.session.events if event.type == "input_queued"]
+    recalled = [event for event in manager.session.events if event.type == "input_recalled"]
+    assert [event.content for event in queued[:3]] == ["start", "first", "/exit"]
+    assert (queued[1].priority, queued[2].priority) == (0, 1)
+    assert len(recalled) == 1
+    assert recalled[0].input_id == queued[2].input_id
+    assert queued[2].input_id not in {event.input_id for event in manager.session.pending_inputs}
+    if cancel_edit:
+        assert len(queued) == 3
+        assert received[1] is False
+    else:
+        assert [event.content for event in queued] == ["start", "first", "/exit", "/exit edited"]
+        assert queued[-1].input_id != recalled[0].input_id
+        assert queued[-1].sequence > queued[-2].sequence
+        assert received[1].message == "first"
+        assert received[2].message == "/exit edited"
+
+
 @pytest.mark.parametrize("method", ["queue", "steer"])
 def test_durable_sync_control_rejects_mailbox_overflow(ui, method):
     """Durable synchronous controls close accepted records when the mailbox is full."""
@@ -1367,6 +1548,8 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
             assert "/respond" not in commands
             assert "/queued" not in commands
             assert "/unavailable" not in commands
+            assert "/edit" in commands
+            assert "/recall" in commands
             assert set(busy_help_names) == {
                 "help",
                 "exit",
@@ -1375,6 +1558,8 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
                 "status",
                 "steer",
                 "queue",
+                "edit",
+                "recall",
                 "choose",
             }
             release.set()
@@ -1946,14 +2131,16 @@ def test_command_capabilities_track_active_run_pending_response_and_settlement(u
     def names():
         return {command.name for command in manager.active_commands}
 
-    assert {"interrupt", "respond", "status", "steer", "queue"}.isdisjoint(names())
+    assert {"interrupt", "respond", "status", "steer", "queue", "edit", "recall"}.isdisjoint(
+        names()
+    )
     controller._loop = Mock()
     idle_names = names()
-    assert {"status", "steer", "queue"} <= idle_names
+    assert {"status", "steer", "queue", "edit", "recall"} <= idle_names
     assert "interrupt" not in idle_names
     with controller.control.execution():
         active_names = names()
-        assert {"interrupt", "status", "steer", "queue"} <= active_names
+        assert {"interrupt", "status", "steer", "queue", "edit", "recall"} <= active_names
         assert "respond" not in active_names
         controller._pending = InteractionCall(
             function=ui.prompt,
@@ -1967,7 +2154,9 @@ def test_command_capabilities_track_active_run_pending_response_and_settlement(u
         assert [item.text for item in completions] == ["Yes"]
     controller._pending = None
     controller._loop = None
-    assert {"interrupt", "respond", "status", "steer", "queue"}.isdisjoint(names())
+    assert {"interrupt", "respond", "status", "steer", "queue", "edit", "recall"}.isdisjoint(
+        names()
+    )
 
 
 def test_command_capabilities_during_shutdown_allow_only_inspection(ui):

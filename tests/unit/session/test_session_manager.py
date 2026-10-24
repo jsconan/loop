@@ -1302,6 +1302,47 @@ def test_manager_priority_write_failure_preserves_previous_projection(monkeypatc
     assert manager.session.serialize() == original
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_manager_recall_closes_pending_input_in_the_durable_projection(asynchronous):
+    """Synchronous and async recalls survive reloading the owning session."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    accepted = manager.queue_input("waiting", priority=1, bypass_commands=True)
+
+    if asynchronous:
+        asyncio.run(manager.recall_input_async(accepted.input_id))
+    else:
+        manager.recall_input(accepted.input_id)
+
+    restored = SessionManager(session=manager.session.id, session_store=store)
+    assert restored.session.pending_inputs == ()
+    assert restored.session.events[-1].type == "input_recalled"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_manager_recall_write_failure_preserves_the_pending_input(monkeypatch, asynchronous):
+    """A failed recall write leaves both the durable snapshot and projection unchanged."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    accepted = manager.queue_input("waiting", priority=1)
+    original = manager.session.serialize()
+
+    def fail_save(_session):
+        """Simulate a durable store refusing the recall transition."""
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "save", fail_save)
+
+    if asynchronous:
+        with pytest.raises(OSError, match="disk full"):
+            asyncio.run(manager.recall_input_async(accepted.input_id))
+    else:
+        with pytest.raises(OSError, match="disk full"):
+            manager.recall_input(accepted.input_id)
+
+    assert manager.session.serialize() == original
+
+
 def test_sqlite_input_acknowledgement_and_consumption_survive_restarts(tmp_path):
     """SQLite reloads accepted input until one atomic canonical message consumes it."""
     path = tmp_path / "sessions.sqlite3"
@@ -1361,6 +1402,37 @@ def test_sqlite_input_acknowledgement_and_consumption_survive_restarts(tmp_path)
     assert [message.content for message in user_messages] == ["review this"]
     assert len(consumed) == 1
     assert consumed[0].item_index == 0
+
+
+def test_sqlite_recalled_input_stays_closed_after_restart(tmp_path):
+    """SQLite does not restore an input whose text was returned to the editor."""
+    path = tmp_path / "sessions.sqlite3"
+    workspace_id = "workspace"
+    store = SQLiteSessionStore(path, workspace_id=workspace_id)
+    manager = SessionManager(session_store=store, workspace_id=workspace_id)
+
+    async def recall_input():
+        """Persist one input and close it through the async session boundary."""
+        accepted = await manager.queue_input_async(
+            "edit this",
+            priority=1,
+            bypass_commands=True,
+        )
+        await manager.recall_input_async(accepted.input_id)
+        return accepted.input_id
+
+    input_id = asyncio.run(recall_input())
+    restored = SessionManager(
+        session=manager.session.id,
+        session_store=SQLiteSessionStore(path, workspace_id=workspace_id),
+        workspace_id=workspace_id,
+    )
+
+    assert restored.session.pending_inputs == ()
+    assert any(
+        event.type == "input_recalled" and event.input_id == input_id
+        for event in restored.session.events
+    )
 
 
 def test_sqlite_uncertain_tool_execution_requires_recovery_after_restart(tmp_path):
