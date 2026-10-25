@@ -5,6 +5,7 @@ import contextvars
 import importlib
 import io
 import json
+import tempfile
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -90,6 +91,7 @@ def result_value(output: str):
 def _permission_manager_mock():
     """Provide a permission mock that allows asynchronous boundary preflight by default."""
     permissions = Mock(spec=PermissionManager)
+    permissions.temporary_directory = Path(tempfile.gettempdir())
     permissions.check_boundaries.return_value = None
     permissions.check_boundaries_async.return_value = None
     return permissions
@@ -3346,6 +3348,7 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path,
     """A file observation cannot change the cwd used by a later process."""
     nested = tmp_path / "src" / "loop"
     nested.mkdir(parents=True)
+    (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
@@ -3383,6 +3386,7 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path,
 def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path, monkeypatch):
     """The workspace shorthand renders and executes as the workspace root."""
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
@@ -3427,6 +3431,7 @@ def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, 
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     nested = tmp_path / "src"
     nested.mkdir()
+    (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
@@ -3507,6 +3512,7 @@ def test_command_accepts_virtual_workspace_cwd(tmp_path, monkeypatch):
     """The command tool resolves a virtual cwd before native authorization."""
     nested = tmp_path / "src"
     nested.mkdir()
+    (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
@@ -3533,6 +3539,7 @@ def test_command_accepts_virtual_workspace_cwd(tmp_path, monkeypatch):
 
 def test_command_output_and_failure_details_hide_host_workspace(tmp_path, monkeypatch):
     """Command streams and diagnostics use virtual paths in model-visible results."""
+    (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
@@ -3567,6 +3574,7 @@ def test_command_output_and_failure_details_hide_host_workspace(tmp_path, monkey
 
 def test_command_sandbox_failure_hides_host_workspace(tmp_path, monkeypatch):
     """Sandbox failure details are virtualized before returning to the model."""
+    (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
@@ -3599,7 +3607,7 @@ def test_command_translates_virtual_roots_and_redacts_aliases(tmp_path, monkeypa
     """Default sandbox access translates roots while output hides local aliases."""
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     scratch = tmp_path.with_name(tmp_path.name + "-scratch")
-    scratch.mkdir()
+    scratch.mkdir(mode=0o700)
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, scratch))
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "approve"
@@ -3621,7 +3629,7 @@ def test_command_translates_virtual_roots_and_redacts_aliases(tmp_path, monkeypa
         assert request.execution_source.startswith(f"cat {request.aliases[0][1]}")
         assert request.aliases[0][0] == "/workspace"
         assert request.aliases[1][0] == "/tmp"
-        assert scratch in request.write_roots
+        assert request.shell_environment()["TMPDIR"] == str(scratch)
         return CommandProcessResult(
             SandboxOutcome.COMPLETED,
             exit_code=0,
@@ -3646,9 +3654,10 @@ def test_command_translates_virtual_roots_and_redacts_aliases(tmp_path, monkeypa
 
 
 def test_command_ignores_virtual_root_substrings(tmp_path, monkeypatch):
-    """A path-like substring cannot require an alias for an unrelated missing root."""
+    """A path-like substring cannot require an alias for an unrelated root."""
+    (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
-        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "missing-scratch")
+        runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
     registry = ToolRegistry(
         [run_command],
@@ -3671,11 +3680,12 @@ def test_command_ignores_virtual_root_substrings(tmp_path, monkeypatch):
     assert result_value(output)["boundary"] == "sandbox"
     request = backend.run.call_args.args[0]
     assert request.execution_source == "echo /tmp-old"
-    assert request.aliases == ()
+    assert tuple(virtual for virtual, _, _ in request.aliases) == ("/tmp",)
 
 
 def test_virtual_command_host_retry_uses_same_live_translation(tmp_path, monkeypatch):
     """One-off host retry executes the bound alias source before alias cleanup."""
+    (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )

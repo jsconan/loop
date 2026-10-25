@@ -132,6 +132,29 @@ def test_manager_uses_injected_services_and_session():
     assert manager.model == "model-a"
 
 
+def test_session_working_directory_rejects_empty_identifiers():
+    """An empty session identity cannot create its store's working storage."""
+    store = MemorySessionStore()
+    manager = SessionManager(session=Session(id=""), session_store=store)
+    with pytest.raises(ValueError, match="must not be empty"):
+        _ = manager.temporary_directory
+    assert not list(store.temporary_root.iterdir())
+
+
+@pytest.mark.parametrize("identifier", [".", "..", "a/b", "a\\b", "a\x00b", "x" * 300, "\ud800"])
+def test_session_working_directory_contains_arbitrary_persisted_identifiers(identifier):
+    """Existing identifiers remain resumable without becoming path or filename authority."""
+    store = MemorySessionStore()
+    manager = SessionManager(session=Session(id=identifier), session_store=store)
+    directory = manager.temporary_directory.get()
+    unrelated = SessionManager(session=Session(id="ordinary"), session_store=store)
+    reopened = SessionManager(session=Session(id=identifier), session_store=store)
+
+    assert directory.parent == store.temporary_root
+    assert directory != unrelated.temporary_directory.get()
+    assert directory == reopened.temporary_directory.get()
+
+
 def test_manager_seeds_references_from_a_supplied_in_memory_session():
     """Managers persist transient reference bytes supplied by an active session."""
     content = b"snapshot"
@@ -3401,3 +3424,195 @@ def test_manager_records_persistence_failure_without_changing_atomicity():
         "session.persistence.failed",
     ]
     assert manager.messages == [Message(role="assistant", content="complete")]
+
+
+def test_session_working_directory_follows_selection_and_saved_resumes(tmp_path):
+    """Saved conversations recover their original files through one stable path reference."""
+    database = tmp_path / "workspaces" / "owner" / "sessions.db"
+    store = SQLiteSessionStore(database, workspace_id="owner")
+    manager = SessionManager(session_store=store, workspace_id="owner")
+    reference = manager.temporary_directory
+    first = reference.get()
+    (first / "draft.txt").write_text("draft")
+    manager.add_user_message("prepare")
+    first_id = manager.session.id
+
+    manager.new_session()
+    assert manager.temporary_directory is reference
+    assert reference.get() != first
+    assert not (reference.get() / "draft.txt").exists()
+    manager.load_session(first_id)
+    assert reference.get() == first
+    assert (first / "draft.txt").read_text() == "draft"
+
+    reopened = SessionManager(
+        session=first_id,
+        session_store=SQLiteSessionStore(database, workspace_id="owner"),
+        workspace_id="owner",
+    )
+    assert reopened.temporary_directory.get() == first
+    assert (reopened.temporary_directory.get() / "draft.txt").read_text() == "draft"
+
+
+def test_memory_session_working_files_follow_store_lifetime():
+    """Managers sharing one memory store reopen files without sharing other stores' roots."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    directory = manager.temporary_directory.get()
+    (directory / "draft").write_text("retained")
+    manager.add_user_message("save")
+    reopened = SessionManager(session=manager.session.id, session_store=store)
+    unrelated = SessionManager(session=Session(id=manager.session.id))
+
+    assert reopened.temporary_directory.get() == directory
+    assert (directory / "draft").read_text() == "retained"
+    assert unrelated.temporary_directory.get() != directory
+
+
+def test_failed_working_directory_selection_keeps_the_active_session(tmp_path):
+    """Unsafe saved storage cannot replace the current session or its working-directory binding."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="owner")
+    manager = SessionManager(session_store=store)
+    original_session = manager.session
+    original_directory = manager.temporary_directory.get()
+    saved = Session(workspace_id="owner")
+    store.save(saved)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    saved_directory = SessionManager(session=saved, session_store=store).temporary_directory.get()
+    saved_directory.rmdir()
+    saved_directory.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="private real directory"):
+        manager.load_session(saved.id)
+
+    assert manager.session is original_session
+    assert manager.temporary_directory.get() == original_directory
+
+
+@pytest.mark.parametrize("operation", ["new", "load", "load_id"])
+def test_session_selection_cannot_retarget_an_active_execution(operation):
+    """Running sessions keep their history and working-directory binding until all leases end."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    original = manager.session
+    reference = manager.temporary_directory
+    directory = reference.get()
+    replacement = Session()
+    store.save(replacement)
+
+    with manager.execution(), manager.execution():
+        with pytest.raises(SessionExecutionConflictError, match="already executing"):
+            if operation == "new":
+                manager.new_session()
+            else:
+                manager.load_session(replacement.id if operation == "load_id" else replacement)
+        assert manager.session is original
+        assert reference.get() == directory
+    manager.load_session(replacement.id)
+    assert manager.session.id == replacement.id
+    assert reference.get() != directory
+
+
+def test_session_selection_is_rejected_from_another_thread_during_execution():
+    """A concurrent session switch cannot redirect an execution owner's services."""
+    manager = SessionManager()
+    reference = manager.temporary_directory
+    original = reference.get()
+    with manager.execution(), ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(manager.new_session)
+        with pytest.raises(SessionExecutionConflictError):
+            future.result(timeout=5)
+    assert reference.get() == original
+
+
+def test_concurrent_temporary_directory_readers_share_one_following_reference():
+    """Concurrent first access publishes one reference that follows all future session switches."""
+    manager = SessionManager()
+    barrier = Barrier(8)
+
+    def access():
+        """Request the shared path reference at the same admission boundary."""
+        barrier.wait(timeout=5)
+        return manager.temporary_directory
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(access) for _ in range(8)]
+        references = [future.result(timeout=5) for future in futures]
+    original = references[0].get()
+    manager.new_session()
+    assert all(reference is references[0] for reference in references)
+    assert all(reference.get() != original for reference in references)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_sync_save_cannot_publish_or_rollback_over_a_replacement_session(fails):
+    """A concurrent selection keeps its history and working directory after an old save settles."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    reference = manager.temporary_directory
+    original_directory = reference.get()
+    replacement = Session(name="Replacement", name_source="user")
+    original_save = store.save
+
+    def save(session):
+        """Switch sessions while the prior session's synchronous write is in progress."""
+        manager.load_session(replacement)
+        if fails:
+            raise OSError("save failed")
+        return original_save(session)
+
+    store.save = save
+    with pytest.raises(OSError if fails else RuntimeError):
+        manager.add_message(Message(role="assistant", content="old session only"))
+    assert manager.session is replacement
+    assert manager.messages == []
+    assert reference.get() != original_directory
+
+
+def test_idle_conversation_selection_is_scoped_and_blocked_by_nested_work():
+    """Idle input may switch sessions, while nested execution cannot permit that switch."""
+    manager = SessionManager()
+    reference = manager.temporary_directory
+    original = reference.get()
+    with manager.execution(allow_session_selection=True):
+        manager.new_session()
+        selected = manager.session
+        assert reference.get() != original
+        with (
+            manager.execution(),
+            manager.execution(allow_session_selection=True),
+            pytest.raises(SessionExecutionConflictError),
+        ):
+            manager.new_session()
+        assert manager.session is selected
+        manager.new_session()
+    assert manager.session is not selected
+
+
+def test_idle_conversation_selection_does_not_authorize_unrelated_threads():
+    """Only an idle input's propagated context may switch its session while a lease is held."""
+    manager = SessionManager()
+    original = manager.session
+    with (
+        manager.execution(allow_session_selection=True),
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        pending = executor.submit(manager.new_session)
+        with pytest.raises(SessionExecutionConflictError):
+            pending.result(timeout=5)
+    assert manager.session is original
+
+
+def test_idle_conversation_selection_reaches_its_async_command_worker():
+    """Context propagation permits synchronous lifecycle commands from an async conversation."""
+    manager = SessionManager()
+    original = manager.session
+
+    async def select():
+        """Run one synchronous selection in a worker belonging to the idle input context."""
+        with manager.execution(allow_session_selection=True):
+            await asyncio.to_thread(manager.new_session)
+
+    asyncio.run(select())
+    assert manager.session is not original

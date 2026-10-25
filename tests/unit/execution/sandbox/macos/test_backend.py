@@ -1932,3 +1932,34 @@ def test_backend_classifies_child_capture_failures(monkeypatch, tmp_path, proces
         assert result.possible_effects
     if isinstance(process.wait_error, subprocess.TimeoutExpired):
         assert result.stdout == "ok"
+
+
+def test_backend_binds_durable_scratch_without_exposing_private_neighbors(monkeypatch, tmp_path):
+    """A session root under Library retains private-name guards and exact directory authority."""
+    scratch = tmp_path / "Library" / "app" / "scratch" / "session"
+    scratch.mkdir(parents=True, mode=0o700)
+    aliases = tmp_path / "aliases"
+    aliases.mkdir(mode=0o700)
+    alias = aliases / "temporary"
+    alias.symlink_to(scratch, target_is_directory=True)
+    probe = MagicMock(returncode=0, stderr="")
+    popen = MagicMock(return_value=Process())
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.subprocess.run", MagicMock(return_value=probe)
+    )
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
+    value = request(
+        tmp_path,
+        environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+        aliases=(("/tmp", alias, scratch),),
+    )
+
+    result = MacOSSeatbeltBackend().run(value)
+
+    assert result.outcome is SandboxOutcome.COMPLETED
+    assert popen.call_args.kwargs["env"]["TMPDIR"] == str(scratch)
+    profile = popen.call_args.args[0][2]
+    assert f"(require-not (subpath {json.dumps(str(scratch))}))" in profile
+    assert re.escape(str(scratch)) + "/(.*/)?" in regex_patterns(profile)
+    assert scratch.is_dir()

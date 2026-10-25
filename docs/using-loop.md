@@ -81,6 +81,8 @@ Common session commands:
 
 Markdown exports include conversation messages, tool calls and results, reasoning summaries, and timeline markers. JSON tool results are pretty-printed in JSON code blocks; other results are preserved as text. Exports omit provider-private reasoning state and captured file contents. Archive exports preserve the serialized session and include verified referenced file snapshots. Treat both formats as sensitive because they may contain conversation text and tool data; archives may also contain captured context and provider state.
 
+Each session has private working storage shared by the agent's `$TMPDIR` and `/tmp` file paths. Saved sessions retain these files across application restarts on the same machine; storage is isolated by database, workspace, and session identity. Selecting a different conversation is allowed while idle and rejected during model or tool execution. Working storage is kept separately from conversation history and is not included in Markdown or archive exports. It has no automatic expiry; copy important deliverables into the workspace. Storage from another namespace is not adopted automatically.
+
 Archive exports are records for inspection or external processing. Loop does not currently import an archive back into its session store.
 
 Examples:

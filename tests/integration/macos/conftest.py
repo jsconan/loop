@@ -91,7 +91,7 @@ def public_command(backend, native_workspace):
         "deny" if "without the OS sandbox" in message else "approve"
     )
     scratch = native_workspace.parent / "instruction-scratch"
-    scratch.mkdir()
+    scratch.mkdir(mode=0o700)
     skill_root = native_workspace.parent / "fixture-skill"
     skill_root.mkdir()
     skill_file = skill_root / "SKILL.md"

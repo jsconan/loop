@@ -852,3 +852,26 @@ def test_result_wire_encoding_refuses_changed_restoration(monkeypatch):
     monkeypatch.setattr(CommandProcessResult, "from_wire", lambda *args: None)
     with pytest.raises(ValueError, match="differs after encoding"):
         result.to_wire("1248c892-42dc-4b68-a3fb-30d2a70a93a7")
+
+
+def test_request_binds_durable_session_scratch_through_its_virtual_alias(tmp_path):
+    """Durable scratch outside the system temp root requires an exact private /tmp binding."""
+    scratch = tmp_path / "Library" / "app" / "scratch" / "session"
+    scratch.mkdir(parents=True, mode=0o700)
+    aliases = tmp_path / "aliases"
+    aliases.mkdir(mode=0o700)
+    alias = aliases / "temporary"
+    alias.symlink_to(scratch, target_is_directory=True)
+    environment = {"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)}
+
+    with pytest.raises(ValueError, match="private real directory"):
+        request(tmp_path, environment=environment)
+    approved = request(tmp_path, environment=environment, aliases=(("/tmp", alias, scratch),))
+    assert approved.session_scratch is True
+    restored = SandboxRequest.from_wire(approved.to_wire())
+    assert restored.session_scratch is True
+    assert restored.shell_environment()["TMPDIR"] == str(scratch)
+
+    scratch.rename(scratch.with_name("previous-session"))
+    scratch.mkdir(mode=0o700)
+    assert not approved.paths_are_current()

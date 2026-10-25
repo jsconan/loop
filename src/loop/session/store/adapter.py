@@ -1,5 +1,6 @@
 """Define the session persistence adapter contract."""
 
+from pathlib import Path
 from typing import Protocol
 
 from ..models import SessionInfo
@@ -8,6 +9,14 @@ from ..session import Session
 
 class SessionStore(Protocol):
     """Persist and retrieve sessions by their identifier."""
+
+    @property
+    def temporary_root(self) -> Path:
+        """Return the store-owned root for isolated session working directories.
+
+        Returns:
+            Path: Canonical root whose lifetime matches this store's persistence.
+        """
 
     def save(self, session: Session) -> str:
         """Persist a session under its stable identifier.

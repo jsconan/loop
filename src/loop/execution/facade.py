@@ -31,7 +31,6 @@ from .sandbox import (
     select_sandbox_backend,
 )
 from .sandbox.constants import (
-    COMMAND_SANDBOX_SCRATCH_PREFIX,
     INITIAL_USER_NAMESPACE_UID_MAP,
     INITIAL_USER_NAMESPACE_UID_MAP_PATH,
     LANG_ENVIRONMENT_VARIABLE,
@@ -94,12 +93,10 @@ def _stream_output(
     chunks: list[str],
     discarded: int | None,
     source: str,
-    redact: Callable[[str], str] | None = None,
+    redact: Callable[[str], str],
 ) -> dict:
     """Return a recoverable preview and explicit capture-loss status for one stream."""
-    content = "".join(chunks)
-    if redact is not None:
-        content = redact(content)
+    content = redact("".join(chunks))
     encoded = content.encode("utf-8")
     preview = encoded[: constants.MAX_TOOL_CONTENT_BYTES // 2].decode("utf-8", errors="ignore")
     included = len(preview.encode("utf-8"))
@@ -476,7 +473,7 @@ class CommandExecutionService:
         self,
         context: ToolContext,
         request: SandboxRequest,
-        redact: Callable[[str], str] | None,
+        redact: Callable[[str], str],
         *,
         prelaunch_failure: CommandProcessResult | None = None,
     ) -> dict | Problem:
@@ -523,8 +520,8 @@ class CommandExecutionService:
         if boundary == "sandbox":
             output["scratch"] = {
                 "path": "$TMPDIR",
-                "lifetime": "this command",
-                "retrieval": "print content through bounded stdout or stderr before exit",
+                "lifetime": "this session",
+                "retrieval": "use file tools at /tmp or subsequent commands through $TMPDIR",
             }
             if result.outcome is SandboxOutcome.COMPLETED and result.exit_code != 0:
                 output["executable_hint"] = (
@@ -535,9 +532,7 @@ class CommandExecutionService:
                     "tools, look up each one and pass their references as a list."
                 )
         if attempt.result.observed_denial:
-            observed = (
-                redact(attempt.result.observed_denial) if redact else attempt.result.observed_denial
-            )
+            observed = redact(attempt.result.observed_denial)
             if boundary == "sandbox":
                 output["sandbox_diagnostic"] = observed
             else:
@@ -550,15 +545,15 @@ class CommandExecutionService:
                 output["host_offer"] = (
                     "The OS denied an operation during this attempt; it may be unrelated to "
                     f"exit code {result.exit_code}. Command: "
-                    f"{json.dumps(redact(request.source) if redact else request.source)}\n"
+                    f"{json.dumps(redact(request.source))}\n"
                     "A separate, fresh host retry was offered to the user. "
                     "The sandboxed attempt may already have had effects; a retry may repeat them."
                 )
             else:
-                failure = redact(result.detail) if redact else result.detail
+                failure = redact(result.detail)
                 output["host_offer"] = (
                     f"Sandbox failure: {failure}\nCommand: "
-                    f"{json.dumps(redact(request.source) if redact else request.source)}\n"
+                    f"{json.dumps(redact(request.source))}\n"
                     "A separate host-specific retry was offered to the user."
                     + (
                         " The sandboxed attempt may already have had effects;"
@@ -584,9 +579,7 @@ class CommandExecutionService:
             title="Sandbox command did not complete"
             if boundary == "sandbox"
             else "Host command did not complete",
-            detail=redact(result.detail or result.outcome.value)
-            if redact
-            else (result.detail or result.outcome.value),
+            detail=redact(result.detail or result.outcome.value),
             operation=context.tool_name,
             metadata=output,
         )
@@ -675,7 +668,12 @@ class CommandExecutionService:
                 else ((), (), False)
             )
             paths = (
-                context.instructions_manager.virtual_paths if context.instructions_manager else None
+                context.instructions_manager.virtual_paths
+                if context.instructions_manager is not None
+                else VirtualPath(
+                    workspace=workspace,
+                    temporary_directory=context.permission_manager.temporary_directory,
+                )
             )
             path_value = os.environ.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH)
             if isinstance(executable_grant, str):
@@ -750,8 +748,7 @@ class CommandExecutionService:
             manual_reads = tuple(
                 Path(
                     paths.resolve(root)
-                    if paths is not None
-                    and any(
+                    if any(
                         root == virtual or root.startswith(f"{virtual}/")
                         for virtual, _ in paths.command_roots()
                     )
@@ -784,40 +781,34 @@ class CommandExecutionService:
                 tuple(self._executable_grants[reference].name for reference in references),
                 bool(grant_reads) and set(grant_reads) <= set(automatic_reads),
             )
+            scratch = dict(paths.command_roots()).get(
+                VirtualPath.TEMPORARY, context.permission_manager.temporary_directory
+            )
             aliases: list[tuple[str, Path, Path]] = []
             translated = command
-            if paths is not None:
-                candidates = tuple(
-                    (virtual, root) for virtual, root in paths.command_roots() if virtual in command
-                )
-                if candidates:
-                    directory = Path(
-                        alias_stack.enter_context(tempfile.TemporaryDirectory(prefix="loop-vpath-"))
-                    ).resolve(strict=True)
-                    mapping = {}
-                    for index, (virtual, root) in enumerate(candidates):
-                        alias = directory / f"r{index}"
-                        mapping[virtual] = alias
-                    translated = VirtualPath.translate_shell_source(command, mapping)
-                    for virtual, root in candidates:
-                        alias = mapping[virtual]
-                        if alias.as_posix() in translated:
-                            canonical = root.resolve(strict=True)
-                            alias.symlink_to(canonical, target_is_directory=True)
-                            aliases.append((virtual, alias, canonical))
-            alias_tuple = tuple(aliases)
-            temporary_writes = tuple(
-                target for virtual, _, target in alias_tuple if virtual == VirtualPath.TEMPORARY
+            candidates = tuple(
+                (virtual, root)
+                for virtual, root in {
+                    **dict(paths.command_roots()),
+                    VirtualPath.TEMPORARY: scratch,
+                }.items()
+                if virtual in command or virtual == VirtualPath.TEMPORARY
             )
-            scratch = Path(
-                alias_stack.enter_context(
-                    tempfile.TemporaryDirectory(
-                        prefix=self._backend.scratch_prefix
-                        if isinstance(getattr(self._backend, "scratch_prefix", None), str)
-                        else COMMAND_SANDBOX_SCRATCH_PREFIX
-                    )
-                )
+            directory = Path(
+                alias_stack.enter_context(tempfile.TemporaryDirectory(prefix="loop-vpath-"))
             ).resolve(strict=True)
+            mapping = {}
+            for index, (virtual, root) in enumerate(candidates):
+                alias = directory / f"r{index}"
+                mapping[virtual] = alias
+            translated = VirtualPath.translate_shell_source(command, mapping)
+            for virtual, root in candidates:
+                alias = mapping[virtual]
+                if alias.as_posix() in translated or virtual == VirtualPath.TEMPORARY:
+                    canonical = root.resolve(strict=True)
+                    alias.symlink_to(canonical, target_is_directory=True)
+                    aliases.append((virtual, alias, canonical))
+            alias_tuple = tuple(aliases)
             environment = {
                 PATH_ENVIRONMENT_VARIABLE: path_value,
                 LANG_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
@@ -847,10 +838,9 @@ class CommandExecutionService:
                     alias_tuple, key=lambda item: len(str(item[1])), reverse=True
                 ):
                     value = value.replace(str(alias), virtual)
-                if alias_tuple:
-                    value = value.replace(str(alias_tuple[0][1].parent), "<command-path>")
-                if paths is not None:
-                    value = paths.redact(value)
+                value = value.replace(str(alias_tuple[0][1].parent), "<command-path>")
+                value = paths.redact(value)
+                value = value.replace(str(scratch), VirtualPath.TEMPORARY)
                 for root in sorted(redaction_roots, key=lambda item: len(str(item)), reverse=True):
                     if root.is_relative_to(workspace) or any(
                         root.is_relative_to(system) for system in system_roots
@@ -872,9 +862,7 @@ class CommandExecutionService:
                 cwd=command_cwd,
                 workspace=workspace,
                 read_roots=(*extra_reads, *git_reads),
-                write_roots=(
-                    temporary_writes if read_only else (workspace, *git_roots, *temporary_writes)
-                ),
+                write_roots=() if read_only else (workspace, *git_roots),
                 network=network,
                 environment=environment,
                 policy_version=self._backend.policy_version
@@ -908,7 +896,7 @@ class CommandExecutionService:
             return self._run_command_attempt(
                 context,
                 request,
-                redact if paths is not None else None,
+                redact,
                 prelaunch_failure=prelaunch_failure,
             )
         finally:

@@ -331,7 +331,11 @@ class InstructionsManager:
             temporary_directory = None
         else:
             workspace = environment.working_directory
-            temporary_directory = environment.temporary_directory
+            temporary_directory = (
+                Path(environment.temporary_directory)
+                if environment.temporary_directory is not None
+                else None
+            )
         return VirtualPath(
             workspace=workspace,
             temporary_directory=temporary_directory,

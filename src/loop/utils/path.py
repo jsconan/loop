@@ -1,5 +1,7 @@
-"""Provide repository-aware path discovery and traversal utilities."""
+"""Provide private directory preparation and repository-aware path utilities."""
 
+import os
+import stat
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
@@ -7,6 +9,52 @@ from pathspec import GitIgnoreSpec
 
 from .. import constants
 from .models import IgnoreRule, IgnoreRules
+
+
+def ensure_private_directory(path: Path) -> None:
+    """Create or validate a private directory without following symbolic path components.
+
+    Create missing parents with mode ``0700`` using no-follow, directory-relative operations.
+    Require the selected directory to have mode ``0700`` and belong to the current user.
+    Refuse unsafe existing directories without changing them, and verify the final path still
+    names the opened directory.
+
+    Args:
+        path (Path): Absolute canonical directory path to create or validate.
+
+    Raises:
+        ValueError: The path is relative, aliased, not a directory, not private, or owned by
+            another user.
+        OSError: Directory creation or inspection fails.
+    """
+    if not path.is_absolute() or path.resolve() != path:
+        raise ValueError("Path must be a private real directory.")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for component in path.parts[1:]:
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=constants.PRIVATE_DIRECTORY_MODE, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        bound = os.fstat(descriptor)
+        details = path.lstat()
+        if (
+            path.resolve(strict=True) != path
+            or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.getuid()
+            or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
+            or (details.st_dev, details.st_ino) != (bound.st_dev, bound.st_ino)
+        ):
+            raise ValueError("Path must be a private real directory.")
+    finally:
+        os.close(descriptor)
 
 
 def canonical_path(path: Path | str) -> str:

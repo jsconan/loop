@@ -995,3 +995,14 @@ def test_store_rejects_loaded_sessions_from_another_workspace(tmp_path):
 
     with pytest.raises(SessionWorkspaceMismatchError, match="belongs to workspace"):
         store.load(session_id)
+
+
+def test_working_storage_is_isolated_by_database_and_workspace(tmp_path):
+    """Equal session IDs cannot share files through adjacent databases or different workspaces."""
+    first = SQLiteSessionStore(tmp_path / "first.db", workspace_id="first")
+    adjacent = SQLiteSessionStore(tmp_path / "second.db", workspace_id="first")
+    other_workspace = SQLiteSessionStore(tmp_path / "first.db", workspace_id="second")
+    reopened = SQLiteSessionStore(tmp_path / "first.db", workspace_id="first")
+
+    assert first.temporary_root == reopened.temporary_root
+    assert len({first.temporary_root, adjacent.temporary_root, other_workspace.temporary_root}) == 3

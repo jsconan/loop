@@ -2547,16 +2547,15 @@ def test_runner_async_query_closes_backend_stream_when_cancelled(tmp_path):
 
     async def query():
         """Cancel a query at a deterministic point in its event stream."""
-        with sessions.execution():
-            task = asyncio.create_task(runner.query_async())
-            try:
-                await waiting.wait()
-                task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await task
-            finally:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+        task = asyncio.create_task(runner.query_async())
+        try:
+            await waiting.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(query())
 
@@ -3443,3 +3442,46 @@ def test_interrupting_approved_recovery_never_retries_an_uncertain_effect(tmp_pa
     assert len(results) == 1
     assert "outcome is unknown" in results[0].output
     assert sessions.recovery_state is None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_direct_model_queries_prevent_session_selection(tmp_path, asynchronous):
+    """Direct model requests retain their session binding even inside idle input ownership."""
+    backend = Mock()
+    runner = file_runner(tmp_path, backend)
+    runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    sessions = runner.session_manager
+    original = sessions.session
+    directory = sessions.temporary_directory.get()
+
+    def check_selection():
+        """Attempt a session change while the backend owns a model request."""
+        with pytest.raises(SessionExecutionConflictError):
+            sessions.new_session()
+        assert sessions.session is original
+        assert sessions.temporary_directory.get() == directory
+
+    def response(**_kwargs):
+        """Return a complete synchronous response after checking model ownership."""
+        check_selection()
+        return [ResponseCompleted(answer="complete")]
+
+    async def events():
+        """Return a complete asynchronous response after checking model ownership."""
+        check_selection()
+        yield ResponseCompleted(answer="complete")
+
+    backend.get_response.side_effect = response
+    backend.get_response_async.return_value = events()
+
+    async def query():
+        """Exercise nested model ownership from the asynchronous idle input context."""
+        with sessions.execution(allow_session_selection=True):
+            return await runner.query_async()
+
+    if asynchronous:
+        result = asyncio.run(query())
+    else:
+        with sessions.execution(allow_session_selection=True):
+            result = runner.query()
+    assert result.answer == "complete"

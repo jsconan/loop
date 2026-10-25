@@ -155,10 +155,12 @@ def payload_policy(
         prefix = "*/{,**/}" if git_granted and name == GIT_DIRECTORY.as_posix() else "{,**/}"
         pattern = workspace + "/" + prefix + _literal(name)
         lines.extend((f'  deny "{pattern}" wkl,', f'  deny "{pattern}/{{,**}}" wkl,'))
-    # Existing private scratch entries are masked; new command-owned fixtures remain usable.
+    # Reused session scratch also needs filename guards for future private entries.
     private_roots = tuple(
         dict.fromkeys(
-            root for root in (*runtime_roots, *reads, *writes) if root != NATIVE_SCRATCH_PATH
+            root
+            for root in (*runtime_roots, *reads, *writes)
+            if root != NATIVE_SCRATCH_PATH or request.session_scratch
         )
     )
     for name in PRIVATE_READ_COMPONENTS:

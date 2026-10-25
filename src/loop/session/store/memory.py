@@ -1,5 +1,7 @@
 """Persist session snapshots in memory."""
 
+import tempfile
+from pathlib import Path
 from threading import Lock
 
 from ...models import Message
@@ -16,8 +18,10 @@ from ..session import Session
 
 
 class MemorySessionStore:
-    """Store session snapshots in an instance-local list."""
+    """Keep snapshots in memory and remove private working storage when this store is released."""
 
+    _temporary: tempfile.TemporaryDirectory[str] | None
+    _temporary_path: Path
     _sessions: list[StoredSession]
     _lock: Lock
     _references: dict[str, bytes]
@@ -25,11 +29,27 @@ class MemorySessionStore:
     _session_references: dict[str, set[str]]
 
     def __init__(self) -> None:
+        self._temporary = None
+        self._temporary = tempfile.TemporaryDirectory(prefix="loop-sessions-")
+        self._temporary_path = Path(self._temporary.name).resolve()
         self._sessions = []
         self._lock = Lock()
         self._references = {}
         self._reference_handles = {}
         self._session_references = {}
+
+    def __del__(self) -> None:
+        if self._temporary is not None:
+            self._temporary.cleanup()
+
+    @property
+    def temporary_root(self) -> Path:
+        """Return private working storage retained for this in-memory store's lifetime.
+
+        Returns:
+            Path: Canonical temporary root shared by managers using this store.
+        """
+        return self._temporary_path
 
     def load_reference(self, digest: str) -> bytes | None:
         """Load immutable referenced content when available.

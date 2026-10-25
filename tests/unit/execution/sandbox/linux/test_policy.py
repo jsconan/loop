@@ -7,6 +7,7 @@ import pytest
 
 from loop.execution.sandbox.contracts import SandboxRequest
 from loop.execution.sandbox.linux import policy as linux_policy
+from loop.execution.sandbox.linux.constants import NATIVE_SCRATCH_PATH
 from loop.execution.sandbox.linux.policy import _literal, payload_policy, payload_profile
 
 
@@ -445,3 +446,14 @@ def test_runtime_policy_sources_bind_only_fixed_trusted_setup(directory, generat
         assert b"change_profile -> &payload_*," in policies[""]["bootstrap"]
         assert b'profile loopgen_test "/safe/helper" flags=(attach_disconnected) {' in attachment
         assert b"change_profile -> &:test:bootstrap," in attachment
+
+
+def test_session_scratch_policy_guards_future_private_names(bound, tmp_path):
+    """Session scratch retains private-name denials even before those entries exist."""
+    create, _, scratch = bound
+    alias = tmp_path / "alias"
+    alias.symlink_to(scratch, target_is_directory=True)
+    value = create(aliases=(("/tmp", alias, scratch),))
+    policy = render(value, scratch)
+
+    assert _literal(str(NATIVE_SCRATCH_PATH)) + "/{,**/}" in policy

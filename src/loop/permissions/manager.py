@@ -33,6 +33,7 @@ from ..errors import Problem, log_problem
 from ..interaction import Interaction, require_async_interaction
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import (
+    PathReference,
     ShutdownRequested,
     VirtualPath,
     canonical_path,
@@ -150,7 +151,7 @@ class PermissionManager:
     _load_policy: PermissionLoadPolicy
     _session_overrides: SessionPolicyOverrides
     _temporary_directory: tempfile.TemporaryDirectory[str]
-    _temporary_path: Path
+    _temporary_path: Path | PathReference
     _presets: dict[str, PermissionPreset]
     _audit_store: SQLitePermissionAudit | None
     _workspace_id: str | None
@@ -186,7 +187,8 @@ class PermissionManager:
         self._workspace_root = (
             Path(workspace_root).resolve() if workspace_root is not None else None
         )
-        self._temporary_directory = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
+        # pylint: disable-next=consider-using-with
+        self._temporary_directory = tempfile.TemporaryDirectory(
             prefix=constants.TEMPORARY_DIRECTORY_PREFIX
         )
         self._temporary_path = Path(self._temporary_directory.name).resolve()
@@ -312,12 +314,20 @@ class PermissionManager:
 
     @property
     def temporary_directory(self) -> Path:
-        """Return the manager-owned scratch directory allowed by ``loop-temp``.
+        """Return the active scratch directory allowed by ``loop-temp``.
 
         Returns:
-            Path: Existing private temporary directory removed with this manager.
+            Path: Bound session directory, or manager-owned storage before session binding.
         """
-        return self._temporary_path
+        return Path(self._temporary_path)
+
+    def bind_temporary_directory(self, directory: PathReference) -> None:
+        """Follow the session owner's working-directory reference without owning its cleanup.
+
+        Args:
+            directory (PathReference): Private storage reference following session selection.
+        """
+        self._temporary_path = directory
 
     @property
     def interaction(self) -> Interaction | None:
@@ -3056,7 +3066,7 @@ class PermissionManager:
         if configured == "workspace":
             return self._workspace_root.resolve() if self._workspace_root else None
         if configured == "loop-temp":
-            return self._temporary_path
+            return self.temporary_directory
         if configured == "system-temp":
             return Path(tempfile.gettempdir()).resolve()
         path = Path(configured)
@@ -3192,7 +3202,7 @@ class PermissionManager:
         if isinstance(operation.target, ProcessTarget):
             virtual_paths = VirtualPath(
                 workspace=self._workspace_root,
-                temporary_directory=self._temporary_path,
+                temporary_directory=self.temporary_directory,
             )
 
             def display_path(path: str) -> str:

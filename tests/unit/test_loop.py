@@ -3078,7 +3078,7 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
         session_manager=session_manager,
     )
 
-    assert not (tmp_path / ".loop").exists()
+    assert not store.path.exists()
 
     loop.run()
 
@@ -3122,6 +3122,7 @@ def test_loop_does_not_mark_a_message_accepted_before_sync_persistence(tmp_path)
     interaction.prompt.return_value = "hello"
     store = Mock(spec=MemorySessionStore)
     store.save.side_effect = OSError("store unavailable")
+    store.temporary_root = tmp_path / "scratch"
     sessions = SessionManager(interaction=interaction, session_store=store)
     adapter = MemoryTelemetryAdapter()
     telemetry = Telemetry(adapter, flush_seconds=0.01)
@@ -3214,6 +3215,7 @@ def test_loop_delegates_a_session_identifier_to_an_injected_manager(tmp_path):
     """A persisted identifier is resolved through the injected session manager."""
     stored = Session(messages=[Message(role="user", content="saved")])
     manager = Mock(spec=SessionManager)
+    manager.temporary_directory = PathHolder(tmp_path)
     manager.session = stored
     manager.interaction = MagicMock(spec=Interaction)
     manager.model = None
@@ -3749,6 +3751,8 @@ def test_handle_tool_calls_delegates_session_updates(tmp_path):
     registry.call_with_timing.return_value = ("tool result", 0.25)
     backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted()]))
     session_manager = Mock(spec=SessionManager)
+    session_manager.execution.side_effect = nullcontext
+    session_manager.temporary_directory = PathHolder(tmp_path)
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
     session_manager.model = None
@@ -3806,6 +3810,8 @@ def test_query_delegates_instruction_state_to_the_session_manager(tmp_path):
     """Queries delegate their prepared instruction state to the session manager."""
     backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted()]))
     session_manager = Mock(spec=SessionManager)
+    session_manager.execution.side_effect = nullcontext
+    session_manager.temporary_directory = PathHolder(tmp_path)
     session_manager.interaction = MagicMock(spec=Interaction)
     session_manager.session = Session()
     session_manager.model = None
@@ -4107,3 +4113,28 @@ def test_mailbox_steers_or_interrupts_active_generation_without_losing_queued_me
     assert all(
         "private" not in repr(record) for record in adapter.records if record.signal == "activity"
     )
+
+
+def test_loop_binds_file_paths_and_permissions_to_the_selected_session(tmp_path):
+    """New and resumed conversations switch the shared temporary root without deleting files."""
+    sessions = SessionManager()
+    loop = Loop.create_default(
+        backend=loop_backend(), working_directory=tmp_path, session_manager=sessions
+    )
+    first = loop.permission_manager.temporary_directory
+    (first / "report").write_text("draft")
+    sessions.add_user_message("save")
+    identifier = sessions.session.id
+    assert loop.instructions_manager.virtual_paths.resolve("/tmp/report") == str(first / "report")
+
+    loop.command_manager.call("sessions", "new")
+    second = loop.permission_manager.temporary_directory
+    assert second != first
+    assert loop.instructions_manager.virtual_paths.resolve("/tmp/report") == str(second / "report")
+    assert (first / "report").read_text() == "draft"
+
+    loop.command_manager.call("sessions", f"resume {identifier}")
+    assert loop.permission_manager.temporary_directory == first
+    assert loop.instructions_manager.virtual_paths.resolve("/tmp/report") == str(first / "report")
+    loop.permission_manager.close()
+    assert (first / "report").read_text() == "draft"

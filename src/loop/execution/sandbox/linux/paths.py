@@ -302,7 +302,10 @@ def _scan(
     original = root.lstat()
     if not stat.S_ISDIR(original.st_mode) or root.resolve(strict=True) != root:
         raise ValueError("Linux path root is not a real directory.")
-    if is_protected_external_read(root):
+    if is_protected_external_read(root) and not (
+        request.session_scratch
+        and str(root) == request.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE)
+    ):
         raise ValueError("Linux path root includes private data.")
     protection = request.protected_paths
     git_granted = request.git_create or request.workspace / GIT_DIRECTORY in request.write_roots

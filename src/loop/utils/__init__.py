@@ -46,6 +46,7 @@ __all__ = [
     "data_url",
     "decode_content_cursor",
     "encode_content_cursor",
+    "ensure_private_directory",
     "filter_paths_by_globs",
     "find_project_root",
     "format_content_diff",
@@ -141,6 +142,7 @@ from .models import (
 from .normalization import normalized_key, safe_scalar
 from .path import (
     canonical_path,
+    ensure_private_directory,
     filter_paths_by_globs,
     find_project_root,
     is_path_ignored,

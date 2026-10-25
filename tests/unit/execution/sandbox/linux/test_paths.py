@@ -1560,3 +1560,24 @@ def test_mount_arguments_requires_skipped_path_roots_to_be_bound(bound, tmp_path
         mount_arguments(request, scratch, skip_path_roots=(tmp_path / "outside",)),
     ):
         pytest.fail("an unbound PATH root was omitted")
+
+
+def test_session_scratch_under_private_ancestry_keeps_masks_and_hardlink_guards(bound, tmp_path):
+    """Only the exact scratch grant bypasses ancestor rejection and its contents remain guarded."""
+    create, _, _ = bound
+    scratch = tmp_path / "Library" / "storage" / "session"
+    scratch.mkdir(parents=True, mode=0o700)
+    alias = tmp_path / "scratch-alias"
+    alias.symlink_to(scratch, target_is_directory=True)
+    private = scratch / ".ssh"
+    private.mkdir()
+    (private / "key").write_text("secret")
+    value = create(
+        environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+        aliases=(("/tmp", alias, scratch),),
+    )
+    _, masked, _, _ = prepare_paths(value, scratch)
+    assert private in masked
+    (scratch / "public-alias").hardlink_to(private / "key")
+    with pytest.raises(ValueError, match="aliases protected or private"):
+        prepare_paths(value, scratch)

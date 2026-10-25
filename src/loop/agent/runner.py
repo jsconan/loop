@@ -1212,6 +1212,7 @@ class AgentRunner:
 
         Raises:
             BackendError: If the backend cannot produce a complete response.
+            SessionExecutionConflictError: If another owner is executing this session.
             ValueError: If neither the selection nor backend provides a model.
             OSError: An applicable instruction source cannot be read.
             UnicodeError: An applicable instruction source is not valid UTF-8.
@@ -1220,7 +1221,7 @@ class AgentRunner:
             RuntimeError: If called from an active event loop.
         """
         self._require_sync_context("query", "query_async")
-        with telemetry_span():
+        with self._session_manager.execution(), telemetry_span():
             return self._query()
 
     @staticmethod
@@ -1240,6 +1241,7 @@ class AgentRunner:
 
         Raises:
             BackendError: If the backend cannot produce a complete response.
+            SessionExecutionConflictError: If another owner is executing this session.
             ValueError: If neither the selection nor backend provides a model.
             OSError: An applicable instruction source cannot be read.
             UnicodeError: An applicable instruction source is not valid UTF-8.
@@ -1248,7 +1250,7 @@ class AgentRunner:
             RunInterrupted: If the active execution scope has been interrupted.
             asyncio.CancelledError: If the query task is cancelled.
         """
-        with telemetry_span():
+        with self._session_manager.execution(), telemetry_span():
             return await self._query_async()
 
     def _query(self, recovery: str | None = None) -> Response:

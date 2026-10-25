@@ -697,10 +697,10 @@ def test_public_ls_runs_with_large_hardlinked_virtualenv(public, native_director
 
 
 def test_public_read_only_command_can_create_files_in_private_scratch(public):
-    """Keep nested private-name paths writable in scratch when the workspace is read-only."""
+    """Keep ordinary session scratch writable while the workspace remains read-only."""
     source = (
         "import os,pathlib; root=pathlib.Path(os.environ['TMPDIR']); "
-        "target=root/'pytest-fixture'/'workspace'/'project'/'.loop'; "
+        "target=root/'pytest-fixture'/'workspace'/'project'/'output'; "
         "target.mkdir(parents=True); "
         "(target/'created').write_text('private scratch',encoding='utf-8'); "
         "print('SCRATCH_WRITE=ok')"
@@ -766,12 +766,12 @@ def test_public_runtime_roots_deny_private_data_and_executables(public, private_
     require_drained(public[2])
 
 
-def test_public_scratch_keeps_new_private_fixture_paths_usable(public):
-    """Stable scratch supports command-created private-name fixtures without ambient data."""
+def test_public_session_scratch_denies_new_private_names(public):
+    """Reused scratch enforces private-name restrictions without granting ambient private data."""
     calls = [
         (
             (
-                f'mkdir "$TMPDIR/nested"; mkdir "$TMPDIR/nested/{component}"; '
+                f'mkdir -p "$TMPDIR/nested"; mkdir "$TMPDIR/nested/{component}"; '
                 f'printf fixture > "$TMPDIR/nested/{component}/key"; '
                 f'cat "$TMPDIR/nested/{component}/key"'
             ),
@@ -782,7 +782,8 @@ def test_public_scratch_keeps_new_private_fixture_paths_usable(public):
     calls.append(('printf ordinary > "$TMPDIR/result"; cat "$TMPDIR/result"', {"read_only": True}))
     results = invoke_many(public, calls)
     for result in results[:-1]:
-        assert result["result"]["stdout"]["content"] == "fixture", result
+        assert result["problem"]["code"] == "process.nonzero_exit", result
+        assert result["problem"]["metadata"]["stdout"]["content"] == ""
     assert results[-1]["result"]["stdout"]["content"] == "ordinary"
     require_drained(public[2])
 

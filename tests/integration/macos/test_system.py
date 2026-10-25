@@ -3,13 +3,22 @@
 import json
 import shlex
 import shutil
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from loop import PermissionManager, ToolRegistry
+from loop import (
+    ApprovalChoice,
+    Loop,
+    PermissionManager,
+    SessionManager,
+    SQLiteSessionStore,
+    ToolRegistry,
+)
 from loop.constants import MAX_OUTPUT_CHARS
 from loop.execution import CommandExecutionService
+from loop.tools.files import read_text_file, write_text_file
 from loop.tools.system import run_command
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e, pytest.mark.macos]
@@ -170,16 +179,17 @@ def test_public_skill_alias_rejects_private_hardlink(public_command, native_work
     public_command.host.run_host_command.assert_not_called()
 
 
-def test_public_private_scratch_keeps_owned_fixture_paths_writable(public_command):
-    """Fresh command scratch supports synthetic private-name fixtures without host-data access."""
+def test_public_session_scratch_denies_private_names(public_command):
+    """Reused session storage enforces private-name restrictions on command-created paths."""
     for component in (".ssh", ".AWS", ".config", ".loop", "Library"):
         result = public_command.call(
-            f'mkdir "$TMPDIR/nested"; mkdir "$TMPDIR/nested/{component}"; '
+            f'mkdir -p "$TMPDIR/nested"; mkdir "$TMPDIR/nested/{component}"; '
             f'printf fixture > "$TMPDIR/nested/{component}/key"; '
             f'cat "$TMPDIR/nested/{component}/key"',
             read_only=True,
         )
-        assert result["result"]["stdout"]["content"] == "fixture", result
+        assert result["problem"]["code"] == "process.nonzero_exit", result
+        assert result["problem"]["metadata"]["stdout"]["content"] == ""
     ordinary = public_command.call('printf ordinary > "$TMPDIR/result"; cat "$TMPDIR/result"')
     assert ordinary["result"]["stdout"]["content"] == "ordinary"
     public_command.host.run_host_command.assert_not_called()
@@ -402,3 +412,141 @@ def test_public_exact_path_executable_does_not_expose_siblings(
     assert not denied["ok"]
     assert "outside-sibling-canary" not in json.dumps(denied)
     public_command.host.run_host_command.assert_not_called()
+
+
+def test_session_files_survive_commands_turns_and_runtime_recreation(backend, native_workspace):
+    """TMPDIR, virtual /tmp, and file tools reopen the same files after a saved session resumes."""
+    database = native_workspace.parent / "Library" / "loop" / "workspace" / "sessions.db"
+    runtimes = []
+    host = Mock()
+    host.run_host_command.side_effect = AssertionError("unapproved host launch")
+    interaction = Mock()
+    interaction.prompt.side_effect = lambda message, **kwargs: (
+        ApprovalChoice.ONCE
+        if message == "Proceed?"
+        else "deny"
+        if "without the OS sandbox" in message
+        else "approve"
+    )
+
+    def compose(identifier=None):
+        """Recreate the runtime using a fresh durable store and the existing native backend."""
+        manager = SessionManager(
+            session=identifier,
+            session_store=SQLiteSessionStore(database, workspace_id="workspace"),
+            workspace_id="workspace",
+        )
+        permissions = PermissionManager(native_workspace)
+        registry = ToolRegistry(
+            [run_command, read_text_file, write_text_file],
+            permission_manager=permissions,
+            execution_service=CommandExecutionService(backend, host),
+        )
+        loop = Loop.create_default(
+            backend=SimpleNamespace(default_model="test", get_context_window=lambda _: None),
+            working_directory=native_workspace,
+            session_manager=manager,
+            interaction=interaction,
+            permission_manager=permissions,
+            tool_registry=registry,
+        )
+        runtimes.append(loop)
+        return loop, manager
+
+    def dispatch(loop, name, **arguments):
+        """Invoke one public tool using the runtime's active virtual paths."""
+        value = json.loads(
+            loop.tool_registry.call(
+                name,
+                json.dumps(arguments),
+                interaction=interaction,
+                instructions_manager=loop.instructions_manager,
+            )
+        )
+        assert value["ok"], value
+        assert str(database.parent) not in json.dumps(value)
+        return value["result"]
+
+    try:
+        loop, sessions = compose()
+        sessions.add_user_message("prepare a report")
+        identifier = sessions.session.id
+        directory = loop.permission_manager.temporary_directory
+        dispatch(
+            loop,
+            "run_command",
+            command='printf draft > "$TMPDIR/report.txt"',
+            cwd="/workspace",
+            read_only=True,
+        )
+        read = dispatch(loop, "read_text_file", path="/tmp/report.txt")
+        assert read["content"] == "draft"
+        sessions.add_user_message("revise the report")
+        dispatch(loop, "write_text_file", path="/tmp/revised.txt", content="revised")
+        result = dispatch(
+            loop,
+            "run_command",
+            command='cat /tmp/report.txt; cat "$TMPDIR/revised.txt"',
+            cwd="/workspace",
+            read_only=True,
+        )
+        assert result["stdout"]["content"] == "draftrevised"
+        loop.command_manager.call("sessions", "new")
+        assert loop.permission_manager.temporary_directory != directory
+        dispatch(
+            loop,
+            "run_command",
+            command='test ! -e "$TMPDIR/report.txt"',
+            cwd="/workspace",
+            read_only=True,
+        )
+        second_directory = loop.permission_manager.temporary_directory
+        escape = second_directory / "escape"
+        escape.symlink_to(directory / "report.txt")
+        denied = json.loads(
+            loop.tool_registry.call(
+                "run_command",
+                json.dumps(
+                    {
+                        "command": 'cat "$TMPDIR/escape"',
+                        "cwd": "/workspace",
+                        "read_only": True,
+                    }
+                ),
+                interaction=interaction,
+                instructions_manager=loop.instructions_manager,
+            )
+        )
+        assert denied["ok"] is False, denied
+        assert "draft" not in json.dumps(denied)
+        escape.unlink()
+        escape.hardlink_to(directory / "report.txt")
+        denied = json.loads(
+            loop.tool_registry.call(
+                "run_command",
+                json.dumps({"command": ":", "cwd": "/workspace", "read_only": True}),
+                interaction=interaction,
+                instructions_manager=loop.instructions_manager,
+            )
+        )
+        assert denied["problem"]["code"] == "sandbox.invalid", denied
+        assert (directory / "report.txt").read_text() == "draft"
+        escape.unlink()
+        loop.permission_manager.close()
+        loop.command_manager.close()
+        loop, _ = compose(identifier)
+        assert loop.permission_manager.temporary_directory == directory
+        result = dispatch(
+            loop,
+            "run_command",
+            command='cat "$TMPDIR/report.txt"; cat /tmp/revised.txt',
+            cwd="/workspace",
+            read_only=True,
+        )
+        assert result["stdout"]["content"] == "draftrevised"
+        assert directory.is_dir()
+        host.run_host_command.assert_not_called()
+    finally:
+        for loop in reversed(runtimes):
+            loop.command_manager.close()
+            loop.permission_manager.close()

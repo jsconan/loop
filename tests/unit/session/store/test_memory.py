@@ -311,3 +311,31 @@ def test_store_lists_recent_sessions_first_and_keeps_instances_isolated():
     assert store.load(second_id) == second
     assert store.load(second_id) is not second
     assert MemorySessionStore().list() == []
+
+
+def test_store_keeps_its_original_temporary_root_when_its_spelling_is_replaced(tmp_path):
+    """A substituted temporary root cannot silently retarget the store's session storage."""
+    store = MemorySessionStore()
+    root = store.temporary_root
+    previous = root.with_name(root.name + "-previous")
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    root.rename(previous)
+    root.symlink_to(outside, target_is_directory=True)
+    try:
+        assert store.temporary_root == root
+    finally:
+        root.unlink()
+        previous.rename(root)
+
+
+def test_working_storage_creation_failure_preserves_the_original_error(monkeypatch):
+    """A failed store constructor releases safely without a secondary finalizer exception."""
+
+    def fail(**_kwargs):
+        """Report an unavailable temporary filesystem."""
+        raise OSError("temporary storage unavailable")
+
+    monkeypatch.setattr("loop.session.store.memory.tempfile.TemporaryDirectory", fail)
+    with pytest.raises(OSError, match="temporary storage unavailable"):
+        MemorySessionStore()

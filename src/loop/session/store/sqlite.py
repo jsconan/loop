@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ...models import Message
-from ...utils import content_digest, utc_now, validate_content_handle
+from ...utils import content_digest, sha256_digest, utc_now, validate_content_handle
 from ..models import (
     SESSION_NAME_SOURCE_INITIAL,
     SessionInfo,
@@ -37,6 +37,19 @@ class SQLiteSessionStore:
         if not workspace_id:
             raise ValueError("Workspace identifier must not be empty.")
         self._workspace_id = workspace_id
+
+    @property
+    def temporary_root(self) -> Path:
+        """Return durable session working storage beside the database.
+
+        Returns:
+            Path: Database- and workspace-specific root preserved across store instances and
+                process restarts. Existing directories outside this namespace remain untouched.
+        """
+        identity = (self._path.name + "\x00" + self._workspace_id).encode(
+            "utf-8", errors="surrogatepass"
+        )
+        return self._path.parent / "scratch" / sha256_digest(identity)
 
     def import_legacy(self, source: Path | str) -> bool:
         """Import a legacy database when this store does not yet exist.

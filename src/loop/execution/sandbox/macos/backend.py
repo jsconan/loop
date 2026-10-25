@@ -524,7 +524,7 @@ def _profile(
         *(target for _, _, target in request.aliases),
         scratch,
     ):
-        if is_protected_external_read(root):
+        if is_protected_external_read(root) and not (request.session_scratch and root == scratch):
             raise ValueError(f"Protected directory cannot be a read root: {root}")
     search_roots = _search_roots(request)
     reads = (
@@ -604,7 +604,7 @@ def _profile(
         )
         + ")"
     )
-    # Fresh command scratch contains command-created fixtures, not ambient host data.
+    # Session storage is re-used, so enforce private-name guards within it as well.
     private_roots = dict.fromkeys(
         root
         for root in (
@@ -619,6 +619,12 @@ def _profile(
         _regex(f"^{re.escape(str(root).rstrip('/'))}/(.*/)?{private_names}(/.*)?$")
         for root in private_roots
     )
+    if request.session_scratch:
+        private_reads = (
+            f"(require-all (require-any {private_reads}) "
+            f"(require-not (subpath {_literal(scratch)}))) "
+            + _regex(f"^{re.escape(str(scratch))}/(.*/)?{private_names}(/.*)?$")
+        )
     temp_prefix = re.escape(str(darwin_temp))
     hex_suffix = "[0-9A-Fa-f]" * 6
     temp_rules = " ".join(
@@ -1087,7 +1093,10 @@ class MacOSSeatbeltBackend:
                     or details.st_uid != os.getuid()
                     or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
                     or (bound_scratch is not None and str(scratch) != directory)
-                    or not scratch.name.startswith(self.scratch_prefix)
+                    or (
+                        not request.session_scratch
+                        and not scratch.name.startswith(self.scratch_prefix)
+                    )
                 ):
                     raise ValueError("Unsafe command scratch directory.")
                 _search_roots(request)

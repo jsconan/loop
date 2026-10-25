@@ -223,10 +223,11 @@ class Loop:
         )
         if instructions_manager is None:
             configured_instructions.reactivate_skills(configured_sessions.session.active_skills)
+        configured_permissions.bind_temporary_directory(configured_sessions.temporary_directory)
         configured_instructions.set_runtime_environment(
             RuntimeEnvironment(
                 working_directory=configured_directory,
-                temporary_directory=configured_permissions.temporary_directory,
+                temporary_directory=configured_sessions.temporary_directory,
             )
         )
         configured_permissions.recorder = configured_sessions
@@ -731,7 +732,7 @@ class Loop:
         with self._session_manager.execution():
             self._recover_session()
         while not self._command_manager.exit_requested:
-            with self._session_manager.execution():
+            with self._session_manager.execution(allow_session_selection=True):
                 user_input = (
                     self._interaction.prompt(completer=self._completion_manager)
                     if input_source is None
@@ -891,7 +892,7 @@ class Loop:
         with self._session_manager.execution():
             await self._recover_session_async()
         while not self._command_manager.exit_requested:
-            with self._session_manager.execution():
+            with self._session_manager.execution(allow_session_selection=True):
                 if input_source is not None:
                     user_input = await input_source(self._completion_manager)
                 else:

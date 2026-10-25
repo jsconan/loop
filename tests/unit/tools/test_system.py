@@ -497,7 +497,7 @@ def test_external_lookup_reference_round_trips_through_public_virtual_boundary(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     scratch = tmp_path / "scratch"
-    scratch.mkdir()
+    scratch.mkdir(mode=0o700)
     installation = tmp_path / "installation"
     installation.mkdir()
     executable = installation / "sampletool"
@@ -807,7 +807,7 @@ def test_external_reference_requires_approval_even_for_unrelated_command(tmp_pat
     installation = tmp_path / "installation"
     installation.mkdir()
     scratch = tmp_path / "scratch"
-    scratch.mkdir()
+    scratch.mkdir(mode=0o700)
     executable = installation / "reviewtool"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o755)
@@ -920,7 +920,43 @@ def test_run_command_accepts_opaque_shell_and_returns_bounded_result(monkeypatch
     environment = dict(backend.run.call_args.args[0].environment)
     assert environment.keys() == {"LANG", "PATH", "TMPDIR", "XDG_CACHE_HOME"}
     assert Path(environment["XDG_CACHE_HOME"]).parent == Path(environment["TMPDIR"])
-    assert not Path(environment["TMPDIR"]).exists()
+    assert Path(environment["TMPDIR"]).is_dir()
+
+
+@pytest.mark.parametrize(
+    "outcome", [SandboxOutcome.COMPLETED, SandboxOutcome.CANCELLED, SandboxOutcome.TIMED_OUT]
+)
+def test_command_working_files_survive_success_interruption_and_timeout(
+    monkeypatch, registry, outcome
+):
+    """Finishing or interrupting an execution preserves its working files for the next command."""
+    directories = []
+
+    def execute(request):
+        """Write through the bound TMPDIR and return the requested process outcome."""
+        directory = Path(request.shell_environment()["TMPDIR"])
+        directories.append(directory)
+        file = directory / "draft"
+        if file.exists():
+            assert file.read_text() == "retained"
+        file.write_text("retained")
+        return CommandProcessResult(
+            outcome, exit_code=0 if outcome is SandboxOutcome.COMPLETED else None
+        )
+
+    backend = MagicMock()
+    backend.run.side_effect = execute
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+
+    for _ in range(2):
+        result, problem = call(registry, ":", read_only=True)
+        if outcome is SandboxOutcome.COMPLETED:
+            assert problem is None
+            assert result["scratch"]["lifetime"] == "this session"
+        else:
+            assert problem["code"] == f"sandbox.{outcome.value}"
+        assert (directories[-1] / "draft").read_text() == "retained"
+    assert directories[0] == directories[1]
 
 
 def test_read_only_command_uses_a_nonwritable_workspace_policy(monkeypatch, registry):
@@ -938,7 +974,7 @@ def test_read_only_command_uses_a_nonwritable_workspace_policy(monkeypatch, regi
     assert problem is None
     assert result["boundary"] == "sandbox"
     assert result["scratch"]["path"] == "$TMPDIR"
-    assert result["scratch"]["lifetime"] == "this command"
+    assert result["scratch"]["lifetime"] == "this session"
     assert backend.run.call_args.args[0].write_roots == ()
     environment = dict(backend.run.call_args.args[0].environment)
     assert Path(environment["COVERAGE_FILE"]).parent == Path(environment["TMPDIR"])
@@ -1253,7 +1289,7 @@ def test_relative_one_character_tool_requires_explicit_external_read(tmp_path, m
     executable.write_text("#!/bin/sh\nprintf external-ok\n", encoding="utf-8")
     executable.chmod(0o755)
     scratch = tmp_path / "scratch"
-    scratch.mkdir()
+    scratch.mkdir(mode=0o700)
     monkeypatch.setenv("PATH", "../../external-bin:/usr/bin:/bin")
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
     backend = MagicMock()
@@ -1316,7 +1352,7 @@ def test_resolve_executable_binds_relative_lookup_cwd_and_rejects_missing_cwd(
     subdirectory = workspace / "subdirectory"
     subdirectory.mkdir(parents=True)
     scratch = tmp_path / "scratch"
-    scratch.mkdir()
+    scratch.mkdir(mode=0o700)
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
 
     service_context = ToolContext(
@@ -1357,7 +1393,7 @@ def test_request_binding_error_redacts_external_paths_without_instructions(
 def test_run_command_preserves_system_path_in_redacted_output(tmp_path):
     """Approved system tool text stays readable while external roots remain redacted."""
     scratch = tmp_path / "scratch"
-    scratch.mkdir()
+    scratch.mkdir(mode=0o700)
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, scratch))
     backend = MagicMock(
         run=MagicMock(
@@ -1683,7 +1719,12 @@ def test_run_command_uses_available_temp_for_virtual_path_alias(monkeypatch, tmp
         run=MagicMock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0))
     )
     execution_service = CommandExecutionService(backend, LocalHostCommandExecutor())
-    instructions = MagicMock(virtual_paths=VirtualPath(workspace=tmp_path))
+    permissions = PermissionManager()
+    instructions = MagicMock(
+        virtual_paths=VirtualPath(
+            workspace=tmp_path, temporary_directory=permissions.temporary_directory
+        )
+    )
     context = ToolContext(
         ApprovingInteraction(),
         "run_command",
@@ -1699,7 +1740,7 @@ def test_run_command_uses_available_temp_for_virtual_path_alias(monkeypatch, tmp
                 ),
             ),
         ),
-        permission_manager=PermissionManager(),
+        permission_manager=permissions,
         execution_service=execution_service,
     )
 

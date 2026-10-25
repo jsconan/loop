@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
 from ..errors import Problem
-from ..utils import VirtualPath, sha256_digest
+from ..utils import PathReference, VirtualPath, sha256_digest
 
 
 @dataclass(frozen=True)
@@ -240,11 +240,12 @@ class RuntimeEnvironment:
 
     Args:
         working_directory (Path): Directory used as the current workspace.
-        temporary_directory (Path): Explicitly permitted ephemeral directory for scratch files.
+        temporary_directory (Path | PathReference | None): Session working directory or its
+            reference, or ``None`` when temporary storage is unavailable.
     """
 
     working_directory: Path
-    temporary_directory: Path
+    temporary_directory: Path | PathReference | None
 
     def render(self) -> str:
         """Render the model-facing runtime environment section.
@@ -265,7 +266,8 @@ class RuntimeEnvironment:
             "are granted by the sandbox execution layer. For other installations, "
             "resolve_executable can provide a bound grant_reference for executable_grant. "
             "A failed sandbox command does not prove a host tool is absent. "
-            "Use $TMPDIR for transient cache or report files.\n"
+            "Use $TMPDIR or /tmp for session working files. Both name the same storage, retained "
+            "across commands, turns, and saved-session resumes.\n"
             "</runtime_environment>"
         )
 

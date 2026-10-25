@@ -6,10 +6,12 @@ import logging
 from asyncio import current_task
 from collections.abc import AsyncIterable, Awaitable, Callable, Generator, Iterable
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import fields
 from datetime import datetime
-from threading import Lock, get_ident
+from pathlib import Path
+from threading import Lock, RLock, get_ident
 from typing import Any
 
 from ..errors import Problem, log_problem
@@ -40,12 +42,15 @@ from ..telemetry import (
     telemetry_span,
 )
 from ..utils import (
+    PathHolder,
+    PathReference,
     bound_tool_result,
     cached_metadata,
     cached_path,
     content_digest,
     content_identity,
     encode_content_cursor,
+    ensure_private_directory,
     get_binary,
     new_uuid,
     register_cached_metadata,
@@ -94,6 +99,7 @@ type ExecutionOwner = tuple[int, int, int | None]
 _LOGGER = logging.getLogger(__name__)
 _EXECUTION_OWNERS: dict[ExecutionKey, tuple[ExecutionOwner, int]] = {}
 _EXECUTION_OWNERS_LOCK = Lock()
+_SESSION_SELECTION: ContextVar[object | None] = ContextVar("loop_session_selection", default=None)
 
 
 def _execution_owner(manager: "SessionManager") -> ExecutionOwner:
@@ -126,7 +132,11 @@ class SessionManager:
         ValueError: If the session or persisted format is invalid.
     """
 
+    _state_lock: RLock
+    _execution_depth: int
+    _selection_block_depth: int
     _interaction: Interaction
+    _temporary_directory: PathHolder | None
     _session: Session
     _session_store: SessionStore
     _workspace_id: str | None
@@ -145,6 +155,9 @@ class SessionManager:
         workspace_id: str | None = None,
         async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
+        self._state_lock = RLock()
+        self._execution_depth = 0
+        self._selection_block_depth = 0
         self._interaction = interaction or ConsoleInteraction()
         self._session_store = session_store or MemorySessionStore()
         self._async_blocking_runner = async_blocking_runner
@@ -156,11 +169,12 @@ class SessionManager:
         if workspace_id == "":
             raise ValueError("Workspace identifier must not be empty.")
         self._workspace_id = workspace_id
+        self._temporary_directory = None
 
         if session and isinstance(session, (str, Session)):
             self.load_session(session)
         else:
-            self._session = Session(workspace_id=self._workspace_id)
+            self._select_session(Session(workspace_id=self._workspace_id))
 
     @property
     def session(self) -> Session:
@@ -169,7 +183,52 @@ class SessionManager:
         Returns:
             Session: The mutable session used by the loop.
         """
-        return self._session
+        with self._state_lock:
+            return self._session
+
+    @property
+    def temporary_directory(self) -> PathReference:
+        """Return the stable path reference following the active session.
+
+        Returns:
+            PathReference: Private working directory shared by file tools and commands. Durable
+                stores retain it across restarts; in-memory stores retain it for their lifetime.
+
+        Raises:
+            ValueError: The session identity is empty or storage is aliased, not private, or
+                owned by another user.
+            OSError: The working directory cannot be created or inspected.
+        """
+        with self._state_lock:
+            if self._temporary_directory is None:
+                self._temporary_directory = PathHolder(self._session_directory(self._session.id))
+            return self._temporary_directory
+
+    def _session_directory(self, session_id: str) -> Path:
+        """Derive and prepare isolated working storage for one nonempty session identity."""
+        if not session_id:
+            raise ValueError("Session identifier must not be empty.")
+        root = self._session_store.temporary_root
+        directory = root / sha256_digest(session_id.encode("utf-8", errors="surrogatepass"))
+        ensure_private_directory(root)
+        ensure_private_directory(directory)
+        return directory
+
+    def _select_session(self, session: Session) -> None:
+        """Bind working storage before publishing a newly selected session."""
+        with self._state_lock:
+            self._check_session_selection()
+            if self._temporary_directory is not None:
+                directory = self._session_directory(session.id)
+                self._temporary_directory.set(directory)
+            self._session = session
+
+    def _check_session_selection(self) -> None:
+        """Refuse a selection that would retarget a running conversation's services."""
+        if self._selection_block_depth or (
+            self._execution_depth and _SESSION_SELECTION.get() is not self
+        ):
+            raise SessionExecutionConflictError(self._session.id)
 
     @property
     def interaction(self) -> Interaction:
@@ -259,11 +318,17 @@ class SessionManager:
         )
 
     @contextmanager
-    def execution(self) -> Generator[None, None, None]:
+    def execution(self, *, allow_session_selection: bool = False) -> Generator[None, None, None]:
         """Own this logical session's execution within the current process.
 
         This lease intentionally provides process-local exclusion only. Persisted revision checks
         independently prevent stale writers in other processes from overwriting newer snapshots.
+        Model and tool execution prevents session selection. Conversation input may permit
+        selection within its own context, including propagated synchronous command workers.
+
+        Args:
+            allow_session_selection (bool): Permit idle conversation commands to select a session.
+                Defaults to ``False``. Nested model and tool leases still prohibit selection.
 
         Yields:
             None: Control while this manager exclusively owns session execution.
@@ -271,23 +336,32 @@ class SessionManager:
         Raises:
             SessionExecutionConflictError: If another execution in this process owns the session.
         """
-        namespace = (
-            ("workspace", self._session.workspace_id)
-            if self._session.workspace_id is not None
-            else ("store", id(self._session_store))
-        )
-        key = (namespace, self._session.id)
-        owner = _execution_owner(self)
-        with _EXECUTION_OWNERS_LOCK:
-            existing = _EXECUTION_OWNERS.get(key)
-            if existing is not None and existing[0] != owner:
-                raise SessionExecutionConflictError(self._session.id)
-            depth = existing[1] + 1 if existing is not None else 1
-            _EXECUTION_OWNERS[key] = (owner, depth)
+        with self._state_lock:
+            namespace = (
+                ("workspace", self._session.workspace_id)
+                if self._session.workspace_id is not None
+                else ("store", id(self._session_store))
+            )
+            key = (namespace, self._session.id)
+            owner = _execution_owner(self)
+            with _EXECUTION_OWNERS_LOCK:
+                existing = _EXECUTION_OWNERS.get(key)
+                if existing is not None and existing[0] != owner:
+                    raise SessionExecutionConflictError(self._session.id)
+                depth = existing[1] + 1 if existing is not None else 1
+                _EXECUTION_OWNERS[key] = (owner, depth)
+            self._execution_depth += 1
+            if not allow_session_selection:
+                self._selection_block_depth += 1
+        token = _SESSION_SELECTION.set(self if allow_session_selection else None)
         try:
             yield
         finally:
-            with _EXECUTION_OWNERS_LOCK:
+            _SESSION_SELECTION.reset(token)
+            with self._state_lock, _EXECUTION_OWNERS_LOCK:
+                self._execution_depth -= 1
+                if not allow_session_selection:
+                    self._selection_block_depth -= 1
                 current_owner, depth = _EXECUTION_OWNERS[key]
                 if depth == 1:
                     del _EXECUTION_OWNERS[key]
@@ -1051,87 +1125,96 @@ class SessionManager:
             SessionNotFoundError: If the requested session does not exist.
             UnsupportedConversationItemError: If a serialized conversation item type is not
                 supported.
-            ValueError: If its persisted format is invalid or unsupported.
+            ValueError: If its persisted format or bound working storage is invalid or unsafe.
+            OSError: Bound working storage cannot be created or inspected.
             SessionWorkspaceMismatchError: If the session belongs to another workspace.
+            SessionExecutionConflictError: If this manager is currently executing a session.
         """
-        if load_from_store := isinstance(session, str):
-            session = self._session_store.load(session)
-        if not isinstance(session, Session):
-            raise ValueError("Invalid session type.")  # noqa: TRY004 - public API contract.
-        self._validate_session_workspace(session)
-        if session.workspace_id is None:
-            session.workspace_id = self._workspace_id
-        cache_restorations = []
-        for message in session.messages:
-            if isinstance(message, Message):
-                for reference in message.context:
-                    if reference.handle is None or reference.version is None:
-                        raise ValueError(
-                            f"Referenced snapshot '{reference.path}' has an incomplete "
-                            "artifact identity."
-                        )
-                    stored = self._session_store.load_reference(reference.version)
-                    if (
-                        stored is None
-                        and not load_from_store
-                        and (reference.content or reference.size_bytes == 0)
-                    ):
-                        content = get_binary(reference.content)
-                        if (
-                            content_digest(content) != reference.version
-                            or len(content) != reference.size_bytes
-                        ):
+        with self._state_lock:
+            self._check_session_selection()
+            if load_from_store := isinstance(session, str):
+                session = self._session_store.load(session)
+            if not isinstance(session, Session):
+                raise ValueError("Invalid session type.")  # noqa: TRY004 - public API contract.
+            self._validate_session_workspace(session)
+            if session.workspace_id is None:
+                session.workspace_id = self._workspace_id
+            cache_restorations = []
+            for message in session.messages:
+                if isinstance(message, Message):
+                    for reference in message.context:
+                        if reference.handle is None or reference.version is None:
                             raise ValueError(
-                                f"Referenced snapshot '{reference.path}' failed integrity "
-                                "validation."
+                                f"Referenced snapshot '{reference.path}' has an incomplete "
+                                "artifact identity."
                             )
-                        self._session_store.store_reference(
-                            content,
-                            handle=reference.handle,
-                            digest=reference.version,
-                        )
-                        stored = content
-                    if stored is None:
-                        raise ValueError(f"Referenced snapshot '{reference.path}' is unavailable.")
-                    digest = content_digest(stored)
-                    if digest != reference.version or len(stored) != reference.size_bytes:
-                        raise ValueError(
-                            f"Referenced snapshot '{reference.path}' failed integrity validation."
-                        )
-                    cached = cached_path(reference.handle)
-                    cache_valid = cached is not None and cached[0].is_file()
-                    if cache_valid:
-                        try:
-                            cache_valid = cached[0].read_bytes() == stored
-                        except OSError:
-                            cache_valid = False
-                    if not cache_valid:
-                        cache_restorations.append((reference, stored))
-        for reference, stored in cache_restorations:
-            store_content(
-                stored,
-                f"mentioned {reference.kind} {reference.path}",
-                handle=reference.handle,
-            )
-        for message in session.messages:
-            if isinstance(message, ToolResult):
-                for artifact in message.artifacts:
-                    register_cached_metadata(
-                        artifact.handle,
-                        artifact.source,
-                        artifact.reloadable,
-                    )
-        if session.pending_interactions:
-            candidate = deepcopy(session)
-            for request in candidate.pending_interactions:
-                candidate.settle_interaction(request.request_id, "revoked")
-            if load_from_store or session.revision > 0:
-                self._save_snapshot(self._session_store, self._persistence_lock, candidate)
-            for session_field in fields(Session):
-                setattr(
-                    session, session_field.name, deepcopy(getattr(candidate, session_field.name))
+                        stored = self._session_store.load_reference(reference.version)
+                        if (
+                            stored is None
+                            and not load_from_store
+                            and (reference.content or reference.size_bytes == 0)
+                        ):
+                            content = get_binary(reference.content)
+                            if (
+                                content_digest(content) != reference.version
+                                or len(content) != reference.size_bytes
+                            ):
+                                raise ValueError(
+                                    f"Referenced snapshot '{reference.path}' failed integrity "
+                                    "validation."
+                                )
+                            self._session_store.store_reference(
+                                content,
+                                handle=reference.handle,
+                                digest=reference.version,
+                            )
+                            stored = content
+                        if stored is None:
+                            raise ValueError(
+                                f"Referenced snapshot '{reference.path}' is unavailable."
+                            )
+                        digest = content_digest(stored)
+                        if digest != reference.version or len(stored) != reference.size_bytes:
+                            raise ValueError(
+                                f"Referenced snapshot '{reference.path}' "
+                                "failed integrity validation."
+                            )
+                        cached = cached_path(reference.handle)
+                        cache_valid = cached is not None and cached[0].is_file()
+                        if cache_valid:
+                            try:
+                                cache_valid = cached[0].read_bytes() == stored
+                            except OSError:
+                                cache_valid = False
+                        if not cache_valid:
+                            cache_restorations.append((reference, stored))
+            for reference, stored in cache_restorations:
+                store_content(
+                    stored,
+                    f"mentioned {reference.kind} {reference.path}",
+                    handle=reference.handle,
                 )
-        self._session = session
+            for message in session.messages:
+                if isinstance(message, ToolResult):
+                    for artifact in message.artifacts:
+                        register_cached_metadata(
+                            artifact.handle,
+                            artifact.source,
+                            artifact.reloadable,
+                        )
+            if session.pending_interactions:
+                candidate = deepcopy(session)
+                for request in candidate.pending_interactions:
+                    candidate.settle_interaction(request.request_id, "revoked")
+                if load_from_store or session.revision > 0:
+                    self._save_snapshot(self._session_store, self._persistence_lock, candidate)
+                for session_field in fields(Session):
+                    setattr(
+                        session,
+                        session_field.name,
+                        deepcopy(getattr(candidate, session_field.name)),
+                    )
+            self._select_session(session)
 
     def load_persisted_session(self, session_id: str) -> Session:
         """Read a persisted session without changing the active session.
@@ -1165,11 +1248,17 @@ class SessionManager:
             )
 
     def new_session(self) -> None:
-        """Replace the active session with a fresh unpersisted session."""
-        self._session = Session(
-            model=self._session.model,
-            workspace_id=self._workspace_id,
-        )
+        """Replace the idle session and select its isolated working directory when bound.
+
+        Raises:
+            SessionExecutionConflictError: If this manager is currently executing a session.
+            ValueError: Bound working storage is aliased, not private, or owned by another user.
+            OSError: The working directory cannot be created or inspected.
+        """
+        with self._state_lock:
+            self._select_session(
+                Session(model=self._session.model, workspace_id=self._workspace_id)
+            )
 
     def rename_session(self, name: str) -> None:
         """Assign and persist a user-controlled name to the active session.
@@ -1965,11 +2054,12 @@ class SessionManager:
     def _commit(self, mutation: Callable[[Session], None]) -> None:
         """Apply and persist one session mutation atomically in memory."""
         with self._commit_lock:
-            previous = deepcopy(self._session)
+            current = self._session
+            previous = deepcopy(current)
             try:
-                mutation(self._session)
+                mutation(current)
                 telemetry_activity("session.persistence.started", component="session_manager")
-                self._save_snapshot(self._session_store, self._persistence_lock, self._session)
+                self._save_snapshot(self._session_store, self._persistence_lock, current)
                 telemetry_activity(
                     "session.persistence.completed",
                     component="session_manager",
@@ -1982,11 +2072,13 @@ class SessionManager:
                 )
                 for session_field in fields(Session):
                     setattr(
-                        self._session,
+                        current,
                         session_field.name,
                         deepcopy(getattr(previous, session_field.name)),
                     )
                 raise
+            if self._session is not current:
+                raise RuntimeError("The active session changed while its snapshot was being saved.")
 
     async def _commit_async(
         self,

@@ -255,6 +255,19 @@ class SandboxRequest:
     file_creation_mask: int = constants.GROUP_AND_OTHER_WRITE_MODE_MASK
 
     @property
+    def session_scratch(self) -> bool:
+        """Return whether TMPDIR is bound to the file tools' session temporary root.
+
+        Returns:
+            bool: Whether an authenticated virtual temporary alias shares the scratch directory.
+        """
+        scratch = self.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE)
+        return any(
+            virtual == VirtualPath.TEMPORARY and str(target) == scratch
+            for virtual, _, target in self.aliases
+        )
+
+    @property
     def protected_paths(self) -> ProtectedWorkspacePaths:
         """Return the permission-owned native write-protection specification.
 
@@ -298,7 +311,7 @@ class SandboxRequest:
             write_roots (tuple[Path, ...]): Writable directory roots.
             network (bool): Explicit general egress grant.
             environment (dict[str, str]): Sanitized effective environment. An included TMPDIR
-                must name a live private Loop scratch directory in the process temp root.
+                must name a live private directory in the process temp root or the bound /tmp root.
             policy_version (str): Reviewed policy revision.
             deadline (float): Absolute monotonic deadline.
             workspace_id (str): Stable workspace identity.
@@ -358,7 +371,13 @@ class SandboxRequest:
                 or not stat.S_ISDIR(details.st_mode)
                 or details.st_uid != os.getuid()
                 or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
-                or scratch.parent != Path(tempfile.gettempdir()).resolve(strict=True)
+                or (
+                    scratch.parent != Path(tempfile.gettempdir()).resolve(strict=True)
+                    and not any(
+                        virtual == VirtualPath.TEMPORARY and target == scratch
+                        for virtual, _, target in aliases
+                    )
+                )
             ):
                 raise ValueError("Command scratch must be a private real directory.")
         if generated_environment and (

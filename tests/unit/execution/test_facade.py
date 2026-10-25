@@ -204,7 +204,7 @@ def test_automatic_executable_identity_does_not_mistake_mapped_uid_for_host_root
     executable.write_text("tool", encoding="utf-8")
     executable.chmod(0o755)
     original_read_text = Path.read_text
-    monkeypatch.setattr(execution_facade.sys, "platform", "linux")
+    monkeypatch.setattr(execution_facade, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(
         Path,
         "read_text",
@@ -232,7 +232,7 @@ def test_trusted_file_owners_follow_live_user_namespace_mapping(
 ):
     """Only an initial namespace can treat file owner zero as host administrator."""
     original_read_text = Path.read_text
-    monkeypatch.setattr(execution_facade.sys, "platform", "linux")
+    monkeypatch.setattr(execution_facade, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(execution_facade.os, "getuid", lambda: uid)
 
     def read_text(path, *args, **kwargs):
@@ -262,7 +262,7 @@ def test_run_command_binds_an_unmanaged_path_tool_as_one_exact_file(
     executable.chmod(0o755)
     details = executable.stat()
     monkeypatch.setenv("PATH", str(tools))
-    monkeypatch.setattr(execution_facade.sys, "platform", platform)
+    monkeypatch.setattr(execution_facade, "sys", SimpleNamespace(platform=platform))
     backend = Mock()
     backend.system_read_roots = ()
     backend.installed_tool_roots.side_effect = lambda path: ((path.parent,), ())
@@ -334,7 +334,7 @@ def test_run_command_automatically_binds_the_workspace_venv_python_runtime(tmp_p
     )
     monkeypatch.setattr("loop.execution.sandbox.linux.backend.runtime_read_roots", lambda: ())
     backend = LinuxNativeBackend(tmp_path / "management.json")
-    monkeypatch.setattr(execution_facade.sys, "platform", "linux")
+    monkeypatch.setattr(execution_facade, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(type(backend), "file_creation_mask", 0o077)
     backend.capability_failure = Mock(return_value=None)
     backend.run = Mock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0))
