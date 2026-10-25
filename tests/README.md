@@ -19,6 +19,7 @@ The platform integration suites are organized by behavior:
 | Suite | Guarantees |
 | --- | --- |
 | `macos/test_sandbox.py` | Native execution, exit status, authority binding, filesystem confinement, aliases, protected paths, grants, relocation, detached children, network/IPC and descriptors |
+| `macos/test_writers.py` | Detached fork/spawn confinement, retained mmap and SQLite WAL resources, native ACL rejection and distinct-account access controls |
 | `macos/test_system.py` | Public command dispatch, virtual paths, destination-aware redirection and Git authorization, host recovery, scratch authority, output bounds and registration aliases |
 | `macos/test_search.py` | Public search, Unicode columns, regex, binary handling, result bounds, executable lookup and outside symlinks |
 | `linux/test_host.py` | Trusted host and installed-tool discovery |
@@ -47,6 +48,12 @@ PYTHONDONTWRITEBYTECODE=1 uv run --no-sync pytest tests/integration -m e2e
 ```
 
 To reject unexpected Python warnings during verification, add `-W error` to a pytest command. Tests that exercise expected warnings, logged errors or exceptions must capture and assert the specific diagnostic using `pytest.warns`, `caplog` or `pytest.raises`. Do not suppress diagnostics to make a failing test pass.
+
+## Native macOS writer prerequisites
+
+The detached-writer checks compile a disposable native helper using `/usr/bin/clang` and the system SQLite library. They use bounded child alarms and kqueue process-exit events to settle owned writers, including after assertion failures. Command completion and ownership release do not establish descendant termination; retained mmap writes and SQLite WAL commits exercise that documented limitation while checking confinement.
+
+The distinct-account ACL check requires existing noninteractive `sudo -n -u nobody` authority. It verifies that account's identity and a public read control before testing private access and ACL rejection. Without that authority the case skips; the suite does not change accounts, configure sudo, or request a password. A separate native ACL case runs without account switching and verifies that extended access lists are rejected even when mode bits remain `0700`.
 
 ## Native Linux test setup
 
