@@ -97,8 +97,8 @@ class InputMailbox:
         """Remove the highest-priority pending admission.
 
         Args:
-            commands_only (bool): Park ordinary messages while allowing commands and shutdown.
-                Defaults to ``False``.
+            commands_only (bool): Park ordinary messages while allowing resume messages,
+                commands, and shutdown. Defaults to ``False``.
 
         Returns:
             InputAdmission: Admission with the lowest numeric priority, then sequence value.
@@ -126,8 +126,8 @@ class InputMailbox:
         """Wait until an admission arrives or shutdown closes an empty mailbox.
 
         Args:
-            commands_only (bool): Wait for a command or shutdown while ordinary input is parked.
-                Defaults to ``False``.
+            commands_only (bool): Wait for resume input, a command, or shutdown while ordinary
+                input is parked. Defaults to ``False``.
 
         Returns:
             bool: Whether an admission is available after waking.

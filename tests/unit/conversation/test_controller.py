@@ -382,8 +382,9 @@ def test_controller_restores_and_records_durable_input_delivery(ui):
     assert manager.session.pending_inputs == ()
 
 
-def test_controller_holds_queued_input_until_interrupted_run_is_recovered(ui):
-    """Pending follow-ups remain queued until the existing recovery gate is cleared."""
+@pytest.mark.parametrize("synchronous", [False, True])
+def test_controller_delivers_new_input_while_older_input_waits_for_recovery(ui, synchronous):
+    """A newly submitted message reaches the stopped owner ahead of parked follow-ups."""
     manager = SessionManager(session_store=MemorySessionStore())
     manager.add_user_message("interrupted request")
     manager.begin_run()
@@ -392,26 +393,39 @@ def test_controller_holds_queued_input_until_interrupted_run_is_recovered(ui):
     controller.bind_session_manager(manager)
     received = []
 
-    def conversation(receive) -> None:
-        """Wait for input while recovery is still required."""
+    def conversation(receive):
+        """Receive the message that implicitly authorizes recovery."""
         received.append(receive(DummyCompleter()))
 
-    async def run_controller() -> None:
-        """Stop without allowing an unrecovered message to reach the owner."""
+    async def conversation_async(receive):
+        """Receive the same admission through the native asynchronous owner."""
+        received.append(await receive(DummyCompleter()))
+
+    async def scenario():
+        """Submit new text while the previous run remains recoverable."""
         inputs = asyncio.Queue()
         inputs.put_nowait("new message")
-        inputs.put_nowait(False)
         read_inputs(ui, inputs)
-        await controller._run_sync_callback_async(conversation)
+        if synchronous:
+            await controller._run_sync_callback_async(conversation)
+        else:
+            await controller.run_async(conversation_async)
 
-    asyncio.run(run_controller())
+    asyncio.run(scenario())
 
-    assert received == [False]
-    assert [event.input_id for event in manager.session.pending_inputs] == [accepted.input_id]
-    assert not any(event.type == "input_delivered" for event in manager.session.events)
-    ui.warning.assert_called_once_with(
-        "Recover the interrupted run or start a new session before sending a message."
-    )
+    assert len(received) == 1
+    assert received[0].message == "new message"
+    assert received[0].session_id == manager.session.id
+    assert [event.content for event in manager.session.pending_inputs] == [
+        "new message",
+        "follow-up",
+    ]
+    delivered = [
+        event.input_id for event in manager.session.events if event.type == "input_delivered"
+    ]
+    assert delivered == [received[0].input_id]
+    assert accepted.input_id not in delivered
+    ui.warning.assert_not_called()
 
 
 def test_controller_persists_interaction_lifecycle_without_answer_values(ui):

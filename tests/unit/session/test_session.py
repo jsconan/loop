@@ -279,6 +279,33 @@ def test_session_classifies_every_interrupted_agent_boundary(messages, events, a
     assert [pending.status for pending in state.pending_calls] == statuses
 
 
+@pytest.mark.parametrize("has_call", [False, True])
+def test_recovery_preserves_superseding_input_across_serialization(has_call):
+    """A saved correction survives restart and applies only to the preceding generation."""
+    session = Session()
+    session.add_message(Message(role="user", content="original request"))
+    call = ToolCall(call_id="old", name="effect", arguments="{}")
+    session.add_message(
+        Response(
+            answer="old answer",
+            reasoning="",
+            items=(call,) if has_call else (Message(role="assistant", content="old answer"),),
+            tool_calls=(call,) if has_call else (),
+        )
+    )
+    session.add_message(Message(role="user", content="corrected request"))
+    restored = Session.deserialize(session.serialize())
+
+    assert restored.recovery_state().superseded is True
+    assert restored.recovery_state().action == ("execute_tools" if has_call else "query_model")
+    if has_call:
+        restored.add_message(ToolResult(call_id="old", output="cancelled"))
+        assert restored.recovery_state().action == "query_model"
+    restored.add_message(Message(role="assistant", content="new answer"))
+    assert restored.recovery_state().superseded is False
+    assert restored.recovery_state().action == "finalize_run"
+
+
 def test_session_treats_presented_legacy_calls_as_uncertain_and_completed_runs_as_clean():
     """Legacy execution markers remain conservative while terminal runs need no recovery."""
     call = ToolCall(call_id="call", name="demo", arguments="{}")

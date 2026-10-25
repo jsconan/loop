@@ -370,7 +370,7 @@ class AgentRunner:
         """Execute an approved recovery plan for the active session.
 
         Args:
-            confirmed (bool): Skip the run-level prompt after an explicit recovery command.
+            confirmed (bool): Skip the run-level prompt after a recovery command or new message.
                 Unknown tool outcomes still require confirmation. Defaults to ``False``.
 
         Returns:
@@ -407,9 +407,9 @@ class AgentRunner:
         """Execute an approved recovery plan using asynchronous interaction and tools.
 
         Args:
-            confirmed (bool): Whether an explicit recovery command already approved the run-level
-                recovery prompt. Unknown tool outcomes still require their own confirmation.
-                Defaults to ``False``.
+            confirmed (bool): Whether a recovery command or new message already approved the
+                run-level recovery prompt. Unknown tool outcomes still require their own
+                confirmation. Defaults to ``False``.
 
         Returns:
             AgentRecoveryStatus: Recovered run result and whether unresolved recovery remains.
@@ -488,6 +488,9 @@ class AgentRunner:
             self._checkpoint()
             if pending.status == "result_available":
                 continue
+            if state.superseded and pending.status == "not_started":
+                self._persist_interrupted_tool_result(pending.call, not_started=True)
+                continue
             retry = True
             if pending.status == "outcome_unknown":
                 with interaction_operation(pending.call.call_id):
@@ -521,6 +524,9 @@ class AgentRunner:
         for pending in state.pending_calls:
             await self._checkpoint_async()
             if pending.status == "result_available":
+                continue
+            if state.superseded and pending.status == "not_started":
+                await self._persist_interrupted_tool_result_async(pending.call, not_started=True)
                 continue
             retry = True
             if pending.status == "outcome_unknown":
@@ -956,7 +962,7 @@ class AgentRunner:
         present: bool,
     ) -> ToolExecutionMetrics:
         """Execute, trace, and persist one tool request inside its correlation span."""
-        self._checkpoint()
+        self._checkpoint(steer=True)
         telemetry_trace_event(
             "tool.request",
             payload={
@@ -971,7 +977,7 @@ class AgentRunner:
 
         def execution_started() -> None:
             """Honor a stop after approval and before recording the execution boundary."""
-            self._checkpoint()
+            self._checkpoint(steer=True)
             self._session_manager.record_tool_execution_started(tool_call.call_id)
 
         tool_result, duration = self._agent.tools.call_with_timing(
@@ -1025,7 +1031,7 @@ class AgentRunner:
         present: bool,
     ) -> ToolExecutionMetrics:
         """Execute, trace, and persist one tool request through async dispatch."""
-        await self._checkpoint_async()
+        await self._checkpoint_async(steer=True)
         telemetry_trace_event(
             "tool.request",
             payload={
@@ -1040,7 +1046,7 @@ class AgentRunner:
 
         async def execution_started_async() -> None:
             """Persist execution intent after approval and before invoking the tool."""
-            await self._checkpoint_async()
+            await self._checkpoint_async(steer=True)
             await self._session_manager.record_tool_execution_started_async(tool_call.call_id)
 
         cancellation = None
@@ -1255,7 +1261,7 @@ class AgentRunner:
 
     def _query(self, recovery: str | None = None) -> Response:
         """Request and collect one response inside the active model-operation span."""
-        self._checkpoint()
+        self._checkpoint(steer=True)
         selected_model = self._model_selection.effective
         snapshot = self._instructions_manager.prepare(self._agent, recovery=recovery)
         self._session_manager.update_instruction_state(
@@ -1264,7 +1270,7 @@ class AgentRunner:
         )
         self._model_selection.synchronize_session()
         self._compaction.compact_if_needed(snapshot)
-        self._checkpoint()
+        self._checkpoint(steer=True)
         started_at = perf_counter()
         first_chunk_at = None
         model_context = self._backend.prepare_context(self._session_manager.model_context)
@@ -1309,7 +1315,7 @@ class AgentRunner:
 
     async def _query_async(self, recovery: str | None = None) -> Response:
         """Collect one asynchronous response inside the active model-operation span."""
-        await self._checkpoint_async()
+        await self._checkpoint_async(steer=True)
         selected_model = self._model_selection.effective
         snapshot = await self._instructions_manager.prepare_async(self._agent, recovery=recovery)
         self._session_manager.update_instruction_state(
@@ -1318,7 +1324,7 @@ class AgentRunner:
         )
         await self._model_selection.synchronize_session_async()
         await self._compaction.compact_if_needed_async(snapshot)
-        await self._checkpoint_async()
+        await self._checkpoint_async(steer=True)
         started_at = perf_counter()
         first_chunk_at = None
         model_context = self._backend.prepare_context(
@@ -1429,6 +1435,8 @@ class AgentRunner:
 
     def _interruption_stop_reason(self) -> AgentRunStopReason:
         """Preserve an incomplete run when its active control requested a pause."""
+        if self._steering_pending() and not self._run_control.interrupted:
+            return AgentRunStopReason.STEERED
         return (
             AgentRunStopReason.PAUSED
             if self._run_control is not None and self._run_control.paused
@@ -1477,7 +1485,7 @@ class AgentRunner:
         """Request one response while escalating exhausted failures to the user."""
         recovery = None
         while True:
-            self._checkpoint()
+            self._checkpoint(steer=True)
             try:
                 if recovery is None:
                     return self.query()
@@ -1545,7 +1553,7 @@ class AgentRunner:
         """
         recovery = None
         while True:
-            await self._checkpoint_async()
+            await self._checkpoint_async(steer=True)
             try:
                 if recovery is None:
                     return await self.query_async()
@@ -1602,15 +1610,19 @@ class AgentRunner:
         interaction = require_async_interaction(self._interaction, "agent confirmation")
         return await interaction.confirm_async(prompt, default=default)
 
-    def _checkpoint(self) -> None:
+    def _checkpoint(self, *, steer: bool = False) -> None:
         """Honor optional cooperative stop requests before a new execution boundary."""
         if self._run_control is not None:
             self._run_control.checkpoint()
+            if steer and self._steering_pending():
+                raise RunInterrupted
 
-    async def _checkpoint_async(self) -> None:
+    async def _checkpoint_async(self, *, steer: bool = False) -> None:
         """Honor run-control state at an asynchronous execution boundary."""
         if self._run_control is not None:
             await self._run_control.checkpoint_async()
+            if steer and self._steering_pending():
+                raise RunInterrupted
 
     def _steering_pending(self) -> bool:
         """Return whether an admitted steering message should stop new work in this run."""

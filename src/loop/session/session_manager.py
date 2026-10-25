@@ -810,10 +810,10 @@ class SessionManager:
 
     @property
     def recovery_pending(self) -> bool:
-        """Return whether the active session is waiting for a recovery decision.
+        """Return whether the active session has an unresolved durable run boundary.
 
         Returns:
-            bool: Whether ordinary conversation input must wait for recovery.
+            bool: Whether recovery must settle before starting a new agent run.
         """
         return self.recovery_state is not None
 

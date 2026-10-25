@@ -501,10 +501,13 @@ class SessionRecoveryState:
         action (SessionRecoveryAction): Next durable agent-loop boundary to enter.
         pending_calls (tuple[PendingToolCall, ...]): Tool requests belonging to the unfinished
             exchange, in model order.
+        superseded (bool): Whether newer user input supersedes the last saved generation.
+            Defaults to ``False``.
     """
 
     action: SessionRecoveryAction
     pending_calls: tuple[PendingToolCall, ...] = ()
+    superseded: bool = False
 
 
 class SessionNameGenerator(Protocol):

@@ -778,12 +778,6 @@ class Loop:
                             self._model_selection.restore(self.session.model)
                             self._recover_session()
                     continue
-                if self._session_manager.recovery_pending:
-                    self._interaction.warning(
-                        "Recover the interrupted run or start a new session "
-                        "before sending a message."
-                    )
-                    continue
                 if self._skill_hints_enabled:
                     try:
                         skill_mentions = tuple(
@@ -844,6 +838,7 @@ class Loop:
                                 self._interaction.info(
                                     f"Attached {reference.path}: {included} bytes."
                                 )
+                        recovering = self._session_manager.recovery_pending
                         self._session_manager.add_user_message(
                             user_input,
                             context=context,
@@ -852,8 +847,11 @@ class Loop:
                             else None,
                         )
                         telemetry_activity("message.accepted", component="session_manager")
-                        result = self._agent_runner.run()
-                        self._complete_agent_run(result)
+                        if recovering:
+                            self._recover_session(explicit=True)
+                        else:
+                            result = self._agent_runner.run()
+                            self._complete_agent_run(result)
                 finally:
                     if self._skill_hints_enabled:
                         self._clear_skill_catalog_priorities()
@@ -925,12 +923,6 @@ class Loop:
                             await self._model_selection.restore_async(self.session.model)
                             await self._recover_session_async()
                     continue
-                if self._session_manager.recovery_pending:
-                    self._interaction.warning(
-                        "Recover the interrupted run or start a new session "
-                        "before sending a message."
-                    )
-                    continue
                 if self._skill_hints_enabled:
                     try:
                         skill_mentions = tuple(
@@ -991,6 +983,7 @@ class Loop:
                                 self._interaction.info(
                                     f"Attached {reference.path}: {included} bytes."
                                 )
+                        recovering = self._session_manager.recovery_pending
                         await self._session_manager.add_user_message_async(
                             user_input,
                             context=context,
@@ -1000,8 +993,11 @@ class Loop:
                         )
                         telemetry_activity("message.accepted", component="session_manager")
                         self._session_name_attempted_this_run = False
-                        result = await self._agent_runner.run_async()
-                        await self._complete_agent_run_async(result)
+                        if recovering:
+                            await self._recover_session_async(explicit=True)
+                        else:
+                            result = await self._agent_runner.run_async()
+                            await self._complete_agent_run_async(result)
                 finally:
                     if self._skill_hints_enabled:
                         await self._clear_skill_catalog_priorities_async()

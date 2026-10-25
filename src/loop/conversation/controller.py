@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Generator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, suppress
 from contextvars import copy_context
+from dataclasses import replace
 from itertools import count
 from queue import Empty, Full
 from threading import Lock, RLock, get_ident
@@ -678,7 +679,7 @@ class SessionController:
             eligible = [
                 item
                 for item in self._inbox.snapshot()
-                if item.kind is InputAdmissionKind.MESSAGE
+                if item.kind in {InputAdmissionKind.MESSAGE, InputAdmissionKind.RESUME}
                 and (item.input_id is None or item.session_id == session_id)
                 and item.input_id not in delivered_ids
             ]
@@ -741,7 +742,7 @@ class SessionController:
             eligible = [
                 item
                 for item in self._inbox.snapshot()
-                if item.kind is InputAdmissionKind.MESSAGE
+                if item.kind in {InputAdmissionKind.MESSAGE, InputAdmissionKind.RESUME}
                 and isinstance(item.message, str)
                 and (
                     item.input_id is None
@@ -1405,22 +1406,21 @@ class SessionController:
             return
         if value == "":
             self._source.warning("Please enter a message!")
-        elif (
-            self._session_manager is not None
-            and self._session_manager.recovery_pending
-            and not self._control.active
-        ):
-            self._source.warning(
-                "Recover the interrupted run or start a new session before sending a message."
-            )
         elif self._session_manager is not None:
-            steer = self._control.active and self._input_mode == "steer"
-            priority = _STEERING_PRIORITY if steer else _INPUT_PRIORITY
+            resume = (
+                self._control.paused
+                or self._control.stop_requested
+                or (self._session_manager.recovery_pending and not self._control.active)
+            )
+            steer = self._control.active and (resume or self._input_mode == "steer")
+            priority = _STEERING_PRIORITY if steer or resume else _INPUT_PRIORITY
             admission = await self._durable_admission_async(
                 str(value),
                 priority=priority,
                 bypass_commands=True,
             )
+            if resume:
+                admission = replace(admission, kind=InputAdmissionKind.RESUME)
             admitted = (
                 await self._enqueue_steering_async(
                     str(value), admission=admission, report_full=False
@@ -1432,13 +1432,16 @@ class SessionController:
                     report_full=False,
                 )
             )
+            if admitted and resume:
+                self._control.continue_run()
             if not admitted:
                 await self._reject_admission_async(admission)
                 self._source.warning(
                     "Input queue is full; this input was not accepted. Try again later."
                 )
-        elif self._control.active and self._input_mode == "steer":
-            await self._enqueue_steering_async(value)
+        elif self._control.active and (self._control.paused or self._input_mode == "steer"):
+            if await self._enqueue_steering_async(value):
+                self._control.continue_run()
         else:
             await self._enqueue_async(value)
 

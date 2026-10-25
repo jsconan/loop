@@ -813,28 +813,63 @@ def test_resume_command_offers_and_completes_an_interrupted_agent_run(tmp_path):
     ]
 
 
-def test_run_declining_recovery_blocks_new_input_without_mutating_history(tmp_path):
-    """An unresolved run remains intact and prevents an incompatible new user turn."""
+@pytest.mark.parametrize("synchronous", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_message_resumes_declined_recovery_with_new_input(tmp_path, synchronous, failed):
+    """Sending text resumes an incomplete or failed run with the new instruction in context."""
     session = Session(messages=[Message(role="user", content="unfinished")])
-    interaction = output_interaction()
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.response_context.side_effect = nullcontext
     interaction.confirm.return_value = False
-    interaction.prompt.side_effect = ["new question", False]
-    backend = loop_backend(get_response=Mock())
+    interaction.confirm_async = AsyncMock(return_value=False)
+    values = iter(("new question", False))
+    requests = []
+
+    def response(**kwargs):
+        """Verify the new message is applied before the first resumed model request."""
+        requests.append(kwargs["input"])
+        assert [item.content for item in kwargs["input"] if isinstance(item, Message)] == [
+            "unfinished",
+            "new question",
+        ]
+        return [
+            ResponseCompleted(answer="answer", items=(Message(role="assistant", content="answer"),))
+        ]
+
+    async def response_async(**kwargs):
+        """Expose the same response contract to native asynchronous execution."""
+        for event in response(**kwargs):
+            yield event
+
     loop = Loop.create_default(
-        backend=backend,
+        backend=loop_backend(get_response=response, get_response_async=response_async),
         interaction=interaction,
         session=session,
         working_directory=tmp_path,
+        session_name_generator=LocalSessionNameGenerator(),
     )
+    loop.agent_runner.compaction.compact_if_needed = Mock(return_value=False)
+    loop.agent_runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    if failed:
+        loop.agent_runner.session_manager.begin_run()
+        loop.agent_runner.session_manager.record_run_failure()
 
-    loop.run()
+    async def read_async(_completer):
+        """Return a new instruction without an explicit recovery command."""
+        return next(values)
 
-    assert loop.messages == [Message(role="user", content="unfinished")]
-    assert loop._session_manager.recovery_pending is True
-    backend.get_response.assert_not_called()
-    interaction.warning.assert_called_once_with(
-        "Recover the interrupted run or start a new session before sending a message."
-    )
+    if synchronous:
+        loop.run(input_source=lambda _completer: next(values))
+        interaction.confirm.assert_called_once()
+    else:
+        asyncio.run(loop.run_async(input_source=read_async))
+        interaction.confirm_async.assert_awaited_once()
+
+    assert len(requests) == 1
+    assert [item.content for item in loop.messages] == ["unfinished", "new question", "answer"]
+    assert loop.recovery_pending is False
+    assert sum(event.type == "run_retry_started" for event in session.events) == int(failed)
+    interaction.warning.assert_not_called()
 
 
 def test_sync_run_keeps_loop_available_after_recoverable_failure(tmp_path):
@@ -1642,6 +1677,215 @@ def test_async_cold_stop_keeps_recovery_pending_in_session_history(tmp_path):
 
     assert loop._session_manager.recovery_pending is True
     assert loop._session_manager.recovery_state.action == "query_model"
+
+
+@pytest.mark.parametrize("synchronous", [False, True])
+@pytest.mark.parametrize("boundary", ["paused", "stopped", "stopping"])
+def test_message_resumes_controlled_run_before_old_tools_execute(tmp_path, synchronous, boundary):
+    """New text wakes a paused or stopped owner and supersedes its remaining tool work."""
+    source = MagicMock(spec=ConsoleInteraction)
+    source.response_context.side_effect = nullcontext
+    controller = SessionController(source, input_mode="queue")
+    sessions = SessionManager(
+        interaction=controller.interaction, session_store=MemorySessionStore()
+    )
+    controller.bind_session_manager(sessions)
+    requests = []
+    results = []
+    paused_or_stopping, stopped, finished = (asyncio.Event() for _ in range(3))
+    owner_loop = None
+    old_call = ToolCall(call_id="old", name="effect", arguments="{}")
+
+    def events(**kwargs):
+        """Pause or stop during the first response, before its tool can execute."""
+        requests.append(kwargs["input"])
+        if len(requests) == 1:
+            if boundary == "paused":
+                assert controller.request_pause()
+            else:
+                assert controller.request_stop_run()
+            owner_loop.call_soon_threadsafe(paused_or_stopping.set)
+            yield ToolCallCompleted(call=old_call)
+            yield ResponseCompleted(items=(old_call,))
+        else:
+            assert [
+                item.content
+                for item in kwargs["input"]
+                if isinstance(item, Message) and item.role == "user"
+            ] == ["delete files", "only list files"]
+            yield ResponseCompleted(
+                answer="listed", items=(Message(role="assistant", content="listed"),)
+            )
+
+    async def events_async(**kwargs):
+        """Expose the same controlled response to the asynchronous owner."""
+        for event in events(**kwargs):
+            yield event
+
+    loop = Loop.create_default(
+        backend=loop_backend(get_response=events, get_response_async=events_async),
+        interaction=controller.interaction,
+        session_manager=sessions,
+        run_control=controller.control,
+        working_directory=tmp_path,
+        session_name_generator=LocalSessionNameGenerator(),
+    )
+    controller.bind_command_manager(loop.command_manager)
+    loop.agent_runner.compaction.compact_if_needed = Mock(return_value=False)
+    loop.agent_runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    loop.agent.tools.call_with_timing = Mock()
+    loop.agent.tools.call_with_timing_async = AsyncMock()
+    prompts = 0
+
+    def metrics(result):
+        """Expose run settlement without relying on scheduler timing."""
+        results.append(result)
+        if len(results) == 1:
+            stopped.set()
+        if len(results) == 2:
+            finished.set()
+
+    source.run_metrics.side_effect = metrics
+
+    async def prompt(*_args, **_kwargs):
+        """Send a correction after the requested control boundary, then exit on completion."""
+        nonlocal prompts
+        prompts += 1
+        if prompts == 1:
+            return "delete files"
+        if prompts == 2:
+            await paused_or_stopping.wait()
+            if boundary == "stopped":
+                await stopped.wait()
+            return "only list files"
+        await finished.wait()
+        return False
+
+    source.prompt_async.side_effect = prompt
+
+    async def scenario():
+        """Run the real controller and conversation through both ownership modes."""
+        nonlocal owner_loop
+        owner_loop = asyncio.get_running_loop()
+        if synchronous:
+            await controller._run_sync_callback_async(
+                lambda receive: loop.run(input_source=receive)
+            )
+        else:
+            await controller.run_async(lambda receive: loop.run_async(input_source=receive))
+
+    asyncio.run(scenario())
+
+    assert len(requests) == 2
+    assert len(results) == 2
+    assert loop.recovery_pending is False
+    assert sessions.session.pending_inputs == ()
+    assert [
+        item.content for item in loop.messages if isinstance(item, Message) and item.role == "user"
+    ] == ["delete files", "only list files"]
+    loop.agent.tools.call_with_timing.assert_not_called()
+    loop.agent.tools.call_with_timing_async.assert_not_awaited()
+    source.confirm.assert_not_called()
+    source.confirm_async.assert_not_called()
+    source.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("synchronous", [False, True])
+@pytest.mark.parametrize("retry_uncertain", [False, True])
+def test_new_message_cancels_unstarted_recovery_tools_and_confirms_uncertain_retry(
+    tmp_path, synchronous, retry_uncertain
+):
+    """Recovery applies new input first, preserves results, and never silently repeats effects."""
+    source = MagicMock(spec=ConsoleInteraction)
+    source.response_context.side_effect = nullcontext
+    # Decline startup recovery; Send supplies run-level continuation intent.
+    source.confirm.side_effect = [False, retry_uncertain]
+    source.confirm_async = AsyncMock(side_effect=[False, retry_uncertain])
+    sessions = SessionManager(interaction=source, session_store=MemorySessionStore())
+    sessions.add_user_message("delete files")
+    sessions.begin_run()
+    calls = tuple(
+        ToolCall(call_id=name, name=name, arguments="{}")
+        for name in ("completed", "uncertain", "unstarted")
+    )
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=calls, items=calls))
+    sessions.add_tool_call(
+        call_id="completed",
+        output='{"ok":true}',
+        working_directory=str(tmp_path),
+        active_skills=(),
+        succeeded=True,
+    )
+    sessions.add_tool_call_event("uncertain")
+    sessions.record_tool_execution_started("uncertain")
+    queried = []
+
+    def response(**kwargs):
+        """Verify that the first recovered query contains the correction and settled calls."""
+        queried.append(kwargs["input"])
+        assert [
+            item.content
+            for item in kwargs["input"]
+            if isinstance(item, Message) and item.role == "user"
+        ] == ["delete files", "only list files"]
+        assert len([item for item in kwargs["input"] if isinstance(item, ToolResult)]) == 3
+        return [
+            ResponseCompleted(answer="listed", items=(Message(role="assistant", content="listed"),))
+        ]
+
+    async def response_async(**kwargs):
+        """Yield the same checked response through the asynchronous backend boundary."""
+        for event in response(**kwargs):
+            yield event
+
+    loop = Loop.create_default(
+        backend=loop_backend(get_response=response, get_response_async=response_async),
+        interaction=source,
+        session_manager=sessions,
+        working_directory=tmp_path,
+        session_name_generator=LocalSessionNameGenerator(),
+    )
+    loop.agent_runner.compaction.compact_if_needed = Mock(return_value=False)
+    loop.agent_runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
+
+    def execute(name, *_args, **kwargs):
+        """Allow only the explicitly approved uncertain retry after the new message is saved."""
+        assert retry_uncertain
+        assert name == "uncertain"
+        assert sessions.messages[-1].content == "only list files"
+        return '{"ok":true}', 0.01
+
+    loop.agent.tools.call_with_timing = Mock(side_effect=execute)
+    loop.agent.tools.call_with_timing_async = AsyncMock(side_effect=execute)
+    values = iter(("only list files", False))
+
+    async def read_async(_completer):
+        """Submit a correction without an explicit continue command."""
+        return next(values)
+
+    if synchronous:
+        loop.run(input_source=lambda _completer: next(values))
+        source.confirm.assert_called_with(
+            "Tool 'uncertain' may already have run. Retry it?", default=False
+        )
+        assert source.confirm.call_count == 2
+        assert loop.agent.tools.call_with_timing.call_count == int(retry_uncertain)
+    else:
+        asyncio.run(loop.run_async(input_source=read_async))
+        source.confirm_async.assert_awaited_with(
+            "Tool 'uncertain' may already have run. Retry it?", default=False
+        )
+        assert source.confirm_async.await_count == 2
+        assert loop.agent.tools.call_with_timing_async.await_count == int(retry_uncertain)
+
+    outputs = {item.call_id: item.output for item in loop.messages if isinstance(item, ToolResult)}
+    assert "cancelled before execution" in outputs["unstarted"]
+    assert outputs["completed"] == '{"ok":true}'
+    if not retry_uncertain:
+        assert "outcome is unknown" in outputs["uncertain"]
+    assert len(queried) == 1
+    assert loop.recovery_pending is False
+    source.warning.assert_not_called()
 
 
 @pytest.mark.parametrize("edit_pending", [False, True])
@@ -2459,10 +2703,10 @@ def test_run_async_skips_input_after_exit_was_requested(tmp_path):
     interaction.conversation_ended.assert_called_once_with()
 
 
-def test_run_async_recovers_session_changes_and_blocks_messages_when_recovery_is_pending(
+def test_run_async_recovers_session_changes_and_resumes_on_new_input(
     tmp_path,
 ):
-    """New sessions re-run async recovery and pending recovery blocks ordinary messages."""
+    """Session selection checks recovery and new input explicitly resumes its boundary."""
     interaction = output_interaction()
     loop = Loop.create_default(
         backend=loop_backend(),
@@ -2483,13 +2727,16 @@ def test_run_async_recovers_session_changes_and_blocks_messages_when_recovery_is
     )
     recovery_calls = 0
 
-    async def recover_session_async():
-        """Return a durable interrupted run after switching to the new session."""
+    async def recover_session_async(**kwargs):
+        """Verify new input precedes automatic recovery after session selection."""
         nonlocal recovery_calls
         recovery_calls += 1
         if recovery_calls == 2:
             await loop._session_manager.begin_run_async()
             return SimpleNamespace(pending=True, result=None)
+        if recovery_calls == 3:
+            assert kwargs == {"confirmed": True}
+            assert loop.messages[-1].content == "hello"
         return SimpleNamespace(pending=False, result=recovered)
 
     loop.agent_runner.recover_session_async = AsyncMock(side_effect=recover_session_async)
@@ -2497,18 +2744,15 @@ def test_run_async_recovers_session_changes_and_blocks_messages_when_recovery_is
     values = iter(("/new", "hello", False))
 
     async def read_input(_completer):
-        """Feed the new-session command and an input blocked by pending recovery."""
+        """Feed the new-session command and an input that authorizes recovery."""
         return next(values)
 
     asyncio.run(loop.run_async(input_source=read_input))
 
-    assert loop.agent_runner.recover_session_async.await_count == 2
-    assert loop._session_manager.recovery_pending is True
+    assert loop.agent_runner.recover_session_async.await_count == 3
     loop.agent_runner.run_async.assert_not_awaited()
-    interaction.run_metrics.assert_called_once_with(recovered.metrics)
-    interaction.warning.assert_called_once_with(
-        "Recover the interrupted run or start a new session before sending a message."
-    )
+    assert interaction.run_metrics.call_count == 2
+    interaction.warning.assert_not_called()
 
 
 def test_run_async_handles_skill_priorities_and_attached_reference_sizes(tmp_path):

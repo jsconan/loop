@@ -1175,6 +1175,79 @@ def test_runner_recovers_unstarted_tools_before_requerying():
     assert sessions.add_tool_call.call_args.kwargs["succeeded"] is True
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_recovery_uses_saved_correction_without_replaying_unstarted_tools(tmp_path, async_mode):
+    """A restart after saving input keeps the old tool cancelled before the resumed query."""
+    sessions = SessionManager()
+    sessions.add_user_message("delete files")
+    sessions.begin_run()
+    call = ToolCall(call_id="old", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.add_user_message("only list files")
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    backend = Mock()
+    runner = file_runner(tmp_path, backend, sessions=restored)
+    final = Response(
+        answer="listed", reasoning="", items=(Message(role="assistant", content="listed"),)
+    )
+    if async_mode:
+        runner.query_async = AsyncMock(return_value=final)
+        result = asyncio.run(runner.recover_session_async(confirmed=True))
+    else:
+        runner.query = Mock(return_value=final)
+        result = runner.recover_session(confirmed=True)
+
+    assert result.result.stop_reason == "completed"
+    backend.get_response.assert_not_called()
+    outputs = [item.output for item in restored.messages if isinstance(item, ToolResult)]
+    assert len(outputs) == 1
+    assert "cancelled before execution" in outputs[0]
+    assert restored.recovery_pending is False
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_steering_after_pause_prevents_an_approved_tool_from_starting(async_mode):
+    """A correction published while paused is checked again after approval and before effects."""
+    control = RunControl()
+    call = ToolCall(call_id="old", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    runner, sessions, _interaction = agent_runner(responses=[response], run_control=control)
+    sessions.recovery_state = SessionRecoveryState(
+        action="execute_tools", pending_calls=(PendingToolCall(call=call, status="not_started"),)
+    )
+
+    def approve(**kwargs):
+        """Publish accepted input before releasing the same paused execution owner."""
+        assert control.pause()
+        assert control.request_steering(lambda: True)
+        assert control.continue_run()
+        return kwargs["execution_started"]
+
+    def execute(*_args, **kwargs):
+        """Reach the synchronous guard immediately before dispatching tool effects."""
+        approve(**kwargs)()
+        pytest.fail("Superseded tool must not execute")
+
+    async def execute_async(*_args, **kwargs):
+        """Reach the asynchronous guard at the same approved execution boundary."""
+        await approve(**kwargs)()
+        pytest.fail("Superseded tool must not execute")
+
+    if async_mode:
+        runner.query_async = AsyncMock(return_value=response)
+        runner.agent.tools.call_with_timing_async = AsyncMock(side_effect=execute_async)
+        result = asyncio.run(runner.run_async())
+    else:
+        runner.agent.tools.call_with_timing.side_effect = execute
+        result = runner.run()
+
+    assert result.stop_reason == "steered"
+    sessions.record_tool_execution_started.assert_not_called()
+    assert "cancelled before execution" in sessions.add_tool_call.call_args.kwargs["output"]
+    assert control.active is False
+    assert control.stopped is False
+
+
 def test_runner_skips_completed_calls_in_a_partially_recovered_batch():
     """Mixed recovery executes only calls whose durable results are still absent."""
     final = Response(answer="done", reasoning="")

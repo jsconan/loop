@@ -25,7 +25,7 @@ class AgentRunResult(BaseModel):
 
 
 class AgentRecoveryStatus(BaseModel):
-    """Report whether session recovery completed or still blocks new input.
+    """Report whether session recovery completed or left an unresolved durable run boundary.
 
     Args:
         pending (bool): Whether the active session still requires recovery.

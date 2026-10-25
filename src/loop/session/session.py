@@ -337,12 +337,32 @@ class Session:
             return None
 
         suffix = self.messages[completed_items:]
+        last_user = max(
+            (
+                index
+                for index, item in enumerate(suffix)
+                if isinstance(item, Message) and item.role == "user"
+            ),
+            default=-1,
+        )
+        last_generation = max(
+            (
+                index
+                for index, item in enumerate(suffix)
+                if isinstance(item, (ToolCall, Reasoning))
+                or (isinstance(item, Message) and item.role == "assistant")
+            ),
+            default=-1,
+        )
+        superseded = last_user > last_generation >= 0
         calls = [item for item in suffix if isinstance(item, ToolCall)]
         results = self._resolved_call_indices(suffix)
         if not calls:
-            if any(isinstance(item, Message) and item.role == "assistant" for item in suffix):
+            if not superseded and any(
+                isinstance(item, Message) and item.role == "assistant" for item in suffix
+            ):
                 return SessionRecoveryState(action="finalize_run")
-            return SessionRecoveryState(action="query_model")
+            return SessionRecoveryState(action="query_model", superseded=superseded)
 
         presented_indices = {
             event.item_index for event in self.events if isinstance(event, ConversationItemEvent)
@@ -367,11 +387,13 @@ class Session:
             action = "resolve_uncertain_tools"
         elif "not_started" in statuses:
             action = "execute_tools"
-        elif isinstance(suffix[-1], (Message, Reasoning)):
+        elif isinstance(suffix[-1], (Message, Reasoning)) and not superseded:
             action = "finalize_run"
         else:
             action = "query_model"
-        return SessionRecoveryState(action=action, pending_calls=tuple(pending))
+        return SessionRecoveryState(
+            action=action, pending_calls=tuple(pending), superseded=superseded
+        )
 
     @property
     def retry_pending(self) -> bool:
