@@ -1594,6 +1594,135 @@ def test_revoked_request_commit_failure_releases_interaction_ownership(ui):
     manager.new_session()
 
 
+@pytest.mark.parametrize("revocation", ["stop", "interrupt", "cancel"])
+def test_successful_registration_rechecks_revocation_before_presenting_input(ui, revocation):
+    """A committed request revoked during registration never opens or grants its prompt."""
+    store = MemorySessionStore()
+    manager = SessionManager(interaction=ui, session_store=store)
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    register = manager.record_interaction_requested_async
+    owners, answers, revoked = [], [], []
+
+    async def register_then_revoke(*args, **kwargs):
+        """Commit the request before the controller observes cancellation at the await boundary."""
+        await register(*args, **kwargs)
+        if revocation == "stop":
+            controller.stop()
+        elif revocation == "interrupt":
+            assert controller.request_interrupt()
+        else:
+            owners[0].cancel()
+        await asyncio.sleep(0)
+
+    async def conversation(_receive):
+        """Catch revocation of an idle-command question without accepting an answer."""
+        owners.append(asyncio.current_task())
+        with (
+            manager.execution(allow_session_selection=True),
+            controller.control.execution(async_owner=True),
+        ):
+            try:
+                answers.append(await controller.interaction.confirm_async("Overwrite?"))
+            except (KeyboardInterrupt, RunInterrupted, asyncio.CancelledError):
+                revoked.append(True)
+
+    manager.record_interaction_requested_async = register_then_revoke
+    ui.confirm_async = AsyncMock(return_value=True)
+    read_inputs(ui, asyncio.Queue())
+    asyncio.run(controller.run_async(conversation))
+
+    assert revoked == [True] and answers == []
+    ui.confirm_async.assert_not_awaited()
+    assert manager.session.pending_interactions == ()
+    assert manager.session.events[-1].outcome == "revoked"
+    assert sum(event.type == "interaction_settled" for event in manager.session.events) == 1
+    manager.new_session()
+
+
+@pytest.mark.parametrize("late_value", [False, True])
+def test_requester_cancellation_settles_its_open_input_without_an_answer(ui, late_value):
+    """Cancelling an owner cancels its matching input and ignores any stale value it returns."""
+    manager = SessionManager(interaction=ui, session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    ready, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    owners, answers = [], []
+
+    async def confirm(*_args, **_kwargs):
+        """Keep input open until cancellation, optionally returning a stale affirmative value."""
+        ready.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            if not late_value:
+                raise
+        return True
+
+    async def conversation(_receive):
+        """End the waiting request without abandoning controller settlement."""
+        owners.append(asyncio.current_task())
+        with manager.execution(allow_session_selection=True):
+            try:
+                answers.append(await controller.interaction.confirm_async("Overwrite?"))
+            except asyncio.CancelledError:
+                pass
+
+    async def scenario():
+        """Cancel the owner and observe input cancellation before releasing the fallback gate."""
+        task = asyncio.create_task(controller.run_async(conversation))
+        try:
+            await ready.wait()
+            owners[0].cancel()
+            await owners[0]
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert cancelled.is_set()
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+        await task
+
+    ui.confirm_async.side_effect = confirm
+    read_inputs(ui, asyncio.Queue())
+    asyncio.run(scenario())
+
+    assert answers == []
+    assert manager.session.pending_interactions == ()
+    assert manager.session.events[-1].outcome == "revoked"
+    manager.new_session()
+
+
+def test_requester_cancellation_ignores_an_input_value_already_returned(ui):
+    """A completed input task cannot grant an answer to an owner that has just cancelled."""
+    manager = SessionManager(interaction=ui)
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    owners, answers = [], []
+
+    async def confirm(*_args, **_kwargs):
+        """Cancel the owner immediately before the input coroutine returns its stale value."""
+        owners[0].cancel()
+        return True
+
+    async def conversation(_receive):
+        """Observe cancellation rather than consuming a returned input value."""
+        owners.append(asyncio.current_task())
+        try:
+            answers.append(await controller.interaction.confirm_async("Overwrite?"))
+        except asyncio.CancelledError:
+            pass
+
+    ui.confirm_async.side_effect = confirm
+    read_inputs(ui, asyncio.Queue())
+    asyncio.run(controller.run_async(conversation))
+
+    assert answers == []
+    assert manager.session.pending_interactions == ()
+    assert manager.session.events[-1].outcome == "revoked"
+
+
 @pytest.mark.parametrize(
     ("error", "outcome"),
     [

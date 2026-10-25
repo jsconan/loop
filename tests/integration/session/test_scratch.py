@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import Interaction, SessionManager, SQLiteSessionStore
+from loop import Interaction, SessionExecutionConflictError, SessionManager, SQLiteSessionStore
 from loop.utils.path import private_directory_lock
 
 pytestmark = pytest.mark.integration
@@ -193,7 +193,9 @@ else:
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
-@pytest.mark.parametrize("outcome", ["answer", "reject", "cancel", "crash", "failure"])
+@pytest.mark.parametrize(
+    "outcome", ["answer", "reject", "cancel", "crash", "failure", "registration-stop"]
+)
 def test_idle_export_confirmation_excludes_concurrent_recovery(tmp_path, mode, outcome):
     """Idle export confirmations retain ownership through answer, cancellation, or owner death."""
     database = tmp_path / "private" / "sessions.db"
@@ -219,9 +221,20 @@ controller=SessionController(ui)
 manager=SessionManager(interaction=controller.interaction,
     session_store=SQLiteSessionStore(sys.argv[1],workspace_id="workspace"))
 manager.rename_session("kept conversation")
+register=manager.record_interaction_requested_async
+async def register_then_stop(*args,**kwargs):
+    await register(*args,**kwargs)
+    if sys.argv[4]=="registration-stop":
+        print(json.dumps({"id":manager.session.id}),flush=True)
+        await asyncio.to_thread(sys.stdin.readline)
+        controller.stop()
+        await asyncio.sleep(0)
+manager.record_interaction_requested_async=register_then_stop
 async def prompt(*args,**kwargs):
     return await inputs.get()
 async def confirm(*args,**kwargs):
+    if sys.argv[4]=="registration-stop":
+        return True
     print(json.dumps({"id":manager.session.id}),flush=True)
     answer=(await asyncio.to_thread(sys.stdin.readline)).strip()
     if answer=="cancel":
@@ -253,6 +266,8 @@ try:
         else:
             asyncio.run(controller.run_async(
                 lambda receive:loop.run_async(input_source=receive),route_idle_commands=True))
+    if sys.argv[4]=="registration-stop":
+        assert ui.confirm_async.await_count==0
 except OSError as error:
     if str(error)!="settlement unavailable":
         raise
@@ -279,7 +294,7 @@ else:
     raise RuntimeError("Live idle confirmation was admitted for recovery")
 """
     owner = subprocess.Popen(
-        [sys.executable, "-B", "-u", "-c", source, str(database), str(destination), mode],
+        [sys.executable, "-B", "-u", "-c", source, str(database), str(destination), mode, outcome],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -309,7 +324,11 @@ else:
         restored = SessionManager(
             interaction=Mock(spec=Interaction), session=session_id, session_store=store
         )
-        expected = "revoked" if outcome in {"cancel", "crash", "failure"} else "answered"
+        expected = (
+            "revoked"
+            if outcome in {"cancel", "crash", "failure", "registration-stop"}
+            else "answered"
+        )
         assert restored.session.pending_interactions == ()
         assert restored.session.events[-1].outcome == expected
         assert sum(event.type == "interaction_settled" for event in restored.session.events) == 1
@@ -324,6 +343,104 @@ else:
             assert "kept conversation" in destination.read_text()
         else:
             assert destination.read_text() == "original export"
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        owner.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("selection", [False, True])
+@pytest.mark.parametrize("late_value", [False, True])
+def test_requester_cancellation_retains_ownership_through_revocation(
+    tmp_path, selection, late_value
+):
+    """A cancelled owner closes its prompt and retains native exclusion until revocation commits."""
+    database = tmp_path / "sessions.db"
+    source = """
+import asyncio,json,signal,sys
+from contextlib import nullcontext
+from unittest.mock import MagicMock,patch
+from loop import ConsoleInteraction,SessionController,SessionManager,SQLiteSessionStore
+signal.alarm(20)
+async def main():
+    ui=MagicMock(spec=ConsoleInteraction)
+    manager=SessionManager(interaction=ui,
+        session_store=SQLiteSessionStore(sys.argv[1],workspace_id="workspace"))
+    controller=SessionController(ui)
+    controller.bind_session_manager(manager)
+    ready,cancelled=asyncio.Event(),asyncio.Event()
+    owners=[]
+    async def confirm(*args,**kwargs):
+        ready.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            if sys.argv[3]=="True":
+                return True
+            raise
+    async def conversation(receive):
+        owners.append(asyncio.current_task())
+        with manager.execution(allow_session_selection=sys.argv[2]=="True"):
+            try:
+                await controller.interaction.confirm_async("Approve?")
+            except asyncio.CancelledError:
+                pass
+    settle=manager.record_interaction_settled_async
+    async def settle_after_gate(*args,**kwargs):
+        assert cancelled.is_set()
+        print("settling",flush=True)
+        await asyncio.to_thread(sys.stdin.readline)
+        await settle(*args,**kwargs)
+    ui.confirm_async.side_effect=confirm
+    manager.record_interaction_settled_async=settle_after_gate
+    with patch("loop.conversation.controller.patch_stdout",lambda **kwargs:nullcontext()):
+        task=asyncio.create_task(controller.run_async(conversation))
+        await ready.wait()
+        print(json.dumps({"id":manager.session.id}),flush=True)
+        await asyncio.to_thread(sys.stdin.readline)
+        owners[0].cancel()
+        await owners[0]
+        await task
+    assert manager.session.pending_interactions==()
+    assert manager.session.events[-1].outcome=="revoked"
+    print("done",flush=True)
+asyncio.run(main())
+"""
+    owner = subprocess.Popen(
+        [sys.executable, "-B", "-u", "-c", source, str(database), str(selection), str(late_value)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        session_id = json.loads(owner.stdout.readline())["id"]
+        store = SQLiteSessionStore(database, workspace_id="workspace")
+        snapshot = store.load(session_id).serialize()
+        with pytest.raises(SessionExecutionConflictError):
+            SessionManager(
+                interaction=Mock(spec=Interaction), session=session_id, session_store=store
+            )
+        owner.stdin.write("cancel\n")
+        owner.stdin.flush()
+        assert owner.stdout.readline() == "settling\n"
+        assert store.load(session_id).serialize() == snapshot
+        with pytest.raises(SessionExecutionConflictError):
+            SessionManager(
+                interaction=Mock(spec=Interaction), session=session_id, session_store=store
+            )
+        stdout, stderr = owner.communicate("commit\n", timeout=10)
+        assert owner.returncode == 0, stderr
+        assert stdout == "done\n" and stderr == ""
+        restored = SessionManager(
+            interaction=Mock(spec=Interaction), session=session_id, session_store=store
+        )
+        assert restored.session.pending_interactions == ()
+        assert restored.session.events[-1].outcome == "revoked"
+        assert sum(event.type == "interaction_settled" for event in restored.session.events) == 1
+        with restored.execution():
+            pass
     finally:
         if owner.poll() is None:
             owner.kill()

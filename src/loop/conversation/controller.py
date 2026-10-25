@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Generator, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, suppress
 from contextvars import copy_context
 from itertools import count
@@ -1326,11 +1326,7 @@ class SessionController:
         if event.result.done():
             return
         if event.kind not in {EVENT_OUTPUT, EVENT_TERMINAL_EXIT}:
-            if self._control.stopped:
-                event.result.set_exception(KeyboardInterrupt())
-                return
-            if self._control.interrupted:
-                event.result.set_exception(RunInterrupted())
+            if self._interaction_revoked(event):
                 return
             with ExitStack() as resources:
                 if self._session_manager is not None:
@@ -1801,6 +1797,18 @@ class SessionController:
             report_full=report_full,
         )
 
+    def _interaction_revoked(self, request: InteractionCall) -> bool:
+        """Refuse completed requests and revoke input after shutdown or run interruption."""
+        if request.result.done():
+            return True
+        if self._control.stopped:
+            request.result.set_exception(KeyboardInterrupt())
+            return True
+        if self._control.interrupted:
+            request.result.set_exception(RunInterrupted())
+            return True
+        return False
+
     async def _answer_async(self) -> tuple[bool, object]:
         """Settle the pending request and return its answer before the caller releases ownership."""
         request = cast(InteractionCall, self._pending)
@@ -1810,6 +1818,8 @@ class SessionController:
         resolved_result = None
         answered = False
         try:
+            if self._interaction_revoked(request):
+                return False, None
             if request.kind == EVENT_TERMINAL:
                 result = request.function(*request.args, **request.kwargs)
                 self._terminal_owned = True
@@ -1821,6 +1831,14 @@ class SessionController:
                 )
                 answer_input = asyncio.create_task(function(*request.args, **request.kwargs))
                 self._answer_input = answer_input
+                loop = asyncio.get_running_loop()
+
+                def cancel_input(future: Future) -> None:
+                    """Cancel only this request's input when its waiting owner abandons it."""
+                    if future.cancelled() and not answer_input.done():
+                        loop.call_soon_threadsafe(answer_input.cancel)
+
+                request.result.add_done_callback(cancel_input)
                 result = await answer_input
             resolved_result = result
             answered = True
@@ -1832,8 +1850,9 @@ class SessionController:
                 and request.result.done()
                 and isinstance(request.result.exception(), RunInterrupted)
             )
-            outcome = "revoked" if self._stopping or interrupted else "failed"
-            if self._pending is request and not self._stopping and not interrupted:
+            revoked = self._stopping or interrupted or request.result.cancelled()
+            outcome = "revoked" if revoked else "failed"
+            if self._pending is request and not revoked:
                 primary = error
         except BaseException as error:  # noqa: BLE001 - return all UI failures to the owner
             outcome = "failed"
@@ -1849,7 +1868,9 @@ class SessionController:
                 request_error = None
                 if request.result.done() and not request.result.cancelled():
                     request_error = request.result.exception()
-                if isinstance(request_error, (KeyboardInterrupt, RunInterrupted)):
+                if request.result.cancelled() or isinstance(
+                    request_error, (KeyboardInterrupt, RunInterrupted)
+                ):
                     outcome = "revoked"
                 elif request_error is not None:
                     outcome = "failed"
