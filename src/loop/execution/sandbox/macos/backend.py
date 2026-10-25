@@ -286,7 +286,7 @@ class SeatbeltDiagnosticService:
 
 def _literal(path: Path | str) -> str:
     """Quote an absolute pathname as a Seatbelt literal."""
-    return json.dumps(str(path))
+    return json.dumps(str(path), ensure_ascii=False)
 
 
 def _regex(pattern: str) -> str:
@@ -542,12 +542,7 @@ def _profile(
     )
     ancestors = {parent for root in (*reads, *search_paths) for parent in root.parents}
     read_rules = (
-        " ".join(
-            f"(literal {_literal(path)})"
-            for path in sorted(ancestors - {Path("/private/tmp")}, key=str)
-        )
-        + " "
-        + " ".join(f"(subpath {_literal(path)})" for path in reads)
+        " ".join(f"(subpath {_literal(path)})" for path in reads)
         + " "
         + " ".join(f"(literal {_literal(path)})" for path in compatibility_files)
         + " "
@@ -556,10 +551,7 @@ def _profile(
         + " ".join(f"(literal {_literal(path)})" for path in _exact_executable_reads(request))
     )
     search_metadata = (
-        " ".join(
-            f"(literal {_literal(path)})"
-            for path in sorted(ancestors & {Path("/private/tmp")}, key=str)
-        )
+        " ".join(f"(literal {_literal(path)})" for path in sorted(ancestors, key=str))
         + " "
         + " ".join(f"(literal {_literal(path)})" for path in limited_search)
         + " "
@@ -625,6 +617,11 @@ def _profile(
             f"(require-not (subpath {_literal(scratch)}))) "
             + _regex(f"^{re.escape(str(scratch))}/(.*/)?{private_names}(/.*)?$")
         )
+    scratch_ancestors = " ".join(f"(literal {_literal(path)})" for path in scratch.parents)
+    private_metadata = (
+        f"(require-all (require-any {private_reads}) "
+        f"(require-not (require-any {scratch_ancestors})))"
+    )
     temp_prefix = re.escape(str(darwin_temp))
     hex_suffix = "[0-9A-Fa-f]" * 6
     temp_rules = " ".join(
@@ -657,9 +654,11 @@ def _profile(
 (allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo")
   (global-name "com.apple.bsd.dirhelper"))
 (allow file-read* {read_rules})
+(allow file-read-data (literal "/"))
 {search_metadata_rule}
 (allow file-read* (literal {_literal(darwin_temp)}) {temp_cache})
-(deny file-read* {private_reads} (with message "{tag}"))
+(deny file-read-data {private_reads} (with message "{tag}"))
+(deny file-read-metadata {private_metadata} (with message "{tag}"))
 (allow file-write* {write_rules})
 (allow file-write* {temp_cache})
 (allow file-write-data (require-all (path "/dev/null") (vnode-type CHARACTER-DEVICE)))

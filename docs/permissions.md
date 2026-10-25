@@ -48,7 +48,7 @@ Use `/permissions default reset <scope> <action>` to reset a decision. A workspa
 
 ## Boundaries
 
-Limits restrict what a policy can reach. Rules cannot bypass them. By default, Loop operations can read and write inside the workspace and the active conversation's private temporary directory (`loop-temp`). Host-process access is off, and private or local network addresses are blocked.
+Limits restrict what a policy can reach. Rules cannot bypass them. By default, Loop operations can read and write inside the workspace and the active conversation's private working directory (`loop-temp`), addressed as `$TMPDIR` by commands and file tools. Saved-session files persist across restarts; `/tmp` is an OS path and is not an alias for `loop-temp`. Namespace parents and ownership locks remain outside command authority; native metadata traversal does not permit private ancestor listings. Host-process access is off, and private or local network addresses are blocked.
 
 Use limits to grant narrowly scoped access:
 

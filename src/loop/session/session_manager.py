@@ -3,12 +3,14 @@
 import asyncio
 import json
 import logging
+import os
+import shutil
 from asyncio import current_task
 from collections.abc import AsyncIterable, Awaitable, Callable, Generator, Iterable
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Lock, RLock, get_ident
@@ -38,6 +40,7 @@ from ..response import ResponseCollector
 from ..telemetry import (
     TelemetryContext,
     telemetry_activity,
+    telemetry_audit,
     telemetry_error,
     telemetry_span,
 )
@@ -60,6 +63,7 @@ from ..utils import (
     utc_now,
     validate_content_handle,
 )
+from ..utils.path import private_directory_lock
 from .models import (
     SESSION_NAME_SOURCE_GENERATED,
     SESSION_NAME_SOURCE_INITIAL,
@@ -91,7 +95,7 @@ from .models import (
 )
 from .naming import initial_session_name
 from .session import Session
-from .store import MemorySessionStore, SessionStore
+from .store import MemorySessionStore, SessionStore, WorkingDirectoryBinding
 
 type ExecutionKey = tuple[tuple[str, str | int], str]
 type ExecutionOwner = tuple[int, int, int | None]
@@ -198,6 +202,7 @@ class SessionManager:
             ValueError: The session identity is empty or storage is aliased, not private, or
                 owned by another user.
             OSError: The working directory cannot be created or inspected.
+            SessionExecutionConflictError: Another harness owns this session's working storage.
         """
         with self._state_lock:
             if self._temporary_directory is None:
@@ -205,14 +210,127 @@ class SessionManager:
             return self._temporary_directory
 
     def _session_directory(self, session_id: str) -> Path:
-        """Derive and prepare isolated working storage for one nonempty session identity."""
+        """Create or reopen one generation under native ownership without replacing lost data."""
         if not session_id:
             raise ValueError("Session identifier must not be empty.")
         root = self._session_store.temporary_root
-        directory = root / sha256_digest(session_id.encode("utf-8", errors="surrogatepass"))
-        ensure_private_directory(root)
-        ensure_private_directory(directory)
+        existing = self._session_store.working_binding(session_id)
+        try:
+            ensure_private_directory(root, create=existing is None or existing.retired)
+        except OSError as error:
+            raise ValueError(
+                "Session working storage recovery failed: namespace unavailable."
+            ) from error
+        # Saved stores have a harness-owned namespace parent; memory stores own their root.
+        if root.parent.name == "scratch":
+            ensure_private_directory(root.parent, create=False)
+        locks = root / ".locks"
+        ensure_private_directory(locks)
+        identity = sha256_digest(session_id.encode("utf-8", errors="surrogatepass"))
+        try:
+            with private_directory_lock(locks, identity):
+                return self._bound_directory(session_id, root, identity)
+        except BlockingIOError as error:
+            raise SessionExecutionConflictError(session_id) from error
+
+    def _bound_directory(self, session_id: str, root: Path, identity: str) -> Path:
+        """Validate durable identity or commit an independently created/adopted generation."""
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            return self._working_directory(session_id, root, identity, descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _working_directory(
+        self,
+        session_id: str,
+        root: Path,
+        identity: str,
+        descriptor: int,
+    ) -> Path:
+        """Validate or create storage through an approved namespace descriptor."""
+        binding = self._session_store.working_binding(session_id)
+        anchor = (root, descriptor)
+        if binding is not None and not binding.retired:
+            relative = Path(binding.generation)
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or relative.parts != (identity,)
+                and not (
+                    len(relative.parts) == 2
+                    and relative.parts[0].startswith(identity + ".")
+                    and relative.parts[1] == "files"
+                )
+            ):
+                raise ValueError("Session working storage recovery failed: invalid binding.")
+            directory = root / relative
+            try:
+                if directory.parent != root:
+                    ensure_private_directory(directory.parent, create=False, anchor=anchor)
+                ensure_private_directory(directory, create=False, anchor=anchor)
+                details = directory.stat()
+                if (details.st_dev, details.st_ino) != (binding.device, binding.inode):
+                    raise ValueError("Session working storage recovery failed: identity changed.")
+            except OSError as error:
+                raise ValueError(
+                    "Session working storage recovery failed: root unavailable."
+                ) from error
+            return directory
+        legacy = root / identity
+        if binding is None and (legacy.exists() or legacy.is_symlink()):
+            ensure_private_directory(legacy, create=False, anchor=anchor)
+            directory = legacy
+        else:
+            parent = root / (identity + "." + str(new_uuid()))
+            ensure_private_directory(parent, anchor=anchor)
+            directory = parent / "files"
+            ensure_private_directory(directory, anchor=anchor)
+        details = directory.stat()
+        self._session_store.bind_working_directory(
+            session_id,
+            WorkingDirectoryBinding(
+                str(directory.relative_to(root)), details.st_dev, details.st_ino
+            ),
+        )
+        telemetry_audit("session.working_directory.bound", session_id=session_id)
         return directory
+
+    def discard_working_directory(self) -> None:
+        """Retire current working storage before cleaning it, preserving conversation history.
+
+        Commit a fresh generation before cleanup. Old descriptors and macOS descendants
+        are not revoked; retirement never reuses their former location. Remove the generation
+        parent only when empty, preserving unrelated contents and adopted legacy namespaces.
+
+        Raises:
+            SessionExecutionConflictError: An operation or another harness owns this session.
+            ValueError: The current storage identity is unsafe or missing.
+            OSError: Retirement or cleanup fails; a committed retirement remains in effect.
+        """
+        with self._state_lock:
+            self._check_session_selection()
+            directory = self._session_directory(self._session.id)
+            root = self._session_store.temporary_root
+            identity = sha256_digest(self._session.id.encode("utf-8", errors="surrogatepass"))
+            try:
+                with private_directory_lock(root / ".locks", identity):
+                    directory = self._bound_directory(self._session.id, root, identity)
+                    binding = self._session_store.working_binding(self._session.id)
+                    self._session_store.bind_working_directory(
+                        self._session.id, replace(binding, retired=True)
+                    )
+                    telemetry_audit(
+                        "session.working_directory.retired", session_id=self._session.id
+                    )
+                    replacement = self._bound_directory(self._session.id, root, identity)
+                    if self._temporary_directory is not None:
+                        self._temporary_directory.set(replacement)
+                    shutil.rmtree(directory)
+                    if directory.parent != root:
+                        directory.parent.rmdir()
+            except BlockingIOError as error:
+                raise SessionExecutionConflictError(self._session.id) from error
 
     def _select_session(self, session: Session) -> None:
         """Bind working storage before publishing a newly selected session."""
@@ -318,44 +436,66 @@ class SessionManager:
         )
 
     @contextmanager
-    def execution(self, *, allow_session_selection: bool = False) -> Generator[None, None, None]:
-        """Own this logical session's execution within the current process.
+    def execution(
+        self,
+        *,
+        allow_session_selection: bool = False,
+    ) -> Generator[Path | None, None, None]:
+        """Capture session storage and hold native ownership until all nested operations settle.
 
-        This lease intentionally provides process-local exclusion only. Persisted revision checks
-        independently prevent stale writers in other processes from overwriting newer snapshots.
-        Model and tool execution prevents session selection. Conversation input may permit
-        selection within its own context, including propagated synchronous command workers.
+        Native locks serialize cooperating harnesses; they do not revoke detached descendants'
+        descriptors. Model and tool execution prevents session selection. Conversation input may
+        permit selection while idle; nested operation leases capture the newly selected resource.
 
         Args:
             allow_session_selection (bool): Permit idle conversation commands to select a session.
                 Defaults to ``False``. Nested model and tool leases still prohibit selection.
 
         Yields:
-            None: Control while this manager exclusively owns session execution.
+            Path | None: Captured working root, or ``None`` for idle selection admission.
 
         Raises:
-            SessionExecutionConflictError: If another execution in this process owns the session.
+            SessionExecutionConflictError: If another thread, task, or process owns the session.
+            ValueError: Working storage is missing or unsafe.
+            OSError: Working storage cannot be inspected or locked.
         """
+        resources = ExitStack()
         with self._state_lock:
-            namespace = (
-                ("workspace", self._session.workspace_id)
-                if self._session.workspace_id is not None
-                else ("store", id(self._session_store))
+            key = (
+                (("manager", id(self)), "selection")
+                if allow_session_selection
+                else (("store", str(self._session_store.temporary_root)), self._session.id)
             )
-            key = (namespace, self._session.id)
             owner = _execution_owner(self)
             with _EXECUTION_OWNERS_LOCK:
                 existing = _EXECUTION_OWNERS.get(key)
                 if existing is not None and existing[0] != owner:
                     raise SessionExecutionConflictError(self._session.id)
                 depth = existing[1] + 1 if existing is not None else 1
+                if not allow_session_selection and self._selection_block_depth == 0:
+                    try:
+                        _ = self.temporary_directory
+                        root = self._session_store.temporary_root
+                        identity = sha256_digest(
+                            self._session.id.encode("utf-8", errors="surrogatepass")
+                        )
+                        resources.enter_context(private_directory_lock(root / ".locks", identity))
+                        selected = self._bound_directory(self._session.id, root, identity)
+                        self._temporary_directory.set(selected)
+                    except BlockingIOError as error:
+                        resources.close()
+                        raise SessionExecutionConflictError(self._session.id) from error
+                    except BaseException:
+                        resources.close()
+                        raise
                 _EXECUTION_OWNERS[key] = (owner, depth)
             self._execution_depth += 1
             if not allow_session_selection:
                 self._selection_block_depth += 1
+            captured = None if allow_session_selection else Path(self.temporary_directory)
         token = _SESSION_SELECTION.set(self if allow_session_selection else None)
         try:
-            yield
+            yield captured
         finally:
             _SESSION_SELECTION.reset(token)
             with self._state_lock, _EXECUTION_OWNERS_LOCK:
@@ -367,6 +507,7 @@ class SessionManager:
                     del _EXECUTION_OWNERS[key]
                 else:
                     _EXECUTION_OWNERS[key] = (current_owner, depth - 1)
+                resources.close()
 
     def response(
         self,

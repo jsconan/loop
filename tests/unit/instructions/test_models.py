@@ -6,7 +6,9 @@ from loop.instructions.models import (
     CapturedInstruction,
     InstructionSection,
     LiveInstructionSource,
+    RuntimeEnvironment,
 )
+from loop.utils import VirtualPath
 from loop.utils.hashing import sha256_digest
 
 
@@ -92,3 +94,16 @@ def test_live_instruction_source_observes_changes_and_creates_fresh_captures(tmp
     assert plain.captured_absolute_path == external_path
     with pytest.raises(ValueError, match="different workspace"):
         source.resolve("other", moved)
+
+
+def test_runtime_environment_uses_the_declared_working_root_in_every_example(monkeypatch, tmp_path):
+    """Rendered working-file guidance follows the shared logical root constant."""
+    original = VirtualPath.TEMPORARY
+    monkeypatch.setattr(VirtualPath, "TEMPORARY", "/session-files")
+
+    rendered = RuntimeEnvironment(tmp_path, tmp_path / "files").render()
+
+    assert original not in rendered
+    assert 'cat "/session-files/report.txt"' in rendered
+    assert 'read_text_file(path="/session-files/report.txt")' in rendered
+    assert "Use /session-files for session working files" in rendered

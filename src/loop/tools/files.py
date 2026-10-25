@@ -16,6 +16,7 @@ from ..permissions import Action, FileKind, FileManifestEntry, FileTarget, Opera
 from ..tooling import ToolContext, tool
 from ..utils import (
     TextSearchCase,
+    VirtualPath,
     canonical_path,
     filter_paths_by_globs,
     format_content_diff,
@@ -577,7 +578,7 @@ def list_folder(
     path: Annotated[
         str,
         "loop:virtual-path",
-        Field(description="Path to the folder whose entries should be listed."),
+        Field(description=f"Folder to list; use {VirtualPath.TEMPORARY}/ for session files."),
     ],
     entry_type: Annotated[
         Literal["files", "folders", "all"],
@@ -632,7 +633,14 @@ def list_folder(
 )
 def read_text_file(
     context: ToolContext,
-    path: Annotated[str, "loop:virtual-path", Field(description="Path to the text file to read.")],
+    path: Annotated[
+        str,
+        "loop:virtual-path",
+        Field(
+            description="Path to the text file to read. "
+            f"Use {VirtualPath.TEMPORARY}/ for session files."
+        ),
+    ],
     start_line: Annotated[
         int,
         Field(description="One-based starting line.", ge=1),
@@ -705,7 +713,12 @@ def read_text_file(
 def search_text(
     context: ToolContext,
     path: Annotated[
-        str, "loop:virtual-path", Field(description="Path to a text file or folder to search.")
+        str,
+        "loop:virtual-path",
+        Field(
+            description="Path to a text file or folder to search. "
+            f"Use {VirtualPath.TEMPORARY}/ for session files."
+        ),
     ],
     query: Annotated[
         str,
@@ -817,7 +830,14 @@ def search_text(
 )
 def write_text_file(
     context: ToolContext,
-    path: Annotated[str, "loop:virtual-path", Field(description="Path to the text file to write.")],
+    path: Annotated[
+        str,
+        "loop:virtual-path",
+        Field(
+            description="Path to the text file to write. "
+            f"Use {VirtualPath.TEMPORARY}/ for session files."
+        ),
+    ],
     content: Annotated[str, Field(description="Content to write to the file.")],
 ) -> str | Problem:
     """Write content to a file on the local disk."""
@@ -859,7 +879,9 @@ def write_text_file(
 def edit_text_file(
     context: ToolContext,
     path: Annotated[
-        str, "loop:virtual-path", Field(description="Path to the existing UTF-8 text file to edit.")
+        str,
+        "loop:virtual-path",
+        Field(description=f"UTF-8 file to edit; use {VirtualPath.TEMPORARY}/ for session files."),
     ],
     old_content: Annotated[
         str,
@@ -928,7 +950,10 @@ def delete_path(
     path: Annotated[
         str,
         "loop:virtual-path",
-        Field(description="Path to the file, symbolic link, or folder to permanently delete."),
+        Field(
+            description="File, link, or folder to delete; use "
+            f"{VirtualPath.TEMPORARY}/ for session files."
+        ),
     ],
 ) -> str | Problem:
     """Permanently delete a file, symbolic link, or folder tree from the local disk."""

@@ -1018,8 +1018,16 @@ def test_elevation_binding_only_allows_fixed_sudo_setuid_leaf(host, monkeypatch,
 def test_elevation_binding_pins_fixed_sudo_bytes(binding, monkeypatch):
     """The expected privilege allowance still binds and revalidates the real inode and bytes."""
     binding.chmod(0o755)
+    metadata = Path.lstat
+    spelling = Path("/usr/bin/sudo")
+
+    def elevation_metadata(path):
+        """Inspect the owned fake executable for the fixed elevation spelling."""
+        return metadata(binding if path == spelling else path)
+
+    monkeypatch.setattr(Path, "lstat", elevation_metadata)
     monkeypatch.setattr(Path, "resolve", lambda self, **options: binding)
-    bound = linux_host.bind_host_file(Path("/usr/bin/sudo"), system_elevation=True)
+    bound = linux_host.bind_host_file(spelling, system_elevation=True)
     with bound.open_verified() as descriptor:
         assert os.read(descriptor, 20) == b"native library bytes"
 

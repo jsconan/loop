@@ -490,7 +490,7 @@ def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
     assert "working_directory: /workspace" in prepared(manager)
     assert manager.generation == generation
     manager.set_runtime_environment(RuntimeEnvironment(tmp_path, tmp_path / ("x" * 900)))
-    assert "temporary_directory: /tmp" in prepared(manager)
+    assert "temporary_directory: $TMPDIR" in prepared(manager)
 
 
 def test_virtual_paths_require_a_runtime_environment_for_workspace_relative_paths():
@@ -507,19 +507,20 @@ def test_runtime_environment_keeps_host_paths_private(tmp_path):
 
     assert str(tmp_path) not in prepared(manager)
     assert "working_directory: /workspace" in prepared(manager)
-    assert "temporary_directory: /tmp" in prepared(manager)
+    assert "temporary_directory: $TMPDIR" in prepared(manager)
     assert "resolve_executable" in prepared(manager)
     assert "verified managed toolchains" in prepared(manager)
     assert "grant_reference for executable_grant" in prepared(manager)
     assert "does not prove a host tool is absent" in prepared(manager)
     assert "default sandbox can read workspace files" in prepared(manager)
     assert manager.virtual_paths.resolve("/workspace/source.py") == str(tmp_path / "source.py")
-    assert manager.virtual_paths.resolve("/tmp/output.txt") == str(
+    assert manager.virtual_paths.resolve("$TMPDIR/output.txt") == str(
         tmp_path / "temporary/output.txt"
     )
     assert manager.virtual_paths.display(str(tmp_path / "source.py")) == "/workspace/source.py"
     assert (
-        manager.virtual_paths.display(str(tmp_path / "temporary/output.txt")) == "/tmp/output.txt"
+        manager.virtual_paths.display(str(tmp_path / "temporary/output.txt"))
+        == "$TMPDIR/output.txt"
     )
     assert manager.virtual_paths.redact(f"Failed at {tmp_path}/source.py") == (
         "Failed at /workspace/source.py"

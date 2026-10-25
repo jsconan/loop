@@ -519,9 +519,10 @@ class CommandExecutionService:
         }
         if boundary == "sandbox":
             output["scratch"] = {
-                "path": "$TMPDIR",
+                "path": VirtualPath.TEMPORARY,
                 "lifetime": "this session",
-                "retrieval": "use file tools at /tmp or subsequent commands through $TMPDIR",
+                "retrieval": f"use file tools at {VirtualPath.TEMPORARY} or subsequent commands "
+                f"through {VirtualPath.TEMPORARY}",
             }
             if result.outcome is SandboxOutcome.COMPLETED and result.exit_code != 0:
                 output["executable_hint"] = (
@@ -831,23 +832,28 @@ class CommandExecutionService:
             system_roots = getattr(self._backend, "system_read_roots", ())
             if not isinstance(system_roots, tuple):
                 system_roots = ()
+            native_output_roots = ()
 
             def redact(value: str) -> str:
                 """Hide private aliases and configured canonical roots from model text."""
+                value = paths.redact(value, roots=native_output_roots)
                 for virtual, alias, _ in sorted(
                     alias_tuple, key=lambda item: len(str(item[1])), reverse=True
                 ):
                     value = value.replace(str(alias), virtual)
-                value = value.replace(str(alias_tuple[0][1].parent), "<command-path>")
-                value = paths.redact(value)
+                value = paths.redact(
+                    value,
+                    roots=tuple((str(alias), virtual) for virtual, alias, _ in alias_tuple)
+                    + ((str(directory), "<command-path>"),),
+                )
                 value = value.replace(str(scratch), VirtualPath.TEMPORARY)
                 for root in sorted(redaction_roots, key=lambda item: len(str(item)), reverse=True):
                     if root.is_relative_to(workspace) or any(
                         root.is_relative_to(system) for system in system_roots
                     ):
                         continue
-                    value = value.replace(str(root), VirtualPath.EXTERNAL)
-                return value
+                    value = paths.redact(value, roots=((str(root), VirtualPath.EXTERNAL),))
+                return paths.redact(value)
 
             file_creation_mask = constants.GROUP_AND_OTHER_WRITE_MODE_MASK
             if sys.platform == "linux":
@@ -883,13 +889,16 @@ class CommandExecutionService:
                 generated_environment=generated_environment,
                 file_creation_mask=file_creation_mask,
             )
+            output_paths = getattr(type(self._backend), "output_path_roots", None)
+            if output_paths is not None:
+                native_output_roots = output_paths(self._backend, request)
         except (OSError, ValueError) as exc:
             return Problem(
                 code="sandbox.unavailable",
                 title="Sandbox unavailable",
                 detail=redact(str(exc))
                 if redact
-                else (paths.redact(str(exc)) if paths else str(exc)),
+                else (paths.redact(str(exc)) if paths else "Command preparation failed."),
                 operation=context.tool_name,
             )
         else:

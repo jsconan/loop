@@ -1291,7 +1291,7 @@ def test_mount_arguments_maps_virtual_alias_targets_inside_scratch(binding, tmp_
     parent.mkdir(mode=0o700)
     alias = parent / "r0"
     alias.symlink_to(scratch)
-    request = create(aliases=(("/tmp", alias, scratch),))
+    request = create(aliases=(("$TMPDIR", alias, scratch),))
     with mount_arguments(request, scratch) as (arguments, _):
         assert arguments[-3:] == ("--symlink", str(NATIVE_SCRATCH_PATH), "/.loop-private-paths/r0")
 
@@ -1574,7 +1574,7 @@ def test_session_scratch_under_private_ancestry_keeps_masks_and_hardlink_guards(
     (private / "key").write_text("secret")
     value = create(
         environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
-        aliases=(("/tmp", alias, scratch),),
+        aliases=(("$TMPDIR", alias, scratch),),
     )
     _, masked, _, _ = prepare_paths(value, scratch)
     assert private in masked

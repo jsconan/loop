@@ -1,6 +1,8 @@
 """Verify the native facade rejects unbound tool contexts."""
 
+import json
 import os
+import shlex
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -13,8 +15,10 @@ from loop.execution import facade as execution_facade
 from loop.execution.facade import _automatic_executable_identities
 from loop.execution.sandbox import CommandProcessResult, SandboxOutcome, UnavailableSandboxBackend
 from loop.execution.sandbox.linux.backend import LinuxNativeBackend
+from loop.instructions import InstructionsManager, RuntimeEnvironment
 from loop.permissions import Action, Operation, PermissionManager, ProcessBoundary, ProcessTarget
 from loop.tooling import ToolContext
+from loop.utils import VirtualPath, cached_path
 
 
 def test_execution_requires_a_bound_sandbox_target():
@@ -419,22 +423,9 @@ def test_automatic_executable_identities_rejects_foreign_group_writable_path_roo
     assert _automatic_executable_identities(("tool",), str(tools), workspace) == ()
 
 
-def test_automatic_executable_identities_reject_foreign_owners(tmp_path, monkeypatch):
-    """Files owned by another account cannot receive automatic launch authority."""
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    executable = tools / "tool"
-    executable.write_text("tool", encoding="utf-8")
-    executable.chmod(0o755)
-    monkeypatch.setattr("loop.execution.facade.os.getuid", lambda: -1)
-
-    assert _automatic_executable_identities(("tool",), str(tools), workspace) == ()
-
-
-def test_automatic_executable_identities_reject_foreign_file_owner(tmp_path, monkeypatch):
-    """A current-user PATH cannot automatically authorize a foreign-owned executable."""
+@pytest.mark.parametrize("foreign", ["directory", "file"])
+def test_automatic_executable_identities_reject_foreign_owners(tmp_path, monkeypatch, foreign):
+    """Foreign-owned search roots and executables cannot receive automatic launch authority."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     tools = tmp_path / "tools"
@@ -444,10 +435,10 @@ def test_automatic_executable_identities_reject_foreign_file_owner(tmp_path, mon
     executable.chmod(0o755)
     original_stat = Path.stat
 
-    def foreign_file_owner(path, *args, **kwargs):
-        """Report a foreign owner only for the executable inode."""
+    def foreign_owner(path, *args, **kwargs):
+        """Report an untrusted owner for the selected search root or executable inode."""
         details = original_stat(path, *args, **kwargs)
-        if path == executable:
+        if path == (tools if foreign == "directory" else executable):
             return type(details)(
                 (
                     details.st_mode,
@@ -460,7 +451,7 @@ def test_automatic_executable_identities_reject_foreign_file_owner(tmp_path, mon
             )
         return details
 
-    monkeypatch.setattr(Path, "stat", foreign_file_owner)
+    monkeypatch.setattr(Path, "stat", foreign_owner)
 
     assert _automatic_executable_identities(("tool",), str(tools), workspace) == ()
 
@@ -616,3 +607,92 @@ def test_trusted_search_rejects_workspace_writable_installation_bin(monkeypatch,
     backend.managed_tool_root.return_value = False
     assert service.run_trusted_search((), (), 7.0) is None
     backend.run_read_only_argv.assert_not_called()
+
+
+def test_command_preparation_failure_before_path_binding_has_no_native_exception_text(tmp_path):
+    """Early preparation errors cannot disclose native paths before a redactor exists."""
+    backend = Mock()
+    service = CommandExecutionService(backend, Mock())
+    missing = tmp_path / "synthetic-home-canary" / "missing"
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", ":"), cwd=str(missing), boundary=ProcessBoundary.SANDBOXED
+        ),
+    )
+    result = service.run_command(
+        ToolContext(
+            None,
+            "run_command",
+            operations=(operation,),
+            permission_manager=PermissionManager(tmp_path),
+        ),
+        ":",
+    )
+    assert result.code == "sandbox.unavailable"
+    assert result.detail == "Command preparation failed."
+    backend.run.assert_not_called()
+
+
+@pytest.mark.parametrize("native_output", [False, True])
+def test_command_output_is_sanitized_before_preview_and_continuation_storage(
+    tmp_path, monkeypatch, native_output
+):
+    """Every stored output byte is sanitized while source and user files remain unchanged."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    scratch = tmp_path / "Library/Application Support/synthetic é ;$'"
+    scratch.mkdir(parents=True, mode=0o700)
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
+    variants = [
+        str(scratch),
+        shlex.quote(str(scratch)),
+        json.dumps(str(scratch), ensure_ascii=True)[1:-1],
+        str(scratch.parent),
+    ]
+    raw = "\n".join(variants) * 300
+    backend = Mock()
+    if native_output:
+        raw += "/native-private-scratch/result\n" * 1000
+        monkeypatch.setattr(
+            type(backend),
+            "output_path_roots",
+            Mock(return_value=(("/native-private-scratch", VirtualPath.TEMPORARY),)),
+            raising=False,
+        )
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED,
+        exit_code=0,
+        stdout=raw,
+        stderr=raw,
+    )
+    command = '''printf '%s' '/tmp/data'; cat "$TMPDIR/report"'''
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", command), cwd=str(workspace), boundary=ProcessBoundary.SANDBOXED
+        ),
+    )
+    service = CommandExecutionService(backend, Mock())
+    result = service.run_command(
+        ToolContext(
+            None,
+            "run_command",
+            instructions_manager=instructions,
+            operations=(operation,),
+            permission_manager=PermissionManager(workspace),
+        ),
+        command,
+    )
+    assert backend.run.call_args.args[0].execution_source == command
+    for name in ("stdout", "stderr"):
+        stream = result[name]
+        assert "$TMPDIR" in stream["content"]
+        assert "synthetic" not in stream["content"]
+        cached = cached_path(stream["handle"])[0].read_text()
+        assert "synthetic" not in cached
+        assert "/native-private-scratch" not in cached
+        assert str(tmp_path) not in cached
+        assert "$TMPDIR" in cached

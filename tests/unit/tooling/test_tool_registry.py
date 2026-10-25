@@ -3625,10 +3625,10 @@ def test_command_translates_virtual_roots_and_redacts_aliases(tmp_path, monkeypa
         """Inspect the live alias request before the tool cleans it up."""
         observed.append(request)
         assert request.paths_are_current()
-        assert request.source == "cat /workspace/a '/tmp/b'"
+        assert request.source == 'cat /workspace/a "$TMPDIR/b"'
         assert request.execution_source.startswith(f"cat {request.aliases[0][1]}")
         assert request.aliases[0][0] == "/workspace"
-        assert request.aliases[1][0] == "/tmp"
+        assert request.aliases[1][0] == "$TMPDIR"
         assert request.shell_environment()["TMPDIR"] == str(scratch)
         return CommandProcessResult(
             SandboxOutcome.COMPLETED,
@@ -3642,12 +3642,12 @@ def test_command_translates_virtual_roots_and_redacts_aliases(tmp_path, monkeypa
 
     output = registry.call(
         "run_command",
-        json.dumps({"command": "cat /workspace/a '/tmp/b'"}),
+        json.dumps({"command": 'cat /workspace/a "$TMPDIR/b"'}),
         interaction=interaction,
         instructions_manager=instructions,
     )
 
-    assert result_value(output)["stdout"]["content"] == "/workspace/a /tmp/b"
+    assert result_value(output)["stdout"]["content"] == "/workspace/a $TMPDIR/b"
     interaction.prompt.assert_not_called()
     assert str(tmp_path) not in output
     assert not observed[0].paths_are_current()
@@ -3680,7 +3680,7 @@ def test_command_ignores_virtual_root_substrings(tmp_path, monkeypatch):
     assert result_value(output)["boundary"] == "sandbox"
     request = backend.run.call_args.args[0]
     assert request.execution_source == "echo /tmp-old"
-    assert tuple(virtual for virtual, _, _ in request.aliases) == ("/tmp",)
+    assert tuple(virtual for virtual, _, _ in request.aliases) == ("$TMPDIR",)
 
 
 def test_virtual_command_host_retry_uses_same_live_translation(tmp_path, monkeypatch):

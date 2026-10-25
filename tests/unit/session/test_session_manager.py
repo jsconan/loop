@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shutil
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing, closing, nullcontext
@@ -65,12 +66,14 @@ from loop.session import (
     ToolExecutionStartedEvent,
 )
 from loop.session import session_manager as session_manager_module
+from loop.session.store import WorkingDirectoryBinding
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.utils import (
     cached_metadata,
     cached_path,
     content_identity,
     encode_content_cursor,
+    ensure_private_directory,
     sha256_digest,
     store_content,
 )
@@ -150,7 +153,7 @@ def test_session_working_directory_contains_arbitrary_persisted_identifiers(iden
     unrelated = SessionManager(session=Session(id="ordinary"), session_store=store)
     reopened = SessionManager(session=Session(id=identifier), session_store=store)
 
-    assert directory.parent == store.temporary_root
+    assert directory.parent.parent == store.temporary_root
     assert directory != unrelated.temporary_directory.get()
     assert directory == reopened.temporary_directory.get()
 
@@ -776,8 +779,13 @@ def test_manager_persists_retry_transitions_asynchronously():
 
 def test_manager_rejects_overlapping_execution_and_releases_normal_ownership():
     """One process cannot own the same logical session twice and releases a completed lease."""
-    first = SessionManager(session=Session(id="shared", workspace_id="workspace"))
-    second = SessionManager(session=Session(id="shared", workspace_id="workspace"))
+    store = MemorySessionStore()
+    first = SessionManager(
+        session=Session(id="shared", workspace_id="workspace"), session_store=store
+    )
+    second = SessionManager(
+        session=Session(id="shared", workspace_id="workspace"), session_store=store
+    )
 
     with (
         first.execution(),
@@ -793,8 +801,13 @@ def test_manager_rejects_overlapping_execution_and_releases_normal_ownership():
 @pytest.mark.parametrize("error", [RuntimeError("failed"), KeyboardInterrupt()])
 def test_manager_releases_execution_ownership_after_failure_or_cancellation(error):
     """Exceptions and cancellation cannot strand a process-local session lease."""
-    first = SessionManager(session=Session(id="shared", workspace_id="workspace"))
-    second = SessionManager(session=Session(id="shared", workspace_id="workspace"))
+    store = MemorySessionStore()
+    first = SessionManager(
+        session=Session(id="shared", workspace_id="workspace"), session_store=store
+    )
+    second = SessionManager(
+        session=Session(id="shared", workspace_id="workspace"), session_store=store
+    )
 
     with pytest.raises(type(error)), first.execution():
         raise error
@@ -823,8 +836,13 @@ def test_manager_does_not_conflate_sessions_from_independent_memory_stores():
 
 def test_manager_rejects_same_session_execution_across_threads():
     """A second thread cannot inherit or bypass an active session owner."""
-    first = SessionManager(session=Session(id="shared", workspace_id="workspace"))
-    second = SessionManager(session=Session(id="shared", workspace_id="workspace"))
+    store = MemorySessionStore()
+    first = SessionManager(
+        session=Session(id="shared", workspace_id="workspace"), session_store=store
+    )
+    second = SessionManager(
+        session=Session(id="shared", workspace_id="workspace"), session_store=store
+    )
     acquired = Event()
     release = Event()
 
@@ -3616,3 +3634,225 @@ def test_idle_conversation_selection_reaches_its_async_command_worker():
 
     asyncio.run(select())
     assert manager.session is not original
+
+
+@pytest.mark.parametrize("lost", ["root", "namespace", "generation", "replacement", "mode"])
+def test_bound_working_storage_refuses_missing_or_changed_identity(tmp_path, lost):
+    """Committed working identity cannot silently become empty or gain broader access."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    manager = SessionManager(session_store=store)
+    original = manager.temporary_directory.get()
+    if lost == "replacement":
+        original.rename(original.with_name("retained"))
+        original.mkdir(mode=0o700)
+    elif lost == "mode":
+        original.chmod(0o755)
+    else:
+        original.rmdir()
+        if lost in {"generation", "namespace"}:
+            original.parent.rmdir()
+        if lost == "namespace":
+            shutil.rmtree(store.temporary_root)
+    reopened = SessionManager(session=manager.session, session_store=store)
+    with pytest.raises(ValueError, match="recovery failed|private real directory"):
+        _ = reopened.temporary_directory
+    if lost == "namespace":
+        assert not store.temporary_root.exists()
+    elif lost != "replacement" and lost != "mode":
+        assert not original.exists()
+
+
+def test_existing_working_files_are_adopted_in_place(tmp_path):
+    """Validated pre-generation working files retain their original path and bytes."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    session = Session(id="legacy")
+    original = store.temporary_root / sha256_digest(session.id.encode())
+    ensure_private_directory(original)
+    (original / "report").write_text("retained")
+    manager = SessionManager(session=session, session_store=store)
+    assert manager.temporary_directory.get() == original
+    assert (original / "report").read_text() == "retained"
+    assert store.working_binding(session.id).generation == original.name
+    with manager.execution() as captured:
+        assert captured == original
+
+
+@pytest.mark.parametrize("generation", ["/absolute", "../escape", "wrong", "wrong/files"])
+def test_working_binding_rejects_unrecognized_relative_authority(tmp_path, generation):
+    """Malformed durable bindings never select filesystem authority."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    store.bind_working_directory(manager.session.id, WorkingDirectoryBinding(generation, 1, 2))
+    with pytest.raises(ValueError, match="invalid binding"):
+        _ = manager.temporary_directory
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_working_retirement_creates_a_fresh_generation_and_preserves_history(bound):
+    """Retirement commits new authority without reusing a former writable location."""
+    manager = SessionManager()
+    manager.add_user_message("retained history")
+    reference = manager.temporary_directory if bound else None
+    original = reference.get() if reference else None
+    manager.discard_working_directory()
+    replacement = manager.temporary_directory.get()
+    assert manager.messages == [Message(role="user", content="retained history")]
+    if reference:
+        assert manager.temporary_directory is reference
+        assert reference.get() == replacement
+        assert original != replacement
+        assert not original.exists()
+        assert not original.parent.exists()
+    assert replacement.is_dir()
+
+
+def test_retiring_adopted_storage_preserves_the_namespace_and_other_sessions(tmp_path):
+    """Legacy retirement removes only its leaf while preserving other session authority."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    session = Session(id="legacy")
+    original = store.temporary_root / sha256_digest(session.id.encode())
+    ensure_private_directory(original)
+    (original / "report").write_text("retired")
+    manager = SessionManager(session=session, session_store=store)
+    sibling = SessionManager(session=Session(id="other"), session_store=store)
+    sibling_directory = sibling.temporary_directory.get()
+    (sibling_directory / "report").write_text("preserved")
+    assert manager.temporary_directory.get() == original
+    manager.discard_working_directory()
+    assert not original.exists()
+    assert store.temporary_root.is_dir()
+    assert (sibling_directory / "report").read_text() == "preserved"
+    assert manager.temporary_directory.get().is_dir()
+
+
+def test_retirement_preserves_unexpected_generation_parent_contents():
+    """Cleanup reports an incomplete generation rather than removing unrelated parent data."""
+    manager = SessionManager()
+    original = manager.temporary_directory.get()
+    retained = original.parent / "unexpected"
+    retained.write_text("recoverable")
+    with pytest.raises(OSError, match="not empty"):
+        manager.discard_working_directory()
+    assert not original.exists()
+    assert retained.read_text() == "recoverable"
+    assert manager.temporary_directory.get() != original
+
+
+def test_working_retirement_cleanup_failure_preserves_new_binding(monkeypatch):
+    """Cleanup failure cannot reactivate or reuse a retired writable generation."""
+    manager = SessionManager()
+    reference = manager.temporary_directory
+    original = reference.get()
+    monkeypatch.setattr(session_manager_module.shutil, "rmtree", Mock(side_effect=OSError("busy")))
+    with pytest.raises(OSError, match="busy"):
+        manager.discard_working_directory()
+    assert reference.get() != original
+    assert original.is_dir()
+
+
+@pytest.mark.parametrize("operation", ["prepare", "execute", "discard"])
+def test_native_working_ownership_conflicts_are_bounded(monkeypatch, operation):
+    """Native lock conflicts fail before tools or retirement can touch working files."""
+    manager = SessionManager()
+    original = manager.temporary_directory.get()
+    lock = Mock(side_effect=BlockingIOError("owned"))
+    monkeypatch.setattr(session_manager_module, "private_directory_lock", lock)
+    with pytest.raises(SessionExecutionConflictError):
+        if operation == "prepare":
+            _ = SessionManager(
+                session=manager.session, session_store=manager.store
+            ).temporary_directory
+        elif operation == "execute":
+            with manager.execution():
+                pytest.fail("conflicting execution admitted")
+        else:
+            manager.discard_working_directory()
+    assert original.is_dir()
+
+
+def test_failed_execution_admission_releases_native_resources(monkeypatch):
+    """Validation failure after locking cannot strand an operation or session-selection guard."""
+    manager = SessionManager()
+    directory = manager.temporary_directory.get()
+    directory.rmdir()
+    with pytest.raises(ValueError, match="recovery failed"), manager.execution():
+        pytest.fail("missing generation admitted")
+    manager.new_session()
+    with manager.execution() as captured:
+        assert captured == manager.temporary_directory.get()
+
+
+def test_working_retirement_refuses_a_new_owner_after_preparation(monkeypatch):
+    """A competing harness acquiring ownership after preparation prevents retirement."""
+    manager = SessionManager()
+    original = manager.temporary_directory.get()
+    lock = Mock(side_effect=[nullcontext(), BlockingIOError("owned")])
+    monkeypatch.setattr(session_manager_module, "private_directory_lock", lock)
+    with pytest.raises(SessionExecutionConflictError):
+        manager.discard_working_directory()
+    assert original.is_dir()
+
+
+def test_failed_generation_commit_preserves_unbound_data_and_retries_fresh(monkeypatch):
+    """Filesystem creation preceding a failed metadata commit leaves recoverable unbound data."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    with monkeypatch.context() as change:
+        change.setattr(store, "bind_working_directory", Mock(side_effect=OSError("disk full")))
+        with pytest.raises(OSError, match="disk full"):
+            _ = manager.temporary_directory
+    assert store.working_binding(manager.session.id) is None
+    unbound = next(path for path in store.temporary_root.iterdir() if path.name != ".locks")
+    (unbound / "files/recoverable").write_text("preserved")
+    assert manager.temporary_directory.get().parent != unbound
+    assert (unbound / "files/recoverable").read_text() == "preserved"
+
+
+def test_retirement_cleanup_refuses_a_substituted_symlink(monkeypatch, tmp_path):
+    """Cleanup cannot follow a retired root replaced with a link to unrelated data."""
+    manager = SessionManager()
+    original = manager.temporary_directory.get()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "preserved").write_text("safe")
+    cleanup = shutil.rmtree
+
+    def substitute(path):
+        """Replace only the retired pathname immediately before the safe cleanup boundary."""
+        path.rename(path.with_name("retained"))
+        path.symlink_to(outside, target_is_directory=True)
+        cleanup(path)
+
+    with monkeypatch.context() as change:
+        change.setattr(session_manager_module.shutil, "rmtree", substitute)
+        with pytest.raises(OSError) as failure:
+            manager.discard_working_directory()
+    assert failure.value.filename == original
+    assert original.is_symlink()
+    assert (outside / "preserved").read_text() == "safe"
+    assert manager.temporary_directory.get() != original
+
+
+def test_execution_ownership_keeps_independent_database_namespaces_concurrent(tmp_path):
+    """Equal IDs in distinct databases are independent even under one workspace identity."""
+    managers = [
+        SessionManager(
+            session=Session(id="shared", workspace_id="workspace"),
+            session_store=SQLiteSessionStore(tmp_path / name, workspace_id="workspace"),
+        )
+        for name in ("first.db", "second.db")
+    ]
+    with managers[0].execution(), managers[1].execution():
+        assert managers[0].temporary_directory.get() != managers[1].temporary_directory.get()
+
+
+def test_idle_selection_does_not_retain_ownership_of_a_previous_session():
+    """Idle conversation admission owns its manager while actual operations own captured storage."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    previous = manager.session
+    independent = SessionManager(session=previous, session_store=store)
+    with manager.execution(allow_session_selection=True):
+        manager.new_session()
+        with independent.execution() as original, manager.execution() as selected:
+            assert original != selected

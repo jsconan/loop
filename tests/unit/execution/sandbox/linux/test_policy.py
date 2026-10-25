@@ -453,7 +453,7 @@ def test_session_scratch_policy_guards_future_private_names(bound, tmp_path):
     create, _, scratch = bound
     alias = tmp_path / "alias"
     alias.symlink_to(scratch, target_is_directory=True)
-    value = create(aliases=(("/tmp", alias, scratch),))
+    value = create(aliases=(("$TMPDIR", alias, scratch),))
     policy = render(value, scratch)
 
     assert _literal(str(NATIVE_SCRATCH_PATH)) + "/{,**/}" in policy

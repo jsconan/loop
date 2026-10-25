@@ -904,9 +904,9 @@ def test_native_redirection_exemption_uses_bound_temporary_alias(tmp_path, escap
     suffix = "link/victim" if escape else "report"
     bound = native_request(
         tmp_path,
-        f"printf text >/tmp/{suffix}",
+        f'printf text >"$TMPDIR/{suffix}"',
         execution_source=f"printf text >{alias}/{suffix}",
-        aliases=(("/tmp", alias, scratch),),
+        aliases=(("$TMPDIR", alias, scratch),),
         read_roots=(),
         write_roots=(tmp_path, scratch),
     )
@@ -3449,7 +3449,7 @@ def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
     prompt = interaction.info.call_args.args[0]
-    assert "/tmp/output.log" in prompt
+    assert "$TMPDIR/output.log" in prompt
 
 
 def test_process_target_display_preserves_external_temporary_paths(tmp_path):

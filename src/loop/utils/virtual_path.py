@@ -1,5 +1,6 @@
 """Translate model-visible paths without filesystem-ignore or application dependencies."""
 
+import json
 import os
 import re
 import shlex
@@ -14,7 +15,7 @@ class VirtualPath:
 
     Args:
         workspace (Path | None): Local directory represented as ``/workspace``.
-        temporary_directory (Path | None): Local directory represented as ``/tmp``.
+        temporary_directory (Path | None): Local directory represented as ``$TMPDIR``.
         skill_roots (Mapping[str, Path]): Skill resource directories represented below
             ``/skills/<name>``.
 
@@ -23,7 +24,7 @@ class VirtualPath:
     """
 
     WORKSPACE = "/workspace"
-    TEMPORARY = "/tmp"
+    TEMPORARY = "$TMPDIR"
     SKILLS = "/skills"
     EXTERNAL = "<external>"
 
@@ -61,7 +62,7 @@ class VirtualPath:
             raise ValueError("Path must be a virtual or workspace-relative path.")
         if value.startswith(("workspace:", "scratch:", "skill:")):  # Detect deprecated path aliases
             raise ValueError("Path aliases are not supported; use a VirtualPath.")
-        if value.startswith("/"):
+        if value.startswith(("/", "$")):
             for virtual_root, local_root in self._roots.items():
                 if value == virtual_root or value.startswith(f"{virtual_root}/"):
                     return self._local_path(local_root, value[len(virtual_root) :].lstrip("/"))
@@ -125,7 +126,11 @@ class VirtualPath:
         Returns:
             str: Source with path-segment root occurrences replaced in one pass. A bare
                 directory root gains a trailing slash so tools traverse the alias symlink.
+            ``$TMPDIR`` is excluded because the shell expands its environment value.
         """
+        if not aliases:
+            return source
+        aliases = {root: path for root, path in aliases.items() if root != VirtualPath.TEMPORARY}
         if not aliases:
             return source
         roots = "|".join(re.escape(root) for root in sorted(aliases, key=len, reverse=True))
@@ -182,7 +187,19 @@ class VirtualPath:
         """
         selected_roots = self.redaction_roots() if roots is None else roots
         for local, virtual in selected_roots:
-            value = value.replace(local, virtual)
+            for spelling in sorted(
+                {
+                    local,
+                    shlex.quote(local),
+                    re.sub(r"([^\w/.-])", r"\\\1", local),
+                    local.replace("/", "\\/"),
+                    json.dumps(local, ensure_ascii=True)[1:-1],
+                    json.dumps(local, ensure_ascii=False)[1:-1],
+                },
+                key=len,
+                reverse=True,
+            ):
+                value = value.replace(spelling, virtual)
         return value
 
     def redaction_roots(self) -> tuple[tuple[str, str], ...]:
@@ -192,12 +209,21 @@ class VirtualPath:
             tuple[tuple[str, str], ...]: Local path spellings paired with their virtual roots,
                 ordered from longest to shortest for safe replacement.
         """
-        roots = (
-            (str(local), virtual)
-            for virtual, root in self._roots.items()
-            for local in (root, root.resolve(strict=False))
-        )
-        return tuple(sorted(roots, key=lambda pair: len(pair[0]), reverse=True))
+        roots = {}
+        for virtual, root in self._roots.items():
+            for local in (root, root.resolve(strict=False)):
+                for parent in local.parents:
+                    if len(parent.parts) > 2:
+                        roots.setdefault(str(parent), self.EXTERNAL)
+                roots[str(local)] = virtual
+                # Diagnostic tools commonly abbreviate an account's home with a tilde.
+                for candidate in (local, *local.parents):
+                    parts = candidate.parts
+                    if len(parts) > 3 and parts[1] in {"Users", "home"}:
+                        roots["~/" + "/".join(parts[3:])] = (
+                            virtual if candidate == local else self.EXTERNAL
+                        )
+        return tuple(sorted(roots.items(), key=lambda pair: len(pair[0]), reverse=True))
 
     def _resolve_command_argument(self, argument: str) -> str:
         """Resolve an exact virtual argument or the value portion of an option."""

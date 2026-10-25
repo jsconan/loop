@@ -127,7 +127,7 @@ def test_public_granted_roots_keep_private_components_denied(
     if role == "workspace":
         root, virtual, reads = native_workspace, "/workspace", []
     elif role == "temporary":
-        root, virtual, reads = public_command.scratch, "/tmp", []
+        root, virtual, reads = public_command.scratch, "$TMPDIR", []
     elif role == "skill":
         public_command.instructions.activate_skill("fixture")
         root, virtual, reads = public_command.skill_root, "/skills/fixture", []
@@ -135,6 +135,11 @@ def test_public_granted_roots_keep_private_components_denied(
         root = native_workspace.parent / "extra"
         root.mkdir()
         virtual, reads = str(root), [str(root)]
+
+    def shell_path(value):
+        """Expand the session token while preserving literal path suffix characters."""
+        return '"' + value + '"' if value.startswith("$TMPDIR") else shlex.quote(value)
+
     (root / "neighbor").write_text("ordinary-readable")
     for prefix in ("", "nested/"):
         directory = root / prefix / component
@@ -144,9 +149,9 @@ def test_public_granted_roots_keep_private_components_denied(
         created = directory / "new-entry"
         for spelling in dict.fromkeys((str(existing), f"{virtual}/{prefix}{component}/credential")):
             result = public_command.call(
-                f": {shlex.quote(virtual)}; cat {shlex.quote(spelling)}; "
-                f"printf changed > {shlex.quote(spelling)}; "
-                f"printf changed > {shlex.quote(spelling.rsplit('/', 1)[0] + '/new-entry')}",
+                f": {shell_path(virtual)}; cat {shell_path(spelling)}; "
+                f"printf changed > {shell_path(spelling)}; "
+                f"printf changed > {shell_path(spelling.rsplit('/', 1)[0] + '/new-entry')}",
                 read_only=read_only,
                 read_roots=reads,
             )
@@ -155,7 +160,7 @@ def test_public_granted_roots_keep_private_components_denied(
             assert existing.read_text() == "private-root-canary"
             assert not created.exists()
     ordinary = public_command.call(
-        f"cat {shlex.quote(virtual + '/neighbor')}", read_only=read_only, read_roots=reads
+        f"cat {shell_path(virtual + '/neighbor')}", read_only=read_only, read_roots=reads
     )
     assert ordinary["result"]["stdout"]["content"] == "ordinary-readable"
     public_command.host.run_host_command.assert_not_called()
@@ -212,7 +217,6 @@ def test_public_writable_command_keeps_ordinary_workspace_writes_available(
         "printf text >/dev/null; printf done",
         "printf text >|/dev/null; printf done",
         "printf text 2>&-; printf done",
-        "printf text >/tmp/report; cat /tmp/report",
     ],
 )
 def test_public_safe_redirections_run_without_approval(public_command, source):
@@ -414,9 +418,12 @@ def test_public_exact_path_executable_does_not_expose_siblings(
     public_command.host.run_host_command.assert_not_called()
 
 
-def test_session_files_survive_commands_turns_and_runtime_recreation(backend, native_workspace):
-    """TMPDIR, virtual /tmp, and file tools reopen the same files after a saved session resumes."""
-    database = native_workspace.parent / "Library" / "loop" / "workspace" / "sessions.db"
+@pytest.mark.parametrize("storage", ["loop", "Loop é ;$' (data)"])
+def test_session_files_survive_commands_turns_and_runtime_recreation(
+    backend, native_workspace, storage
+):
+    """TMPDIR and file tools reopen the same files after a saved session resumes."""
+    database = native_workspace.parent / "Library" / storage / "workspace" / "sessions.db"
     runtimes = []
     host = Mock()
     host.run_host_command.side_effect = AssertionError("unapproved host launch")
@@ -479,14 +486,23 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(backend, na
             cwd="/workspace",
             read_only=True,
         )
-        read = dispatch(loop, "read_text_file", path="/tmp/report.txt")
+        canonical = dispatch(loop, "run_command", command='cd "$TMPDIR"; pwd -P', read_only=True)
+        assert canonical["stdout"]["content"].strip() == "$TMPDIR"
+        dispatch(
+            loop,
+            "run_command",
+            command='sqlite3 "$TMPDIR/state.db" "CREATE TABLE state(value); '
+            "INSERT INTO state VALUES ('literal /tmp/row');\"",
+            read_only=True,
+        )
+        read = dispatch(loop, "read_text_file", path="$TMPDIR/report.txt")
         assert read["content"] == "draft"
         sessions.add_user_message("revise the report")
-        dispatch(loop, "write_text_file", path="/tmp/revised.txt", content="revised")
+        dispatch(loop, "write_text_file", path="$TMPDIR/revised.txt", content="revised")
         result = dispatch(
             loop,
             "run_command",
-            command='cat /tmp/report.txt; cat "$TMPDIR/revised.txt"',
+            command='cat "$TMPDIR/report.txt"; cat "$TMPDIR/revised.txt"',
             cwd="/workspace",
             read_only=True,
         )
@@ -500,6 +516,17 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(backend, na
             cwd="/workspace",
             read_only=True,
         )
+        for forbidden in (database.parent, database, directory):
+            denied = json.loads(
+                loop.tool_registry.call(
+                    "run_command",
+                    json.dumps({"command": "ls " + shlex.quote(str(forbidden)), "read_only": True}),
+                    interaction=interaction,
+                    instructions_manager=loop.instructions_manager,
+                )
+            )
+            assert not denied["ok"], denied
+            assert str(database.parent) not in json.dumps(denied)
         second_directory = loop.permission_manager.temporary_directory
         escape = second_directory / "escape"
         escape.symlink_to(directory / "report.txt")
@@ -539,11 +566,18 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(backend, na
         result = dispatch(
             loop,
             "run_command",
-            command='cat "$TMPDIR/report.txt"; cat /tmp/revised.txt',
+            command='cat "$TMPDIR/report.txt"; cat "$TMPDIR/revised.txt"',
             cwd="/workspace",
             read_only=True,
         )
         assert result["stdout"]["content"] == "draftrevised"
+        state = dispatch(
+            loop,
+            "run_command",
+            command='sqlite3 "$TMPDIR/state.db" "SELECT value FROM state;"',
+            read_only=True,
+        )
+        assert state["stdout"]["content"].strip() == "literal /tmp/row"
         assert directory.is_dir()
         host.run_host_command.assert_not_called()
     finally:

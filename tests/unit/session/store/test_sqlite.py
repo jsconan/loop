@@ -22,6 +22,7 @@ from loop import (
     ToolCall,
     ToolResult,
 )
+from loop.session.store import WorkingDirectoryBinding
 from loop.utils import PathHolder, content_identity
 
 
@@ -1006,3 +1007,31 @@ def test_working_storage_is_isolated_by_database_and_workspace(tmp_path):
 
     assert first.temporary_root == reopened.temporary_root
     assert len({first.temporary_root, adjacent.temporary_root, other_workspace.temporary_root}) == 3
+
+
+def test_sqlite_working_bindings_persist_independently_of_snapshots(tmp_path):
+    """Creation, retirement and replacement commit without changing conversation revisions."""
+    path = tmp_path / "sessions.db"
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    assert store.working_binding("session") is None
+    binding = WorkingDirectoryBinding("generation/files", 1, 2)
+    store.bind_working_directory("session", binding)
+    reopened = SQLiteSessionStore(path, workspace_id="workspace")
+    assert reopened.working_binding("session") == binding
+    assert reopened.working_binding("other") is None
+    retired = WorkingDirectoryBinding("generation/files", 1, 2, True)
+    reopened.bind_working_directory("session", retired)
+    assert store.working_binding("session") == retired
+    assert store.list() == []
+
+
+def test_working_bindings_are_scoped_to_database_workspace(tmp_path):
+    """Equal logical identities in different workspace namespaces retain independent bindings."""
+    first = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="first")
+    second = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="second")
+    binding = WorkingDirectoryBinding("first/files", 1, 2)
+    first.bind_working_directory("same-id", binding)
+    assert second.working_binding("same-id") is None
+    second.bind_working_directory("same-id", WorkingDirectoryBinding("second/files", 1, 3))
+    assert first.working_binding("same-id") == binding
+    assert second.working_binding("same-id").inode == 3

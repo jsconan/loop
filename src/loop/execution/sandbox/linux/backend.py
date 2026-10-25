@@ -17,6 +17,7 @@ from threading import Event
 from .... import constants
 from ....constants import NATIVE_FILE_READ_CHUNK_BYTES, NATIVE_INSTALLATION_DIRECTORY
 from ....utils.process import ProcessCapture, ProcessCaptureStatus
+from ....utils.virtual_path import VirtualPath
 from ..constants import (
     COMMAND_SANDBOX_SCRATCH_PREFIX,
     LC_ALL_ENVIRONMENT_VARIABLE,
@@ -42,7 +43,7 @@ from .host import (
     protected_path,
     runtime_read_roots,
 )
-from .paths import python_runtime_mounts
+from .paths import payload_aliases, python_runtime_mounts
 from .runtime import exchange_installed_request, execution_authority
 
 _RECORD = NATIVE_INSTALLATION_DIRECTORY / MANAGEMENT_RECORD_NAME
@@ -80,6 +81,27 @@ class LinuxNativeBackend:
     def __init__(self, record: Path = _RECORD) -> None:
         self._record = record
         self._authority_seen = False
+
+    def output_path_roots(self, request: SandboxRequest) -> tuple[tuple[str, str], ...]:
+        """Describe native namespace paths for command-result disclosure.
+
+        Args:
+            request (SandboxRequest): Bound command aliases in their namespace mount order.
+
+        Returns:
+            tuple[tuple[str, str], ...]: Native and logical roots, longest native path first.
+                Raw native results and selected-file search bytes remain unchanged.
+        """
+        roots = (
+            (str(NATIVE_SCRATCH_PATH), VirtualPath.TEMPORARY),
+            *(
+                (str(native), virtual)
+                for (virtual, _, _), (_, native, _) in zip(
+                    request.aliases, payload_aliases(request), strict=True
+                )
+            ),
+        )
+        return tuple(sorted(roots, key=lambda pair: len(pair[0]), reverse=True))
 
     @property
     def system_read_roots(self) -> tuple[Path, ...]:

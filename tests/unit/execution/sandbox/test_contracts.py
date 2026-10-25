@@ -866,7 +866,7 @@ def test_request_binds_durable_session_scratch_through_its_virtual_alias(tmp_pat
 
     with pytest.raises(ValueError, match="private real directory"):
         request(tmp_path, environment=environment)
-    approved = request(tmp_path, environment=environment, aliases=(("/tmp", alias, scratch),))
+    approved = request(tmp_path, environment=environment, aliases=(("$TMPDIR", alias, scratch),))
     assert approved.session_scratch is True
     restored = SandboxRequest.from_wire(approved.to_wire())
     assert restored.session_scratch is True

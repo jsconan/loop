@@ -388,3 +388,96 @@ def test_extra_read_root_preserves_private_restrictions(native_command, native_w
     result = native_command(f"cat ../extra/{path}", read_roots=(extra,), write_roots=())
     assert result.exit_code != 0
     assert "extra-private-canary" not in result.stdout
+
+
+def test_session_ancestor_metadata_does_not_expose_private_siblings(
+    native_command, native_workspace
+):
+    """Temporary private storage permits exact ancestor traversal without sibling metadata."""
+    private = native_workspace / "Library"
+    scratch = private / "session" / "files"
+    scratch.mkdir(mode=0o700, parents=True)
+    sibling = private / "unrelated"
+    sibling.write_text("private-sibling-canary")
+    alias = native_workspace / "session-alias"
+    alias.symlink_to(scratch, target_is_directory=True)
+    source = 'printf scratch > "$TMPDIR/report"; cat "$TMPDIR/report"; stat -f %HT ' + shlex.quote(
+        str(private)
+    )
+    changes = {
+        "environment": {"PATH": "/usr/bin:/bin", "LANG": "C", "TMPDIR": str(scratch)},
+        "aliases": (("$TMPDIR", alias, scratch),),
+        "write_roots": (),
+    }
+    allowed = native_command(source, **changes)
+    assert allowed.exit_code == 0, allowed
+    assert allowed.stdout == "scratchDirectory\n"
+    for command in ("stat -f %HT " + shlex.quote(str(sibling)), "ls " + shlex.quote(str(private))):
+        denied = native_command(command, **changes)
+        assert denied.exit_code != 0, denied
+        assert denied.stdout == ""
+    assert sibling.read_text() == "private-sibling-canary"
+
+
+def test_detached_descendant_retains_old_descriptor_after_generation_retirement(
+    backend, native_workspace
+):
+    """Detached macOS writers remain confined but are not revoked by ownership or retirement."""
+    import json
+    from unittest.mock import Mock
+
+    from loop import Interaction, SessionManager
+
+    manager = SessionManager(interaction=Mock(spec=Interaction))
+    original = manager.temporary_directory.get()
+    aliases = native_workspace.parent / "aliases"
+    aliases.mkdir(mode=0o700)
+    alias = aliases / "session"
+    alias.symlink_to(original, target_is_directory=True)
+    program = r"""
+pipe(R, W) or die;
+my $pid = fork(); defined($pid) or die;
+if ($pid) { close W; sysread(R, my $ready, 1); exit; }
+close R;
+POSIX::setsid() >= 0 or die;
+my $second = fork(); defined($second) or die;
+if ($second) { POSIX::_exit(0); }
+open(my $retained, ">", "$ENV{TMPDIR}/late") or die;
+syswrite(W, "R"); close W;
+close STDIN; close STDOUT; close STDERR;
+select(undef, undef, undef, 0.4);
+my $escaped = open(my $outside, ">", "$ENV{TMPDIR}/../escape");
+print $retained ($escaped ? "escaped" : "confined"); close $retained;
+POSIX::_exit(0);
+"""
+    request = SandboxRequest.create(
+        source="/usr/bin/perl -MPOSIX -e " + shlex.quote(program),
+        cwd=native_workspace,
+        workspace=native_workspace,
+        read_roots=(),
+        write_roots=(),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin", "LANG": "C", "TMPDIR": str(original)},
+        policy_version=backend.policy_version,
+        deadline=time.monotonic() + 5,
+        workspace_id="detached-working-generation",
+        aliases=(("$TMPDIR", alias, original),),
+    )
+    result = backend.run(request)
+    assert result.outcome is SandboxOutcome.COMPLETED, result
+    assert result.exit_code == 0, result
+    assert result.stdout == result.stderr == "", json.dumps(result.__dict__)
+    with (original / "late").open() as retained:
+        manager.discard_working_directory()
+        assert manager.temporary_directory.get() != original
+        deadline = time.monotonic() + 3
+        content = ""
+        while time.monotonic() < deadline and not content:
+            retained.seek(0)
+            content = retained.read()
+            if not content:
+                time.sleep(0.01)
+        assert content == "confined"
+    assert not original.exists()
+    assert not original.parent.exists()
+    assert not (original.parent / "escape").exists()

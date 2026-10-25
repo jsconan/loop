@@ -6,7 +6,13 @@ from datetime import datetime
 from pathlib import Path
 
 from ...models import Message
-from ...utils import content_digest, sha256_digest, utc_now, validate_content_handle
+from ...utils import (
+    content_digest,
+    ensure_private_directory,
+    sha256_digest,
+    utc_now,
+    validate_content_handle,
+)
 from ..models import (
     SESSION_NAME_SOURCE_INITIAL,
     SessionInfo,
@@ -16,6 +22,7 @@ from ..models import (
 )
 from ..naming import initial_session_name
 from ..session import Session
+from .adapter import WorkingDirectoryBinding
 
 
 class SQLiteSessionStore:
@@ -50,6 +57,54 @@ class SQLiteSessionStore:
             "utf-8", errors="surrogatepass"
         )
         return self._path.parent / "scratch" / sha256_digest(identity)
+
+    def working_binding(self, session_id: str) -> WorkingDirectoryBinding | None:
+        """Read durable working identity without modifying the conversation revision.
+
+        Args:
+            session_id (str): Opaque session identifier.
+
+        Returns:
+            WorkingDirectoryBinding | None: Current binding or retirement tombstone, if present.
+        """
+        if not self._path.exists():
+            return None
+        with closing(sqlite3.connect(self._path)) as connection:
+            self._create_schema(connection)
+            row = connection.execute(
+                "SELECT generation, device, inode, retired FROM working_directories "
+                "WHERE workspace_id = ? AND id = ?",
+                (self._workspace_id, session_id),
+            ).fetchone()
+        return WorkingDirectoryBinding(row[0], row[1], row[2], bool(row[3])) if row else None
+
+    def bind_working_directory(self, session_id: str, binding: WorkingDirectoryBinding) -> None:
+        """Commit a validated generation before filesystem tools can use it.
+
+        Args:
+            session_id (str): Opaque session identifier.
+            binding (WorkingDirectoryBinding): Validated generation or retirement tombstone.
+        """
+        ensure_private_directory(self._path.parent, create=False)
+        with closing(sqlite3.connect(self._path)) as connection:
+            self._enforce_private_modes()
+            with connection:
+                self._create_schema(connection)
+                connection.execute(
+                    "INSERT INTO working_directories "
+                    "(workspace_id, id, generation, device, inode, retired) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, id) DO UPDATE SET "
+                    "generation=excluded.generation, device=excluded.device, "
+                    "inode=excluded.inode, retired=excluded.retired",
+                    (
+                        self._workspace_id,
+                        session_id,
+                        binding.generation,
+                        binding.device,
+                        binding.inode,
+                        binding.retired,
+                    ),
+                )
 
     def import_legacy(self, source: Path | str) -> bool:
         """Import a legacy database when this store does not yet exist.
@@ -417,6 +472,22 @@ class SQLiteSessionStore:
     def _create_schema(connection: sqlite3.Connection) -> None:
         """Create the session table when it does not exist."""
         with closing(connection.execute("BEGIN IMMEDIATE")):
+            pass
+        with closing(
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS working_directories (
+                    workspace_id TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    generation TEXT NOT NULL,
+                    device INTEGER NOT NULL,
+                    inode INTEGER NOT NULL,
+                    retired INTEGER NOT NULL CHECK (retired IN (0, 1)),
+                    PRIMARY KEY (workspace_id, id)
+                )
+                """
+            )
+        ):
             pass
         with closing(
             connection.execute(

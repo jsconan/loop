@@ -311,7 +311,8 @@ class SandboxRequest:
             write_roots (tuple[Path, ...]): Writable directory roots.
             network (bool): Explicit general egress grant.
             environment (dict[str, str]): Sanitized effective environment. An included TMPDIR
-                must name a live private directory in the process temp root or the bound /tmp root.
+                must name a live private directory in the process temp root or the bound
+                ``$TMPDIR`` root.
             policy_version (str): Reviewed policy revision.
             deadline (float): Absolute monotonic deadline.
             workspace_id (str): Stable workspace identity.
@@ -416,7 +417,7 @@ class SandboxRequest:
         alias_identities = []
         for virtual_root, alias, target in aliases:
             if (
-                not virtual_root.startswith("/")
+                not (virtual_root.startswith("/") or virtual_root == VirtualPath.TEMPORARY)
                 or not alias.is_absolute()
                 or re.fullmatch(r"/[A-Za-z0-9_/-]+", str(alias)) is None
                 or target.resolve(strict=True) != target

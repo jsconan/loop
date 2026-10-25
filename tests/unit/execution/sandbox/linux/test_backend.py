@@ -10,10 +10,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop.execution.sandbox.contracts import CommandProcessResult, SandboxOutcome
+from loop.execution.sandbox.contracts import CommandProcessResult, SandboxOutcome, SandboxRequest
 from loop.execution.sandbox.linux import backend as linux
-from loop.execution.sandbox.linux.constants import NATIVE_SCRATCH_PATH
+from loop.execution.sandbox.linux.constants import NATIVE_ALIAS_PATH, NATIVE_SCRATCH_PATH
 from loop.execution.sandbox.linux.policy import payload_profile
+from loop.utils import VirtualPath
 from loop.utils.process import ProcessCaptureStatus
 
 
@@ -26,6 +27,29 @@ def backend(monkeypatch, tmp_path):
     record = tmp_path / "management.json"
     record.write_text("installed")
     return linux.LinuxNativeBackend(record)
+
+
+def test_backend_describes_namespace_output_paths_without_rewriting_results(backend, tmp_path):
+    """Namespace scratch and indexed aliases map to their logical command roots."""
+    request = Mock(spec=SandboxRequest)
+    request.aliases = tuple(
+        (f"/skills/guide{index}", tmp_path / f"r{index}", tmp_path / f"skill{index}")
+        for index in range(12)
+    )
+
+    roots = backend.output_path_roots(request)
+
+    assert dict(roots) == {
+        str(NATIVE_SCRATCH_PATH): VirtualPath.TEMPORARY,
+        **{str(NATIVE_ALIAS_PATH / f"r{index}"): f"/skills/guide{index}" for index in range(12)},
+    }
+    assert [len(local) for local, _ in roots] == sorted(
+        (len(local) for local, _ in roots), reverse=True
+    )
+    request.aliases = ()
+    assert backend.output_path_roots(request) == (
+        (str(NATIVE_SCRATCH_PATH), VirtualPath.TEMPORARY),
+    )
 
 
 def test_backend_properties_and_safe_read_candidates(backend, monkeypatch):
@@ -106,7 +130,10 @@ def test_backend_restores_only_original_typed_result(backend, outcome, tmp_path)
     request = Mock(deadline=20, attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7")
     request.to_wire.return_value = b"request"
     result = CommandProcessResult(
-        outcome, exit_code=17 if outcome is SandboxOutcome.COMPLETED else None
+        outcome,
+        exit_code=17 if outcome is SandboxOutcome.COMPLETED else None,
+        stdout=str(NATIVE_SCRATCH_PATH / "selected/source"),
+        stderr=str(NATIVE_ALIAS_PATH / "r0/diagnostic"),
     )
     linux.exchange_installed_request.return_value = result.to_wire(request.attempt_id)
     assert backend.run(request) == result

@@ -859,8 +859,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
     if uv is None:
         pytest.skip("uv is not available on the qualification PATH")
 
-    project = Path(__file__).resolve().parents[3]
-    project_venv = project / ".venv"
+    project_venv = Path(sys.prefix)
     config = project_venv / "pyvenv.cfg"
     if not config.is_file():
         pytest.skip("The qualification project has no active Python virtual environment")

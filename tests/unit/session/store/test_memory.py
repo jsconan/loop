@@ -1,18 +1,23 @@
 """Tests for in-memory session persistence."""
 
+import gc
 import json
 from datetime import UTC, datetime
+from unittest.mock import Mock
 
 import pytest
 
 from loop import (
     ContextReference,
+    Interaction,
     MemorySessionStore,
     Message,
     Session,
+    SessionManager,
     SessionNotFoundError,
     SessionRevisionConflictError,
 )
+from loop.session.store import WorkingDirectoryBinding
 from loop.utils import content_identity
 
 
@@ -339,3 +344,25 @@ def test_working_storage_creation_failure_preserves_the_original_error(monkeypat
     monkeypatch.setattr("loop.session.store.memory.tempfile.TemporaryDirectory", fail)
     with pytest.raises(OSError, match="temporary storage unavailable"):
         MemorySessionStore()
+
+
+def test_memory_working_bindings_retain_retirement_without_snapshot_changes():
+    """Working generations have independent identity and lifecycle metadata."""
+    store = MemorySessionStore()
+    assert store.working_binding("session") is None
+    binding = WorkingDirectoryBinding("generation/files", 1, 2)
+    store.bind_working_directory("session", binding)
+    assert store.working_binding("session") == binding
+    assert store.list() == []
+
+
+def test_memory_working_storage_cleans_up_owners_in_reference_cycles():
+    """Cyclic manager ownership cleans disposable files before temporary-resource finalization."""
+    interaction = Mock(spec=Interaction)
+    manager = SessionManager(interaction=interaction)
+    interaction.retained_manager = manager
+    root = manager.store.temporary_root
+    (manager.temporary_directory.get() / "report").write_text("disposable")
+    del manager, interaction
+    gc.collect()
+    assert not root.exists()

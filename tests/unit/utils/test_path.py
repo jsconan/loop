@@ -1,9 +1,11 @@
 """Tests for private directory preparation and path discovery helpers."""
 
+import errno
 import os
 import stat
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -15,6 +17,8 @@ from loop.utils import (
     is_path_ignored,
     iter_visible_paths,
 )
+from loop.utils import path as path_module
+from loop.utils.path import private_directory_lock
 
 
 def test_ensure_private_directory_creates_and_reopens_private_storage(tmp_path):
@@ -309,3 +313,127 @@ def test_private_directory_validation_rejects_a_replaced_inode(monkeypatch, tmp_
     monkeypatch.setattr(Path, "lstat", lstat)
     with pytest.raises(ValueError, match="private real directory"):
         ensure_private_directory(path)
+
+
+def test_private_directory_reopen_never_creates_missing_components(tmp_path):
+    """Reopening missing storage fails without creating a replacement directory."""
+    missing = tmp_path / "missing" / "files"
+    with pytest.raises(FileNotFoundError):
+        ensure_private_directory(missing, create=False)
+    assert not missing.parent.exists()
+
+
+@pytest.mark.parametrize(
+    ("acl", "entry", "error", "expected"),
+    [
+        (None, 0, 2, None),
+        (None, 0, 13, OSError),
+        (123, -1, 22, None),
+        (123, -1, 1, OSError),
+        (123, 0, 0, ValueError),
+    ],
+)
+def test_private_directory_checks_darwin_access_lists(
+    monkeypatch, tmp_path, acl, entry, error, expected
+):
+    """Darwin extended ACLs are refused and inspection failures remain explicit."""
+
+    native = SimpleNamespace(
+        acl_get_fd_np=Mock(return_value=acl),
+        acl_get_entry=Mock(return_value=entry),
+        acl_free=Mock(),
+    )
+    monkeypatch.setattr(path_module, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(path_module.ctypes, "CDLL", Mock(return_value=native))
+    monkeypatch.setattr(path_module.ctypes, "get_errno", Mock(return_value=error))
+    directory = tmp_path / "private"
+    if expected:
+        with pytest.raises(expected):
+            ensure_private_directory(directory)
+    else:
+        ensure_private_directory(directory)
+    if acl:
+        native.acl_free.assert_called_once_with(acl)
+
+
+@pytest.mark.parametrize("value", [b"extended-acl", b"", "missing", "unsupported", "denied"])
+def test_private_directory_checks_linux_access_lists(monkeypatch, tmp_path, value):
+    """Linux ACL absence is accepted while extended grants and unexpected errors fail closed."""
+
+    errors = {"missing": errno.ENODATA, "unsupported": errno.ENOTSUP, "denied": errno.EACCES}
+    reader = Mock()
+    if isinstance(value, str):
+        reader.side_effect = OSError(errors[value], "synthetic ACL diagnostic")
+    else:
+        reader.return_value = value
+    monkeypatch.setattr(path_module, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(path_module.os, "getxattr", reader, raising=False)
+    directory = tmp_path / "private"
+    if value == b"extended-acl":
+        with pytest.raises(ValueError, match="private real directory"):
+            ensure_private_directory(directory)
+    elif value == "denied":
+        with pytest.raises(OSError, match="synthetic ACL diagnostic"):
+            ensure_private_directory(directory)
+    else:
+        ensure_private_directory(directory)
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "../outside", "/absolute"])
+def test_private_directory_lock_rejects_unchecked_names(tmp_path, name):
+    """A lock name cannot supply path traversal or select its parent directory."""
+
+    with pytest.raises(ValueError, match="lock name"), private_directory_lock(tmp_path, name):
+        pytest.fail("invalid lock admitted")
+
+
+@pytest.mark.parametrize("kind", ["shared", "hardlink", "directory"])
+def test_private_directory_lock_refuses_unsafe_existing_entries(tmp_path, kind):
+    """Existing lock entries are validated rather than repaired or followed."""
+
+    lock = tmp_path / "owner"
+    if kind == "directory":
+        lock.mkdir()
+    else:
+        lock.write_text("preserve")
+        lock.chmod(0o644 if kind == "shared" else 0o600)
+        if kind == "hardlink":
+            (tmp_path / "alias").hardlink_to(lock)
+    with pytest.raises((OSError, ValueError)), private_directory_lock(tmp_path, "owner"):
+        pytest.fail("unsafe lock admitted")
+
+
+def test_private_directory_anchors_creation_and_validation_at_approved_descriptor(tmp_path):
+    """Approved descriptors support private descendants without reopening every ancestor."""
+    root = tmp_path / "private"
+    ensure_private_directory(root)
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        ensure_private_directory(root / "generation/files", anchor=(root, descriptor))
+        ensure_private_directory(root, create=False, anchor=(root, descriptor))
+        assert (root / "generation/files").is_dir()
+        with pytest.raises(ValueError, match="authority changed"):
+            ensure_private_directory(tmp_path / "outside", anchor=(root, descriptor))
+        moved = tmp_path / "moved"
+        root.rename(moved)
+        root.mkdir(mode=0o700)
+        with pytest.raises(ValueError, match="authority changed"):
+            ensure_private_directory(root / "files", anchor=(root, descriptor))
+        assert not (root / "files").exists()
+        assert not (moved / "files").exists()
+    finally:
+        os.close(descriptor)
+
+
+def test_native_ownership_unavailability_does_not_break_portable_imports(monkeypatch, tmp_path):
+    """Platforms without advisory locking fail closed when execution requests ownership."""
+    monkeypatch.setattr(
+        path_module, "import_module", Mock(side_effect=ModuleNotFoundError("fcntl"))
+    )
+    with (
+        pytest.raises(OSError, match="requires macOS or Linux") as failure,
+        private_directory_lock(tmp_path, "owner"),
+    ):
+        pytest.fail("ownership admitted without native locks")
+    assert failure.value.errno == errno.ENOTSUP
+    assert not (tmp_path / "owner").exists()

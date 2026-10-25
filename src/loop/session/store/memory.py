@@ -3,6 +3,7 @@
 import tempfile
 from pathlib import Path
 from threading import Lock
+from weakref import finalize
 
 from ...models import Message
 from ...utils import content_digest, utc_now, validate_content_handle
@@ -15,12 +16,14 @@ from ..models import (
 )
 from ..naming import initial_session_name
 from ..session import Session
+from .adapter import WorkingDirectoryBinding
 
 
 class MemorySessionStore:
     """Keep snapshots in memory and remove private working storage when this store is released."""
 
-    _temporary: tempfile.TemporaryDirectory[str] | None
+    _cleanup: finalize
+    _bindings: dict[str, WorkingDirectoryBinding]
     _temporary_path: Path
     _sessions: list[StoredSession]
     _lock: Lock
@@ -29,18 +32,15 @@ class MemorySessionStore:
     _session_references: dict[str, set[str]]
 
     def __init__(self) -> None:
-        self._temporary = None
-        self._temporary = tempfile.TemporaryDirectory(prefix="loop-sessions-")
-        self._temporary_path = Path(self._temporary.name).resolve()
+        temporary = tempfile.TemporaryDirectory(prefix="loop-sessions-")
+        self._cleanup = finalize(self, temporary.cleanup)
+        self._temporary_path = Path(temporary.name).resolve()
+        self._bindings = {}
         self._sessions = []
         self._lock = Lock()
         self._references = {}
         self._reference_handles = {}
         self._session_references = {}
-
-    def __del__(self) -> None:
-        if self._temporary is not None:
-            self._temporary.cleanup()
 
     @property
     def temporary_root(self) -> Path:
@@ -50,6 +50,28 @@ class MemorySessionStore:
             Path: Canonical temporary root shared by managers using this store.
         """
         return self._temporary_path
+
+    def working_binding(self, session_id: str) -> WorkingDirectoryBinding | None:
+        """Read a working generation retained for this store's lifetime.
+
+        Args:
+            session_id (str): Opaque session identifier.
+
+        Returns:
+            WorkingDirectoryBinding | None: Current binding or retirement tombstone, if present.
+        """
+        with self._lock:
+            return self._bindings.get(session_id)
+
+    def bind_working_directory(self, session_id: str, binding: WorkingDirectoryBinding) -> None:
+        """Retain a validated generation independently of conversation snapshots.
+
+        Args:
+            session_id (str): Opaque session identifier.
+            binding (WorkingDirectoryBinding): Validated generation or retirement tombstone.
+        """
+        with self._lock:
+            self._bindings[session_id] = binding
 
     def load_reference(self, digest: str) -> bytes | None:
         """Load immutable referenced content when available.

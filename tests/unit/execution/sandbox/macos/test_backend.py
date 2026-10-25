@@ -756,7 +756,7 @@ def test_backend_denies_private_reads_inside_every_granted_root(monkeypatch, tmp
     for root in (workspace, extra, writable, target):
         assert f"{re.escape(str(root))}/(.*/)?{names}(/.*)?$" in regex_patterns(profile)
     assert f"{re.escape(str(scratch))}/(.*/)?{names}(/.*)?$" not in regex_patterns(profile)
-    assert profile.index("(deny file-read*") > profile.index("(allow file-read*")
+    assert profile.index("(deny file-read-data") > profile.index("(allow file-read*")
     assert profile.index("(deny file-write* ") > profile.index("(allow file-write* ")
 
 
@@ -1934,9 +1934,12 @@ def test_backend_classifies_child_capture_failures(monkeypatch, tmp_path, proces
         assert result.stdout == "ok"
 
 
-def test_backend_binds_durable_scratch_without_exposing_private_neighbors(monkeypatch, tmp_path):
+@pytest.mark.parametrize("storage", ["app", "App é ;$' (data)"])
+def test_backend_binds_durable_scratch_without_exposing_private_neighbors(
+    monkeypatch, tmp_path, storage
+):
     """A session root under Library retains private-name guards and exact directory authority."""
-    scratch = tmp_path / "Library" / "app" / "scratch" / "session"
+    scratch = tmp_path / "Library" / storage / "scratch" / "session"
     scratch.mkdir(parents=True, mode=0o700)
     aliases = tmp_path / "aliases"
     aliases.mkdir(mode=0o700)
@@ -1952,7 +1955,7 @@ def test_backend_binds_durable_scratch_without_exposing_private_neighbors(monkey
     value = request(
         tmp_path,
         environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
-        aliases=(("/tmp", alias, scratch),),
+        aliases=(("$TMPDIR", alias, scratch),),
     )
 
     result = MacOSSeatbeltBackend().run(value)
@@ -1960,6 +1963,6 @@ def test_backend_binds_durable_scratch_without_exposing_private_neighbors(monkey
     assert result.outcome is SandboxOutcome.COMPLETED
     assert popen.call_args.kwargs["env"]["TMPDIR"] == str(scratch)
     profile = popen.call_args.args[0][2]
-    assert f"(require-not (subpath {json.dumps(str(scratch))}))" in profile
+    assert f"(require-not (subpath {json.dumps(str(scratch), ensure_ascii=False)}))" in profile
     assert re.escape(str(scratch)) + "/(.*/)?" in regex_patterns(profile)
     assert scratch.is_dir()

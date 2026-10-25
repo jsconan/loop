@@ -259,15 +259,19 @@ class RuntimeEnvironment:
             f"temporary_directory: {VirtualPath.TEMPORARY}\n"
             f"File tools and command shell source use {VirtualPath.WORKSPACE}, "
             f"{VirtualPath.TEMPORARY}, or {VirtualPath.SKILLS} paths. "
-            "Literal configured virtual roots in command source are mapped to approved local "
-            "paths before execution. Set read_only when workspace writes are unnecessary. "
+            "Workspace and skill roots in command source map to approved local paths. "
+            f'Use shell expansion such as cat "{VirtualPath.TEMPORARY}/report.txt" for working '
+            f'files, and read_text_file(path="{VirtualPath.TEMPORARY}/report.txt") with file '
+            "tools. /tmp is an OS path "
+            "outside the session retention guarantee. Set read_only when workspace writes "
+            "are unnecessary. "
             "The default sandbox can read workspace files and return them in output. "
             "PATH gives external installed tools lookup only; verified managed toolchains "
             "are granted by the sandbox execution layer. For other installations, "
             "resolve_executable can provide a bound grant_reference for executable_grant. "
             "A failed sandbox command does not prove a host tool is absent. "
-            "Use $TMPDIR or /tmp for session working files. Both name the same storage, retained "
-            "across commands, turns, and saved-session resumes.\n"
+            f"Use {VirtualPath.TEMPORARY} for session working files in commands and file tools. "
+            "Files are retained across commands, turns, and saved-session resumes.\n"
             "</runtime_environment>"
         )
 

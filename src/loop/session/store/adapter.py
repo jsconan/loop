@@ -1,5 +1,6 @@
 """Define the session persistence adapter contract."""
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -7,8 +8,43 @@ from ..models import SessionInfo
 from ..session import Session
 
 
+@dataclass(frozen=True)
+class WorkingDirectoryBinding:
+    """Retain an opaque relative generation and its original filesystem identity.
+
+    Args:
+        generation (str): Store-relative working root, never an absolute pathname.
+        device (int): Original filesystem device.
+        inode (int): Original directory inode.
+        retired (bool): Whether this generation has been permanently retired.
+    """
+
+    generation: str
+    device: int
+    inode: int
+    retired: bool = False
+
+
 class SessionStore(Protocol):
     """Persist and retrieve sessions by their identifier."""
+
+    def working_binding(self, session_id: str) -> WorkingDirectoryBinding | None:
+        """Read durable working storage identity independently of conversation snapshots.
+
+        Args:
+            session_id (str): Opaque session identifier.
+
+        Returns:
+            WorkingDirectoryBinding | None: Existing binding, including retirement, if present.
+        """
+
+    def bind_working_directory(self, session_id: str, binding: WorkingDirectoryBinding) -> None:
+        """Commit a working generation before admitting filesystem operations.
+
+        Args:
+            session_id (str): Opaque session identifier.
+            binding (WorkingDirectoryBinding): Validated generation or retirement tombstone.
+        """
 
     @property
     def temporary_root(self) -> Path:

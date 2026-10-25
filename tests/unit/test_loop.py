@@ -129,7 +129,7 @@ def test_loop_exposes_its_configured_state(tmp_path):
     assert loop.working_directory == tmp_path.resolve()
     assert loop.instructions is not None
     assert str(loop.permission_manager.temporary_directory) not in loop.instructions
-    assert "temporary_directory: /tmp" in loop.instructions
+    assert "temporary_directory: $TMPDIR" in loop.instructions
     assert loop.instructions_manager is not None
     assert loop.permission_manager.configuration_path == tmp_path / ".loop" / "permissions.yaml"
     assert loop.tool_registry.names == []
@@ -159,7 +159,9 @@ def test_sync_loop_rejects_another_session_owner_before_accepting_input(tmp_path
     """A competing thread cannot persist input before the session lease rejects it."""
     session = Session(id="shared-session", workspace_id="shared-workspace")
     owner = SessionManager(session=session)
-    sessions = SessionManager(session=Session(id=session.id, workspace_id=session.workspace_id))
+    sessions = SessionManager(
+        session=Session(id=session.id, workspace_id=session.workspace_id), session_store=owner.store
+    )
     loop = Loop.create_default(
         backend=loop_backend(),
         interaction=output_interaction(),
@@ -3055,7 +3057,7 @@ def test_loops_share_local_conversation_context(tmp_path):
 
 
 def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
-    """A fresh session creates storage only after a query result forms a complete snapshot."""
+    """A fresh session commits working identity before persisting its first conversation snapshot."""
     backend = loop_backend(
         get_response=Mock(
             return_value=[
@@ -3078,7 +3080,8 @@ def test_new_session_is_not_persisted_until_its_first_completed_query(tmp_path):
         session_manager=session_manager,
     )
 
-    assert not store.path.exists()
+    assert store.path.exists()
+    assert store.list() == []
 
     loop.run()
 
@@ -4125,16 +4128,22 @@ def test_loop_binds_file_paths_and_permissions_to_the_selected_session(tmp_path)
     (first / "report").write_text("draft")
     sessions.add_user_message("save")
     identifier = sessions.session.id
-    assert loop.instructions_manager.virtual_paths.resolve("/tmp/report") == str(first / "report")
+    assert loop.instructions_manager.virtual_paths.resolve("$TMPDIR/report") == str(
+        first / "report"
+    )
 
     loop.command_manager.call("sessions", "new")
     second = loop.permission_manager.temporary_directory
     assert second != first
-    assert loop.instructions_manager.virtual_paths.resolve("/tmp/report") == str(second / "report")
+    assert loop.instructions_manager.virtual_paths.resolve("$TMPDIR/report") == str(
+        second / "report"
+    )
     assert (first / "report").read_text() == "draft"
 
     loop.command_manager.call("sessions", f"resume {identifier}")
     assert loop.permission_manager.temporary_directory == first
-    assert loop.instructions_manager.virtual_paths.resolve("/tmp/report") == str(first / "report")
+    assert loop.instructions_manager.virtual_paths.resolve("$TMPDIR/report") == str(
+        first / "report"
+    )
     loop.permission_manager.close()
     assert (first / "report").read_text() == "draft"

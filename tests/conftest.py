@@ -106,7 +106,7 @@ sys.addaudithook(_audit_output)
 @pytest.fixture
 def tmp_path(monkeypatch):
     """Provide fresh scratch and remove it, including sibling fixtures, after each test."""
-    # /tmp is a model-facing virtual alias; physical fixtures must have another prefix.
+    # Keep physical fixtures separate from the OS /tmp namespace used by native setup.
     parent = "/var/tmp" if Path(tempfile.gettempdir()).resolve() == Path("/tmp") else None
     with tempfile.TemporaryDirectory(prefix="loop-test-", dir=parent) as directory:
         workspace = Path(directory).resolve() / "workspace"
