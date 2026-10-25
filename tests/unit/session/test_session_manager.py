@@ -862,6 +862,72 @@ def test_manager_allows_separate_sessions_to_execute_concurrently():
         pass
 
 
+@pytest.mark.parametrize("error", [None, RuntimeError("storage failed"), asyncio.CancelledError()])
+def test_stalled_storage_admission_keeps_other_sessions_independent(monkeypatch, error):
+    """Storage waits reserve only their session and release resources after failed admission."""
+    store = MemorySessionStore()
+    first = SessionManager(session_store=store)
+    contender = SessionManager(session=first.session, session_store=store)
+    original = first.temporary_directory.get()
+    independent = SessionManager()
+    settling = SessionManager()
+    waiting, release = Event(), Event()
+    active, settle = Event(), Event()
+    read_binding = store.working_binding
+
+    def blocked_binding(session_id):
+        """Suspend validation after native ownership has been acquired."""
+        waiting.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("Storage admission was not released.")
+        if error is not None:
+            raise error
+        return read_binding(session_id)
+
+    def admit():
+        """Finish admission or surface the configured validation failure."""
+        with first.execution() as directory:
+            assert directory == original
+
+    def hold_independent():
+        """Keep an unrelated lease live until the stalled admission is challenged."""
+        with settling.execution():
+            active.set()
+            if not settle.wait(timeout=5):
+                raise TimeoutError("Independent settlement was not released.")
+
+    def challenge():
+        """Admit another store while rejecting the reserved session's contender."""
+        with independent.execution():
+            pass
+        with pytest.raises(SessionExecutionConflictError), contender.execution():
+            pytest.fail("A reserved session admitted a competing owner.")
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        held = executor.submit(hold_independent)
+        assert active.wait(timeout=5)
+        monkeypatch.setattr(store, "working_binding", blocked_binding)
+        pending = executor.submit(admit)
+        try:
+            assert waiting.wait(timeout=5)
+            executor.submit(challenge).result(timeout=2)
+            settle.set()
+            held.result(timeout=2)
+        finally:
+            settle.set()
+            release.set()
+        if error is None:
+            pending.result(timeout=5)
+        else:
+            with pytest.raises(type(error)) as failure:
+                pending.result(timeout=5)
+            assert failure.value is error
+    monkeypatch.setattr(store, "working_binding", read_binding)
+    with contender.execution() as directory:
+        assert directory == original
+    first.new_session()
+
+
 def test_interaction_ownership_rejects_other_sessions_and_other_managers():
     """Interactions cannot borrow another manager's lease or retarget a captured request."""
     store = MemorySessionStore()

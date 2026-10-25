@@ -508,24 +508,28 @@ class SessionManager:
                 if existing is not None and existing[0] != owner:
                     raise SessionExecutionConflictError(self._session.id)
                 depth = existing[1] + 1 if existing is not None else 1
-                if not allow_session_selection and self._selection_block_depth == 0:
-                    try:
-                        _ = self.temporary_directory
-                        root = self._session_store.temporary_root
-                        identity = sha256_digest(
-                            self._session.id.encode("utf-8", errors="surrogatepass")
-                        )
-                        resources.enter_context(private_directory_lock(root / ".locks", identity))
-                        selected = self._bound_directory(self._session.id, root, identity)
-                        self._temporary_directory.set(selected)
-                        self._execution_resources = resources
-                    except BlockingIOError as error:
-                        resources.close()
-                        raise SessionExecutionConflictError(self._session.id) from error
-                    except BaseException:
-                        resources.close()
-                        raise
+                # Reserve this session before storage work without blocking other owners.
                 _EXECUTION_OWNERS[key] = (owner, depth)
+            if not allow_session_selection and self._selection_block_depth == 0:
+                try:
+                    _ = self.temporary_directory
+                    root = self._session_store.temporary_root
+                    identity = sha256_digest(
+                        self._session.id.encode("utf-8", errors="surrogatepass")
+                    )
+                    resources.enter_context(private_directory_lock(root / ".locks", identity))
+                    selected = self._bound_directory(self._session.id, root, identity)
+                    self._temporary_directory.set(selected)
+                    self._execution_resources = resources
+                except BaseException as error:
+                    try:
+                        resources.close()
+                    finally:
+                        with _EXECUTION_OWNERS_LOCK:
+                            del _EXECUTION_OWNERS[key]
+                    if isinstance(error, BlockingIOError):
+                        raise SessionExecutionConflictError(self._session.id) from error
+                    raise
             self._execution_depth += 1
             if not allow_session_selection:
                 self._selection_block_depth += 1
@@ -535,17 +539,18 @@ class SessionManager:
             yield captured
         finally:
             _SESSION_SELECTION.reset(token)
-            with self._state_lock, _EXECUTION_OWNERS_LOCK:
+            with self._state_lock:
                 self._execution_depth -= 1
                 if not allow_session_selection:
                     self._selection_block_depth -= 1
-                current_owner, depth = _EXECUTION_OWNERS[key]
-                if depth == 1:
-                    del _EXECUTION_OWNERS[key]
-                    if not allow_session_selection:
-                        self._execution_resources.close()
-                else:
-                    _EXECUTION_OWNERS[key] = (current_owner, depth - 1)
+                with _EXECUTION_OWNERS_LOCK:
+                    current_owner, depth = _EXECUTION_OWNERS[key]
+                    if depth == 1:
+                        del _EXECUTION_OWNERS[key]
+                    else:
+                        _EXECUTION_OWNERS[key] = (current_owner, depth - 1)
+                if depth == 1 and not allow_session_selection:
+                    self._execution_resources.close()
 
     def response(
         self,

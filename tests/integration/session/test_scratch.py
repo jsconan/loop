@@ -2,8 +2,12 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from threading import Event
 from unittest.mock import Mock
 
 import pytest
@@ -445,6 +449,46 @@ asyncio.run(main())
         if owner.poll() is None:
             owner.kill()
         owner.communicate(timeout=5)
+
+
+def test_busy_database_admission_does_not_block_an_independent_store(tmp_path, monkeypatch):
+    """A real SQLite writer wait cannot stall another store's admission or settlement."""
+    database = tmp_path / "sessions.db"
+    manager = SessionManager(
+        interaction=Mock(spec=Interaction),
+        session_store=SQLiteSessionStore(database, workspace_id="workspace"),
+    )
+    original = manager.temporary_directory.get()
+    independent = SessionManager(interaction=Mock(spec=Interaction))
+    waiting = Event()
+    connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        """Observe the actual writer-lock request before SQLite waits for the owned writer."""
+        connection = connect(*args, **kwargs)
+        connection.set_trace_callback(
+            lambda statement: waiting.set() if statement == "BEGIN IMMEDIATE" else None
+        )
+        return connection
+
+    def admit(selected):
+        """Enter and settle one real ownership lease against the selected store."""
+        with selected.execution() as directory:
+            assert directory.is_dir()
+            return directory
+
+    with closing(connect(database)) as writer, ThreadPoolExecutor(max_workers=2) as executor:
+        writer.execute("BEGIN IMMEDIATE")
+        monkeypatch.setattr(sqlite3, "connect", traced_connect)
+        pending = executor.submit(admit, manager)
+        try:
+            assert waiting.wait(timeout=5)
+            executor.submit(admit, independent).result(timeout=2)
+        finally:
+            writer.rollback()
+        assert pending.result(timeout=5) == original
+    with manager.execution() as directory:
+        assert directory == original
 
 
 def test_ownership_descriptor_closes_on_exec(tmp_path):
