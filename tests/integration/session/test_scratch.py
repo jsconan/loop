@@ -192,6 +192,144 @@ else:
         owner.communicate(timeout=5)
 
 
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("outcome", ["answer", "reject", "cancel", "crash", "failure"])
+def test_idle_export_confirmation_excludes_concurrent_recovery(tmp_path, mode, outcome):
+    """Idle export confirmations retain ownership through answer, cancellation, or owner death."""
+    database = tmp_path / "private" / "sessions.db"
+    destination = tmp_path / "work" / "existing export.md"
+    destination.parent.mkdir(mode=0o700)
+    destination.write_text("original export")
+    source = r"""
+import asyncio,json,logging,shlex,signal,sys
+from contextlib import nullcontext
+from logging.handlers import BufferingHandler
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock,patch
+from loop import (ConsoleInteraction,Loop,PermissionManager,SessionController,SessionManager,
+                  SQLiteSessionStore,ToolRegistry)
+from loop.session import LocalSessionNameGenerator
+signal.alarm(20)
+diagnostics=BufferingHandler(1000)
+logging.getLogger("loop.operational").addHandler(diagnostics)
+inputs=asyncio.Queue()
+ui=MagicMock(spec=ConsoleInteraction)
+controller=SessionController(ui)
+manager=SessionManager(interaction=controller.interaction,
+    session_store=SQLiteSessionStore(sys.argv[1],workspace_id="workspace"))
+manager.rename_session("kept conversation")
+async def prompt(*args,**kwargs):
+    return await inputs.get()
+async def confirm(*args,**kwargs):
+    print(json.dumps({"id":manager.session.id}),flush=True)
+    answer=(await asyncio.to_thread(sys.stdin.readline)).strip()
+    if answer=="cancel":
+        controller.stop()
+        await asyncio.Future()
+    if answer=="failure":
+        manager.store.save=MagicMock(side_effect=OSError("settlement unavailable"))
+    return answer=="answer"
+def info(message=""):
+    if message.startswith("Exported session ") or message=="Session export stopped.":
+        inputs.put_nowait(False)
+ui.prompt_async.side_effect=prompt
+ui.confirm_async.side_effect=confirm
+ui.info.side_effect=info
+workspace=Path(sys.argv[2]).parent
+permissions=PermissionManager(workspace)
+registry=ToolRegistry(permission_manager=permissions)
+backend=SimpleNamespace(default_model="fixture",get_context_window=lambda _model:None)
+loop=Loop.create_default(backend,interaction=controller.interaction,run_control=controller.control,
+    session_manager=manager,working_directory=workspace,permission_manager=permissions,
+    tool_registry=registry,session_name_generator=LocalSessionNameGenerator())
+controller.bind_session_manager(manager)
+controller.bind_command_manager(loop.command_manager)
+inputs.put_nowait("/session export "+shlex.quote(sys.argv[2]))
+try:
+    with patch("loop.conversation.controller.patch_stdout",lambda **kwargs:nullcontext()):
+        if sys.argv[3]=="sync":
+            controller.run(lambda receive:loop.run(input_source=receive),route_idle_commands=True)
+        else:
+            asyncio.run(controller.run_async(
+                lambda receive:loop.run_async(input_source=receive),route_idle_commands=True))
+except OSError as error:
+    if str(error)!="settlement unavailable":
+        raise
+    failures=[record for record in diagnostics.buffer
+        if getattr(record,"event.name",None)=="session.persistence.failed"]
+    assert len(failures)==1
+    assert getattr(failures[0],"error.type")=="session.persistence_failed"
+    print("settlement failed",flush=True)
+finally:
+    loop.command_manager.close()
+    registry.close()
+    permissions.close()
+"""
+    contender_source = """
+import sys
+from unittest.mock import Mock
+from loop import Interaction,SessionExecutionConflictError,SessionManager,SQLiteSessionStore
+try:
+    SessionManager(interaction=Mock(spec=Interaction),session=sys.argv[2],
+        session_store=SQLiteSessionStore(sys.argv[1],workspace_id="workspace"))
+except SessionExecutionConflictError:
+    print("owned")
+else:
+    raise RuntimeError("Live idle confirmation was admitted for recovery")
+"""
+    owner = subprocess.Popen(
+        [sys.executable, "-B", "-u", "-c", source, str(database), str(destination), mode],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        session_id = json.loads(owner.stdout.readline())["id"]
+        store = SQLiteSessionStore(database, workspace_id="workspace")
+        snapshot = store.load(session_id).serialize()
+        contender = subprocess.run(
+            [sys.executable, "-B", "-c", contender_source, str(database), session_id],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        assert contender.stdout == "owned\n" and contender.stderr == ""
+        assert store.load(session_id).serialize() == snapshot
+        if outcome == "crash":
+            owner.kill()
+            stdout, stderr = owner.communicate(timeout=5)
+        else:
+            stdout, stderr = owner.communicate(outcome + "\n", timeout=10)
+            assert owner.returncode == 0, stderr
+        assert stdout == ("settlement failed\n" if outcome == "failure" else "")
+        assert stderr == ""
+        restored = SessionManager(
+            interaction=Mock(spec=Interaction), session=session_id, session_store=store
+        )
+        expected = "revoked" if outcome in {"cancel", "crash", "failure"} else "answered"
+        assert restored.session.pending_interactions == ()
+        assert restored.session.events[-1].outcome == expected
+        assert sum(event.type == "interaction_settled" for event in restored.session.events) == 1
+        revision = restored.session.revision
+        reopened = SessionManager(
+            interaction=Mock(spec=Interaction), session=session_id, session_store=store
+        )
+        assert reopened.session.revision == revision
+        with reopened.execution():
+            pass
+        if outcome == "answer":
+            assert "kept conversation" in destination.read_text()
+        else:
+            assert destination.read_text() == "original export"
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        owner.communicate(timeout=5)
+
+
 def test_ownership_descriptor_closes_on_exec(tmp_path):
     """Payload exec cannot inherit the harness ownership lock even with close_fds disabled."""
     with private_directory_lock(tmp_path, "owner") as descriptor:

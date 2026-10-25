@@ -862,6 +862,61 @@ def test_manager_allows_separate_sessions_to_execute_concurrently():
         pass
 
 
+def test_interaction_ownership_rejects_other_sessions_and_other_managers():
+    """Interactions cannot borrow another manager's lease or retarget a captured request."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    contender = SessionManager(session=manager.session, session_store=store)
+    with pytest.raises(ValueError, match="another session"), manager.interaction_execution("other"):
+        pytest.fail("foreign session admitted")
+    with (
+        manager.execution(),
+        pytest.raises(SessionExecutionConflictError),
+        contender.interaction_execution(),
+    ):
+        pytest.fail("foreign manager admitted")
+    with contender.execution():
+        pass
+
+
+def test_interaction_retains_ownership_after_its_execution_task_finishes():
+    """UI settlement retains the captured native lease even after the original owner exits."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    contender = SessionManager(session=manager.session, session_store=store)
+
+    async def scenario():
+        """Release the original task while a distinct UI task still owns its request cleanup."""
+        ready, release = asyncio.Event(), asyncio.Event()
+
+        async def owner():
+            """Hold ordinary execution until interaction cleanup has retained its resource."""
+            with manager.execution():
+                ready.set()
+                await release.wait()
+
+        task = asyncio.create_task(owner())
+        try:
+            await ready.wait()
+            with manager.interaction_execution(manager.session.id):
+                release.set()
+                await task
+                with pytest.raises(SessionExecutionConflictError), contender.execution():
+                    pytest.fail("native ownership released before interaction settlement")
+                with pytest.raises(SessionExecutionConflictError), manager.execution():
+                    pytest.fail("unrelated task borrowed interaction ownership")
+                with pytest.raises(SessionExecutionConflictError):
+                    manager.new_session()
+            with contender.execution():
+                pass
+            manager.new_session()
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(scenario())
+
+
 def test_manager_does_not_conflate_sessions_from_independent_memory_stores():
     """Equal IDs without workspace identity remain independent across isolated stores."""
     first = SessionManager(session=Session(id="shared"))

@@ -140,6 +140,7 @@ class SessionManager:
 
     _state_lock: RLock
     _execution_depth: int
+    _execution_resources: ExitStack
     _selection_block_depth: int
     _interaction: Interaction
     _temporary_directory: PathHolder | None
@@ -163,6 +164,7 @@ class SessionManager:
     ) -> None:
         self._state_lock = RLock()
         self._execution_depth = 0
+        self._execution_resources = ExitStack()
         self._selection_block_depth = 0
         self._interaction = interaction or ConsoleInteraction()
         self._session_store = session_store or MemorySessionStore()
@@ -455,8 +457,44 @@ class SessionManager:
             ValueError: Working storage is missing or unsafe.
             OSError: Working storage cannot be inspected or locked.
         """
+        with self._execution(allow_session_selection=allow_session_selection) as directory:
+            yield directory
+
+    @contextmanager
+    def interaction_execution(self, session_id: str | None = None) -> Generator[None, None, None]:
+        """Retain the selected session's ownership through a blocking interaction's settlement.
+
+        Share this manager's existing execution lease across its owner and UI tasks, or acquire
+        ownership when an idle command has none. Prevent selection until all shared leases settle.
+
+        Args:
+            session_id (str | None): Request's captured session identity. Defaults to the current
+                session when absent; a different identity is rejected.
+
+        Yields:
+            None: Control while the interaction retains native session ownership.
+
+        Raises:
+            ValueError: The request belongs to another session or working storage is unsafe.
+            OSError: Working storage cannot be inspected or locked.
+            SessionExecutionConflictError: Another manager or process owns the session.
+        """
+        with self._execution(session_id=session_id, share_owner=True):
+            yield
+
+    @contextmanager
+    def _execution(
+        self,
+        *,
+        allow_session_selection: bool = False,
+        session_id: str | None = None,
+        share_owner: bool = False,
+    ) -> Generator[Path | None, None, None]:
+        """Admit an execution or retain its resource for the same manager's interaction task."""
         resources = ExitStack()
         with self._state_lock:
+            if session_id is not None and session_id != self._session.id:
+                raise ValueError("Interaction belongs to another session.")
             key = (
                 (("manager", id(self)), "selection")
                 if allow_session_selection
@@ -465,6 +503,8 @@ class SessionManager:
             owner = _execution_owner(self)
             with _EXECUTION_OWNERS_LOCK:
                 existing = _EXECUTION_OWNERS.get(key)
+                if share_owner and existing is not None and existing[0][0] == id(self):
+                    owner = existing[0]
                 if existing is not None and existing[0] != owner:
                     raise SessionExecutionConflictError(self._session.id)
                 depth = existing[1] + 1 if existing is not None else 1
@@ -478,6 +518,7 @@ class SessionManager:
                         resources.enter_context(private_directory_lock(root / ".locks", identity))
                         selected = self._bound_directory(self._session.id, root, identity)
                         self._temporary_directory.set(selected)
+                        self._execution_resources = resources
                     except BlockingIOError as error:
                         resources.close()
                         raise SessionExecutionConflictError(self._session.id) from error
@@ -501,9 +542,10 @@ class SessionManager:
                 current_owner, depth = _EXECUTION_OWNERS[key]
                 if depth == 1:
                     del _EXECUTION_OWNERS[key]
+                    if not allow_session_selection:
+                        self._execution_resources.close()
                 else:
                     _EXECUTION_OWNERS[key] = (current_owner, depth - 1)
-                resources.close()
 
     def response(
         self,

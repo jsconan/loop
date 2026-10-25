@@ -26,6 +26,7 @@ from loop import (
     RunInterrupted,
     RunMetrics,
     SessionController,
+    SessionExecutionConflictError,
     SessionManager,
 )
 from loop.conversation import ConversationCommands, ConversationRecoveryCommands
@@ -441,6 +442,43 @@ def test_controller_persists_interaction_lifecycle_without_answer_values(ui):
     assert settled.outcome == "answered"
     assert "Approve this request?" not in manager.session.serialize()
     assert "answer" not in settled.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("answer", [False, True])
+def test_idle_confirmation_keeps_session_ownership_until_settlement(ui, answer):
+    """Live idle confirmations exclude recovery and session switching until their answer settles."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    answers = []
+
+    async def confirm(*_args, **_kwargs):
+        """Challenge recovery while the idle command is waiting for its actual answer."""
+        snapshot = store.load(manager.session.id).serialize()
+        with pytest.raises(SessionExecutionConflictError):
+            SessionManager(session=manager.session.id, session_store=store)
+        with pytest.raises(SessionExecutionConflictError):
+            manager.new_session()
+        assert store.load(manager.session.id).serialize() == snapshot
+        return answer
+
+    async def conversation(_receive):
+        """Ask a blocking question from session-selection admission, as idle commands do."""
+        with manager.execution(allow_session_selection=True):
+            answers.append(await controller.interaction.confirm_async("Replace export?"))
+            manager.new_session()
+
+    ui.confirm_async.side_effect = confirm
+    previous = manager.session
+    read_inputs(ui, asyncio.Queue())
+    asyncio.run(controller.run_async(conversation))
+
+    assert answers == [answer]
+    persisted = store.load(previous.id)
+    assert persisted.pending_interactions == ()
+    assert persisted.events[-1].outcome == "answered"
+    assert manager.session is not previous
 
 
 def test_controller_does_not_present_interaction_when_request_commit_fails(ui):
@@ -1526,6 +1564,36 @@ def test_durable_interaction_request_cancellation_is_propagated(ui):
     ui.prompt_async.assert_not_awaited()
 
 
+def test_revoked_request_commit_failure_releases_interaction_ownership(ui):
+    """A revoked registration failure preserves cancellation and releases its session lease."""
+    manager = SessionManager()
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    owners, cancelled = [], []
+
+    async def fail_registration(*_args, **_kwargs):
+        """Cancel the owner request while its durable registration is failing."""
+        owners[0].cancel()
+        await asyncio.sleep(0)
+        raise OSError("registration unavailable")
+
+    async def conversation(_receive):
+        """Handle cancellation of the waiting owner before registration completes."""
+        owners.append(asyncio.current_task())
+        try:
+            await controller.interaction.prompt_async("Question?")
+        except asyncio.CancelledError:
+            cancelled.append(True)
+
+    manager.record_interaction_requested_async = fail_registration
+    read_inputs(ui, asyncio.Queue())
+    asyncio.run(controller.run_async(conversation))
+
+    assert cancelled == [True]
+    ui.prompt_async.assert_not_awaited()
+    manager.new_session()
+
+
 @pytest.mark.parametrize(
     ("error", "outcome"),
     [
@@ -1614,6 +1682,8 @@ def test_controller_surfaces_interaction_settlement_storage_failure(ui, prompt_f
         assert isinstance(request.result.exception(), ValueError)
     else:
         assert isinstance(failure, OSError)
+        assert request.result.done()
+        assert request.result.exception() is failure
     assert manager.session.pending_interactions
 
 

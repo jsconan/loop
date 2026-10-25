@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from contextvars import copy_context
 from itertools import count
 from queue import Empty, Full
@@ -1332,22 +1332,29 @@ class SessionController:
             if self._control.interrupted:
                 event.result.set_exception(RunInterrupted())
                 return
-            if self._session_manager is not None:
-                try:
-                    await self._session_manager.record_interaction_requested_async(
-                        event.request_id,
-                        kind=event.kind,
-                        session_id=event.session_id,
-                        run_id=event.run_id,
-                        operation_id=event.operation_id,
-                    )
-                except BaseException as error:
-                    event.result.set_exception(error)
-                    if isinstance(error, asyncio.CancelledError):
-                        raise
-                    return
-            self._pending = event
-            await self._answer_async()
+            with ExitStack() as resources:
+                if self._session_manager is not None:
+                    try:
+                        resources.enter_context(
+                            self._session_manager.interaction_execution(event.session_id)
+                        )
+                        await self._session_manager.record_interaction_requested_async(
+                            event.request_id,
+                            kind=event.kind,
+                            session_id=event.session_id,
+                            run_id=event.run_id,
+                            operation_id=event.operation_id,
+                        )
+                    except BaseException as error:
+                        if not event.result.done():
+                            event.result.set_exception(error)
+                        if isinstance(error, asyncio.CancelledError):
+                            raise
+                        return
+                self._pending = event
+                answered, result = await self._answer_async()
+            if answered and not event.result.done():
+                event.result.set_result(result)
             return
         try:
             result = event.function(*event.args, **event.kwargs)
@@ -1794,8 +1801,8 @@ class SessionController:
             report_full=report_full,
         )
 
-    async def _answer_async(self) -> None:
-        """Resolve only the explicit pending request through the UI's async input surface."""
+    async def _answer_async(self) -> tuple[bool, object]:
+        """Settle the pending request and return its answer before the caller releases ownership."""
         request = cast(InteractionCall, self._pending)
         answer_input = None
         outcome = "answered"
@@ -1852,6 +1859,8 @@ class SessionController:
                         outcome,
                     )
                 except BaseException as error:
+                    if not request.result.done():
+                        request.result.set_exception(error)
                     if primary is None:
                         raise
                     primary.add_note(
@@ -1859,8 +1868,7 @@ class SessionController:
                     )
         if primary is not None:
             raise primary
-        if answered and not request.result.done():
-            request.result.set_result(resolved_result)
+        return answered, resolved_result
 
     def _stop(self) -> int:
         """Stop admission, revoke pending input, and wake an idle execution owner."""
