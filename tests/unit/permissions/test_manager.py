@@ -2596,6 +2596,30 @@ def test_recursive_mutations_cannot_remove_protected_directories(tmp_path):
     assert result.sources == ("boundary:protected_path",)
 
 
+@pytest.mark.parametrize("workspace_bound", [False, True])
+@pytest.mark.parametrize("ancestor", [False, True])
+def test_working_root_mutations_cannot_be_overridden(tmp_path, workspace_bound, ancestor):
+    """Broad permits cannot delete a working root or an ancestor containing it."""
+    manager = PermissionManager(
+        tmp_path if workspace_bound else None,
+        configuration=PermissionConfiguration(rules=[PermissionRule(decision=Decision.ALLOW)]),
+    )
+    root = manager.temporary_directory
+    target = FileTarget(path=str(root.parent if ancestor else root), recursive=True)
+
+    result = manager.evaluate((operation(Action.FILESYSTEM_DELETE, target=target),))
+
+    assert result.decision is Decision.DENY
+    assert result.sources == ("boundary:protected_path",)
+    assert (
+        manager.evaluate((file_operation(Action.FILESYSTEM_READ, root),)).decision is Decision.ALLOW
+    )
+    assert (
+        manager.evaluate((file_operation(Action.FILESYSTEM_DELETE, root / "child"),)).decision
+        is Decision.ALLOW
+    )
+
+
 def test_explicit_filesystem_roots_expand_the_hard_boundary(tmp_path):
     """Configured absolute roots deliberately extend readable and writable scope."""
     outside = tmp_path.parent / "shared"

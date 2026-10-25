@@ -50,6 +50,8 @@ Use `/permissions default reset <scope> <action>` to reset a decision. A workspa
 
 Limits restrict what a policy can reach. Rules cannot bypass them. By default, Loop operations can read and write inside the workspace and the active conversation's private working directory (`loop-temp`), addressed as `$TMPDIR` by commands and file tools. Saved-session files persist across restarts; `/tmp` is an OS path and is not an alias for `loop-temp`. Namespace parents and ownership locks remain outside command authority; native metadata traversal does not permit private ancestor listings. Host-process access is off, and private or local network addresses are blocked.
 
+File tools cannot delete the active working-root directory or a containing tree, even with an allow rule or prior approval. They can delete ordinary descendants and remove symbolic links without deleting their targets. Replacing the working root requires the session manager's explicit retirement operation.
+
 Use limits to grant narrowly scoped access:
 
 ```text

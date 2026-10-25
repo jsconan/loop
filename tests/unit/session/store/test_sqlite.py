@@ -1009,6 +1009,17 @@ def test_working_storage_is_isolated_by_database_and_workspace(tmp_path):
     assert len({first.temporary_root, adjacent.temporary_root, other_workspace.temporary_root}) == 3
 
 
+def test_working_storage_rejects_an_unsafe_namespace_parent(tmp_path):
+    """Saved storage validates its private parent without repairing broader access."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    root = store.temporary_root
+    root.parent.mkdir(mode=0o755)
+    with pytest.raises(ValueError, match="private real directory"):
+        store.working_binding("session")
+    assert root.parent.stat().st_mode & 0o777 == 0o755
+    assert not root.exists()
+
+
 def test_sqlite_working_bindings_persist_independently_of_snapshots(tmp_path):
     """Creation, retirement and replacement commit without changing conversation revisions."""
     path = tmp_path / "sessions.db"

@@ -59,14 +59,21 @@ class SQLiteSessionStore:
         return self._path.parent / "scratch" / sha256_digest(identity)
 
     def working_binding(self, session_id: str) -> WorkingDirectoryBinding | None:
-        """Read durable working identity without modifying the conversation revision.
+        """Validate the existing namespace and read identity without changing the conversation.
 
         Args:
             session_id (str): Opaque session identifier.
 
         Returns:
             WorkingDirectoryBinding | None: Current binding or retirement tombstone, if present.
+
+        Raises:
+            ValueError: The existing namespace parent is not a private real directory.
+            OSError: The namespace parent cannot be inspected.
         """
+        parent = self.temporary_root.parent
+        if parent.exists() or parent.is_symlink():
+            ensure_private_directory(parent, create=False)
         if not self._path.exists():
             return None
         with closing(sqlite3.connect(self._path)) as connection:

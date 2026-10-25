@@ -134,6 +134,8 @@ class SessionManager:
         SessionNotFoundError: If the requested persisted session does not exist.
         UnsupportedConversationItemError: If a serialized conversation item type is unsupported.
         ValueError: If the session or persisted format is invalid.
+        OSError: Working storage cannot be prepared for interaction recovery.
+        SessionExecutionConflictError: Another harness owns a session requiring recovery.
     """
 
     _state_lock: RLock
@@ -206,11 +208,13 @@ class SessionManager:
         """
         with self._state_lock:
             if self._temporary_directory is None:
-                self._temporary_directory = PathHolder(self._session_directory(self._session.id))
+                with self._session_directory(self._session.id) as directory:
+                    self._temporary_directory = PathHolder(directory)
             return self._temporary_directory
 
-    def _session_directory(self, session_id: str) -> Path:
-        """Create or reopen one generation under native ownership without replacing lost data."""
+    @contextmanager
+    def _session_directory(self, session_id: str) -> Generator[Path, None, None]:
+        """Hold ownership of a validated generation without replacing lost data."""
         if not session_id:
             raise ValueError("Session identifier must not be empty.")
         root = self._session_store.temporary_root
@@ -221,17 +225,15 @@ class SessionManager:
             raise ValueError(
                 "Session working storage recovery failed: namespace unavailable."
             ) from error
-        # Saved stores have a harness-owned namespace parent; memory stores own their root.
-        if root.parent.name == "scratch":
-            ensure_private_directory(root.parent, create=False)
         locks = root / ".locks"
         ensure_private_directory(locks)
         identity = sha256_digest(session_id.encode("utf-8", errors="surrogatepass"))
-        try:
-            with private_directory_lock(locks, identity):
-                return self._bound_directory(session_id, root, identity)
-        except BlockingIOError as error:
-            raise SessionExecutionConflictError(session_id) from error
+        with ExitStack() as resources:
+            try:
+                resources.enter_context(private_directory_lock(locks, identity))
+            except BlockingIOError as error:
+                raise SessionExecutionConflictError(session_id) from error
+            yield self._bound_directory(session_id, root, identity)
 
     def _bound_directory(self, session_id: str, root: Path, identity: str) -> Path:
         """Validate durable identity or commit an independently created/adopted generation."""
@@ -310,34 +312,28 @@ class SessionManager:
         """
         with self._state_lock:
             self._check_session_selection()
-            directory = self._session_directory(self._session.id)
             root = self._session_store.temporary_root
             identity = sha256_digest(self._session.id.encode("utf-8", errors="surrogatepass"))
-            try:
-                with private_directory_lock(root / ".locks", identity):
-                    directory = self._bound_directory(self._session.id, root, identity)
-                    binding = self._session_store.working_binding(self._session.id)
-                    self._session_store.bind_working_directory(
-                        self._session.id, replace(binding, retired=True)
-                    )
-                    telemetry_audit(
-                        "session.working_directory.retired", session_id=self._session.id
-                    )
-                    replacement = self._bound_directory(self._session.id, root, identity)
-                    if self._temporary_directory is not None:
-                        self._temporary_directory.set(replacement)
-                    shutil.rmtree(directory)
-                    if directory.parent != root:
-                        directory.parent.rmdir()
-            except BlockingIOError as error:
-                raise SessionExecutionConflictError(self._session.id) from error
+            with self._session_directory(self._session.id) as directory:
+                binding = self._session_store.working_binding(self._session.id)
+                self._session_store.bind_working_directory(
+                    self._session.id, replace(binding, retired=True)
+                )
+                telemetry_audit("session.working_directory.retired", session_id=self._session.id)
+                replacement = self._bound_directory(self._session.id, root, identity)
+                if self._temporary_directory is not None:
+                    self._temporary_directory.set(replacement)
+                shutil.rmtree(directory)
+                if directory.parent != root:
+                    directory.parent.rmdir()
 
-    def _select_session(self, session: Session) -> None:
-        """Bind working storage before publishing a newly selected session."""
-        with self._state_lock:
+    def _select_session(self, session: Session, directory: Path | None = None) -> None:
+        """Publish a session using its held generation or a newly acquired storage lease."""
+        with self._state_lock, ExitStack() as resources:
             self._check_session_selection()
             if self._temporary_directory is not None:
-                directory = self._session_directory(session.id)
+                if directory is None:
+                    directory = resources.enter_context(self._session_directory(session.id))
                 self._temporary_directory.set(directory)
             self._session = session
 
@@ -1269,15 +1265,22 @@ class SessionManager:
             ValueError: If its persisted format or bound working storage is invalid or unsafe.
             OSError: Bound working storage cannot be created or inspected.
             SessionWorkspaceMismatchError: If the session belongs to another workspace.
-            SessionExecutionConflictError: If this manager is currently executing a session.
+            SessionExecutionConflictError: This manager is executing or another harness owns
+                the target session's working storage during selection or interaction recovery.
         """
-        with self._state_lock:
+        with self._state_lock, ExitStack() as resources:
             self._check_session_selection()
             if load_from_store := isinstance(session, str):
                 session = self._session_store.load(session)
             if not isinstance(session, Session):
                 raise ValueError("Invalid session type.")  # noqa: TRY004 - public API contract.
             self._validate_session_workspace(session)
+            directory = None
+            if session.pending_interactions:
+                directory = resources.enter_context(self._session_directory(session.id))
+                if load_from_store:
+                    session = self._session_store.load(session.id)
+                    self._validate_session_workspace(session)
             if session.workspace_id is None:
                 session.workspace_id = self._workspace_id
             cache_restorations = []
@@ -1355,7 +1358,7 @@ class SessionManager:
                         session_field.name,
                         deepcopy(getattr(candidate, session_field.name)),
                     )
-            self._select_session(session)
+            self._select_session(session, directory)
 
     def load_persisted_session(self, session_id: str) -> Session:
         """Read a persisted session without changing the active session.

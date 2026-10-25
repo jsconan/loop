@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 import sqlite3
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing, closing, nullcontext
 from datetime import UTC, datetime
@@ -156,6 +157,42 @@ def test_session_working_directory_contains_arbitrary_persisted_identifiers(iden
     assert directory.parent.parent == store.temporary_root
     assert directory != unrelated.temporary_directory.get()
     assert directory == reopened.temporary_directory.get()
+
+
+@pytest.mark.parametrize("parent_name", ["scratch", "ordinary"])
+def test_memory_working_storage_accepts_shared_temporary_parents(
+    tmp_path, monkeypatch, parent_name
+):
+    """Private memory-store roots do not require a private system temporary parent."""
+    parent = tmp_path / parent_name
+    parent.mkdir(mode=0o755)
+    monkeypatch.setattr(tempfile, "tempdir", str(parent))
+    manager = SessionManager()
+
+    with manager.execution() as directory:
+        assert directory.is_dir()
+        assert directory.stat().st_mode & 0o777 == 0o700
+        assert manager.store.temporary_root.stat().st_mode & 0o777 == 0o700
+    assert parent.stat().st_mode & 0o777 == 0o755
+
+
+def test_new_saved_namespace_is_validated_before_binding(tmp_path, monkeypatch):
+    """A namespace parent that becomes unsafe during creation cannot publish working storage."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    root = store.temporary_root
+    manager = SessionManager(session_store=store)
+
+    def prepare_directory(directory, **kwargs):
+        """Expose an unsafe parent immediately after namespace creation."""
+        ensure_private_directory(directory, **kwargs)
+        if directory == root:
+            root.parent.chmod(0o755)
+
+    monkeypatch.setattr(session_manager_module, "ensure_private_directory", prepare_directory)
+    with pytest.raises(ValueError, match="private real directory"):
+        _ = manager.temporary_directory
+    assert not store.path.exists()
+    assert root.parent.stat().st_mode & 0o777 == 0o755
 
 
 def test_manager_seeds_references_from_a_supplied_in_memory_session():
@@ -1730,6 +1767,81 @@ def test_sqlite_interaction_restart_revokes_pending_request_durably(tmp_path):
         for event in reopened.session.events
         if event.type == "interaction_settled" and event.request_id == "confirmation-request"
     ] == settled
+
+
+@pytest.mark.parametrize("supplied_session", [False, True])
+def test_loading_an_owned_session_preserves_live_interactions(tmp_path, supplied_session):
+    """Rejected loaders cannot revoke or mutate an owner's live pending confirmation."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    manager = SessionManager(session_store=store)
+    contender = SessionManager(session_store=store)
+    _ = contender.temporary_directory
+    previous = contender.session
+    with manager.execution():
+        asyncio.run(
+            manager.record_interaction_requested_async(
+                "live-confirmation", kind="confirm", session_id=None, run_id=None, operation_id=None
+            )
+        )
+        snapshot = store.load(manager.session.id).serialize()
+        target = manager.session if supplied_session else manager.session.id
+        with pytest.raises(SessionExecutionConflictError):
+            contender.load_session(target)
+        assert contender.session is previous
+        assert store.load(manager.session.id).serialize() == snapshot
+        assert manager.session.pending_interactions[0].request_id == "live-confirmation"
+        asyncio.run(manager.record_interaction_settled_async("live-confirmation", "answered"))
+    assert store.load(manager.session.id).pending_interactions == ()
+    assert manager.session.events[-1].outcome == "answered"
+
+
+def test_interaction_recovery_reloads_after_acquiring_ownership(tmp_path, monkeypatch):
+    """Recovery keeps a confirmation already answered before ownership was acquired."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    manager = SessionManager(session_store=store)
+    asyncio.run(
+        manager.record_interaction_requested_async(
+            "confirmation", kind="confirm", session_id=None, run_id=None, operation_id=None
+        )
+    )
+    load = store.load
+
+    def load_before_settlement(session_id):
+        """Return an earlier snapshot while the prior owner commits its final answer."""
+        snapshot = load(session_id)
+        asyncio.run(manager.record_interaction_settled_async("confirmation", "answered"))
+        monkeypatch.setattr(store, "load", load)
+        return snapshot
+
+    contender = SessionManager(session_store=store)
+    _ = contender.temporary_directory
+    monkeypatch.setattr(store, "load", load_before_settlement)
+    contender.load_session(manager.session.id)
+
+    assert contender.session.pending_interactions == ()
+    assert contender.session.events[-1].outcome == "answered"
+    assert contender.session.revision == manager.session.revision
+    assert contender.temporary_directory.get() == manager.temporary_directory.get()
+
+
+@pytest.mark.parametrize("error", [OSError("disk full"), BlockingIOError("snapshot busy")])
+def test_failed_interaction_recovery_preserves_state_and_releases_ownership(tmp_path, error):
+    """Persistence failures retain pending requests and release the lease for a later recovery."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    manager = SessionManager(session_store=store)
+    asyncio.run(
+        manager.record_interaction_requested_async(
+            "confirmation", kind="confirm", session_id=None, run_id=None, operation_id=None
+        )
+    )
+    snapshot = store.load(manager.session.id).serialize()
+    with patch.object(store, "save", side_effect=error), pytest.raises(type(error)) as failure:
+        SessionManager(session=manager.session.id, session_store=store)
+    assert failure.value is error
+    assert store.load(manager.session.id).serialize() == snapshot
+    restored = SessionManager(session=manager.session.id, session_store=store)
+    assert restored.session.pending_interactions == ()
+    assert restored.session.events[-1].outcome == "revoked"
 
 
 def test_sqlite_input_write_failure_is_not_acknowledged_or_published(tmp_path):
@@ -3782,15 +3894,25 @@ def test_failed_execution_admission_releases_native_resources(monkeypatch):
         assert captured == manager.temporary_directory.get()
 
 
-def test_working_retirement_refuses_a_new_owner_after_preparation(monkeypatch):
-    """A competing harness acquiring ownership after preparation prevents retirement."""
-    manager = SessionManager()
+def test_working_retirement_holds_ownership_through_replacement(monkeypatch):
+    """Another manager cannot execute between retirement and replacement binding."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    contender = SessionManager(session=manager.session, session_store=store)
     original = manager.temporary_directory.get()
-    lock = Mock(side_effect=[nullcontext(), BlockingIOError("owned")])
-    monkeypatch.setattr(session_manager_module, "private_directory_lock", lock)
-    with pytest.raises(SessionExecutionConflictError):
-        manager.discard_working_directory()
-    assert original.is_dir()
+    bind = store.bind_working_directory
+
+    def bind_while_owned(session_id, binding):
+        """Challenge native admission while the new generation is being committed."""
+        with pytest.raises(SessionExecutionConflictError), contender.execution():
+            pytest.fail("retiring generation admitted a competing owner")
+        bind(session_id, binding)
+
+    monkeypatch.setattr(store, "bind_working_directory", bind_while_owned)
+    manager.discard_working_directory()
+    assert not original.exists()
+    with contender.execution() as replacement:
+        assert replacement == manager.temporary_directory.get()
 
 
 def test_failed_generation_commit_preserves_unbound_data_and_retries_fresh(monkeypatch):

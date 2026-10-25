@@ -17,6 +17,8 @@ from loop import (
     Operation,
     PermissionManager,
     RuntimeEnvironment,
+    SessionManager,
+    SQLiteSessionStore,
     ToolRegistry,
 )
 from loop.execution import CommandExecutionService
@@ -1134,6 +1136,52 @@ def test_delete_path_requires_confirmation_and_removes_files(tmp_path, monkeypat
     assert confirm.call_count == 2
     assert all("filesystem.delete" in item.args[0] for item in confirm.call_args_list)
     assert all("Permanently delete this file." in item.args[0] for item in confirm.call_args_list)
+
+
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize("path", ["$TMPDIR", "$TMPDIR/", "$TMPDIR/."])
+def test_delete_path_preserves_the_bound_session_root(tmp_path, saved, path):
+    """Root deletion is forbidden while child cleanup and explicit retirement stay usable."""
+    store = (
+        SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace") if saved else None
+    )
+    manager = SessionManager(session_store=store)
+    root = manager.temporary_directory.get()
+    permissions = PermissionManager(tmp_path)
+    permissions.bind_temporary_directory(manager.temporary_directory)
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, manager.temporary_directory)
+    )
+    registry = ToolRegistry([delete_path_tool], permission_manager=permissions)
+    binding = manager.store.working_binding(manager.session.id)
+    child = root / "child"
+    child.write_text("obsolete")
+    alias = root / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    with manager.execution():
+        denied = registry.call(
+            "delete_path",
+            json.dumps({"path": path}),
+            interaction=ConsoleInteraction(),
+            instructions_manager=instructions,
+        )
+        assert problem(denied)["code"] == "tool.denied"
+        assert root.is_dir() and child.read_text() == "obsolete"
+        assert manager.store.working_binding(manager.session.id) == binding
+        for target in ("$TMPDIR/child", "$TMPDIR/alias"):
+            output = registry.call(
+                "delete_path",
+                json.dumps({"path": target}),
+                interaction=ConsoleInteraction(),
+                instructions_manager=instructions,
+            )
+            assert json.loads(output)["ok"]
+        assert root.is_dir() and not child.exists() and not alias.is_symlink()
+    with manager.execution() as captured:
+        assert captured == root
+    manager.discard_working_directory()
+    assert manager.temporary_directory.get() != root
+    assert not root.exists()
 
 
 def test_delete_path_removes_folder_trees_without_following_symbolic_links(tmp_path, monkeypatch):

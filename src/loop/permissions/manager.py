@@ -3119,10 +3119,14 @@ class PermissionManager:
             self._policy_lock.release()
 
     def _is_protected_path(self, resource: str, *, mutation: bool, recursive: bool = False) -> bool:
-        if self._workspace_root is None:
-            return False
+        """Protect control data and the working root without following a mutation's leaf link."""
         requested = Path(resource)
         path = requested.parent.resolve() / requested.name if mutation else requested.resolve()
+        temporary = self.temporary_directory
+        if mutation and (path == temporary or recursive and temporary.is_relative_to(path)):
+            return True
+        if self._workspace_root is None:
+            return False
         protected = (
             self._workspace_root / constants.APP_DIRECTORY,
             self._workspace_root / constants.GIT_DIRECTORY,

@@ -4,9 +4,11 @@ import json
 import os
 import subprocess
 import sys
+from unittest.mock import Mock
 
 import pytest
 
+from loop import Interaction, SessionManager, SQLiteSessionStore
 from loop.utils.path import private_directory_lock
 
 pytestmark = pytest.mark.integration
@@ -106,6 +108,84 @@ except SessionExecutionConflictError:
         stdout, stderr = owner.communicate(timeout=5)
         assert stdout == stderr == ""
         assert attempt("shared") == initial
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        owner.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("crash", [False, True])
+def test_concurrent_load_preserves_live_confirmation_and_recovers_abandoned_requests(
+    tmp_path, crash
+):
+    """A rejected process cannot revoke live approval; owner death permits one recovery."""
+    database = tmp_path / "sessions.db"
+    source = """
+import asyncio, json, signal, sys
+from unittest.mock import Mock
+from loop import Interaction, SessionManager, SQLiteSessionStore
+signal.alarm(15)
+manager = SessionManager(interaction=Mock(spec=Interaction),
+    session_store=SQLiteSessionStore(sys.argv[1], workspace_id="workspace"))
+with manager.execution():
+    asyncio.run(manager.record_interaction_requested_async("confirmation", kind="confirm",
+        session_id=None, run_id=None, operation_id=None))
+    print(json.dumps({"id": manager.session.id}), flush=True)
+    if sys.stdin.readline().strip() == "answer":
+        asyncio.run(manager.record_interaction_settled_async("confirmation", "answered"))
+"""
+    contender_source = """
+import sys
+from unittest.mock import Mock
+from loop import Interaction, SessionExecutionConflictError, SessionManager, SQLiteSessionStore
+try:
+    SessionManager(interaction=Mock(spec=Interaction), session=sys.argv[2],
+        session_store=SQLiteSessionStore(sys.argv[1], workspace_id="workspace"))
+except SessionExecutionConflictError:
+    print("owned")
+else:
+    raise RuntimeError("Live confirmation was admitted for recovery")
+"""
+    owner = subprocess.Popen(
+        [sys.executable, "-B", "-u", "-c", source, str(database)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        session_id = json.loads(owner.stdout.readline())["id"]
+        store = SQLiteSessionStore(database, workspace_id="workspace")
+        snapshot = store.load(session_id).serialize()
+        contender = subprocess.run(
+            [sys.executable, "-B", "-c", contender_source, str(database), session_id],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        assert contender.stdout == "owned\n" and contender.stderr == ""
+        assert store.load(session_id).serialize() == snapshot
+        if crash:
+            owner.kill()
+            stdout, stderr = owner.communicate(timeout=5)
+        else:
+            stdout, stderr = owner.communicate("answer\n", timeout=5)
+            assert owner.returncode == 0
+        assert stdout == stderr == ""
+        restored = SessionManager(
+            interaction=Mock(spec=Interaction), session=session_id, session_store=store
+        )
+        assert restored.session.pending_interactions == ()
+        assert restored.session.events[-1].outcome == ("revoked" if crash else "answered")
+        revision = restored.session.revision
+        reopened = SessionManager(
+            interaction=Mock(spec=Interaction), session=session_id, session_store=store
+        )
+        assert reopened.session.revision == revision
+        assert sum(event.type == "interaction_settled" for event in reopened.session.events) == 1
+        with reopened.execution():
+            assert reopened.temporary_directory.get().is_dir()
     finally:
         if owner.poll() is None:
             owner.kill()
