@@ -2598,8 +2598,11 @@ def test_recover_async_finalizes_or_reenters_query_boundary():
     runner._run_from_boundary_async.assert_awaited_once_with(recovery=recovery)
 
 
-def test_runner_async_query_closes_backend_stream_when_cancelled(tmp_path):
-    """Cancelling async query closes its backend stream and retains no partial response."""
+@pytest.mark.parametrize("storage_failure", [False, True])
+def test_runner_async_query_closes_backend_stream_when_cancelled(
+    tmp_path, monkeypatch, storage_failure
+):
+    """Close cancelled streams and propagate setup errors without waiting for stream startup."""
     backend = Mock()
     runner = file_runner(tmp_path, backend)
     runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
@@ -2620,21 +2623,27 @@ def test_runner_async_query_closes_backend_stream_when_cancelled(tmp_path):
 
     async def query():
         """Cancel a query at a deterministic point in its event stream."""
-        task = asyncio.create_task(runner.query_async())
-        try:
+        async with asyncio.TaskGroup() as tasks:
+            task = tasks.create_task(runner.query_async())
             await waiting.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
-    asyncio.run(query())
-
-    assert closed.is_set()
+    if storage_failure:
+        error = ValueError("Session working storage recovery failed: namespace unavailable.")
+        monkeypatch.setattr(sessions, "execution", Mock(side_effect=error))
+        with pytest.raises(ExceptionGroup) as captured:
+            asyncio.run(query())
+        assert captured.value.exceptions == (error,)
+        assert not waiting.is_set()
+        assert not closed.is_set()
+        runner.interaction.answer_delta.assert_not_called()
+    else:
+        asyncio.run(query())
+        assert closed.is_set()
+        runner.interaction.answer_delta.assert_called_once_with("partial")
     assert sessions.messages == []
-    runner.interaction.answer_delta.assert_called_once_with("partial")
 
 
 @pytest.mark.parametrize("mode", ["interrupt", "stop", "external"])

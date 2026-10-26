@@ -33,6 +33,47 @@ def test_ensure_private_directory_creates_and_reopens_private_storage(tmp_path):
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700
 
 
+@pytest.mark.parametrize("search_only", [True, False])
+def test_ensure_private_directory_uses_available_directory_search_access(
+    monkeypatch, tmp_path, search_only
+):
+    """Select search-only or fallback flags without requiring either native open capability."""
+    directory = tmp_path / "parent" / "private"
+    directory.mkdir(mode=0o700, parents=True)
+    details = directory.lstat()
+    search_flag = 1 << 40
+    if search_only:
+        monkeypatch.setattr(os, "O_SEARCH", search_flag, raising=False)
+    else:
+        monkeypatch.delattr(os, "O_SEARCH", raising=False)
+    opened = []
+    closed = Mock()
+    monkeypatch.setattr(os, "close", closed)
+    monkeypatch.setattr(os, "fstat", Mock(return_value=details))
+    monkeypatch.setattr(path_module, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(os, "getxattr", Mock(return_value=b""), raising=False)
+
+    def open_directory(path, flags, *args, **kwargs):
+        """Model descriptor acquisition independently of the host OS and sandbox."""
+        access = search_flag if search_only else os.O_RDONLY
+        assert flags == access | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        descriptor = 100 + len(opened)
+        opened.append((path, descriptor))
+        return descriptor
+
+    monkeypatch.setattr(os, "open", open_directory)
+
+    ensure_private_directory(directory)
+    ensure_private_directory(directory, create=False)
+
+    assert directory.stat().st_mode & 0o777 == 0o700
+    assert opened[0][0] == directory.anchor
+    assert directory.name in [path for path, _ in opened]
+    assert [call.args[0] for call in closed.call_args_list] == [
+        descriptor for _, descriptor in opened
+    ]
+
+
 @pytest.mark.parametrize("component", ["target", "ancestor", "relative"])
 def test_ensure_private_directory_rejects_aliased_roots_before_creating_files(tmp_path, component):
     """Symbolic directory substitutions and relative roots never grant working storage."""

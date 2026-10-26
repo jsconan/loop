@@ -133,6 +133,18 @@ def test_shell_pipeline_and_nested_child(native_command, native_workspace):
     assert result.stdout == "HELLO\nworkspace-ok"
 
 
+def test_nested_permissive_sandbox_cannot_remove_parent_confinement(native_command):
+    """Launching another sandbox never grants access denied by the command's parent policy."""
+    result = native_command(
+        "/usr/bin/sandbox-exec -p '(version 1)(allow default)' /bin/cat ../outside/secret"
+    )
+
+    assert result.outcome is SandboxOutcome.COMPLETED, result
+    assert result.exit_code != 0
+    assert "fake-outside-canary" not in result.stdout
+    assert "fake-outside-canary" not in result.stderr
+
+
 @pytest.mark.parametrize(
     "source",
     [

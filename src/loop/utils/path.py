@@ -28,6 +28,8 @@ def ensure_private_directory(
     """Create or validate a private directory without following symbolic path components.
 
     Create missing parents with mode ``0700`` using no-follow, directory-relative operations.
+    Use search-only directory descriptors when available so traversal does not require permission
+    to list ancestor directories.
     Require the selected directory to have mode ``0700`` and belong to the current user.
     Refuse unsafe existing directories without changing them, and verify the final path still
     names the opened directory.
@@ -45,7 +47,7 @@ def ensure_private_directory(
     """
     if not path.is_absolute() or path.resolve() != path:
         raise ValueError("Path must be a private real directory.")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    flags = getattr(os, "O_SEARCH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     components = path.parts[1:]
     if anchor is None:
         descriptor = os.open(path.anchor, flags)

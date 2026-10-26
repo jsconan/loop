@@ -3,6 +3,8 @@
 import json
 import shlex
 import shutil
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -20,6 +22,7 @@ from loop.constants import MAX_OUTPUT_CHARS
 from loop.execution import CommandExecutionService
 from loop.tools.files import read_text_file, write_text_file
 from loop.tools.system import run_command
+from loop.utils import path as path_module
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e, pytest.mark.macos]
 
@@ -93,6 +96,42 @@ def test_read_only_command_writes_only_owned_scratch(public_command, native_work
     assert denied["ok"] is False
     assert not (native_workspace / ".coverage").exists()
     assert not (native_workspace / "report").exists()
+    public_command.host.run_host_command.assert_not_called()
+
+
+def test_public_python_session_uses_scratch_without_ancestor_read_access(
+    public_command, monkeypatch
+):
+    """Nested session ownership works while ancestor directory listings remain denied."""
+    monkeypatch.setenv("PATH", str(Path(sys.executable).parent) + ":/usr/bin:/bin")
+    source = """
+import os
+from pathlib import Path
+from unittest.mock import Mock
+from loop import Interaction, SessionManager
+
+manager = SessionManager(interaction=Mock(spec=Interaction))
+with manager.execution():
+    report = Path(manager.temporary_directory) / "report"
+    report.write_text("session-ok")
+    print(report.read_text())
+try:
+    os.listdir("/private")
+except PermissionError:
+    print("ancestor-denied")
+else:
+    raise AssertionError("ancestor listing was allowed")
+"""
+    result = public_command.call(
+        "python -B -c " + shlex.quote(source),
+        read_only=True,
+        read_roots=[str(Path(sys.prefix).resolve()), str(Path(path_module.__file__).parents[2])],
+    )
+
+    assert result["ok"], result
+    assert result["result"]["boundary"] == "sandbox"
+    assert result["result"]["stdout"]["content"] == "session-ok\nancestor-denied\n"
+    assert result["result"]["stderr"]["content"] == ""
     public_command.host.run_host_command.assert_not_called()
 
 
