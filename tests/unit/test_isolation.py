@@ -1,9 +1,12 @@
 """Verify the suite rejects external resources and production filesystem mutations."""
 
+import ctypes
 import os
+import pwd
 import socket
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -69,3 +72,64 @@ def test_native_sqlite_output_is_blocked_before_creation(tmp_path):
     with pytest.raises(AssertionError, match="escapes disposable scratch"):
         sqlite3.connect(target)
     assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        "subprocess.Popen",
+        "os.system",
+        "os.fork",
+        "os.exec",
+        "os.kill",
+        "socket.connect",
+        "socket.bind",
+        "socket.getaddrinfo",
+        "ctypes.dlopen",
+    ],
+)
+def test_native_audit_boundary_cannot_bypass_scoped_doubles(event):
+    """Retained native function aliases still encounter the unit resource guard."""
+    with pytest.raises(AssertionError, match="external resource"):
+        sys.audit(event)
+
+
+def test_default_console_input_is_isolated_and_requires_an_explicit_response():
+    """Default editors are independent and unconfigured input fails without a terminal."""
+    from loop.interaction import ConsoleInteraction
+
+    first = ConsoleInteraction()
+    second = ConsoleInteraction()
+    first.set_current_input("owned draft")
+    assert first.current_input() == "owned draft"
+    assert second.current_input() == ""
+    with pytest.raises(AssertionError, match="external resource"):
+        second.prompt()
+
+
+def test_native_library_loading_is_blocked_before_dlopen():
+    """Unconfigured ctypes loading cannot invoke host libraries in a portable unit test."""
+    with pytest.raises(AssertionError, match="external resource"):
+        ctypes.CDLL(None)
+
+
+def test_account_lookup_uses_the_disposable_home():
+    """Trusted-home discovery uses synthetic account data instead of host directory services."""
+    account = pwd.getpwuid(os.getuid())
+    assert account.pw_dir == os.environ["HOME"]
+    assert account.pw_name == "test-user"
+    with pytest.raises(AssertionError, match="external resource"):
+        pwd.getpwnam("unused")
+
+
+@pytest.mark.parametrize("repeat", [0, 1])
+def test_permission_catalog_templates_never_share_mutable_defaults(repeat):
+    """Consumers and repeated cases cannot mutate the validated permission-catalog template."""
+    from loop.permissions import PermissionPreset
+
+    presets = PermissionPreset.builtin_presets()
+    expected = dict(presets[0].defaults)
+    presets[0].defaults.clear()
+    fresh = PermissionPreset.builtin_presets()
+    assert fresh[0] is not presets[0]
+    assert fresh[0].defaults == expected

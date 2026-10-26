@@ -17,6 +17,11 @@ from loop import (
 from loop.permissions import HostCommandRule, PermissionPreset
 
 
+@pytest.fixture(autouse=True)
+def isolated_permission_catalog():
+    """Exercise the actual packaged catalog loader in its owning model suite."""
+
+
 def test_actions_map_to_distinct_prompt_icons():
     """Every authority-bearing action exposes its assigned prompt icon."""
     assert {action: action.icon for action in Action} == {

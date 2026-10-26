@@ -35,7 +35,7 @@ class BlockingAdapter(MemoryTelemetryAdapter):
     def write_batch(self, records):
         """Wait before retaining the first offered batch."""
         self.started.set()
-        self.release.wait()
+        assert self.release.wait(timeout=5), "test synchronization was not released"
         super().write_batch(records)
 
 
@@ -273,7 +273,8 @@ def test_shutdown_barrier_rejects_late_activity_and_coordinates_lifecycle_calls(
     telemetry.error("ignored.error", error_type="test.ignored", exception=RuntimeError())
 
     adapter.release.set()
-    closing.join()
+    closing.join(timeout=5)
+    assert not closing.is_alive()
     assert telemetry.close(1)
     assert [record.event_name for record in adapter.records] == ["accepted"]
 

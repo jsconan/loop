@@ -138,7 +138,7 @@ def test_async_config_command_offloads_persistence_and_applies_on_owner(tmp_path
     configuration = ConfigurationManager(tmp_path / "config.toml")
     configuration.load()
     interaction = Mock(spec=ConsoleInteraction)
-    release = Event()
+    started, release = Event(), Event()
     set_threads = []
     apply_threads = []
     original_set = configuration.set
@@ -146,7 +146,8 @@ def test_async_config_command_offloads_persistence_and_applies_on_owner(tmp_path
     def wait_then_set(path, value, *, scope="user"):
         """Pause persistence until the async owner gets a scheduling turn."""
         set_threads.append(get_ident())
-        assert release.wait(timeout=0.5)
+        started.set()
+        assert release.wait(timeout=5)
         return original_set(path, value, scope=scope)
 
     def apply(path, settings):
@@ -163,8 +164,16 @@ def test_async_config_command_offloads_persistence_and_applies_on_owner(tmp_path
     async def dispatch():
         """Release synchronous persistence from a scheduled owner-loop callback."""
         owner_thread = get_ident()
-        asyncio.get_running_loop().call_later(0.01, release.set)
-        await manager.call_async("config", "set loop.debug true scope=user")
+        pending = asyncio.create_task(
+            manager.call_async("config", "set loop.debug true scope=user")
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            assert not pending.done()
+            release.set()
+            await pending
+        finally:
+            release.set()
         assert apply_threads == [owner_thread]
 
     asyncio.run(dispatch())
@@ -346,7 +355,7 @@ def test_async_config_cancellation_settles_persistence_and_owner_effect(tmp_path
     def wait_then_set(path, value, *, scope="user"):
         """Hold the file transaction until the test cancels its async command."""
         started.set()
-        assert release.wait(timeout=0.5)
+        assert release.wait(timeout=5)
         return original_set(path, value, scope=scope)
 
     def apply(_path, _settings):
@@ -366,11 +375,13 @@ def test_async_config_cancellation_settles_persistence_and_owner_effect(tmp_path
         pending = asyncio.create_task(
             manager.call_async("config", "set loop.debug true scope=user")
         )
-        assert await asyncio.to_thread(started.wait, 0.5)
-        loop = asyncio.get_running_loop()
-        loop.call_later(0, pending.cancel)
-        loop.call_later(0.01, pending.cancel)
-        loop.call_later(0.02, release.set)
+        assert await asyncio.to_thread(started.wait, 5)
+        pending.cancel()
+        await asyncio.sleep(0)
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done()
+        release.set()
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert apply_threads == [owner_thread]
@@ -405,11 +416,13 @@ def test_async_config_cancellation_preserves_cancel_when_persistence_fails(tmp_p
         pending = asyncio.create_task(
             manager.call_async("config", "set loop.debug true scope=user")
         )
-        assert await asyncio.to_thread(started.wait, 0.5)
-        loop = asyncio.get_running_loop()
-        loop.call_later(0, pending.cancel)
-        loop.call_later(0.01, pending.cancel)
-        loop.call_later(0.02, release.set)
+        assert await asyncio.to_thread(started.wait, 5)
+        pending.cancel()
+        await asyncio.sleep(0)
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done()
+        release.set()
         with pytest.raises(asyncio.CancelledError) as captured:
             await pending
         assert any("OSError" in note for note in captured.value.__notes__)

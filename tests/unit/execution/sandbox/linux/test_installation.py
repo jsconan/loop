@@ -1722,12 +1722,13 @@ def test_attachment_removal_retains_confinement_on_unsafe_policy_authority(
             b"loopgen_generation\n" if change == "duplicate" else b"other\n"
         )
         if change == "inventory":
+            monkeypatch.setattr(linux_installation, "_MAX_GLOBAL_POLICY_INVENTORY_ENTRIES", 2)
             previous_iter = Path.iterdir
             monkeypatch.setattr(
                 Path,
                 "iterdir",
                 lambda path: (
-                    iter([path / "other"] * 4097)
+                    iter([path / "other"] * 3)
                     if path == Path("/sys/kernel/security/apparmor/policy/profiles")
                     else previous_iter(path)
                 ),

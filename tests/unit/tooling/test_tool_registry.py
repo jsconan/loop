@@ -814,7 +814,7 @@ def test_sync_and_async_registry_calls_reuse_their_native_async_loops():
         registry.close()
 
 
-def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
+def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch, contended_lock):
     """Concurrent sync calls use one runner and reject the non-owner safely."""
 
     @declare_tool
@@ -825,8 +825,8 @@ def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
     registry = ToolRegistry([calculate])
     runner_creation_started = Event()
     second_call_started = Event()
-    second_runner_creation_started = Event()
     release_runner_creation = Event()
+    monkeypatch.setattr(registry, "_runner_lock", contended_lock.lock)
     created_runners = []
     created_runners_lock = Lock()
     results = {}
@@ -842,8 +842,6 @@ def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
         if first_runner:
             runner_creation_started.set()
             assert release_runner_creation.wait(timeout=3)
-        else:
-            second_runner_creation_started.set()
         return runner
 
     monkeypatch.setattr(tool_registry_module.asyncio, "Runner", create_runner)
@@ -861,7 +859,8 @@ def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
         second_thread = Thread(target=call_tool, args=("second",))
         second_thread.start()
         assert second_call_started.wait(timeout=3)
-        assert not second_runner_creation_started.wait(timeout=1)
+        assert contended_lock.contended.wait(timeout=3)
+        assert len(created_runners) == 1
     finally:
         release_runner_creation.set()
         first_thread.join(timeout=3)
@@ -1057,7 +1056,7 @@ def test_blocking_sync_tool_does_not_stall_the_async_event_loop():
     def wait_for_release() -> str:
         """Wait for the test owner to release the worker."""
         started.set()
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
         return "finished"
 
     registry = ToolRegistry([wait_for_release])
@@ -1089,7 +1088,7 @@ def test_async_tool_worker_admission_is_bounded():
     def wait_for_release() -> str:
         """Hold a worker until the registry reports its capacity boundary."""
         invocation_count.append(True)
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
         return "finished"
 
     registry = ToolRegistry([wait_for_release])
@@ -1130,7 +1129,7 @@ def test_cancellation_waits_for_sync_tool_settlement():
     def wait_for_release(context: ToolContext) -> str:
         """Finish only after observing the worker's cancellation signal."""
         started.set()
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
         settled.set()
         return "finished"
 
@@ -1169,7 +1168,7 @@ def test_cancellation_settles_sync_work_without_a_run_signal():
     def wait_for_release() -> str:
         """Hold the worker until the event loop advances cancellation."""
         started.set()
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
         settled.set()
         return "finished"
 
@@ -1209,7 +1208,7 @@ def test_cancelled_worker_does_not_start_or_await_additional_execution(during_st
     def hold():
         """Hold a synchronous boundary until cancellation has been requested."""
         owner_loop.call_soon_threadsafe(started.set)
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
 
     def invoke():
         """Return an unstarted coroutine only when execution was already admitted."""
@@ -1267,7 +1266,7 @@ def test_cancelled_callback_retrieves_its_completed_future_without_starting_more
     def future_callback():
         """Return the completed owner-loop future after cancellation reaches the worker."""
         owner_loop.call_soon_threadsafe(started.set)
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
         return returned
 
     def invoke():
@@ -1514,7 +1513,7 @@ def test_foreign_future_ownership_is_preserved_during_dispatch_cancellation(canc
     def invoke():
         """Return a pending foreign future through a controlled worker boundary."""
         owner_loop.call_soon_threadsafe(started.set)
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
         return future
 
     registry = ToolRegistry([invoke])
@@ -1634,7 +1633,7 @@ def test_worker_failure_is_logged_when_cancellation_waits_for_settlement(caplog)
     def fail_after_release() -> str:
         """Raise after the cancellation owner releases the worker."""
         started.set()
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
         raise RuntimeError("private failure detail")
 
     registry = ToolRegistry([fail_after_release])
@@ -3218,11 +3217,11 @@ def test_async_planning_stops_at_operation_boundaries():
 
 
 @pytest.mark.parametrize(
-    ("execution_service", "operations", "expected"),
+    ("has_execution_service", "operations", "expected"),
     [
-        (None, (), "sandbox.unavailable"),
+        (False, (), "sandbox.unavailable"),
         (
-            object(),
+            True,
             (
                 Operation(
                     tool_id="execute",
@@ -3233,7 +3232,7 @@ def test_async_planning_stops_at_operation_boundaries():
             "sandbox.unavailable",
         ),
         (
-            object(),
+            True,
             (
                 Operation(
                     tool_id="execute",
@@ -3250,9 +3249,10 @@ def test_async_planning_stops_at_operation_boundaries():
     ],
 )
 def test_async_execution_authorization_keeps_sandbox_boundary(
-    execution_service, operations, expected
+    has_execution_service, operations, expected
 ):
     """Async dispatch only accepts operations authorized for the sandbox boundary."""
+    execution_service = Mock() if has_execution_service else None
 
     def process_plan(arguments):
         """Return the arguments unchanged for direct authorization checks."""

@@ -103,33 +103,37 @@ def test_value_holder_from_value_constructs_requested_holder_type(holder_type, v
 
 
 @pytest.mark.parametrize(
-    ("holder", "expected", "value_type"),
+    ("holder_type", "initial", "expected", "value_type"),
     [
-        (StrValueHolder(123), "123", str),
-        (IntValueHolder("42"), 42, int),
-        (FloatValueHolder("3.14"), 3.14, float),
-        (BoolValueHolder(1), True, bool),
+        (StrValueHolder, 123, "123", str),
+        (IntValueHolder, "42", 42, int),
+        (FloatValueHolder, "3.14", 3.14, float),
+        (BoolValueHolder, 1, True, bool),
     ],
 )
-def test_typed_holders_coerce_values_during_construction(holder, expected, value_type):
+def test_typed_holders_coerce_values_during_construction(
+    holder_type, initial, expected, value_type
+):
     """Every typed holder stores its constructor input as the declared scalar type."""
+    holder = holder_type(initial)
     assert holder.value == expected
     assert isinstance(holder.value, value_type)
 
 
 @pytest.mark.parametrize(
-    ("holder", "assigned", "set_value", "expected_assigned", "expected_set"),
+    ("holder_type", "initial", "assigned", "set_value", "expected_assigned", "expected_set"),
     [
-        (StrValueHolder(""), 123, False, "123", "False"),
-        (IntValueHolder(0), "42", 3.9, 42, 3),
-        (FloatValueHolder(0), "3.14", 2, 3.14, 2.0),
-        (BoolValueHolder(False), "false", "", True, False),
+        (StrValueHolder, "", 123, False, "123", "False"),
+        (IntValueHolder, 0, "42", 3.9, 42, 3),
+        (FloatValueHolder, 0, "3.14", 2, 3.14, 2.0),
+        (BoolValueHolder, False, "false", "", True, False),
     ],
 )
 def test_typed_holders_coerce_property_and_method_mutations(
-    holder, assigned, set_value, expected_assigned, expected_set
+    holder_type, initial, assigned, set_value, expected_assigned, expected_set
 ):
     """Property assignment and set apply the same subclass coercion hook."""
+    holder = holder_type(initial)
     holder.value = assigned
     assert holder.value == expected_assigned
 
@@ -212,17 +216,18 @@ def test_value_holder_ordering_delegates_to_current_underlying_values():
 
 
 @pytest.mark.parametrize(
-    "holder",
+    ("holder_type", "initial"),
     [
-        ValueHolder("value"),
-        StrValueHolder("value"),
-        IntValueHolder(1),
-        FloatValueHolder(1),
-        BoolValueHolder(1),
+        (ValueHolder, "value"),
+        (StrValueHolder, "value"),
+        (IntValueHolder, 1),
+        (FloatValueHolder, 1),
+        (BoolValueHolder, 1),
     ],
 )
-def test_value_holders_are_unhashable(holder):
+def test_value_holders_are_unhashable(holder_type, initial):
     """Mutable holders cannot violate hash-container invariants after value changes."""
+    holder = holder_type(initial)
     with pytest.raises(TypeError, match="unhashable type"):
         hash(holder)
 
@@ -311,13 +316,13 @@ def test_shared_reads_writes_and_conversions_remain_consistent():
 
     def write(seed: int) -> None:
         """Replace the shared value after all workers are ready."""
-        barrier.wait()
+        barrier.wait(timeout=5)
         for offset in range(500):
             holder.value = seed + offset
 
     def read() -> None:
         """Read and convert complete integer snapshots during replacement."""
-        barrier.wait()
+        barrier.wait(timeout=5)
         for _ in range(500):
             assert isinstance(holder.get(), int)
             assert isinstance(holder.value, int)
@@ -340,7 +345,7 @@ def test_opposite_order_holder_comparisons_do_not_deadlock():
 
     def compare(left: IntValueHolder, right: IntValueHolder) -> bool:
         """Start with the peer and compare repeatedly in one operand order."""
-        barrier.wait()
+        barrier.wait(timeout=5)
         return all(left == right for _ in range(1_000))
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -364,17 +369,18 @@ def test_compare_and_set_atomically_matches_and_coerces_replacements():
 
 
 @pytest.mark.parametrize(
-    "holder",
+    ("holder_type", "initial"),
     [
-        ValueHolder("value"),
-        StrValueHolder("value"),
-        IntValueHolder(1),
-        FloatValueHolder(1),
-        BoolValueHolder(1),
+        (ValueHolder, "value"),
+        (StrValueHolder, "value"),
+        (IntValueHolder, 1),
+        (FloatValueHolder, 1),
+        (BoolValueHolder, 1),
     ],
 )
-def test_value_holders_copy_and_pickle_with_independent_synchronization(holder):
+def test_value_holders_copy_and_pickle_with_independent_synchronization(holder_type, initial):
     """Copying and pickling preserve values without attempting to serialize locks."""
+    holder = holder_type(initial)
     replicas = [copy.copy(holder), copy.deepcopy(holder), pickle.loads(pickle.dumps(holder))]
 
     holder.set(holder.get())

@@ -1898,7 +1898,7 @@ def test_recovery_keeps_full_mailbox_inputs_until_the_owner_can_consume_them(
     source = MagicMock(spec=ConsoleInteraction)
     source.response_context.side_effect = nullcontext
     controller = SessionController(source)
-    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    store = MemorySessionStore()
     sessions = SessionManager(
         interaction=controller.interaction, session_store=store, workspace_id="workspace"
     )
@@ -2026,7 +2026,7 @@ def test_recovery_keeps_full_mailbox_inputs_until_the_owner_can_consume_them(
         run = sessions.begin_run()
         with controller.control.execution():
             signal(started)
-            release.wait()
+            assert release.wait(timeout=5), "test synchronization was not released"
         return boundary_result(run)
 
     async def stop_run_async():
@@ -4155,7 +4155,7 @@ def test_mailbox_rejects_session_change_and_preserves_conversation_order(tmp_pat
             queries.append(kwargs["input"])
             if len(queries) == 1:
                 controller.interaction.info("backend working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
             answer = f"answer {len(queries)}"
             return [
                 AnswerCompleted(text=answer),
@@ -4276,7 +4276,7 @@ def test_mailbox_steers_or_interrupts_active_generation_without_losing_queued_me
             try:
                 yield AnswerDelta(text="partial answer")
                 controller.interaction.info("working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
                 stale = ToolCall(call_id="stale", name="effect", arguments="{}")
                 yield ToolCallCompleted(call=stale)
                 yield ResponseCompleted(items=(stale,))

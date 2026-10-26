@@ -128,6 +128,47 @@ class Process:
         return self.returncode
 
 
+class LogStream(io.BytesIO):
+    """Represent a diagnostic descriptor and producer EOF entirely in memory."""
+
+    eof: bool
+
+    def __init__(self, records):
+        super().__init__(records)
+        self.eof = False
+
+    def fileno(self):
+        """Return this controlled descriptor for the scoped select and read doubles."""
+        return self
+
+
+@pytest.fixture(autouse=True)
+def diagnostic_pipe_boundary(monkeypatch):
+    """Model readable records and EOF without allocating or waiting on native pipes."""
+    original_read = os.read
+
+    def select_streams(readers, writers, errors, timeout):
+        """Return only streams with buffered bytes or a closed producer."""
+        ready = []
+        for reader in readers:
+            stream = reader.fileno()
+            assert isinstance(stream, LogStream)
+            if stream.tell() < len(stream.getvalue()) or stream.eof:
+                ready.append(reader)
+        return ready, [], []
+
+    def read_stream(descriptor, count):
+        """Read diagnostic bytes in memory while preserving ordinary owned file reads."""
+        if isinstance(descriptor, LogStream):
+            return descriptor.read(count)
+        return original_read(descriptor, count)
+
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.select", SimpleNamespace(select=select_streams)
+    )
+    monkeypatch.setattr(os, "read", read_stream)
+
+
 class LogProcess:
     """Expose bounded kernel-log bytes through a real readable pipe."""
 
@@ -147,19 +188,12 @@ class LogProcess:
         self.wait_error = wait_error
         self.stuck_after_kill = stuck_after_kill
         self.wait_timeouts = []
-        if stdout:
-            read_fd, write_fd = os.pipe()
-            os.write(write_fd, records)
-            self.stdout = os.fdopen(read_fd, "rb")
-            self._write_fd = write_fd
-        else:
-            self.stdout = None
-            self._write_fd = None
+        self.stdout = LogStream(records) if stdout else None
         if not running or not stuck_after_kill:
             self.finish()
 
     def clone(self):
-        """Create a fresh pipe for a later bounded log snapshot."""
+        """Create a fresh in-memory stream for a later bounded log snapshot."""
         return LogProcess(
             self.records,
             running=self.running,
@@ -187,9 +221,8 @@ class LogProcess:
 
     def finish(self):
         """Close the producer after its data has been consumed."""
-        if self._write_fd is not None:
-            os.close(self._write_fd)
-            self._write_fd = None
+        if self.stdout is not None:
+            self.stdout.eof = True
 
 
 class CloseErrorStream:
@@ -957,7 +990,7 @@ def test_trusted_argv_search_stops_after_slow_helper_copy(monkeypatch, tmp_path)
     started = clock.return_value
     result = MacOSSeatbeltBackend().run_read_only_argv(executable, (), (), started + 0.01)
     assert result.status is ProcessCaptureStatus.TIMED_OUT
-    assert time.monotonic() - started < 0.5
+    assert clock.return_value == pytest.approx(started + 0.04)
     launch.assert_not_called()
 
 
@@ -999,7 +1032,7 @@ def test_backend_deadline_during_granted_tree_walk_prevents_launch(monkeypatch, 
     started = clock.return_value
     result = MacOSSeatbeltBackend().run(request(tmp_path, deadline=started + 0.01))
     assert result.outcome is SandboxOutcome.TIMED_OUT
-    assert time.monotonic() - started < 0.5
+    assert clock.return_value == pytest.approx(started + 0.04)
     launch.assert_not_called()
 
 
@@ -1273,8 +1306,6 @@ def test_backend_bounds_denial_log_cleanup_without_masking_shell_result(monkeypa
         wait_error=subprocess.TimeoutExpired("/usr/bin/log", 0.01),
         stuck_after_kill=True,
     )
-    started = time.monotonic()
-
     try:
         result, _ = run_with_log(
             monkeypatch,
@@ -1286,7 +1317,6 @@ def test_backend_bounds_denial_log_cleanup_without_masking_shell_result(monkeypa
     finally:
         log_process.finish()
 
-    assert time.monotonic() - started < 0.5
     assert result.outcome is SandboxOutcome.COMPLETED
     assert result.exit_code == 23
     assert result.observed_denial == ""
@@ -1869,11 +1899,11 @@ def test_backend_times_out_when_capture_reader_stays_alive(monkeypatch, tmp_path
 
 
 @pytest.mark.parametrize(
-    ("process", "outcome"),
+    ("process_factory", "outcome"),
     [
-        (Process(stdout=None), SandboxOutcome.UNAVAILABLE),
+        (lambda: Process(stdout=None), SandboxOutcome.UNAVAILABLE),
         (
-            Process(
+            lambda: Process(
                 stdout="",
                 stderr="sandbox-exec: sandbox_apply: Operation not permitted",
                 returncode=71,
@@ -1882,23 +1912,27 @@ def test_backend_times_out_when_capture_reader_stays_alive(monkeypatch, tmp_path
             SandboxOutcome.UNAVAILABLE,
         ),
         (
-            Process(stdout="", stderr="sandbox-exec: forged failure", returncode=71),
+            lambda: Process(stdout="", stderr="sandbox-exec: forged failure", returncode=71),
             SandboxOutcome.COMPLETED,
         ),
         (
-            Process(stdout="", stderr="sandbox-exec: forged failure", returncode=65),
+            lambda: Process(stdout="", stderr="sandbox-exec: forged failure", returncode=65),
             SandboxOutcome.COMPLETED,
         ),
-        (Process(stdout="", stderr="ordinary failure", returncode=65), SandboxOutcome.COMPLETED),
         (
-            Process(wait_error=subprocess.TimeoutExpired(["sandbox-exec"], 1)),
+            lambda: Process(stdout="", stderr="ordinary failure", returncode=65),
+            SandboxOutcome.COMPLETED,
+        ),
+        (
+            lambda: Process(wait_error=subprocess.TimeoutExpired(["sandbox-exec"], 1)),
             SandboxOutcome.TIMED_OUT,
         ),
-        (Process(wait_error=KeyboardInterrupt()), SandboxOutcome.CANCELLED),
+        (lambda: Process(wait_error=KeyboardInterrupt()), SandboxOutcome.CANCELLED),
     ],
 )
-def test_backend_classifies_child_capture_failures(monkeypatch, tmp_path, process, outcome):
+def test_backend_classifies_child_capture_failures(monkeypatch, tmp_path, process_factory, outcome):
     """Missing pipes, nested launcher failure, and timeout each fail closed."""
+    process = process_factory()
     monkeypatch.setattr(
         "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),

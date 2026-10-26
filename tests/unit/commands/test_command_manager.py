@@ -755,19 +755,20 @@ def test_sync_dispatch_rejects_runner_use_from_a_different_thread():
 
     thread = Thread(target=dispatch)
     thread.start()
-    thread.join()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
 
     assert len(failures) == 1
     assert failures[0].problem.code == "command.async_required"
 
 
-def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
+def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch, contended_lock):
     """Concurrent sync callers cannot race manager-owned runner initialization."""
     manager = CommandManager()
     start = Barrier(3)
     runner_creation_started = Event()
-    second_runner_creation_started = Event()
     release_runner_creation = Event()
+    monkeypatch.setattr(manager, "_runner_lock", contended_lock.lock)
     created_runners = []
     created_runners_lock = Lock()
     results = []
@@ -781,8 +782,6 @@ def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
         if first_runner:
             runner_creation_started.set()
             assert release_runner_creation.wait(timeout=3)
-        else:
-            second_runner_creation_started.set()
         return runner
 
     monkeypatch.setattr(module.asyncio, "Runner", create_runner)
@@ -798,7 +797,8 @@ def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch):
             thread.start()
         start.wait(timeout=3)
         assert runner_creation_started.wait(timeout=3)
-        assert not second_runner_creation_started.wait(timeout=1)
+        assert contended_lock.contended.wait(timeout=3)
+        assert len(created_runners) == 1
     finally:
         release_runner_creation.set()
         for thread in threads:
@@ -882,7 +882,7 @@ def test_sync_command_leaves_the_async_loop_responsive():
     def blocked() -> None:
         """Hold worker execution until the async owner has made progress."""
         signal_started[0]()
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
 
     manager.register(blocked)
 
@@ -934,7 +934,7 @@ def test_sync_command_admission_is_bounded():
 
     def blocked() -> None:
         """Wait until all admitted work is queued for bounded-admission coverage."""
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
 
     manager.register(blocked)
 

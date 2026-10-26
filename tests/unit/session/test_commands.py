@@ -574,7 +574,7 @@ def test_async_export_dispatch_keeps_file_work_off_the_event_loop(tmp_path, monk
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(SessionManager(), Mock()))
     target = tmp_path / "async-export.md"
-    release = Event()
+    started, release = Event(), Event()
     export_threads = []
     loop_released_worker = []
     original_export = session_commands_module.export_session
@@ -582,7 +582,8 @@ def test_async_export_dispatch_keeps_file_work_off_the_event_loop(tmp_path, monk
     def wait_then_export(session, store, destination, *, format="markdown", overwrite=False):
         """Pause the file operation until the async owner gets a scheduling turn."""
         export_threads.append(get_ident())
-        loop_released_worker.append(release.wait(timeout=0.5))
+        started.set()
+        loop_released_worker.append(release.wait(timeout=5))
         return original_export(session, store, destination, format=format, overwrite=overwrite)
 
     monkeypatch.setattr(session_commands_module, "export_session", wait_then_export)
@@ -590,8 +591,16 @@ def test_async_export_dispatch_keeps_file_work_off_the_event_loop(tmp_path, monk
     async def dispatch():
         """Let the event loop release the simulated blocking export operation."""
         owner_thread = get_ident()
-        asyncio.get_running_loop().call_later(0.01, release.set)
-        await manager.call_async("session", f"export {target}", interaction=interaction)
+        pending = asyncio.create_task(
+            manager.call_async("session", f"export {target}", interaction=interaction)
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            assert not pending.done()
+            release.set()
+            await pending
+        finally:
+            release.set()
         assert export_threads[0] != owner_thread
 
     asyncio.run(dispatch())

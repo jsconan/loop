@@ -216,7 +216,7 @@ def test_sync_admission_wakes_an_async_recall_waiter(ui, monkeypatch):
         def try_put(self, admission):
             """Expose the owned write before allowing the admission to finish."""
             owner_loop.call_soon_threadsafe(admitted.set)
-            release.wait()
+            assert release.wait(timeout=5), "test synchronization was not released"
             return super().try_put(admission)
 
     monkeypatch.setattr(controller_module, "InputMailbox", HeldMailbox)
@@ -1896,7 +1896,7 @@ def test_controller_commands_appear_in_help_and_complete_values_while_busy(ui):
             receive(DummyCompleter())
             with controller.control.execution():
                 controller.interaction.info("working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
             receive(DummyCompleter())
 
         ui.info.side_effect = lambda message="": working.set() if message == "working" else None
@@ -1973,7 +1973,7 @@ def test_controller_rejects_inactive_and_unknown_slash_input_without_queueing(ui
             received.append(receive(DummyCompleter()))
             with controller.control.execution():
                 controller.interaction.info("working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
             received.append(receive(DummyCompleter()))
 
         task = asyncio.create_task(controller._run_sync_callback_async(conversation))
@@ -2123,7 +2123,7 @@ def test_active_commands_use_native_async_blocking_interactions(ui, kind, expect
         receive(DummyCompleter())
         with controller.control.execution():
             controller.interaction.info("working")
-            release.wait()
+            assert release.wait(timeout=5), "test synchronization was not released"
         receive(DummyCompleter())
 
     async def scenario():
@@ -2175,7 +2175,7 @@ def test_active_command_finishes_after_conversation_worker_and_keeps_prompt_open
             context.interaction.prompt("Choose a scope:", choices={"session": "Session"})
         )
         prompt_returned.set()
-        command_release.wait()
+        assert command_release.wait(timeout=5), "test synchronization was not released"
 
     manager = CommandManager(
         commands=(
@@ -2196,7 +2196,7 @@ def test_active_command_finishes_after_conversation_worker_and_keeps_prompt_open
     def conversation(receive):
         """Return when active command dispatch proves its prompt has started."""
         receive(DummyCompleter())
-        command_started.wait()
+        assert command_started.wait(timeout=5), "test synchronization was not released"
 
     async def scenario():
         """Resolve the prompt after conversation execution ends, then finish the command."""
@@ -2261,7 +2261,7 @@ def test_stopping_releases_an_active_command_confirmation(ui):
         receive(DummyCompleter())
         with controller.control.execution():
             controller.interaction.info("working")
-            release.wait()
+            assert release.wait(timeout=5), "test synchronization was not released"
 
     async def scenario():
         """Stop after the command confirmation opens and wait for clean settlement."""
@@ -2390,7 +2390,7 @@ def test_interrupted_active_command_does_not_stop_the_controller(ui):
         receive(DummyCompleter())
         with controller.control.execution():
             controller.interaction.info("working")
-            release.wait()
+            assert release.wait(timeout=5), "test synchronization was not released"
 
     async def scenario():
         """Interrupt the pending approval and allow both owners to settle normally."""
@@ -2452,7 +2452,7 @@ def test_failed_active_command_is_reported_during_controller_settlement(ui):
         receive(DummyCompleter())
         with controller.control.execution():
             controller.interaction.info("working")
-            release.wait()
+            assert release.wait(timeout=5), "test synchronization was not released"
 
     async def scenario():
         """Raise the UI failure after controller cleanup settles both owners."""
@@ -3240,7 +3240,7 @@ def test_controller_accepts_messages_and_status_during_serialized_work(ui):
                 execution_threads.append(get_ident())
                 if message == "first":
                     controller.interaction.info("working")
-                    release.wait()
+                    assert release.wait(timeout=5), "test synchronization was not released"
                 else:
                     controller.interaction.info("processed")
             controller.interaction.conversation_ended()
@@ -3331,7 +3331,7 @@ def test_ordinary_input_during_active_run_is_deferred_steering(ui):
             received.append(receive(DummyCompleter()))
             with controller.control.execution():
                 controller.interaction.info("working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
                 assert controller.control.steering_pending is True
                 assert controller.control.interrupted is False
                 controller.control.checkpoint()
@@ -3805,7 +3805,7 @@ def test_controller_bounds_queued_inputs_and_reports_unexecuted_inputs_on_exit(u
             messages.append(receive(DummyCompleter()))
             with controller.control.execution():
                 controller.interaction.info("working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
                 messages.append(receive(DummyCompleter()))
 
         task = asyncio.create_task(controller._run_sync_callback_async(conversation))
@@ -3901,7 +3901,7 @@ def test_controller_keeps_live_completion_reads_out_of_active_execution(ui):
             """Hold the owner gate around a synchronous operation."""
             receive(WordCompleter(["hello"]))
             controller.interaction.info("working")
-            release.wait()
+            assert release.wait(timeout=5), "test synchronization was not released"
 
         task = asyncio.create_task(controller._run_sync_callback_async(conversation))
         try:
@@ -3955,7 +3955,7 @@ def test_controller_cancellation_waits_for_execution_cleanup(ui):
             """Finalize presentation after an in-progress synchronous operation settles."""
             try:
                 controller.interaction.info("working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
             finally:
                 cleanup_threads.append(get_ident())
                 controller.interaction.info("cleaned")
@@ -4007,7 +4007,7 @@ def test_controller_hands_off_exclusive_terminal_without_starting_another_editor
             with controller.interaction.terminal_context():
                 decisions.append(controller.interaction.confirm("Install?"))
                 controller.interaction.info("held")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
             controller.interaction.info("released")
             receive(DummyCompleter())
 
@@ -4693,7 +4693,7 @@ def test_controller_rejects_a_new_approval_requested_after_stop(ui):
         def conversation(_receive):
             """Attempt confirmation after the active operation has settled."""
             controller.interaction.info("working")
-            release.wait()
+            assert release.wait(timeout=5), "test synchronization was not released"
             controller.interaction.confirm("Too late", default=True)
 
         task = asyncio.create_task(controller._run_sync_callback_async(conversation))
@@ -4731,7 +4731,7 @@ def test_controller_retains_cleanup_failure_evidence_during_repeated_cancellatio
                 controller.control.wait(60)
             except KeyboardInterrupt:
                 controller.interaction.info("cleaning")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
             raise ValueError("cleanup failed")
 
         task = asyncio.create_task(controller._run_sync_callback_async(conversation))
@@ -4823,7 +4823,7 @@ def test_controller_stop_tolerates_the_event_loop_settling_in_another_thread(ui,
             """Model a loop closing after a stopper has read its active reference."""
             if stopper_id and get_ident() == stopper_id[0]:
                 schedule(stopping.set)
-                release_stopper.wait()
+                assert release_stopper.wait(timeout=5), "test synchronization was not released"
                 raise RuntimeError("event loop closed")
             return schedule(callback, *args, **kwargs)
 
@@ -4838,7 +4838,7 @@ def test_controller_stop_tolerates_the_event_loop_settling_in_another_thread(ui,
         def conversation(_receive):
             """Keep execution active until the stop scheduler is paused."""
             controller.interaction.info("working")
-            release_worker.wait()
+            assert release_worker.wait(timeout=5), "test synchronization was not released"
 
         monkeypatch.setattr(loop, "call_soon_threadsafe", call_soon)
         task = asyncio.create_task(controller._run_sync_callback_async(conversation))
@@ -4950,7 +4950,7 @@ def test_controller_reports_discarded_inputs_without_hiding_primary_failures(ui,
             """Fail or settle only after a second input has been admitted to the queue."""
             receive(DummyCompleter())
             controller.interaction.info("working")
-            release.wait()
+            assert release.wait(timeout=5), "test synchronization was not released"
             if worker_failure:
                 raise LookupError("worker failed")
 
@@ -5012,7 +5012,7 @@ def test_steering_precedes_queued_messages_and_keeps_corrections_in_submission_o
             messages.append(receive(DummyCompleter()))
             with controller.control.execution():
                 controller.interaction.info("working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
                 with pytest.raises(RunInterrupted):
                     controller.control.checkpoint()
             for _ in range(4):
@@ -5134,7 +5134,7 @@ def test_rejected_steering_does_not_interrupt_or_displace_a_full_mailbox(ui):
             receive(DummyCompleter())
             with controller.control.execution():
                 controller.interaction.info("working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
                 interrupted.append(controller.control.interrupted)
                 controller.control.checkpoint()
             for _ in range(16):
@@ -5191,7 +5191,7 @@ def test_interrupted_runs_cannot_open_late_questions_or_terminal_handoffs(ui, op
             receive(DummyCompleter())
             with controller.control.execution(), pytest.raises(RunInterrupted):
                 controller.interaction.info("working")
-                release.wait()
+                assert release.wait(timeout=5), "test synchronization was not released"
                 if operation == "terminal_context":
                     with controller.interaction.terminal_context():
                         pytest.fail("Interrupted work must not obtain terminal ownership")

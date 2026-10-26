@@ -2,6 +2,8 @@
 
 import json
 import os
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -65,12 +67,19 @@ def test_search_text_paths_regex_and_limits(tmp_path):
     assert not matches and truncated
 
 
-def test_search_text_paths_bounds_pathological_regex(tmp_path):
-    """A pattern with catastrophic backtracking cannot hold the application indefinitely."""
+def test_search_text_paths_bounds_pathological_regex(tmp_path, monkeypatch):
+    """A matcher timeout is forwarded as a bounded-search failure without real backtracking."""
     source = tmp_path / "source.txt"
     source.write_text("a" * 900 + "!\n", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="time limit"):
+    pattern = Mock()
+    pattern.search.side_effect = TimeoutError("regex budget exhausted")
+    compile_pattern = Mock(return_value=pattern)
+    monkeypatch.setattr("loop.utils.search.re.compile", compile_pattern)
+    with pytest.raises(RuntimeError, match="pattern exceeded its time limit"):
         search_text_paths([source], r"(a+)+$", root=tmp_path, regex=True)
+    compile_pattern.assert_called_once()
+    assert compile_pattern.call_args.args[0] == r"(a+)+$"
+    pattern.search.assert_called_once_with("a" * 900 + "!", timeout=0.1)
 
 
 def test_search_text_paths_continues_after_overlong_line_and_file(tmp_path):
@@ -91,9 +100,6 @@ def test_search_text_paths_continues_after_overlong_line_and_file(tmp_path):
 
 def test_search_text_paths_observes_total_deadline(tmp_path, monkeypatch):
     """A search that outlives its total budget stops before further matching."""
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
     source = tmp_path / "source.txt"
     source.write_text("needle\n", encoding="utf-8")
     monkeypatch.setattr(
@@ -105,9 +111,6 @@ def test_search_text_paths_observes_total_deadline(tmp_path, monkeypatch):
 
 def test_search_text_paths_bounds_drain_of_oversized_line(tmp_path, monkeypatch):
     """An oversized line cannot hold the search past its total deadline."""
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
     source = tmp_path / "source.txt"
     source.write_text("x" * 2000, encoding="utf-8")
     monkeypatch.setattr(

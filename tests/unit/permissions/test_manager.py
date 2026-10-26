@@ -9,6 +9,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 from threading import Event, Thread, get_ident
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
@@ -51,6 +52,24 @@ from loop.permissions import (
 from loop.permissions import manager as manager_module
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.telemetry.policy import thaw
+
+
+@pytest.fixture
+def policy_waits(monkeypatch):
+    """Expose policy-lock polling as controlled futures rather than elapsed timers."""
+    waits = asyncio.Queue()
+
+    async def sleep(seconds):
+        """Park one lock poll until the test releases ownership or cancels it."""
+        assert seconds == 0.01
+        pending = asyncio.get_running_loop().create_future()
+        waits.put_nowait(pending)
+        await pending
+
+    monkeypatch.setattr(
+        manager_module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep})
+    )
+    return waits
 
 
 def operation(action: Action, *, tool: str = "demo", target=None, reason=None) -> Operation:
@@ -1434,7 +1453,7 @@ def test_async_remembered_approval_writes_off_loop_and_publishes_after_save(tmp_
     def slow_persist(path, configuration):
         """Hold policy-file I/O so the test can observe event-loop progress."""
         worker_started.set()
-        if not release_worker.wait(timeout=0.2):
+        if not release_worker.wait(timeout=5):
             blocked_event_loop.set()
         original_persist(path, configuration)
 
@@ -1465,7 +1484,6 @@ def test_async_remembered_approval_writes_off_loop_and_publishes_after_save(tmp_
         task = asyncio.create_task(manager.authorize_async(operation_set, recorder=recorder))
         await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
         unpublished_during_write = not manager.configuration.rules
-        await asyncio.sleep(0.01)
         event_loop_responsive = not blocked_event_loop.is_set()
         release_worker.set()
         result = await task
@@ -1606,7 +1624,7 @@ def test_async_remembered_approval_rechecks_a_new_deny_policy(tmp_path):
     assert manager.configuration.rules
 
 
-def test_async_authorization_yields_while_a_policy_update_holds_its_lock(tmp_path):
+def test_async_authorization_yields_while_a_policy_update_holds_its_lock(tmp_path, policy_waits):
     """Async policy evaluation waits cooperatively for a concurrent sync update."""
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
     interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.ONCE)
@@ -1631,11 +1649,12 @@ def test_async_authorization_yields_while_a_policy_update_holds_its_lock(tmp_pat
         holder = asyncio.create_task(asyncio.to_thread(hold_policy_lock))
         await asyncio.wait_for(asyncio.to_thread(lock_acquired.wait), timeout=2)
         authorization = asyncio.create_task(manager.authorize_async(operation_set))
-        await asyncio.sleep(0.02)
+        waiting = await policy_waits.get()
         yielded = not authorization.done()
         release_lock.set()
-        result = await authorization
         await holder
+        waiting.set_result(None)
+        result = await authorization
         return yielded, result
 
     try:
@@ -1774,7 +1793,7 @@ def test_async_remembered_approval_settles_worker_before_cancellation(tmp_path, 
     asyncio.run(cancel_authorization())
 
 
-def test_async_remembered_approval_waits_for_policy_lock_after_persistence(tmp_path):
+def test_async_remembered_approval_waits_for_policy_lock_after_persistence(tmp_path, policy_waits):
     """Cancellation during post-save publication waits for lock ownership to settle."""
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
     interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.WORKSPACE)
@@ -1817,11 +1836,16 @@ def test_async_remembered_approval_waits_for_policy_lock_after_persistence(tmp_p
         """Cancel while durable policy publication waits cooperatively for its lock."""
         pending = asyncio.create_task(manager.authorize_async(operation_set))
         await asyncio.wait_for(asyncio.to_thread(lock_held.wait), timeout=2)
-        await asyncio.sleep(0.02)
+        await policy_waits.get()
         pending.cancel()
-        await asyncio.sleep(0.02)
+        await policy_waits.get()
         pending.cancel()
+        waiting = await policy_waits.get()
         release_lock.set()
+        for holder in holder_threads:
+            await asyncio.to_thread(holder.join, 5)
+            assert not holder.is_alive()
+        waiting.set_result(None)
         with pytest.raises(asyncio.CancelledError):
             await pending
 

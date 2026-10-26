@@ -133,8 +133,10 @@ def test_session_source_and_operating_system_tmp_remain_opaque():
 
 
 @pytest.mark.parametrize("home", ["/Users/synthetic-account", "/home/synthetic-account"])
-def test_native_diagnostic_variants_hide_session_and_private_ancestors(home):
+def test_native_diagnostic_variants_hide_session_and_private_ancestors(home, monkeypatch):
     """Raw, quoted, JSON, shell, canonical and abbreviated diagnostics use logical roots."""
+    # These are diagnostic spellings, not host accounts or automounted home directories.
+    monkeypatch.setattr(Path, "resolve", lambda path, **kwargs: path)
     root = Path(home) / "Library/Application Support/synthetic é;$/files"
     paths = VirtualPath(Path(home) / "work", root)
     variants = [

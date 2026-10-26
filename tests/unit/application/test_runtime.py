@@ -660,7 +660,7 @@ def test_async_close_settles_sync_cleanup_after_cancellation():
     def cleanup():
         """Hold cleanup until the async shutdown receives cancellation."""
         started.set()
-        release.wait(timeout=1.0)
+        assert release.wait(timeout=5)
         settled.set()
 
     runtime = ApplicationRuntime(Mock(), Mock(), 1.0, cleanup_callbacks=[cleanup])
@@ -670,7 +670,9 @@ def test_async_close_settles_sync_cleanup_after_cancellation():
         closing = asyncio.create_task(runtime.close_async())
         assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1.0), timeout=2.0)
         closing.cancel()
-        asyncio.get_running_loop().call_later(0.01, release.set)
+        await asyncio.sleep(0)
+        assert not closing.done()
+        release.set()
         with pytest.raises(asyncio.CancelledError):
             await closing
         assert settled.is_set()

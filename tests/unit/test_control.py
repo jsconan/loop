@@ -2,6 +2,7 @@
 
 import asyncio
 from threading import Thread
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -369,13 +370,28 @@ def test_interruption_wakes_retry_waits_and_failure_releases_the_scope(monkeypat
     control.checkpoint()
 
 
-def test_async_wait_keeps_the_event_loop_responsive_until_timeout():
+def test_async_wait_keeps_the_event_loop_responsive_until_timeout(monkeypatch):
     """Async retry delays yield control to other tasks while the timer is pending."""
 
     async def scenario():
         """Let a heartbeat run while a retry timer expires."""
         control = RunControl()
         heartbeat = asyncio.Event()
+
+        async def controlled_timeout(waiter, *, timeout):
+            """Expire the retry timer only after the heartbeat proves loop progress."""
+            assert timeout == 0.01
+            try:
+                await heartbeat.wait()
+            finally:
+                waiter.close()
+            raise TimeoutError
+
+        monkeypatch.setattr(
+            control_module,
+            "asyncio",
+            SimpleNamespace(**{**vars(asyncio), "wait_for": controlled_timeout}),
+        )
 
         async def signal():
             """Mark that another task ran during the retry delay."""
@@ -412,7 +428,8 @@ def test_async_wait_is_woken_by_cross_thread_run_interruption():
             interrupt = Thread(target=control.interrupt)
             interrupt.start()
             result = await waiting
-            interrupt.join()
+            interrupt.join(timeout=5)
+            assert not interrupt.is_alive()
         return result, control._async_waiters, control.active
 
     result, waiters, active = asyncio.run(scenario())

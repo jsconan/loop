@@ -2360,35 +2360,35 @@ def test_async_tool_execution_preserves_boundary_records_and_outcomes(
         assert interaction.tool_call.call_count == 1
 
 
-@pytest.mark.parametrize("interrupted_tools", [None, []])
-def test_async_tool_batch_retains_settled_metrics_when_interrupted(interrupted_tools):
+@pytest.mark.parametrize("track_interrupted_tools", [False, True])
+def test_async_tool_batch_retains_settled_metrics_when_interrupted(track_interrupted_tools):
     """An interrupted async batch keeps metrics for tools that already settled."""
     runner, _sessions, _interaction = agent_runner()
     call = ToolCall(call_id="call", name="effect", arguments="{}")
     settled = ToolExecutionMetrics(name="effect", duration_seconds=0.1, succeeded=True)
     runner._execute_tool_call_async = AsyncMock(side_effect=[settled, RunInterrupted()])
-    runner._interrupted_tools = interrupted_tools
+    runner._interrupted_tools = [] if track_interrupted_tools else None
 
     with pytest.raises(RunInterrupted):
         asyncio.run(runner._execute_tool_calls_async((call, call), present=True))
 
-    if interrupted_tools is not None:
+    if track_interrupted_tools:
         assert runner._interrupted_tools == [settled]
 
 
-@pytest.mark.parametrize("interrupted_tools", [None, []])
-def test_async_tool_batch_retains_settled_metrics_when_task_is_cancelled(interrupted_tools):
+@pytest.mark.parametrize("track_interrupted_tools", [False, True])
+def test_async_tool_batch_retains_settled_metrics_when_task_is_cancelled(track_interrupted_tools):
     """Task cancellation does not discard metrics for previously settled tools."""
     runner, _sessions, _interaction = agent_runner()
     call = ToolCall(call_id="call", name="effect", arguments="{}")
     settled = ToolExecutionMetrics(name="effect", duration_seconds=0.1, succeeded=True)
     runner._execute_tool_call_async = AsyncMock(side_effect=[settled, asyncio.CancelledError()])
-    runner._interrupted_tools = interrupted_tools
+    runner._interrupted_tools = [] if track_interrupted_tools else None
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(runner._execute_tool_calls_async((call, call), present=True))
 
-    if interrupted_tools is not None:
+    if track_interrupted_tools:
         assert runner._interrupted_tools == [settled]
 
 
@@ -2745,7 +2745,7 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(
     def save_receipt():
         """Finish a controlled effect after the run receives cancellation."""
         owner_loop.call_soon_threadsafe(started.set)
-        release.wait()
+        assert release.wait(timeout=5), "test synchronization was not released"
         (tmp_path / "receipt.txt").write_text("confirmed-receipt-123", encoding="utf-8")
         return receipt
 
@@ -2945,7 +2945,7 @@ def test_cancellation_settles_returned_owner_loop_work_before_the_run_ends(
         """Return already-scheduled owner-loop work from a synchronous tool."""
         result = asyncio.run_coroutine_threadsafe(create_result(), owner_loop).result()
         owner_loop.call_soon_threadsafe(worker_ready.set)
-        release_worker.wait()
+        assert release_worker.wait(timeout=5), "test synchronization was not released"
         return result
 
     def later_effect():
@@ -3297,11 +3297,18 @@ def test_synchronous_pause_resumes_the_same_stream_at_a_safe_checkpoint(tmp_path
     runner = file_runner(tmp_path, backend, run_control=control)
     sessions = runner.session_manager
     sessions.add_user_message("question")
-    resume = Thread(target=lambda: (pause_requested.wait(), control.continue_run()))
+
+    def continue_paused_run():
+        """Resume only after the stream parks, with a bounded failure path."""
+        assert pause_requested.wait(timeout=5), "test stream did not pause"
+        control.continue_run()
+
+    resume = Thread(target=continue_paused_run)
     resume.start()
 
     result = runner.run()
-    resume.join()
+    resume.join(timeout=5)
+    assert not resume.is_alive()
 
     closed.assert_called_once_with()
     assert result.stop_reason == "completed"
