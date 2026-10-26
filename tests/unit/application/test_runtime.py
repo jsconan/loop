@@ -18,6 +18,7 @@ from loop.configuration import ApplicationSettings, ConfigurationCommands
 from loop.conversation import ConversationCommands, ConversationRecoveryCommands
 from loop.telemetry import SQLiteTelemetryAdapter, Telemetry
 from loop.workspace import Workspace, WorkspaceCommands
+from tests.scheduling import deliver_callbacks
 
 
 @pytest.fixture
@@ -670,7 +671,7 @@ def test_async_close_settles_sync_cleanup_after_cancellation():
         closing = asyncio.create_task(runtime.close_async())
         assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1.0), timeout=2.0)
         closing.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not closing.done()
         release.set()
         with pytest.raises(asyncio.CancelledError):

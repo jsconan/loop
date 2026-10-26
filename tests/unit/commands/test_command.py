@@ -22,6 +22,7 @@ from loop import (
 )
 from loop.commands.models import CommandRemainder
 from loop.commands.utils import get_command_arguments_model
+from tests.scheduling import deliver_callbacks
 
 
 def make_command(function, name: str = "select") -> Command:
@@ -68,7 +69,7 @@ def test_call_async_keeps_the_owner_loop_responsive_for_context_free_sync_comman
         owner_thread = get_ident()
         pending = asyncio.create_task(make_command(select).call_async(""))
         assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1), timeout=2)
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not pending.done()
         release.set()
         assert await pending == "selected"

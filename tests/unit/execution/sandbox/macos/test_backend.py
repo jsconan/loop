@@ -1224,9 +1224,9 @@ def test_backend_external_path_grants_only_metadata_even_with_hardlink(monkeypat
     assert str(search) not in data
 
 
-@pytest.mark.parametrize("config_kind", ["regular", "symlink", "hardlink"])
+@pytest.mark.parametrize("config_kind", ["missing", "regular", "symlink", "hardlink"])
 def test_backend_grants_only_safe_python_environment_config(monkeypatch, tmp_path, config_kind):
-    """A host Python search root grants its exact config or fails on an alias."""
+    """A Python search root permits absent metadata, grants exact files and rejects aliases."""
     workspace = tmp_path / "work"
     workspace.mkdir()
     external = tmp_path / "venv"
@@ -1237,7 +1237,7 @@ def test_backend_grants_only_safe_python_environment_config(monkeypatch, tmp_pat
         secret = external / "secret"
         secret.write_text("private")
         config.symlink_to(secret)
-    else:
+    elif config_kind != "missing":
         config.write_text("home = /usr/local/bin")
         if config_kind == "hardlink":
             os.link(config, external / "alias")
@@ -1251,7 +1251,10 @@ def test_backend_grants_only_safe_python_environment_config(monkeypatch, tmp_pat
     result = MacOSSeatbeltBackend().run(
         request(workspace, read_roots=(search,), environment={"PATH": str(search), "LANG": "C"})
     )
-    if config_kind == "regular":
+    if config_kind == "missing":
+        assert result.outcome is SandboxOutcome.COMPLETED
+        assert str(config) not in popen.call_args.args[0][2]
+    elif config_kind == "regular":
         assert result.outcome is SandboxOutcome.COMPLETED
         assert f'(literal "{config}")' in popen.call_args.args[0][2]
         assert f'(subpath "{external}")' not in popen.call_args.args[0][2]
@@ -1664,9 +1667,9 @@ def test_backend_bounds_getconf_by_remaining_deadline(monkeypatch, tmp_path):
     launch = MagicMock()
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.run", lookup)
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", launch)
-    result = MacOSSeatbeltBackend().run(request(tmp_path, deadline=time.monotonic() + 0.1))
+    result = MacOSSeatbeltBackend().run(request(tmp_path, deadline=time.monotonic() + 0.125))
     assert result.outcome is SandboxOutcome.TIMED_OUT
-    assert 0 < lookup.call_args.kwargs["timeout"] <= 0.1
+    assert 0 < lookup.call_args.kwargs["timeout"] <= 0.125
     launch.assert_not_called()
 
 

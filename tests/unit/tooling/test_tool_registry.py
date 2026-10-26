@@ -68,6 +68,7 @@ from loop.tooling import (
 from loop.tooling import tool as declare_tool
 from loop.tooling.tool_registry import ToolExecutionPortal
 from loop.utils import VirtualPath, cached_path, content_digest
+from tests.scheduling import deliver_callbacks
 
 tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
 
@@ -1235,7 +1236,7 @@ def test_cancelled_worker_does_not_start_or_await_additional_execution(during_st
         try:
             await started.wait()
             task.cancel()
-            await asyncio.sleep(0)
+            await deliver_callbacks()
             release.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -1297,7 +1298,7 @@ def test_cancelled_callback_retrieves_its_completed_future_without_starting_more
         try:
             await started.wait()
             task.cancel()
-            await asyncio.sleep(0)
+            await deliver_callbacks()
             release.set()
             with pytest.raises(asyncio.CancelledError) as captured:
                 await task
@@ -1527,7 +1528,7 @@ def test_foreign_future_ownership_is_preserved_during_dispatch_cancellation(canc
             await started.wait()
             if cancelled:
                 task.cancel()
-                await asyncio.sleep(0)
+                await deliver_callbacks()
             release.set()
             if cancelled:
                 with pytest.raises(asyncio.CancelledError):
@@ -3180,7 +3181,7 @@ def test_async_dispatch_keeps_event_loop_responsive_during_approval():
     async def dispatch():
         task = asyncio.create_task(registry.call_with_timing_async("calculate", '{"number": 3}'))
         await approval_started.wait()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not task.done()
         assert executed == []
         continue_approval.set()

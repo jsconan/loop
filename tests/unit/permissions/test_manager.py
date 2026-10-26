@@ -52,6 +52,7 @@ from loop.permissions import (
 from loop.permissions import manager as manager_module
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.telemetry.policy import thaw
+from tests.scheduling import deliver_callbacks
 
 
 @pytest.fixture
@@ -1782,7 +1783,7 @@ def test_async_remembered_approval_settles_worker_before_cancellation(tmp_path, 
         pending = asyncio.create_task(manager.authorize_async(operation_set))
         await worker_started.wait()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         pending.cancel()
         release_worker.set()
         with pytest.raises(asyncio.CancelledError) as captured:
@@ -1988,7 +1989,7 @@ def test_async_authorization_settles_audit_before_propagating_cancellation(
         pending = asyncio.create_task(manager.authorize_async(operation_set))
         await started.wait()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         pending.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError) as captured:

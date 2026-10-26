@@ -58,6 +58,7 @@ from loop.session.models import RunCompletedEvent, RunStartedEvent
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.tooling import FileObservations
 from loop.utils import PathHolder, VirtualPath, content_digest, utc_now
+from tests.scheduling import deliver_callbacks
 
 
 def agent_runner(
@@ -2820,7 +2821,7 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(
                 control.stop()
             else:
                 task.cancel()
-            await asyncio.sleep(0)
+            await deliver_callbacks()
             release.set()
             await publishing.wait()
             task.cancel()
@@ -2990,13 +2991,13 @@ def test_cancellation_settles_returned_owner_loop_work_before_the_run_ends(
                 control.stop()
             else:
                 task.cancel()
-            await asyncio.sleep(0)
+            await deliver_callbacks()
             release_worker.set()
             if kind in {"pending_task", "recovering_task"}:
                 await asyncio.wait_for(cancelling.wait(), timeout=1)
                 assert not task.done()
                 task.cancel()
-                await asyncio.sleep(0)
+                await deliver_callbacks()
                 assert not owned_results[0].done()
                 finish_cleanup.set()
             if mode == "external":

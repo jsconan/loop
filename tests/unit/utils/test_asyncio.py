@@ -3,7 +3,7 @@
 import asyncio
 import inspect
 from contextvars import ContextVar
-from threading import BoundedSemaphore, Event, get_ident
+from threading import BoundedSemaphore
 
 import pytest
 
@@ -15,6 +15,7 @@ from loop.utils import (
     is_async_callable,
     run_in_worker_async,
 )
+from tests.scheduling import deliver_callbacks
 
 
 def test_is_async_callable_recognizes_coroutine_functions_and_objects():
@@ -96,22 +97,6 @@ def test_await_value_wraps_futures_for_runner_dispatch():
         runner.close()
 
 
-def test_run_in_worker_offloads_and_preserves_context():
-    """The bounded fallback runs away from the loop and carries correlation context."""
-    correlation = ContextVar("correlation", default="missing")
-    correlation.set("turn-42")
-    owner = get_ident()
-
-    async def scenario():
-        """Return worker identity and its copied correlation value."""
-        return await run_in_worker_async(lambda: (get_ident(), correlation.get()))
-
-    worker, value = asyncio.run(scenario())
-
-    assert worker != owner
-    assert value == "turn-42"
-
-
 def test_run_in_worker_propagates_operation_failures():
     """A worker exception is returned to the async caller unchanged."""
 
@@ -187,44 +172,6 @@ def test_run_in_worker_reports_a_cancelled_executor_future(monkeypatch):
     assert any("CancelledError" in note for note in error.__notes__)
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_run_in_worker_settles_admitted_work_before_propagating_cancellation(fail):
-    """Cancellation waits for an admitted worker and retains any secondary failure."""
-    started = Event()
-    release = Event()
-    completed = Event()
-
-    def work():
-        """Wait for cancellation, then complete or fail the owned operation."""
-        started.set()
-        if not release.wait(timeout=2):
-            raise TimeoutError("test worker was not released")
-        completed.set()
-        if fail:
-            raise ValueError("worker failed")
-        return "done"
-
-    async def scenario():
-        """Cancel twice while the worker remains owned, then release it."""
-        task = asyncio.create_task(run_in_worker_async(work))
-        while not started.is_set():
-            await asyncio.sleep(0)
-        task.cancel()
-        await asyncio.sleep(0)
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-        release.set()
-        with pytest.raises(asyncio.CancelledError) as captured:
-            await task
-        return captured.value
-
-    error = asyncio.run(scenario())
-
-    assert completed.is_set()
-    assert any("ValueError" in note for note in getattr(error, "__notes__", ())) is fail
-
-
 def test_package_exports_asyncio_helpers():
     """The utility package exposes the asyncio helpers from their topic module."""
     assert await_value_async is asyncio_utils.await_value_async
@@ -232,3 +179,56 @@ def test_package_exports_asyncio_helpers():
     assert has_running_event_loop is asyncio_utils.has_running_event_loop
     assert is_async_callable is asyncio_utils.is_async_callable
     assert run_in_worker_async is asyncio_utils.run_in_worker_async
+
+
+def test_run_in_worker_submits_the_captured_context_and_returns_the_result(monkeypatch):
+    """The worker boundary receives the calling context and returns its completed result."""
+    correlation = ContextVar("correlation", default="missing")
+    correlation.set("turn-42")
+    calls = []
+
+    async def scenario():
+        """Deliver a completed executor response without scheduling a real thread."""
+        loop = asyncio.get_running_loop()
+
+        def submit(executor, function, operation):
+            """Evaluate the supplied context callback at the controlled boundary."""
+            calls.append(executor)
+            correlation.set("outside-context")
+            pending = loop.create_future()
+            pending.set_result(function(operation))
+            return pending
+
+        monkeypatch.setattr(loop, "run_in_executor", submit)
+        return await run_in_worker_async(correlation.get)
+
+    assert asyncio.run(scenario()) == "turn-42"
+    assert calls == [asyncio_utils._WORKER_EXECUTOR]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_run_in_worker_settles_controlled_result_after_cancellation(monkeypatch, fail):
+    """Cancellation retains ownership until the injected result settles, including failures."""
+
+    async def scenario():
+        """Deliver cancellation and completion through explicit callback turns."""
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()
+        monkeypatch.setattr(loop, "run_in_executor", lambda *args: pending)
+        task = asyncio.create_task(run_in_worker_async(lambda: "unused"))
+        await deliver_callbacks()
+        task.cancel()
+        await deliver_callbacks()
+        task.cancel()
+        await deliver_callbacks()
+        assert not task.done()
+        if fail:
+            pending.set_exception(ValueError("worker failed"))
+        else:
+            pending.set_result("done")
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await task
+        return captured.value
+
+    error = asyncio.run(scenario())
+    assert any("ValueError" in note for note in getattr(error, "__notes__", ())) is fail

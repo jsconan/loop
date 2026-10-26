@@ -4231,8 +4231,10 @@ def test_reclamation_retains_capacity_on_late_integrity_and_budget_failures(
 
         monkeypatch.setattr(linux_installation, "bind_host_file", bind)
     elif change == "walk_bound":
-        for index in range(257):
+        monkeypatch.setattr(linux_installation, "MAX_NATIVE_INSTALLATION_ENTRIES", 8)
+        for index in range(9):
             (state.root / str(index)).mkdir()
+        message = "Generation artifact inventory exceeds its bound"
     elif change == "directory_alias":
         previous = linux_installation.protected_path
         monkeypatch.setattr(

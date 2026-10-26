@@ -78,6 +78,7 @@ from loop.utils import (
     sha256_digest,
     store_content,
 )
+from tests.scheduling import deliver_callbacks
 
 
 def response_interaction() -> MagicMock:
@@ -1355,7 +1356,7 @@ def test_slow_async_session_store_leaves_the_event_loop_available_for_control():
         """Process a control callback while the session snapshot is still being saved."""
         pending = asyncio.create_task(manager.add_user_message_async("durable input"))
         while not store.started.is_set():
-            await asyncio.sleep(0)
+            await deliver_callbacks()
         control_processed = asyncio.Event()
         asyncio.get_running_loop().call_soon(control_processed.set)
         await asyncio.wait_for(control_processed.wait(), timeout=1)
@@ -2288,7 +2289,7 @@ def test_async_session_commit_finishes_persistence_before_propagating_cancellati
         pending = asyncio.create_task(manager.add_response_async(response))
         await started.wait()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         pending.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -2332,7 +2333,7 @@ def test_async_session_commit_preserves_cancellation_and_reports_a_save_failure(
         )
         await started.wait()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         release.set()
         with pytest.raises(asyncio.CancelledError) as captured:
             await pending
@@ -2372,7 +2373,7 @@ def test_async_session_commit_does_not_publish_over_a_replacement_session(cancel
         manager.load_session(replacement)
         if cancelled:
             pending.cancel()
-            await asyncio.sleep(0)
+            await deliver_callbacks()
         release.set()
         with pytest.raises(asyncio.CancelledError if cancelled else RuntimeError):
             await pending
@@ -2779,7 +2780,7 @@ def test_async_session_name_generation_settles_legacy_worker_before_cancellation
         pending = asyncio.create_task(manager.generate_session_name_async(generator))
         await started.wait()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         pending.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError) as captured:

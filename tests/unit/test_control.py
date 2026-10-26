@@ -10,6 +10,7 @@ import pytest
 from loop import RunControl, RunInterrupted
 from loop import control as control_module
 from loop.control import RunStopRequested
+from tests.scheduling import deliver_callbacks
 
 
 def test_control_stays_stopped_after_a_stop_request():
@@ -99,7 +100,7 @@ def test_pause_parks_the_same_async_run_until_continue():
         assert control.pause() is True
         assert control.pause() is True
         checkpoint.set()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert task.done() is False
         assert control.paused is True
         assert control.interrupted is False
@@ -395,7 +396,7 @@ def test_async_wait_keeps_the_event_loop_responsive_until_timeout(monkeypatch):
 
         async def signal():
             """Mark that another task ran during the retry delay."""
-            await asyncio.sleep(0)
+            await deliver_callbacks()
             heartbeat.set()
 
         await asyncio.gather(control.wait_async(0.01), signal())
@@ -424,7 +425,7 @@ def test_async_wait_is_woken_by_cross_thread_run_interruption():
 
         with control.execution():
             waiting = asyncio.create_task(wait_for_interruption())
-            await asyncio.sleep(0)
+            await deliver_callbacks()
             interrupt = Thread(target=control.interrupt)
             interrupt.start()
             result = await waiting
@@ -455,7 +456,7 @@ def test_async_wait_is_woken_by_sticky_shutdown():
             return None
 
         waiting = asyncio.create_task(wait_for_shutdown())
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         control.stop()
         result = await waiting
         return result, control._async_waiters, control.stopped
@@ -533,7 +534,7 @@ def test_async_wait_cancellation_unregisters_its_wakeup():
         """Cancel one pending retry wait and return its registration state."""
         control = RunControl()
         waiting = asyncio.create_task(control.wait_async(5))
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         waiting.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiting

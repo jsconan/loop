@@ -24,6 +24,7 @@ from loop import (
     tool,
 )
 from loop.tooling import Tool, ToolContext, ToolPreflightResult, ToolStatus
+from tests.scheduling import deliver_callbacks
 
 tool_module = importlib.import_module("loop.tooling.tool")
 
@@ -332,7 +333,7 @@ def test_call_async_keeps_the_owner_loop_responsive_for_context_free_sync_tools(
         owner_thread = get_ident()
         pending = asyncio.create_task(make_tool(calculate).call_async({"number": 7}))
         assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1), timeout=2)
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not pending.done()
         release.set()
         assert json.loads(await pending)["result"] == 7

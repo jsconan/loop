@@ -7,6 +7,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -133,3 +134,22 @@ def test_permission_catalog_templates_never_share_mutable_defaults(repeat):
     fresh = PermissionPreset.builtin_presets()
     assert fresh[0] is not presets[0]
     assert fresh[0].defaults == expected
+
+
+def test_fixture_boundaries_survive_undoing_test_mocks(tmp_path, monkeypatch):
+    """Undoing case-specific patches cannot restore external resource access."""
+    monkeypatch.setenv("LOOP_TEST_ONLY", "value")
+    monkeypatch.undo()
+    marker = tmp_path / "marker"
+    marker.write_text("owned", encoding="utf-8")
+    assert marker.read_text(encoding="utf-8") == "owned"
+    with pytest.raises(AssertionError, match="external resource"):
+        subprocess.Popen("unused")
+
+
+def test_unit_clocks_are_synthetic_and_sleep_is_rejected():
+    """Elapsed-time calls are controlled and an accidental sleep fails immediately."""
+    assert time.monotonic() == 1000.0
+    assert time.perf_counter() == 1000.0
+    with pytest.raises(AssertionError, match="must not use real sleeps"):
+        time.sleep(0.1)

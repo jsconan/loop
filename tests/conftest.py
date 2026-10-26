@@ -104,7 +104,7 @@ sys.addaudithook(_audit_output)
 
 
 @pytest.fixture
-def tmp_path(monkeypatch):
+def tmp_path():
     """Provide fresh scratch and remove it, including sibling fixtures, after each test."""
     # Keep physical fixtures separate from the OS /tmp namespace used by native setup.
     parent = "/var/tmp" if Path(tempfile.gettempdir()).resolve() == Path("/tmp") else None
@@ -112,12 +112,19 @@ def tmp_path(monkeypatch):
         workspace = Path(directory).resolve() / "workspace"
         workspace.mkdir(mode=0o700)
         yield workspace
-        monkeypatch.undo()
+
+
+@pytest.fixture
+def environment_patch(tmp_path):
+    """Keep fixture environment ownership independent of case-specific mocks."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
 
 
 @pytest.fixture(autouse=True)
-def isolated_environment(monkeypatch, tmp_path):
+def isolated_environment(environment_patch, tmp_path):
     """Replace ambient inputs and redirect every application and temporary output root."""
+    monkeypatch = environment_patch
     root = tmp_path.parent
     home = root / "home"
     temporary = root / "temporary"

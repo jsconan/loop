@@ -13,6 +13,7 @@ from loop.completion import CommandCompletionAdapter, CompletionManager
 from loop.configuration import ConfigurationCommands, ConfigurationManager
 from loop.interaction import ConsoleInteraction
 from loop.models import CommandCapability
+from tests.scheduling import deliver_callbacks
 
 
 def test_safe_config_changes_apply_during_runs_and_hide_unsafe_values(tmp_path):
@@ -377,9 +378,9 @@ def test_async_config_cancellation_settles_persistence_and_owner_effect(tmp_path
         )
         assert await asyncio.to_thread(started.wait, 5)
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not pending.done()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -418,9 +419,9 @@ def test_async_config_cancellation_preserves_cancel_when_persistence_fails(tmp_p
         )
         assert await asyncio.to_thread(started.wait, 5)
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not pending.done()
         release.set()
         with pytest.raises(asyncio.CancelledError) as captured:

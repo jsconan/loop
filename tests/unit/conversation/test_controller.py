@@ -47,6 +47,7 @@ from loop.conversation.models import (
     SteeringOutcome,
 )
 from loop.models import SteeringMessage
+from tests.scheduling import deliver_callbacks
 
 
 @pytest.fixture
@@ -133,7 +134,7 @@ def test_controller_pause_parks_the_active_run_without_cancelling_it(ui):
         await started.wait()
         assert controller.request_pause() is True
         checkpoint.set()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not task.done()
         assert controller.control.cancellation_event.is_set() is False
         assert controller.control.continue_run() is True
@@ -239,7 +240,7 @@ def test_sync_admission_wakes_an_async_recall_waiter(ui, monkeypatch):
         try:
             await admitted.wait()
             recall = asyncio.create_task(controller.recall_latest_async())
-            await asyncio.sleep(0)
+            await deliver_callbacks()
             assert not recall.done()
             release.set()
             assert await writer
@@ -262,7 +263,7 @@ def test_async_mailbox_lock_waits_without_blocking_the_event_loop(ui):
     async def scenario():
         """Hold an async acquisition until the existing lock owner releases it."""
         waiting = asyncio.create_task(controller._acquire_mailbox_lock_async())
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert waiting.done() is False
         controller._release_mailbox_lock()
         await waiting
@@ -1588,7 +1589,7 @@ def test_revoked_request_commit_failure_releases_interaction_ownership(ui):
     async def fail_registration(*_args, **_kwargs):
         """Cancel the owner request while its durable registration is failing."""
         owners[0].cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         raise OSError("registration unavailable")
 
     async def conversation(_receive):
@@ -1627,7 +1628,7 @@ def test_successful_registration_rechecks_revocation_before_presenting_input(ui,
             assert controller.request_interrupt()
         else:
             owners[0].cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
 
     async def conversation(_receive):
         """Catch revocation of an idle-command question without accepting an answer."""
@@ -1690,8 +1691,8 @@ def test_requester_cancellation_settles_its_open_input_without_an_answer(ui, lat
             await ready.wait()
             owners[0].cancel()
             await owners[0]
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            await deliver_callbacks()
+            await deliver_callbacks()
             assert cancelled.is_set()
         finally:
             release.set()
@@ -2785,7 +2786,7 @@ def test_idle_command_activity_waiter_completion_releases_input_routing(ui):
 
     async def scenario():
         """Complete the activity waiter and worker in the same event-loop turn."""
-        worker = asyncio.create_task(asyncio.sleep(0))
+        worker = asyncio.create_task(deliver_callbacks())
         await controller._drive_async(worker, route_idle_commands=True)
 
     asyncio.run(scenario())
@@ -3203,7 +3204,7 @@ def test_steering_admission_from_a_non_ui_thread_wakes_the_controller_loop(ui):
         controller._ui_thread = -1
         with controller.control.execution():
             assert controller._enqueue_steering("message") is True
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         return controller._input_signal.is_set()
 
     assert asyncio.run(scenario()) is True
@@ -4075,7 +4076,7 @@ def test_async_controller_keeps_conversation_on_ui_loop_and_routes_approval(ui):
     async def scenario():
         """Run the async owner and submit its first ordinary message."""
         task = asyncio.create_task(controller.run_async(conversation))
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         await inputs.put("hello")
         await task
 
@@ -4112,7 +4113,7 @@ def test_async_controller_processes_status_while_conversation_is_suspended(ui):
     async def scenario():
         """Keep the agent suspended while the UI executes its status command."""
         task = asyncio.create_task(controller.run_async(conversation))
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         await inputs.put("hello")
         await working.wait()
         await inputs.put("/status")
@@ -4298,7 +4299,7 @@ def test_async_controller_waits_for_owned_work_after_repeated_cancellation(ui):
         task.cancel()
         await cleanup_started.wait()
         task.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert task.done() is False
         release.set()
         with pytest.raises(asyncio.CancelledError):

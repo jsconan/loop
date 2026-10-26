@@ -40,13 +40,13 @@ make test-integration     # native and dependency integration
 make test-all             # both suites with strict coverage
 ```
 
-The Make targets disable the persistent `uv` cache and dependency synchronization so verification uses the installed environment and writable temporary storage.
+The Make targets invoke the installed `.venv/bin/python` directly, avoiding dependency-manager cache initialization inside a sandbox. Override `PYTHON` to select another installed interpreter, for example `make test PYTHON=/path/to/environment/bin/python`. Dependency installation with `uv sync` is a separate setup step.
 
 Run an individual module or select end-to-end cases:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 uv --no-cache run --no-sync pytest tests/unit/tools/test_system.py
-PYTHONDONTWRITEBYTECODE=1 uv --no-cache run --no-sync pytest tests/integration -m e2e
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/unit/tools/test_system.py
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/integration -m e2e
 ```
 
 To reject unexpected Python warnings during verification, add `-W error` to a pytest command. Tests that exercise expected warnings, logged errors or exceptions must capture and assert the specific diagnostic using `pytest.warns`, `caplog` or `pytest.raises`. Do not suppress diagnostics to make a failing test pass.
@@ -84,15 +84,15 @@ Run `linux/test_management_lifecycle.py` separately with `pytest -s`, in a real 
 
 Each case receives a fresh workspace, working directory, home, temporary directory, application storage roots and content cache. Environment variables, cache metadata, permission-manager lifecycle state and telemetry are scoped and restored. Unit cases also own fresh fallback worker admission and executors, and close tool registries before removing their scratch. Construct mutable agents and other collaborators inside test fixtures rather than at collection time. Permission-catalog consumers receive fresh copies of validated package fixtures; the owning model suite exercises the actual catalog loader.
 
-Unit tests cannot launch real processes, signal host processes, load native libraries, open network connections or listeners, or perform DNS. Scoped doubles and a Python audit guard reject these calls, including retained native function aliases. Default prompt sessions fail immediately on unconfigured input; account discovery and ACL inspection use synthetic collaborators. Replace these boundaries with explicit test responses. Timing, timeout, cancellation and retained-pipe checks use controlled clocks, futures and in-memory streams; they must not depend on real sleeps or scheduling delays. Thread synchronization uses observable handshakes with bounded failure waits and joins.
+Unit tests cannot launch real processes, signal host processes, load native libraries, open network connections or listeners, or perform DNS. Scoped doubles and a Python audit guard reject these calls, including retained native function aliases. Default prompt sessions fail immediately on unconfigured input; account discovery and ACL inspection use synthetic collaborators. Replace these boundaries with explicit test responses. Timing, timeout, cancellation and retained-pipe checks use controlled clocks, futures and in-memory streams; they must not depend on real sleeps or scheduling delays. Application and case clocks are synthetic; real sleep calls fail immediately. Asynchronous delivery checkpoints use queued callbacks without timers. Telemetry unit cases drive queue responses and lifecycle completion directly; native writer intervals, executor ownership, cancellation settlement and holder thread stress are checked in integration.
 
 The native process integration suite also exercises short flushed output held by a blocking reader until timeout cleanup. The supervisor snapshots bounded output after owned termination and bounded pipe draining, including on cancellation; stalled draining reports unknown discard counts. Portable unit cases reproduce this ordering without launching or waiting for real children.
 
-Filesystem and storage tests use synthetic files and databases in disposable scratch, preserving native inode, symlink, hardlink, transaction and permission semantics. Fixture data is removed after every case, including failed cases and sibling paths. Ordinary physical fixtures use owned scratch; `/tmp` remains an operating-system path and session file tools use `$TMPDIR`. Native tests that require the system temporary root or the listener filesystem use `native_directory` to register and own one fresh directory at a time, with cleanup before its output registration is removed.
+Filesystem and storage fixtures use owned disposable scratch with real local files and SQLite databases. Fixture output, including sibling paths, is removed after each case. Native inode, descriptor, symlink, hardlink, journal and thread-contention guarantees belong in integration suites. Native cases requiring the system temporary root or listener filesystem use `native_directory` to register one fresh directory at a time, with cleanup before its output registration is removed.
 
 A Python audit hook rejects filesystem and SQLite output outside the owned roots, including unregistered siblings of native fixture directories. A scoped `os.open` guard also checks descriptor-relative writes. `/dev/null` is allowed as an output sink. Coverage output remains allowed outside per-case isolation. Pytest cache writing is disabled, and the Make targets disable Python bytecode writing before interpreter startup. Cleanup completes before the next case starts.
 
-Filesystem cases require scratch where synthetic `.loop` and `.git` entries can be created. An enclosing sandbox's name-based denials still apply within owned scratch.
+Fixture environment and resource guards have independent patch scopes, so undoing a case's mocks cannot remove them. Filesystem fixtures need authority to create their synthetic names; an enclosing sandbox's private-name denials still apply inside disposable scratch.
 
 These guards apply to trusted test code; they are not an operating-system sandbox. Native extensions and integration children can bypass Python auditing. Integration commands must use only explicitly constructed disposable fixtures, without production credentials, user data or external services. Loopback and Unix-domain endpoints used for native network/IPC checks are owned and closed by the test. Native enforcement remains real; diagnostic log polling is stubbed and its behavior is covered by the unit suite. Linux continuity children use the installed receiver's system temporary root for fresh probe scratch while keeping saved working files in synthetic private storage. Native virtual-environment checks inspect the active interpreter environment, including environments selected outside the default project directory.
 
@@ -103,8 +103,8 @@ Coverage measures both statements and branches with a 100% threshold. Keep secur
 After changing tests, run the affected modules, the complete unit suite with coverage, and applicable integration suites. Check formatting and whitespace:
 
 ```sh
-uv run ruff check tests
-uv run ruff format --check tests
+.venv/bin/ruff check tests
+.venv/bin/ruff format --check tests
 git diff --check
 ```
 

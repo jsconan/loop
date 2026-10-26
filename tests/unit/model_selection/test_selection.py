@@ -19,6 +19,7 @@ from loop import (
     Session,
     SessionManager,
 )
+from tests.scheduling import deliver_callbacks
 
 
 def backend(**attributes):
@@ -302,12 +303,12 @@ def test_async_selection_settles_durable_write_before_propagating_cancellation()
         """Cancel selection during its worker write, then allow its effect to settle."""
         pending = asyncio.create_task(selection.select_async("selected"))
         while not started.is_set():
-            await asyncio.sleep(0)
+            await deliver_callbacks()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not pending.done()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not pending.done()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -380,9 +381,9 @@ def test_async_selection_keeps_cancellation_when_writer_fails_while_settling():
         """Cancel during persistence and release the worker with a storage failure."""
         pending = asyncio.create_task(selection.select_async("selected"))
         while not started.is_set():
-            await asyncio.sleep(0)
+            await deliver_callbacks()
         pending.cancel()
-        await asyncio.sleep(0)
+        await deliver_callbacks()
         assert not pending.done()
         release.set()
         with pytest.raises(asyncio.CancelledError) as captured:

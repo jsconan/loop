@@ -3513,8 +3513,9 @@ def test_auto_repetition_detection_reports_without_cancelling_productive_output(
     assert "gen_ai.repetition_suspected" in [record.event_name for record in adapter.records]
 
 
-def test_sync_stream_stops_after_the_configured_generation_duration():
-    """An active stream cannot run beyond its configured elapsed-time boundary."""
+def test_sync_stream_stops_after_the_configured_generation_duration(monkeypatch):
+    """A supplied clock crossing the duration limit stops the active stream immediately."""
+    monkeypatch.setattr("loop.utils.generation.perf_counter", Mock(side_effect=[10.0, 11.0, 11.0]))
     sdk = Mock()
     sdk.responses.create.return_value = [
         ResponseTextDeltaEvent(
@@ -3533,7 +3534,7 @@ def test_sync_stream_stops_after_the_configured_generation_duration():
         pytest.raises(BackendGenerationLimitError) as raised,
     ):
         list(
-            OpenAIBackend(default_model="model", max_generation_seconds=0.000_000_1).get_response(
+            OpenAIBackend(default_model="model", max_generation_seconds=0.5).get_response(
                 "hello", stream=True
             )
         )
