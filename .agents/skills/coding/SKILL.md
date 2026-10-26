@@ -64,8 +64,8 @@ Define an observable success criterion. Include docstring completeness in the ch
 After changing code, run:
 
 ```shell
-uv run ruff format src
-uv run ruff check src
+.venv/bin/ruff format tests
+.venv/bin/ruff check tests
 git diff --check
 ```
 

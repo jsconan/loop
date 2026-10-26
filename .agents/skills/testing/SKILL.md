@@ -51,16 +51,16 @@ Make every test deterministic, idempotent, standalone, and independent of execut
 
 ## Verify in increasing scope
 
-Run the affected module suite independently first:
+Use the installed test environment directly so sandbox verification does not initialize dependency-manager caches. Install dependencies separately with `uv sync`. Run the affected module suite independently first:
 
 ```shell
-uv run pytest tests/path/to/test_module.py
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/path/to/test_module.py
 ```
 
 Then run the complete suite with strict coverage:
 
 ```shell
-uv run pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest --cov=loop --cov-report=term-missing:skip-covered --cov-fail-under=100
 ```
 
 For architecture and unit changes, run `make test` to execute architecture checks and the complete unit suite with strict coverage. Run `make test-architecture` for architecture checks alone. For native or dependency boundaries, run the applicable integration suite with `make test-integration`. Run every suite with strict coverage using `make test-all` when the change spans all three boundaries or warrants full-suite verification. See `tests/README.md` for suite guarantees and integration prerequisites.
@@ -68,7 +68,7 @@ For architecture and unit changes, run `make test` to execute architecture check
 After changing tests, run:
 
 ```shell
-uv run ruff format tests
-uv run ruff check tests
+.venv/bin/ruff format tests
+.venv/bin/ruff check tests
 git diff --check
 ```
