@@ -93,7 +93,7 @@ def _external_reference_session(content: bytes) -> Session:
 
 
 def test_markdown_export_renders_timeline_and_omits_private_payloads(tmp_path):
-    """Markdown preserves useful conversation detail without private context or reasoning."""
+    """Markdown prefers reasoning summaries and omits captured context and approval prompts."""
     session = Session(
         name="Transcript\nTitle",
         name_source="user",
@@ -163,6 +163,7 @@ def test_markdown_export_renders_timeline_and_omits_private_payloads(tmp_path):
     assert "## User\n\nQuestion" in transcript
     assert "## Assistant\n\nAnswer" in transcript
     assert "Visible summary" in transcript
+    assert "### Reasoning summary\n\nVisible summary\n" in transcript
     assert "private reasoning content" not in transcript
     assert "captured file secret" not in transcript
     assert "Private prompt details" not in transcript
@@ -183,7 +184,7 @@ def test_markdown_export_omits_empty_reasoning_and_marks_unplaced_calls(tmp_path
     """Markdown omits empty reasoning and makes unplaced tool calls visible."""
     session = Session(
         messages=[
-            Reasoning(content="private", summary=""),
+            Reasoning(content="", encrypted_content="private"),
             ToolCall(call_id="pending", name="inspect", arguments="{}"),
         ],
         events=[
@@ -201,6 +202,24 @@ def test_markdown_export_omits_empty_reasoning_and_marks_unplaced_calls(tmp_path
     transcript = target.read_text(encoding="utf-8")
     assert "private" not in transcript
     assert "Pending tool call: inspect" in transcript
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_markdown_export_includes_reasoning_text_without_a_summary(tmp_path, recorded):
+    """Markdown preserves displayed reasoning from recorded and unplaced session items."""
+    session = Session(
+        messages=[Reasoning(content="Visible reasoning", encrypted_content="opaque-state")]
+    )
+    session = Session.deserialize(session.serialize())
+    if not recorded:
+        session.events = []
+    target = tmp_path / "reasoning.md"
+
+    export_session(session, MemorySessionStore(), target)
+
+    transcript = target.read_text(encoding="utf-8")
+    assert "### Reasoning\n\nVisible reasoning\n" in transcript
+    assert "opaque-state" not in transcript
 
 
 def test_markdown_export_formats_json_tool_results_for_readability(tmp_path):

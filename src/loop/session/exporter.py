@@ -33,7 +33,7 @@ def export_session(
     format: SessionExportFormat = "markdown",
     overwrite: bool = False,
 ) -> None:
-    """Write a Markdown transcript or a self-contained session archive.
+    """Write a Markdown transcript with displayed reasoning or a self-contained archive.
 
     Args:
         session (Session): Session to export.
@@ -86,7 +86,7 @@ def export_session(
 
 
 def _render_markdown(session: Session) -> str:
-    """Render user-facing session history without provider-private reasoning state."""
+    """Render session history with displayed reasoning, excluding encrypted provider state."""
     title = (session.name or "Untitled session").replace("\r", " ").replace("\n", " ")
     lines = [
         f"# {title}",
@@ -129,8 +129,10 @@ def _append_item(
         role = "User" if item.role == "user" else "Assistant"
         lines.extend((f"## {role}", "", item.content, ""))
     elif isinstance(item, Reasoning):
-        if item.summary:
-            lines.extend(("### Reasoning summary", "", item.summary, ""))
+        text = item.summary or item.content
+        if text:
+            heading = "Reasoning summary" if item.summary else "Reasoning"
+            lines.extend((f"### {heading}", "", text, ""))
     elif isinstance(item, ToolCall):
         heading = "Pending tool call" if pending else "Tool call"
         lines.extend(
