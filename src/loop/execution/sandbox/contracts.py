@@ -336,8 +336,9 @@ class SandboxRequest:
             protected_instruction_names (tuple[str, ...]): Validated instruction basenames
                 whose workspace writes the native policy must deny.
             file_creation_mask (int): Caller process umask applied before command source starts.
-            scratch_root (Path | None): Session-owned physical root matching TMPDIR; defaults
-                to an authenticated temporary alias binding.
+            scratch_root (Path | None): Session-owned physical root matching TMPDIR. Explicit
+                roots and authenticated temporary aliases need no global temporary directory.
+                Defaults to alias binding or system temporary-root validation.
             scratch_data (bool): Allow ordinary names in fresh agent-only scratch. Requires an
                 explicit disjoint scratch_root; defaults to restricted scratch semantics.
 
@@ -397,12 +398,12 @@ class SandboxRequest:
                 or details.st_uid != os.getuid()
                 or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
                 or (
-                    scratch.parent != Path(tempfile.gettempdir()).resolve(strict=True)
-                    and scratch_root != scratch
+                    scratch_root != scratch
                     and not any(
                         virtual == VirtualPath.TEMPORARY and target == scratch
                         for virtual, _, target in aliases
                     )
+                    and scratch.parent != Path(tempfile.gettempdir()).resolve(strict=True)
                 )
             ):
                 raise ValueError("Command scratch must be a private real directory.")

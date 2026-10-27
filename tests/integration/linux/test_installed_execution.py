@@ -27,7 +27,7 @@ from uuid import uuid4
 
 import pytest
 
-from loop import PermissionManager, RuntimeEnvironment, ToolRegistry
+from loop import ApprovalChoice, PermissionManager, RuntimeEnvironment, ToolRegistry
 from loop.constants import NATIVE_INSTALLATION_DIRECTORY, NATIVE_RESULT_DELIVERY_SECONDS
 from loop.execution import CommandExecutionService
 from loop.execution.sandbox import SandboxOutcome, SandboxRequest, select_sandbox_backend
@@ -42,14 +42,16 @@ from loop.execution.sandbox.linux.runtime import execution_authority
 from loop.instructions import InstructionsManager
 from loop.permissions.audit import SQLitePermissionAudit
 from loop.tooling import ToolRegistration, ToolRuntimeSettings
-from loop.tools.files import search_text
+from loop.tools.files import read_text_file, search_text, write_text_file
 from loop.tools.system import resolve_executable, run_command
+from loop.utils import PathHolder
 
 _ALIAS_DIRECTORY = os.environ.get("LOOP_NATIVE_SOCKET_ALIAS_DIRECTORY")
 _CAPACITY_TEST_OPT_IN = os.environ.get("LOOP_NATIVE_CAPACITY_TEST") == "disposable-linux-host"
 _RUNTIME_FIXTURE = os.environ.get("LOOP_NATIVE_RUNTIME_FIXTURE")
 _RUNTIME_FIXTURE_MARKER = b"Loop private-runtime qualification fixture v1\n"
 _QUALIFICATION_UV = shutil.which("uv")
+_HOST_HOME = Path.home().resolve()
 _PUBLIC_ROOT_MARKER = b"Loop installed native qualification fixture v1\n"
 
 pytestmark = [
@@ -84,7 +86,7 @@ class Interaction:
         """Record each permission decision and reject unintended host recovery."""
         self.prompts.append(str(message))
         assert "without the OS sandbox" not in str(message)
-        return "approve"
+        return ApprovalChoice.ONCE if message == "Proceed?" else "approve"
 
     def info(self, message):
         """Accept the permission service's informational text."""
@@ -130,9 +132,13 @@ def private_runtime_fixture():
 
 
 @pytest.fixture(scope="module")
-def public_workspace_root():
+def public_workspace_root(request):
     """Provide stable, private fixture roots so repeated runs reuse exact native policies."""
-    parent = Path(tempfile.gettempdir()).resolve(strict=True)
+    parent = (
+        _HOST_HOME
+        if getattr(request, "param", None) == "home"
+        else Path(tempfile.gettempdir()).resolve(strict=True)
+    )
     parent_info = parent.stat()
     private_parent = parent_info.st_uid == os.getuid() and not parent_info.st_mode & 0o022
     sticky_shared_parent = (
@@ -204,11 +210,11 @@ def _test_directory_name(node_id):
 
 
 @pytest.fixture
-def public(installation, public_workspace_root, request, native_directory, monkeypatch):
+def public(installation, public_workspace_root, request, native_directory, environment_patch):
     """Own the stable workspace fixture and isolated permission roots for one test."""
     _, generation = installation
     workspace_root, permissions_root, _external_root = public_workspace_root
-    monkeypatch.setattr(tempfile, "tempdir", "/tmp")
+    environment_patch.setattr(tempfile, "tempdir", "/tmp")
     if getattr(request.node, "callspec", None) and request.node.callspec.params.get("alias"):
         if not _ALIAS_DIRECTORY:
             pytest.skip(
@@ -365,18 +371,23 @@ def public_client():
             "audit_path": value["audit_path"],
             "workspace_id": value["workspace_id"],
         }
+    permissions = PermissionManager(
+        Path(value["workspace"]),
+        configuration_path=value["configuration_path"],
+        **permission_manager_arguments,
+    )
+    if instructions is not None:
+        permissions.bind_temporary_directory(PathHolder(scratch))
     registry = ToolRegistry(
         [
             run_command,
             resolve_executable,
+            read_text_file,
             search_text,
+            write_text_file,
             ToolRegistration(run_command, name="renamed_command"),
         ],
-        permission_manager=PermissionManager(
-            Path(value["workspace"]),
-            configuration_path=value["configuration_path"],
-            **permission_manager_arguments,
-        ),
+        permission_manager=permissions,
         execution_service=CommandExecutionService(backend, RefusingHost()),
         settings=ToolRuntimeSettings(command_timeout=value.get("seconds", 2)),
     )
@@ -474,7 +485,7 @@ def test_public_virtual_commands_reuse_policy_and_keep_protected_paths(public, n
     renamed = {**call, "tool": "renamed_command"}
     repeated = invoke_tools(public, [call, renamed], model_paths=True)
     assert all(
-        result["ok"] and result["result"]["stdout"]["content"] == "ordinary-data" + str(workspace)
+        result["ok"] and result["result"]["stdout"]["content"] == "ordinary-data$WORKSPACE_ROOT"
         for result in repeated
     ), repeated
     assert profile_inventory(generation) == baseline
@@ -727,6 +738,72 @@ def test_public_read_only_command_can_create_files_in_private_scratch(public):
     assert result["result"]["stdout"]["content"] == "SCRATCH_WRITE=ok\n"
     assert not public[0].prompts
     require_drained(public[2])
+
+
+@pytest.mark.parametrize("public_workspace_root", ["home"], indirect=True)
+def test_bound_session_scratch_works_without_global_temporary_directories(public):
+    """Home-based read-only requests share scratch across tools and children without host access."""
+    interaction, workspace, generation = public
+    parent = interaction.configuration_path.parent
+    scratch = parent / "instruction-scratch"
+    scratch.mkdir(mode=0o700)
+    other = parent / "other-session"
+    other.mkdir(mode=0o700)
+    (other / "secret").write_text("other-session-canary")
+    (parent / "host-private").write_text("host-private-canary")
+    (scratch / "escape").symlink_to(other / "secret")
+    (workspace / "input").write_text("workspace-data")
+    program = (
+        "import errno,os,pathlib,subprocess,tempfile\n"
+        "s=pathlib.Path(os.environ['TMPDIR']); w=pathlib.Path(os.environ['WORKSPACE_ROOT'])\n"
+        "assert pathlib.Path.cwd()==w\n"
+        "assert not any(pathlib.Path(p).exists() for p in ('/tmp','/var/tmp','/usr/tmp'))\n"
+        "assert tempfile.gettempdir()==str(s)\n"
+        "assert (w/'input').read_text()=='workspace-data'\n"
+        "with tempfile.NamedTemporaryFile() as f:\n"
+        " f.write(b'temporary-data'); f.flush()\n"
+        " assert pathlib.Path(f.name).parent==s\n"
+        " assert subprocess.check_output(['/bin/cat',f.name])==b'temporary-data'\n"
+        "for p in (s/'escape',s/'../other-session/secret',s/'../host-private'):\n"
+        " try: p.read_text()\n"
+        " except OSError as e: assert e.errno in (errno.EACCES,errno.ENOENT)\n"
+        " else: raise AssertionError('outside read allowed')\n"
+        "try: (w/'forbidden-write').write_text('bad')\n"
+        "except OSError as e: assert e.errno in (errno.EACCES,errno.EROFS)\n"
+        "else: raise AssertionError('workspace write allowed')\n"
+        "print('scratch-ok')\n"
+    )
+    results = invoke_tools(
+        public,
+        [
+            {
+                "tool": "write_text_file",
+                "arguments": {
+                    "path": "$TMPDIR/probe.sh",
+                    "content": 'set -eu\ncd "$WORKSPACE_ROOT"\n'
+                    'printf script-data > "$TMPDIR/report.txt"\n'
+                    "/usr/bin/python3 -c " + shlex.quote(program) + "\n",
+                },
+            },
+            {
+                "tool": "run_command",
+                "arguments": {
+                    "command": '/bin/sh "$TMPDIR/probe.sh"',
+                    "cwd": "$WORKSPACE_ROOT",
+                    "read_only": True,
+                },
+            },
+            {"tool": "read_text_file", "arguments": {"path": "$TMPDIR/report.txt"}},
+        ],
+        model_paths=True,
+    )
+    assert all(result["ok"] for result in results), json.dumps(results, indent=2)
+    assert results[1]["result"]["stdout"]["content"] == "scratch-ok\n"
+    assert results[2]["result"]["content"] == "script-data"
+    assert (other / "secret").read_text() == "other-session-canary"
+    assert (parent / "host-private").read_text() == "host-private-canary"
+    assert not (workspace / "forbidden-write").exists()
+    require_drained(generation)
 
 
 def test_public_writable_command_cannot_change_private_workspace_entries(public):
@@ -1306,7 +1383,7 @@ def test_public_default_verified_tls_to_owned_fixture(
 
 
 def test_ordinary_approved_broader_request_is_executable(
-    installation, public_workspace_root, request, native_directory, monkeypatch
+    installation, public_workspace_root, request, native_directory, environment_patch
 ):
     """Approved outside access and network requests provide a valid escalation control."""
     from loop.execution.sandbox import SandboxOutcome
@@ -1317,7 +1394,7 @@ def test_ordinary_approved_broader_request_is_executable(
     workspace = native_directory(workspace_root, name=fixture_name)
     outside = native_directory(workspace_root, name=fixture_name + "-outside")
     (outside / "secret").write_text("broader-control")
-    monkeypatch.setattr(tempfile, "tempdir", "/tmp")
+    environment_patch.setattr(tempfile, "tempdir", "/tmp")
     scratch = native_directory(Path("/tmp"))
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))

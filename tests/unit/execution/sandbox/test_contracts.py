@@ -901,6 +901,37 @@ def test_explicit_session_data_binding_survives_transport_and_binds_approval(tmp
     assert not approved.paths_are_current()
 
 
+@pytest.mark.parametrize("binding", ["explicit", "alias"])
+def test_bound_session_scratch_restores_without_global_temp_discovery(
+    tmp_path, monkeypatch, binding
+):
+    """Authenticated scratch restores when the setup filesystem has no global temporary root."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "session"
+    scratch.mkdir(mode=0o700)
+    values = {"environment": {"TMPDIR": str(scratch)}, "write_roots": ()}
+    if binding == "explicit":
+        values.update(scratch_root=scratch, scratch_data=True)
+    else:
+        aliases = tmp_path / "aliases"
+        aliases.mkdir(mode=0o700)
+        alias = aliases / "temporary"
+        alias.symlink_to(scratch, target_is_directory=True)
+        values["aliases"] = (("$TMPDIR", alias, scratch),)
+
+    def unavailable():
+        """Reject discovery probes in the request-restoration filesystem view."""
+        raise FileNotFoundError("No usable temporary directory found")
+
+    monkeypatch.setattr(tempfile, "gettempdir", unavailable)
+    approved = request(workspace, **values)
+    assert approved.session_scratch
+    assert SandboxRequest.from_wire(approved.to_wire()) == approved
+    with pytest.raises(FileNotFoundError, match="No usable temporary directory"):
+        request(workspace, environment={"TMPDIR": str(scratch)}, write_roots=())
+
+
 @pytest.mark.parametrize("change", ["unbound", "overlap", "wrong-root", "no-root", "not-bool"])
 def test_session_data_binding_rejects_ambiguous_authority(tmp_path, change):
     """Environment values and overlapping roots cannot independently grant scratch-data access."""
