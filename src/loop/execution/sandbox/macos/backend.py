@@ -317,6 +317,7 @@ def _walk_granted_root(
     *,
     rename_anchors: set[Path] | None = None,
     protection: ProtectedWorkspacePaths | None = None,
+    ordinary_names: bool = False,
 ) -> None:
     """Reject unsafe aliases and bind ancestors of protected entries against relocation."""
     original = root.lstat()
@@ -329,7 +330,9 @@ def _walk_granted_root(
         {*protection.instruction_names, *protection.files} if protection is not None else set()
     )
     protected_directory_names = {parts[-1] for parts in protected_directories}
-    private_names = {name.casefold() for name in PRIVATE_READ_COMPONENTS}
+    private_names = (
+        set() if ordinary_names else {name.casefold() for name in PRIVATE_READ_COMPONENTS}
+    )
     pending = [root]
     while pending:
         _check_deadline(deadline)
@@ -615,8 +618,9 @@ def _profile(
         private_reads = (
             f"(require-all (require-any {private_reads}) "
             f"(require-not (subpath {_literal(scratch)}))) "
-            + _regex(f"^{re.escape(str(scratch))}/(.*/)?{private_names}(/.*)?$")
         )
+        if not request.scratch_data:
+            private_reads += _regex(f"^{re.escape(str(scratch))}/(.*/)?{private_names}(/.*)?$")
     scratch_ancestors = " ".join(f"(literal {_literal(path)})" for path in scratch.parents)
     private_metadata = (
         f"(require-all (require-any {private_reads}) "
@@ -1125,6 +1129,7 @@ class MacOSSeatbeltBackend:
                         if root in (request.workspace, scratch, *request.write_roots)
                         else None,
                         protection=request.protected_paths if root == request.workspace else None,
+                        ordinary_names=request.scratch_data and root == scratch,
                     )
                 guarded_anchors = tuple(sorted(rename_anchors))
                 darwin_temp = self._diagnostics.darwin_temp(request.deadline)

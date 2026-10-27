@@ -76,10 +76,10 @@ def test_context_replay_consumes_results_once_and_allows_reissued_call_ids(
             {
                 "ok": False,
                 "problem": {"code": "filesystem.stale_context"},
-                "read_versions": {"/workspace/file.txt": None},
+                "read_versions": {"$WORKSPACE_ROOT/file.txt": None},
             }
             if absence_report
-            else {"ok": True, "file_versions": {"/workspace/file.txt": None}}
+            else {"ok": True, "file_versions": {"$WORKSPACE_ROOT/file.txt": None}}
         ),
     )
     restore = ToolCall(call_id="restore", name="write_text_file", arguments='{"content":"new"}')
@@ -91,7 +91,7 @@ def test_context_replay_consumes_results_once_and_allows_reissued_call_ids(
         ToolResult(
             call_id=restore.call_id,
             output=json.dumps(
-                {"ok": True, "file_versions": {"/workspace/file.txt": content_digest("new")}}
+                {"ok": True, "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("new")}}
             ),
         ),
     ]
@@ -135,7 +135,7 @@ def test_untrusted_tool_output_cannot_refresh_a_file_observation(tmp_path):
         {
             "ok": True,
             "result": {
-                "path": "/workspace/file.txt",
+                "path": "$WORKSPACE_ROOT/file.txt",
                 "version": content_digest(current),
                 "size_bytes": len(current),
                 "content": "anchor\n",
@@ -169,9 +169,9 @@ def test_redacted_read_results_retain_source_identity_without_visible_bytes(tmp_
                 output=json.dumps(
                     {
                         "ok": True,
-                        "read_versions": {"/workspace/file.txt": content_digest("new")},
+                        "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("new")},
                         "result": {
-                            "path": "/workspace/file.txt",
+                            "path": "$WORKSPACE_ROOT/file.txt",
                             "version": content_digest("new"),
                             "size_bytes": 3,
                             "start_byte": 0,
@@ -216,7 +216,7 @@ def test_stale_context_includes_a_bounded_diff_without_refreshing_the_view(tmp_p
     assert first.code == "filesystem.stale_context"
     assert "-old" in first.metadata["diff"]
     assert "+new" in first.metadata["diff"]
-    assert "/workspace/file.txt" in first.metadata["diff"]
+    assert "$WORKSPACE_ROOT/file.txt" in first.metadata["diff"]
     assert observations.check(operations, {}).code == "filesystem.stale_context"
 
 
@@ -449,9 +449,9 @@ def test_successful_model_edits_advance_only_the_content_the_model_knows(tmp_pat
         {
             "ok": True,
             "result": "edited",
-            "read_versions": {"/workspace/file.txt": content_digest("old\nhidden\n")},
+            "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("old\nhidden\n")},
             "file_versions": {
-                "/workspace/file.txt": content_digest("longer\nhidden\n"),
+                "$WORKSPACE_ROOT/file.txt": content_digest("longer\nhidden\n"),
             },
         }
     )
@@ -468,7 +468,7 @@ def test_successful_model_edits_advance_only_the_content_the_model_knows(tmp_pat
             {
                 "ok": True,
                 "result": "written",
-                "file_versions": {"/workspace/file.txt": content_digest("entire")},
+                "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("entire")},
             }
         ),
     )
@@ -482,9 +482,9 @@ def test_undelivered_reads_do_not_refresh_the_generating_model_view(tmp_path):
     output = json.dumps(
         {
             "ok": True,
-            "read_versions": {"/workspace/file.txt": content_digest("new")},
+            "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("new")},
             "result": {
-                "path": "/workspace/file.txt",
+                "path": "$WORKSPACE_ROOT/file.txt",
                 "version": content_digest("new"),
                 "size_bytes": 3,
                 "content": "new",
@@ -575,7 +575,7 @@ def test_an_edit_receipt_without_its_source_cannot_establish_visible_content(tmp
                         "ok": True,
                         "result": "edited",
                         "file_versions": {
-                            "/workspace/file.txt": content_digest("b"),
+                            "$WORKSPACE_ROOT/file.txt": content_digest("b"),
                         },
                     }
                 ),
@@ -590,7 +590,7 @@ def test_an_edit_receipt_without_its_source_cannot_establish_visible_content(tmp
     "versions,arguments",
     [
         (None, {}),
-        ({"/workspace/file.txt": content_digest("b")}, {"content": 123}),
+        ({"$WORKSPACE_ROOT/file.txt": content_digest("b")}, {"content": 123}),
     ],
 )
 def test_incompatible_mutation_receipts_require_a_fresh_read(tmp_path, versions, arguments):
@@ -632,7 +632,10 @@ def test_missing_reads_refresh_existence_only_when_delivered(tmp_path, code):
         {
             "ok": False,
             "problem": {"code": code},
-            "read_versions": {"/workspace/file.txt": None, "/workspace/other.txt": "ignored"},
+            "read_versions": {
+                "$WORKSPACE_ROOT/file.txt": None,
+                "$WORKSPACE_ROOT/other.txt": "ignored",
+            },
         }
     )
     observations.observe_result(call, output, include_reads=False)
@@ -647,9 +650,9 @@ def test_missing_reads_refresh_existence_only_when_delivered(tmp_path, code):
         json.dumps(
             {
                 "ok": True,
-                "read_versions": {"/workspace/file.txt": content_digest("new")},
+                "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("new")},
                 "result": {
-                    "path": "/workspace/file.txt",
+                    "path": "$WORKSPACE_ROOT/file.txt",
                     "version": content_digest("new"),
                     "size_bytes": 3,
                     "start_byte": 0,
@@ -676,7 +679,7 @@ def test_deletion_receipts_preserve_generation_recovery_and_session_boundaries(
     )
     receipts = {}
     problem = observations.check((creation,), {"content": "stale"}, absence_receipts=receipts)
-    assert receipts == {"/workspace/file.txt": None}
+    assert receipts == {"$WORKSPACE_ROOT/file.txt": None}
     assert problem.metadata == {"reread_required": False, "regeneration_required": True}
     assert "deleted" in problem.detail
     assert observations.check((creation,), {"content": "same batch"}).code == (
@@ -762,7 +765,7 @@ def test_absence_receipts_require_an_explicit_failed_envelope(tmp_path, code, st
     call = ToolCall(call_id="failed", name="write_text_file", arguments="{}")
     payload = {
         "problem": {"code": code},
-        "read_versions": {"/workspace/file.txt": None},
+        "read_versions": {"$WORKSPACE_ROOT/file.txt": None},
     }
     if status != "missing":
         payload["ok"] = status
@@ -789,7 +792,7 @@ def test_successful_removals_allow_creation_and_detect_external_recreation(tmp_p
     delete = ToolCall(call_id="delete", name="delete_path", arguments="{}")
     observations.observe_result(
         delete,
-        json.dumps({"ok": True, "file_versions": {"/workspace/file.txt": None}}),
+        json.dumps({"ok": True, "file_versions": {"$WORKSPACE_ROOT/file.txt": None}}),
         include_reads=False,
     )
     creation = (
@@ -806,7 +809,9 @@ def test_successful_removals_allow_creation_and_detect_external_recreation(tmp_p
     write = ToolCall(call_id="write", name="write_text_file", arguments='{"content":"new"}')
     observations.observe_result(
         write,
-        json.dumps({"ok": True, "file_versions": {"/workspace/file.txt": content_digest("new")}}),
+        json.dumps(
+            {"ok": True, "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("new")}}
+        ),
         include_reads=False,
     )
     assert observations.check(replacement(tmp_path, "new"), {}) is None
@@ -828,7 +833,7 @@ def test_recovery_uses_prior_generation_and_replays_completed_own_writes(tmp_pat
         ToolResult(
             call_id="write",
             output=json.dumps(
-                {"ok": True, "file_versions": {"/workspace/file.txt": content_digest("new")}}
+                {"ok": True, "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("new")}}
             ),
         ),
     ]
@@ -868,7 +873,7 @@ def test_recovery_prepares_only_the_preceding_generation_context(tmp_path, compl
                 output=json.dumps(
                     {
                         "ok": True,
-                        "file_versions": {"/workspace/file.txt": content_digest("new secret")},
+                        "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("new secret")},
                     }
                 ),
             )
@@ -957,8 +962,8 @@ def test_cached_rereads_cannot_supply_the_source_of_a_same_batch_edit_receipt(tm
     result = json.dumps(
         {
             "ok": True,
-            "read_versions": {"/workspace/file.txt": content_digest("anchor newest")},
-            "file_versions": {"/workspace/file.txt": content_digest("model newest")},
+            "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("anchor newest")},
+            "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("model newest")},
             "result": "edited",
         }
     )
@@ -1055,8 +1060,8 @@ def test_inconsistent_mutation_receipts_discard_visible_coverage(
         json.dumps(
             {
                 "ok": True,
-                "read_versions": {"/workspace/file.txt": content_digest(original)},
-                "file_versions": {"/workspace/file.txt": content_digest(result)},
+                "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest(original)},
+                "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest(result)},
             }
         ),
     )
@@ -1070,9 +1075,9 @@ def test_inconsistent_mutation_receipts_discard_visible_coverage(
         json.dumps(
             {
                 "ok": True,
-                "read_versions": {"/workspace/file.txt": content_digest(result)},
+                "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest(result)},
                 "result": {
-                    "path": "/workspace/file.txt",
+                    "path": "$WORKSPACE_ROOT/file.txt",
                     "version": content_digest(result),
                     "size_bytes": len(result),
                     "start_byte": 0,
@@ -1103,8 +1108,8 @@ def test_redacted_edit_arguments_cannot_invent_visible_replacement_bytes(tmp_pat
             output=json.dumps(
                 {
                     "ok": True,
-                    "read_versions": {"/workspace/file.txt": content_digest(original)},
-                    "file_versions": {"/workspace/file.txt": content_digest(updated)},
+                    "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest(original)},
+                    "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest(updated)},
                 }
             ),
         ),
@@ -1143,8 +1148,8 @@ def test_partial_mutation_receipts_preserve_utf8_ranges_and_offsets(tmp_path):
         json.dumps(
             {
                 "ok": True,
-                "read_versions": {"/workspace/file.txt": content_digest(original)},
-                "file_versions": {"/workspace/file.txt": content_digest(updated)},
+                "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest(original)},
+                "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest(updated)},
             }
         ),
         include_reads=False,
@@ -1171,7 +1176,7 @@ def test_recovery_does_not_replay_mutations_from_a_later_generation(tmp_path):
                 output=json.dumps(
                     {
                         "ok": True,
-                        "file_versions": {"/workspace/file.txt": content_digest("new")},
+                        "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("new")},
                     }
                 ),
             ),
@@ -1221,9 +1226,9 @@ def test_read_ranges_must_agree_with_each_other_and_the_complete_digest(tmp_path
                     output=json.dumps(
                         {
                             "ok": True,
-                            "read_versions": {"/workspace/file.txt": content_digest(source)},
+                            "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest(source)},
                             "result": {
-                                "path": "/workspace/file.txt",
+                                "path": "$WORKSPACE_ROOT/file.txt",
                                 "version": content_digest(source),
                                 "content": content,
                                 "start_byte": offset,
@@ -1257,7 +1262,7 @@ def test_recovery_refuses_duplicate_or_unmatched_results(tmp_path, result_id):
     remove = ToolCall(call_id="remove", name="delete_path", arguments="{}")
     restore = ToolCall(call_id="restore", name="write_text_file", arguments='{"content":"new"}')
     pending = ToolCall(call_id="pending", name="write_text_file", arguments='{"content":"next"}')
-    removal = json.dumps({"ok": True, "file_versions": {"/workspace/file.txt": None}})
+    removal = json.dumps({"ok": True, "file_versions": {"$WORKSPACE_ROOT/file.txt": None}})
     observations = FileObservations.for_recovery(
         [
             observed_message("old"),
@@ -1268,7 +1273,10 @@ def test_recovery_refuses_duplicate_or_unmatched_results(tmp_path, result_id):
             ToolResult(
                 call_id=restore.call_id,
                 output=json.dumps(
-                    {"ok": True, "file_versions": {"/workspace/file.txt": content_digest("new")}}
+                    {
+                        "ok": True,
+                        "file_versions": {"$WORKSPACE_ROOT/file.txt": content_digest("new")},
+                    }
                 ),
             ),
             ToolResult(call_id=result_id, output=removal),
@@ -1304,9 +1312,9 @@ def test_a_verified_reread_restores_coverage_after_inconsistent_snapshot_bytes(t
         json.dumps(
             {
                 "ok": True,
-                "read_versions": {"/workspace/file.txt": content_digest(source)},
+                "read_versions": {"$WORKSPACE_ROOT/file.txt": content_digest(source)},
                 "result": {
-                    "path": "/workspace/file.txt",
+                    "path": "$WORKSPACE_ROOT/file.txt",
                     "version": content_digest(source),
                     "content": source,
                     "start_byte": 0,

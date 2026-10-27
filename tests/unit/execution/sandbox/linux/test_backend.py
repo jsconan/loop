@@ -32,6 +32,7 @@ def backend(monkeypatch, tmp_path):
 def test_backend_describes_namespace_output_paths_without_rewriting_results(backend, tmp_path):
     """Namespace scratch and indexed aliases map to their logical command roots."""
     request = Mock(spec=SandboxRequest)
+    request.scratch_root = None
     request.aliases = tuple(
         (f"/skills/guide{index}", tmp_path / f"r{index}", tmp_path / f"skill{index}")
         for index in range(12)
@@ -47,6 +48,10 @@ def test_backend_describes_namespace_output_paths_without_rewriting_results(back
         (len(local) for local, _ in roots), reverse=True
     )
     request.aliases = ()
+    assert backend.output_path_roots(request) == (
+        (str(NATIVE_SCRATCH_PATH), VirtualPath.TEMPORARY),
+    )
+    request.scratch_root = tmp_path
     assert backend.output_path_roots(request) == (
         (str(NATIVE_SCRATCH_PATH), VirtualPath.TEMPORARY),
     )

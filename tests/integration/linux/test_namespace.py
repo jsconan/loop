@@ -137,7 +137,7 @@ def test_namespace_virtual_alias_and_selected_scratch_keep_read_only_mounts(help
             policy_version="namespace-fixture",
             deadline=time.monotonic() + 10,
             workspace_id="fixture",
-            aliases=(("/workspace", alias, selected),),
+            aliases=(("$WORKSPACE_ROOT", alias, selected),),
         )
         code = """import errno,os,sys
 from pathlib import Path

@@ -101,14 +101,14 @@ def test_user_permission_configuration_rejects_duplicate_rule_identifiers():
     "change",
     [
         {"cwd": "/Users/alice/project"},
-        {"cwd": "/workspace/../private"},
+        {"cwd": "$WORKSPACE_ROOT/../private"},
         {"source": "cat /Users/alice/private"},
         {"signature": "/Users/alice/project"},
     ],
 )
 def test_host_rule_rejects_real_paths_and_malformed_virtual_context(change):
     """Session host rule records contain virtual paths and a path-free digest only."""
-    values = {"signature": "a" * 64, "cwd": "/workspace", "source": "printf ok"}
+    values = {"signature": "a" * 64, "cwd": "$WORKSPACE_ROOT", "source": "printf ok"}
     values.update(change)
     with pytest.raises(ValidationError, match="virtual context"):
         HostCommandRule.model_validate(values)

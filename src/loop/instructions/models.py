@@ -253,25 +253,26 @@ class RuntimeEnvironment:
         Returns:
             str: XML-like runtime environment guidance with the current paths.
         """
+        temporary = VirtualPath.TEMPORARY if self.temporary_directory is not None else "unavailable"
         return (
             "<runtime_environment>\n"
             f"working_directory: {VirtualPath.WORKSPACE}\n"
-            f"temporary_directory: {VirtualPath.TEMPORARY}\n"
-            f"File tools and command shell source use {VirtualPath.WORKSPACE}, "
-            f"{VirtualPath.TEMPORARY}, or {VirtualPath.SKILLS} paths. "
-            "Workspace and skill roots in command source map to approved local paths. "
-            f'Use shell expansion such as cat "{VirtualPath.TEMPORARY}/report.txt" for working '
-            f'files, and read_text_file(path="{VirtualPath.TEMPORARY}/report.txt") with file '
-            "tools. /tmp is an OS path "
-            "outside the session retention guarantee. Set read_only when workspace writes "
-            "are unnecessary. "
+            f"temporary_directory: {temporary}\n"
+            f"In file tools, use {VirtualPath.WORKSPACE}/... for workspace files "
+            f"and {VirtualPath.TEMPORARY}/... for session working files. "
+            "In shell commands and saved scripts, quote these same variables: "
+            f'cd "{VirtualPath.WORKSPACE}"; cat "{VirtualPath.TEMPORARY}/report.txt". '
+            "Programs and subprocesses inherit the corresponding environment variables; "
+            "read them from the environment when constructing paths. "
+            "Command source and saved file content are passed unchanged. "
+            "Set read_only when workspace writes are unnecessary. "
             "The default sandbox can read workspace files and return them in output. "
             "PATH gives external installed tools lookup only; verified managed toolchains "
             "are granted by the sandbox execution layer. For other installations, "
             "resolve_executable can provide a bound grant_reference for executable_grant. "
             "A failed sandbox command does not prove a host tool is absent. "
-            f"Use {VirtualPath.TEMPORARY} for session working files in commands and file tools. "
-            "Files are retained across commands, turns, and saved-session resumes.\n"
+            "Session working files are retained across commands, turns, and saved-session "
+            "resumes. Some restored sessions restrict private filenames in scratch.\n"
             "</runtime_environment>"
         )
 

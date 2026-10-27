@@ -1452,7 +1452,7 @@ def test_mount_arguments_validates_alias_targets_and_preserves_original_links(
     interior = workspace / "approved-read"
     interior.symlink_to(external, target_is_directory=True)
     request = create(
-        aliases=(("/workspace", alias, external),),
+        aliases=(("$WORKSPACE_ROOT", alias, external),),
         read_roots=(external,) if mounted else (),
         read_aliases=(interior,) if mounted else (),
     )
@@ -1581,3 +1581,19 @@ def test_session_scratch_under_private_ancestry_keeps_masks_and_hardlink_guards(
     (scratch / "public-alias").hardlink_to(private / "key")
     with pytest.raises(ValueError, match="aliases protected or private"):
         prepare_paths(value, scratch)
+
+
+def test_fresh_session_data_scan_allows_private_names_without_exposing_workspace(bound):
+    """Fresh scratch data is ordinary while identically named workspace entries stay masked."""
+    create, workspace, scratch = bound
+    (workspace / ".loop").mkdir()
+    (scratch / ".loop").mkdir()
+    (scratch / "library").write_text("data")
+    source = create(scratch_root=scratch, scratch_data=True)
+    _, private, _, _ = prepare_paths(source, scratch)
+    assert workspace / ".loop" in private
+    assert scratch / ".loop" not in private
+    assert scratch / "library" not in private
+    (scratch / "shared").hardlink_to(scratch / "library")
+    with pytest.raises(ValueError, match="shared inode"):
+        prepare_paths(create(scratch_root=scratch, scratch_data=True), scratch)

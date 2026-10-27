@@ -277,7 +277,7 @@ def test_file_navigation_reports_successful_instruction_context_changes(tmp_path
 
     tool_registry.call(
         "list_folder",
-        json.dumps({"path": "/workspace/nested"}),
+        json.dumps({"path": "$WORKSPACE_ROOT/nested"}),
         interaction=interaction,
         instructions_manager=manager,
     )
@@ -286,7 +286,7 @@ def test_file_navigation_reports_successful_instruction_context_changes(tmp_path
 
     tool_registry.call(
         "write_text_file",
-        json.dumps({"path": "/workspace/nested/written.txt", "content": "content"}),
+        json.dumps({"path": "$WORKSPACE_ROOT/nested/written.txt", "content": "content"}),
         interaction=interaction,
         instructions_manager=manager,
     )

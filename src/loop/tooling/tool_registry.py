@@ -1409,9 +1409,7 @@ class ToolRegistry:
         resolved = {}
         for name, value in arguments.items():
             metadata = tool.arguments_model.model_fields[name].metadata
-            if "loop:workspace-cwd" in metadata and value == "workspace":
-                resolved[name] = instructions_manager.virtual_paths.resolve(VirtualPath.WORKSPACE)
-            elif "loop:virtual-path" in metadata:
+            if "loop:virtual-path" in metadata:
                 resolved[name] = instructions_manager.virtual_paths.resolve(str(value))
             else:
                 resolved[name] = value

@@ -920,7 +920,7 @@ def test_execute_payload_translates_only_bound_virtual_aliases(monkeypatch):
         deadline=20,
         cwd=Path("/work"),
         execution_source="cat '/tmp/bound/r0/file'; printf '%s' /tmp/bound/r0-other",
-        aliases=(("/workspace", Path("/tmp/bound/r0"), Path("/work")),),
+        aliases=(("$WORKSPACE_ROOT", Path("/tmp/bound/r0"), Path("/work")),),
         generated_environment=(),
         file_creation_mask=0o022,
         attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",

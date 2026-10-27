@@ -18,6 +18,7 @@ from loop import (
     SkillManager,
 )
 from loop.instructions.models import SkillOperationError
+from loop.utils import VirtualPath
 
 TEST_POLICY = AgentInstructions("Test policy.", "test", "tests")
 
@@ -487,10 +488,11 @@ def test_runtime_environment_is_budgeted_and_only_increment_on_change(tmp_path):
     manager.set_runtime_environment(environment)
 
     assert str(tmp_path) not in prepared(manager)
-    assert "working_directory: /workspace" in prepared(manager)
+    assert f"working_directory: {VirtualPath.WORKSPACE}" in prepared(manager)
     assert manager.generation == generation
-    manager.set_runtime_environment(RuntimeEnvironment(tmp_path, tmp_path / ("x" * 900)))
-    assert "temporary_directory: $TMPDIR" in prepared(manager)
+    manager.set_runtime_environment(RuntimeEnvironment(tmp_path / ("x" * 900), None))
+    assert "temporary_directory: unavailable" in prepared(manager)
+    assert manager.generation > generation
 
 
 def test_virtual_paths_require_a_runtime_environment_for_workspace_relative_paths():
@@ -499,31 +501,33 @@ def test_virtual_paths_require_a_runtime_environment_for_workspace_relative_path
         configured_manager().virtual_paths.resolve("relative.txt")
 
 
-def test_runtime_environment_keeps_host_paths_private(tmp_path):
-    """Both file and command guidance retain virtual roots without revealing host paths."""
+def test_runtime_environment_exposes_canonical_prefixes(tmp_path):
+    """File and command guidance share canonical environment-variable prefixes."""
     manager = configured_manager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "temporary")
     )
 
     assert str(tmp_path) not in prepared(manager)
-    assert "working_directory: /workspace" in prepared(manager)
-    assert "temporary_directory: $TMPDIR" in prepared(manager)
+    assert f"working_directory: {VirtualPath.WORKSPACE}" in prepared(manager)
+    assert "temporary_directory: " + manager.virtual_paths.display(
+        str(tmp_path / "temporary")
+    ) in prepared(manager)
     assert "resolve_executable" in prepared(manager)
     assert "verified managed toolchains" in prepared(manager)
     assert "grant_reference for executable_grant" in prepared(manager)
     assert "does not prove a host tool is absent" in prepared(manager)
     assert "default sandbox can read workspace files" in prepared(manager)
-    assert manager.virtual_paths.resolve("/workspace/source.py") == str(tmp_path / "source.py")
+    assert manager.virtual_paths.resolve("$WORKSPACE_ROOT/source.py") == str(tmp_path / "source.py")
     assert manager.virtual_paths.resolve("$TMPDIR/output.txt") == str(
         tmp_path / "temporary/output.txt"
     )
-    assert manager.virtual_paths.display(str(tmp_path / "source.py")) == "/workspace/source.py"
+    assert manager.virtual_paths.display(str(tmp_path / "source.py")) == "$WORKSPACE_ROOT/source.py"
     assert (
         manager.virtual_paths.display(str(tmp_path / "temporary/output.txt"))
-        == "$TMPDIR/output.txt"
+        == VirtualPath.TEMPORARY + "/output.txt"
     )
     assert manager.virtual_paths.redact(f"Failed at {tmp_path}/source.py") == (
-        "Failed at /workspace/source.py"
+        "Failed at $WORKSPACE_ROOT/source.py"
     )
     with pytest.raises(ValueError):
         manager.virtual_paths.resolve("scratch:/output.txt")
@@ -543,7 +547,7 @@ def test_runtime_environment_is_independent_from_observed_instruction_directory(
     manager.observe_path(observed, directory=True)
     manager.prepare(configured_agent())
 
-    assert "working_directory: /workspace" in prepared(manager)
+    assert f"working_directory: {VirtualPath.WORKSPACE}" in prepared(manager)
     assert manager.working_directory == observed.resolve()
     assert manager.virtual_paths.resolve(".") == str(initial.resolve())
     sections = manager.list_skills()["instruction_context"]["sections"]

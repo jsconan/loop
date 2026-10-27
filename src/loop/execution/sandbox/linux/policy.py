@@ -160,7 +160,7 @@ def payload_policy(
         dict.fromkeys(
             root
             for root in (*runtime_roots, *reads, *writes)
-            if root != NATIVE_SCRATCH_PATH or request.session_scratch
+            if root != NATIVE_SCRATCH_PATH or request.session_scratch and not request.scratch_data
         )
     )
     for name in PRIVATE_READ_COMPONENTS:

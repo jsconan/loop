@@ -200,15 +200,15 @@ def test_host_command_signature_normalizes_verified_virtual_aliases(tmp_path):
         second_alias.symlink_to(tmp_path, target_is_directory=True)
         first = request(
             tmp_path,
-            source="cat /workspace/file",
+            source="cat $WORKSPACE_ROOT/file",
             execution_source=f"cat {first_alias}/file",
-            aliases=(("/workspace", first_alias, tmp_path),),
+            aliases=(("$WORKSPACE_ROOT", first_alias, tmp_path),),
         )
         second = request(
             tmp_path,
-            source="cat /workspace/file",
+            source="cat $WORKSPACE_ROOT/file",
             execution_source=f"cat {second_alias}/file",
-            aliases=(("/workspace", second_alias, tmp_path),),
+            aliases=(("$WORKSPACE_ROOT", second_alias, tmp_path),),
         )
         assert first.host_command_signature() == second.host_command_signature()
         assert first.host_command_runtime_signature() == second.host_command_runtime_signature()
@@ -335,9 +335,9 @@ def test_request_binds_private_alias_and_translated_source(tmp_path):
     alias.symlink_to(tmp_path, target_is_directory=True)
     approved = request(
         tmp_path,
-        source="cat /workspace/file",
+        source="cat $WORKSPACE_ROOT/file",
         execution_source=f"cat {alias}/file",
-        aliases=(("/workspace", alias, tmp_path),),
+        aliases=(("$WORKSPACE_ROOT", alias, tmp_path),),
     )
     assert approved.execution_source == f"cat {alias}/file"
     assert approved.paths_are_current()
@@ -442,14 +442,14 @@ def test_request_rejects_unsafe_aliases(tmp_path):
         request(tmp_path, execution_source="")
     for item in (
         ("workspace", alias, tmp_path),
-        ("/workspace", alias, private),
-        ("/workspace", Path("relative"), tmp_path),
+        ("$WORKSPACE_ROOT", alias, private),
+        ("$WORKSPACE_ROOT", Path("relative"), tmp_path),
     ):
         with pytest.raises(ValueError):
             request(tmp_path, aliases=(item,))
     private.chmod(0o755)
     with pytest.raises(ValueError):
-        request(tmp_path, aliases=(("/workspace", alias, tmp_path),))
+        request(tmp_path, aliases=(("$WORKSPACE_ROOT", alias, tmp_path),))
 
 
 @pytest.mark.parametrize(
@@ -558,7 +558,7 @@ def test_request_wire_roundtrip_keeps_alias_and_executable_inodes(tmp_path, monk
         workspace,
         read_roots=(tool,),
         environment={"PATH": str(tool)},
-        aliases=(("/workspace", alias, workspace),),
+        aliases=(("$WORKSPACE_ROOT", alias, workspace),),
         read_aliases=(read_alias,),
         executable_identities=(("runner", binary, binary, details.st_dev, details.st_ino),),
         automatic_tool_reads=(tool,),
@@ -639,7 +639,7 @@ def test_request_wire_duplicate_keys_refuse(tmp_path):
         ("environment", ["PATH"]),
         ("environment", [["PATH"]]),
         ("environment", [["PATH", 0]]),
-        ("aliases", [["/workspace", 0, "/workspace"]]),
+        ("aliases", [["$WORKSPACE_ROOT", 0, "$WORKSPACE_ROOT"]]),
         ("executable_identities", [["python", "/bin/python", "/bin/python", True, 1]]),
         ("executable_identities", [["python", "/bin/python", "/bin/python", -1, 1]]),
     ],
@@ -875,3 +875,51 @@ def test_request_binds_durable_session_scratch_through_its_virtual_alias(tmp_pat
     scratch.rename(scratch.with_name("previous-session"))
     scratch.mkdir(mode=0o700)
     assert not approved.paths_are_current()
+
+
+def test_explicit_session_data_binding_survives_transport_and_binds_approval(tmp_path):
+    """Fresh-data permission is explicit, identity-bound and part of remembered authority."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "session"
+    scratch.mkdir(mode=0o700)
+    values = {
+        "environment": {"TMPDIR": str(scratch)},
+        "scratch_root": scratch,
+        "scratch_data": True,
+    }
+    approved = request(workspace, **values)
+    assert approved.session_scratch
+    assert SandboxRequest.from_wire(approved.to_wire()) == approved
+    restricted = request(workspace, **{**values, "scratch_data": False})
+    assert approved.sandbox_command_signature("session") != restricted.sandbox_command_signature(
+        "session"
+    )
+    assert approved.host_command_runtime_signature() != restricted.host_command_runtime_signature()
+    scratch.rename(scratch.with_name("retired"))
+    scratch.mkdir(mode=0o700)
+    assert not approved.paths_are_current()
+
+
+@pytest.mark.parametrize("change", ["unbound", "overlap", "wrong-root", "no-root", "not-bool"])
+def test_session_data_binding_rejects_ambiguous_authority(tmp_path, change):
+    """Environment values and overlapping roots cannot independently grant scratch-data access."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    changes = {
+        "environment": {"TMPDIR": str(scratch)},
+        "scratch_root": scratch,
+        "scratch_data": True,
+    }
+    if change == "unbound":
+        changes["environment"] = {}
+    elif change == "overlap":
+        changes["read_roots"] = (scratch,)
+    elif change == "wrong-root":
+        changes["scratch_root"] = tmp_path / "other"
+    elif change == "no-root":
+        changes["scratch_root"] = None
+    else:
+        changes["scratch_data"] = "true"
+    with pytest.raises(ValueError, match="explicit and disjoint"):
+        request(tmp_path, **changes)

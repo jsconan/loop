@@ -96,14 +96,22 @@ def test_live_instruction_source_observes_changes_and_creates_fresh_captures(tmp
         source.resolve("other", moved)
 
 
-def test_runtime_environment_uses_the_declared_working_root_in_every_example(monkeypatch, tmp_path):
-    """Rendered working-file guidance follows the shared logical root constant."""
-    original = VirtualPath.TEMPORARY
-    monkeypatch.setattr(VirtualPath, "TEMPORARY", "/session-files")
-
+def test_runtime_environment_uses_shared_prefixes_without_exposing_host_paths(
+    monkeypatch, tmp_path
+):
+    """Agent guidance derives its single path contract from the shared root constants."""
+    monkeypatch.setattr(VirtualPath, "WORKSPACE", "$TEST_WORKSPACE")
+    monkeypatch.setattr(VirtualPath, "TEMPORARY", "$TEST_SCRATCH")
     rendered = RuntimeEnvironment(tmp_path, tmp_path / "files").render()
-
-    assert original not in rendered
-    assert 'cat "/session-files/report.txt"' in rendered
-    assert 'read_text_file(path="/session-files/report.txt")' in rendered
-    assert "Use /session-files for session working files" in rendered
+    assert "working_directory: $TEST_WORKSPACE" in rendered
+    assert "temporary_directory: $TEST_SCRATCH" in rendered
+    assert 'cd "$TEST_WORKSPACE"' in rendered
+    assert 'cat "$TEST_SCRATCH/report.txt"' in rendered
+    assert "passed unchanged" in rendered
+    assert "legacy" not in rendered.casefold()
+    assert "concrete" not in rendered.casefold()
+    assert str(tmp_path) not in rendered
+    assert "/workspace" not in rendered
+    assert "$WORKSPACE_ROOT" not in rendered
+    assert "$TMPDIR" not in rendered
+    assert "temporary_directory: unavailable" in RuntimeEnvironment(tmp_path, None).render()

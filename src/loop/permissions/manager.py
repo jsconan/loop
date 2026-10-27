@@ -152,6 +152,7 @@ class PermissionManager:
     _session_overrides: SessionPolicyOverrides
     _temporary_directory: tempfile.TemporaryDirectory[str]
     _temporary_path: Path | PathReference
+    _temporary_ordinary_names: Callable[[], bool] | None
     _presets: dict[str, PermissionPreset]
     _audit_store: SQLitePermissionAudit | None
     _workspace_id: str | None
@@ -192,6 +193,7 @@ class PermissionManager:
             prefix=constants.TEMPORARY_DIRECTORY_PREFIX
         )
         self._temporary_path = Path(self._temporary_directory.name).resolve()
+        self._temporary_ordinary_names = None
         _LIVE_MANAGERS.add(self)
         try:
             self._configuration_path = (
@@ -321,13 +323,34 @@ class PermissionManager:
         """
         return Path(self._temporary_path)
 
-    def bind_temporary_directory(self, directory: PathReference) -> None:
+    def bind_temporary_directory(
+        self,
+        directory: PathReference,
+        *,
+        ordinary_names: Callable[[], bool] | None = None,
+    ) -> None:
         """Follow the session owner's working-directory reference without owning its cleanup.
 
         Args:
             directory (PathReference): Private storage reference following session selection.
+            ordinary_names (Callable[[], bool] | None): Trusted session-owner query for fresh
+                agent-data authority. None retains private-name restrictions.
         """
         self._temporary_path = directory
+        self._temporary_ordinary_names = ordinary_names
+
+    @property
+    def temporary_directory_allows_private_names(self) -> bool:
+        """Return the session owner's current scratch-data classification.
+
+        Returns:
+            bool: Whether ordinary data basenames are allowed in this generation.
+
+        Raises:
+            ValueError: The session owner finds unsafe working storage.
+            OSError: The session owner cannot inspect working storage.
+        """
+        return self._temporary_ordinary_names is not None and self._temporary_ordinary_names()
 
     @property
     def interaction(self) -> Interaction | None:
@@ -1247,8 +1270,8 @@ class PermissionManager:
 
     @staticmethod
     def _sandbox_scratch_roots(request: SandboxRequest) -> set[Path]:
-        """Return host paths backing the request's temporary aliases."""
-        return {
+        """Return explicitly bound session roots and authenticated temporary alias targets."""
+        return ({request.scratch_root} if request.scratch_root is not None else set()) | {
             target for virtual, _, target in request.aliases if virtual == VirtualPath.TEMPORARY
         }
 
@@ -1262,6 +1285,7 @@ class PermissionManager:
             "sandbox.permission_scope",
             {
                 "attempt_id": request.attempt_id,
+                "scratch_data": request.scratch_data,
                 "read_roots": [str(root) for root in request.read_roots],
                 "automatic_tool_reads": [str(root) for root in request.automatic_tool_reads],
                 "read_aliases": [str(alias) for alias in request.read_aliases],

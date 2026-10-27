@@ -25,7 +25,7 @@ def test_public_search_preserves_unicode_and_python_regex(public_command, native
     (native_workspace / "search.txt").write_text("before\n€ needle\nafter\n", encoding="utf-8")
     result = public_command.call(
         name="search_text",
-        path="/workspace/search.txt",
+        path="$WORKSPACE_ROOT/search.txt",
         query=query,
         regex=query != "needle",
         context_lines=1,
@@ -54,11 +54,13 @@ def test_hostile_path_helper_and_outside_search_are_rejected(
     helper.write_text(f"#!/bin/sh\nprintf ran > {shlex.quote(str(marker))}\n")
     helper.chmod(0o755)
     monkeypatch.setenv("PATH", f"{hostile}:/usr/bin:/bin")
-    result = public_command.call(name="search_text", path="/workspace/ordinary", query="ordinary")
+    result = public_command.call(
+        name="search_text", path="$WORKSPACE_ROOT/ordinary", query="ordinary"
+    )
     assert result["ok"] is True
     assert not marker.exists()
     outside = public_command.call(
-        name="search_text", path="/workspace/external-link", query="fake-outside"
+        name="search_text", path="$WORKSPACE_ROOT/external-link", query="fake-outside"
     )
     assert outside["ok"] is False
     assert "fake-outside-canary" not in json.dumps(outside)
@@ -71,16 +73,19 @@ def test_public_search_binary_bounds_and_backreferences(public_command, native_w
     (native_workspace / "search-second.txt").write_text("needle\n")
     (native_workspace / "search-binary.bin").write_bytes(b"\0needle\n")
     backreference = public_command.call(
-        name="search_text", path="/workspace/search-first.txt", query=r"(needle) \1", regex=True
+        name="search_text",
+        path="$WORKSPACE_ROOT/search-first.txt",
+        query=r"(needle) \1",
+        regex=True,
     )
     assert backreference["result"]["matches"][0]["column"] == 1
     bounded = public_command.call(
-        name="search_text", path="/workspace", query="needle", max_results=1
+        name="search_text", path="$WORKSPACE_ROOT", query="needle", max_results=1
     )
     assert len(bounded["result"]["matches"]) == 1
     assert bounded["result"]["truncated"] is True
     binary = public_command.call(
-        name="search_text", path="/workspace/search-binary.bin", query="needle"
+        name="search_text", path="$WORKSPACE_ROOT/search-binary.bin", query="needle"
     )
     assert binary["result"]["matches"] == []
 
@@ -132,7 +137,7 @@ def test_public_native_search_preserves_dialect_unicode_and_bounds(
     for query, regex in (("needle", False), ("needle$", True)):
         value = public_command.call(
             name="search_text",
-            path="/workspace/selected",
+            path="$WORKSPACE_ROOT/selected",
             query=query,
             regex=regex,
             context_lines=1,
@@ -143,13 +148,13 @@ def test_public_native_search_preserves_dialect_unicode_and_bounds(
         assert len(match["context"]) == 2
     for query in (r"(?<=€ )needle", r"(needle) \1"):
         value = public_command.call(
-            name="search_text", path="/workspace/selected", query=query, regex=True
+            name="search_text", path="$WORKSPACE_ROOT/selected", query=query, regex=True
         )
         assert not value["ok"] and "regex parse error" in json.dumps(value)
     assert sum("Could not search text" in record.message for record in caplog.records) == 2
     selected.write_text("needle\n" * 20000)
     bounded = public_command.call(
-        name="search_text", path="/workspace/selected", query="needle", max_results=1
+        name="search_text", path="$WORKSPACE_ROOT/selected", query="needle", max_results=1
     )
     assert bounded["ok"] and len(bounded["result"]["matches"]) == 1
     assert bounded["result"]["truncated"]
@@ -171,7 +176,7 @@ def test_public_native_search_keeps_selected_files_isolated(
         values = list(
             workers.map(
                 lambda name: public_command.call(
-                    name="search_text", path="/workspace/" + name, query="needle"
+                    name="search_text", path="$WORKSPACE_ROOT/" + name, query="needle"
                 ),
                 ("first", "second"),
             )
@@ -205,7 +210,7 @@ def test_public_native_search_keeps_selected_files_isolated(
     before = len(native_search_helper)
     refusal = Mock()
     refusal.prompt.return_value = "deny"
-    for path in ("/workspace/.git/config", "/workspace/external-link"):
+    for path in ("$WORKSPACE_ROOT/.git/config", "$WORKSPACE_ROOT/external-link"):
         value = public_command.call(
             name="search_text", path=path, query="canary", chosen_interaction=refusal
         )

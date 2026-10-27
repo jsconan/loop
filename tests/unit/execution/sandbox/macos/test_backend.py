@@ -421,9 +421,9 @@ def test_backend_reads_only_alias_symlink_and_runs_translated_source(monkeypatch
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
     value = request(
         tmp_path,
-        source="cat /workspace/file",
+        source="cat $WORKSPACE_ROOT/file",
         execution_source=f"cat {alias}/file",
-        aliases=(("/workspace", alias, tmp_path),),
+        aliases=(("$WORKSPACE_ROOT", alias, tmp_path),),
     )
 
     result = MacOSSeatbeltBackend().run(value)
@@ -2004,3 +2004,31 @@ def test_backend_binds_durable_scratch_without_exposing_private_neighbors(
     assert f"(require-not (subpath {json.dumps(str(scratch), ensure_ascii=False)}))" in profile
     assert re.escape(str(scratch)) + "/(.*/)?" in regex_patterns(profile)
     assert scratch.is_dir()
+
+
+def test_fresh_session_data_profile_preserves_outside_private_denials(monkeypatch, tmp_path):
+    """Fresh data names are usable without dropping inherited or workspace private protection."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    scratch = tmp_path / "Library" / "files"
+    scratch.mkdir(parents=True, mode=0o700)
+    (scratch / ".loop").mkdir()
+    (scratch / ".loop" / "nested").mkdir()
+    popen = MagicMock(return_value=Process())
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.subprocess.run",
+        MagicMock(return_value=MagicMock(returncode=0, stderr="")),
+    )
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
+    approved = request(
+        workspace,
+        environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+        scratch_root=scratch,
+        scratch_data=True,
+    )
+    assert MacOSSeatbeltBackend().run(approved).outcome is SandboxOutcome.COMPLETED
+    profile = popen.call_args.args[0][2]
+    patterns = regex_patterns(profile)
+    assert f"^{re.escape(str(scratch))}/(.*/)?" not in patterns
+    assert f"^{re.escape(str(workspace))}/(.*/)?" in patterns
+    assert f'(require-not (subpath "{scratch}"))' in profile

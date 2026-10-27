@@ -463,8 +463,8 @@ def test_public_virtual_commands_reuse_policy_and_keep_protected_paths(public, n
     call = {
         "tool": "run_command",
         "arguments": {
-            "command": "cat '/workspace/ordinary'; printf '%s' /workspace",
-            "cwd": "/workspace",
+            "command": 'cat "$WORKSPACE_ROOT/ordinary"; printf "%s" "$WORKSPACE_ROOT"',
+            "cwd": "$WORKSPACE_ROOT",
             "read_only": True,
         },
     }
@@ -474,7 +474,7 @@ def test_public_virtual_commands_reuse_policy_and_keep_protected_paths(public, n
     renamed = {**call, "tool": "renamed_command"}
     repeated = invoke_tools(public, [call, renamed], model_paths=True)
     assert all(
-        result["ok"] and result["result"]["stdout"]["content"] == "ordinary-data/workspace/"
+        result["ok"] and result["result"]["stdout"]["content"] == "ordinary-data" + str(workspace)
         for result in repeated
     ), repeated
     assert profile_inventory(generation) == baseline
@@ -485,14 +485,17 @@ def test_public_virtual_commands_reuse_policy_and_keep_protected_paths(public, n
             {
                 "tool": "run_command",
                 "arguments": {
-                    "command": "cat /workspace/.ssh/key; cat ../loop-native-test-outside/secret",
-                    "cwd": "/workspace",
+                    "command": 'cat "$WORKSPACE_ROOT/.ssh/key"; cat ../loop-native-test-outside/secret',
+                    "cwd": "$WORKSPACE_ROOT",
                     "read_only": True,
                 },
             },
             {
                 "tool": "run_command",
-                "arguments": {"command": "printf bad > /workspace/.ssh/key", "cwd": "/workspace"},
+                "arguments": {
+                    "command": 'printf bad > "$WORKSPACE_ROOT/.ssh/key"',
+                    "cwd": "$WORKSPACE_ROOT",
+                },
             },
         ],
         model_paths=True,
@@ -512,7 +515,10 @@ def test_public_native_search_reuses_policy_and_preserves_dialect_bounds(public,
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     (workspace / "selected").write_text("first needle\nsecond needle\n")
     calls = [
-        {"tool": "search_text", "arguments": {"path": "/workspace/selected", "query": "needle"}}
+        {
+            "tool": "search_text",
+            "arguments": {"path": "$WORKSPACE_ROOT/selected", "query": "needle"},
+        }
     ]
     (first,) = invoke_tools(public, calls, model_paths=True)
     assert first["ok"], first
@@ -523,12 +529,16 @@ def test_public_native_search_reuses_policy_and_preserves_dialect_bounds(public,
             *calls,
             {
                 "tool": "search_text",
-                "arguments": {"path": "/workspace/selected", "query": "needle$", "regex": True},
+                "arguments": {
+                    "path": "$WORKSPACE_ROOT/selected",
+                    "query": "needle$",
+                    "regex": True,
+                },
             },
             {
                 "tool": "search_text",
                 "arguments": {
-                    "path": "/workspace/selected",
+                    "path": "$WORKSPACE_ROOT/selected",
                     "query": "(?<=first )needle",
                     "regex": True,
                 },
@@ -551,11 +561,11 @@ def test_public_native_search_reuses_policy_and_preserves_dialect_bounds(public,
         [
             {
                 "tool": "search_text",
-                "arguments": {"path": "/workspace/.git/key", "query": "private-canary"},
+                "arguments": {"path": "$WORKSPACE_ROOT/.git/key", "query": "private-canary"},
             },
             {
                 "tool": "search_text",
-                "arguments": {"path": "/workspace/outside-link", "query": "anything"},
+                "arguments": {"path": "$WORKSPACE_ROOT/outside-link", "query": "anything"},
             },
         ],
         model_paths=True,
@@ -568,7 +578,11 @@ def test_public_native_search_reuses_policy_and_preserves_dialect_bounds(public,
         [
             {
                 "tool": "search_text",
-                "arguments": {"path": "/workspace/selected", "query": "needle", "max_results": 1},
+                "arguments": {
+                    "path": "$WORKSPACE_ROOT/selected",
+                    "query": "needle",
+                    "max_results": 1,
+                },
             }
         ],
         model_paths=True,
@@ -962,7 +976,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
                 "tool": "run_command",
                 "arguments": {
                     "command": "uv run pytest -p no:cacheprovider --cov=sample --cov-branch --cov-report=term-missing --cov-fail-under=100",
-                    "cwd": "/workspace",
+                    "cwd": "$WORKSPACE_ROOT",
                     "read_only": True,
                 },
             }
@@ -987,7 +1001,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
                 "tool": "run_command",
                 "arguments": {
                     "command": "uv run ruff check sample.py test_sample.py",
-                    "cwd": "/workspace",
+                    "cwd": "$WORKSPACE_ROOT",
                     "read_only": True,
                 },
             }
@@ -1631,7 +1645,7 @@ def test_installed_requests_reuse_policy_without_sharing_private_scratch(
         parent = native_directory(Path("/tmp"))
         alias = parent / "r0"
         alias.symlink_to(workspace)
-        return (("/workspace", alias, workspace),)
+        return (("$WORKSPACE_ROOT", alias, workspace),)
 
     first_aliases, second_aliases = aliases(), aliases()
     first = native_request(

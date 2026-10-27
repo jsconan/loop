@@ -20,7 +20,7 @@ The platform integration suites are organized by behavior:
 | --- | --- |
 | `macos/test_sandbox.py` | Native execution, exit status, authority binding, filesystem confinement, aliases, protected paths, grants, relocation, detached children, network/IPC and descriptors |
 | `macos/test_writers.py` | Detached fork/spawn confinement, retained mmap and SQLite WAL resources, native ACL rejection and distinct-account access controls |
-| `macos/test_system.py` | Public command dispatch, virtual paths, destination-aware redirection and Git authorization, host recovery, scratch authority, output bounds and registration aliases |
+| `macos/test_system.py` | Public command dispatch, canonical paths across scripts/subprocesses/file tools, destination-aware redirection and Git authorization, host recovery, scratch authority, output bounds and registration aliases |
 | `macos/test_search.py` | Public search, Unicode columns, regex, binary handling, result bounds, executable lookup and outside symlinks |
 | `linux/test_host.py` | Trusted host and installed-tool discovery |
 | `linux/test_seccomp.py` | Native ABI and seccomp behavior |

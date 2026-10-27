@@ -205,12 +205,12 @@ class SandboxRequest:
         write_roots (tuple[Path, ...]): Approved writable directory roots.
         network (bool): Whether general network egress was explicitly granted.
         environment (tuple[tuple[str, str], ...]): Sanitized, ordered effective environment,
-            including the live private TMPDIR when the facade owns the attempt.
+            including WORKSPACE_ROOT and the live private temporary environment when facade-owned.
         policy_version (str): Reviewed policy revision used for this approval.
         deadline (float): Absolute monotonic deadline for this attempt.
         workspace_id (str): Stable identity of the selected workspace.
         path_roots (tuple[tuple[Path, Path], ...]): Bound PATH spellings and canonical search roots.
-        execution_source (str): Shell source after literal virtual-root substitution.
+        execution_source (str): Exact execution source, optionally bound to internal native aliases.
         aliases (tuple[tuple[str, Path, Path], ...]): Virtual root, private symlink, and canonical
             target bindings retained through sandbox execution and any host retry.
         git_create (bool): Whether this approval permits creating absent top-level Git metadata.
@@ -226,6 +226,8 @@ class SandboxRequest:
             writes at every depth of the workspace.
         file_creation_mask (int): Caller process umask applied before command source starts.
         attempt_id (str): Opaque identifier correlating this attempt's audit records.
+        scratch_root (Path | None): Explicit session-owned physical root matching TMPDIR.
+        scratch_data (bool): Permit ordinary names only in a fresh agent-data generation.
     """
 
     source: str
@@ -253,16 +255,18 @@ class SandboxRequest:
     generated_environment: tuple[str, ...] = ()
     protected_instruction_names: tuple[str, ...] = ()
     file_creation_mask: int = constants.GROUP_AND_OTHER_WRITE_MODE_MASK
+    scratch_root: Path | None = None
+    scratch_data: bool = False
 
     @property
     def session_scratch(self) -> bool:
         """Return whether TMPDIR is bound to the file tools' session temporary root.
 
         Returns:
-            bool: Whether an authenticated virtual temporary alias shares the scratch directory.
+            bool: Whether an explicit session root or authenticated temporary alias binds scratch.
         """
         scratch = self.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE)
-        return any(
+        return self.scratch_root is not None or any(
             virtual == VirtualPath.TEMPORARY and str(target) == scratch
             for virtual, _, target in self.aliases
         )
@@ -300,6 +304,8 @@ class SandboxRequest:
         generated_environment: tuple[str, ...] = (),
         protected_instruction_names: tuple[str, ...] = (),
         file_creation_mask: int = constants.GROUP_AND_OTHER_WRITE_MODE_MASK,
+        scratch_root: Path | None = None,
+        scratch_data: bool = False,
     ) -> SandboxRequest:
         """Create a request and capture every authority-bearing directory identity.
 
@@ -330,6 +336,10 @@ class SandboxRequest:
             protected_instruction_names (tuple[str, ...]): Validated instruction basenames
                 whose workspace writes the native policy must deny.
             file_creation_mask (int): Caller process umask applied before command source starts.
+            scratch_root (Path | None): Session-owned physical root matching TMPDIR; defaults
+                to an authenticated temporary alias binding.
+            scratch_data (bool): Allow ordinary names in fresh agent-only scratch. Requires an
+                explicit disjoint scratch_root; defaults to restricted scratch semantics.
 
         Returns:
             SandboxRequest: Immutable request with bound directory identities.
@@ -363,6 +373,20 @@ class SandboxRequest:
         ):
             raise ValueError("Sandbox environment contains an invalid entry.")
         scratch_value = environment.get(TMPDIR_ENVIRONMENT_VARIABLE)
+        if (
+            not isinstance(scratch_data, bool)
+            or scratch_root is not None
+            and str(scratch_root) != scratch_value
+            or scratch_data
+            and (
+                scratch_root is None
+                or any(
+                    root.is_relative_to(scratch_root) or scratch_root.is_relative_to(root)
+                    for root in (workspace, *read_roots, *write_roots)
+                )
+            )
+        ):
+            raise ValueError("Session scratch authority must be explicit and disjoint.")
         if scratch_value is not None:
             scratch = Path(scratch_value)
             details = scratch.lstat()
@@ -374,6 +398,7 @@ class SandboxRequest:
                 or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
                 or (
                     scratch.parent != Path(tempfile.gettempdir()).resolve(strict=True)
+                    and scratch_root != scratch
                     and not any(
                         virtual == VirtualPath.TEMPORARY and target == scratch
                         for virtual, _, target in aliases
@@ -417,7 +442,10 @@ class SandboxRequest:
         alias_identities = []
         for virtual_root, alias, target in aliases:
             if (
-                not (virtual_root.startswith("/") or virtual_root == VirtualPath.TEMPORARY)
+                not (
+                    virtual_root.startswith("/")
+                    or virtual_root in {VirtualPath.WORKSPACE, VirtualPath.TEMPORARY}
+                )
                 or not alias.is_absolute()
                 or re.fullmatch(r"/[A-Za-z0-9_/-]+", str(alias)) is None
                 or target.resolve(strict=True) != target
@@ -479,6 +507,8 @@ class SandboxRequest:
             tuple(dict.fromkeys(generated_environment)),
             tuple(dict.fromkeys(protected_instruction_names)),
             file_creation_mask,
+            scratch_root,
+            scratch_data,
         )
 
     def paths_are_current(self) -> bool:
@@ -626,7 +656,9 @@ class SandboxRequest:
         text = {name: _wire_text(value[name]) for name in text_names}
         if str(UUID(text["attempt_id"])) != text["attempt_id"]:
             raise ValueError("Invalid sandbox request attempt identity.")
-        if any(not isinstance(value[name], bool) for name in ("network", "git_create")):
+        if any(
+            not isinstance(value[name], bool) for name in ("network", "git_create", "scratch_data")
+        ):
             raise ValueError("Invalid sandbox request boolean authority.")
         file_creation_mask = value["file_creation_mask"]
         if (
@@ -678,6 +710,10 @@ class SandboxRequest:
                 _wire_text(name) for name in value["protected_instruction_names"]
             ),
             file_creation_mask=file_creation_mask,
+            scratch_root=Path(_wire_text(value["scratch_root"]))
+            if value["scratch_root"] is not None
+            else None,
+            scratch_data=value["scratch_data"],
         )
         restored = replace(restored, attempt_id=text["attempt_id"])
         canonical = json.dumps(
@@ -750,6 +786,8 @@ class SandboxRequest:
             self.git_create,
             self.protected_instruction_names,
             self.file_creation_mask,
+            self.scratch_root,
+            self.scratch_data,
             tuple((virtual, target) for virtual, _, target in self.aliases),
         )
         return sha256_digest(repr(payload))
@@ -787,6 +825,8 @@ class SandboxRequest:
             self.policy_version,
             self.git_create,
             self.file_creation_mask,
+            self.scratch_root is not None,
+            self.scratch_data,
             tuple(
                 (virtual, "workspace" if target == self.workspace else str(target))
                 for virtual, _, target in self.aliases

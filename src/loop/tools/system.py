@@ -20,7 +20,6 @@ def resolve_executable(
     cwd: Annotated[
         str,
         "loop:virtual-path",
-        "loop:workspace-cwd",
         Field(
             description="Workspace working directory used to resolve relative host PATH entries."
         ),
@@ -77,12 +76,9 @@ def run_command(
     cwd: Annotated[
         str,
         "loop:virtual-path",
-        "loop:workspace-cwd",
         Field(
-            description="Virtual working directory. 'workspace' selects "
-            f"{VirtualPath.WORKSPACE}; relative paths use that root. "
-            "Literal virtual paths in shell source are mapped "
-            "to approved local paths before execution."
+            description=f"Workspace directory using {VirtualPath.WORKSPACE}/...; "
+            "defaults to the workspace root. Shell source is passed unchanged."
         ),
     ] = ".",
     read_only: Annotated[

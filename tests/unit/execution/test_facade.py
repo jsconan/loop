@@ -15,10 +15,10 @@ from loop.execution import facade as execution_facade
 from loop.execution.facade import _automatic_executable_identities
 from loop.execution.sandbox import CommandProcessResult, SandboxOutcome, UnavailableSandboxBackend
 from loop.execution.sandbox.linux.backend import LinuxNativeBackend
-from loop.instructions import InstructionsManager, RuntimeEnvironment
+from loop.instructions import InstructionsManager, RuntimeEnvironment, Skill, SkillManager
 from loop.permissions import Action, Operation, PermissionManager, ProcessBoundary, ProcessTarget
 from loop.tooling import ToolContext
-from loop.utils import VirtualPath, cached_path
+from loop.utils import PathHolder, cached_path
 
 
 def test_execution_requires_a_bound_sandbox_target():
@@ -593,7 +593,7 @@ def test_command_preparation_failure_before_path_binding_has_no_native_exception
 def test_command_output_is_sanitized_before_preview_and_continuation_storage(
     tmp_path, monkeypatch, native_output
 ):
-    """Every stored output byte is sanitized while source and user files remain unchanged."""
+    """Canonical scratch prefixes survive output caching while host paths stay hidden."""
     workspace = tmp_path / "work"
     workspace.mkdir()
     scratch = tmp_path / "Library/Application Support/synthetic é ;$'"
@@ -612,7 +612,7 @@ def test_command_output_is_sanitized_before_preview_and_continuation_storage(
         monkeypatch.setattr(
             type(backend),
             "output_path_roots",
-            Mock(return_value=(("/native-private-scratch", VirtualPath.TEMPORARY),)),
+            Mock(return_value=(("/native-private-scratch", str(scratch)),)),
             raising=False,
         )
     backend.run.return_value = CommandProcessResult(
@@ -645,8 +645,133 @@ def test_command_output_is_sanitized_before_preview_and_continuation_storage(
         stream = result[name]
         assert "$TMPDIR" in stream["content"]
         assert "synthetic" not in stream["content"]
+        assert "<external>" in stream["content"]
         cached = cached_path(stream["handle"])[0].read_text()
+        assert "$TMPDIR" in cached
         assert "synthetic" not in cached
         assert "/native-private-scratch" not in cached
-        assert str(tmp_path) not in cached
-        assert "$TMPDIR" in cached
+        assert str(scratch.parent) + "\n" not in cached
+        assert "<external>" in cached
+
+
+@pytest.mark.parametrize("same_root", [False, True])
+def test_scratch_data_classification_cannot_transfer_to_a_different_runtime_root(
+    tmp_path, same_root
+):
+    """The trusted generation flag grants ordinary names only to its exact bound root."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    scratch = tmp_path / "session"
+    scratch.mkdir(mode=0o700)
+    permissions = PermissionManager(workspace)
+    permissions.bind_temporary_directory(
+        PathHolder(scratch if same_root else permissions.temporary_directory),
+        ordinary_names=lambda: True,
+    )
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", ":"), cwd=str(workspace), boundary=ProcessBoundary.SANDBOXED
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    service = CommandExecutionService(backend, Mock())
+    result = service.run_command(
+        ToolContext(
+            None,
+            "run_command",
+            operations=(operation,),
+            instructions_manager=instructions,
+            permission_manager=permissions,
+        ),
+        ":",
+    )
+    assert result["exit_code"] == 0
+    approved = backend.run.call_args.args[0]
+    assert approved.scratch_root == scratch
+    assert approved.scratch_data is same_root
+
+
+def test_workspace_environment_keeps_its_mounted_path_beneath_restricted_scratch(tmp_path):
+    """Workspace paths are not remapped as generated temporary-file environment values."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    workspace = scratch / "project"
+    workspace.mkdir()
+    permissions = PermissionManager(workspace)
+    permissions.bind_temporary_directory(PathHolder(scratch))
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", ":"), cwd=str(workspace), boundary=ProcessBoundary.SANDBOXED
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    result = CommandExecutionService(backend, Mock()).run_command(
+        ToolContext(
+            None,
+            "run_command",
+            operations=(operation,),
+            instructions_manager=instructions,
+            permission_manager=permissions,
+        ),
+        ":",
+    )
+    assert result["exit_code"] == 0
+    approved = backend.run.call_args.args[0]
+    assert approved.shell_environment()["WORKSPACE_ROOT"] == str(workspace)
+    assert "WORKSPACE_ROOT" not in approved.generated_environment
+    assert {"TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME"} <= set(approved.generated_environment)
+
+
+@pytest.mark.parametrize("referenced", [False, True])
+def test_only_referenced_active_skill_roots_enter_command_authority(tmp_path, referenced):
+    """Concrete skill paths preserve their identity without broadening unrelated commands."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    skill_root = tmp_path / "guide"
+    skill_root.mkdir()
+    location = skill_root / "SKILL.md"
+    location.write_text("---\nname: guide\ndescription: Guide\n---\nGuide instructions")
+    permissions = PermissionManager(workspace)
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(workspace, permissions.temporary_directory),
+        skill_manager=SkillManager([Skill("guide", "Guide", location)]),
+    )
+    instructions.activate_skill("guide")
+    source = "cat " + shlex.quote(str(skill_root / "data")) if referenced else ":"
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", source), cwd=str(workspace), boundary=ProcessBoundary.SANDBOXED
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED, exit_code=0, stdout=str(skill_root) if referenced else ""
+    )
+    interaction = Mock()
+    interaction.prompt.return_value = "approve"
+    result = CommandExecutionService(backend, Mock()).run_command(
+        ToolContext(
+            interaction,
+            "run_command",
+            operations=(operation,),
+            instructions_manager=instructions,
+            permission_manager=permissions,
+        ),
+        source,
+    )
+    assert result["stdout"]["content"] == ("/skills/guide" if referenced else "")
+    approved = backend.run.call_args.args[0]
+    assert approved.read_roots == ((skill_root,) if referenced else ())
+    assert approved.execution_source == source
+    if not referenced:
+        interaction.prompt.assert_not_called()

@@ -56,12 +56,14 @@ def test_public_denial_never_launches_unapproved_host_retry(backend, native_work
         registry.close()
 
 
-def test_virtual_workspace_paths_remain_model_safe(public_command, native_workspace):
-    """Public shell paths and output expose virtual workspace identities rather than host paths."""
-    result = public_command.call("cat /workspace/ordinary; printf '%s' /workspace", read_only=True)
+def test_workspace_paths_are_usable_process_paths(public_command, native_workspace):
+    """Shell expansion reaches workspace bytes and diagnostics retain the canonical prefix."""
+    result = public_command.call(
+        'cat "$WORKSPACE_ROOT/ordinary"; printf "%s" "$WORKSPACE_ROOT"', read_only=True
+    )
     assert result["ok"] is True
     assert "ordinary-data" in result["result"]["stdout"]["content"]
-    assert "/workspace" in result["result"]["stdout"]["content"]
+    assert "$WORKSPACE_ROOT" in result["result"]["stdout"]["content"]
     assert str(native_workspace) not in json.dumps(result)
     public_command.host.run_host_command.assert_not_called()
 
@@ -69,7 +71,7 @@ def test_virtual_workspace_paths_remain_model_safe(public_command, native_worksp
 @pytest.mark.parametrize(
     "source",
     [
-        "cat /workspace/external-link",
+        'cat "$WORKSPACE_ROOT/external-link"',
         "/bin/sh -c 'cat ../outside/secret'",
         "printf unsafe > .git/config",
         "printf unsafe > ../outside/write",
@@ -164,12 +166,12 @@ def test_public_granted_roots_keep_private_components_denied(
 ):
     """Canonical and virtual grants protect private content at every depth and access mode."""
     if role == "workspace":
-        root, virtual, reads = native_workspace, "/workspace", []
+        root, virtual, reads = native_workspace, str(native_workspace), []
     elif role == "temporary":
         root, virtual, reads = public_command.scratch, "$TMPDIR", []
     elif role == "skill":
         public_command.instructions.activate_skill("fixture")
-        root, virtual, reads = public_command.skill_root, "/skills/fixture", []
+        root, virtual, reads = public_command.skill_root, str(public_command.skill_root), []
     else:
         root = native_workspace.parent / "extra"
         root.mkdir()
@@ -215,7 +217,7 @@ def test_public_skill_alias_rejects_private_hardlink(public_command, native_work
     (root / "public-alias").hardlink_to(source)
     public_command.instructions.activate_skill("fixture")
 
-    result = public_command.call("cat /skills/fixture/public-alias", read_only=True)
+    result = public_command.call("cat " + shlex.quote(str(root / "public-alias")), read_only=True)
 
     assert result["problem"]["code"] == "sandbox.invalid", result
     assert "private-skill-canary" not in json.dumps(result)
@@ -398,21 +400,21 @@ def test_renamed_tool_keeps_native_boundary(public_command):
 )
 def test_public_special_workspace_names_preserve_policy(public_command, native_workspace):
     """Virtual paths with unusual host spellings retain protected and outside denies."""
-    allowed = public_command.call("cat /workspace/ordinary", read_only=True)
+    allowed = public_command.call('cat "$WORKSPACE_ROOT/ordinary"', read_only=True)
     assert allowed["ok"] and allowed["result"]["stdout"]["content"] == "ordinary-data"
     targets = ["AGENTS.md", 'POLICY"name.md', "POLICY\nname.md"]
     for name in targets:
         path = native_workspace / name
         path.write_text("preserve-instructions")
         denied = public_command.call(
-            "eval " + shlex.quote("printf changed > " + shlex.quote("/workspace/" + name))
+            "eval " + shlex.quote("printf changed > " + shlex.quote(str(native_workspace / name)))
         )
         assert not denied["ok"]
         assert "host_offer" not in denied["problem"]["metadata"]
         assert path.read_text() == "preserve-instructions"
     for source in (
-        "cat /workspace/.ssh/id_ed25519",
-        "cat /workspace/external-link",
+        'cat "$WORKSPACE_ROOT/.ssh/id_ed25519"',
+        'cat "$WORKSPACE_ROOT/external-link"',
         "eval 'printf bad > ../outside/write'",
     ):
         denied = public_command.call(source)
@@ -509,8 +511,8 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
                 instructions_manager=loop.instructions_manager,
             )
         )
-        assert value["ok"], value
-        assert str(database.parent) not in json.dumps(value)
+        assert value["ok"], json.dumps(value)
+        assert str(database) not in json.dumps(value)
         return value["result"]
 
     try:
@@ -522,7 +524,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             loop,
             "run_command",
             command='printf draft > "$TMPDIR/report.txt"',
-            cwd="/workspace",
+            cwd="$WORKSPACE_ROOT",
             read_only=True,
         )
         canonical = dispatch(loop, "run_command", command='cd "$TMPDIR"; pwd -P', read_only=True)
@@ -542,7 +544,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             loop,
             "run_command",
             command='cat "$TMPDIR/report.txt"; cat "$TMPDIR/revised.txt"',
-            cwd="/workspace",
+            cwd="$WORKSPACE_ROOT",
             read_only=True,
         )
         assert result["stdout"]["content"] == "draftrevised"
@@ -552,7 +554,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             loop,
             "run_command",
             command='test ! -e "$TMPDIR/report.txt"',
-            cwd="/workspace",
+            cwd="$WORKSPACE_ROOT",
             read_only=True,
         )
         for forbidden in (database.parent, database, directory):
@@ -565,7 +567,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
                 )
             )
             assert not denied["ok"], denied
-            assert str(database.parent) not in json.dumps(denied)
+            assert "draft" not in denied["problem"]["metadata"]["stdout"]["content"]
         second_directory = loop.permission_manager.temporary_directory
         escape = second_directory / "escape"
         escape.symlink_to(directory / "report.txt")
@@ -575,7 +577,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
                 json.dumps(
                     {
                         "command": 'cat "$TMPDIR/escape"',
-                        "cwd": "/workspace",
+                        "cwd": "$WORKSPACE_ROOT",
                         "read_only": True,
                     }
                 ),
@@ -590,7 +592,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
         denied = json.loads(
             loop.tool_registry.call(
                 "run_command",
-                json.dumps({"command": ":", "cwd": "/workspace", "read_only": True}),
+                json.dumps({"command": ":", "cwd": "$WORKSPACE_ROOT", "read_only": True}),
                 interaction=interaction,
                 instructions_manager=loop.instructions_manager,
             )
@@ -606,7 +608,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             loop,
             "run_command",
             command='cat "$TMPDIR/report.txt"; cat "$TMPDIR/revised.txt"',
-            cwd="/workspace",
+            cwd="$WORKSPACE_ROOT",
             read_only=True,
         )
         assert result["stdout"]["content"] == "draftrevised"
@@ -623,3 +625,137 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
         for loop in reversed(runtimes):
             loop.command_manager.close()
             loop.permission_manager.close()
+
+
+@pytest.mark.parametrize("native_workspace", ["work space é"], indirect=True)
+def test_session_paths_round_trip_through_scripts_subprocesses_and_file_tools(
+    backend, native_workspace, monkeypatch
+):
+    """Fresh data paths stay identical across process boundaries while outside data is denied."""
+    monkeypatch.setenv("PATH", str(Path(sys.executable).parent) + ":/usr/bin:/bin")
+    database = native_workspace.parent / "Library" / "Application Support" / "state.db"
+    sessions = SessionManager(
+        session_store=SQLiteSessionStore(database, workspace_id="paths"), workspace_id="paths"
+    )
+    permissions = PermissionManager(native_workspace)
+    host = Mock()
+    host.run_host_command.side_effect = AssertionError("unapproved host launch")
+    interaction = Mock()
+    interaction.prompt.side_effect = lambda message, **kwargs: (
+        ApprovalChoice.ONCE
+        if message == "Proceed?"
+        else "deny"
+        if "without the OS sandbox" in message
+        else "approve"
+    )
+    registry = ToolRegistry(
+        [run_command, read_text_file, write_text_file],
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(backend, host),
+    )
+    loop = Loop.create_default(
+        backend=SimpleNamespace(default_model="test", get_context_window=lambda _: None),
+        working_directory=native_workspace,
+        session_manager=sessions,
+        interaction=interaction,
+        permission_manager=permissions,
+        tool_registry=registry,
+    )
+
+    def call(name, **arguments):
+        """Use public dispatch with the session's canonical path prefixes."""
+        return json.loads(
+            registry.call(
+                name,
+                json.dumps(arguments),
+                interaction=interaction,
+                instructions_manager=loop.instructions_manager,
+            )
+        )
+
+    def command(source, **arguments):
+        """Require successful native execution without permitting a host recovery."""
+        value = call("run_command", command=source, cwd="$WORKSPACE_ROOT", **arguments)
+        assert value["ok"], json.dumps(value)
+        assert value["result"]["boundary"] == "sandbox"
+        return value["result"]["stdout"]["content"]
+
+    try:
+        scratch = permissions.temporary_directory
+        assert sessions.working_directory_allows_private_names()
+        rendered = loop.instructions_manager.virtual_paths
+        assert rendered.display(str(native_workspace)) == "$WORKSPACE_ROOT"
+        assert rendered.display(str(scratch)) == "$TMPDIR"
+        assert call("write_text_file", path="$WORKSPACE_ROOT/input.txt", content="workspace")["ok"]
+        assert command('cat "$WORKSPACE_ROOT/input.txt"') == "workspace"
+        assert (native_workspace / "input.txt").read_text() == "workspace"
+        output = command(
+            'printf command > "$TMPDIR/command.txt"; '
+            'printf "%s\\n" "$WORKSPACE_ROOT" "$TMPDIR" "$TMP" "$TEMP"'
+        )
+        assert output.splitlines() == ["$WORKSPACE_ROOT", *(["$TMPDIR"] * 3)]
+        read = call("read_text_file", path="$TMPDIR/command.txt")
+        assert read["result"]["path"] == "$TMPDIR/command.txt"
+        assert read["result"]["content"] == "command"
+        shell = (
+            'set -eu\ncd "$WORKSPACE_ROOT"\n'
+            'test "$(cat "$TMPDIR/command.txt")" = command\n'
+            'printf script > "$TMPDIR/script.txt"\n'
+            'mkdir "$TMPDIR/.loop" "$TMPDIR/Library"\n'
+        )
+        assert call("write_text_file", path="$TMPDIR/script.sh", content=shell)["ok"]
+        assert (scratch / "script.sh").read_text() == shell
+        command('/bin/sh "$TMPDIR/script.sh"')
+        assert call("write_text_file", path="$TMPDIR/.loop/data", content="tool")["ok"]
+        assert call("read_text_file", path="$TMPDIR/.loop/data")["result"]["content"] == "tool"
+        program = (
+            "import json, os, pathlib, tempfile, subprocess\n"
+            "s = pathlib.Path(os.environ['TMPDIR'])\n"
+            "w = pathlib.Path(os.environ['WORKSPACE_ROOT'])\n"
+            "assert pathlib.Path.cwd() == w\n"
+            "assert tempfile.gettempdir() == str(s)\n"
+            "assert subprocess.check_output(['/bin/cat', str(s/'script.txt')]) == b'script'\n"
+            "assert subprocess.check_output(['/bin/cat', str(w/'input.txt')]) == b'workspace'\n"
+            "assert subprocess.check_output(['/usr/bin/printf', '%s', '$TMPDIR/script.txt']) "
+            "== b'$TMPDIR/script.txt'\n"
+            "subprocess.run(['/bin/sh', '-c', 'test -f \"$TMPDIR/.loop/data\"'], check=True)\n"
+            "(s/'paths.json').write_text(json.dumps(dict(workspace=str(w), scratch=str(s))))\n"
+            "with tempfile.NamedTemporaryFile(delete=False) as f:\n"
+            " f.write(b'subprocess'); print(f.name)\n"
+        )
+        assert call("write_text_file", path="$TMPDIR/probe.py", content=program)["ok"]
+        filename = command('python -B -S "$TMPDIR/probe.py"').strip()
+        assert Path(rendered.resolve(filename)).parent == scratch
+        assert call("read_text_file", path=filename)["result"]["content"] == "subprocess"
+        expected = {"workspace": str(native_workspace), "scratch": str(scratch)}
+        assert json.loads((scratch / "paths.json").read_text()) == expected
+        evidence = call("read_text_file", path="$TMPDIR/paths.json")["result"]["content"]
+        assert json.loads(evidence) == expected
+        command(
+            'printf data > "$TMPDIR/.loop/library"; mv "$TMPDIR/.loop/library" "$TMPDIR/renamed"; '
+            'rm "$TMPDIR/renamed"',
+            read_only=True,
+        )
+        for target in (native_workspace / ".gitignore", native_workspace / ".ssh" / "new"):
+            denied = call("run_command", command="printf bad > " + shlex.quote(str(target)))
+            assert not denied["ok"], denied
+            assert not target.exists()
+        sessions.new_session()
+        current = permissions.temporary_directory
+        assert current != scratch
+        (current / "escape").symlink_to(scratch, target_is_directory=True)
+        for source in (
+            'cat "$TMPDIR/escape/command.txt"',
+            'printf bad > "$TMPDIR/escape/command.txt"',
+            "cat " + shlex.quote(str(scratch / "command.txt")),
+            'cat "$TMPDIR/../../"*/files/command.txt',
+        ):
+            denied = call("run_command", command=source, read_only=True)
+            assert not denied["ok"], denied
+            assert "command" not in denied["problem"]["metadata"]["stdout"]["content"]
+        assert (scratch / "command.txt").read_text() == "command"
+        assert not call("read_text_file", path="$TMPDIR/escape/command.txt")["ok"]
+        host.run_host_command.assert_not_called()
+    finally:
+        loop.command_manager.close()
+        permissions.close()

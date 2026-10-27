@@ -11,19 +11,19 @@ from .process import parse_command_line
 
 
 class VirtualPath:
-    """Translate a fixed model-visible filesystem into local execution paths.
+    """Translate canonical tool path prefixes to local filesystem roots.
 
     Args:
-        workspace (Path | None): Local directory represented as ``/workspace``.
-        temporary_directory (Path | None): Local directory represented as ``$TMPDIR``.
-        skill_roots (Mapping[str, Path]): Skill resource directories represented below
+        workspace (Path | None): Physical workspace root addressed by ``$WORKSPACE_ROOT``.
+        temporary_directory (Path | None): Physical session scratch addressed by ``$TMPDIR``.
+        skill_roots (Mapping[str, Path] | None): Skill resource directories represented below
             ``/skills/<name>``.
 
-    Virtual paths are resolved before filesystem operations and process launch. Literal roots in
-    model-authored shell source can be replaced with private shell-safe aliases.
+    Typed paths resolve before filesystem operations. Shell source and saved file content
+    remain unchanged; executed programs obtain the same roots from their environment.
     """
 
-    WORKSPACE = "/workspace"
+    WORKSPACE = "$WORKSPACE_ROOT"
     TEMPORARY = "$TMPDIR"
     SKILLS = "/skills"
     EXTERNAL = "<external>"
@@ -47,16 +47,16 @@ class VirtualPath:
         self._roots = roots
 
     def resolve(self, value: str) -> str:
-        """Resolve one virtual or workspace-relative path for local execution.
+        """Resolve a canonical prefix or workspace-relative tool path.
 
         Args:
-            value (str): Model-supplied virtual or workspace-relative path.
+            value (str): Model-supplied path within a configured root.
 
         Returns:
             str: Local lexical path, preserving leaf symlinks for mutation planners.
 
         Raises:
-            ValueError: The path is outside a configured virtual root or escapes its root.
+            ValueError: The path is outside a configured root or escapes its root.
         """
         if not value or "//" in value:
             raise ValueError("Path must be a virtual or workspace-relative path.")
@@ -73,13 +73,13 @@ class VirtualPath:
         return self._local_path(workspace, value)
 
     def display(self, value: str) -> str:
-        """Render a local path without disclosing configured host roots.
+        """Render a local path using its configured public spelling.
 
         Args:
             value (str): Local path or relative metadata path.
 
         Returns:
-            str: Virtual path, unchanged relative path, or ``<external>``.
+            str: Canonical prefix, relative path, or ``<external>``.
         """
         path = Path(value)
         if not path.is_absolute():
@@ -108,7 +108,7 @@ class VirtualPath:
         return shlex.join(tuple(self._resolve_command_argument(argument) for argument in argv))
 
     def command_roots(self) -> tuple[tuple[str, Path], ...]:
-        """Return configured virtual roots and their local directories for shell translation.
+        """Return canonical root keys and physical targets for request binding.
 
         Returns:
             tuple[tuple[str, Path], ...]: Roots ordered from longest virtual name to shortest.
@@ -126,11 +126,11 @@ class VirtualPath:
         Returns:
             str: Source with path-segment root occurrences replaced in one pass. A bare
                 directory root gains a trailing slash so tools traverse the alias symlink.
-            ``$TMPDIR`` is excluded because the shell expands its environment value.
+            Environment-variable prefixes are excluded because the shell expands their values.
         """
         if not aliases:
             return source
-        aliases = {root: path for root, path in aliases.items() if root != VirtualPath.TEMPORARY}
+        aliases = {root: path for root, path in aliases.items() if not root.startswith("$")}
         if not aliases:
             return source
         roots = "|".join(re.escape(root) for root in sorted(aliases, key=len, reverse=True))
@@ -144,14 +144,14 @@ class VirtualPath:
         )
 
     def metadata(self, value: object, fields: tuple[tuple[str, ...], ...]) -> object:
-        """Render declared local metadata fields as virtual paths.
+        """Render declared metadata fields using their configured public paths.
 
         Args:
             value (object): Parsed tool result or reference metadata.
             fields (tuple[tuple[str, ...], ...]): Declared key paths; ``"*"`` selects list items.
 
         Returns:
-            object: Copy with declared metadata path values represented virtually.
+            object: Copy with declared metadata path values using public spellings.
         """
 
         def rewrite(item: object, path: tuple[str, ...]) -> object:
@@ -175,17 +175,18 @@ class VirtualPath:
         *,
         roots: tuple[tuple[str, str], ...] | None = None,
     ) -> str:
-        """Replace configured local roots in implementation-generated text.
+        """Render configured roots as canonical prefixes in diagnostics.
 
         Args:
             value (str): Diagnostic text that may include one declared root.
-            roots (tuple[tuple[str, str], ...] | None): Precomputed local and virtual root pairs.
+            roots (tuple[tuple[str, str], ...] | None): Precomputed local and public root pairs.
                 Defaults to resolving canonical root aliases on demand.
 
         Returns:
-            str: Text with configured local roots represented virtually.
+            str: Text with canonical prefixes and unrelated host ancestors sanitized.
         """
         selected_roots = self.redaction_roots() if roots is None else roots
+        replacements = {}
         for local, virtual in selected_roots:
             for spelling in sorted(
                 {
@@ -199,14 +200,17 @@ class VirtualPath:
                 key=len,
                 reverse=True,
             ):
-                value = value.replace(spelling, virtual)
-        return value
+                replacements.setdefault(spelling, virtual)
+        if not replacements:
+            return value
+        pattern = "|".join(re.escape(key) for key in sorted(replacements, key=len, reverse=True))
+        return re.sub(pattern, lambda match: replacements[match.group()], value)
 
     def redaction_roots(self) -> tuple[tuple[str, str], ...]:
-        """Return lexical and canonical aliases used to hide configured host roots.
+        """Return lexical and canonical roots for public-path disclosure.
 
         Returns:
-            tuple[tuple[str, str], ...]: Local path spellings paired with their virtual roots,
+            tuple[tuple[str, str], ...]: Local path spellings paired with public roots,
                 ordered from longest to shortest for safe replacement.
         """
         roots = {}

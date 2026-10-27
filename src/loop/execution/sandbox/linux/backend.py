@@ -86,10 +86,10 @@ class LinuxNativeBackend:
         """Describe native namespace paths for command-result disclosure.
 
         Args:
-            request (SandboxRequest): Bound command aliases in their namespace mount order.
+            request (SandboxRequest): Bound session root and internal namespace aliases.
 
         Returns:
-            tuple[tuple[str, str], ...]: Native and logical roots, longest native path first.
+            tuple[tuple[str, str], ...]: Namespace and public roots, longest native path first.
                 Raw native results and selected-file search bytes remain unchanged.
         """
         roots = (

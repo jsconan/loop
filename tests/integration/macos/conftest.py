@@ -117,7 +117,7 @@ def public_command(backend, native_workspace):
     def call(source=None, *, name="run_command", chosen_interaction=None, **arguments):
         """Dispatch through the model's virtual paths and return the public response."""
         if source is not None:
-            arguments = {"command": source, "cwd": "/workspace", **arguments}
+            arguments = {"command": source, "cwd": "$WORKSPACE_ROOT", **arguments}
         return json.loads(
             registry.call(
                 name,

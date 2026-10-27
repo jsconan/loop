@@ -236,7 +236,7 @@ def test_runner_rejects_stale_edits_and_delivers_reread_recovery(
         name="read_text_file",
         arguments=json.dumps(
             {
-                "path": "/workspace/file.txt",
+                "path": "$WORKSPACE_ROOT/file.txt",
                 **({"max_lines": 1} if partial else {}),
             }
         ),
@@ -246,11 +246,11 @@ def test_runner_rejects_stale_edits_and_delivers_reread_recovery(
         name="read_text_file",
         arguments=json.dumps(
             {
-                "path": "/workspace/file.txt",
+                "path": "$WORKSPACE_ROOT/file.txt",
             }
         ),
     )
-    arguments = {"path": "/workspace/file.txt"}
+    arguments = {"path": "$WORKSPACE_ROOT/file.txt"}
     arguments.update(
         {"content": "model\nuser: old\n"}
         if tool == "write_text_file"
@@ -552,7 +552,7 @@ def test_shared_registry_does_not_share_deletion_receipts_between_sessions(tmp_p
             if isinstance(item, ToolResult)
         )
         assert result["problem"]["code"] == "filesystem.stale_context"
-        assert result["read_versions"] == {"/workspace/file.txt": None}
+        assert result["read_versions"] == {"$WORKSPACE_ROOT/file.txt": None}
         runner.interaction.prompt.assert_not_called()
     assert not target.exists()
 
@@ -736,7 +736,7 @@ def test_persisted_recovery_preserves_deletion_receipt_delivery_boundaries(
         permission_manager=original.permission_manager,
         file_observations=observations,
     )
-    assert json.loads(output)["read_versions"] == {"/workspace/file.txt": None}
+    assert json.loads(output)["read_versions"] == {"$WORKSPACE_ROOT/file.txt": None}
     sessions.add_tool_call(
         call_id=rejected.call_id, output=output, working_directory=str(tmp_path), active_skills=()
     )
@@ -888,7 +888,7 @@ def test_deletion_warning_allows_reconsidered_creation_with_normal_authorization
         if backend.get_response.call_count == 2:
             for identifier in ("stale", "same_batch"):
                 assert results[identifier]["problem"]["code"] == "filesystem.stale_context"
-                assert results[identifier]["read_versions"] == {"/workspace/file.txt": None}
+                assert results[identifier]["read_versions"] == {"$WORKSPACE_ROOT/file.txt": None}
                 assert results[identifier]["problem"]["metadata"] == {
                     "reread_required": False,
                     "regeneration_required": True,
@@ -997,10 +997,10 @@ def test_explicit_absence_or_own_deletion_allows_intentional_recreation(tmp_path
     }
     assert results["recreate"]["ok"] is True
     if removed_by_model:
-        assert results["remove"]["file_versions"] == {"/workspace/file.txt": None}
+        assert results["remove"]["file_versions"] == {"$WORKSPACE_ROOT/file.txt": None}
     else:
         assert results["stale"]["problem"]["code"] == "filesystem.stale_context"
-        assert results["absence"]["read_versions"] == {"/workspace/file.txt": None}
+        assert results["absence"]["read_versions"] == {"$WORKSPACE_ROOT/file.txt": None}
         assert results["absence"]["problem"]["code"] == "filesystem.path_missing"
 
 
@@ -2243,7 +2243,7 @@ def test_async_tool_results_update_file_observations_in_a_worker(tmp_path, monke
         {
             "ok": True,
             "result": "done",
-            "file_versions": {"/workspace/source.txt": content_digest("snapshot")},
+            "file_versions": {"$WORKSPACE_ROOT/source.txt": content_digest("snapshot")},
         }
     )
     runner.agent.tools.call_with_timing_async = AsyncMock(return_value=(output, 0.1))
@@ -3416,7 +3416,9 @@ def test_interruption_preserves_settled_tool_results_and_cancels_remaining_calls
     target = tmp_path / "file.txt"
     target.write_text("original", encoding="utf-8")
     calls = tuple(
-        ToolCall(call_id=name, name="read_text_file", arguments='{"path":"/workspace/file.txt"}')
+        ToolCall(
+            call_id=name, name="read_text_file", arguments='{"path":"$WORKSPACE_ROOT/file.txt"}'
+        )
         for name in ("first", "second")
     )
     backend = Mock()

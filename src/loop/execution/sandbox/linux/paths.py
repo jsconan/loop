@@ -334,11 +334,16 @@ def _scan(
                             or entry.name in (*protection.instruction_names, *protection.files)
                         )
                     )
-                    is_private = private_parent or entry.name.casefold() in _PRIVATE_NAMES
+                    is_private = private_parent or (
+                        not (request.scratch_data and root == request.scratch_root)
+                        and entry.name.casefold() in _PRIVATE_NAMES
+                    )
                     inode = (details.st_dev, details.st_ino)
                     if stat.S_ISREG(details.st_mode) and (is_protected or is_private):
                         sensitive_inodes.add(inode)
                     if stat.S_ISREG(details.st_mode) and details.st_nlink > 1:
+                        if request.scratch_data and root == request.scratch_root:
+                            raise ValueError("Session scratch contains a shared inode.")
                         hardlinked[path] = inode
                     if (is_protected or is_private) and stat.S_ISLNK(details.st_mode):
                         raise ValueError("Linux protected or private entry is a symlink.")

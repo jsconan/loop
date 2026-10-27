@@ -223,7 +223,10 @@ class Loop:
         )
         if instructions_manager is None:
             configured_instructions.reactivate_skills(configured_sessions.session.active_skills)
-        configured_permissions.bind_temporary_directory(configured_sessions.temporary_directory)
+        configured_permissions.bind_temporary_directory(
+            configured_sessions.temporary_directory,
+            ordinary_names=configured_sessions.working_directory_allows_private_names,
+        )
         configured_instructions.set_runtime_environment(
             RuntimeEnvironment(
                 working_directory=configured_directory,

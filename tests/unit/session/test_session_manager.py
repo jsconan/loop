@@ -565,7 +565,7 @@ def test_manager_replays_permissions_and_run_statistics():
     operation = Operation(
         tool_id="read",
         action=Action.FILESYSTEM_READ,
-        target=FileTarget(path="/workspace/file.txt"),
+        target=FileTarget(path="$WORKSPACE_ROOT/file.txt"),
     )
     result = AuthorizationResult(
         operations=(operation,),

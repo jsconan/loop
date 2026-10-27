@@ -523,12 +523,12 @@ def test_native_commands_file_tools_and_sqlite_survive_independent_resume(tmp_pa
 import json, shlex, sys, tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
-from loop import (ApprovalChoice, Interaction, PermissionManager, SessionManager,
+from loop import (ApprovalChoice, Interaction, PermissionManager, Session, SessionManager,
                   SQLiteSessionStore, ToolRegistry)
 from loop.execution import CommandExecutionService
 from loop.execution.sandbox import UnavailableSandboxBackend, select_sandbox_backend
 from loop.instructions import InstructionsManager, RuntimeEnvironment
-from loop.tools.files import read_text_file, edit_text_file
+from loop.tools.files import read_text_file, edit_text_file, write_text_file
 from loop.tools.system import run_command
 from loop.session.exporter import export_session
 from loop.utils import cached_path
@@ -551,12 +551,13 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
     manager = SessionManager(interaction=interaction, session=sys.argv[3] or None,
         session_store=SQLiteSessionStore(sys.argv[1], workspace_id="workspace"))
     permissions = PermissionManager(Path(sys.argv[2]))
-    permissions.bind_temporary_directory(manager.temporary_directory)
+    permissions.bind_temporary_directory(manager.temporary_directory,
+        ordinary_names=manager.working_directory_allows_private_names)
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(
         Path(sys.argv[2]), manager.temporary_directory))
     host = Mock()
     host.run_host_command.side_effect = AssertionError("unapproved host retry")
-    registry = ToolRegistry([run_command, read_text_file, edit_text_file],
+    registry = ToolRegistry([run_command, read_text_file, edit_text_file, write_text_file],
         permission_manager=permissions, execution_service=CommandExecutionService(backend, host))
     def sqlite_command(query, *, select=False):
         '''Use the installed Linux runtime's Python SQLite module or the macOS system CLI.'''
@@ -578,19 +579,27 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
         if not result["ok"]:
             raise RuntimeError(json.dumps(result))
         manager.add_tool_call("synthetic-" + str(len(manager.messages)), json.dumps(result),
-                              "/workspace", (), succeeded=True)
+                              "$WORKSPACE_ROOT", (), succeeded=True)
         return result["result"]
     try:
         if not sys.argv[3]:
             dispatch("run_command", command='printf draft > "$TMPDIR/report.txt"; '
                 + sqlite_command("CREATE TABLE state(value); INSERT INTO state VALUES ('retained SQL');"),
                 read_only=True)
+            visible = instructions.virtual_paths.display(str(manager.temporary_directory.get()))
+            script = ('set -eu\ncd "$WORKSPACE_ROOT"\nmkdir "$TMPDIR/.loop"\n'
+                      'cat "$TMPDIR/report.txt"\n'
+                      '/bin/sh -c \'printf child > "$TMPDIR/.loop/data"\'\n')
+            dispatch("write_text_file", path=visible + "/roundtrip.sh", content=script)
+            assert dispatch("run_command", command='/bin/sh "$TMPDIR/roundtrip.sh"',
+                            read_only=True)["stdout"]["content"] == "draft"
+            assert dispatch("read_text_file", path=visible + "/.loop/data")["content"] == "child"
             manager.add_user_message("retain working state")
             diagnostics = dispatch("run_command", command='i=0; while [ "$i" -lt 2048 ]; '
                 'do printf "%s\n" "$TMPDIR"; i=$((i+1)); done', read_only=True)
             cached = cached_path(diagnostics["stdout"]["handle"])[0].read_text()
-            assert "$TMPDIR" in cached
-            assert str(manager.temporary_directory.get()) not in cached
+            visible = instructions.virtual_paths.display(str(manager.temporary_directory.get()))
+            assert visible in cached
         else:
             assert dispatch("read_text_file", path="$TMPDIR/report.txt")["content"] == "draft"
             dispatch("edit_text_file", path="$TMPDIR/report.txt", old_content="draft",
@@ -600,17 +609,21 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
             read_only=True)["stdout"]["content"].strip()
         persisted = manager.store.load(manager.session.id)
         native = str(manager.temporary_directory.get())
-        assert native not in persisted.serialize()
+        visible = instructions.virtual_paths.display(native)
+        outputs = [json.loads(item.output) for item in persisted.messages
+                   if getattr(item, "output", None)]
+        assert visible in json.dumps(outputs, ensure_ascii=False)
         for kind, filename in (("markdown", "transcript.md"), ("archive", "transcript.zip")):
             destination = Path(sys.argv[2]) / filename
             export_session(persisted, manager.store, destination, format=kind, overwrite=True)
             if kind == "markdown":
-                exported = destination.read_text()
+                assert visible in destination.read_text()
             else:
                 with ZipFile(destination) as archive:
-                    exported = "".join(archive.read(name).decode() for name in archive.namelist())
-            assert native not in exported
-            assert "$TMPDIR" in exported
+                    archived = Session.deserialize(archive.read("session.json").decode())
+                archived_outputs = [json.loads(item.output) for item in archived.messages
+                                    if getattr(item, "output", None)]
+                assert visible in json.dumps(archived_outputs, ensure_ascii=False)
         print(json.dumps({"id": manager.session.id, "content": content, "state": state,
                           "directory": str(manager.temporary_directory.get())}))
     finally:

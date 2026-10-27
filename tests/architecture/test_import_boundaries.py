@@ -60,7 +60,7 @@ from loop.execution.sandbox.contracts import SandboxRequest
 from loop.utils.virtual_path import VirtualPath
 assert VirtualPath.__module__ == 'loop.utils.virtual_path'
 assert (VirtualPath.WORKSPACE, VirtualPath.TEMPORARY, VirtualPath.SKILLS) == (
-    '/workspace', '$TMPDIR', '/skills'
+    '$WORKSPACE_ROOT', '$TMPDIR', '/skills'
 )
 assert 'pathspec' not in sys.modules
 """

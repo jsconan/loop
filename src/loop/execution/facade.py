@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import time
 from collections.abc import Callable
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,7 +32,10 @@ from .sandbox.constants import (
     MINIMAL_SYSTEM_PATH,
     PATH_ENVIRONMENT_VARIABLE,
     SYSTEM_LOCALE,
+    TEMP_ENVIRONMENT_VARIABLE,
+    TMP_ENVIRONMENT_VARIABLE,
     TMPDIR_ENVIRONMENT_VARIABLE,
+    WORKSPACE_ROOT_ENVIRONMENT_VARIABLE,
     XDG_CACHE_HOME_ENVIRONMENT_VARIABLE,
 )
 
@@ -466,7 +467,7 @@ class CommandExecutionService:
         *,
         prelaunch_failure: CommandProcessResult | None = None,
     ) -> dict | Problem:
-        """Execute one bound sandbox request and return only virtualized model-visible text."""
+        """Execute one bound request and render canonical prefixes in model-visible output."""
         coordinator = CommandExecutionCoordinator(
             self._backend, self._host_executor, context.permission_manager, context.interaction
         )
@@ -508,10 +509,11 @@ class CommandExecutionService:
         }
         if boundary == "sandbox":
             output["scratch"] = {
-                "path": VirtualPath.TEMPORARY,
+                "path": redact(request.shell_environment()[TMPDIR_ENVIRONMENT_VARIABLE]),
                 "lifetime": "this session",
-                "retrieval": f"use file tools at {VirtualPath.TEMPORARY} or subsequent commands "
-                f"through {VirtualPath.TEMPORARY}",
+                "retrieval": (
+                    f"Use {VirtualPath.TEMPORARY}/... in file tools; quote it in shell commands."
+                ),
             }
             if result.outcome is SandboxOutcome.COMPLETED and result.exit_code != 0:
                 output["executable_hint"] = (
@@ -633,7 +635,6 @@ class CommandExecutionService:
             if isinstance(failure, str)
             else None
         )
-        alias_stack = ExitStack()
         paths = None
         redact = None
         try:
@@ -755,9 +756,16 @@ class CommandExecutionService:
             runtime_reads = tuple(
                 root for root in runtime_reads if not root.is_relative_to(workspace)
             )
+            skill_reads = tuple(
+                root
+                for name, root in paths.command_roots()
+                if name.startswith(f"{VirtualPath.SKILLS}/") and str(root) in command
+            )
             extra_reads = tuple(
                 root
-                for root in dict.fromkeys((*grant_reads, *manual_reads, *runtime_reads))
+                for root in dict.fromkeys(
+                    (*grant_reads, *manual_reads, *runtime_reads, *skill_reads)
+                )
                 if not root.is_relative_to(workspace)
             )
             automatic_reads = tuple(
@@ -780,35 +788,13 @@ class CommandExecutionService:
             scratch = dict(paths.command_roots()).get(
                 VirtualPath.TEMPORARY, context.permission_manager.temporary_directory
             )
-            aliases: list[tuple[str, Path, Path]] = []
-            translated = command
-            candidates = tuple(
-                (virtual, root)
-                for virtual, root in {
-                    **dict(paths.command_roots()),
-                    VirtualPath.TEMPORARY: scratch,
-                }.items()
-                if virtual in command or virtual == VirtualPath.TEMPORARY
-            )
-            directory = Path(
-                alias_stack.enter_context(tempfile.TemporaryDirectory(prefix="loop-vpath-"))
-            ).resolve(strict=True)
-            mapping = {}
-            for index, (virtual, root) in enumerate(candidates):
-                alias = directory / f"r{index}"
-                mapping[virtual] = alias
-            translated = VirtualPath.translate_shell_source(command, mapping)
-            for virtual, root in candidates:
-                alias = mapping[virtual]
-                if alias.as_posix() in translated or virtual == VirtualPath.TEMPORARY:
-                    canonical = root.resolve(strict=True)
-                    alias.symlink_to(canonical, target_is_directory=True)
-                    aliases.append((virtual, alias, canonical))
-            alias_tuple = tuple(aliases)
             environment = {
                 PATH_ENVIRONMENT_VARIABLE: path_value,
                 LANG_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+                WORKSPACE_ROOT_ENVIRONMENT_VARIABLE: str(workspace),
                 TMPDIR_ENVIRONMENT_VARIABLE: str(scratch),
+                TMP_ENVIRONMENT_VARIABLE: str(scratch),
+                TEMP_ENVIRONMENT_VARIABLE: str(scratch),
                 XDG_CACHE_HOME_ENVIRONMENT_VARIABLE: str(scratch / "cache"),
             }
             if read_only:
@@ -820,31 +806,25 @@ class CommandExecutionService:
             generated_environment = tuple(
                 name
                 for name, value in environment.items()
-                if value == str(scratch) or value.startswith(f"{scratch}/")
+                if name != WORKSPACE_ROOT_ENVIRONMENT_VARIABLE
+                and (value == str(scratch) or value.startswith(f"{scratch}/"))
             )
 
             redaction_roots = {*extra_reads, *read_aliases, *git_reads}
+            advertised_roots = {root for _, root in paths.command_roots()}
             system_roots = getattr(self._backend, "system_read_roots", ())
             if not isinstance(system_roots, tuple):
                 system_roots = ()
             native_output_roots = ()
 
             def redact(value: str) -> str:
-                """Hide private aliases and configured canonical roots from model text."""
+                """Render canonical path prefixes while hiding unrelated host paths."""
                 value = paths.redact(value, roots=native_output_roots)
-                for virtual, alias, _ in sorted(
-                    alias_tuple, key=lambda item: len(str(item[1])), reverse=True
-                ):
-                    value = value.replace(str(alias), virtual)
-                value = paths.redact(
-                    value,
-                    roots=tuple((str(alias), virtual) for virtual, alias, _ in alias_tuple)
-                    + ((str(directory), "<command-path>"),),
-                )
-                value = value.replace(str(scratch), VirtualPath.TEMPORARY)
                 for root in sorted(redaction_roots, key=lambda item: len(str(item)), reverse=True):
-                    if root.is_relative_to(workspace) or any(
-                        root.is_relative_to(system) for system in system_roots
+                    if (
+                        root in advertised_roots
+                        or root.is_relative_to(workspace)
+                        or any(root.is_relative_to(system) for system in system_roots)
                     ):
                         continue
                     value = paths.redact(value, roots=((str(root), VirtualPath.EXTERNAL),))
@@ -857,8 +837,9 @@ class CommandExecutionService:
 
             request = SandboxRequest.create(
                 source=command,
-                execution_source=translated,
-                aliases=alias_tuple,
+                scratch_root=scratch,
+                scratch_data=scratch == context.permission_manager.temporary_directory
+                and context.permission_manager.temporary_directory_allows_private_names,
                 cwd=command_cwd,
                 workspace=workspace,
                 read_roots=(*extra_reads, *git_reads),
@@ -902,5 +883,3 @@ class CommandExecutionService:
                 redact,
                 prelaunch_failure=prelaunch_failure,
             )
-        finally:
-            alias_stack.close()

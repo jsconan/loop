@@ -60,7 +60,7 @@ def _permission_event(approval: ApprovalChoice | None = None) -> PermissionEvent
     operation = Operation(
         tool_id="read",
         action=Action.FILESYSTEM_READ,
-        target=FileTarget(path="/workspace/source.txt"),
+        target=FileTarget(path="$WORKSPACE_ROOT/source.txt"),
     )
     return PermissionEvent(
         id=f"permission-event-{approval or 'none'}",

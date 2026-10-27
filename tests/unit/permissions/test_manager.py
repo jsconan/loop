@@ -52,6 +52,7 @@ from loop.permissions import (
 from loop.permissions import manager as manager_module
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.telemetry.policy import thaw
+from loop.utils import PathHolder
 from tests.scheduling import deliver_callbacks
 
 
@@ -128,15 +129,15 @@ def test_host_rule_stores_only_virtual_context_and_checks_runtime_binding(tmp_pa
     other = tmp_path.parent / "other-host-workspace"
     other.mkdir()
     manager = PermissionManager(tmp_path)
-    first = native_request(tmp_path, "cat /workspace/file", read_roots=())
-    moved = native_request(other, "cat /workspace/file", read_roots=())
+    first = native_request(tmp_path, "cat $WORKSPACE_ROOT/file", read_roots=())
+    moved = native_request(other, "cat $WORKSPACE_ROOT/file", read_roots=())
 
     rule = manager.remember_host_command_rule(first)
 
     assert first.host_command_signature() == moved.host_command_signature()
     assert tmp_path.as_posix() not in rule.model_dump_json()
     assert other.as_posix() not in rule.model_dump_json()
-    assert rule.cwd == "/workspace"
+    assert rule.cwd == "$WORKSPACE_ROOT"
     assert rule.source == "<path-bearing-command>"
     assert manager.matching_host_command_rule(first) == rule
     assert manager.matching_host_command_rule(moved) is None
@@ -150,7 +151,7 @@ def test_host_rule_stores_only_virtual_context_and_checks_runtime_binding(tmp_pa
     nested_rule = manager.remember_host_command_rule(
         native_request(tmp_path, "printf nested", cwd=nested, read_roots=())
     )
-    assert nested_rule.cwd == "/workspace/nested"
+    assert nested_rule.cwd == "$WORKSPACE_ROOT/nested"
     assert manager.reset_session()
     assert manager.matching_host_command_rule(first) is None
 
@@ -418,6 +419,7 @@ def test_combined_command_findings_show_both_reasons_and_allow_once_only(tmp_pat
             "WHERE event_name = 'sandbox.permission_scope'"
         ).fetchone()
     assert json.loads(row[0])["review_policies"] == ["git_change", "destructive_command"]
+    assert json.loads(row[0])["scratch_data"] is False
 
 
 def test_fresh_command_finding_overrides_matching_remembered_rule(tmp_path):
@@ -3427,8 +3429,8 @@ def test_process_target_display_resolves_local_paths_to_workspace_virtual_paths(
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
     prompt = interaction.info.call_args.args[0]
-    assert "cat /workspace/README.md" in prompt
-    assert "(cwd: /workspace/src/loop)" in prompt
+    assert "cat '$WORKSPACE_ROOT/README.md'" in prompt
+    assert "(cwd: $WORKSPACE_ROOT/src/loop)" in prompt
     assert "../" not in prompt
 
 
@@ -3451,7 +3453,7 @@ def test_process_target_display_preserves_workspace_relative_argv(tmp_path):
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
-    assert "cat README.md (cwd: /workspace)" in interaction.info.call_args.args[0]
+    assert "cat README.md (cwd: $WORKSPACE_ROOT)" in interaction.info.call_args.args[0]
 
 
 def test_process_target_display_preserves_argument_boundaries(tmp_path):
@@ -3473,7 +3475,7 @@ def test_process_target_display_preserves_argument_boundaries(tmp_path):
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
-    assert "tool 'a b' (cwd: /workspace)" in interaction.info.call_args.args[0]
+    assert "tool 'a b' (cwd: $WORKSPACE_ROOT)" in interaction.info.call_args.args[0]
 
 
 def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
@@ -3524,3 +3526,16 @@ def test_process_target_display_preserves_external_temporary_paths(tmp_path):
     prompt = interaction.info.call_args.args[0]
     assert str(external_path) in prompt
     assert "<external>" not in prompt
+
+
+def test_bound_session_owner_controls_scratch_data_scope(tmp_path):
+    """Fresh-data classification follows the trusted owner and resets on restricted binding."""
+    manager = PermissionManager(tmp_path)
+    reference = PathHolder(manager.temporary_directory)
+    state = [True]
+    manager.bind_temporary_directory(reference, ordinary_names=lambda: state[0])
+    assert manager.temporary_directory_allows_private_names
+    state[0] = False
+    assert not manager.temporary_directory_allows_private_names
+    manager.bind_temporary_directory(reference)
+    assert not manager.temporary_directory_allows_private_names

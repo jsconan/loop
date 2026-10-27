@@ -95,6 +95,7 @@ def _permission_manager_mock():
     permissions.temporary_directory = Path(tempfile.gettempdir())
     permissions.check_boundaries.return_value = None
     permissions.check_boundaries_async.return_value = None
+    permissions.temporary_directory_allows_private_names = False
     return permissions
 
 
@@ -256,7 +257,7 @@ def test_async_dispatch_rejects_stale_file_context_before_approval(tmp_path, del
 
     assert output["problem"]["code"] == "filesystem.stale_context"
     if deleted:
-        assert output["read_versions"] == {"/workspace/file.txt": None}
+        assert output["read_versions"] == {"$WORKSPACE_ROOT/file.txt": None}
         assert not target.exists()
     else:
         assert "read_versions" not in output
@@ -327,7 +328,7 @@ def test_async_dispatch_redacts_canonical_paths_in_a_worker(tmp_path, monkeypatc
         registry.close()
 
     payload = json.loads(output)
-    assert payload["problem"]["detail"] == "Failed at /workspace/source.txt"
+    assert payload["problem"]["detail"] == "Failed at $WORKSPACE_ROOT/source.txt"
     assert resolution_threads
     assert owner_thread not in resolution_threads
 
@@ -376,7 +377,7 @@ def test_deletion_receipts_preserve_inspection_and_creation_authorization(tmp_pa
     )
     output = registry.call(call.name, call.arguments, file_observations=observations)
     if denial == "creation":
-        assert json.loads(output)["read_versions"] == {"/workspace/file.txt": None}
+        assert json.loads(output)["read_versions"] == {"$WORKSPACE_ROOT/file.txt": None}
         assert json.loads(output)["problem"]["code"] == "filesystem.stale_context"
         refreshed = FileObservations(
             [original, call, ToolResult(call_id=call.call_id, output=output)], paths
@@ -2268,7 +2269,7 @@ def test_worker_context_service_values_are_detached():
             self.agents_filenames = ()
             self.empty = None
             self.text = "owner-text"
-            self.location = Path("/workspace/item")
+            self.location = Path("$WORKSPACE_ROOT/item")
             self.model = Problem(code="test.owner", title="Owner", detail="safe")
             self.record = Record("record")
             self.sequence = (1, 2)
@@ -2306,7 +2307,7 @@ def test_worker_context_service_values_are_detached():
     assert result_value(output) == {
         "empty": None,
         "text": "owner-text",
-        "location": "/workspace/item",
+        "location": "$WORKSPACE_ROOT/item",
         "model": "test.owner",
         "record": "record",
         "sequence": [1, 2],
@@ -2897,11 +2898,11 @@ def test_call_command_resolves_virtual_paths_before_execution(tmp_path):
     )
 
     execution = ToolRegistry([read_text_file]).command(
-        "read_text_file", ("/workspace/notes.txt",), instructions_manager=instructions
+        "read_text_file", ("$WORKSPACE_ROOT/notes.txt",), instructions_manager=instructions
     )
 
     assert result_value(execution.output)["content"] == "virtual content"
-    assert result_value(execution.output)["path"] == "/workspace/notes.txt"
+    assert result_value(execution.output)["path"] == "$WORKSPACE_ROOT/notes.txt"
 
 
 def test_call_command_reports_unknown_tools_and_invalid_parameters():
@@ -3240,7 +3241,7 @@ def test_async_planning_stops_at_operation_boundaries():
                     action=Action.PROCESS_EXECUTE,
                     target=ProcessTarget(
                         argv=("safe-command",),
-                        cwd="/workspace",
+                        cwd="$WORKSPACE_ROOT",
                         boundary=ProcessBoundary.SANDBOXED,
                     ),
                 ),
@@ -3332,7 +3333,7 @@ def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_meta
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
     kwargs = {"instructions_manager": instructions}
-    args = json.dumps({"path": "/workspace/é notes.txt"})
+    args = json.dumps({"path": "$WORKSPACE_ROOT/é notes.txt"})
     output, _ = (
         asyncio.run(registry.call_with_timing_async("read_text_file", args, **kwargs))
         if asynchronous
@@ -3340,7 +3341,7 @@ def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_meta
     )
     result = result_value(output)
     assert result["content"] == "useful content"
-    assert result["path"] == "/workspace/é notes.txt"
+    assert result["path"] == "$WORKSPACE_ROOT/é notes.txt"
     authorization = permissions.authorize_async if asynchronous else permissions.authorize
     assert str(path) in str(authorization.call_args.args[0])
 
@@ -3379,13 +3380,13 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path,
         instructions_manager=instructions,
     )
 
-    assert result_value(output)["stdout"]["content"].strip() == "/workspace"
+    assert result_value(output)["stdout"]["content"].strip() == "$WORKSPACE_ROOT"
     request = permissions.authorize_sandboxed_command.call_args.args[0]
     assert request.cwd == tmp_path
 
 
-def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path, monkeypatch):
-    """The workspace shorthand renders and executes as the workspace root."""
+def test_command_workspace_prefix_selects_the_workspace_root(tmp_path, monkeypatch):
+    """The canonical workspace prefix renders and executes as the workspace root."""
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
@@ -3416,12 +3417,12 @@ def test_command_workspace_shorthand_selects_the_workspace_root(tmp_path, monkey
 
     output = registry.call(
         "run_command",
-        json.dumps({"command": "printf cwd", "cwd": "workspace"}),
+        json.dumps({"command": "printf cwd", "cwd": "$WORKSPACE_ROOT"}),
         interaction=interaction,
         instructions_manager=instructions,
     )
 
-    assert result_value(output)["stdout"]["content"].strip() == "/workspace"
+    assert result_value(output)["stdout"]["content"].strip() == "$WORKSPACE_ROOT"
     assert str(tmp_path) not in output
     interaction.prompt.assert_not_called()
     assert backend.run.call_args.args[0].cwd == tmp_path
@@ -3453,10 +3454,10 @@ def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, 
         "run_command",
         json.dumps(
             {
-                "command": "cd /workspace && git diff --cached --stat",
-                "cwd": "workspace",
+                "command": "cd $WORKSPACE_ROOT && git diff --cached --stat",
+                "cwd": "$WORKSPACE_ROOT",
                 "read_only": True,
-                "read_roots": ["/workspace", "/workspace/src"],
+                "read_roots": ["$WORKSPACE_ROOT", "$WORKSPACE_ROOT/src"],
             }
         ),
         instructions_manager=instructions,
@@ -3466,12 +3467,12 @@ def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, 
     request = backend.run.call_args.args[0]
     assert request.cwd == tmp_path
     assert request.read_roots == ()
-    assert request.execution_source != request.source
+    assert request.execution_source == request.source
     interaction.prompt.assert_not_called()
 
 
 def test_denied_command_virtualizes_offer_and_cached_output(tmp_path, monkeypatch):
-    """A public denial hides configured roots in every model-visible field and cache."""
+    """A public denial preserves usable workspace paths in diagnostics and cached output."""
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, None))
     interaction = _approving_interaction()
     registry = ToolRegistry(
@@ -3486,15 +3487,15 @@ def test_denied_command_virtualizes_offer_and_cached_output(tmp_path, monkeypatc
     backend.run.return_value = CommandProcessResult(
         SandboxOutcome.DENIED,
         stdout=(str(tmp_path) + "/output\n")
-        * (MAX_TOOL_RESULT_BYTES // len("/workspace/output\n") + 1),
+        * (MAX_TOOL_RESULT_BYTES // len("$WORKSPACE_ROOT/output\n") + 1),
         detail=f"Denied {tmp_path}/.ssh/fake",
     )
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
-    source = f"cat {tmp_path}/.ssh/fake /workspace/file"
+    source = f"cat {tmp_path}/.ssh/fake $WORKSPACE_ROOT/file"
 
     output = registry.call(
         "run_command",
-        json.dumps({"command": source, "cwd": "/workspace", "read_only": True}),
+        json.dumps({"command": source, "cwd": "$WORKSPACE_ROOT", "read_only": True}),
         interaction=interaction,
         instructions_manager=instructions,
     )
@@ -3502,11 +3503,11 @@ def test_denied_command_virtualizes_offer_and_cached_output(tmp_path, monkeypatc
     problem = json.loads(output)["problem"]
     assert problem["code"] == "sandbox.denied", problem
     assert str(tmp_path) not in output
-    assert "/workspace/.ssh/fake" in problem["metadata"]["host_offer"]
-    assert any(str(tmp_path) in call.args[0] for call in interaction.info.call_args_list)
+    assert "$WORKSPACE_ROOT/.ssh/fake" in problem["metadata"]["host_offer"]
+    assert any("$WORKSPACE_ROOT" in call.args[0] for call in interaction.info.call_args_list)
     handle = problem["metadata"]["stdout"]["handle"]
     path, _ = cached_path(handle)
-    assert str(tmp_path) not in path.read_text()
+    assert "$WORKSPACE_ROOT" in path.read_text()
 
 
 def test_command_accepts_virtual_workspace_cwd(tmp_path, monkeypatch):
@@ -3531,15 +3532,15 @@ def test_command_accepts_virtual_workspace_cwd(tmp_path, monkeypatch):
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
     output = registry.call(
         "run_command",
-        json.dumps({"command": "pwd", "cwd": "/workspace/src"}),
+        json.dumps({"command": "pwd", "cwd": "$WORKSPACE_ROOT/src"}),
         instructions_manager=instructions,
     )
     assert result_value(output)["boundary"] == "sandbox"
     assert backend.run.call_args.args[0].cwd == nested
 
 
-def test_command_output_and_failure_details_hide_host_workspace(tmp_path, monkeypatch):
-    """Command streams and diagnostics use virtual paths in model-visible results."""
+def test_command_output_and_failure_details_preserve_workspace_paths(tmp_path, monkeypatch):
+    """Command streams and diagnostics retain the advertised workspace paths."""
     (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
@@ -3569,12 +3570,12 @@ def test_command_output_and_failure_details_hide_host_workspace(tmp_path, monkey
 
     assert str(tmp_path) not in output
     problem = json.loads(output)["problem"]
-    assert problem["metadata"]["stdout"]["content"] == "/workspace/one\n"
-    assert problem["metadata"]["stderr"]["content"] == "failed at /workspace/two\n"
+    assert problem["metadata"]["stdout"]["content"] == "$WORKSPACE_ROOT/one\n"
+    assert problem["metadata"]["stderr"]["content"] == "failed at $WORKSPACE_ROOT/two\n"
 
 
-def test_command_sandbox_failure_hides_host_workspace(tmp_path, monkeypatch):
-    """Sandbox failure details are virtualized before returning to the model."""
+def test_command_sandbox_failure_preserves_workspace_paths(tmp_path, monkeypatch):
+    """Sandbox failures retain usable workspace paths without exposing environment secrets."""
     (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
@@ -3600,12 +3601,14 @@ def test_command_sandbox_failure_hides_host_workspace(tmp_path, monkeypatch):
     )
 
     assert str(tmp_path) not in output
-    assert json.loads(output)["problem"]["detail"] == ("failed to inspect /workspace/source.py")
+    assert json.loads(output)["problem"]["detail"] == (
+        "failed to inspect $WORKSPACE_ROOT/source.py"
+    )
     assert "PATH=" not in json.loads(output)["problem"]["metadata"]["host_offer"]
 
 
-def test_command_translates_virtual_roots_and_redacts_aliases(tmp_path, monkeypatch):
-    """Default sandbox access translates roots while output hides local aliases."""
+def test_command_preserves_source_and_binds_concrete_roots(tmp_path, monkeypatch):
+    """Default sandbox access binds concrete roots and leaves source bytes unchanged."""
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     scratch = tmp_path.with_name(tmp_path.name + "-scratch")
     scratch.mkdir(mode=0o700)
@@ -3623,18 +3626,18 @@ def test_command_translates_virtual_roots_and_redacts_aliases(tmp_path, monkeypa
     observed = []
 
     def execute(request):
-        """Inspect the live alias request before the tool cleans it up."""
+        """Inspect bound roots and unchanged source at the execution boundary."""
         observed.append(request)
         assert request.paths_are_current()
-        assert request.source == 'cat /workspace/a "$TMPDIR/b"'
-        assert request.execution_source.startswith(f"cat {request.aliases[0][1]}")
-        assert request.aliases[0][0] == "/workspace"
-        assert request.aliases[1][0] == "$TMPDIR"
+        assert request.source == 'cat $WORKSPACE_ROOT/a "$TMPDIR/b"'
+        assert request.execution_source == request.source
+        assert request.aliases == ()
+        assert request.scratch_root == scratch
         assert request.shell_environment()["TMPDIR"] == str(scratch)
         return CommandProcessResult(
             SandboxOutcome.COMPLETED,
             exit_code=0,
-            stdout=f"{request.aliases[0][1]}/a {request.aliases[1][1]}/b",
+            stdout=f"{tmp_path}/a {scratch}/b",
         )
 
     backend = Mock()
@@ -3643,15 +3646,15 @@ def test_command_translates_virtual_roots_and_redacts_aliases(tmp_path, monkeypa
 
     output = registry.call(
         "run_command",
-        json.dumps({"command": 'cat /workspace/a "$TMPDIR/b"'}),
+        json.dumps({"command": 'cat $WORKSPACE_ROOT/a "$TMPDIR/b"'}),
         interaction=interaction,
         instructions_manager=instructions,
     )
 
-    assert result_value(output)["stdout"]["content"] == "/workspace/a $TMPDIR/b"
+    assert result_value(output)["stdout"]["content"] == "$WORKSPACE_ROOT/a $TMPDIR/b"
     interaction.prompt.assert_not_called()
     assert str(tmp_path) not in output
-    assert not observed[0].paths_are_current()
+    assert observed[0].paths_are_current()
 
 
 def test_command_ignores_virtual_root_substrings(tmp_path, monkeypatch):
@@ -3681,11 +3684,11 @@ def test_command_ignores_virtual_root_substrings(tmp_path, monkeypatch):
     assert result_value(output)["boundary"] == "sandbox"
     request = backend.run.call_args.args[0]
     assert request.execution_source == "echo /tmp-old"
-    assert tuple(virtual for virtual, _, _ in request.aliases) == ("$TMPDIR",)
+    assert request.aliases == ()
 
 
-def test_virtual_command_host_retry_uses_same_live_translation(tmp_path, monkeypatch):
-    """One-off host retry executes the bound alias source before alias cleanup."""
+def test_command_host_retry_preserves_source(tmp_path, monkeypatch):
+    """One-off host retry retains the exact approved source and process paths."""
     (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
@@ -3707,10 +3710,8 @@ def test_virtual_command_host_retry_uses_same_live_translation(tmp_path, monkeyp
     host = Mock()
 
     def execute(request):
-        """Observe the alias while the separately approved host run is active."""
-        alias = Path(request.source.removeprefix("cat ").rstrip("/"))
-        assert alias.parent.name.startswith("loop-vpath-")
-        assert alias.is_symlink()
+        """Observe the exact source while the separately approved host run is active."""
+        assert request.source == "cat $WORKSPACE_ROOT"
         return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0, stdout=request.source)
 
     host.run_host_command.side_effect = execute
@@ -3719,15 +3720,15 @@ def test_virtual_command_host_retry_uses_same_live_translation(tmp_path, monkeyp
 
     output = registry.call(
         "run_command",
-        json.dumps({"command": "cat /workspace"}),
+        json.dumps({"command": "cat $WORKSPACE_ROOT"}),
         interaction=interaction,
         instructions_manager=instructions,
     )
 
     assert result_value(output)["boundary"] == "host"
-    assert result_value(output)["stdout"]["content"] == "cat /workspace/"
+    assert result_value(output)["stdout"]["content"] == "cat $WORKSPACE_ROOT"
     warning = interaction.info.call_args_list[-1].args[0]
-    assert 'Command: "cat /workspace"' in warning
+    assert 'Command: "cat $WORKSPACE_ROOT"' in warning
     assert "Reason: The sandbox was unavailable." in warning
     assert str(tmp_path) not in warning
     assert "Execution source:" not in warning
@@ -3747,17 +3748,17 @@ def test_delete_path_accepts_a_virtual_workspace_path(tmp_path):
 
     output = registry.call(
         "delete_path",
-        json.dumps({"path": "/workspace/obsolete.txt"}),
+        json.dumps({"path": "$WORKSPACE_ROOT/obsolete.txt"}),
         interaction=Mock(spec=Interaction, prompt=Mock(return_value=ApprovalChoice.ONCE)),
         instructions_manager=instructions,
     )
 
-    assert result_value(output) == "Successfully deleted path '/workspace/obsolete.txt'."
+    assert result_value(output) == "Successfully deleted path '$WORKSPACE_ROOT/obsolete.txt'."
     assert not target.exists()
 
 
-def test_delete_path_uses_virtual_paths_without_disclosing_the_host_root(tmp_path):
-    """Virtual file operations resolve paths without returning the backing host root."""
+def test_delete_path_returns_the_canonical_workspace_path(tmp_path):
+    """Canonical file paths resolve and return the same workspace prefix."""
     target = tmp_path / "obsolete.txt"
     target.write_text("obsolete", encoding="utf-8")
     instructions = InstructionsManager(
@@ -3767,12 +3768,12 @@ def test_delete_path_uses_virtual_paths_without_disclosing_the_host_root(tmp_pat
 
     output = registry.call(
         "delete_path",
-        json.dumps({"path": "/workspace/obsolete.txt"}),
+        json.dumps({"path": "$WORKSPACE_ROOT/obsolete.txt"}),
         interaction=Mock(spec=Interaction, prompt=Mock(return_value=ApprovalChoice.ONCE)),
         instructions_manager=instructions,
     )
 
-    assert result_value(output) == "Successfully deleted path '/workspace/obsolete.txt'."
+    assert result_value(output) == "Successfully deleted path '$WORKSPACE_ROOT/obsolete.txt'."
     assert str(tmp_path) not in output
     assert not target.exists()
 

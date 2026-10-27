@@ -919,9 +919,18 @@ def test_run_command_accepts_opaque_shell_and_returns_bounded_result(monkeypatch
     assert result["stdout"]["content"] == "hello\n"
     assert backend.run.call_args.args[0].source.endswith("'printf child'")
     environment = dict(backend.run.call_args.args[0].environment)
-    assert environment.keys() == {"LANG", "PATH", "TMPDIR", "XDG_CACHE_HOME"}
+    assert environment.keys() == {
+        "LANG",
+        "PATH",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "WORKSPACE_ROOT",
+        "XDG_CACHE_HOME",
+    }
     assert Path(environment["XDG_CACHE_HOME"]).parent == Path(environment["TMPDIR"])
     assert Path(environment["TMPDIR"]).is_dir()
+    assert environment["TMP"] == environment["TEMP"] == environment["TMPDIR"]
 
 
 @pytest.mark.parametrize(
@@ -974,7 +983,7 @@ def test_read_only_command_uses_a_nonwritable_workspace_policy(monkeypatch, regi
 
     assert problem is None
     assert result["boundary"] == "sandbox"
-    assert result["scratch"]["path"] == "$TMPDIR"
+    assert result["scratch"]["path"] == VirtualPath.TEMPORARY
     assert result["scratch"]["lifetime"] == "this session"
     assert backend.run.call_args.args[0].write_roots == ()
     environment = dict(backend.run.call_args.args[0].environment)
@@ -1702,20 +1711,8 @@ def test_run_command_fails_when_request_paths_are_invalid(tmp_path):
     manager.authorize_sandboxed_command.assert_not_called()
 
 
-def test_run_command_uses_available_temp_for_virtual_path_alias(monkeypatch, tmp_path):
-    """Virtual path aliases use an accessible private temp root instead of /private/tmp."""
-    original = tempfile.TemporaryDirectory
-
-    def temporary_directory(*args, **kwargs):
-        """Keep the alias on the disposable filesystem and reject a fixed temp path."""
-        assert "dir" not in kwargs
-        return (
-            original(*args, dir=tmp_path, **kwargs)
-            if kwargs.get("prefix") == "loop-vpath-"
-            else original(*args, **kwargs)
-        )
-
-    monkeypatch.setattr("loop.execution.facade.tempfile.TemporaryDirectory", temporary_directory)
+def test_run_command_preserves_source_without_temporary_aliases(monkeypatch, tmp_path):
+    """Opaque commands need no temporary path aliases or shell source rewriting."""
     backend = MagicMock(
         run=MagicMock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0))
     )
@@ -1735,7 +1732,7 @@ def test_run_command_uses_available_temp_for_virtual_path_alias(monkeypatch, tmp
                 tool_id="run_command",
                 action="process.execute",
                 target=ProcessTarget(
-                    argv=("/bin/sh", "-c", "cat /workspace/file"),
+                    argv=("/bin/sh", "-c", "cat $WORKSPACE_ROOT/file"),
                     cwd=str(tmp_path),
                     boundary=ProcessBoundary.SANDBOXED,
                 ),
@@ -1745,11 +1742,12 @@ def test_run_command_uses_available_temp_for_virtual_path_alias(monkeypatch, tmp
         execution_service=execution_service,
     )
 
-    result = run_command_tool(context, "cat /workspace/file")
+    result = run_command_tool(context, "cat $WORKSPACE_ROOT/file")
 
     assert result["boundary"] == "sandbox"
-    alias = backend.run.call_args.args[0].aliases[0][1]
-    assert alias.parent.is_relative_to(tmp_path)
+    request = backend.run.call_args.args[0]
+    assert request.aliases == ()
+    assert request.execution_source == request.source == "cat $WORKSPACE_ROOT/file"
 
 
 def test_run_command_honors_fresh_denial(monkeypatch, registry):

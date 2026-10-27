@@ -135,7 +135,7 @@ def test_payload_profile_reuses_virtual_alias_authority_without_host_names(bound
         parent.mkdir(mode=0o700)
         alias = parent / "r0"
         alias.symlink_to(workspace)
-        requests.append(create(aliases=(("/workspace", alias, workspace),)))
+        requests.append(create(aliases=(("$WORKSPACE_ROOT", alias, workspace),)))
     cache = Path("/run/cache.lock")
     profiles = [payload_profile(request, scratch, cache, (Path("/usr"),)) for request in requests]
     assert profiles[0] == profiles[1]
@@ -149,7 +149,7 @@ def test_payload_profile_reuses_virtual_alias_authority_without_host_names(bound
     parent.mkdir(mode=0o700)
     alias = parent / "r0"
     alias.symlink_to(extra)
-    changed = create(read_roots=(extra,), aliases=(("/workspace", alias, extra),))
+    changed = create(read_roots=(extra,), aliases=(("$WORKSPACE_ROOT", alias, extra),))
     assert payload_profile(changed, scratch, cache, (Path("/usr"),)) != profiles[0]
 
 
@@ -457,3 +457,12 @@ def test_session_scratch_policy_guards_future_private_names(bound, tmp_path):
     policy = render(value, scratch)
 
     assert _literal(str(NATIVE_SCRATCH_PATH)) + "/{,**/}" in policy
+
+
+def test_fresh_session_data_policy_keeps_private_guards_outside_scratch(bound):
+    """Only the bound fresh scratch loses basename denials; workspace private rules remain."""
+    create, workspace, scratch = bound
+    value = create(scratch_root=scratch, scratch_data=True)
+    policy = render(value, scratch)
+    assert 'deny "' + _literal(str(NATIVE_SCRATCH_PATH)) + "/{,**/}" not in policy
+    assert _literal(str(workspace)) + "/{,**/}[lL][iI][bB][rR][aA][rR][yY]" in policy
