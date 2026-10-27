@@ -35,18 +35,18 @@ Install development dependencies and run the desired suite:
 
 ```sh
 uv sync
-make test                 # portable unit tests with strict coverage
+make test                 # architecture and portable unit tests with strict coverage
 make test-integration     # native and dependency integration
-make test-all             # both suites with strict coverage
+make test-all             # architecture, unit and integration tests with strict coverage
 ```
 
-The Make targets invoke the installed `.venv/bin/python` directly, avoiding dependency-manager cache initialization inside a sandbox. Override `PYTHON` to select another installed interpreter, for example `make test PYTHON=/path/to/environment/bin/python`. Dependency installation with `uv sync` is a separate setup step.
+The Make targets run pytest through `uv --no-cache run`, which may resolve dependencies and initialize a cache. They do not support a `PYTHON` override.
 
 Run an individual module or select end-to-end cases:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/unit/tools/test_system.py
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/integration -m e2e
+PYTHONDONTWRITEBYTECODE=1 uv --no-cache run pytest tests/unit/tools/test_system.py
+PYTHONDONTWRITEBYTECODE=1 uv --no-cache run pytest tests/integration -m e2e
 ```
 
 To reject unexpected Python warnings during verification, add `-W error` to a pytest command. Tests that exercise expected warnings, logged errors or exceptions must capture and assert the specific diagnostic using `pytest.warns`, `caplog` or `pytest.raises`. Do not suppress diagnostics to make a failing test pass.
@@ -103,8 +103,8 @@ Coverage measures both statements and branches with a 100% threshold. Keep secur
 After changing tests, run the affected modules, the complete unit suite with coverage, and applicable integration suites. Check formatting and whitespace:
 
 ```sh
-.venv/bin/ruff check tests
-.venv/bin/ruff format --check tests
+uv --no-cache run ruff check tests
+uv --no-cache run ruff format --check tests
 git diff --check
 ```
 
