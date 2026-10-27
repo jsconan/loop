@@ -79,11 +79,16 @@ class SQLiteSessionStore:
         with closing(sqlite3.connect(self._path)) as connection:
             self._create_schema(connection)
             row = connection.execute(
-                "SELECT generation, device, inode, retired FROM working_directories "
+                "SELECT generation, device, inode, retired, ordinary_names "
+                "FROM working_directories "
                 "WHERE workspace_id = ? AND id = ?",
                 (self._workspace_id, session_id),
             ).fetchone()
-        return WorkingDirectoryBinding(row[0], row[1], row[2], bool(row[3])) if row else None
+        return (
+            WorkingDirectoryBinding(row[0], row[1], row[2], bool(row[3]), bool(row[4]))
+            if row
+            else None
+        )
 
     def bind_working_directory(self, session_id: str, binding: WorkingDirectoryBinding) -> None:
         """Commit a validated generation before filesystem tools can use it.
@@ -99,10 +104,11 @@ class SQLiteSessionStore:
                 self._create_schema(connection)
                 connection.execute(
                     "INSERT INTO working_directories "
-                    "(workspace_id, id, generation, device, inode, retired) "
-                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, id) DO UPDATE SET "
+                    "(workspace_id, id, generation, device, inode, retired, ordinary_names) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, id) DO UPDATE SET "
                     "generation=excluded.generation, device=excluded.device, "
-                    "inode=excluded.inode, retired=excluded.retired",
+                    "inode=excluded.inode, retired=excluded.retired, "
+                    "ordinary_names=excluded.ordinary_names",
                     (
                         self._workspace_id,
                         session_id,
@@ -110,6 +116,7 @@ class SQLiteSessionStore:
                         binding.device,
                         binding.inode,
                         binding.retired,
+                        binding.ordinary_names,
                     ),
                 )
 
@@ -477,7 +484,7 @@ class SQLiteSessionStore:
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
-        """Create the session table when it does not exist."""
+        """Create session tables and migrate retained bindings conservatively."""
         with closing(connection.execute("BEGIN IMMEDIATE")):
             pass
         with closing(
@@ -490,6 +497,7 @@ class SQLiteSessionStore:
                     device INTEGER NOT NULL,
                     inode INTEGER NOT NULL,
                     retired INTEGER NOT NULL CHECK (retired IN (0, 1)),
+                    ordinary_names INTEGER NOT NULL DEFAULT 0 CHECK (ordinary_names IN (0, 1)),
                     PRIMARY KEY (workspace_id, id)
                 )
                 """
@@ -546,6 +554,13 @@ class SQLiteSessionStore:
         )
         with closing(connection.execute("PRAGMA table_info(sessions)")) as cursor:
             columns = {row[1] for row in cursor.fetchall()}
+        with closing(connection.execute("PRAGMA table_info(working_directories)")) as cursor:
+            working_columns = {row[1] for row in cursor.fetchall()}
+        if "ordinary_names" not in working_columns:
+            connection.execute(
+                "ALTER TABLE working_directories ADD COLUMN ordinary_names "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (ordinary_names IN (0, 1))"
+            )
         if "name" not in columns:
             with closing(connection.execute("ALTER TABLE sessions ADD COLUMN name TEXT")):
                 pass

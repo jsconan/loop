@@ -237,6 +237,27 @@ class SessionManager:
                 raise SessionExecutionConflictError(session_id) from error
             yield self._bound_directory(session_id, root, identity)
 
+    def working_directory_allows_private_names(self) -> bool:
+        """Report whether the current bound generation contains only agent-owned data.
+
+        Returns:
+            bool: Whether fresh-data authority was durably assigned to this generation.
+
+        Raises:
+            ValueError: The store's private namespace is unsafe.
+            OSError: The current working storage cannot be inspected.
+        """
+        with self._state_lock:
+            directory = Path(self.temporary_directory)
+            binding = self._session_store.working_binding(self._session.id)
+            details = directory.lstat()
+            return (
+                binding is not None
+                and not binding.retired
+                and binding.ordinary_names
+                and (details.st_dev, details.st_ino) == (binding.device, binding.inode)
+            )
+
     def _bound_directory(self, session_id: str, root: Path, identity: str) -> Path:
         """Validate durable identity or commit an independently created/adopted generation."""
         descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -282,6 +303,7 @@ class SessionManager:
                 ) from error
             return directory
         legacy = root / identity
+        ordinary_names = False
         if binding is None and (legacy.exists() or legacy.is_symlink()):
             ensure_private_directory(legacy, create=False, anchor=anchor)
             directory = legacy
@@ -290,14 +312,22 @@ class SessionManager:
             ensure_private_directory(parent, anchor=anchor)
             directory = parent / "files"
             ensure_private_directory(directory, anchor=anchor)
+            ordinary_names = True
         details = directory.stat()
         self._session_store.bind_working_directory(
             session_id,
             WorkingDirectoryBinding(
-                str(directory.relative_to(root)), details.st_dev, details.st_ino
+                str(directory.relative_to(root)),
+                details.st_dev,
+                details.st_ino,
+                ordinary_names=ordinary_names,
             ),
         )
-        telemetry_audit("session.working_directory.bound", session_id=session_id)
+        telemetry_audit(
+            "session.working_directory.bound",
+            session_id=session_id,
+            ordinary_names=ordinary_names,
+        )
         return directory
 
     def discard_working_directory(self) -> None:

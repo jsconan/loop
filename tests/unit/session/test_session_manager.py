@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing, closing, nullcontext
+from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Barrier, Event, get_ident
 from types import SimpleNamespace
@@ -4100,3 +4101,25 @@ def test_idle_selection_does_not_retain_ownership_of_a_previous_session():
         manager.new_session()
         with independent.execution() as original, manager.execution() as selected:
             assert original != selected
+
+
+def test_only_fresh_working_generations_allow_private_basenames(tmp_path):
+    """Adoption and retained bindings stay restricted until explicit generation retirement."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    session = Session(id="legacy-data")
+    legacy = store.temporary_root / sha256_digest(session.id.encode())
+    ensure_private_directory(legacy)
+    manager = SessionManager(session=session, session_store=store)
+    assert not manager.working_directory_allows_private_names()
+    manager.discard_working_directory()
+    assert manager.working_directory_allows_private_names()
+    assert store.working_binding(session.id).ordinary_names
+    reopened = SessionManager(session=session, session_store=store)
+    assert reopened.working_directory_allows_private_names()
+    binding = store.working_binding(session.id)
+    store.bind_working_directory(session.id, replace(binding, ordinary_names=False))
+    assert not reopened.working_directory_allows_private_names()
+    store.bind_working_directory(session.id, replace(binding, retired=True))
+    assert not reopened.working_directory_allows_private_names()
+    store.bind_working_directory(session.id, replace(binding, inode=binding.inode + 1))
+    assert not reopened.working_directory_allows_private_names()

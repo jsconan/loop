@@ -1046,3 +1046,23 @@ def test_working_bindings_are_scoped_to_database_workspace(tmp_path):
     second.bind_working_directory("same-id", WorkingDirectoryBinding("second/files", 1, 3))
     assert first.working_binding("same-id") == binding
     assert second.working_binding("same-id").inode == 3
+
+
+def test_working_binding_migration_preserves_restricted_legacy_generations(tmp_path):
+    """Old database bindings stay restricted and fresh-data classification persists separately."""
+    path = tmp_path / "sessions.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            "CREATE TABLE working_directories (workspace_id TEXT, id TEXT, generation TEXT, "
+            "device INTEGER, inode INTEGER, retired INTEGER, PRIMARY KEY(workspace_id, id))"
+        )
+        connection.execute(
+            "INSERT INTO working_directories VALUES ('workspace','old','files',1,2,0)"
+        )
+        connection.commit()
+    store = SQLiteSessionStore(path, workspace_id="workspace")
+    assert store.working_binding("old") == WorkingDirectoryBinding("files", 1, 2)
+    binding = WorkingDirectoryBinding("fresh/files", 3, 4, ordinary_names=True)
+    store.bind_working_directory("fresh", binding)
+    assert SQLiteSessionStore(path, workspace_id="workspace").working_binding("fresh") == binding
+    assert not store.working_binding("old").ordinary_names

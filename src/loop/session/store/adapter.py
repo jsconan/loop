@@ -17,12 +17,15 @@ class WorkingDirectoryBinding:
         device (int): Original filesystem device.
         inode (int): Original directory inode.
         retired (bool): Whether this generation has been permanently retired.
+        ordinary_names (bool): Whether a fresh generation contains only agent-owned data.
+            Defaults to false for retained generations created under private-name restrictions.
     """
 
     generation: str
     device: int
     inode: int
     retired: bool = False
+    ordinary_names: bool = False
 
 
 class SessionStore(Protocol):
