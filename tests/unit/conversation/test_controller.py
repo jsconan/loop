@@ -944,6 +944,22 @@ def test_controller_priority_write_failure_keeps_the_mailbox_item_unchanged(ui):
     assert [event.type for event in manager.session.events] == ["input_queued"]
 
 
+def test_controller_reprioritization_keeps_an_unchanged_priority(ui):
+    """Queueing an already ordinary input keeps its priority unchanged."""
+    controller = SessionController(ui)
+
+    async def scenario():
+        """Queue an input and select the same priority again."""
+        with controller.control.execution():
+            assert await controller.queue_async("waiting", ui) is True
+            assert await controller.reprioritize_latest_async(steer=False) is (
+                PendingInputPriorityOutcome.UPDATED
+            )
+            assert controller.status_snapshot().queued_inputs == 1
+
+    asyncio.run(scenario())
+
+
 def test_controller_reprioritization_skips_inputs_already_delivered(ui):
     """The physical queue cannot reprioritize an input after durable delivery begins."""
     manager = SessionManager(session_store=MemorySessionStore())
@@ -1164,6 +1180,269 @@ def test_controller_recall_cancellation_keeps_mailbox_aligned_with_durable_state
     else:
         assert controller.status_snapshot().queued_inputs == 1
         assert [item.content for item in manager.session.pending_inputs] == ["waiting"]
+
+
+@pytest.mark.parametrize("action", ["/recall", "/queue"])
+@pytest.mark.parametrize("earlier_steering", [False, True])
+def test_withdrawn_deferred_steering_preserves_the_active_run(ui, action, earlier_steering):
+    """Withdrawing the last deferred correction lets the active operation continue."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui, input_mode="steer")
+    controller.bind_session_manager(manager)
+    controller.bind_command_manager(
+        CommandManager(providers=(ConversationCommands(controller),), interaction=ui)
+    )
+
+    async def scenario():
+        """Submit steering and withdraw it before the active operation reaches its boundary."""
+        inputs = asyncio.Queue()
+        working, accepted, changed, release = (asyncio.Event() for _ in range(4))
+        count = 0
+
+        async def prompt(*_args, **kwargs):
+            """Keep recalled text in the editor while the operation finishes."""
+            if "initial" in kwargs:
+                await release.wait()
+            return await inputs.get()
+
+        def report(message=""):
+            """Expose admission and command completion to the test."""
+            nonlocal count
+            if message == "working":
+                working.set()
+            elif message.startswith("Steering accepted"):
+                count += 1
+                if count == (2 if earlier_steering else 1):
+                    accepted.set()
+            elif message in {
+                "Pending message moved to the editor.",
+                "Newest pending message set to queue priority.",
+            }:
+                changed.set()
+
+        ui.prompt_async.side_effect = prompt
+        ui.info.side_effect = report
+
+        async def conversation(receive):
+            """Observe the signal at the boundary following a held operation."""
+            await receive(DummyCompleter())
+            with controller.control.execution():
+                controller.interaction.info("working")
+                await release.wait()
+                assert controller.control.steering_pending is earlier_steering
+                assert not controller.control.cancellation_event.is_set()
+
+        task = asyncio.create_task(controller.run_async(conversation))
+        try:
+            inputs.put_nowait("start")
+            await working.wait()
+            if earlier_steering:
+                inputs.put_nowait("earlier correction")
+            inputs.put_nowait("accidental answer")
+            await accepted.wait()
+            inputs.put_nowait(action)
+            await changed.wait()
+            release.set()
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    pending = [item.content for item in manager.session.pending_inputs]
+    assert ("earlier correction" in pending) is earlier_steering
+    assert ("accidental answer" in pending) is (action == "/queue")
+
+
+@pytest.mark.parametrize("durable", [False, True])
+@pytest.mark.parametrize("action", ["recall", "queue"])
+def test_withdrawal_ignores_steering_left_from_an_earlier_run(ui, durable, action):
+    """An older waiting correction cannot keep a withdrawn run-scoped signal alive."""
+    controller = SessionController(ui, input_mode="steer")
+    if durable:
+        controller.bind_session_manager(SessionManager(session_store=MemorySessionStore()))
+
+    async def scenario():
+        """Leave one earlier correction queued while the next run withdraws new steering."""
+        inputs = asyncio.Queue()
+        working, accepted, release = (asyncio.Event() for _ in range(3))
+        read_inputs(ui, inputs)
+
+        def report(message=""):
+            """Expose execution and admission to the input owner."""
+            if message == "working":
+                working.set()
+            elif message.startswith("Steering accepted"):
+                accepted.set()
+
+        ui.info.side_effect = report
+        with controller.control.execution():
+            assert await controller.steer_async("first", ui) is SteeringOutcome.INTERRUPTED
+            assert await controller.steer_async("older waiting", ui) is SteeringOutcome.INTERRUPTED
+        accepted.clear()
+
+        async def conversation(receive):
+            """Start the first correction, leaving the second in the mailbox."""
+            await receive(DummyCompleter())
+            with controller.control.execution():
+                controller.interaction.info("working")
+                await release.wait()
+                assert controller.control.steering_pending is False
+
+        task = asyncio.create_task(controller.run_async(conversation))
+        try:
+            await working.wait()
+            inputs.put_nowait("accidental answer")
+            await accepted.wait()
+            if action == "recall":
+                assert await controller.recall_latest_async() is PendingInputRecallOutcome.RECALLED
+            else:
+                assert await controller.reprioritize_latest_async(steer=False) is (
+                    PendingInputPriorityOutcome.UPDATED
+                )
+            release.set()
+            await task
+        finally:
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_recall_after_steering_boundary_preserves_the_committed_decision(ui):
+    """A recall racing a committed boundary cannot make the runner resume its old batch."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui, input_mode="steer")
+    controller.bind_session_manager(manager)
+
+    async def scenario():
+        """Commit steering while the durable recall write is still in progress."""
+        inputs = asyncio.Queue()
+        working, accepted, writing, finish_write, release = (asyncio.Event() for _ in range(5))
+        read_inputs(ui, inputs)
+        ui.info.side_effect = lambda message="": (
+            working.set()
+            if message == "working"
+            else accepted.set()
+            if message.startswith("Steering accepted")
+            else None
+        )
+        recall_write = manager.recall_input_async
+
+        async def held_recall(input_id):
+            """Hold persistence until the active runner claims the steering boundary."""
+            writing.set()
+            await finish_write.wait()
+            return await recall_write(input_id)
+
+        manager.recall_input_async = held_recall
+
+        async def conversation(receive):
+            """Keep an operation active until the recall has completed."""
+            await receive(DummyCompleter())
+            with controller.control.execution():
+                controller.interaction.info("working")
+                await release.wait()
+                assert controller.control.steering_pending is True
+
+        task = asyncio.create_task(controller.run_async(conversation))
+        recall = None
+        try:
+            inputs.put_nowait("start")
+            await working.wait()
+            inputs.put_nowait("correction")
+            await accepted.wait()
+            recall = asyncio.create_task(controller.recall_latest_async())
+            await writing.wait()
+            assert controller.control.commit_steering() is True
+            finish_write.set()
+            assert await recall is PendingInputRecallOutcome.RECALLED
+            release.set()
+            await task
+        finally:
+            finish_write.set()
+            release.set()
+            controller.stop()
+            await asyncio.gather(task, *([recall] if recall else []), return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert [item.content for item in manager.session.pending_inputs] == ["start"]
+
+
+def test_recalling_explicit_steering_does_not_reverse_interruption(ui):
+    """An explicit interruption remains in effect after its correction is recalled."""
+    controller = SessionController(ui)
+
+    async def scenario():
+        """Interrupt an active run, then recall its pending correction."""
+        with controller.control.execution():
+            assert await controller.steer_async("correction", ui) is SteeringOutcome.INTERRUPTED
+            assert await controller.recall_latest_async() is PendingInputRecallOutcome.RECALLED
+            assert controller.control.interrupted is True
+            assert controller.control.cancellation_event.is_set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("action", ["recall", "queue"])
+def test_cancelled_withdrawal_preserves_the_deferred_steering_signal(ui, committed, action):
+    """A cancelled durable withdrawal updates the signal only when its write committed."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui, input_mode="steer")
+    controller.bind_session_manager(manager)
+
+    async def scenario():
+        """Admit ordinary steering through the running input reader and cancel its withdrawal."""
+        inputs = asyncio.Queue()
+        working, accepted, release = (asyncio.Event() for _ in range(3))
+        read_inputs(ui, inputs)
+        ui.info.side_effect = lambda message="": (
+            working.set()
+            if message == "working"
+            else accepted.set()
+            if message.startswith("Steering accepted")
+            else None
+        )
+
+        async def conversation(receive):
+            """Keep execution active until the withdrawal has settled."""
+            await receive(DummyCompleter())
+            with controller.control.execution():
+                controller.interaction.info("working")
+                await release.wait()
+
+        async def cancel_write(input_id, *args):
+            """Optionally persist the requested transition before cancellation."""
+            if committed:
+                if action == "recall":
+                    manager.recall_input(input_id)
+                else:
+                    manager.change_input_priority(input_id, *args)
+            raise asyncio.CancelledError
+
+        task = asyncio.create_task(controller.run_async(conversation))
+        try:
+            inputs.put_nowait("start")
+            await working.wait()
+            inputs.put_nowait("correction")
+            await accepted.wait()
+            if action == "recall":
+                manager.recall_input_async = cancel_write
+                operation = controller.recall_latest_async()
+            else:
+                manager.change_input_priority_async = cancel_write
+                operation = controller.reprioritize_latest_async(steer=False)
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+            assert controller.control.steering_pending is (not committed)
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

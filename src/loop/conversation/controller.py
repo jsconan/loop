@@ -703,9 +703,12 @@ class SessionController:
                     )
                     if persisted is not None and persisted.priority == priority:
                         self._inbox.reprioritize(target, priority)
+                        self._withdraw_steering(target)
                     raise
-            if target.priority != priority and not self._inbox.reprioritize(target, priority):
-                return PendingInputPriorityOutcome.NO_PENDING_INPUT
+            if target.priority != priority:
+                if not self._inbox.reprioritize(target, priority):
+                    return PendingInputPriorityOutcome.NO_PENDING_INPUT
+                self._withdraw_steering(target)
         finally:
             self._release_mailbox_lock()
         if steer and self._control.active and self.request_interrupt():
@@ -781,8 +784,14 @@ class SessionController:
     def _remove_recalled_input(self, admission: InputAdmission) -> None:
         """Remove a recalled admission and release its durable mailbox identity."""
         self._inbox.remove(admission)
+        self._withdraw_steering(admission)
         if admission.input_id is not None:
             self._queued_input_ids.discard(admission.input_id)
+
+    def _withdraw_steering(self, admission: InputAdmission) -> None:
+        """Withdraw the steering request associated with this exact admission."""
+        if admission.priority == _STEERING_PRIORITY:
+            self._control.withdraw_steering(id(admission))
 
     @property
     def interaction(self) -> Interaction:
@@ -1724,7 +1733,8 @@ class SessionController:
         try:
             with self._mailbox_access():
                 accepted = self._control.request_steering(
-                    lambda: self._put_mailbox_item_locked(durable_admission)
+                    lambda: self._put_mailbox_item_locked(durable_admission),
+                    key=id(durable_admission),
                 )
         except Full:
             accepted = False
@@ -1775,7 +1785,8 @@ class SessionController:
         try:
             try:
                 accepted = self._control.request_steering(
-                    lambda: self._put_mailbox_item_locked(durable_admission)
+                    lambda: self._put_mailbox_item_locked(durable_admission),
+                    key=id(durable_admission),
                 )
             except Full:
                 accepted = False

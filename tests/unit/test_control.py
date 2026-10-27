@@ -196,6 +196,26 @@ def test_steering_admission_is_scoped_to_an_active_run(active, stopped, admitted
         assert control.steering_pending is False
 
 
+def test_steering_requests_are_scoped_and_commit_atomically():
+    """Withdrawal affects only its request and cannot undo a committed decision."""
+    control = RunControl()
+    assert control.commit_steering() is False
+    with control.execution():
+        assert control.request_steering(lambda: True, key=1)
+        assert control.request_steering(lambda: True, key=2)
+        control.withdraw_steering(1)
+        assert control.steering_pending is True
+        assert control.commit_steering() is True
+        control.withdraw_steering(2)
+        assert control.steering_pending is True
+        assert control.commit_steering() is True
+    with control.execution():
+        assert control.steering_pending is False
+        assert control.request_steering(lambda: True, key=2)
+        control.withdraw_steering(2)
+        assert control.commit_steering() is False
+
+
 def test_shutdown_supersedes_interruption_and_survives_execution_cleanup():
     """Settling an interrupted scope cannot clear a concurrent sticky shutdown request."""
     control = RunControl()

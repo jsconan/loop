@@ -254,7 +254,7 @@ def test_async_model_check_can_select_a_fallback_without_stopping_the_loop(tmp_p
 
 @pytest.mark.parametrize(
     "mode",
-    ["queue", "interrupt", "steer", "default-queue", "default-steer"],
+    ["queue", "interrupt", "steer", "default-queue", "default-steer", "recall-steer"],
 )
 def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode):
     """A real editor queues durable input and controls execution while its model is active."""
@@ -265,12 +265,12 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
         prompt = PromptSession(input=pipe, output=DummyOutput())
         source = ConsoleInteraction(session=prompt, console=Console(file=output), markdown=False)
         controller = SessionController(
-            source, input_mode="steer" if mode == "default-steer" else "queue"
+            source, input_mode="steer" if mode in {"default-steer", "recall-steer"} else "queue"
         )
 
         async def scenario():
             """Submit queued input before releasing the first model operation."""
-            working, queued, completed, interrupted = (asyncio.Event() for _ in range(4))
+            working, queued, completed, interrupted, recalled = (asyncio.Event() for _ in range(5))
             original_info, original_metrics = source.info, source.run_metrics
             metrics = []
 
@@ -283,12 +283,14 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
                     queued.set()
                 elif text.startswith("Interrupt requested"):
                     interrupted.set()
+                elif text == "Pending message moved to the editor.":
+                    recalled.set()
 
             def run_metrics(value):
                 """Observe the second durable run completion before requesting shutdown."""
                 original_metrics(value)
                 metrics.append(value)
-                if len(metrics) == (3 if mode == "steer" else 2):
+                if len(metrics) == (1 if mode == "recall-steer" else 3 if mode == "steer" else 2):
                     completed.set()
 
             def get_response(**kwargs):
@@ -329,16 +331,24 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
                 pipe.send_text("first\n")
                 await working.wait()
                 pipe.send_text(
-                    "second\n" if mode in {"default-queue", "default-steer"} else "/queue second\n"
+                    "second\n"
+                    if mode in {"default-queue", "default-steer", "recall-steer"}
+                    else "/queue second\n"
                 )
                 await asyncio.wait_for(queued.wait(), timeout=5)
                 assert len(requests) == 1
                 if mode in {"interrupt", "steer"}:
                     pipe.send_text("/steer correction\n" if mode == "steer" else "/interrupt\n")
                     await interrupted.wait()
+                if mode == "recall-steer":
+                    pipe.send_text("/recall\n")
+                    await recalled.wait()
                 release.set()
                 await completed.wait()
-                pipe.send_text("/exit\n")
+                if mode == "recall-steer":
+                    controller.stop()
+                else:
+                    pipe.send_text("/exit\n")
                 await task
                 return loop
             finally:
@@ -348,7 +358,12 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
 
         loop = asyncio.run(scenario())
 
-    if mode in {"queue", "default-queue", "default-steer"}:
+    if mode == "recall-steer":
+        expected = ["first", "answer 1"]
+        assert [
+            event.stop_reason for event in loop.session.events if event.type == "run_completed"
+        ] == ["completed"]
+    elif mode in {"queue", "default-queue", "default-steer"}:
         expected = ["first", "answer 1", "second", "answer 2"]
     elif mode == "interrupt":
         expected = ["first", "second", "answer 2"]
@@ -358,7 +373,7 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
     assert loop.session.recovery_state() is None
     assert loop.session.pending_inputs == ()
     assert "Queued input" in output.getvalue() or "Steering accepted" in output.getvalue()
-    assert "answer 2" in output.getvalue()
+    assert ("answer 1" if mode == "recall-steer" else "answer 2") in output.getvalue()
     assert controller.running is False
 
 

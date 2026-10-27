@@ -97,7 +97,7 @@ Reset behavior depends on the scope. At workspace scope, reset removes the overr
 
 Session settings apply only to the current Loop process and take precedence over environment and file values. A file value remains saved when an environment variable overrides it, so the saved value applies again when the variable is absent. Backend and supported interactive-loop settings apply immediately. Logging, telemetry, and agent identity changes require a restart. API-key input and configuration output are masked.
 
-While an agent run is active, `conversation.input_mode = "queue"` admits plain text as a follow-up that runs after the current operation settles. Set it to `"steer"` to admit plain text at steering priority and request the existing controlled interruption. Explicit `/queue` and `/steer` commands override this setting.
+While an agent run is active, `conversation.input_mode = "queue"` admits plain text as a follow-up that runs after the current operation settles. Set it to `"steer"` to admit plain text at steering priority and stop the run at its next safe boundary. Explicit `/queue` and `/steer` commands override this setting.
 
 ## Configure the backend from Python
 

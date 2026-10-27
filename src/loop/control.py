@@ -34,7 +34,8 @@ class RunControl:
     for later recovery. Cancellation-aware process supervisors receive a thread-safe event; other
     synchronous tools still finish under their existing deadlines. Steering is a separate
     safe-boundary signal: generation and the current tool finish, while later work in the same
-    response is skipped.
+    response is skipped. Once the runner commits to steering, withdrawing the requesting input
+    cannot reverse that decision.
     """
 
     _wake: Event
@@ -43,7 +44,8 @@ class RunControl:
     _lock: Lock
     _stopped: bool
     _state: RunControlState
-    _steering_pending: bool
+    _steering_requests: set[int | None]
+    _steering_committed: bool
     _cancelled: bool
     _async_loop: asyncio.AbstractEventLoop | None
     _async_task: asyncio.Task[Any] | None
@@ -59,7 +61,8 @@ class RunControl:
         self._lock = Lock()
         self._stopped = False
         self._state = RunControlState.IDLE
-        self._steering_pending = False
+        self._steering_requests = set()
+        self._steering_committed = False
         self._cancelled = False
         self._async_loop = None
         self._async_task = None
@@ -119,13 +122,13 @@ class RunControl:
 
     @property
     def steering_pending(self) -> bool:
-        """Return whether accepted steering awaits the next safe execution boundary.
+        """Return whether steering is requested or committed for the current run.
 
         Returns:
-            bool: Whether an accepted steering message should stop further work in this run.
+            bool: Whether steering should stop further work in this run.
         """
         with self._lock:
-            return self._steering_pending
+            return bool(self._steering_requests) or self._steering_committed
 
     @property
     def cancelling(self) -> bool:
@@ -247,12 +250,14 @@ class RunControl:
             self._wake_checkpoint_waiters()
         return True
 
-    def request_steering(self, admit: Callable[[], bool]) -> bool:
+    def request_steering(self, admit: Callable[[], bool], *, key: int | None = None) -> bool:
         """Atomically admit steering while an active run publishes its safe-boundary signal.
 
         Args:
             admit (Callable[[], bool]): Nonblocking mailbox admission callback. It must not
                 perform UI interaction or wait for another task.
+            key (int | None): Identity of the admitted input, or ``None`` for an unattributed
+                request. Defaults to ``None``.
 
         Returns:
             bool: Whether the active run admitted the message and recorded the signal.
@@ -260,8 +265,27 @@ class RunControl:
         with self._lock:
             if self._state == RunControlState.IDLE or self._stopped or not admit():
                 return False
-            self._steering_pending = True
+            self._steering_requests.add(key)
             return True
+
+    def withdraw_steering(self, key: int | None) -> None:
+        """Withdraw one request without reversing a committed steering decision.
+
+        Args:
+            key (int | None): Identity supplied when the steering request was admitted.
+        """
+        with self._lock:
+            self._steering_requests.discard(key)
+
+    def commit_steering(self) -> bool:
+        """Commit to an accepted steering request at a safe execution boundary.
+
+        Returns:
+            bool: Whether steering has been committed for this execution scope.
+        """
+        with self._lock:
+            self._steering_committed = bool(self._steering_requests) or self._steering_committed
+            return self._steering_committed
 
     @contextmanager
     def execution(self, *, async_owner: bool = False) -> Generator[None]:
@@ -299,7 +323,8 @@ class RunControl:
             with self._lock:
                 self._cancelled = self._stopped or self._state == RunControlState.INTERRUPTED
                 self._state = RunControlState.IDLE
-                self._steering_pending = False
+                self._steering_requests.clear()
+                self._steering_committed = False
                 self._async_loop = None
                 self._async_task = None
                 if not self._stopped:

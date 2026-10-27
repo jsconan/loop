@@ -1625,8 +1625,8 @@ class AgentRunner:
                 raise RunInterrupted
 
     def _steering_pending(self) -> bool:
-        """Return whether an admitted steering message should stop new work in this run."""
-        return self._run_control is not None and self._run_control.steering_pending is True
+        """Commit to steering before stopping work at a safe boundary."""
+        return self._run_control is not None and self._run_control.commit_steering() is True
 
     def _report_backend_error(self, error: BackendError) -> None:
         """Display a normalized backend failure and useful diagnostic identifiers."""

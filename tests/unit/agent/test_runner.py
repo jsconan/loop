@@ -2144,6 +2144,111 @@ def test_sync_steering_finishes_current_work_and_resolves_unstarted_calls(during
     assert control.steering_pending is False
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_withdrawal_after_steering_boundary_settles_remaining_tools(async_mode):
+    """A recalled request cannot reverse a decision to skip the remaining tool batch."""
+    control = RunControl()
+    first = ToolCall(call_id="first", name="effect", arguments="{}")
+    second = ToolCall(call_id="second", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(first, second), items=(first, second))
+    runner, sessions, _ = agent_runner(run_control=control)
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=second, status="not_started"),),
+    )
+
+    def execute(*_args, **_kwargs):
+        """Finish the first tool and request steering before the next one."""
+        assert control.request_steering(lambda: True, key=1)
+        return '{"ok": true}', 0.1
+
+    async def execute_async(*args, **kwargs):
+        """Finish the first tool through the native asynchronous boundary."""
+        return execute(*args, **kwargs)
+
+    if async_mode:
+        runner.query_async = AsyncMock(return_value=response)
+        runner.agent.tools.call_with_timing_async = AsyncMock(side_effect=execute_async)
+        handle = runner.handle_tool_calls_async
+
+        async def withdraw_after_batch(value):
+            """Withdraw the request after the runner has skipped the second tool."""
+            result = await handle(value)
+            control.withdraw_steering(1)
+            return result
+
+        runner.handle_tool_calls_async = withdraw_after_batch
+        result = asyncio.run(runner.run_async())
+        assert runner.agent.tools.call_with_timing_async.await_count == 1
+    else:
+        runner.query = Mock(return_value=response)
+        runner.agent.tools.call_with_timing = Mock(side_effect=execute)
+        handle = runner.handle_tool_calls
+
+        def withdraw_after_batch(value):
+            """Withdraw the request after the runner has skipped the second tool."""
+            result = handle(value)
+            control.withdraw_steering(1)
+            return result
+
+        runner.handle_tool_calls = withdraw_after_batch
+        result = runner.run()
+        assert runner.agent.tools.call_with_timing.call_count == 1
+
+    assert result.stop_reason == "steered"
+    assert len(result.metrics.tools) == 1
+    calls = sessions.add_tool_call.call_args_list
+    assert [call.kwargs["call_id"] for call in calls] == ["first", "second"]
+    assert "cancelled before execution" in calls[1].kwargs["output"]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_withdrawal_after_steering_checkpoint_keeps_its_stop_reason(async_mode):
+    """A committed checkpoint remains steered when its input is immediately withdrawn."""
+    control = RunControl()
+    call = ToolCall(call_id="old", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    runner, sessions, _ = agent_runner(run_control=control)
+    sessions.recovery_state = SessionRecoveryState(
+        action="execute_tools", pending_calls=(PendingToolCall(call=call, status="not_started"),)
+    )
+    commit = control.commit_steering
+
+    def commit_then_withdraw():
+        """Withdraw after the checkpoint commits but before it raises its interruption."""
+        result = commit()
+        if result:
+            control.withdraw_steering(1)
+        return result
+
+    control.commit_steering = commit_then_withdraw
+
+    def execute(*_args, **kwargs):
+        """Request steering after approval, then enter the tool execution guard."""
+        assert control.request_steering(lambda: True, key=1)
+        kwargs["execution_started"]()
+        pytest.fail("Steering must prevent the tool from starting")
+
+    async def execute_async(*_args, **kwargs):
+        """Enter the asynchronous guard after publishing the steering request."""
+        assert control.request_steering(lambda: True, key=1)
+        await kwargs["execution_started"]()
+        pytest.fail("Steering must prevent the tool from starting")
+
+    if async_mode:
+        runner.query_async = AsyncMock(return_value=response)
+        runner.agent.tools.call_with_timing_async = AsyncMock(side_effect=execute_async)
+        result = asyncio.run(runner.run_async())
+    else:
+        runner.query = Mock(return_value=response)
+        runner.agent.tools.call_with_timing = Mock(side_effect=execute)
+        result = runner.run()
+
+    assert result.stop_reason == "steered"
+    sessions.record_tool_execution_started.assert_not_called()
+    assert "cancelled before execution" in sessions.add_tool_call.call_args.kwargs["output"]
+
+
 def test_runner_run_async_resolves_recovery_before_querying():
     """A supplied recovery boundary settles its pending tool plan before the next query."""
     runner, _sessions, _interaction = agent_runner()
