@@ -241,6 +241,7 @@ async def chat(backend):
     controller.bind_session_manager(sessions)
     conversation.register_command_provider(ConversationCommands(controller))
     controller.bind_command_manager(conversation.command_manager)
+
     async def own_conversation(receive):
         await conversation.run_async(input_source=receive)
 

@@ -11,13 +11,12 @@ Run the test suite and linters:
 ```bash
 make test
 make test-integration
-uv run ruff check .
-uv run ruff format --check .
-git diff --check
-uv run pylint src
+make check
 ```
 
 `make test` runs the portable unit suite with 100% statement and branch coverage. Integration and end-to-end checks live separately under `tests/integration/` and skip unsupported platforms. `make test-all` runs both sets. See [test organization, execution and isolation](../tests/README.md).
+
+`make check` runs Ruff lint and formatting checks, checks diff whitespace, and runs Pylint on the source. Run `make format` to apply Ruff formatting.
 
 ## macOS native integration
 
