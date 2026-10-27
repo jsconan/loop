@@ -64,8 +64,8 @@ Define an observable success criterion. Include docstring completeness in the ch
 After changing code, run:
 
 ```shell
-uv --no-cache run ruff format tests
-uv --no-cache run ruff check tests
+uv --no-cache run ruff format src
+uv --no-cache run ruff check src
 git diff --check
 ```
 
