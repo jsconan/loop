@@ -16,6 +16,7 @@ from loop.constants import MAX_OUTPUT_CHARS
 from loop.execution import CommandExecutionService
 from loop.execution.coordinator import HostCommandRequest, LocalHostCommandExecutor
 from loop.execution.sandbox import CommandProcessResult, SandboxOutcome, UnavailableSandboxBackend
+from loop.execution.sandbox.linux import backend as linux
 from loop.execution.sandbox.macos import MacOSSeatbeltBackend
 from loop.instructions import InstructionsManager, RuntimeEnvironment
 from loop.permissions import (
@@ -1803,12 +1804,12 @@ def test_linux_integrity_failure_never_uses_host_offer_or_session_rule(
 ):
     """Initial and per-command integrity failures cannot prompt, offer or reuse host authority."""
     from loop.execution.sandbox import selection
-    from loop.execution.sandbox.linux import backend as linux
 
     record = tmp_path / "management.json"
     record.write_text("bound authority")
     native = linux.LinuxNativeBackend(record)
     monkeypatch.setattr(linux, "runtime_read_roots", lambda: ())
+    monkeypatch.setattr(linux.LinuxNativeBackend, "file_creation_mask", 0o022)
     monkeypatch.setattr(linux.LinuxNativeBackend, "managed_tool_root", lambda *_: False)
     validator = MagicMock()
     monkeypatch.setattr(linux, "execution_authority", validator)
@@ -1867,12 +1868,12 @@ def test_linux_public_timeout_retains_capture_or_reports_unknown_loss(
 ):
     """Public timeout streams retain authenticated text or honestly report unavailable capture."""
     from loop.execution.sandbox import SandboxRequest
-    from loop.execution.sandbox.linux import backend as linux
 
     record = tmp_path / "management.json"
     record.write_text("bound authority")
     monkeypatch.setattr(linux, "execution_authority", MagicMock())
     monkeypatch.setattr(linux, "runtime_read_roots", lambda: ())
+    monkeypatch.setattr(linux.LinuxNativeBackend, "file_creation_mask", 0o022)
     monkeypatch.setattr(linux.LinuxNativeBackend, "managed_tool_root", lambda *_: False)
 
     def exchange(_record, payload, _deadline):

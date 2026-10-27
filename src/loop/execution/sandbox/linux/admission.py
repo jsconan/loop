@@ -20,10 +20,10 @@ from ....constants import (
     NATIVE_ADMISSION_SOCKET_MODE,
     NATIVE_UNIT_PREFIX,
 )
-from ..constants import INITIAL_USER_NAMESPACE_UID_MAP
 from .constants import (
     CGROUP_PROCS_FILENAME,
     CGROUP_ROOT,
+    INITIAL_USER_NAMESPACE_UID_MAP,
     NATIVE_CANCEL_FRAME,
     NATIVE_REQUEST_MAGIC,
     PEER_CREDENTIALS_FORMAT,
@@ -114,7 +114,8 @@ class GenerationAdmission:
             + SYSTEMD_SLICE_UNIT_SUFFIX: "[Unit]\nDescription=Loop protected generation\n[Slice]\n",
             prefix + SYSTEMD_SOCKET_UNIT_SUFFIX: (
                 "[Unit]\nDescription=Loop ordinary command admission\n[Socket]\n"
-                f"ListenStream={SYSTEM_RUNTIME_DIRECTORY}/{prefix}{SYSTEMD_SOCKET_UNIT_SUFFIX}\nAccept=yes\n"
+                f"ListenStream={SYSTEM_RUNTIME_DIRECTORY}/{prefix}{SYSTEMD_SOCKET_UNIT_SUFFIX}\n"
+                "Accept=yes\n"
                 f"SocketUser={self.uid}\nSocketGroup={self.gid}\n"
                 f"SocketMode={NATIVE_ADMISSION_SOCKET_MODE:04o}\n"
                 f"Backlog={_SOCKET_BACKLOG}\n"
@@ -328,7 +329,9 @@ def receive_request(
         files,
         {
             prefix + SYSTEMD_SOCKET_UNIT_SUFFIX: {
-                "Listen": f"{SYSTEM_RUNTIME_DIRECTORY}/{prefix}{SYSTEMD_SOCKET_UNIT_SUFFIX} (Stream)",
+                "Listen": (
+                    f"{SYSTEM_RUNTIME_DIRECTORY}/{prefix}{SYSTEMD_SOCKET_UNIT_SUFFIX} (Stream)"
+                ),
                 "Accept": "yes",
             },
             service: {

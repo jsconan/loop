@@ -1,10 +1,6 @@
 """Define shared command sandbox names and defaults."""
 
-from pathlib import Path
-
 COMMAND_SANDBOX_SCRATCH_PREFIX = "loop-sandbox-"
-INITIAL_USER_NAMESPACE_UID_MAP = ("0", "0", "4294967295")
-INITIAL_USER_NAMESPACE_UID_MAP_PATH = Path("/proc/self/uid_map")
 
 LANG_ENVIRONMENT_VARIABLE = "LANG"
 LC_ALL_ENVIRONMENT_VARIABLE = "LC_ALL"

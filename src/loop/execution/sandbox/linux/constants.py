@@ -3,8 +3,7 @@
 import struct
 from pathlib import Path
 
-from ..constants import INITIAL_USER_NAMESPACE_UID_MAP_PATH
-
+INITIAL_USER_NAMESPACE_UID_MAP = ("0", "0", "4294967295")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 CGROUP_PROCS_FILENAME = "cgroup.procs"
 CACHE_LOCK_FILENAME = "cache.lock"
@@ -22,7 +21,7 @@ PAYLOAD_FILENAME = "loop_payload.py"
 PEER_CREDENTIALS_FORMAT = "3i"
 PEER_CREDENTIALS_SIZE = struct.calcsize(PEER_CREDENTIALS_FORMAT)
 PROC_STATUS_PATH = Path("/proc/self/status")
-PROC_UID_MAP_PATH = INITIAL_USER_NAMESPACE_UID_MAP_PATH
+PROC_UID_MAP_PATH = Path("/proc/self/uid_map")
 RECEIPT_FILENAME = "receipt.json"
 RECEIVER_FILENAME = "loop_receiver.py"
 REQUEST_LENGTH_FORMAT = "!I"

@@ -76,6 +76,15 @@ class UnavailableSandboxBackend:
         self._reason = reason
 
     @property
+    def trusted_file_owner_ids(self) -> tuple[int, ...]:
+        """Return file owners trusted for automatic executable binding.
+
+        Returns:
+            tuple[int, ...]: Current user and any verified host administrator identity.
+        """
+        return (os.getuid(),)
+
+    @property
     def system_read_roots(self) -> tuple[Path, ...]:
         """Return no default reads while native execution is unavailable.
 

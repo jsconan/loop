@@ -21,6 +21,7 @@ def test_unsupported_host_fails_closed_without_instantiating_seatbelt(monkeypatc
     assert backend.system_read_roots == ()
     assert backend.policy_version == "unavailable-native-v1"
     assert backend.scratch_prefix == "loop-sandbox-"
+    assert backend.trusted_file_owner_ids == (os.getuid(),)
     assert backend.automatic_tool_read_roots(Path("/work"), (), ()) == ()
     assert not backend.managed_tool_root(Mock())
     assert backend.installed_tool_roots(Path("/outside/bin/tool")) == (

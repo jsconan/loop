@@ -104,6 +104,18 @@ class LinuxNativeBackend:
         return tuple(sorted(roots, key=lambda pair: len(pair[0]), reverse=True))
 
     @property
+    def trusted_file_owner_ids(self) -> tuple[int, ...]:
+        """Return file owners trusted for automatic executable binding.
+
+        Returns:
+            tuple[int, ...]: Current user and any verified host administrator identity.
+        """
+        uid = os.getuid()
+        if not in_initial_host_user_namespace():
+            return (uid,)
+        return tuple(dict.fromkeys((0, uid)))
+
+    @property
     def system_read_roots(self) -> tuple[Path, ...]:
         """Return protected native runtime directories without an architecture allowlist.
 

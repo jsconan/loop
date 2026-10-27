@@ -196,10 +196,8 @@ def test_automatic_executable_identities_bind_one_live_path_file(tmp_path):
     assert identities == (("uv", executable, executable, details.st_dev, details.st_ino),)
 
 
-def test_automatic_executable_identity_does_not_mistake_mapped_uid_for_host_root(
-    tmp_path, monkeypatch
-):
-    """A user-namespace UID zero file is not administrator-owned host authority."""
+def test_automatic_executable_identities_enforce_backend_owner_authority(tmp_path):
+    """An executable owned outside the backend's trusted IDs cannot gain automatic access."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     tools = tmp_path / "tools"
@@ -207,55 +205,13 @@ def test_automatic_executable_identity_does_not_mistake_mapped_uid_for_host_root
     executable = tools / "tool"
     executable.write_text("tool", encoding="utf-8")
     executable.chmod(0o755)
-    original_read_text = Path.read_text
-    monkeypatch.setattr(execution_facade, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(
-        Path,
-        "read_text",
-        lambda path, *args, **kwargs: (
-            "0 1000 1\n"
-            if path == Path("/proc/self/uid_map")
-            else original_read_text(path, *args, **kwargs)
-        ),
+    assert (
+        _automatic_executable_identities(("tool",), str(tools), workspace, trusted_owners=(-1,))
+        == ()
     )
-    monkeypatch.setattr(execution_facade.os, "getuid", lambda: -1)
-
-    assert _automatic_executable_identities(("tool",), str(tools), workspace) == ()
 
 
-@pytest.mark.parametrize(
-    ("mapping", "uid", "expected"),
-    [
-        ("0 0 4294967295\n", 1000, (0, 1000)),
-        ("0 1000 1\n", 1000, (1000,)),
-        (OSError("missing proc status"), 1000, (1000,)),
-    ],
-)
-def test_trusted_file_owners_follow_live_user_namespace_mapping(
-    monkeypatch, mapping, uid, expected
-):
-    """Only an initial namespace can treat file owner zero as host administrator."""
-    original_read_text = Path.read_text
-    monkeypatch.setattr(execution_facade, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(execution_facade.os, "getuid", lambda: uid)
-
-    def read_text(path, *args, **kwargs):
-        """Provide the chosen live mapping while leaving all other path reads untouched."""
-        if path == Path("/proc/self/uid_map"):
-            if isinstance(mapping, OSError):
-                raise mapping
-            return mapping
-        return original_read_text(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_text", read_text)
-
-    assert execution_facade._trusted_file_owner_ids() == expected
-
-
-@pytest.mark.parametrize("platform", ["linux", "darwin"])
-def test_run_command_binds_an_unmanaged_path_tool_as_one_exact_file(
-    tmp_path, monkeypatch, platform
-):
+def test_run_command_binds_an_unmanaged_path_tool_as_one_exact_file(tmp_path, monkeypatch):
     """Each platform binds exact tool access without inferring directory reads or a custom mask."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -266,7 +222,6 @@ def test_run_command_binds_an_unmanaged_path_tool_as_one_exact_file(
     executable.chmod(0o755)
     details = executable.stat()
     monkeypatch.setenv("PATH", str(tools))
-    monkeypatch.setattr(execution_facade, "sys", SimpleNamespace(platform=platform))
     backend = Mock()
     backend.system_read_roots = ()
     backend.installed_tool_roots.side_effect = lambda path: ((path.parent,), ())
@@ -338,7 +293,6 @@ def test_run_command_automatically_binds_the_workspace_venv_python_runtime(tmp_p
     )
     monkeypatch.setattr("loop.execution.sandbox.linux.backend.runtime_read_roots", lambda: ())
     backend = LinuxNativeBackend(tmp_path / "management.json")
-    monkeypatch.setattr(execution_facade, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(type(backend), "file_creation_mask", 0o077)
     backend.capability_failure = Mock(return_value=None)
     backend.run = Mock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0))

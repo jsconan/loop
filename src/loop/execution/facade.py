@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -31,8 +30,6 @@ from .sandbox import (
     select_sandbox_backend,
 )
 from .sandbox.constants import (
-    INITIAL_USER_NAMESPACE_UID_MAP,
-    INITIAL_USER_NAMESPACE_UID_MAP_PATH,
     LANG_ENVIRONMENT_VARIABLE,
     MINIMAL_SYSTEM_PATH,
     PATH_ENVIRONMENT_VARIABLE,
@@ -43,19 +40,6 @@ from .sandbox.constants import (
 
 if TYPE_CHECKING:
     from ..tooling import ToolContext
-
-
-def _trusted_file_owner_ids() -> tuple[int, ...]:
-    """Return current-user and host-root IDs that retain their host meaning."""
-    current_uid = os.getuid()
-    if sys.platform == "linux":
-        try:
-            mapping = tuple(INITIAL_USER_NAMESPACE_UID_MAP_PATH.read_text(encoding="ascii").split())
-        except OSError:
-            return (current_uid,)
-        if mapping != INITIAL_USER_NAMESPACE_UID_MAP:
-            return (current_uid,)
-    return tuple(dict.fromkeys((0, current_uid)))
 
 
 @dataclass(frozen=True)
@@ -119,11 +103,16 @@ def _stream_output(
 
 
 def _automatic_executable_identities(
-    names: tuple[str, ...], path_value: str, cwd: Path
+    names: tuple[str, ...],
+    path_value: str,
+    cwd: Path,
+    *,
+    trusted_owners: tuple[int, ...] | None = None,
 ) -> tuple[tuple[str, Path, Path, int, int], ...]:
     """Bind safe exact executable files found in the request's live PATH roots."""
     roots = path_search_roots({PATH_ENVIRONMENT_VARIABLE: path_value}, cwd)
-    trusted_owners = _trusted_file_owner_ids()
+    if trusted_owners is None:
+        trusted_owners = (os.getuid(),)
     identities = []
     for name in dict.fromkeys(names[:128]):
         if "/" in name:
@@ -717,6 +706,9 @@ class CommandExecutionService:
                     for alias in self._executable_grants[reference].opt_aliases
                 )
             )
+            trusted_owners = getattr(self._backend, "trusted_file_owner_ids", None)
+            if not isinstance(trusted_owners, tuple):
+                trusted_owners = (os.getuid(),)
             executable_identities = tuple(
                 dict.fromkeys(
                     (
@@ -730,7 +722,10 @@ class CommandExecutionService:
                             for reference in dict.fromkeys(references)
                         ),
                         *_automatic_executable_identities(
-                            analysis.executables, path_value, command_cwd
+                            analysis.executables,
+                            path_value,
+                            command_cwd,
+                            trusted_owners=trusted_owners,
                         ),
                     )
                 )
@@ -856,10 +851,9 @@ class CommandExecutionService:
                 return paths.redact(value)
 
             file_creation_mask = constants.GROUP_AND_OTHER_WRITE_MODE_MASK
-            if sys.platform == "linux":
-                current_mask = getattr(self._backend, "file_creation_mask", None)
-                if isinstance(current_mask, int) and not isinstance(current_mask, bool):
-                    file_creation_mask = current_mask
+            current_mask = getattr(self._backend, "file_creation_mask", None)
+            if isinstance(current_mask, int) and not isinstance(current_mask, bool):
+                file_creation_mask = current_mask
 
             request = SandboxRequest.create(
                 source=command,

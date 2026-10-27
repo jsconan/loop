@@ -52,6 +52,16 @@ def test_backend_describes_namespace_output_paths_without_rewriting_results(back
     )
 
 
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.parametrize("uid", [0, 1000])
+def test_trusted_file_owners_require_initial_host_namespace(backend, monkeypatch, initial, uid):
+    """Mapped namespace root never gains host administrator authority."""
+    monkeypatch.setattr(linux.os, "getuid", lambda: uid)
+    monkeypatch.setattr(linux, "in_initial_host_user_namespace", lambda: initial)
+    expected = tuple(dict.fromkeys((0, uid))) if initial else (uid,)
+    assert backend.trusted_file_owner_ids == expected
+
+
 def test_backend_properties_and_safe_read_candidates(backend, monkeypatch):
     """Preserve root provenance and give external tools only narrow candidates."""
     monkeypatch.setattr(linux, "in_initial_host_user_namespace", lambda: True)

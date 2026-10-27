@@ -825,6 +825,15 @@ class MacOSSeatbeltBackend:
             self._diagnostics.close()
 
     @property
+    def trusted_file_owner_ids(self) -> tuple[int, ...]:
+        """Return file owners trusted for automatic executable binding.
+
+        Returns:
+            tuple[int, ...]: Current user and any verified host administrator identity.
+        """
+        return tuple(dict.fromkeys((0, os.getuid())))
+
+    @property
     def system_read_roots(self) -> tuple[Path, ...]:
         """Return the reviewed system roots readable without an extra tool grant.
 

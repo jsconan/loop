@@ -939,6 +939,14 @@ class SandboxBackend(Protocol):
         """
 
     @property
+    def trusted_file_owner_ids(self) -> tuple[int, ...]:
+        """Return file owners trusted for automatic executable binding.
+
+        Returns:
+            tuple[int, ...]: Platform-verified owner IDs in the caller's current namespace.
+        """
+
+    @property
     def system_read_roots(self) -> tuple[Path, ...]:
         """Return reviewed system roots that require no extra read approval.
 

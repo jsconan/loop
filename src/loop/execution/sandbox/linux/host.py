@@ -21,13 +21,13 @@ from ....constants import MAX_NATIVE_RECEIPT_BYTES, NATIVE_FILE_READ_CHUNK_BYTES
 from ....utils.json import load_unique_json
 from ....utils.process import ProcessCaptureStatus, supervise_process
 from ..constants import (
-    INITIAL_USER_NAMESPACE_UID_MAP,
     LC_ALL_ENVIRONMENT_VARIABLE,
     PATH_ENVIRONMENT_VARIABLE,
     SYSTEM_LOCALE,
 )
 from .constants import (
     COMPILER_LOCK_FILENAME,
+    INITIAL_USER_NAMESPACE_UID_MAP,
     MANAGEMENT_LOCK_FILENAME,
     PROC_UID_MAP_PATH,
     SYSTEM_COMMAND_PATH,

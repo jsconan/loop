@@ -21,11 +21,11 @@ from ....constants import (
     NATIVE_MANAGEMENT_TIMEOUT_SECONDS,
     NATIVE_UNIT_PREFIX,
 )
-from ..constants import INITIAL_USER_NAMESPACE_UID_MAP
 from .admission import GenerationAdmission
 from .catalog import runtime_catalog
 from .constants import (
     COMPILER_LOCK_FILENAME,
+    INITIAL_USER_NAMESPACE_UID_MAP,
     MANAGEMENT_LOCK_FILENAME,
     MANAGEMENT_RECORD_NAME,
     NATIVE_RESERVATIONS_DIRECTORY_NAME,
