@@ -7,13 +7,13 @@ import stat
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from .. import constants
 from ..errors import Problem, ProblemException, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, FileKind, FileManifestEntry, FileTarget, Operation, OperationPlan
-from ..tooling import ToolContext, tool
+from ..tooling import ToolContext, normalize_optional_null, tool
 from ..utils import (
     TextSearchCase,
     VirtualPath,
@@ -642,19 +642,37 @@ def read_text_file(
         ),
     ],
     start_line: Annotated[
-        int,
-        Field(description="One-based starting line.", ge=1),
+        int | None,
+        Field(
+            description="One-based starting line. When continuing by byte offset, use JSON "
+            "null (unquoted).",
+            ge=1,
+        ),
+        BeforeValidator(normalize_optional_null),
     ] = 1,
+    start_byte: Annotated[
+        int | None,
+        Field(
+            description="Byte offset from next_start_byte when a line is split. "
+            "For line-based reads, use JSON null (unquoted).",
+            ge=0,
+        ),
+        BeforeValidator(normalize_optional_null),
+    ] = None,
     max_lines: Annotated[
         int | None,
         Field(
-            description="Optional line ceiling; the first reached line or byte limit wins.", ge=1
+            description="Line ceiling; the first reached line or byte limit wins. "
+            "For no line ceiling, use JSON null (unquoted).",
+            ge=1,
         ),
+        BeforeValidator(normalize_optional_null),
     ] = None,
     max_bytes: Annotated[
         int,
         Field(
-            description="Maximum UTF-8 bytes returned, capped by the application hard limit.",
+            description="Requested UTF-8 byte limit; the first character or line may increase it "
+            "up to the application ceiling.",
             ge=1,
             le=constants.MAX_TOOL_CONTENT_BYTES,
         ),
@@ -667,7 +685,8 @@ def read_text_file(
             path=path,
             **read_bounded_text(
                 file_path,
-                start_line=start_line,
+                start_byte=start_byte,
+                start_line=None if start_byte is not None and start_line == 1 else start_line,
                 max_lines=max_lines,
                 max_bytes=max_bytes,
                 preserve_line_boundaries=True,
@@ -734,7 +753,12 @@ def search_text(
     ] = "smart",
     include: Annotated[
         list[str] | None,
-        Field(description="Optional inclusive Git-style file globs.", max_length=20),
+        Field(
+            description="Inclusive Git-style file globs. "
+            "Use JSON null (unquoted) to search all visible files.",
+            max_length=20,
+        ),
+        BeforeValidator(normalize_optional_null),
     ] = None,
     context_lines: Annotated[
         int,

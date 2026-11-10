@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from .. import constants
 from .hashing import sha256_digest
+from .json import load_unique_json
 from .models import BoundedTextContent, CachedContentMetadata
 
 _CACHE = TemporaryDirectory(prefix=constants.TEMPORARY_CONTENT_DIRECTORY_PREFIX)
@@ -296,20 +297,238 @@ def cached_metadata(handle: str) -> CachedContentMetadata | None:
         return _METADATA.get(handle)
 
 
+def _bound_file_result(output: str, source: str) -> tuple[str, str] | None:
+    """Retain a verified file page and cache its original serialized result when oversized."""
+    try:
+        payload = load_unique_json(output, duplicate_message="Duplicate tool-result field.")
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is not True or "handle" in payload:
+        return None
+    result, receipts = payload.get("result"), payload.get("read_versions")
+    if not isinstance(result, dict) or not isinstance(receipts, dict):
+        return None
+    path, version, content = result.get("path"), result.get("version"), result.get("content")
+    start, end, size = result.get("start_byte"), result.get("end_byte"), result.get("size_bytes")
+    if (
+        not isinstance(path, str)
+        or not isinstance(version, str)
+        or receipts.get(path) != version
+        or not isinstance(content, str)
+        or not content
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) for value in (start, end, size)
+        )
+        or start < 0
+        or end > size
+    ):
+        return None
+    try:
+        content_bytes = content.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if end != start + len(content_bytes):
+        return None
+    start_line = result.get("start_line")
+    if start_line is not None and (
+        not isinstance(start_line, int) or isinstance(start_line, bool) or start_line < 1
+    ):
+        return None
+    handle = uuid4().hex
+    bounded = {
+        **payload,
+        "handle": handle,
+        "cached_snapshot_format": "serialized_tool_result",
+        "result": dict(result),
+    }
+    page = bounded["result"]
+    page.pop("next_start_line", None)
+    page["truncated"] = True
+    page["truncation_reason"] = "result_limit"
+    low, high, best = 1, len(content), None
+    while low <= high:
+        middle = (low + high) // 2
+        text = content[:middle]
+        included = len(text.encode("utf-8"))
+        page.update(
+            content=text,
+            included_bytes=included,
+            end_byte=start + included,
+            next_start_byte=start + included,
+        )
+        if "requested_max_bytes" in page:
+            page["effective_max_bytes"] = included
+        if isinstance(page.get("start_line"), int):
+            page["end_line"] = page["start_line"] + text.count("\n") - int(text.endswith("\n"))
+        try:
+            candidate = json.dumps(bounded, ensure_ascii=False)
+            candidate_size = len(candidate.encode("utf-8"))
+        except (UnicodeEncodeError, RecursionError):
+            return None
+        if candidate_size <= constants.MAX_TOOL_RESULT_BYTES:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    if best is None:
+        return None
+    store_content(output, source, handle=handle)
+    return best, handle
+
+
+def _bound_command_result(output: str, source: str) -> tuple[str, str] | None:
+    """Keep command status and stream continuations when serialized previews exceed the limit."""
+    try:
+        payload = load_unique_json(output, duplicate_message="Duplicate tool-result field.")
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict) or "handle" in payload:
+        return None
+    if payload.get("ok") is True and isinstance(payload.get("result"), dict):
+        body = payload["result"]
+        bounded = {**payload, "result": dict(body)}
+        target = bounded["result"]
+    elif payload.get("ok") is False and isinstance(payload.get("problem"), dict):
+        problem = payload["problem"]
+        if not isinstance(problem.get("metadata"), dict):
+            return None
+        body = problem["metadata"]
+        bounded = {**payload, "problem": {**problem, "metadata": dict(body)}}
+        target = bounded["problem"]["metadata"]
+    else:
+        return None
+    exit_code = body.get("exit_code")
+    if (
+        body.get("boundary") not in ("sandbox", "host")
+        or "exit_code" not in body
+        or (
+            exit_code is not None
+            and (not isinstance(exit_code, int) or isinstance(exit_code, bool))
+        )
+    ):
+        return None
+    streams = {}
+    for name in ("stdout", "stderr"):
+        item = body.get(name)
+        if not isinstance(item, dict) or not isinstance(item.get("content"), str):
+            return None
+        try:
+            data = item["content"].encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        captured, included = item.get("captured_bytes"), item.get("included_bytes")
+        discarded = item.get("discarded_characters")
+        if (
+            not isinstance(captured, int)
+            or isinstance(captured, bool)
+            or not isinstance(included, int)
+            or isinstance(included, bool)
+            or included != len(data)
+            or captured < included
+            or not isinstance(item.get("truncated"), bool)
+            or not isinstance(item.get("capture_complete"), bool)
+            or "discarded_characters" not in item
+            or (
+                discarded is not None
+                and (not isinstance(discarded, int) or isinstance(discarded, bool) or discarded < 0)
+            )
+            or item["capture_complete"] != (discarded == 0)
+            or item["truncated"] != (included < captured or discarded != 0)
+            or item.get("decoding_loss") not in ("none", "unknown")
+        ):
+            return None
+        previous = item.get("handle")
+        if previous is None:
+            if captured != included:
+                return None
+        else:
+            if not isinstance(previous, str):
+                return None
+            try:
+                validate_content_handle(previous)
+                cached = cached_path(previous)
+                if cached is None or cached[0].stat().st_size != captured:
+                    return None
+                with cached[0].open("rb") as stream:
+                    if stream.read(included) != data:
+                        return None
+                if decode_content_cursor(item.get("next_cursor"), previous) != included:
+                    return None
+            except (OSError, TypeError, ValueError):
+                return None
+        streams[name] = (item["content"], data, previous)
+        target[name] = dict(item)
+
+    snapshot = uuid4().hex
+    bounded["handle"] = snapshot
+    bounded["cached_snapshot_format"] = "serialized_tool_result"
+    pending = []
+    for name in sorted(
+        streams,
+        key=lambda key: len(json.dumps(streams[key][0], ensure_ascii=False).encode("utf-8")),
+        reverse=True,
+    ):
+        text, data, previous = streams[name]
+        if not text:
+            continue
+        handle = previous or uuid4().hex
+        page = target[name]
+        page.update(
+            handle=handle,
+            truncated=True,
+            continuation=page.get(
+                "continuation", "Continue this stream using its handle and cursor."
+            ),
+        )
+        if previous is None:
+            pending.append((handle, data, name))
+        low, high, best = 0, len(text) - 1, None
+        while low <= high:
+            middle = (low + high) // 2
+            prefix = text[:middle]
+            included = len(prefix.encode("utf-8"))
+            page.update(
+                content=prefix,
+                included_bytes=included,
+                next_cursor=encode_content_cursor(handle, included),
+            )
+            try:
+                candidate = json.dumps(bounded, ensure_ascii=False)
+                candidate_size = len(candidate.encode("utf-8"))
+            except (UnicodeEncodeError, RecursionError):
+                return None
+            if candidate_size <= constants.MAX_TOOL_RESULT_BYTES:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best is not None:
+            for content_handle, content, stream_name in pending:
+                store_content(content, f"{source} {stream_name}", handle=content_handle)
+            store_content(output, source, handle=snapshot)
+            return best, snapshot
+        page.update(content="", included_bytes=0, next_cursor=encode_content_cursor(handle, 0))
+    return None
+
+
 def bound_tool_result(output: str, source: str) -> tuple[str, str | None]:
-    """Replace an oversized serialized tool result with a bounded preview and cache handle.
+    """Bound a serialized result while preserving file and command continuations.
 
     Args:
         output (str): Complete serialized tool result.
         source (str): Human-readable origin for the cached content.
 
     Returns:
-        tuple[str, str | None]: Bounded result and its handle, or the unchanged result and
-            ``None`` when it already fits.
+        tuple[str, str | None]: Bounded result and its original-output cache handle, or the
+            unchanged result and ``None`` when it already fits.
     """
     encoded = output.encode("utf-8")
     if len(encoded) <= constants.MAX_TOOL_RESULT_BYTES:
         return output, None
+    if file_result := _bound_file_result(output, source):
+        return file_result
+    if command_result := _bound_command_result(output, source):
+        return command_result
     handle = store_content(encoded, source)
     preview_bytes = min(constants.MAX_TOOL_CONTENT_BYTES // 2, len(encoded))
     while True:
@@ -396,18 +615,22 @@ def read_bounded_text(
         max_lines (int | None): Optional maximum lines returned from either starting mode.
             Defaults to no line limit. When both ceilings are set, the first reached stops reading.
         max_bytes (int): Requested encoded byte ceiling, capped by the application hard limit.
-        preserve_line_boundaries (bool): Whether line-oriented reads stop before consuming a
-            partial line. Defaults to ``False`` for byte-resumable consumers.
+            If the first character cannot fit, the reader includes that one character instead.
+        preserve_line_boundaries (bool): Whether line-oriented reads prefer whole lines. The
+            requested byte ceiling expands as needed for the first line, up to the hard limit;
+            larger lines return a byte-resumable fragment. Defaults to ``False``.
         include_version (bool): Whether to hash the complete source through the read descriptor
             and reject changes during capture. Defaults to ``False``.
 
     Returns:
         BoundedTextContent: Text, exact byte range, continuation metadata, and the complete source
-            digest when ``include_version`` is enabled.
+            digest when ``include_version`` is enabled. When the first character or line
+            exceeds the requested ceiling, requested and effective limits identify the adjustment.
 
     Raises:
-        ValueError: If ranges are invalid, both starting modes are selected, the offset splits a
-            UTF-8 character, selected content is not UTF-8 text, or a versioned source changes.
+        ValueError: If ranges are invalid, both starting modes are selected, the offset is beyond
+            the source or splits a UTF-8 character, selected content is not UTF-8 text, or a
+            versioned source changes.
     """
     start_byte, start_line = _validate_boundaries(start_byte, start_line, max_lines, max_bytes)
 
@@ -417,6 +640,8 @@ def read_bounded_text(
         before = os.fstat(stream.fileno()) if include_version else None
         if before is not None:
             size = before.st_size
+        if start_byte is not None and start_byte > size:
+            raise ValueError("start_byte is beyond the end of the content.")
         probe = stream.read(min(size, _SCAN_CHUNK_BYTES))
         if b"\0" in probe:
             raise ValueError("Content appears to be binary.")
@@ -433,7 +658,8 @@ def read_bounded_text(
         remaining = max_bytes
         lines_read = 0
         stopped_by_lines = False
-        line_too_long = False
+        split_line = False
+        adjusted_limit = None
         while remaining:
             if max_lines is not None and lines_read >= max_lines:
                 stopped_by_lines = True
@@ -443,8 +669,19 @@ def read_bounded_text(
                 break
             if len(chunk) > remaining:
                 if start_line is not None and preserve_line_boundaries:
-                    stream.seek(-len(chunk), 1)
-                    line_too_long = not chunks
+                    if chunks:
+                        stream.seek(-len(chunk), 1)
+                        break
+                    stream.seek(start)
+                    chunk = stream.readline(constants.MAX_TOOL_CONTENT_BYTES + 1)
+                    split_line = len(chunk) > constants.MAX_TOOL_CONTENT_BYTES
+                    if split_line:
+                        stream.seek(-1, 1)
+                        chunk = chunk[:-1]
+                    chunks.append(chunk)
+                    adjusted_limit = len(chunk) if len(chunk) > max_bytes else None
+                    lines_read = 0 if split_line else 1
+                    stopped_by_lines = max_lines is not None and lines_read >= max_lines
                     break
                 stream.seek(-(len(chunk) - remaining), 1)
                 chunk = chunk[:remaining]
@@ -462,10 +699,28 @@ def read_bounded_text(
         except UnicodeDecodeError as exc:
             if exc.end != len(encoded) or exc.reason != "unexpected end of data":
                 raise ValueError("Selected range is not valid UTF-8 text.") from exc
-            omitted = len(encoded) - exc.start
-            encoded = encoded[: exc.start]  # pylint: disable=invalid-slice-index
-            end -= omitted
-            content = encoded.decode("utf-8")
+            if exc.start:
+                if end == size:
+                    raise ValueError("Selected range is not valid UTF-8 text.") from exc
+                omitted = len(encoded) - exc.start
+                encoded = encoded[: exc.start]  # pylint: disable=invalid-slice-index
+                end -= omitted
+                content = encoded.decode("utf-8")
+            else:
+                stream.seek(start)
+                decoder = getincrementaldecoder("utf-8")()
+                encoded, content = b"", ""
+                while not content:
+                    byte = stream.read(1)
+                    if not byte:
+                        raise ValueError("Selected range is not valid UTF-8 text.") from exc
+                    encoded += byte
+                    try:
+                        content = decoder.decode(byte)
+                    except UnicodeDecodeError as error:
+                        raise ValueError("Selected range is not valid UTF-8 text.") from error
+                end = start + len(encoded)
+                adjusted_limit = len(encoded)
         more = end < size
         if before is not None:
             stream.seek(0)
@@ -488,6 +743,9 @@ def read_bounded_text(
     )
     if version is not None:
         result["version"] = version
+    if adjusted_limit is not None:
+        result["requested_max_bytes"] = max_bytes
+        result["effective_max_bytes"] = adjusted_limit
     if start_line is not None:
         result["start_line"] = current_line
         if content:
@@ -496,11 +754,8 @@ def read_bounded_text(
         else:
             result["end_line"] = current_line - 1
     if more:
-        if line_too_long:
-            result["truncation_reason"] = "line_too_long"
-        else:
-            result["truncation_reason"] = "lines" if stopped_by_lines else "bytes"
+        result["truncation_reason"] = "lines" if stopped_by_lines else "bytes"
         result["next_start_byte"] = end
-        if start_line is not None and not line_too_long:
+        if start_line is not None and not split_line:
             result["next_start_line"] = current_line + lines_read
     return result

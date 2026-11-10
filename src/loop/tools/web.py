@@ -8,13 +8,13 @@ from urllib.parse import urlsplit
 
 import httpcore
 import httpx
-from pydantic import Field, HttpUrl, TypeAdapter
+from pydantic import BeforeValidator, Field, HttpUrl, TypeAdapter
 
 from .. import constants
 from ..errors import Problem, ProblemException, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, NetworkTarget, Operation, OperationPlan
-from ..tooling import ToolContext, tool
+from ..tooling import ToolContext, normalize_optional_null, tool
 from ..utils import (
     BoundedTextContent,
     cached_metadata,
@@ -274,22 +274,35 @@ def read_cached_content(
     ],
     cursor: Annotated[
         str | None,
-        Field(description="Opaque continuation cursor returned by a previous content result."),
+        Field(
+            description="Opaque continuation cursor returned by a previous content result; "
+            "use JSON null (unquoted) for line-based reads and set start_line to JSON null "
+            "when using a cursor."
+        ),
+        BeforeValidator(normalize_optional_null),
     ] = None,
     start_line: Annotated[
         int | None,
-        Field(description="Optional one-based starting line for deliberate random access.", ge=1),
+        Field(
+            description="One-based starting line for deliberate random access. "
+            "Use JSON null (unquoted) when using a cursor.",
+            ge=1,
+        ),
+        BeforeValidator(normalize_optional_null),
     ] = None,
     max_lines: Annotated[
         int | None,
         Field(
-            description="Optional line ceiling; the first reached line or byte limit wins.", ge=1
+            description="Line ceiling; the first reached line or byte limit wins. "
+            "Use JSON null (unquoted) for no line ceiling.",
+            ge=1,
         ),
+        BeforeValidator(normalize_optional_null),
     ] = None,
     max_bytes: Annotated[
         int,
         Field(
-            description="Maximum UTF-8 bytes returned.",
+            description="Requested UTF-8 byte limit; an initial character may adjust it.",
             ge=1,
             le=constants.MAX_TOOL_CONTENT_BYTES,
         ),
@@ -327,17 +340,14 @@ def read_cached_content(
         start_byte = decode_content_cursor(cursor, handle) if cursor is not None else None
         if start_byte is not None and start_byte > path.stat().st_size:
             raise ValueError("Cached content cursor is beyond the end of the content.")
-        result = _cached_result(
-            handle,
-            source,
-            read_bounded_text(
-                path,
-                start_byte=start_byte,
-                start_line=None if start_byte is not None else start_line,
-                max_lines=max_lines,
-                max_bytes=max_bytes,
-            ),
+        bounded = read_bounded_text(
+            path,
+            start_byte=start_byte,
+            start_line=None if start_byte is not None else start_line,
+            max_lines=max_lines,
+            max_bytes=max_bytes,
         )
+        result = _cached_result(handle, source, bounded)
         context.record_cached_read(handle)
         return result
     except ProblemException as exc:

@@ -1,10 +1,12 @@
 """Tests for progressive Agent Skill discovery and activation."""
 
 from pathlib import Path
+from typing import get_args, get_origin, get_type_hints
 
 import pytest
 
 from loop.instructions import Skill, SkillManager
+from loop.instructions.models import SkillActivationResult
 
 
 def write_skill(directory: Path, name: str, description: str, body: str = "Instructions") -> Path:
@@ -180,6 +182,14 @@ def test_deactivate_reports_unknown_names_and_deactivate_all_clears_every_skill(
     assert not manager.activated_locations
 
 
+def test_restore_return_annotation_resolves_to_builtin_list():
+    """The restore return type stays inspectable despite the manager's list method."""
+    annotation = get_type_hints(SkillManager.restore)["return"]
+
+    assert get_origin(annotation) is list
+    assert get_args(annotation) == (SkillActivationResult,)
+
+
 def test_restore_owns_identity_matching_and_lifecycle_diagnostics(tmp_path):
     """Restoration accepts exact identities and diagnoses missing or shadowed definitions."""
     skills_directory = tmp_path / "skills"
@@ -290,6 +300,26 @@ def test_resource_loading_rejects_escapes_and_bounds_oversized_content(tmp_path)
     assert oversized["included_bytes"] == 16 * 1024
     assert oversized["truncated"] is True
     assert oversized["next_start_byte"] == 16 * 1024
+
+
+def test_text_resource_automatically_completes_small_utf8_page(tmp_path):
+    """An oversized character advances the resource offset with an explicit adjustment."""
+    skill_root = tmp_path / "skills" / "safe"
+    write_skill(skill_root, "safe", "Safe resources.")
+    assets = skill_root / "assets"
+    assets.mkdir()
+    (assets / "text.txt").write_text("€z", encoding="utf-8")
+    manager = SkillManager.discover(tmp_path, [tmp_path / "skills"])
+    manager.activate("safe")
+
+    first = manager.read_resource("safe", "assets/text.txt", max_bytes=1)
+    assert first["content"] == "€"
+    assert first["requested_max_bytes"] == 1
+    assert first["effective_max_bytes"] == len("€".encode())
+    resumed = manager.read_resource(
+        "safe", "assets/text.txt", start_byte=first["next_start_byte"], start_line=None, max_bytes=1
+    )
+    assert resumed["content"] == "z"
 
 
 def test_binary_resource_loading_is_bounded_and_validates_ranges(tmp_path):

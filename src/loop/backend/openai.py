@@ -1639,6 +1639,7 @@ class OpenAIBackend(Backend):
             return output
         before = original.get("result") if isinstance(original, dict) else None
         after = payload.get("result") if isinstance(payload, dict) else None
+        marked = False
         if (
             isinstance(before, dict)
             and isinstance(after, dict)
@@ -1646,8 +1647,29 @@ class OpenAIBackend(Backend):
             and before["content"] != after.get("content")
         ):
             after["payload_redacted"] = True
-            output = json.dumps(payload, ensure_ascii=False)
-        return output
+            marked = True
+        original_problem = original.get("problem") if isinstance(original, dict) else None
+        prepared_problem = payload.get("problem") if isinstance(payload, dict) else None
+        for source, target in (
+            (before, after),
+            (
+                original_problem.get("metadata") if isinstance(original_problem, dict) else None,
+                prepared_problem.get("metadata") if isinstance(prepared_problem, dict) else None,
+            ),
+        ):
+            if not isinstance(source, dict) or not isinstance(target, dict):
+                continue
+            for name in ("stdout", "stderr"):
+                original_stream, prepared_stream = source.get(name), target.get(name)
+                if (
+                    isinstance(original_stream, dict)
+                    and isinstance(prepared_stream, dict)
+                    and "content" in original_stream
+                    and original_stream["content"] != prepared_stream.get("content")
+                ):
+                    prepared_stream["payload_redacted"] = True
+                    marked = True
+        return json.dumps(payload, ensure_ascii=False) if marked else output
 
     def _serialize_input(  # pylint: disable=redefined-builtin
         self, input: str | Iterable[ModelContextItem]

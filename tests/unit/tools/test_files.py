@@ -12,22 +12,27 @@ from loop import (
     BUILTIN_TOOLS,
     Action,
     ConsoleInteraction,
+    Decision,
     FileTarget,
     InstructionsManager,
     Operation,
     PermissionManager,
+    PolicyScope,
     RuntimeEnvironment,
     SessionManager,
     SQLiteSessionStore,
     ToolRegistry,
+    constants,
 )
 from loop.execution import CommandExecutionService
+from loop.models import ToolCall
 from loop.tooling import ToolContext
+from loop.tooling.file_observations import FileObservations
 from loop.tools.files import delete_path as delete_path_tool
 from loop.tools.files import edit_text_file as edit_text_file_tool
 from loop.tools.files import list_folder as list_folder_tool
 from loop.tools.files import write_text_file as write_text_file_tool
-from loop.utils import content_digest
+from loop.utils import VirtualPath, bound_tool_result, content_digest, sha256_digest
 from loop.utils.process import ProcessCapture, ProcessCaptureStatus
 
 tool_registry: ToolRegistry
@@ -447,24 +452,225 @@ def test_read_text_file_stops_at_lines_before_the_byte_ceiling(tmp_path):
     assert second["content"] == "b\n"
 
 
-def test_read_text_file_rejects_byte_selection_and_reports_oversized_lines(tmp_path):
-    """The public tool is line-only and reports a line that exceeds its byte ceiling."""
+def test_read_text_file_automatically_pages_oversized_lines(tmp_path):
+    """An oversized line returns content immediately and continues by byte offset."""
     source = tmp_path / "unicode.txt"
-    source.write_text("€", encoding="utf-8")
+    content = "€long first line\nnext line\n"
+    source.write_text(content, encoding="utf-8")
 
-    oversized = json.loads(read_text_file(source, max_bytes=2))
-    invalid = json.loads(read_text_file(source, start_byte=0))
+    first = json.loads(read_text_file(source, max_bytes=2))
+    second = json.loads(read_text_file(source, start_line=first["next_start_line"], max_bytes=20))
     definition = next(
         definition
         for definition in tool_registry.definitions()
         if definition.name == "read_text_file"
     )
 
-    assert oversized["content"] == ""
-    assert oversized["truncation_reason"] == "line_too_long"
-    assert "next_start_line" not in oversized
-    assert invalid["problem"]["code"] == "tool.invalid_arguments"
-    assert "start_byte" not in definition.parameters["properties"]
+    assert first["content"] == "€long first line\n"
+    assert first["requested_max_bytes"] == 2
+    assert first["effective_max_bytes"] == len(first["content"].encode())
+    assert first["next_start_line"] == 2
+    assert second["content"] == "next line\n"
+    assert second["start_byte"] == first["end_byte"]
+    assert second["version"] == first["version"]
+    assert "start_byte" in definition.parameters["properties"]
+    for name in ("start_line", "start_byte", "max_lines"):
+        description = definition.parameters["properties"][name]["description"]
+        assert "JSON null (unquoted)" in description
+
+
+@pytest.mark.parametrize("spelling", ["None", "nOnE", "null", "NULL"])
+def test_read_text_file_accepts_optional_null_spellings_without_changing_paths(
+    tmp_path, monkeypatch, spelling
+):
+    """String nulls behave like JSON null while a file named None stays addressable."""
+    source = tmp_path / "None"
+    source.write_text("one\ntwo\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    spelled = json.loads(
+        read_text_file("None", start_line=spelling, start_byte=4, max_lines=spelling)
+    )
+    actual = json.loads(read_text_file("None", start_line=None, start_byte=4, max_lines=None))
+    assert spelled == actual
+    assert spelled["content"] == "two\n"
+    assert problem(read_text_file("None", start_line=" None "))["code"] == "tool.invalid_arguments"
+
+
+@pytest.mark.parametrize("spelling", ["None", "nOnE", "null", "NULL"])
+def test_optional_null_spelling_does_not_bypass_file_authorization(tmp_path, monkeypatch, spelling):
+    """A normalized range cannot grant a read that the permission manager denies."""
+    source = tmp_path / "secret"
+    source.write_text("private", encoding="utf-8")
+    monkeypatch.undo()
+    permissions = PermissionManager(tmp_path)
+    permissions.set_default(Action.FILESYSTEM_READ, Decision.DENY, scope=PolicyScope.SESSION)
+    registry = ToolRegistry(BUILTIN_TOOLS, permission_manager=permissions)
+    output = registry.call(
+        "read_text_file",
+        json.dumps({"path": str(source), "start_line": spelling, "max_lines": spelling}),
+        interaction=ConsoleInteraction(),
+    )
+    assert problem(output)["code"] == "tool.denied"
+    assert "private" not in output
+
+
+@pytest.mark.parametrize("spelling", ["None", "nOnE", "null", "NULL"])
+def test_search_text_preserves_literal_globs_when_null_spelling_is_supported(
+    tmp_path, monkeypatch, spelling
+):
+    """An omitted filter and literal sentinel globs remain distinct through public dispatch."""
+    (tmp_path / "None").write_text("needle", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("needle", encoding="utf-8")
+    (tmp_path / "null").write_text("needle", encoding="utf-8")
+    engine = MagicMock(return_value=([], False))
+    monkeypatch.setattr("loop.tools.files.search_text_paths", engine)
+
+    assert json.loads(search_text(tmp_path, "needle", include=spelling))["matches"] == []
+    assert {item.name for item in engine.call_args.args[0]} == {"None", "null", "other.txt"}
+    assert json.loads(search_text(tmp_path, "needle", include=["None"]))["matches"] == []
+    assert [item.name for item in engine.call_args.args[0]] == ["None"]
+    assert json.loads(search_text(tmp_path, "needle", include=["null"]))["matches"] == []
+    assert [item.name for item in engine.call_args.args[0]] == ["null"]
+
+
+@pytest.mark.parametrize("character", ["a", "€"])
+def test_read_text_file_pages_a_line_above_the_hard_limit(tmp_path, character):
+    """A genuinely oversized line remains bounded and resumes without skipping bytes."""
+    source = tmp_path / "long-line.txt"
+    width = len(character.encode())
+    content = character * (constants.MAX_TOOL_CONTENT_BYTES // width) + "€tail\n"
+    source.write_text(content, encoding="utf-8")
+
+    first = json.loads(read_text_file(source, max_bytes=2))
+    second = json.loads(read_text_file(source, start_byte=first["next_start_byte"], max_bytes=10))
+    assert first["content"] + second["content"] == content
+    assert first["included_bytes"] == constants.MAX_TOOL_CONTENT_BYTES // width * width
+    assert first["requested_max_bytes"] == 2
+    assert first["effective_max_bytes"] == constants.MAX_TOOL_CONTENT_BYTES
+    assert "next_start_line" not in first
+    assert second["start_byte"] == first["end_byte"]
+    assert second["version"] == first["version"]
+
+
+def test_byte_pages_preserve_visible_content_guards(tmp_path):
+    """Partial byte pages cannot authorize unseen edits or full replacement."""
+    source = tmp_path / "long-line.txt"
+    content = "a" * constants.MAX_TOOL_CONTENT_BYTES + "€tail\n"
+    source.write_text(content, encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, scratch))
+    logical = f"{VirtualPath.WORKSPACE}/{source.name}"
+    operations = (
+        Operation(
+            tool_id="edit_text_file",
+            action=Action.FILESYSTEM_REPLACE,
+            target=FileTarget(
+                path=str(source), expected_exists=True, expected_digest=sha256_digest(content)
+            ),
+        ),
+    )
+    observations = FileObservations([], instructions.virtual_paths)
+
+    def capture(arguments):
+        """Deliver one actual public read and record only its attested visible bytes."""
+        request = json.dumps({"path": logical, **arguments})
+        output = tool_registry.call(
+            "read_text_file",
+            request,
+            interaction=ConsoleInteraction(),
+            instructions_manager=instructions,
+        )
+        observations.observe_result(
+            ToolCall(call_id="read", name="read_text_file", arguments=request), output
+        )
+        return json.loads(output)["result"]
+
+    first = capture({"max_bytes": 2})
+    assert (
+        observations.check(operations, {"old_content": "€tail"}).code == "filesystem.unread_content"
+    )
+    assert (
+        observations.check(operations, {"replace_all": True}).code == "filesystem.incomplete_read"
+    )
+    second = capture({"start_byte": first["next_start_byte"], "max_bytes": 10})
+    assert first["content"] + second["content"] == content
+    assert observations.check(operations, {"old_content": "€tail"}) is None
+    assert observations.check(operations, {"replace_all": True}) is None
+    changed = "b" * constants.MAX_TOOL_CONTENT_BYTES + "€tail\n"
+    source.write_text(changed, encoding="utf-8")
+    changed_page = capture({"start_byte": first["next_start_byte"], "max_bytes": 10})
+    assert changed_page["version"] != first["version"]
+    changed_operations = (
+        Operation(
+            tool_id="edit_text_file",
+            action=Action.FILESYSTEM_REPLACE,
+            target=FileTarget(
+                path=str(source), expected_exists=True, expected_digest=sha256_digest(changed)
+            ),
+        ),
+    )
+    assert (
+        observations.check(changed_operations, {"old_content": "b"}).code
+        == "filesystem.unread_content"
+    )
+    assert (
+        observations.check(changed_operations, {"replace_all": True}).code
+        == "filesystem.incomplete_read"
+    )
+
+
+def test_result_limited_file_pages_preserve_visible_content_guards(tmp_path):
+    """A serialization-limited page preserves receipts without exposing unseen content."""
+    source = tmp_path / "escaped.txt"
+    content = '"' * constants.MAX_TOOL_CONTENT_BYTES + "unseen"
+    source.write_text(content, encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, scratch))
+    logical = f"{VirtualPath.WORKSPACE}/{source.name}"
+    operations = (
+        Operation(
+            tool_id="edit_text_file",
+            action=Action.FILESYSTEM_REPLACE,
+            target=FileTarget(
+                path=str(source), expected_exists=True, expected_digest=sha256_digest(content)
+            ),
+        ),
+    )
+    observations = FileObservations([], instructions.virtual_paths)
+
+    def capture(arguments):
+        """Bound one real tool result and record only its delivered file range."""
+        request = json.dumps({"path": logical, **arguments})
+        raw = tool_registry.call(
+            "read_text_file",
+            request,
+            interaction=ConsoleInteraction(),
+            instructions_manager=instructions,
+        )
+        bounded, handle = bound_tool_result(raw, "synthetic")
+        observations.observe_result(
+            ToolCall(call_id="read", name="read_text_file", arguments=request), bounded
+        )
+        return json.loads(bounded)["result"], handle
+
+    first, handle = capture({"max_bytes": 2})
+    assert handle is not None
+    assert first["truncation_reason"] == "result_limit"
+    assert first["requested_max_bytes"] == 2
+    assert first["effective_max_bytes"] == first["included_bytes"]
+    assert (
+        observations.check(operations, {"old_content": "unseen"}).code
+        == "filesystem.unread_content"
+    )
+    assert (
+        observations.check(operations, {"replace_all": True}).code == "filesystem.incomplete_read"
+    )
+    second, _ = capture({"start_byte": first["next_start_byte"]})
+    assert first["content"] + second["content"] == content
+    assert observations.check(operations, {"old_content": "unseen"}) is None
+    assert observations.check(operations, {"replace_all": True}) is None
 
 
 def test_search_text_finds_literal_unicode_with_smart_case_and_context(tmp_path, monkeypatch):

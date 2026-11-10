@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from .. import constants
 from ..instructions.models import (
@@ -13,7 +13,7 @@ from ..instructions.models import (
 )
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
 from ..permissions import Action, Operation, OperationPlan, SessionTarget
-from ..tooling import ToolContext, tool
+from ..tooling import ToolContext, normalize_optional_null, tool
 from ..utils import VirtualPath
 
 _FIELDS_BY_NAME = {
@@ -30,6 +30,8 @@ _FIELDS_BY_NAME = {
         "start_byte",
         "end_byte",
         "included_bytes",
+        "requested_max_bytes",
+        "effective_max_bytes",
         "truncated",
         "truncation_reason",
         "start_line",
@@ -134,7 +136,7 @@ def activate_skill(
         ),
     ],
 ) -> PublicSkillOperationResult:
-    """Load matching skill instructions before beginning task work."""
+    """Load a skill; its /skills root is for file tools, not a shell pathname."""
     manager = context.instructions_manager
     if manager is None:
         return SkillOperationError(
@@ -171,43 +173,62 @@ def manage_skills(
             "list_resources",
             "read_resource",
         ],
-        Field(description="Whether to list, activate, or deactivate skills."),
+        Field(
+            description="Skill action: list, activate, deactivate, deactivate_all, "
+            "list_resources, or read_resource."
+        ),
     ],
     name: Annotated[
         str | None,
-        Field(description="Exact skill name for activation or deactivation; null when listing."),
+        Field(
+            description="Exact skill name for activation, deactivation, or resource access. "
+            "Use JSON null (unquoted) for list and deactivate_all."
+        ),
     ] = None,
     path: Annotated[
         str | None,
-        Field(description="Relative skill resource path when reading a resource."),
+        Field(
+            description="Relative skill resource path for read_resource. "
+            "Use JSON null (unquoted) for other actions."
+        ),
     ] = None,
     start_byte: Annotated[
         int | None,
         Field(
-            description="Zero-based resource offset; start_line may remain 1 only at byte zero.",
+            description="Zero-based resource offset for byte access. "
+            "Use JSON null (unquoted) for line-based reads; set start_line to JSON null "
+            "for nonzero byte offsets.",
             ge=0,
         ),
+        BeforeValidator(normalize_optional_null),
     ] = None,
     start_line: Annotated[
         int | None,
-        Field(description="One-based resource line; set to null for byte access.", ge=1),
+        Field(
+            description="One-based resource line. Use JSON null (unquoted) for byte access.",
+            ge=1,
+        ),
+        BeforeValidator(normalize_optional_null),
     ] = 1,
     max_lines: Annotated[
         int | None,
         Field(
-            description="Optional line ceiling; the first reached line or byte limit wins.", ge=1
+            description="Line ceiling; the first reached line or byte limit wins. "
+            "Use JSON null (unquoted) for no line ceiling.",
+            ge=1,
         ),
+        BeforeValidator(normalize_optional_null),
     ] = None,
     max_bytes: Annotated[
         int,
         Field(
-            description="Maximum raw resource bytes returned.",
+            description="Requested raw resource byte limit; an initial character may adjust it.",
             ge=1,
             le=constants.MAX_TOOL_CONTENT_BYTES,
         ),
     ] = constants.MAX_TOOL_CONTENT_BYTES,
 ) -> PublicSkillOperationResult:
-    """List, activate, or deactivate skill instructions on demand."""
+    """Manage skills and resources; /skills roots are file-tool paths, not shell paths."""
     manager = context.instructions_manager
     if manager is None:
         return SkillOperationError(

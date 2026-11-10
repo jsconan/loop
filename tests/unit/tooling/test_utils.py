@@ -13,12 +13,27 @@ from loop.tooling import (
     get_tool_arguments_model,
     get_tool_description,
     get_tool_schema,
+    normalize_optional_null,
     serialize_tool_problem,
     serialize_tool_result,
     takes_tool_context,
 )
 
 # pylint: disable=unused-argument, redefined-outer-name
+
+
+@pytest.mark.parametrize(
+    "value", [None, " None ", "null ", "n" * 10000, "", 0, ["null"], {"value": "None"}]
+)
+def test_normalize_optional_null_preserves_other_values(value):
+    """Non-sentinels and nested values remain unchanged."""
+    assert normalize_optional_null(value) is value
+
+
+@pytest.mark.parametrize("value", ["None", "none", "nOnE", "null", "NULL", "NuLl"])
+def test_normalize_optional_null_accepts_case_insensitive_spellings(value):
+    """Both exact sentinel spellings are recognized in any case."""
+    assert normalize_optional_null(value) is None
 
 
 def test_get_tool_description_returns_flattened_summary():

@@ -21,7 +21,7 @@ from loop import (
 )
 from loop.tools import web as web_module
 from loop.utils import cached_path as resolve_cached_path
-from loop.utils import encode_content_cursor
+from loop.utils import encode_content_cursor, store_content
 
 tool_registry: ToolRegistry
 
@@ -410,7 +410,7 @@ def test_fetch_content_rejects_binary_content(monkeypatch):
 
 
 def test_fetch_content_is_bounded_and_cached_for_continuation(monkeypatch):
-    """Large web text returns one bounded part and an opaque resumable handle."""
+    """Large web text returns bounded parts and schema guidance for cursor continuation."""
     content = ("line\n" * 5_000).encode()
     response = stream_response(content)
     monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
@@ -429,14 +429,14 @@ def test_fetch_content_is_bounded_and_cached_for_continuation(monkeypatch):
     assert second["start_byte"] == first["end_byte"]
     assert second["source"] == "https://my-host.local/large.txt"
     assert "next_start_byte" not in first
-    assert (
-        "start_byte"
-        not in next(
-            definition
-            for definition in tool_registry.definitions()
-            if definition.name == "read_cached_content"
-        ).parameters["properties"]
-    )
+    fields = next(
+        definition
+        for definition in tool_registry.definitions()
+        if definition.name == "read_cached_content"
+    ).parameters["properties"]
+    assert "start_byte" not in fields
+    assert "set start_line to JSON null" in fields["cursor"]["description"]
+    assert "JSON null (unquoted) when using a cursor" in fields["start_line"]["description"]
 
 
 def test_fetch_content_rejects_unsupported_or_excessive_responses(monkeypatch):
@@ -531,6 +531,37 @@ def test_read_cached_content_reports_invalid_cursors_and_selectors(monkeypatch):
     assert "Invalid cached content cursor" in malformed
     assert "either cursor or start_line" in conflicting
     assert "beyond the end" in beyond_end
+
+
+def test_read_cached_content_accepts_optional_null_spellings_and_keeps_real_cursors():
+    """Nullable selectors preserve bounded continuation and reject other malformed cursors."""
+    handle = store_content("first\nsecond\n", "fixture")
+    spelled = json.loads(
+        read_cached_content(handle, cursor="None", start_line="None", max_lines="None")
+    )
+    actual = json.loads(read_cached_content(handle, cursor=None, start_line=None, max_lines=None))
+    assert spelled == actual
+    cursor = encode_content_cursor(handle, 6)
+    continued = json.loads(read_cached_content(handle, cursor=cursor, start_line="None"))
+    assert continued["content"] == "second\n"
+    assert "Invalid cached content cursor" in read_cached_content(handle, cursor=" None ")
+
+
+def test_read_cached_content_automatically_completes_small_utf8_page(monkeypatch):
+    """Small byte limits make progress without splitting characters or repeating offsets."""
+    monkeypatch.setattr(PermissionManager, "request_permission", MagicMock(return_value=True))
+    handle = store_content("a€z", "synthetic")
+    first = json.loads(read_cached_content(handle, max_bytes=1))
+    cursor = first["next_cursor"]
+    resumed = json.loads(read_cached_content(handle, cursor=cursor, max_bytes=1))
+    final = json.loads(read_cached_content(handle, cursor=resumed["next_cursor"], max_bytes=1))
+
+    assert first["content"] == "a"
+    assert resumed["content"] == "€"
+    assert resumed["requested_max_bytes"] == 1
+    assert resumed["effective_max_bytes"] == len("€".encode())
+    assert final["content"] == "z"
+    assert resumed["start_byte"] == first["end_byte"]
 
 
 def test_fetch_content_rejects_non_http_urls(monkeypatch):

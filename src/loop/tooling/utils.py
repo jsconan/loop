@@ -13,6 +13,20 @@ from .context import ToolContext
 from .models import ToolRegistrationError
 
 
+def normalize_optional_null(value: Any) -> Any:
+    """Interpret top-level ``none`` and ``null`` strings case-insensitively as omitted values.
+
+    Args:
+        value (Any): Raw value supplied for an explicitly marked optional argument.
+
+    Returns:
+        Any: None for either exact spelling in any case, or the original value unchanged.
+    """
+    if isinstance(value, str) and len(value) == 4 and value.casefold() in {"none", "null"}:
+        return None
+    return value
+
+
 def get_tool_description(function: Callable[..., Any]) -> str:
     """Return the summary paragraph from a function's docstring.
 

@@ -403,6 +403,8 @@ class SkillResourceContentResult(TypedDict):
     included_bytes: int
     truncated: bool
     truncation_reason: NotRequired[Literal["bytes", "lines"]]
+    requested_max_bytes: NotRequired[int]
+    effective_max_bytes: NotRequired[int]
     start_line: NotRequired[int]
     end_line: NotRequired[int]
     next_start_byte: NotRequired[int]

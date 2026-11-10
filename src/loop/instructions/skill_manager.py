@@ -1,5 +1,6 @@
 """Discover and progressively load Agent Skills."""
 
+import builtins
 from collections.abc import Iterable
 from html import escape
 from pathlib import Path
@@ -388,7 +389,7 @@ class SkillManager:
         identities: Iterable[tuple[str, str]],
         *,
         refresh: bool = False,
-    ) -> list[SkillActivationResult]:
+    ) -> builtins.list[SkillActivationResult]:
         """Activate definitions that exactly match persisted identities.
 
         Args:
@@ -487,9 +488,12 @@ class SkillManager:
             max_lines (int | None): Optional maximum text lines returned from either starting mode.
                 Defaults to no line limit; the first reached line or byte ceiling wins.
             max_bytes (int): Maximum raw bytes returned, subject to the hard content ceiling.
+                The first UTF-8 character is returned even if it exceeds this limit.
 
         Returns:
             SkillResourceContentResponse: Text or base64 resource content, or a structured error.
+                An initial UTF-8 character exceeding the requested byte limit reports both the
+                requested and effective byte limits.
         """
         listed = self.list_resources(name)
         if isinstance(listed, SkillOperationError):

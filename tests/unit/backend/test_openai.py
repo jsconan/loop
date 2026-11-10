@@ -2655,6 +2655,59 @@ def test_context_preparation_preserves_redacted_non_file_tool_outputs(output):
     assert item.output == output
 
 
+@pytest.mark.parametrize("include_secret", [False, True])
+def test_context_preparation_preserves_command_paths_and_filters_credentials(include_secret):
+    """Model input keeps path-like command text while filtering registered credentials."""
+    secret = "registered-credential-123"
+    content = '/Users/example/work-extra/file https://example.test/Users/example/work "é"'
+    if include_secret:
+        content += " " + secret
+    output = json.dumps({"ok": True, "result": {"stdout": {"content": content}}})
+    item = ToolResult(call_id="call", output=output)
+
+    prepared = OpenAIBackend(api_key=secret).prepare_context([item])[0]
+
+    expected = content.replace(secret, "<redacted:secret>") if include_secret else content
+    assert json.loads(prepared.output)["result"]["stdout"]["content"] == expected
+    assert item.output == output
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_model_input_marks_only_command_streams_changed_by_credential_filtering(failed, stream):
+    """The provider sees redacted stream markers while stored output and path text remain intact."""
+    secret = "registered-credential-123"
+    path = '/Users/example/work-extra/file https://example.test/Users/example/work "é"'
+    streams = {
+        name: {"content": path + (" " + secret if name == stream else ""), "captured_bytes": 99}
+        for name in ("stdout", "stderr")
+    }
+    output = json.dumps(
+        {"ok": False, "problem": {"metadata": streams}}
+        if failed
+        else {"ok": True, "result": streams}
+    )
+    item = ToolResult(call_id="call", output=output)
+    sdk = Mock()
+    sdk.responses.create.return_value = sdk_response(
+        output=[], output_text="", usage=None, model="model"
+    )
+    with patch("loop.backend.openai.OpenAI", return_value=sdk):
+        backend = OpenAIBackend(default_model="model", api_key=secret)
+        prepared = backend.prepare_context([item])
+        assert backend.prepare_context(prepared) == prepared
+        list(backend.get_response([item]))
+
+    serialized = sdk.responses.create.call_args.kwargs["input"][0]
+    result = json.loads(serialized["output"])
+    observed = result["problem"]["metadata"] if failed else result["result"]
+    assert observed[stream]["content"] == path + " <redacted:secret>"
+    assert observed[stream]["payload_redacted"] is True
+    other = "stderr" if stream == "stdout" else "stdout"
+    assert observed[other] == {"content": path, "captured_bytes": 99}
+    assert item.output == output
+
+
 @pytest.mark.parametrize("secret", ["é" * 16, 'registered\\credential"value'])
 def test_context_preparation_redacts_json_escaped_credentials(secret):
     """Decoded tool text is filtered even when JSON escaping hides the registered credential."""

@@ -68,7 +68,10 @@ def test_activate_skill_loads_matching_instructions_with_a_single_argument(tmp_p
         "instructions_updated": True,
         "skill_root": "/skills/example",
     }
-    assert definition.description == "Load matching skill instructions before beginning task work."
+    assert (
+        definition.description
+        == "Load a skill; its /skills root is for file tools, not a shell pathname."
+    )
     assert set(definition.parameters["properties"]) == {"name"}
     assert definition.parameters["required"] == ["name"]
     assert "Do the work." in manager.instructions
@@ -112,8 +115,19 @@ def test_activate_skill_sanitizes_loading_failures(tmp_path):
     assert str(location) not in json.dumps(result)
 
 
+def test_manage_skills_schema_describes_all_actions_and_nullable_fields():
+    """The model sees the full action set and the null mode for action-specific arguments."""
+    definition = next(tool for tool in tool_registry.definitions() if tool.name == "manage_skills")
+    fields = definition.parameters["properties"]
+
+    assert "list_resources" in fields["action"]["description"]
+    assert "read_resource" in fields["action"]["description"]
+    assert "list and deactivate_all" in fields["name"]["description"]
+    assert "for other actions" in fields["path"]["description"]
+
+
 def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path):
-    """The skill lifecycle returns only fields required by each model-facing action."""
+    """The skill lifecycle returns public fields and resumable resource results."""
     location = tmp_path / "example" / "SKILL.md"
     location.parent.mkdir()
     location.write_text(
@@ -155,6 +169,35 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
         tool_registry.call(
             "manage_skills",
             '{"action":"read_resource","name":"example","path":"references/guide.md"}',
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+        )
+    )
+    reference.write_text("€z", encoding="utf-8")
+    resource_arguments = {
+        "action": "read_resource",
+        "name": "example",
+        "path": "references/guide.md",
+    }
+    first_page = decoded(
+        tool_registry.call(
+            "manage_skills",
+            json.dumps({**resource_arguments, "max_bytes": 1}),
+            interaction=interaction,
+            instructions_manager=instructions_manager,
+        )
+    )
+    resumed = decoded(
+        tool_registry.call(
+            "manage_skills",
+            json.dumps(
+                {
+                    **resource_arguments,
+                    "start_byte": first_page["next_start_byte"],
+                    "start_line": None,
+                    "max_bytes": 1,
+                }
+            ),
             interaction=interaction,
             instructions_manager=instructions_manager,
         )
@@ -203,6 +246,10 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
         "start_line": 1,
         "end_line": 1,
     }
+    assert first_page["content"] == "€"
+    assert first_page["requested_max_bytes"] == 1
+    assert first_page["effective_max_bytes"] == len("€".encode())
+    assert resumed["content"] == "z"
     assert deactivated == {
         "name": "example",
         "status": "deactivated",
@@ -218,6 +265,42 @@ def test_manage_skills_lists_activates_and_deactivates_through_one_tool(tmp_path
     )
     assert "skill_root" not in resource
     assert "Do the work." not in instructions_manager.instructions
+
+
+def test_manage_skills_preserves_literal_resource_names_with_optional_nulls(tmp_path):
+    """Optional range sentinels do not rewrite a real resource path or skill name."""
+    location = tmp_path / "example" / "SKILL.md"
+    location.parent.mkdir()
+    location.write_text("---\nname: example\ndescription: Example.\n---\nWork.", encoding="utf-8")
+    (location.parent / "references").mkdir()
+    (location.parent / "references" / "None").write_text("resource text", encoding="utf-8")
+    manager = InstructionsManager(
+        skill_manager=SkillManager([Skill("example", "Example.", location)])
+    )
+    tool_registry.call(
+        "activate_skill",
+        '{"name":"example"}',
+        interaction=approving_interaction(),
+        instructions_manager=manager,
+    )
+    arguments = {
+        "action": "read_resource",
+        "name": "example",
+        "path": "references/None",
+        "start_byte": "None",
+        "start_line": "None",
+        "max_lines": "None",
+    }
+    result = decoded(
+        tool_registry.call("manage_skills", json.dumps(arguments), instructions_manager=manager)
+    )
+    assert result["path"] == "references/None"
+    assert result["content"] == "resource text"
+    arguments["name"] = "None"
+    missing = decoded(
+        tool_registry.call("manage_skills", json.dumps(arguments), instructions_manager=manager)
+    )
+    assert missing["code"] != "skill.name_required"
 
 
 def test_manage_skills_validates_mutations_and_runtime_manager():
