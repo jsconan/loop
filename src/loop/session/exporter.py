@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Literal
@@ -14,6 +15,8 @@ from ..utils import content_digest, utc_now
 from .models import (
     CompactionEvent,
     ConversationItemEvent,
+    InteractionRequestedEvent,
+    InteractionSettledEvent,
     PermissionEvent,
     ReferenceArtifact,
     RunCompletedEvent,
@@ -33,7 +36,7 @@ def export_session(
     format: SessionExportFormat = "markdown",
     overwrite: bool = False,
 ) -> None:
-    """Write a Markdown transcript with displayed reasoning or a self-contained archive.
+    """Write a Markdown transcript with safe decisions or a self-contained archive.
 
     Args:
         session (Session): Session to export.
@@ -86,17 +89,18 @@ def export_session(
 
 
 def _render_markdown(session: Session) -> str:
-    """Render session history with displayed reasoning, excluding encrypted provider state."""
+    """Render reasoning and safe decisions without exposing encrypted provider state."""
     title = (session.name or "Untitled session").replace("\r", " ").replace("\n", " ")
     lines = [
         f"# {title}",
         "",
-        f"- Session ID: `{session.id}`",
-        f"- Model: `{session.model or 'unknown'}`",
+        f"- Session ID: {_inline_code(session.id)}",
+        f"- Model: {_inline_code(session.model or 'unknown')}",
         f"- Exported at: {utc_now().isoformat()}",
         "",
     ]
     recorded_items = set()
+    requested_kinds = {}
     for event in session.events:
         if isinstance(event, ConversationItemEvent):
             recorded_items.add(event.item_index)
@@ -107,7 +111,51 @@ def _render_markdown(session: Session) -> str:
             decision = event.result.decision.value
             if event.result.approval_choice is not None:
                 decision += f" ({event.result.approval_choice.value})"
-            lines.extend(("### Permission decision", "", f"Outcome: {decision}", ""))
+            lines.extend(
+                (
+                    "### Permission decision",
+                    "",
+                    f"Policy: {event.result.policy.decision.value}",
+                    f"Outcome: {decision}",
+                    f"Source: {event.result.source}",
+                    "Reason:",
+                    "",
+                    _code_block(event.result.reason),
+                    "",
+                )
+            )
+        elif isinstance(event, InteractionRequestedEvent):
+            requested_kinds[event.request_id] = event.kind
+            if event.kind != "terminal":
+                lines.extend(
+                    (
+                        "### Interactive request",
+                        "",
+                        f"Request ID: {_inline_code(event.request_id)}",
+                    )
+                )
+                if event.operation_id:
+                    lines.append(f"Operation ID: {_inline_code(event.operation_id)}")
+                if event.question is not None:
+                    lines.extend(("Question:", "", _code_block(event.question)))
+                else:
+                    lines.append("Question: not recorded")
+                lines.append("")
+        elif isinstance(event, InteractionSettledEvent):
+            if requested_kinds.get(event.request_id) != "terminal":
+                lines.extend(
+                    (
+                        "### Interactive response",
+                        "",
+                        f"Request ID: {_inline_code(event.request_id)}",
+                        f"Outcome: {event.outcome}",
+                    )
+                )
+                if event.selection is not None:
+                    lines.extend(("Selected:", "", _code_block(event.selection)))
+                elif event.outcome == "answered":
+                    lines.append("Selection: not recorded")
+                lines.append("")
         elif isinstance(event, RunCompletedEvent):
             lines.extend(("### Run completed", "", f"Stop reason: {event.stop_reason}", ""))
 
@@ -137,9 +185,9 @@ def _append_item(
         heading = "Pending tool call" if pending else "Tool call"
         lines.extend(
             (
-                f"### {heading}: {item.name}",
+                f"### {heading}: {_inline_code(item.name)}",
                 "",
-                f"Call ID: `{item.call_id}`",
+                f"Call ID: {_inline_code(item.call_id)}",
                 "",
                 "Arguments:",
                 "",
@@ -158,7 +206,7 @@ def _append_item(
             language = "json"
         lines.extend(
             (
-                f"### Tool result: `{item.call_id}`",
+                f"### Tool result: {_inline_code(item.call_id)}",
                 "",
                 _code_block(output, language),
                 "",
@@ -168,6 +216,23 @@ def _append_item(
         raise UnsupportedConversationItemError(
             f"Unsupported conversation item type: {type(item).__name__}."
         )
+
+
+def _inline_code(value: str) -> str:
+    """Render an identifier faithfully, using labelled JSON for nonprintable characters."""
+    encoded = not value or any(not character.isprintable() for character in value)
+    if encoded:
+        value = json.dumps(value, ensure_ascii=True)
+    fence = "`" * (max((len(match) for match in re.findall(r"`+", value)), default=0) + 1)
+    padding = (
+        " "
+        if value.startswith("`")
+        or value.endswith("`")
+        or (value.startswith(" ") and value.endswith(" ") and value.strip(" "))
+        else ""
+    )
+    label = "JSON " if encoded else ""
+    return f"{label}{fence}{padding}{value}{padding}{fence}"
 
 
 def _code_block(value: str, language: str = "text") -> str:

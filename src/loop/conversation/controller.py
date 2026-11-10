@@ -1350,6 +1350,20 @@ class SessionController:
                             session_id=event.session_id,
                             run_id=event.run_id,
                             operation_id=event.operation_id,
+                            question=(
+                                event.args[0]
+                                if event.args
+                                and isinstance(event.args[0], str)
+                                and (
+                                    event.kind == EVENT_CONFIRM
+                                    or (
+                                        event.kind == EVENT_PROMPT
+                                        and event.kwargs.get("choices") is not None
+                                        and not event.kwargs.get("secret", False)
+                                    )
+                                )
+                                else None
+                            ),
                         )
                     except BaseException as error:
                         if not event.result.done():
@@ -1888,10 +1902,33 @@ class SessionController:
                     outcome = "revoked"
                 elif request_error is not None:
                     outcome = "failed"
+                selection = None
+                if outcome == "answered" and answered:
+                    if request.kind == EVENT_CONFIRM and isinstance(resolved_result, bool):
+                        selection = "Yes" if resolved_result else "No"
+                    elif (
+                        request.kind == EVENT_PROMPT
+                        and request.kwargs.get("choices") is not None
+                        and not request.kwargs.get("secret", False)
+                    ):
+                        try:
+                            choices = self._pending_response_choices(request)
+                        except ValueError:
+                            pass
+                        else:
+                            selection = next(
+                                (
+                                    choice.label
+                                    for choice in choices
+                                    if choice.value == resolved_result
+                                ),
+                                None,
+                            )
                 try:
                     await self._session_manager.record_interaction_settled_async(
                         request.request_id,
                         outcome,
+                        selection,
                     )
                 except BaseException as error:
                     if not request.result.done():

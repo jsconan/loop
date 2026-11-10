@@ -7,6 +7,7 @@ from unittest.mock import Mock
 from zipfile import ZipFile
 
 import pytest
+from markdown_it import MarkdownIt
 
 from loop import (
     Action,
@@ -16,6 +17,8 @@ from loop import (
     ConversationItemEvent,
     Decision,
     FileTarget,
+    InteractionRequestedEvent,
+    InteractionSettledEvent,
     MemorySessionStore,
     Message,
     Operation,
@@ -180,6 +183,199 @@ def test_markdown_export_renders_timeline_and_omits_private_payloads(tmp_path):
     assert transcript.index("### Tool result") < transcript.index("Run completed")
 
 
+@pytest.mark.parametrize(
+    ("identifier", "rendered"),
+    [
+        ("`start", "`` `start ``"),
+        ("end`", "`` end` ``"),
+        ("ordinary", "`ordinary`"),
+        ("provider\\id", "`provider\\id`"),
+        (" id ", "`  id  `"),
+        ("  ", "`  `"),
+    ],
+)
+def test_export_preserves_code_span_boundaries(tmp_path, identifier, rendered):
+    """Identifiers at either backtick boundary remain inside their code span."""
+    session = Session(messages=[ToolResult(call_id=identifier, output="ok")])
+    target = tmp_path / "transcript.md"
+    export_session(session, MemorySessionStore(), target)
+    transcript = target.read_text(encoding="utf-8")
+    assert f"### Tool result: {rendered}" in transcript
+    heading = next(line for line in transcript.splitlines() if line.startswith("### Tool result:"))
+    tokens = MarkdownIt("commonmark").parseInline(heading)[0].children
+    assert next(token.content for token in tokens if token.type == "code_inline") == identifier
+
+
+def test_export_keeps_provider_identifiers_in_single_code_spans(tmp_path):
+    """Provider IDs and names cannot introduce headings or escape their code spans."""
+    identifier = "id``\n### forged"
+    session = Session(
+        messages=[
+            ToolCall(call_id=identifier, name="tool`\n### fake", arguments="{}"),
+            ToolResult(call_id=identifier, output="ok"),
+        ]
+    )
+    session.events.append(
+        InteractionRequestedEvent(
+            id="event",
+            created_at=datetime(2026, 8, 20, tzinfo=UTC),
+            request_id="request",
+            session_id=session.id,
+            operation_id=identifier,
+            kind="confirm",
+        )
+    )
+    target = tmp_path / "transcript.md"
+    export_session(session, MemorySessionStore(), target)
+    transcript = target.read_text(encoding="utf-8")
+    assert 'Operation ID: JSON ```"id``\\n### forged"```' in transcript
+    assert 'Call ID: JSON ```"id``\\n### forged"```' in transcript
+    assert '### Tool result: JSON ```"id``\\n### forged"```' in transcript
+    assert '### Tool call: JSON ``"tool`\\n### fake"``' in transcript
+    line = next(line for line in transcript.splitlines() if line.startswith("Operation ID:"))
+    tokens = MarkdownIt("commonmark").parseInline(line)[0].children
+    encoded = next(token.content for token in tokens if token.type == "code_inline")
+    assert line.startswith("Operation ID: JSON ")
+    assert json.loads(encoded) == identifier
+    assert "\n### forged" not in transcript
+    assert "\n### fake" not in transcript
+
+
+@pytest.mark.parametrize("identifier", ["", "first\rsecond", "first\r\nsecond\\tail", "a\x00b"])
+def test_export_identifies_nonprintable_and_empty_ids_as_recoverable_json(tmp_path, identifier):
+    """Empty and nonprintable IDs use a reversible, explicitly labelled JSON representation."""
+    session = Session(messages=[ToolResult(call_id=identifier, output="ok")])
+    target = tmp_path / "transcript.md"
+    export_session(session, MemorySessionStore(), target)
+    line = next(
+        line
+        for line in target.read_text(encoding="utf-8").splitlines()
+        if line.startswith("### Tool result:")
+    )
+    tokens = MarkdownIt("commonmark").parseInline(line)[0].children
+    encoded = next(token.content for token in tokens if token.type == "code_inline")
+    assert line.startswith("### Tool result: JSON ")
+    assert json.loads(encoded) == identifier
+
+
+def test_export_distinguishes_json_labels_from_literal_identifiers(tmp_path):
+    """A literal identifier resembling an encoded one remains distinguishable in Markdown."""
+    session = Session(
+        messages=[
+            ToolResult(call_id="a\nb", output="first"),
+            ToolResult(call_id='JSON "a\\nb"', output="second"),
+        ]
+    )
+    target = tmp_path / "transcript.md"
+    export_session(session, MemorySessionStore(), target)
+    headings = [
+        line
+        for line in target.read_text(encoding="utf-8").splitlines()
+        if line.startswith("### Tool result:")
+    ]
+    assert headings == ['### Tool result: JSON `"a\\nb"`', '### Tool result: `JSON "a\\nb"`']
+
+
+def test_export_preserves_ordered_decisions_without_secret_answers(tmp_path):
+    """Exports correlate finite choices with tool work and omit unrecorded private input."""
+    created_at = datetime(2026, 8, 20, tzinfo=UTC)
+    session = Session(
+        messages=[
+            ToolCall(call_id="call-1", name="run_command", arguments='{"command":"make test"}'),
+            ToolResult(call_id="call-1", output='{"boundary":"sandbox"}'),
+        ]
+    )
+    items = [event for event in session.events if isinstance(event, ConversationItemEvent)]
+    session.events = [
+        items[0],
+        InteractionRequestedEvent(
+            id="request-event",
+            created_at=created_at,
+            request_id="approval-1",
+            session_id=session.id,
+            operation_id="call-1",
+            kind="prompt",
+            question="Allow this command?\nScope: read /opt/runtime",
+        ),
+        InteractionSettledEvent(
+            id="settled-event",
+            created_at=created_at,
+            request_id="approval-1",
+            outcome="answered",
+            selection="(Y) Allow once",
+        ),
+        _permission_event(ApprovalChoice.ONCE),
+        InteractionRequestedEvent(
+            id="private-request",
+            created_at=created_at,
+            request_id="private-1",
+            session_id=session.id,
+            kind="prompt",
+        ),
+        InteractionSettledEvent(
+            id="private-settlement",
+            created_at=created_at,
+            request_id="private-1",
+            outcome="answered",
+        ),
+        InteractionRequestedEvent(
+            id="revoked-request",
+            created_at=created_at,
+            request_id="revoked-1",
+            session_id=session.id,
+            kind="confirm",
+            question="Continue?",
+        ),
+        InteractionSettledEvent(
+            id="revoked-settlement",
+            created_at=created_at,
+            request_id="revoked-1",
+            outcome="revoked",
+        ),
+        InteractionRequestedEvent(
+            id="terminal-request",
+            created_at=created_at,
+            request_id="terminal-1",
+            session_id=session.id,
+            kind="terminal",
+        ),
+        InteractionSettledEvent(
+            id="terminal-settlement",
+            created_at=created_at,
+            request_id="terminal-1",
+            outcome="revoked",
+        ),
+        items[1],
+    ]
+    markdown = tmp_path / "decisions.md"
+    archive = tmp_path / "decisions.zip"
+
+    export_session(session, MemorySessionStore(), markdown)
+    export_session(session, MemorySessionStore(), archive, format="archive")
+
+    transcript = markdown.read_text(encoding="utf-8")
+    assert "Allow this command?\nScope: read /opt/runtime" in transcript
+    assert "Selected:\n\n```text\n(Y) Allow once\n```" in transcript
+    assert "Operation ID: `call-1`" in transcript
+    assert "Policy: ask" in transcript
+    assert "Source: user" in transcript
+    assert "Reason:\n\n```text\nallowed\n```" in transcript
+    assert "Question: not recorded" in transcript
+    assert "Selection: not recorded" in transcript
+    assert "Outcome: revoked" in transcript
+    assert "terminal-1" not in transcript
+    assert "Private prompt details" not in transcript
+    assert transcript.index("Tool call: `run_command`") < transcript.index("approval-1")
+    assert transcript.index("approval-1") < transcript.index("(Y) Allow once")
+    assert transcript.index("(Y) Allow once") < transcript.index("Outcome: allow (once)")
+    assert transcript.index("Outcome: allow (once)") < transcript.index("Tool result")
+    with ZipFile(archive) as file:
+        stored = json.loads(file.read("session.json"))
+    assert any(event.get("selection") == "(Y) Allow once" for event in stored["events"])
+    restored = Session.deserialize(json.dumps(stored))
+    assert restored.events == session.events
+
+
 def test_markdown_export_omits_empty_reasoning_and_marks_unplaced_calls(tmp_path):
     """Markdown omits empty reasoning and makes unplaced tool calls visible."""
     session = Session(
@@ -201,7 +397,7 @@ def test_markdown_export_omits_empty_reasoning_and_marks_unplaced_calls(tmp_path
 
     transcript = target.read_text(encoding="utf-8")
     assert "private" not in transcript
-    assert "Pending tool call: inspect" in transcript
+    assert "Pending tool call: `inspect`" in transcript
 
 
 @pytest.mark.parametrize("recorded", [True, False])

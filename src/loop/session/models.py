@@ -319,7 +319,7 @@ class InputRecalledEvent(SessionEventModel):
 
 
 class InteractionRequestedEvent(SessionEventModel):
-    """Record a pending UI request without persisting its answer or authority.
+    """Record a pending UI request with its nonsecret decision question.
 
     Args:
         type (Literal["interaction_requested"]): Event discriminator.
@@ -328,6 +328,8 @@ class InteractionRequestedEvent(SessionEventModel):
         run_id (str | None): Active run that owns the request.
         operation_id (str | None): Related operation identity, when available.
         kind (Literal["confirm", "prompt", "terminal"]): Type of user interaction.
+        question (str | None): Displayed finite-choice question, excluding secret and free-text
+            prompts. Defaults to ``None`` when no safe decision question is available.
     """
 
     type: Literal["interaction_requested"] = "interaction_requested"
@@ -336,20 +338,24 @@ class InteractionRequestedEvent(SessionEventModel):
     run_id: str | None = None
     operation_id: str | None = None
     kind: Literal["confirm", "prompt", "terminal"]
+    question: str | None = None
 
 
 class InteractionSettledEvent(SessionEventModel):
-    """Close a pending interaction while keeping its answer out of the lifecycle ledger.
+    """Close a pending interaction with its nonsecret finite-choice selection.
 
     Args:
         type (Literal["interaction_settled"]): Event discriminator.
         request_id (str): Identity of the settled request.
         outcome (Literal["answered", "revoked", "failed"]): How the request ended.
+        selection (str | None): Displayed decision label, or ``None`` for free-text, secret,
+            terminal, failed, and revoked interactions.
     """
 
     type: Literal["interaction_settled"] = "interaction_settled"
     request_id: str = Field(min_length=1)
     outcome: Literal["answered", "revoked", "failed"]
+    selection: str | None = None
 
 
 class RunStartedEvent(SessionEventModel):

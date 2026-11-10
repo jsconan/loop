@@ -1133,6 +1133,7 @@ class SessionManager:
         session_id: str | None,
         run_id: str | None,
         operation_id: str | None,
+        question: str | None = None,
     ) -> None:
         """Record safe identity metadata before presenting a blocking interaction.
 
@@ -1142,6 +1143,7 @@ class SessionManager:
             session_id (str | None): Request owner, or the active session when absent.
             run_id (str | None): Correlated run identity.
             operation_id (str | None): Correlated tool operation identity.
+            question (str | None): Nonsecret finite-choice question, when available.
 
         Raises:
             ValueError: If the request belongs to another session or has an invalid kind.
@@ -1155,21 +1157,27 @@ class SessionManager:
             run_id=run_id,
             operation_id=operation_id,
             kind=kind,
+            question=question,
         )
         await self._commit_async(lambda session: session.request_interaction(event))
 
-    async def record_interaction_settled_async(self, request_id: str, outcome: str) -> None:
-        """Close a durable UI request without retaining any answer or reusable approval.
+    async def record_interaction_settled_async(
+        self, request_id: str, outcome: str, selection: str | None = None
+    ) -> None:
+        """Close a durable UI request with a safe selected label, never reusable authority.
 
         Args:
             request_id (str): Unique UI request identity.
             outcome (str): Answered, revoked, or failed lifecycle outcome.
+            selection (str | None): Nonsecret finite-choice label, when available.
 
         Raises:
             ValueError: If the request is not pending or the outcome is invalid.
             asyncio.CancelledError: If persistence settles after cancellation.
         """
-        await self._commit_async(lambda session: session.settle_interaction(request_id, outcome))
+        await self._commit_async(
+            lambda session: session.settle_interaction(request_id, outcome, selection)
+        )
 
     @property
     def model(self) -> str | None:

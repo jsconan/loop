@@ -627,10 +627,10 @@ class Session:
         )
 
     def request_interaction(self, event: InteractionRequestedEvent) -> None:
-        """Persist a correlated interaction request without storing its arguments or answer.
+        """Persist a correlated interaction request and safe decision question.
 
         Args:
-            event (InteractionRequestedEvent): Safe request identity and lifecycle metadata.
+            event (InteractionRequestedEvent): Request identity and safe decision metadata.
 
         Raises:
             ValueError: If the request belongs to another session or its ID was used before.
@@ -647,12 +647,18 @@ class Session:
             raise ValueError(f"Interaction request '{event.request_id}' was already recorded.")
         self.events.append(event)
 
-    def settle_interaction(self, request_id: str, outcome: str) -> None:
-        """Close one pending interaction without retaining its response value.
+    def settle_interaction(
+        self,
+        request_id: str,
+        outcome: str,
+        selection: str | None = None,
+    ) -> None:
+        """Close one pending interaction with a safe finite-choice selection when available.
 
         Args:
             request_id (str): Identity of the pending request.
             outcome (str): Answered, revoked, or failed lifecycle outcome.
+            selection (str | None): Displayed choice label, or ``None`` if not applicable.
 
         Raises:
             ValueError: If the request is unknown, already settled, or has an invalid outcome.
@@ -667,6 +673,7 @@ class Session:
                 created_at=utc_now(),
                 request_id=request_id,
                 outcome=outcome,
+                selection=selection,
             )
         )
 

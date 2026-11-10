@@ -429,8 +429,8 @@ def test_controller_delivers_new_input_while_older_input_waits_for_recovery(ui, 
     ui.warning.assert_not_called()
 
 
-def test_controller_persists_interaction_lifecycle_without_answer_values(ui):
-    """The owner receives a prompt answer only after its safe lifecycle record settles."""
+def test_controller_persists_confirmation_decision_after_owner_settlement(ui):
+    """Record the displayed confirmation and chosen answer after the UI settles."""
     store = MemorySessionStore()
     manager = SessionManager(session_store=store)
     controller = SessionController(ui)
@@ -453,10 +453,54 @@ def test_controller_persists_interaction_lifecycle_without_answer_values(ui):
     assert manager.session.pending_interactions == ()
     requested, settled = manager.session.events
     assert requested.type == "interaction_requested"
+    assert requested.question == "Approve this request?"
     assert settled.type == "interaction_settled"
     assert settled.outcome == "answered"
-    assert "Approve this request?" not in manager.session.serialize()
-    assert "answer" not in settled.model_dump(mode="json")
+    assert settled.selection == "Yes"
+    assert "Approve this request?" in manager.session.serialize()
+    assert "Yes" in manager.session.serialize()
+
+
+@pytest.mark.parametrize(
+    ("choices", "secret", "answer", "expected_question", "expected_selection"),
+    [
+        ({"allow": "Allow once", "deny": "Deny"}, False, "allow", "Choose?", "(Y) Allow once"),
+        ({"allow": "Allow once", "deny": "Deny"}, False, "deny", "Choose?", "(N) Deny"),
+        ({}, False, "unknown", "Choose?", None),
+        (None, False, "free text secret", None, None),
+        ({"allow": "Allow once"}, True, "masked secret", None, None),
+    ],
+)
+def test_controller_records_only_nonsecret_finite_choices(
+    ui, choices, secret, answer, expected_question, expected_selection
+):
+    """Record finite decisions while omitting secret and free-text prompt content."""
+    manager = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(manager)
+    ui.prompt_async = AsyncMock(return_value=answer)
+
+    def conversation(_receive) -> None:
+        """Ask one routed question using the supplied sensitivity and choices."""
+        controller.interaction.prompt(
+            "Choose?",
+            choices=choices,
+            index={"allow": "Y", "deny": "N"} if choices and len(choices) == 2 else None,
+            secret=secret,
+        )
+
+    async def run_controller() -> None:
+        """Settle the prompt through the controller UI loop."""
+        await controller._run_sync_callback_async(conversation)
+
+    asyncio.run(run_controller())
+
+    requested, settled = manager.session.events
+    assert requested.question == expected_question
+    assert settled.selection == expected_selection
+    serialized = manager.session.serialize()
+    assert "free text secret" not in serialized
+    assert "masked secret" not in serialized
 
 
 @pytest.mark.parametrize("answer", [False, True])
