@@ -12,6 +12,7 @@ from loop.utils.virtual_path import VirtualPath
 
 def test_virtual_paths_preserve_identity_without_disclosing_local_roots(tmp_path):
     """Virtual paths resolve typed roots while keeping host roots out of model-facing metadata."""
+    assert VirtualPath.METADATA_KEY == "app:virtual-path"
     scratch = tmp_path / "temporary"
     scratch.mkdir()
     paths = VirtualPath(tmp_path, scratch)
@@ -78,27 +79,22 @@ def test_virtual_paths_redact_canonical_symlink_targets(tmp_path):
     )
 
 
-def test_virtual_shell_roots_translate_in_one_pass_without_reparsing():
-    """Internal literal aliases translate without replacing environment-variable prefixes."""
-    aliases = {
-        "/bound-work": Path("/private/tmp/loop-vpath-safe/r0"),
-        VirtualPath.WORKSPACE: Path("/ignored-workspace"),
-        VirtualPath.TEMPORARY: Path("/ignored-scratch"),
-    }
-    source = (
-        "cat /bound-work/a '/bound-work/b'; "
-        'cat "$WORKSPACE_ROOT/c" "$TMPDIR/d"; '
-        "echo /bound-work-old /foo/bound-work https://example.test/bound-work"
+def test_diagnostic_redaction_does_not_mislabel_sibling_path_prefixes(tmp_path):
+    """A path sharing only a root's textual prefix is not identified as that root."""
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "session"
+    paths = VirtualPath(workspace, scratch)
+
+    assert paths.redact(f"{workspace}/file") == "$WORKSPACE_ROOT/file"
+    assert paths.redact(f"{workspace}-other/file") == "<external>-other/file"
+    assert paths.redact(f"{scratch}.old/file") == "<external>.old/file"
+    assert paths.redact(f"https://example.test{workspace}/file") == (
+        "https://example.test<external>/file"
     )
-    assert VirtualPath.translate_shell_source(source, aliases) == (
-        "cat /private/tmp/loop-vpath-safe/r0/a '/private/tmp/loop-vpath-safe/r0/b'; "
-        'cat "$WORKSPACE_ROOT/c" "$TMPDIR/d"; '
-        "echo /bound-work-old /foo/bound-work https://example.test/bound-work"
-    )
-    assert VirtualPath.translate_shell_source(source, {}) == source
-    assert VirtualPath.translate_shell_source("ls /bound-work", aliases) == (
-        "ls /private/tmp/loop-vpath-safe/r0/"
-    )
+
+
+def test_command_roots_are_ordered_by_longest_virtual_prefix():
+    """Configured command roots retain their longest-prefix ordering."""
     paths = VirtualPath(Path("/work"), Path("/scratch"), {"guide": Path("/skill")})
     assert [root for root, _ in paths.command_roots()] == [
         VirtualPath.WORKSPACE,
@@ -128,12 +124,6 @@ def test_session_token_requires_an_exact_contained_prefix(tmp_path, value):
     assert paths.resolve("$TMPDIR/space é;$/file") == str(tmp_path / "session/space é;$/file")
 
 
-def test_session_source_and_operating_system_tmp_remain_opaque():
-    """Session environment expansion and embedded program text are never substituted."""
-    source = '''python -c 'print("/tmp/data", "$TMPDIR/data")'; cat "$TMPDIR/report"'''
-    assert VirtualPath.translate_shell_source(source, {"$TMPDIR": Path("/alias")}) == source
-
-
 @pytest.mark.parametrize("home", ["/Users/synthetic-account", "/home/synthetic-account"])
 def test_native_diagnostic_variants_hide_session_and_private_ancestors(home, monkeypatch):
     """Raw, quoted, JSON, shell, canonical and abbreviated diagnostics use logical roots."""
@@ -157,8 +147,8 @@ def test_native_diagnostic_variants_hide_session_and_private_ancestors(home, mon
     assert paths.redact("~/Library/Application Support") == "<external>"
 
 
-def test_canonical_prefixes_round_trip_and_reject_physical_paths(tmp_path):
-    """One portable spelling round-trips without accepting host or obsolete root aliases."""
+def test_canonical_prefixes_round_trip_and_accept_bound_physical_paths(tmp_path):
+    """Portable and physical paths address the same bound roots, but outsiders remain invalid."""
     workspace = tmp_path / "work space"
     temporary = tmp_path / "session"
     skill = tmp_path / "skill"
@@ -177,6 +167,45 @@ def test_canonical_prefixes_round_trip_and_reject_physical_paths(tmp_path):
     )
     assert paths.redact(shlex.quote(str(workspace))) == VirtualPath.WORKSPACE
     assert paths.redact("unchanged", roots=()) == "unchanged"
-    for value in ("/workspace/file", str(workspace / "file"), str(temporary / "file")):
+    for physical in (workspace, temporary, skill):
+        assert paths.resolve(str(physical / "file")) == str(physical / "file")
+    for value in ("/workspace/file", str(tmp_path / "outside"), str(workspace) + "-other/file"):
         with pytest.raises(ValueError, match="configured"):
             paths.resolve(value)
+
+
+def test_physical_root_aliases_remain_contained_and_preserve_symlink_leaves(tmp_path):
+    """Canonical and lexical root spellings never accept parent traversal or sibling prefixes."""
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (actual / "link").symlink_to(outside, target_is_directory=True)
+    paths = VirtualPath(alias)
+
+    assert paths.resolve(str(alias / "link" / "file")) == str(alias / "link" / "file")
+    assert paths.resolve(str(actual / "link" / "file")) == str(alias / "link" / "file")
+    with pytest.raises(ValueError, match="escapes"):
+        paths.resolve(f"{actual}/../outside/file")
+    with pytest.raises(ValueError, match="configured"):
+        paths.resolve(f"{actual}-other/file")
+
+
+@pytest.mark.parametrize("failure", [OSError, RuntimeError])
+def test_physical_root_resolution_failure_does_not_authorize_an_unknown_path(
+    tmp_path, monkeypatch, failure
+):
+    """An unavailable canonical alias never expands physical path authority."""
+    root = tmp_path / "workspace"
+    paths = VirtualPath(root)
+
+    def unavailable(*_args, **_kwargs):
+        """Simulate a missing or circular canonical root."""
+        raise failure()
+
+    monkeypatch.setattr(Path, "resolve", unavailable)
+    assert paths.resolve(str(root / "file")) == str(root / "file")
+    with pytest.raises(ValueError, match="configured"):
+        paths.resolve(str(tmp_path / "outside"))

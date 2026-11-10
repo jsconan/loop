@@ -107,6 +107,10 @@ def test_runtime_environment_uses_shared_prefixes_without_exposing_host_paths(
     assert "temporary_directory: $TEST_SCRATCH" in rendered
     assert 'cd "$TEST_WORKSPACE"' in rendered
     assert 'cat "$TEST_SCRATCH/report.txt"' in rendered
+    assert (
+        "Physical host paths within these roots are also accepted with the same permissions"
+        in rendered
+    )
     assert "passed unchanged" in rendered
     assert "legacy" not in rendered.casefold()
     assert "concrete" not in rendered.casefold()

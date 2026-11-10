@@ -9,6 +9,9 @@ from pathlib import Path, PurePosixPath
 
 from .process import parse_command_line
 
+_DIAGNOSTIC_PATH_DELIMITERS = "/\\ \t\r\n\"':,)]}"
+_DIAGNOSTIC_PATH_PREFIXES = " \t\r\n\"':=([{"
+
 
 class VirtualPath:
     """Translate canonical tool path prefixes to local filesystem roots.
@@ -19,14 +22,16 @@ class VirtualPath:
         skill_roots (Mapping[str, Path] | None): Skill resource directories represented below
             ``/skills/<name>``.
 
-    Typed paths resolve before filesystem operations. Shell source and saved file content
-    remain unchanged; executed programs obtain the same roots from their environment.
+    Typed paths resolve before filesystem operations. Physical spellings of configured roots
+    are also accepted; they do not grant access beyond the normal authorization checks. Shell
+    source and saved file content remain unchanged.
     """
 
     WORKSPACE = "$WORKSPACE_ROOT"
     TEMPORARY = "$TMPDIR"
     SKILLS = "/skills"
     EXTERNAL = "<external>"
+    METADATA_KEY = "app:virtual-path"
 
     _roots: dict[str, Path]
 
@@ -47,7 +52,7 @@ class VirtualPath:
         self._roots = roots
 
     def resolve(self, value: str) -> str:
-        """Resolve a canonical prefix or workspace-relative tool path.
+        """Resolve a configured prefix, contained physical path, or workspace-relative path.
 
         Args:
             value (str): Model-supplied path within a configured root.
@@ -66,6 +71,20 @@ class VirtualPath:
             for virtual_root, local_root in self._roots.items():
                 if value == virtual_root or value.startswith(f"{virtual_root}/"):
                     return self._local_path(local_root, value[len(virtual_root) :].lstrip("/"))
+            if value.startswith("/"):
+                candidate = Path(value)
+                if ".." in candidate.parts:
+                    raise ValueError("Physical path escapes its root.")
+                for local_root in self._roots.values():
+                    try:
+                        spellings = (local_root, local_root.resolve(strict=False))
+                    except (OSError, RuntimeError):
+                        spellings = (local_root,)
+                    for spelling in spellings:
+                        if candidate.is_relative_to(spelling):
+                            return self._local_path(
+                                local_root, candidate.relative_to(spelling).as_posix()
+                            )
             raise ValueError("Absolute paths must be inside a configured virtual root.")
         workspace = self._roots.get(self.WORKSPACE)
         if workspace is None:
@@ -204,7 +223,21 @@ class VirtualPath:
         if not replacements:
             return value
         pattern = "|".join(re.escape(key) for key in sorted(replacements, key=len, reverse=True))
-        return re.sub(pattern, lambda match: replacements[match.group()], value)
+
+        def replace(match: re.Match[str]) -> str:
+            """Avoid labeling a longer sibling path as one of the configured roots."""
+            virtual = replacements[match.group()]
+            if virtual != self.EXTERNAL and (
+                (match.start() > 0 and value[match.start() - 1] not in _DIAGNOSTIC_PATH_PREFIXES)
+                or (
+                    match.end() < len(value)
+                    and value[match.end()] not in _DIAGNOSTIC_PATH_DELIMITERS
+                )
+            ):
+                return self.EXTERNAL
+            return virtual
+
+        return re.sub(pattern, replace, value)
 
     def redaction_roots(self) -> tuple[tuple[str, str], ...]:
         """Return lexical and canonical roots for public-path disclosure.

@@ -552,6 +552,45 @@ def test_read_text_file_pages_a_line_above_the_hard_limit(tmp_path, character):
     assert second["version"] == first["version"]
 
 
+def test_physical_file_read_preserves_virtual_receipt_and_edit_guards(tmp_path):
+    """A contained physical path records the same read authority as its logical spelling."""
+    source = tmp_path / "observed.txt"
+    content = "visible content"
+    source.write_text(content, encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, scratch))
+    arguments = json.dumps({"path": str(source)})
+    output = tool_registry.call(
+        "read_text_file",
+        arguments,
+        interaction=ConsoleInteraction(),
+        instructions_manager=instructions,
+    )
+    result = json.loads(output)
+    logical = f"{VirtualPath.WORKSPACE}/{source.name}"
+    assert result["ok"] and result["result"]["path"] == logical
+    assert result["read_versions"][logical] == result["result"]["version"]
+    observations = FileObservations([], instructions.virtual_paths)
+    observations.observe_result(
+        ToolCall(call_id="read", name="read_text_file", arguments=arguments), output
+    )
+    operations = (
+        Operation(
+            tool_id="edit_text_file",
+            action=Action.FILESYSTEM_REPLACE,
+            target=FileTarget(
+                path=str(source), expected_exists=True, expected_digest=sha256_digest(content)
+            ),
+        ),
+    )
+    assert observations.check(operations, {"old_content": "visible"}) is None
+    assert (
+        observations.check(operations, {"old_content": "unseen"}).code
+        == "filesystem.unread_content"
+    )
+
+
 def test_byte_pages_preserve_visible_content_guards(tmp_path):
     """Partial byte pages cannot authorize unseen edits or full replacement."""
     source = tmp_path / "long-line.txt"
