@@ -351,6 +351,7 @@ def test_python_runtime_mounts_reject_changed_or_invalid_venv_metadata(
     home, workspace, venv_bin, _, _ = _python_environment(tmp_path)
     monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
     config = venv_bin.parent / "pyvenv.cfg"
+    selected = config.stat()
     tools = tmp_path / "tools"
     tools.mkdir()
     if failure == "link":
@@ -362,7 +363,9 @@ def test_python_runtime_mounts_reject_changed_or_invalid_venv_metadata(
         def fstat(descriptor):
             """Change the opened config identity before parsing it."""
             details = original_fstat(descriptor)
-            return SimpleNamespace(st_dev=details.st_dev, st_ino=details.st_ino + 1)
+            if (details.st_dev, details.st_ino) == (selected.st_dev, selected.st_ino):
+                return SimpleNamespace(st_dev=details.st_dev, st_ino=details.st_ino + 1)
+            return details
 
         monkeypatch.setattr(linux_paths.os, "fstat", fstat)
     elif failure == "changed":
@@ -372,8 +375,10 @@ def test_python_runtime_mounts_reject_changed_or_invalid_venv_metadata(
         def fstat(descriptor):
             """Change the metadata timestamp between its read and final check."""
             nonlocal calls
-            calls += 1
             details = original_fstat(descriptor)
+            if (details.st_dev, details.st_ino) != (selected.st_dev, selected.st_ino):
+                return details
+            calls += 1
             return SimpleNamespace(
                 st_dev=details.st_dev,
                 st_ino=details.st_ino,

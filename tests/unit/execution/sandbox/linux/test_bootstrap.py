@@ -310,7 +310,17 @@ def test_load_cached_payload_rejects_unsafe_lock(cache, tmp_path, change):
 
 def test_load_cached_payload_rejects_nonregular_lock(cache, monkeypatch):
     """A descriptor to a nonregular object cannot establish admission serialization."""
-    monkeypatch.setattr(os, "fstat", lambda fd: SimpleNamespace(st_mode=0o040444))
+    original_fstat = os.fstat
+    lock = cache["lock"].stat()
+
+    def nonregular_lock(descriptor):
+        """Alter only the owned lock descriptor, preserving unrelated test descriptors."""
+        details = original_fstat(descriptor)
+        if (details.st_dev, details.st_ino) == (lock.st_dev, lock.st_ino):
+            return SimpleNamespace(st_mode=0o040444)
+        return details
+
+    monkeypatch.setattr(os, "fstat", nonregular_lock)
     with pytest.raises(ValueError, match="Invalid policy cache lock"):
         linux_bootstrap.load_cached_payload(
             "payload", b"compiled", "loop_sandbox", 1000, cache["lock"], 1

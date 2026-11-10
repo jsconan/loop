@@ -27,10 +27,16 @@ def test_external_boundary_is_blocked(boundary):
         guarded("unused")
 
 
-def test_network_connection_is_blocked():
-    """An unmocked socket connection fails before contacting another process."""
-    with socket.socket() as connection, pytest.raises(AssertionError, match="external resource"):
-        connection.connect(("127.0.0.1", 1))
+@pytest.mark.parametrize("family", [socket.AF_INET, socket.AF_INET6])
+def test_network_socket_creation_is_blocked(family):
+    """An unmocked IP socket fails before native allocation or a connection."""
+    with pytest.raises(AssertionError, match="external resource"):
+        socket.socket(family, socket.SOCK_STREAM)
+
+
+def test_in_process_unix_socketpair_audit_is_allowed():
+    """The unit guard permits local socket pairs required by asyncio wakeups."""
+    sys.audit("socket.__new__", None, socket.AF_UNIX, socket.SOCK_STREAM, 0)
 
 
 def test_environment_and_current_directory_are_disposable(tmp_path):
@@ -83,6 +89,7 @@ def test_native_sqlite_output_is_blocked_before_creation(tmp_path):
         "os.fork",
         "os.exec",
         "os.kill",
+        "socket.__new__",
         "socket.connect",
         "socket.bind",
         "socket.getaddrinfo",

@@ -1,5 +1,6 @@
 """Isolate both suites from user configuration and clean all disposable test data."""
 
+import errno
 import fcntl
 import os
 import shutil
@@ -8,6 +9,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote
 from uuid import uuid4
 from weakref import WeakSet
 
@@ -20,6 +22,7 @@ from loop.permissions import PermissionManager
 from loop.permissions import manager as permission_module
 from loop.telemetry import get_telemetry, set_telemetry
 from loop.utils import content as content_module
+from loop.utils.path import ensure_private_directory
 
 _OUTPUT_ROOT: str | None = None
 _NATIVE_OUTPUT_ROOTS: list[str] = []
@@ -95,7 +98,7 @@ def _audit_output(event, arguments):
     elif event == "sqlite3.connect":
         database = os.fsdecode(arguments[0])
         if database.startswith("file:"):
-            database = database[5:].split("?", 1)[0]
+            database = unquote(database[5:].split("?", 1)[0])
         if database != ":memory:":
             _check_output(database)
 
@@ -103,12 +106,68 @@ def _audit_output(event, arguments):
 sys.addaudithook(_audit_output)
 
 
+@pytest.fixture(scope="session")
+def scratch_root():
+    """Select owned private scratch without constraining its physical spelling."""
+    selected = os.environ.get("LOOP_TEST_SCRATCH_ROOT")
+    if selected is None:
+        parent = Path(tempfile.gettempdir()).resolve()
+        try:
+            temporary = tempfile.TemporaryDirectory(prefix="l", dir=parent)
+        except OSError as error:
+            pytest.fail(f"Cannot create test scratch; set LOOP_TEST_SCRATCH_ROOT: {error}")
+        with temporary as directory:
+            root = Path(directory).resolve()
+            _validate_scratch_root(root)
+            yield root
+    else:
+        path = Path(selected)
+        if not path.is_absolute():
+            pytest.fail("LOOP_TEST_SCRATCH_ROOT must be an absolute existing directory.")
+        try:
+            root = path.resolve(strict=True)
+        except OSError as error:
+            pytest.fail(f"LOOP_TEST_SCRATCH_ROOT cannot be resolved: {error}")
+        _validate_scratch_root(root)
+        yield root
+
+
+def _validate_scratch_root(root):
+    """Reject scratch roots without private, stable directory authority."""
+    try:
+        ensure_private_directory(root, create=False)
+        if sys.platform == "linux":
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                bound = os.fstat(descriptor)
+                current = root.lstat()
+                if (bound.st_dev, bound.st_ino) != (current.st_dev, current.st_ino):
+                    raise ValueError("Test scratch root changed during ACL validation.")
+                try:
+                    default_acl = os.getxattr(descriptor, "system.posix_acl_default")
+                except OSError as error:
+                    if error.errno not in (errno.ENODATA, errno.ENOTSUP):
+                        raise
+                else:
+                    if default_acl:
+                        raise ValueError("Test scratch root has a default access list.")
+            finally:
+                os.close(descriptor)
+    except (OSError, ValueError) as error:
+        pytest.fail(
+            "Test scratch root must be an existing directory owned by the user with mode 0700 "
+            f"and no extended access list: {error}"
+        )
+
+
 @pytest.fixture
-def tmp_path():
+def tmp_path(scratch_root):
     """Provide fresh scratch and remove it, including sibling fixtures, after each test."""
-    # Keep physical fixtures separate from the OS /tmp namespace used by native setup.
-    parent = "/var/tmp" if Path(tempfile.gettempdir()).resolve() == Path("/tmp") else None
-    with tempfile.TemporaryDirectory(prefix="loop-test-", dir=parent) as directory:
+    try:
+        temporary = tempfile.TemporaryDirectory(prefix="", dir=scratch_root)
+    except OSError as error:
+        pytest.fail(f"Cannot create test scratch in LOOP_TEST_SCRATCH_ROOT: {error}")
+    with temporary as directory:
         workspace = Path(directory).resolve() / "workspace"
         workspace.mkdir(mode=0o700)
         yield workspace
@@ -117,6 +176,13 @@ def tmp_path():
 @pytest.fixture
 def environment_patch(tmp_path):
     """Keep fixture environment ownership independent of case-specific mocks."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
+
+
+@pytest.fixture
+def monkeypatch(environment_patch):
+    """Restore case-specific patches before the owning environment is removed."""
     with pytest.MonkeyPatch.context() as patch:
         yield patch
 
@@ -193,6 +259,33 @@ def native_directory(isolated_environment):
     for path in reversed(directories):
         if path.exists() or path.is_symlink():
             shutil.rmtree(path)
+        _NATIVE_OUTPUT_ROOTS.remove(str(path))
+
+
+@pytest.fixture
+def native_file(isolated_environment):
+    """Own exact disposable files on a native filesystem while retaining output guards."""
+    files = []
+
+    def create(parent, *, name):
+        """Register and exclusively create one fresh canonical child file."""
+        parent = Path(parent).resolve(strict=True)
+        assert Path(name).name == name and name not in {".", ".."}
+        path = parent / name
+        assert not path.exists() and not path.is_symlink()
+        _NATIVE_OUTPUT_ROOTS.append(str(path))
+        try:
+            with path.open("x", encoding="utf-8"):
+                pass
+        except BaseException:
+            _NATIVE_OUTPUT_ROOTS.remove(str(path))
+            raise
+        files.append(path)
+        return path
+
+    yield create
+    for path in reversed(files):
+        path.unlink(missing_ok=True)
         _NATIVE_OUTPUT_ROOTS.remove(str(path))
 
 

@@ -112,25 +112,38 @@ def test_runtime_sources_are_pinned_readonly_and_closed(preparation, monkeypatch
     canonical.stat.return_value = details
     roots = Mock(return_value=(Path("/bin"),))
     protected = Mock(return_value=canonical)
-    opened = Mock(return_value=12)
+    descriptor = 1_000_000
     closed = Mock()
+    original_open = linux_namespace.os.open
+    original_fstat = linux_namespace.os.fstat
+    original_close = linux_namespace.os.close
+
+    def open_runtime(path, flags, *args, **kwargs):
+        """Fake only the selected runtime source and open other paths normally."""
+        return descriptor if path is canonical else original_open(path, flags, *args, **kwargs)
+
+    bound = details
+
+    def stat_runtime(fd):
+        """Return selected runtime metadata without affecting other descriptors."""
+        return bound if fd == descriptor else original_fstat(fd)
+
+    def close_runtime(fd):
+        """Record only the selected runtime close and preserve other closes."""
+        if fd == descriptor:
+            closed(fd)
+        else:
+            original_close(fd)
+
     monkeypatch.setattr(linux_namespace, "runtime_read_roots", roots)
     monkeypatch.setattr(linux_namespace, "protected_path", protected)
-    monkeypatch.setattr(linux_namespace.os, "open", opened)
-    monkeypatch.setattr(linux_namespace.os, "close", closed)
-    monkeypatch.setattr(linux_namespace.os, "fstat", Mock(return_value=details))
+    monkeypatch.setattr(linux_namespace.os, "open", open_runtime)
+    monkeypatch.setattr(linux_namespace.os, "close", close_runtime)
+    monkeypatch.setattr(linux_namespace.os, "fstat", stat_runtime)
     if failure == "flag":
         monkeypatch.delattr(linux_namespace.os, "O_PATH")
     elif failure == "identity":
-        monkeypatch.setattr(
-            linux_namespace.os,
-            "fstat",
-            Mock(
-                return_value=SimpleNamespace(
-                    st_dev=1, st_ino=3, st_mode=0o40755, st_uid=0, st_gid=0
-                )
-            ),
-        )
+        bound = SimpleNamespace(st_dev=1, st_ino=3, st_mode=0o40755, st_uid=0, st_gid=0)
     elif failure == "alias":
         protected.side_effect = [canonical, Path("/changed")]
     elif failure == "path":
@@ -148,7 +161,7 @@ def test_runtime_sources_are_pinned_readonly_and_closed(preparation, monkeypatch
         ):
             pytest.fail("Unsafe runtime was accepted")
         if failure != "flag":
-            closed.assert_called_once_with(12)
+            closed.assert_called_once_with(descriptor)
     else:
         with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
             arguments,
@@ -156,10 +169,17 @@ def test_runtime_sources_are_pinned_readonly_and_closed(preparation, monkeypatch
         ):
             assert arguments[
                 arguments.index("--ro-bind-fd") : arguments.index("--ro-bind-fd") + 6
-            ] == ("--ro-bind-fd", "12", str(canonical), "--symlink", str(canonical), "/bin")
-            assert descriptors == (12, 4, 7)
+            ] == (
+                "--ro-bind-fd",
+                str(descriptor),
+                str(canonical),
+                "--symlink",
+                str(canonical),
+                "/bin",
+            )
+            assert descriptors == (descriptor, 4, 7)
             closed.assert_not_called()
-        closed.assert_called_once_with(12)
+        closed.assert_called_once_with(descriptor)
 
 
 def test_runtime_path_alias_is_recreated_when_request_mount_is_skipped(

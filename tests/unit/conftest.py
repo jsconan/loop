@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -41,9 +42,106 @@ _EXTERNAL_EVENTS = frozenset(
 _BOUNDARIES_GUARDED = False
 
 
+@pytest.fixture
+def shebang_root(tmp_path, monkeypatch):
+    """Keep interpreter fixtures in scratch while giving their shebangs a logical path."""
+    if not any(character.isspace() for character in str(tmp_path)):
+        return tmp_path
+
+    from loop.execution import facade
+    from loop.execution.sandbox import contracts
+
+    logical = Path("/loop-test-shebang")
+    physical_prefix = os.fsencode(str(tmp_path))
+    logical_prefix = os.fsencode(str(logical))
+    original_read = facade.os.read
+    original_select = facade._selected_executable
+    original_relative = Path.is_relative_to
+
+    def read(descriptor, size):
+        """Render scratch interpreter prefixes without changing the physical fixture."""
+        content = original_read(descriptor, size)
+        if content.startswith(b"#!"):
+            offset = 2
+            while content[offset : offset + 1] in (b" ", b"\t"):
+                offset += 1
+            prefix = physical_prefix + b"/"
+            if content[offset:].startswith(prefix):
+                return content[:offset] + logical_prefix + content[offset + len(physical_prefix) :]
+        return content
+
+    def select(name, path_value, cwd):
+        """Resolve the logical interpreter through its owned physical spelling."""
+        path = Path(name)
+        if original_relative(path, logical):
+            name = str(tmp_path / path.relative_to(logical))
+        return original_select(name, path_value, cwd)
+
+    def is_relative_to(path, other):
+        """Recognize logical interpreter paths within their physical fixture workspace."""
+        if original_relative(path, logical):
+            path = tmp_path / path.relative_to(logical)
+        return original_relative(path, other)
+
+    mapped_os = SimpleNamespace(**vars(facade.os))
+    mapped_os.read = read
+    monkeypatch.setattr(facade, "os", mapped_os)
+    monkeypatch.setattr(facade, "_selected_executable", select)
+    monkeypatch.setattr(contracts, "resolve_selected_executable", select)
+    monkeypatch.setattr(Path, "is_relative_to", is_relative_to)
+    return tmp_path
+
+
+@pytest.fixture
+def logical_command_alias(monkeypatch):
+    """Give owned physical aliases shell-safe logical spellings for request tests."""
+    lstat, resolve, open_file = Path.lstat, Path.resolve, os.open
+    aliases = {}
+    parents = {}
+
+    def mapped_lstat(path, *args, **kwargs):
+        """Read actual metadata for the exact logical alias or parent."""
+        return lstat(aliases.get(path, parents.get(path, path)), *args, **kwargs)
+
+    def mapped_resolve(path, *args, **kwargs):
+        """Resolve real aliases and accept logical parents only if canonical."""
+        for alias, physical in aliases.items():
+            if path.is_relative_to(alias):
+                return resolve(physical / path.relative_to(alias), *args, **kwargs)
+        if path in parents:
+            physical = parents[path]
+            resolved = resolve(physical, *args, **kwargs)
+            return path if resolved == physical else resolved
+        return resolve(path, *args, **kwargs)
+
+    def mapped_open(path, flags, *args, **kwargs):
+        """Open the physical directory when binding the logical mount source."""
+        return open_file(parents.get(path, path), flags, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", mapped_lstat)
+    monkeypatch.setattr(Path, "resolve", mapped_resolve)
+    monkeypatch.setattr(os, "open", mapped_open)
+
+    def bind(physical, *, child=None):
+        """Map an alias and relevant directory identities to their actual inodes."""
+        parent = Path("/unit-command-alias") / str(len(aliases)) / "parent"
+        alias = parent / physical.name
+        parents[parent] = physical.parent
+        if child is not None:
+            parents[parent.parent] = physical.parent.parent
+            parents[parent / child.name] = child
+        aliases[alias] = physical
+        return alias
+
+    return bind
+
+
 def _audit_external_resources(event, arguments):
-    """Reject native calls even when a caller retained a pre-fixture function alias."""
-    if _BOUNDARIES_GUARDED and event in _EXTERNAL_EVENTS:
+    """Reject external calls while permitting in-process Unix socket pairs."""
+    if _BOUNDARIES_GUARDED and (
+        event in _EXTERNAL_EVENTS
+        or (event == "socket.__new__" and (len(arguments) < 2 or arguments[1] != socket.AF_UNIX))
+    ):
         forbidden_resource()
 
 
