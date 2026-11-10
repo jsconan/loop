@@ -11,6 +11,7 @@ OMIT = Omit()
 
 # Application directory and configuration
 APP_NAME = "loop"
+APP_DISPLAY_NAME = APP_NAME.capitalize()
 APP_DIRECTORY = Path(f".{APP_NAME}")
 APP_CONFIGURATION_FILENAME = "config.toml"
 
