@@ -2,6 +2,7 @@
 
 import ctypes
 import errno
+import io
 import logging
 import os
 import subprocess
@@ -13,12 +14,33 @@ from unittest.mock import MagicMock
 import pytest
 
 from loop.utils.process import (
+    CapturedChunks,
     ProcessCaptureStatus,
+    is_finite_deadline,
     kill_process_group,
     parse_command_line,
     read_bounded_stream,
+    render_terminal_text,
     supervise_process,
 )
+
+
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [(0, True), (1.5, True), (True, False), ("1", False), (10**1000, False)],
+)
+def test_deadline_validation_accepts_only_representable_numeric_values(value, valid):
+    """Validation rejects booleans, nonnumeric values, and unrepresentable integers."""
+    assert is_finite_deadline(value) is valid
+
+
+def test_terminal_output_renders_controls_without_executing_ansi_or_clipboard_sequences():
+    """Untrusted cursor, clipboard and hyperlink controls become visible text only."""
+    source = "hello\x1b[31m\x1b]52;c;secret\x07\r\n\t\x7f\x9b"
+    assert (
+        render_terminal_text(source)
+        == "hello\u241b[31m\u241b]52;c;secret\u2407\u240d\n\u2409\u2421\ufffd"
+    )
 
 
 @pytest.fixture
@@ -76,6 +98,52 @@ def test_parse_command_line_rejects_incomplete_or_unquoted_shell_syntax(command)
         parse_command_line(command)
 
 
+@pytest.mark.parametrize("preserve", [False, True])
+def test_supervised_reader_preserves_requested_newline_semantics(monkeypatch, process_os, preserve):
+    """Cooperative pipe polling retains the text stream's newline behavior."""
+
+    class PollableBytes(io.BytesIO):
+        """Represent already-available bytes behind a selectable descriptor."""
+
+        def fileno(self):
+            return 42
+
+    poller = MagicMock()
+    poller.poll.side_effect = [[], [(42, 1)], [(42, 1)], [(42, 1)]]
+    monkeypatch.setattr("loop.utils.process.select.poll", lambda: poller)
+    stream = io.TextIOWrapper(PollableBytes(b"a\r\nb\r"), encoding="utf-8")
+    chunks = CapturedChunks("stdout", None, threading.Event(), preserve)
+    assert read_bounded_stream(stream, chunks) == 0
+    assert "".join(chunks) == ("a\r\nb\r" if preserve else "a\nb\n")
+    poller.register.assert_called_once()
+
+
+def test_supervised_reader_stops_when_no_pipe_data_arrives(monkeypatch, process_os):
+    """An idle inherited pipe stops promptly without pretending its output was complete."""
+
+    class PollableBytes(io.BytesIO):
+        """Represent a selectable pipe whose writer remains open."""
+
+        def fileno(self):
+            return 42
+
+    stop = threading.Event()
+    poller = MagicMock()
+
+    def stop_waiting(_timeout):
+        """Request cleanup while the mocked pipe is idle."""
+        stop.set()
+        return []
+
+    poller.poll.side_effect = stop_waiting
+    monkeypatch.setattr("loop.utils.process.select.poll", lambda: poller)
+    stream = io.TextIOWrapper(PollableBytes(), encoding="utf-8")
+    chunks = CapturedChunks("stdout", None, stop)
+    assert read_bounded_stream(stream, chunks) is None
+    assert stream.closed
+    assert not chunks
+
+
 def test_read_bounded_stream_drains_every_chunk_but_retains_the_configured_limit():
     """Output draining continues past the retained budget to avoid blocked child processes."""
     stream = MagicMock()
@@ -116,12 +184,12 @@ def test_read_bounded_stream_reports_no_discarded_characters_within_limit():
 
 
 def test_read_bounded_stream_tolerates_supervisor_pipe_close():
-    """An intentional descriptor close during timeout cleanup ends the reader quietly."""
+    """A closed descriptor reports unknown drain completeness without losing captured text."""
     stream = MagicMock()
     stream.read.side_effect = ["partial", OSError(errno.EBADF, "Bad file descriptor")]
     chunks = []
 
-    assert read_bounded_stream(stream, chunks, maximum=20) == 0
+    assert read_bounded_stream(stream, chunks, maximum=20) is None
     assert chunks == ["partial"]
 
 
@@ -132,6 +200,16 @@ def test_read_bounded_stream_preserves_unrelated_read_failures():
 
     with pytest.raises(OSError, match="I/O error"):
         read_bounded_stream(stream, [], maximum=20)
+
+
+def test_read_bounded_stream_accepts_only_an_explicit_pty_eof():
+    """A PTY's EIO end condition completes capture without weakening pipe error handling."""
+    stream = MagicMock()
+    stream.read.side_effect = ["terminal", OSError(errno.EIO, "slave closed")]
+    chunks = []
+
+    assert read_bounded_stream(stream, chunks, maximum=4, eof_errno=errno.EIO) == 4
+    assert chunks == ["term"]
 
 
 def test_read_bounded_stream_preserves_unrelated_close_failures():
@@ -392,12 +470,12 @@ def test_kill_process_group_uses_the_portable_single_process_fallback(monkeypatc
 
 
 def test_read_bounded_stream_tolerates_already_closed_descriptor():
-    """Cleanup ignores EBADF when a supervisor has already closed the reader descriptor."""
+    """A descriptor closed during cleanup leaves drain completeness unknown."""
     stream = MagicMock()
     stream.read.return_value = ""
     stream.close.side_effect = OSError(errno.EBADF, "already closed")
 
-    assert read_bounded_stream(stream, [], maximum=20) == 0
+    assert read_bounded_stream(stream, [], maximum=20) is None
 
 
 @pytest.mark.parametrize("missing", ["stdout", "stderr"])
@@ -426,6 +504,76 @@ def test_supervise_process_reaps_child_when_missing_pipe_termination_fails(missi
     process.wait.assert_called_once()
 
 
+def test_supervise_process_rejects_invalid_deadline_with_missing_pipe():
+    """Invalid deadlines still terminate and reap a child with a missing capture pipe."""
+    process = MagicMock(returncode=-9, stdout=None)
+    terminate = MagicMock()
+    with pytest.raises(ValueError, match="Process deadline must be finite"):
+        supervise_process(process, float("nan"), terminate=terminate)
+    terminate.assert_called_once_with(process)
+    process.wait.assert_called_once()
+
+
+@pytest.mark.parametrize("deadline", [float("nan"), float("inf"), float("-inf")])
+def test_supervise_process_reaps_child_when_deadline_is_nonfinite(process_os, deadline):
+    """An invalid deadline still terminates and reaps the already-started child."""
+    process = MagicMock(returncode=-9)
+    terminate = MagicMock()
+    with pytest.raises(ValueError, match="Process deadline must be finite"):
+        supervise_process(process, deadline, terminate=terminate)
+    terminate.assert_called_once_with(process)
+    process.wait.assert_called_once()
+    process.stdout.close.assert_called_once()
+    process.stderr.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("failure", "index", "alive", "exception"),
+    [
+        ("construct", 0, False, RuntimeError("reader setup failed")),
+        ("construct", 1, False, RuntimeError("reader setup failed")),
+        ("start", 0, False, RuntimeError("reader setup failed")),
+        ("start", 1, False, RuntimeError("reader setup failed")),
+        ("start", 1, True, RuntimeError("reader setup failed")),
+        ("start", 0, False, KeyboardInterrupt()),
+    ],
+)
+def test_supervise_process_cleans_up_when_reader_setup_fails(
+    process_os, failure, index, alive, exception
+):
+    """A reader setup error cannot leave the already spawned process unsupervised."""
+    process = MagicMock(returncode=-9)
+    terminate = MagicMock()
+    threads = [MagicMock(), MagicMock()]
+    for thread in threads:
+        thread.is_alive.return_value = False
+    if alive:
+        threads[index].is_alive.side_effect = [True, False]
+    if failure == "start":
+        threads[index].start.side_effect = exception
+    created = []
+
+    def make_thread(**_kwargs):
+        """Return controlled reader threads or fail while constructing one."""
+        current = len(created)
+        if failure == "construct" and current == index:
+            raise exception
+        created.append(threads[current])
+        return threads[current]
+
+    with pytest.raises(type(exception)):
+        supervise_process(process, 100, terminate=terminate, thread_factory=make_thread)
+
+    terminate.assert_called_once_with(process)
+    process.wait.assert_called_once()
+    if failure == "start" and (index == 1 or alive):
+        threads[0].join.assert_called_once()
+    if failure == "start" and alive:
+        threads[index].join.assert_called_once()
+    process.stdout.close.assert_called_once()
+    process.stderr.close.assert_called_once()
+
+
 def test_supervise_process_drains_fake_child_and_bounds_output(process_os):
     """Both streams are drained and truncated without launching a real child."""
     process = MagicMock(returncode=7)
@@ -443,6 +591,236 @@ def test_supervise_process_drains_fake_child_and_bounds_output(process_os):
     terminate.assert_called_once_with(process)
     assert process.wait.call_count == 1
     process_os.waitid.assert_called_once_with(1, process.pid, 1 | 2 | 4)
+
+
+def test_supervise_process_observes_output_beyond_final_capture(process_os):
+    """A live observer receives later stdout and stderr while final capture stays bounded."""
+    process = MagicMock(returncode=0)
+    process.stdout.read.side_effect = ["abcdef", "later", ""]
+    process.stderr.read.side_effect = ["xy", ""]
+    observed = []
+
+    capture = supervise_process(
+        process,
+        time.monotonic() + 1,
+        stdout_limit=3,
+        output_observer=lambda stream, chunk: observed.append((stream, chunk)),
+    )
+
+    assert [(stream, chunk) for stream, chunk in observed if stream == "stdout"] == [
+        ("stdout", "abcdef"),
+        ("stdout", "later"),
+    ]
+    assert ("stderr", "xy") in observed
+    assert capture.stdout == "abc"
+    assert capture.stderr == "xy"
+    assert capture.stdout_discarded == 8
+
+
+def test_supervise_process_preserves_capture_when_live_observer_fails(process_os):
+    """A failed live sink retains the bounded chunk and reports incomplete capture."""
+    process = MagicMock(returncode=0)
+    process.stdout.read.side_effect = ["abcdef", ""]
+    process.stderr.read.return_value = ""
+
+    def fail_observer(_stream, _chunk):
+        """Model a failed live output consumer."""
+        raise OSError("live sink failed")
+
+    capture = supervise_process(
+        process, time.monotonic() + 1, stdout_limit=3, output_observer=fail_observer
+    )
+
+    assert capture.status is ProcessCaptureStatus.UNAVAILABLE
+    assert capture.stdout == "abc"
+    assert capture.stdout_discarded is None
+
+
+def test_supervise_process_decodes_available_live_bytes_before_pipe_eof(process_os):
+    """Live capture decodes split UTF-8 and preserves newlines from available pipe chunks."""
+
+    class AvailableBytes(io.BytesIO):
+        """Supply one raw byte per read without waiting for the whole text stream."""
+
+        def read1(self, size):
+            """Return the next available raw byte even when a larger read was requested."""
+            return super().read(min(size, 1))
+
+    process = MagicMock(returncode=0)
+    process.stdout = io.TextIOWrapper(AvailableBytes("é\r\nnext".encode()), encoding="utf-8")
+    process.stderr = io.TextIOWrapper(AvailableBytes(b"err"), encoding="utf-8")
+    observed = []
+
+    capture = supervise_process(
+        process,
+        time.monotonic() + 1,
+        preserve_newlines=True,
+        output_observer=lambda stream, chunk: observed.append((stream, chunk)),
+    )
+
+    assert capture.status is ProcessCaptureStatus.COMPLETED
+    assert capture.stdout == "é\r\nnext"
+    assert "".join(chunk for stream, chunk in observed if stream == "stdout") == capture.stdout
+    assert "".join(chunk for stream, chunk in observed if stream == "stderr") == "err"
+
+
+@pytest.mark.parametrize(
+    ("data", "limit", "expected", "discarded"),
+    [(b"\xc3", 0, "", 1), (b"\xc3", 1, "\ufffd", 0), (b"ok", 2, "ok", 0)],
+)
+def test_supervise_process_flushes_partial_utf8_at_pty_eof(
+    process_os, data, limit, expected, discarded
+):
+    """A closing PTY counts incomplete UTF-8 and handles a fully decoded final chunk."""
+
+    class PtyBytes(io.BytesIO):
+        """Raise the native PTY EOF error after the supplied bytes are decoded."""
+
+        def read1(self, size):
+            """Return a byte once and then report the closed slave."""
+            value = super().read(min(size, 1))
+            if value:
+                return value
+            raise OSError(errno.EIO, "slave closed")
+
+    process = MagicMock(returncode=0)
+    process.stdout = io.TextIOWrapper(PtyBytes(data), encoding="utf-8", errors="replace")
+    process.stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    observed = []
+
+    def read(stream, chunks, *, maximum):
+        """Apply terminal EOF semantics to only the owned PTY stream."""
+        return read_bounded_stream(
+            stream,
+            chunks,
+            maximum=maximum,
+            eof_errno=errno.EIO if stream is process.stdout else None,
+        )
+
+    capture = supervise_process(
+        process,
+        time.monotonic() + 1,
+        stdout_limit=limit,
+        reader=read,
+        output_observer=lambda stream, chunk: observed.append((stream, chunk)),
+    )
+
+    assert capture.status is ProcessCaptureStatus.COMPLETED
+    assert capture.stdout == expected
+    assert capture.stdout_discarded == discarded
+    assert "".join(content for stream, content in observed if stream == "stdout") == data.decode(
+        "utf-8", errors="replace"
+    )
+
+
+@pytest.mark.parametrize("failed_stream", ["stdout", "stderr"])
+@pytest.mark.parametrize("failure", ["exception", "incomplete"])
+def test_supervise_process_does_not_report_success_after_reader_failure(
+    process_os, failed_stream, failure
+):
+    """A failed reader preserves partial output and cannot report a complete successful capture."""
+    process = MagicMock(returncode=0)
+    uncaught = []
+
+    def reader(stream, chunks, *, maximum):
+        """Produce controlled output and fail only for the selected pipe."""
+        chunks.append("partial" if stream is getattr(process, failed_stream) else "complete")
+        if stream is getattr(process, failed_stream):
+            if failure == "exception":
+                raise OSError(errno.EIO, "synthetic reader failure")
+            return None
+        return 0
+
+    def thread_factory(*, target, daemon):
+        """Model a finished reader thread without propagating its exception to start()."""
+        thread = MagicMock()
+
+        def start():
+            """Record an exception that would otherwise escape inside the reader thread."""
+            try:
+                target()
+            except OSError as error:
+                uncaught.append(error)
+
+        thread.start.side_effect = start
+        thread.is_alive.return_value = False
+        return thread
+
+    terminate = MagicMock()
+    capture = supervise_process(
+        process,
+        time.monotonic() + 1,
+        terminate=terminate,
+        reader=reader,
+        thread_factory=thread_factory,
+    )
+
+    assert capture.status is ProcessCaptureStatus.UNAVAILABLE
+    assert capture.exit_code is None
+    assert getattr(capture, failed_stream) == "partial"
+    assert getattr(capture, f"{failed_stream}_discarded") is None
+    assert not uncaught
+    terminate.assert_called_once_with(process)
+    process.wait.assert_called_once()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_supervise_process_keeps_interruption_outcome_when_reader_fails(process_os, cancelled):
+    """Timeout and cancellation remain distinct while a failed drain stays incomplete."""
+    process = MagicMock(returncode=-9)
+    process.stdout.read.side_effect = ["partial", OSError(errno.EIO, "reader failed")]
+    process.stderr.read.return_value = ""
+    event = threading.Event()
+    if cancelled:
+        event.set()
+    else:
+        process_os.waitid.side_effect = None
+        process_os.waitid.return_value = None
+
+    capture = supervise_process(
+        process,
+        time.monotonic() + 1 if cancelled else time.monotonic() - 1,
+        terminate=MagicMock(),
+        cancel_event=event,
+    )
+
+    assert capture.status is (
+        ProcessCaptureStatus.CANCELLED if cancelled else ProcessCaptureStatus.TIMED_OUT
+    )
+    assert capture.stdout == "partial" and capture.stdout_discarded is None
+    assert capture.stderr_discarded == 0
+
+
+def test_supervise_process_configures_payload_pipes_before_reading(process_os):
+    """Payload readers preserve carriage returns and existing decoded-character bounds."""
+    process = MagicMock(returncode=0)
+    process.stdout.read.side_effect = ["a\rb\r\nc\n", ""]
+    process.stderr.read.side_effect = ["x\ry", ""]
+
+    capture = supervise_process(
+        process, time.monotonic() + 1, terminate=MagicMock(), preserve_newlines=True
+    )
+
+    assert capture.stdout == "a\rb\r\nc\n"
+    assert capture.stderr == "x\ry"
+    process.stdout.reconfigure.assert_called_once_with(newline="")
+    process.stderr.reconfigure.assert_called_once_with(newline="")
+
+
+@pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
+def test_supervise_process_reaps_child_when_pipe_configuration_fails(process_os, stream_name):
+    """Failed text-pipe configuration still terminates and reaps the owned child."""
+    process = MagicMock(returncode=-9)
+    getattr(process, stream_name).reconfigure.side_effect = OSError("pipe setup failed")
+    terminate = MagicMock()
+
+    with pytest.raises(OSError, match="pipe setup failed"):
+        supervise_process(process, 100, terminate=terminate, preserve_newlines=True)
+
+    terminate.assert_called_once_with(process)
+    process.wait.assert_called_once()
+    process.stdout.close.assert_called_once()
+    process.stderr.close.assert_called_once()
 
 
 def test_supervise_process_reaps_child_after_group_signal_failure(process_os):

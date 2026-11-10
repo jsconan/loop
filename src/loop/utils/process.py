@@ -1,7 +1,9 @@
 """Provide safe process invocation utilities."""
 
+import codecs
 import ctypes
 import errno
+import io
 import logging
 import os
 import select
@@ -13,11 +15,27 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, cast
 
 from .. import constants
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def is_finite_deadline(value: object) -> bool:
+    """Check whether a deadline is a finite, representable numeric value.
+
+    Args:
+        value (object): Candidate monotonic deadline or duration.
+
+    Returns:
+        bool: Whether the value is a non-boolean integer or float representable as a float.
+    """
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and -sys.float_info.max <= value <= sys.float_info.max
+    )
 
 
 class TextStream(Protocol):
@@ -39,17 +57,39 @@ class ProcessCaptureStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+def render_terminal_text(value: str) -> str:
+    """Render untrusted terminal controls visibly without executing ANSI or OSC sequences.
+
+    Args:
+        value (str): Untrusted text that may contain terminal control characters.
+
+    Returns:
+        str: Equal-length text with C0 and DEL shown as control pictures, C1 replaced, and
+            line feeds preserved for ordinary reading.
+    """
+    return "".join(
+        "\ufffd"
+        if 0x80 <= ord(character) <= 0x9F
+        else "\u2421"
+        if character == "\x7f"
+        else chr(0x2400 + ord(character))
+        if ord(character) < 0x20 and character != "\n"
+        else character
+        for character in value
+    )
+
+
 @dataclass(frozen=True)
 class ProcessCapture:
     """Hold bounded child output and supervision outcome.
 
     Args:
-        status (ProcessCaptureStatus): Lifecycle result.
+        status (ProcessCaptureStatus): Lifecycle result, or unavailable if capture fails.
         exit_code (int | None): Child exit status on completion.
         stdout (str): Captured standard output.
         stderr (str): Captured standard error.
-        stdout_discarded (int | None): Characters discarded, or unknown if draining stalled.
-        stderr_discarded (int | None): Characters discarded, or unknown if draining stalled.
+        stdout_discarded (int | None): Characters discarded, or unknown if draining failed.
+        stderr_discarded (int | None): Characters discarded, or unknown if draining failed.
     """
 
     status: ProcessCaptureStatus
@@ -58,6 +98,44 @@ class ProcessCapture:
     stderr: str = ""
     stdout_discarded: int | None = 0
     stderr_discarded: int | None = 0
+
+
+class CapturedChunks(list[str]):
+    """Retain bounded stream chunks and publish live output to an optional observer.
+
+    Args:
+        stream (str): Stream name supplied with each observed chunk.
+        observer (Callable[[str, str], None] | None): Recipient of live decoded chunks.
+        stop (threading.Event | None): Cooperative reader shutdown signal, when supervised.
+        preserve_newlines (bool): Whether to preserve native newline characters.
+    """
+
+    _stream: str
+    observer: Callable[[str, str], None] | None
+    stop: threading.Event | None
+    preserve_newlines: bool
+
+    def __init__(
+        self,
+        stream: str,
+        observer: Callable[[str, str], None] | None,
+        stop: threading.Event | None = None,
+        preserve_newlines: bool = False,
+    ) -> None:
+        super().__init__()
+        self._stream = stream
+        self.observer = observer
+        self.stop = stop
+        self.preserve_newlines = preserve_newlines
+
+    def observe(self, value: str) -> None:
+        """Publish a decoded chunk independently of the final capture limit.
+
+        Args:
+            value (str): Decoded output to send to the observer.
+        """
+        if self.observer is not None:
+            self.observer(self._stream, value)
 
 
 _SHELL_SYNTAX = frozenset("|;&<>`()$")
@@ -141,7 +219,8 @@ def read_bounded_stream(
     *,
     chunk_size: int = constants.DEFAULT_STREAM_CHUNK_SIZE,
     maximum: int = constants.MAX_OUTPUT_CHARS,
-) -> int:
+    eof_errno: int | None = None,
+) -> int | None:
     """Drain and close a text stream while retaining the requested character limit.
 
     Args:
@@ -151,33 +230,99 @@ def read_bounded_stream(
             Defaults to ``constants.DEFAULT_STREAM_CHUNK_SIZE``.
         maximum (int, optional): Maximum total characters retained in ``chunks``.
             Defaults to ``constants.MAX_OUTPUT_CHARS``.
+        eof_errno (int | None): Native PTY read error that means its last slave closed. Ordinary
+            pipes leave this unset so an I/O error never becomes a complete capture.
 
     Returns:
-        int: Number of characters discarded after the capture limit.
+        int | None: Number of characters discarded after the capture limit, or ``None`` when
+            a closed descriptor prevents a complete drain.
+
+    Raises:
+        OSError: Reading or closing fails for a reason other than a closed descriptor.
     """
     remaining = maximum
     discarded = 0
+    incomplete = False
     try:
-        while True:
+        buffer = getattr(stream, "buffer", None)
+        supervised = (
+            isinstance(chunks, CapturedChunks)
+            and chunks.stop is not None
+            and os.name == "posix"
+            and isinstance(stream, io.TextIOWrapper)
+            and isinstance(buffer, io.BufferedIOBase)
+        )
+        descriptor = None
+        if supervised:
             try:
-                chunk = stream.read(chunk_size)
+                descriptor = stream.fileno()
+            except (OSError, ValueError):
+                supervised = False
+        read_available = (
+            getattr(buffer, "read1", None)
+            if isinstance(chunks, CapturedChunks)
+            and (chunks.observer is not None or supervised)
+            and isinstance(buffer, io.BufferedIOBase)
+            else None
+        )
+        decoder = (
+            codecs.getincrementaldecoder(stream.encoding or "utf-8")(
+                errors=stream.errors or "replace"
+            )
+            if callable(read_available)
+            else None
+        )
+        if decoder is not None and supervised and chunks.observer is None:
+            decoder = io.IncrementalNewlineDecoder(decoder, not chunks.preserve_newlines)
+        poller = None
+        if supervised:
+            poller = select.poll()
+            poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+        while True:
+            if poller is not None:
+                if chunks.stop.is_set():
+                    incomplete = True
+                    break
+                if not poller.poll(50):
+                    continue
+            try:
+                if decoder is None:
+                    chunk = stream.read(chunk_size)
+                else:
+                    data = read_available(chunk_size)
+                    chunk = decoder.decode(data, final=not data)
             except OSError as exc:
+                if eof_errno is not None and exc.errno == eof_errno:
+                    if decoder is not None:
+                        tail = decoder.decode(b"", final=True)
+                        if tail:
+                            discarded += max(0, len(tail) - remaining)
+                            if remaining:
+                                chunks.append(tail[:remaining])
+                            cast(CapturedChunks, chunks).observe(tail)
+                    break
                 if exc.errno != errno.EBADF:
                     raise
+                incomplete = True
                 break
             if not chunk:
+                if decoder is not None and data:
+                    continue
                 break
             discarded += max(0, len(chunk) - remaining)
             if remaining:
                 chunks.append(chunk[:remaining])
                 remaining -= len(chunk[:remaining])
+            if isinstance(chunks, CapturedChunks):
+                chunks.observe(chunk)
     finally:
         try:
             stream.close()
         except OSError as exc:
             if exc.errno != errno.EBADF:
                 raise
-    return discarded
+            incomplete = True
+    return None if incomplete else discarded
 
 
 def kill_process_group(process: subprocess.Popen[str]) -> None:
@@ -362,17 +507,22 @@ def supervise_process(
     stdout_limit: int = constants.MAX_OUTPUT_CHARS,
     stderr_limit: int = constants.MAX_OUTPUT_CHARS,
     terminate: Callable[[subprocess.Popen[str]], None] = kill_process_group,
-    reader: Callable[..., int] = read_bounded_stream,
+    reader: Callable[..., int | None] = read_bounded_stream,
     thread_factory: Callable[..., threading.Thread] = threading.Thread,
     cancel_event: threading.Event | None = None,
+    preserve_newlines: bool = False,
+    output_observer: Callable[[str, str], None] | None = None,
 ) -> ProcessCapture:
-    """Drain bounded child output and capture the result after owned-group cleanup.
+    """Drain bounded child output and attempt owned-group cleanup before returning.
 
-    Observe leader exit without reaping it, then terminate and reap the group before taking the
-    output snapshot. This keeps the process-group identity pinned through cleanup. Give readers
+    Observe leader exit without reaping it, then signal the group and wait for its leader before
+    taking the output snapshot. The leader remains waitable until signaling is attempted. A
+    bounded wait can expire without confirming that the leader was reaped. Give readers
     a bounded cleanup interval to consume the resulting pipe EOF; incomplete draining retains
-    unknown discard counts. Observe cancellation while draining inherited pipes after leader
-    exit, and never extend the execution deadline.
+    unknown discard counts. A reader failure makes an otherwise completed capture unavailable.
+    Observe cancellation while draining inherited pipes after leader exit, and never extend the
+    execution deadline. Built-in POSIX pipe readers stop cooperatively during cleanup; an injected
+    reader or output observer that blocks indefinitely cannot be forcibly stopped by Python.
 
     Args:
         process (subprocess.Popen[str]): Child started in its own process group.
@@ -380,44 +530,76 @@ def supervise_process(
         stdout_limit (int): Maximum retained standard-output characters.
         stderr_limit (int): Maximum retained standard-error characters.
         terminate (Callable[[subprocess.Popen[str]], None]): Process-group terminator.
-        reader (Callable[..., int]): Bounded stream reader.
+        reader (Callable[..., int | None]): Bounded stream reader; ``None`` means incomplete.
         thread_factory (Callable[..., threading.Thread]): Reader-thread constructor.
         cancel_event (threading.Event | None): Optional event that requests cancellation before
             the process leader is reaped.
+        preserve_newlines (bool): Preserve CR and CRLF in the child text pipes. When true,
+            both pipes must support ``reconfigure`` and must not have been read yet.
+        output_observer (Callable[[str, str], None] | None): Optional callback receiving the
+            stream name and each decoded text portion, independently of final capture limits.
 
     Returns:
-        ProcessCapture: Exit, timeout, cancellation, or missing-pipe result.
+        ProcessCapture: Exit, timeout, cancellation, or unavailable capture result.
+
+    Raises:
+        BaseException: An operation or cleanup failure prevents a complete capture.
+        ValueError: The deadline is invalid; owned child cleanup is attempted before raising.
     """
     if process.stdout is None or process.stderr is None:
         try:
             terminate(process)
         finally:
             _wait_process(process)
+        if not is_finite_deadline(deadline):
+            raise ValueError("Process deadline must be finite.")
         return ProcessCapture(ProcessCaptureStatus.UNAVAILABLE)
 
     streams = (process.stdout, process.stderr)
-    chunks = ([], [])
-    discarded = [0, 0]
-    readers = [
-        thread_factory(
-            target=lambda index=i: discarded.__setitem__(
-                index,
-                reader(
-                    streams[index],
-                    chunks[index],
-                    maximum=stdout_limit if index == 0 else stderr_limit,
-                ),
-            ),
-            daemon=True,
-        )
-        for i in range(2)
-    ]
-
-    for thread in readers:
-        thread.start()
-
+    reader_stop = threading.Event()
+    chunks = (
+        CapturedChunks("stdout", output_observer, reader_stop, preserve_newlines),
+        CapturedChunks("stderr", output_observer, reader_stop, preserve_newlines),
+    )
+    discarded: list[int | None] = [0, 0]
+    readers = []
+    started_readers = []
+    setup_complete = False
     result = ProcessCapture(ProcessCaptureStatus.UNAVAILABLE)
+
+    def drain(index: int) -> None:
+        """Record reader failure without losing already captured output."""
+        try:
+            discarded[index] = reader(
+                streams[index],
+                chunks[index],
+                maximum=stdout_limit if index == 0 else stderr_limit,
+            )
+        except BaseException:  # noqa: BLE001 - the supervisor must report every reader failure.
+            discarded[index] = None
+
     try:
+        if not is_finite_deadline(deadline):
+            raise ValueError("Process deadline must be finite.")
+        if preserve_newlines:
+            for stream in streams:
+                stream.reconfigure(newline="")
+        for i in range(2):
+            readers.append(
+                thread_factory(
+                    target=lambda index=i: drain(index),
+                    daemon=True,
+                )
+            )
+        for thread in readers:
+            try:
+                thread.start()
+            except BaseException:
+                if thread.is_alive():
+                    started_readers.append(thread)
+                raise
+            started_readers.append(thread)
+        setup_complete = True
         wait_status = _wait_for_process_exit(process, deadline, cancel_event)
         if wait_status is ProcessCaptureStatus.CANCELLED:
             result = ProcessCapture(ProcessCaptureStatus.CANCELLED)
@@ -452,13 +634,17 @@ def supervise_process(
                 )
             else:
                 result = ProcessCapture(
-                    ProcessCaptureStatus.COMPLETED,
+                    ProcessCaptureStatus.UNAVAILABLE
+                    if None in discarded
+                    else ProcessCaptureStatus.COMPLETED,
                     stdout="".join(chunks[0]),
                     stderr="".join(chunks[1]),
                     stdout_discarded=discarded[0],
                     stderr_discarded=discarded[1],
                 )
     except KeyboardInterrupt:
+        if not setup_complete:
+            raise
         result = ProcessCapture(ProcessCaptureStatus.CANCELLED)
     finally:
         cleanup_error = None
@@ -473,11 +659,16 @@ def supervise_process(
             if cleanup_error is None:
                 cleanup_error = exc
 
-        for thread in readers:
+        reader_stop.set()
+        for thread in started_readers:
             thread.join(constants.COMMAND_CLEANUP_WAIT_SECONDS)
 
-        for thread, stream in zip(readers, streams, strict=True):
-            if thread.is_alive():
+        for index, stream in enumerate(streams):
+            if (
+                index < len(readers)
+                and readers[index] in started_readers
+                and readers[index].is_alive()
+            ):
                 try:
                     os.close(stream.fileno())
                 except (OSError, TypeError, ValueError):

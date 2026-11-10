@@ -79,6 +79,7 @@ __all__ = [
     "read_bounded_text",
     "register_cached_metadata",
     "register_shutdown_signals",
+    "render_terminal_text",
     "ripgrep_path",
     "run_in_worker_async",
     "safe_scalar",
@@ -167,6 +168,7 @@ from .process import (
     kill_process_group,
     parse_command_line,
     read_bounded_stream,
+    render_terminal_text,
     supervise_process,
 )
 from .rotating_file import PrivateRotatingTextFile
