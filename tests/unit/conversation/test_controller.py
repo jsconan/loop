@@ -693,6 +693,43 @@ def test_controller_accepts_durable_input_when_mailbox_has_capacity(ui):
     assert controller._inbox.size() == 1
 
 
+@pytest.mark.parametrize(
+    ("recalled", "submitted", "dispatch"),
+    [
+        (None, "/export", True),
+        ("wrong message", "/export", True),
+        ("/queue old", "/export", True),
+        ("/export original", "/export edited", False),
+        ("/export original", "ordinary message", False),
+    ],
+)
+def test_recalled_input_routes_new_commands(ui, monkeypatch, recalled, submitted, dispatch):
+    """A new slash command is dispatched while an edited literal command remains text."""
+    sessions = SessionManager(session_store=MemorySessionStore())
+    controller = SessionController(ui)
+    controller.bind_session_manager(sessions)
+    commands = CommandManager()
+    handler = AsyncMock(return_value=True)
+    monkeypatch.setattr(commands, "handle_user_command_async", handler)
+    controller.bind_command_manager(commands)
+
+    async def scenario():
+        """Submit the replacement through the same admission boundary as the editor."""
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(submitted)
+        await controller._accept_async(future, route_idle_commands=False, recalled_command=recalled)
+        if controller._command_task is not None:
+            await controller._command_task
+
+    asyncio.run(scenario())
+    if dispatch:
+        handler.assert_awaited_once()
+        assert not sessions.session.pending_inputs
+    else:
+        handler.assert_not_awaited()
+        assert [event.content for event in sessions.session.pending_inputs] == [submitted]
+
+
 def test_controller_accepts_durable_input_during_its_live_run(ui):
     """A controller-owned durable run does not activate the abandoned-run recovery gate."""
     manager = SessionManager(session_store=MemorySessionStore())

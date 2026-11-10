@@ -61,6 +61,16 @@ _INPUT_PRIORITY = 1
 _STATUS_COMPONENT = "session_controller"
 
 
+def _same_recalled_command(original: str | None, value: object) -> bool:
+    """Keep explicitly queued slash text literal only while editing the same command word."""
+    return (
+        original is not None
+        and original.startswith("/")
+        and isinstance(value, str)
+        and value.split(maxsplit=1)[:1] == original.split(maxsplit=1)[:1]
+    )
+
+
 class GuardedCompleter(Completer):
     """Read live completion sources only while their execution owner is idle.
 
@@ -1186,7 +1196,7 @@ class SessionController:
         incoming = asyncio.create_task(events.get())
         typing = None
         active_waiter = None
-        typing_bypass_commands = False
+        typing_recalled = None
         worker_done = False
         try:
             while True:
@@ -1207,7 +1217,7 @@ class SessionController:
                     and self._command_task is None
                 ):
                     if self._draft is not None:
-                        typing_bypass_commands = self._draft_bypass_commands
+                        typing_recalled = self._draft if self._draft_bypass_commands else None
                         typing = asyncio.create_task(
                             self._input.prompt_async(
                                 completer=self._completer,
@@ -1218,7 +1228,7 @@ class SessionController:
                         self._draft = None
                         self._draft_bypass_commands = False
                     else:
-                        typing_bypass_commands = False
+                        typing_recalled = None
                         typing = asyncio.create_task(
                             self._input.prompt_async(completer=self._completer, default="")
                         )
@@ -1257,13 +1267,15 @@ class SessionController:
                                 await self._accept_async(
                                     submitted,
                                     route_idle_commands=route_idle_commands,
-                                    bypass_commands=typing_bypass_commands,
+                                    recalled_command=typing_recalled,
                                 )
                         else:
                             draft = self._input.current_input()
                             if isinstance(draft, str):
                                 self._draft = draft
-                                self._draft_bypass_commands = typing_bypass_commands
+                                self._draft_bypass_commands = _same_recalled_command(
+                                    typing_recalled, draft
+                                )
                             self._input.set_current_input("")
                             typing.cancel()
                             await asyncio.gather(typing, return_exceptions=True)
@@ -1278,7 +1290,7 @@ class SessionController:
                         await self._accept_async(
                             submitted,
                             route_idle_commands=route_idle_commands,
-                            bypass_commands=typing_bypass_commands,
+                            recalled_command=typing_recalled,
                         )
                 if worker in done:
                     completion = ConversationCompletion(
@@ -1393,7 +1405,7 @@ class SessionController:
         submitted: asyncio.Task,
         *,
         route_idle_commands: bool,
-        bypass_commands: bool = False,
+        recalled_command: str | None = None,
     ) -> None:
         """Resolve input without hiding errors, then apply controls or admit ordinary text."""
         if self._stopping:
@@ -1401,6 +1413,7 @@ class SessionController:
                 submitted.result()
             return
         value = submitted.result()
+        bypass_commands = _same_recalled_command(recalled_command, value)
         if value is False:
             self._stop()
             self._source.info("Stopping after the active operation settles...")
