@@ -6,7 +6,7 @@ import os
 import stat
 import sys
 from collections.abc import Generator, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from importlib import import_module
 from pathlib import Path
 
@@ -19,6 +19,55 @@ _DARWIN_EXTENDED_ACL_TYPE = 0x100
 _DARWIN_FIRST_ACL_ENTRY = 0
 
 
+def open_selected_file(root: Path, path: Path, identity: tuple[int, int]) -> int:
+    """Open an identity-bound file through no-follow directory descriptors.
+
+    Args:
+        root (Path): Absolute real directory authorizing the selected file.
+        path (Path): Absolute file path strictly below that directory.
+        identity (tuple[int, int]): Expected file device and inode.
+
+    Returns:
+        int: Open read descriptor owned by the caller.
+
+    Raises:
+        ValueError: The selected path is not strictly inside the absolute root.
+        OSError: A directory or file is unavailable, aliased, or changed during opening.
+    """
+    if not root.is_absolute() or not path.is_absolute():
+        raise ValueError("Selected file requires absolute paths.")
+    relative = path.relative_to(root)
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError("Selected file must be inside its root.")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    before = root.lstat()
+    with ExitStack() as stack:
+        directory = os.open(root, flags)
+        stack.callback(os.close, directory)
+        bound = os.fstat(directory)
+        if not stat.S_ISDIR(before.st_mode) or (before.st_dev, before.st_ino) != (
+            bound.st_dev,
+            bound.st_ino,
+        ):
+            raise OSError("Selected file root changed before opening.")
+        for part in relative.parts[:-1]:
+            directory = os.open(part, flags, dir_fd=directory)
+            stack.callback(os.close, directory)
+        descriptor = os.open(
+            relative.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=directory,
+        )
+        try:
+            details = os.fstat(descriptor)
+            if (details.st_dev, details.st_ino) != identity:
+                raise OSError("Selected file changed before opening.")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+
 def ensure_private_directory(
     path: Path,
     *,
@@ -29,7 +78,8 @@ def ensure_private_directory(
 
     Create missing parents with mode ``0700`` using no-follow, directory-relative operations.
     Use search-only directory descriptors when available so traversal does not require permission
-    to list ancestor directories.
+    to list ancestor directories. On Linux, open the final directory for reading so its access
+    list can be inspected by descriptor.
     Require the selected directory to have mode ``0700`` and belong to the current user.
     Refuse unsafe existing directories without changing them, and verify the final path still
     names the opened directory.
@@ -47,10 +97,15 @@ def ensure_private_directory(
     """
     if not path.is_absolute() or path.resolve() != path:
         raise ValueError("Path must be a private real directory.")
-    flags = getattr(os, "O_SEARCH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    search_access = getattr(os, "O_SEARCH", getattr(os, "O_PATH", os.O_RDONLY))
+    common_flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    search_flags = search_access | common_flags
+    final_flags = (
+        os.O_RDONLY if search_access == getattr(os, "O_PATH", None) else search_access
+    ) | common_flags
     components = path.parts[1:]
     if anchor is None:
-        descriptor = os.open(path.anchor, flags)
+        descriptor = os.open(path.anchor, search_flags if components else final_flags)
     else:
         root, approved = anchor
         current = root.lstat()
@@ -66,7 +121,8 @@ def ensure_private_directory(
         components = path.relative_to(root).parts
         descriptor = os.dup(approved)
     try:
-        for component in components:
+        for index, component in enumerate(components):
+            flags = final_flags if index == len(components) - 1 else search_flags
             try:
                 child = os.open(component, flags, dir_fd=descriptor)
             except FileNotFoundError:
@@ -87,15 +143,25 @@ def ensure_private_directory(
             or details.st_uid != os.getuid()
             or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
             or (details.st_dev, details.st_ino) != (bound.st_dev, bound.st_ino)
-            or _has_directory_acl(descriptor)
+            or has_extended_access_acl(descriptor)
         ):
             raise ValueError("Path must be a private real directory.")
     finally:
         os.close(descriptor)
 
 
-def _has_directory_acl(descriptor: int) -> bool:
-    """Refuse extended access lists on harness-owned private directories."""
+def has_extended_access_acl(descriptor: int) -> bool:
+    """Inspect an open file or directory for an extended access control list.
+
+    Args:
+        descriptor (int): Open descriptor referring to the file or directory to inspect.
+
+    Returns:
+        bool: Whether an extended access control list is present, excluding Linux default ACLs.
+
+    Raises:
+        OSError: The access control list cannot be inspected safely.
+    """
     if sys.platform == "darwin":
         native = ctypes.CDLL(None, use_errno=True)
         native.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -118,6 +184,24 @@ def _has_directory_acl(descriptor: int) -> bool:
     try:
         return bool(os.getxattr(descriptor, "system.posix_acl_access"))
     except OSError as error:
+        if error.errno == errno.EBADF:
+            # Linux O_PATH descriptors need their held inode's procfs magic link.
+            link = f"/proc/self/fd/{descriptor}"
+            held = os.fstat(descriptor)
+            linked = os.stat(link)
+            identity = (held.st_dev, held.st_ino, stat.S_IFMT(held.st_mode))
+            if (linked.st_dev, linked.st_ino, stat.S_IFMT(linked.st_mode)) != identity:
+                raise OSError(errno.ESTALE, "Access-list descriptor target changed.")
+            try:
+                acl = os.getxattr(link, "system.posix_acl_access")
+            except OSError as fallback:
+                if fallback.errno not in (errno.ENODATA, errno.ENOTSUP):
+                    raise
+                acl = b""
+            linked = os.stat(link)
+            if (linked.st_dev, linked.st_ino, stat.S_IFMT(linked.st_mode)) != identity:
+                raise OSError(errno.ESTALE, "Access-list descriptor target changed.")
+            return bool(acl)
         if error.errno not in (errno.ENODATA, errno.ENOTSUP):
             raise
         return False

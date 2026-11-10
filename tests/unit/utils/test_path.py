@@ -16,9 +16,120 @@ from loop.utils import (
     find_project_root,
     is_path_ignored,
     iter_visible_paths,
+    open_selected_file,
+    private_directory_lock,
 )
 from loop.utils import path as path_module
-from loop.utils.path import private_directory_lock
+
+
+def test_open_selected_file_reads_identity_bound_file(tmp_path):
+    """A selected regular file opens through the approved directory and returns an owned fd."""
+    directory = tmp_path / "nested"
+    directory.mkdir()
+    source = directory / "file"
+    source.write_bytes(b"selected content")
+    details = source.stat()
+
+    descriptor = open_selected_file(tmp_path, source, (details.st_dev, details.st_ino))
+    try:
+        assert os.read(descriptor, 100) == b"selected content"
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "selection", ["relative-root", "relative-file", "root", "parent", "outside"]
+)
+def test_open_selected_file_rejects_paths_outside_its_root(tmp_path, selection):
+    """Relative, root-only and traversing paths do not select files under the root."""
+    choices = {
+        "relative-root": (Path("relative"), tmp_path / "file"),
+        "relative-file": (tmp_path, Path("relative")),
+        "root": (tmp_path, tmp_path),
+        "parent": (tmp_path, tmp_path / "nested/../file"),
+        "outside": (tmp_path, tmp_path.parent / "file"),
+    }
+    root, path = choices[selection]
+    with pytest.raises(ValueError):
+        open_selected_file(root, path, (0, 0))
+
+
+@pytest.mark.parametrize("component", ["root", "parent", "leaf"])
+def test_open_selected_file_refuses_symlink_substitutions(tmp_path, component):
+    """Root, ancestor and final-component links cannot redirect the selected read."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    source = outside / "source"
+    source.write_bytes(b"outside canary")
+    root = tmp_path / "root"
+    if component == "root":
+        root.symlink_to(outside, target_is_directory=True)
+        selected = root / "source"
+    else:
+        root.mkdir()
+        if component == "parent":
+            (root / "link").symlink_to(outside, target_is_directory=True)
+            selected = root / "link/source"
+        else:
+            selected = root / "source"
+            selected.symlink_to(source)
+    details = source.stat()
+    with pytest.raises(OSError):
+        open_selected_file(root, selected, (details.st_dev, details.st_ino))
+    assert source.read_bytes() == b"outside canary"
+
+
+def test_open_selected_file_rejects_file_identity_change(tmp_path):
+    """A replacement file is refused before the caller can read its contents."""
+    source = tmp_path / "source"
+    source.write_text("changed", encoding="utf-8")
+    details = source.stat()
+    with pytest.raises(OSError, match="Selected file changed"):
+        open_selected_file(tmp_path, source, (details.st_dev, details.st_ino + 1))
+
+
+def test_open_selected_file_does_not_block_on_a_replaced_fifo(tmp_path, monkeypatch):
+    """A selected regular file replaced with a FIFO is refused without waiting for a writer."""
+    source = tmp_path / "source"
+    source.write_text("content", encoding="utf-8")
+    details = source.stat()
+    original_open = os.open
+
+    def replace_file(path, flags, *args, **kwargs):
+        """Substitute a FIFO exactly when the selected leaf would be opened."""
+        if path == source.name:
+            assert flags & os.O_NONBLOCK
+            source.rename(tmp_path / "original")
+            os.mkfifo(source)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(path_module.os, "open", replace_file)
+    with pytest.raises(OSError, match="Selected file changed"):
+        open_selected_file(tmp_path, source, (details.st_dev, details.st_ino))
+
+
+@pytest.mark.parametrize("change", ["identity", "type"])
+def test_open_selected_file_rejects_root_identity_change(tmp_path, monkeypatch, change):
+    """A replaced or non-directory root cannot establish selected-file authority."""
+    source = tmp_path / "source"
+    source.write_text("content", encoding="utf-8")
+    details = source.stat()
+    original_lstat = Path.lstat
+
+    def changed_lstat(path, *args, **kwargs):
+        """Return an earlier root identity differing from the opened descriptor."""
+        result = original_lstat(path, *args, **kwargs)
+        if path != tmp_path:
+            return result
+        return SimpleNamespace(
+            st_mode=stat.S_IFREG if change == "type" else result.st_mode,
+            st_dev=result.st_dev,
+            st_ino=result.st_ino + (change == "identity"),
+        )
+
+    monkeypatch.setattr(Path, "lstat", changed_lstat)
+    with pytest.raises(OSError, match="root changed"):
+        open_selected_file(tmp_path, source, (details.st_dev, details.st_ino))
 
 
 def test_ensure_private_directory_creates_and_reopens_private_storage(tmp_path):
@@ -33,19 +144,22 @@ def test_ensure_private_directory_creates_and_reopens_private_storage(tmp_path):
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700
 
 
-@pytest.mark.parametrize("search_only", [True, False])
+@pytest.mark.parametrize("access", ["search", "path", "read"])
 def test_ensure_private_directory_uses_available_directory_search_access(
-    monkeypatch, tmp_path, search_only
+    monkeypatch, tmp_path, access
 ):
-    """Select search-only or fallback flags without requiring either native open capability."""
-    directory = tmp_path / "parent" / "private"
+    """Use search-only ancestors and an ACL-readable target when O_PATH is selected."""
+    directory = tmp_path / "parent" / "acl-target"
     directory.mkdir(mode=0o700, parents=True)
     details = directory.lstat()
     search_flag = 1 << 40
-    if search_only:
+    path_flag = 1 << 41
+    monkeypatch.delattr(os, "O_SEARCH", raising=False)
+    monkeypatch.delattr(os, "O_PATH", raising=False)
+    if access == "search":
         monkeypatch.setattr(os, "O_SEARCH", search_flag, raising=False)
-    else:
-        monkeypatch.delattr(os, "O_SEARCH", raising=False)
+    elif access == "path":
+        monkeypatch.setattr(os, "O_PATH", path_flag, raising=False)
     opened = []
     closed = Mock()
     monkeypatch.setattr(os, "close", closed)
@@ -55,8 +169,10 @@ def test_ensure_private_directory_uses_available_directory_search_access(
 
     def open_directory(path, flags, *args, **kwargs):
         """Model descriptor acquisition independently of the host OS and sandbox."""
-        access = search_flag if search_only else os.O_RDONLY
-        assert flags == access | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        expected = {"search": search_flag, "path": path_flag, "read": os.O_RDONLY}[access]
+        if access == "path" and path == directory.name:
+            expected = os.O_RDONLY
+        assert flags == expected | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         descriptor = 100 + len(opened)
         opened.append((path, descriptor))
         return descriptor
@@ -418,6 +534,74 @@ def test_private_directory_checks_linux_access_lists(monkeypatch, tmp_path, valu
             ensure_private_directory(directory)
     else:
         ensure_private_directory(directory)
+
+
+@pytest.mark.parametrize("fallback", [b"", b"extended-acl", errno.ENODATA, errno.EACCES])
+def test_search_only_descriptor_checks_linux_access_lists(monkeypatch, fallback):
+    """An O_PATH descriptor checks its held inode through procfs or fails closed."""
+    monkeypatch.setattr(path_module, "sys", SimpleNamespace(platform="linux"))
+    held = SimpleNamespace(st_dev=1, st_ino=2, st_mode=stat.S_IFDIR | 0o755)
+
+    def read_access_list(target, name):
+        """Model fd ACL limits and the descriptor-bound procfs fallback."""
+        assert name == "system.posix_acl_access"
+        if target == 17:
+            raise OSError(errno.EBADF, "search-only descriptor")
+        assert target == "/proc/self/fd/17"
+        if isinstance(fallback, int):
+            raise OSError(fallback, "procfs ACL lookup")
+        return fallback
+
+    monkeypatch.setattr(
+        path_module,
+        "os",
+        SimpleNamespace(
+            getxattr=read_access_list,
+            fstat=lambda descriptor: held,
+            stat=lambda path: held,
+        ),
+    )
+    if fallback == errno.EACCES:
+        with pytest.raises(OSError, match="procfs ACL lookup"):
+            path_module.has_extended_access_acl(17)
+    else:
+        assert path_module.has_extended_access_acl(17) is (fallback == b"extended-acl")
+
+
+@pytest.mark.parametrize("failure", ["before", "after", "denied", "missing_after"])
+def test_search_only_acl_rejects_unbound_procfs_target(monkeypatch, failure):
+    """A fake or inaccessible procfs path cannot supply authority for an O_PATH inode."""
+    monkeypatch.setattr(path_module, "sys", SimpleNamespace(platform="linux"))
+    held = SimpleNamespace(st_dev=1, st_ino=2, st_mode=stat.S_IFDIR | 0o755)
+    changed = SimpleNamespace(st_dev=1, st_ino=3, st_mode=stat.S_IFDIR | 0o755)
+    lookups = 0
+
+    def stat_link(path):
+        """Substitute or deny the procfs name before or after ACL inspection."""
+        nonlocal lookups
+        assert path == "/proc/self/fd/17"
+        lookups += 1
+        if failure == "denied":
+            raise PermissionError("procfs unavailable")
+        return changed if failure == "before" or lookups == 2 else held
+
+    def read_access_list(target, name):
+        """Use a search-only descriptor and an otherwise empty ACL."""
+        assert name == "system.posix_acl_access"
+        if target == 17:
+            raise OSError(errno.EBADF, "search-only descriptor")
+        assert target == "/proc/self/fd/17"
+        if failure == "missing_after":
+            raise OSError(errno.ENODATA, "no ACL on substituted entry")
+        return b""
+
+    monkeypatch.setattr(
+        path_module,
+        "os",
+        SimpleNamespace(getxattr=read_access_list, fstat=lambda descriptor: held, stat=stat_link),
+    )
+    with pytest.raises(OSError, match="procfs unavailable|descriptor target changed"):
+        path_module.has_extended_access_acl(17)
 
 
 @pytest.mark.parametrize("name", ["", ".", "..", "../outside", "/absolute"])

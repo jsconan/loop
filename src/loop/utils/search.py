@@ -17,6 +17,7 @@ import regex as re
 
 from .. import constants
 from .models import TextSearchCase, TextSearchContext, TextSearchMatch
+from .path import open_selected_file
 from .process import ProcessCapture, ProcessCaptureStatus
 
 _MAX_QUERY_CHARS = 1000
@@ -47,25 +48,6 @@ def _rg_text(value: dict[str, str]) -> str:
         return base64.b64decode(value["bytes"], validate=True).decode("utf-8", errors="replace")
     except (KeyError, TypeError, binascii.Error) as exc:
         raise RuntimeError("Native search returned invalid structured output.") from exc
-
-
-def _open_selected_file(root: Path, path: Path, identity: tuple[int, int]) -> int:
-    """Open a selected file through real directory descriptors and verify its inode."""
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-    with ExitStack() as stack:
-        directory = os.open(root, directory_flags)
-        stack.callback(os.close, directory)
-        for part in path.relative_to(root).parts[:-1]:
-            directory = os.open(part, directory_flags, dir_fd=directory)
-            stack.callback(os.close, directory)
-        descriptor = os.open(
-            path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory
-        )
-        details = os.fstat(descriptor)
-        if (details.st_dev, details.st_ino) != identity:
-            os.close(descriptor)
-            raise OSError("Selected search file changed before opening.")
-        return descriptor
 
 
 def search_text_paths(
@@ -140,7 +122,7 @@ def search_text_paths(
         trailing = 0
         try:
             selected = path.stat()
-            descriptor = _open_selected_file(root, path, (selected.st_dev, selected.st_ino))
+            descriptor = open_selected_file(root, path, (selected.st_dev, selected.st_ino))
             with os.fdopen(descriptor, "r", encoding="utf-8", errors="replace") as stream:
                 number = 0
                 while raw := stream.readline(_MAX_LINE_CHARS + 2):
@@ -225,7 +207,7 @@ def _search_native(
             for path in candidates[offset : offset + 200]:
                 try:
                     details = path.stat()
-                    descriptor = _open_selected_file(root, path, (details.st_dev, details.st_ino))
+                    descriptor = open_selected_file(root, path, (details.st_dev, details.st_ino))
                 except OSError as exc:
                     raise RuntimeError(f"Could not search selected file: {path}") from exc
                 stack.callback(os.close, descriptor)
