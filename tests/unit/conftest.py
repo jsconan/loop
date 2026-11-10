@@ -9,7 +9,7 @@ import socket
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from threading import BoundedSemaphore, Event, Lock
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -127,7 +127,9 @@ def isolated_workers(unit_patch, isolated_environment):
         unit_patch.setattr(
             asyncio_utils,
             "_WORKER_SLOTS",
-            BoundedSemaphore(asyncio_utils._WORKER_COUNT + asyncio_utils._WORKER_QUEUE_SIZE),
+            asyncio_utils.WorkerCapacity(
+                asyncio_utils._WORKER_COUNT + asyncio_utils._WORKER_QUEUE_SIZE
+            ),
         )
         yield
 

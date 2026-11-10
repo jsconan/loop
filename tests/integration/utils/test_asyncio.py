@@ -3,7 +3,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from threading import BoundedSemaphore, Event, get_ident
+from threading import Event, get_ident
 
 import pytest
 
@@ -19,7 +19,7 @@ def native_executor(monkeypatch):
     """Own and settle the executor used by each native worker scenario."""
     with ThreadPoolExecutor(max_workers=2) as executor:
         monkeypatch.setattr(asyncio_utils, "_WORKER_EXECUTOR", executor)
-        monkeypatch.setattr(asyncio_utils, "_WORKER_SLOTS", BoundedSemaphore(4))
+        monkeypatch.setattr(asyncio_utils, "_WORKER_SLOTS", asyncio_utils.WorkerCapacity(4))
         yield
 
 

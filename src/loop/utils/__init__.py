@@ -28,6 +28,8 @@ __all__ = [
     "ValueHolder",
     "ValueReference",
     "VirtualPath",
+    "WorkerCapacity",
+    "WorkerEntry",
     "as_utc",
     "await_value_async",
     "base64_decode",
@@ -81,6 +83,7 @@ __all__ = [
     "run_in_worker_async",
     "safe_scalar",
     "search_text_paths",
+    "settle_future_async",
     "sha256_digest",
     "snippet",
     "store_content",
@@ -94,11 +97,14 @@ __all__ = [
 
 
 from .asyncio import (
+    WorkerCapacity,
+    WorkerEntry,
     await_value_async,
     close_awaitable,
     has_running_event_loop,
     is_async_callable,
     run_in_worker_async,
+    settle_future_async,
 )
 from .callables import callable_hints, callable_name
 from .content import (
